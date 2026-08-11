@@ -1,0 +1,22 @@
+{
+  "name": "@geoyws/kanban",
+  "version": "0.1.0",
+  "description": "Durable local-first work ledger for long-horizon agents and swarms",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "kanban": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun test && tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.8.2"
+  }
+}
