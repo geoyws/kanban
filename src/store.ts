@@ -162,6 +162,28 @@ export interface ClaimOptions {
   allowReassign?: boolean;
 }
 
+export interface AdvanceStoryOptions {
+  actor: string;
+  target?: string;
+  reviewer?: string;
+  committer?: string;
+}
+
+export interface AdvanceStoryResult {
+  from: string;
+  to: string;
+  parentEpicFlipped: boolean;
+  dispatchedTaskID: string | null;
+  noop: boolean;
+}
+
+export interface StorySignoffResult {
+  storyID: string;
+  actor: string;
+  at: number;
+  note: string | null;
+}
+
 export interface CheckpointInput {
   taskID: string;
   leaseToken: string;
@@ -498,6 +520,161 @@ export class KanbanStore {
       this.event(taskID, "task_metadata_patched", who, { keys: Object.keys(patch) });
     }).immediate();
     return this.requireTask(taskID);
+  }
+
+  advanceStory(storyID: string, options: AdvanceStoryOptions): AdvanceStoryResult {
+    const actor = nonempty(options.actor, "actor");
+    let result!: AdvanceStoryResult;
+    this.db.transaction(() => {
+      const story = this.requireTask(storyID);
+      if (story.type !== "story") throw new Error(`${storyID} is not a story`);
+      const current =
+        typeof story.metadata.workflowStatus === "string"
+          ? story.metadata.workflowStatus
+          : "planning";
+      const mergeMode =
+        story.metadata.mergeMode === "trunk-direct" ? "trunk-direct" : "feature-branch";
+      const nextByState: Record<string, string | null> = {
+        planning: "ready",
+        ready: "in-progress",
+        "in-progress": "testing",
+        testing: "review",
+        review: mergeMode === "trunk-direct" ? "done" : "merging",
+        merging: "done",
+        done: null,
+      };
+      const target = options.target?.trim() || nextByState[current];
+      if (!target) throw new Error(`story ${storyID} is in terminal state ${current}`);
+      const legal = target === current || target === nextByState[current];
+      if (!legal) throw new Error(`illegal story transition ${current} -> ${target}`);
+      if (target === current) {
+        result = {
+          from: current,
+          to: target,
+          parentEpicFlipped: false,
+          dispatchedTaskID: null,
+          noop: true,
+        };
+        return;
+      }
+
+      const children = this.db
+        .query("SELECT * FROM tasks WHERE parent_id=? AND type='task' ORDER BY created_at,id")
+        .all(storyID) as TaskRow[];
+      if (target === "testing") {
+        const blockers = children
+          .map(taskFromRow)
+          .filter((task) => (task.lane ?? "misc") !== "test" && task.status !== "done")
+          .map((task) => task.id);
+        if (blockers.length) throw new Error(`non-test-lane tasks still open: ${blockers.join(",")}`);
+      }
+      if (target === "review") {
+        const blockers = children
+          .map(taskFromRow)
+          .filter((task) => task.lane === "test" && task.status !== "done")
+          .map((task) => task.id);
+        if (blockers.length) throw new Error(`test-lane tasks still open: ${blockers.join(",")}`);
+        if (!options.reviewer) throw new Error("reviewer is required when entering review");
+      }
+      if (target === "merging") {
+        if (story.metadata.reviewSignoff !== true) throw new Error("reviewer signoff is required");
+        if (!options.committer) throw new Error("committer is required when entering merging");
+      }
+      if (target === "done") {
+        if (mergeMode === "trunk-direct") {
+          if (story.metadata.reviewSignoff !== true) throw new Error("reviewer signoff is required");
+        } else {
+          const mergeTaskID =
+            typeof story.metadata.mergeTaskID === "string" ? story.metadata.mergeTaskID : null;
+          if (!mergeTaskID || this.requireTask(mergeTaskID).status !== "done") {
+            throw new Error(`merge task ${mergeTaskID ?? "(missing)"} is not done`);
+          }
+        }
+      }
+
+      const now = this.now();
+      let parentEpicFlipped = false;
+      if (current === "ready" && target === "in-progress" && story.parentID) {
+        const parent = this.requireTask(story.parentID);
+        if (parent.type === "epic" && parent.metadata.workflowStatus === "ready") {
+          this.db
+            .query("UPDATE tasks SET status='in_progress',metadata=?,updated_at=? WHERE id=?")
+            .run(JSON.stringify({ ...parent.metadata, workflowStatus: "in-progress" }), now, parent.id);
+          this.event(parent.id, "epic_advanced", actor, { from: "ready", to: "in-progress" });
+          parentEpicFlipped = true;
+        }
+      }
+
+      let dispatchedTaskID: string | null = null;
+      const storyMetadata: Record<string, unknown> = {
+        ...story.metadata,
+        workflowStatus: target,
+        advancedAt: Math.floor(now / 1_000),
+      };
+      if (target === "review" || target === "merging") {
+        dispatchedTaskID = `t-${randomUUID().slice(0, 8)}`;
+        const enteringReview = target === "review";
+        const assignee = nonempty(enteringReview ? options.reviewer! : options.committer!, "dispatch assignee");
+        this.db
+          .query(
+            `INSERT INTO tasks(
+               id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,
+               status,priority,created_at,updated_at,completed_at,metadata
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            dispatchedTaskID,
+            "task",
+            storyID,
+            `${enteringReview ? "review" : "merge"} ${storyID}`,
+            `Story ${storyID} entered ${target}.`,
+            assignee,
+            enteringReview ? "review" : "misc",
+            null,
+            null,
+            0,
+            "in_progress",
+            1,
+            now,
+            now,
+            null,
+            JSON.stringify({ workflowDispatch: target }),
+          );
+        this.event(dispatchedTaskID, "task_created", actor, { storyID, workflowDispatch: target });
+        if (!enteringReview) storyMetadata.mergeTaskID = dispatchedTaskID;
+      }
+
+      const status: TaskStatus =
+        target === "planning"
+          ? "backlog"
+          : target === "ready"
+            ? "todo"
+            : target === "in-progress"
+              ? "in_progress"
+              : target === "done"
+                ? "done"
+                : "review";
+      this.db
+        .query("UPDATE tasks SET status=?,metadata=?,updated_at=?,completed_at=? WHERE id=?")
+        .run(status, JSON.stringify(storyMetadata), now, status === "done" ? now : null, storyID);
+      this.event(storyID, "story_advanced", actor, { from: current, to: target, dispatchedTaskID });
+      result = {
+        from: current,
+        to: target,
+        parentEpicFlipped,
+        dispatchedTaskID,
+        noop: false,
+      };
+    }).immediate();
+    return result;
+  }
+
+  signoffStory(storyID: string, actorValue: string, noteValue?: string): StorySignoffResult {
+    return this.setStorySignoff(storyID, actorValue, true, noteValue);
+  }
+
+  unsignoffStory(storyID: string, actorValue: string, noteValue?: string): StorySignoffResult {
+    return this.setStorySignoff(storyID, actorValue, false, noteValue);
   }
 
   importTasks(inputs: ImportTaskInput[], actor: string): Task[] {
@@ -1002,6 +1179,45 @@ export class KanbanStore {
         expiresAt: now + leaseMs,
       });
       result = { handoff: this.requireHandoff(id), claim: this.getClaim(task.id)! };
+    }).immediate();
+    return result;
+  }
+
+  private setStorySignoff(
+    storyID: string,
+    actorValue: string,
+    signed: boolean,
+    noteValue?: string,
+  ): StorySignoffResult {
+    const actor = nonempty(actorValue, "actor");
+    let result!: StorySignoffResult;
+    this.db.transaction(() => {
+      const story = this.requireTask(storyID);
+      if (story.type !== "story") throw new Error(`${storyID} is not a story`);
+      if (story.metadata.workflowStatus !== "review") {
+        throw new Error(`story signoff is only valid in review`);
+      }
+      if (!signed && typeof story.metadata.mergeTaskID === "string") {
+        throw new Error(`story ${storyID} signoff has already been consumed`);
+      }
+      const at = this.now();
+      const note = noteValue?.trim() || null;
+      const prior = Array.isArray(story.metadata.signoffAudit)
+        ? story.metadata.signoffAudit
+        : [];
+      const entry = signed
+        ? { signedOffBy: actor, signedOffAt: at, note }
+        : { unsignedBy: actor, unsignedAt: at, note };
+      const metadata = {
+        ...story.metadata,
+        reviewSignoff: signed,
+        signoffAudit: [...prior, entry],
+      };
+      this.db
+        .query("UPDATE tasks SET metadata=?,updated_at=? WHERE id=?")
+        .run(JSON.stringify(metadata), at, storyID);
+      this.event(storyID, signed ? "story_signed_off" : "story_signoff_revoked", actor, { note });
+      result = { storyID, actor, at, note };
     }).immediate();
     return result;
   }

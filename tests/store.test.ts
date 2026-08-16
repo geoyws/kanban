@@ -61,6 +61,50 @@ describe("task graph and atomic claims", () => {
     expect(moved.metadata.workflowStatus).toBe("review");
   });
 
+  it("advances story workflow, dispatches atomically, and enforces gates", () => {
+    const store = makeStore();
+    store.addTask({
+      id: "e-one",
+      type: "epic",
+      title: "Epic",
+      status: "todo",
+      metadata: { workflowStatus: "ready" },
+    });
+    store.addTask({
+      id: "s-one",
+      type: "story",
+      parentID: "e-one",
+      title: "Story",
+      status: "backlog",
+      metadata: { workflowStatus: "planning", mergeMode: "feature-branch" },
+    });
+    store.addTask({ id: "t-dev", parentID: "s-one", title: "Develop", lane: "be" });
+    store.addTask({ id: "t-test", parentID: "s-one", title: "Test", lane: "test" });
+
+    expect(store.advanceStory("s-one", { actor: "driver" }).to).toBe("ready");
+    expect(store.advanceStory("s-one", { actor: "driver" }).parentEpicFlipped).toBe(true);
+    expect(store.requireTask("e-one").metadata.workflowStatus).toBe("in-progress");
+    expect(() => store.advanceStory("s-one", { actor: "driver" })).toThrow(/t-dev/);
+    store.moveTask("t-dev", "done", "worker");
+    expect(store.advanceStory("s-one", { actor: "driver" }).to).toBe("testing");
+    expect(() => store.advanceStory("s-one", { actor: "driver", reviewer: "reviewer" })).toThrow(
+      /t-test/,
+    );
+    store.moveTask("t-test", "done", "tester");
+    const review = store.advanceStory("s-one", { actor: "driver", reviewer: "reviewer" });
+    expect(review.to).toBe("review");
+    expect(store.requireTask(review.dispatchedTaskID!).assignee).toBe("reviewer");
+
+    store.signoffStory("s-one", "reviewer", "looks good");
+    store.unsignoffStory("s-one", "reviewer", "recheck");
+    store.signoffStory("s-one", "reviewer");
+    const merging = store.advanceStory("s-one", { actor: "driver", committer: "committer" });
+    expect(merging.to).toBe("merging");
+    expect(store.requireTask(merging.dispatchedTaskID!).assignee).toBe("committer");
+    store.moveTask(merging.dispatchedTaskID!, "done", "committer");
+    expect(store.advanceStory("s-one", { actor: "driver" }).to).toBe("done");
+  });
+
   it("updates atmux-compatible routing fields and dependencies atomically", () => {
     const store = makeStore();
     store.addTask({ id: "t-base", title: "Base" });

@@ -45,6 +45,9 @@ Usage:
              [--deliverable TEXT|--clear-deliverable] [--stale-minutes N]
              [--driver-only|--no-driver-only] [--depends-on ID ...|--clear-dependencies]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
+  kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
+  kanban story signoff ID --as ACTOR [--note TEXT]
+  kanban story unsignoff ID --as ACTOR [--note TEXT]
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role LANE] [--caller-scope member|driver]
              [--no-cross-lane] [--allow-reassign] [--json]
@@ -483,6 +486,35 @@ export function run(argv: string[], cwd = process.cwd()): void {
           },
           requireFlag(args, "as"),
         ),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "story" && subcommand === "advance") {
+      const storyID = rest[0];
+      if (!storyID) throw new Error("story id is required");
+      output(
+        store.advanceStory(storyID, {
+          actor: requireFlag(args, "as"),
+          ...(one(args, "to") ? { target: one(args, "to")! } : {}),
+          ...(one(args, "reviewer") ? { reviewer: one(args, "reviewer")! } : {}),
+          ...(one(args, "committer") ? { committer: one(args, "committer")! } : {}),
+        }),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "story" && (subcommand === "signoff" || subcommand === "unsignoff")) {
+      const storyID = rest[0];
+      if (!storyID) throw new Error("story id is required");
+      const actor = requireFlag(args, "as");
+      const note = one(args, "note");
+      output(
+        subcommand === "signoff"
+          ? store.signoffStory(storyID, actor, note)
+          : store.unsignoffStory(storyID, actor, note),
         has(args, "json"),
       );
       return;
