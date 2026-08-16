@@ -64,6 +64,8 @@ export interface Claim {
   expiresAt: number;
 }
 
+export type ClaimSummary = Omit<Claim, "leaseToken">;
+
 export interface TaskNote {
   seq: number;
   taskID: string;
@@ -121,7 +123,7 @@ export interface ContextPacket {
   task: Task;
   ancestors: Task[];
   dependencies: Task[];
-  claim: Claim | null;
+  claim: ClaimSummary | null;
   notes: TaskNote[];
   checkpoints: Checkpoint[];
   handoffs: Handoff[];

@@ -36,13 +36,14 @@ Usage:
              [--body TEXT] [--status STATUS] [--priority N] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
-  kanban task list [--status STATUS] [--json]
+  kanban task list [--status STATUS] [--with-relations] [--json]
   kanban task show ID [--json]
   kanban task move ID STATUS --as ACTOR
   kanban task update ID --as ACTOR [--title TEXT] [--body TEXT] [--priority N]
+             [--parent ID|--clear-parent]
              [--assignee AGENT|--unassign] [--lane LANE|--clear-lane]
              [--deliverable TEXT|--clear-deliverable] [--stale-minutes N]
-             [--driver-only|--no-driver-only] [--depends-on ID ...]
+             [--driver-only|--no-driver-only] [--depends-on ID ...|--clear-dependencies]
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role LANE] [--caller-scope member|driver]
              [--no-cross-lane] [--allow-reassign] [--json]
@@ -84,6 +85,9 @@ const BOOLEAN_FLAGS = new Set([
   "clear-deliverable",
   "no-cross-lane",
   "allow-reassign",
+  "with-relations",
+  "clear-parent",
+  "clear-dependencies",
 ]);
 
 interface ParsedArgs {
@@ -336,18 +340,37 @@ export function run(argv: string[], cwd = process.cwd()): void {
       const rawStatus = one(args, "status");
       const status = rawStatus as TaskStatus | undefined;
       if (status && !TASK_STATUSES.includes(status)) throw new Error(`invalid task status ${status}`);
-      output(store.listTasks(status), has(args, "json"));
+      const tasks = store.listTasks(status);
+      output(
+        has(args, "with-relations")
+          ? tasks.map((task) => ({
+              ...task,
+              dependencies: store.dependencies(task.id).map((dependency) => dependency.id),
+            }))
+          : tasks,
+        has(args, "json"),
+      );
       return;
     }
 
     if (command === "task" && subcommand === "show") {
       if (!rest[0]) throw new Error("task id is required");
       const task = store.requireTask(rest[0]);
+      const claim = store.getClaim(task.id);
       output(
         {
           ...task,
           dependencies: store.dependencies(task.id),
-          claim: store.getClaim(task.id),
+          claim: claim
+            ? {
+                taskID: claim.taskID,
+                agentID: claim.agentID,
+                sessionID: claim.sessionID,
+                claimedAt: claim.claimedAt,
+                heartbeatAt: claim.heartbeatAt,
+                expiresAt: claim.expiresAt,
+              }
+            : null,
           notes: store.notes(task.id),
           checkpoints: store.checkpoints(task.id),
           handoffs: store.handoffs({ taskID: task.id }),
@@ -380,10 +403,21 @@ export function run(argv: string[], cwd = process.cwd()): void {
       if (one(args, "deliverable") && has(args, "clear-deliverable")) {
         throw new Error("--deliverable and --clear-deliverable are mutually exclusive");
       }
+      if (one(args, "parent") && has(args, "clear-parent")) {
+        throw new Error("--parent and --clear-parent are mutually exclusive");
+      }
+      if (args.flags.has("depends-on") && has(args, "clear-dependencies")) {
+        throw new Error("--depends-on and --clear-dependencies are mutually exclusive");
+      }
       output(
         store.updateTask(
           taskID,
           {
+            ...(one(args, "parent")
+              ? { parentID: one(args, "parent")! }
+              : has(args, "clear-parent")
+                ? { parentID: null }
+                : {}),
             ...(one(args, "title") ? { title: one(args, "title")! } : {}),
             ...(args.flags.has("body") ? { body: one(args, "body")! } : {}),
             ...(one(args, "priority")
@@ -412,7 +446,9 @@ export function run(argv: string[], cwd = process.cwd()): void {
               : has(args, "no-driver-only")
                 ? { driverOnly: false }
                 : {}),
-            ...(args.flags.has("depends-on")
+            ...(has(args, "clear-dependencies")
+              ? { dependencies: [] }
+              : args.flags.has("depends-on")
               ? { dependencies: args.flags.get("depends-on") ?? [] }
               : {}),
           },

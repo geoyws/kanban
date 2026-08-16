@@ -125,6 +125,7 @@ export interface AddTaskInput {
 }
 
 export interface UpdateTaskInput {
+  parentID?: string | null;
   title?: string;
   body?: string | null;
   assignee?: string | null;
@@ -412,7 +413,18 @@ export class KanbanStore {
     }
     this.db.transaction(() => {
       const current = this.requireTask(taskID);
+      if (input.parentID !== undefined) {
+        if (input.parentID === taskID) throw new Error("task cannot be its own parent");
+        let parentID = input.parentID;
+        const seen = new Set<string>([taskID]);
+        while (parentID) {
+          if (seen.has(parentID)) throw new Error(`parent ${input.parentID} would create a cycle`);
+          seen.add(parentID);
+          parentID = this.requireTask(parentID).parentID;
+        }
+      }
       const next = {
+        parentID: input.parentID === undefined ? current.parentID : input.parentID,
         title: input.title === undefined ? current.title : nonempty(input.title, "title"),
         body: input.body === undefined ? current.body : input.body?.trim() || null,
         assignee:
@@ -431,10 +443,11 @@ export class KanbanStore {
       this.db
         .query(
           `UPDATE tasks SET
-             title=?,body=?,assignee=?,lane=?,deliverable=?,stale_minutes=?,driver_only=?,
+             parent_id=?,title=?,body=?,assignee=?,lane=?,deliverable=?,stale_minutes=?,driver_only=?,
              priority=?,metadata=?,updated_at=? WHERE id=?`,
         )
         .run(
+          next.parentID,
           next.title,
           next.body,
           next.assignee,

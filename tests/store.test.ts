@@ -30,6 +30,19 @@ afterEach(() => {
 });
 
 describe("task graph and atomic claims", () => {
+  it("updates task parents while preventing hierarchy cycles", () => {
+    const store = makeStore();
+    store.addTask({ id: "e-one", type: "epic", title: "One" });
+    store.addTask({ id: "s-two", type: "story", parentID: "e-one", title: "Two" });
+    store.addTask({ id: "t-three", parentID: "s-two", title: "Three" });
+
+    expect(store.updateTask("t-three", { parentID: "e-one" }, "operator").parentID).toBe("e-one");
+    expect(store.updateTask("t-three", { parentID: null }, "operator").parentID).toBeNull();
+    expect(() => store.updateTask("e-one", { parentID: "s-two" }, "operator")).toThrow(
+      /create a cycle/,
+    );
+  });
+
   it("updates atmux-compatible routing fields and dependencies atomically", () => {
     const store = makeStore();
     store.addTask({ id: "t-base", title: "Base" });

@@ -34,13 +34,78 @@ describe("CLI vertical slice", () => {
 
     expect((await cli(workspace, data, ["init", "--name", "Demo"])).exitCode).toBe(0);
     expect(
-      (await cli(workspace, data, ["task", "add", "Long task", "--id", "t-demo", "--json"]))
+      (await cli(workspace, data, ["task", "add", "Parent", "--id", "e-parent", "--type", "epic"]))
+        .exitCode,
+    ).toBe(0);
+    expect(
+      (
+        await cli(workspace, data, [
+          "task",
+          "add",
+          "Long task",
+          "--id",
+          "t-demo",
+          "--parent",
+          "e-parent",
+          "--depends-on",
+          "e-parent",
+          "--json",
+        ])
+      )
         .stdout,
     ).toContain('"id": "t-demo"');
+    expect(
+      (await cli(workspace, data, ["task", "move", "e-parent", "done", "--as", "operator"]))
+        .exitCode,
+    ).toBe(0);
 
     const claimed = await cli(workspace, data, ["claim", "t-demo", "--as", "deepseek", "--json"]);
     expect(claimed.exitCode).toBe(0);
     const lease = (JSON.parse(claimed.stdout) as { leaseToken: string }).leaseToken;
+
+    const listed = await cli(workspace, data, ["task", "list", "--with-relations", "--json"]);
+    const listedTask = (JSON.parse(listed.stdout) as Array<{ id: string; dependencies: string[] }>).find(
+      (task) => task.id === "t-demo",
+    );
+    expect(listedTask?.dependencies).toEqual(["e-parent"]);
+
+    const clearedRelations = await cli(workspace, data, [
+      "task",
+      "update",
+      "t-demo",
+      "--as",
+      "operator",
+      "--clear-dependencies",
+      "--json",
+    ]);
+    expect(clearedRelations.exitCode).toBe(0);
+    expect(
+      (JSON.parse(clearedRelations.stdout) as { id: string }).id,
+    ).toBe("t-demo");
+    expect(
+      JSON.parse(
+        (await cli(workspace, data, ["task", "list", "--with-relations", "--json"])).stdout,
+      ).find((task: { id: string }) => task.id === "t-demo").dependencies,
+    ).toEqual([]);
+
+    const shown = await cli(workspace, data, ["task", "show", "t-demo", "--json"]);
+    expect(shown.stdout).not.toContain(lease);
+    expect(shown.stdout).not.toContain("leaseToken");
+
+    const jsonContext = await cli(workspace, data, ["context", "t-demo", "--json"]);
+    expect(jsonContext.stdout).not.toContain(lease);
+    expect(jsonContext.stdout).not.toContain("leaseToken");
+
+    const reparented = await cli(workspace, data, [
+      "task",
+      "update",
+      "t-demo",
+      "--as",
+      "operator",
+      "--clear-parent",
+      "--json",
+    ]);
+    expect((JSON.parse(reparented.stdout) as { parentID: string | null }).parentID).toBeNull();
 
     const checkpoint = await cli(workspace, data, [
       "checkpoint",

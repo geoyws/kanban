@@ -57,11 +57,21 @@ export function contextPacket(
   taskID: string,
   limits: { notes?: number; checkpoints?: number; handoffs?: number } = {},
 ): ContextPacket {
+  const claim = store.getClaim(taskID);
   return {
     task: store.requireTask(taskID),
     ancestors: store.ancestors(taskID),
     dependencies: store.dependencies(taskID),
-    claim: store.getClaim(taskID),
+    claim: claim
+      ? {
+          taskID: claim.taskID,
+          agentID: claim.agentID,
+          sessionID: claim.sessionID,
+          claimedAt: claim.claimedAt,
+          heartbeatAt: claim.heartbeatAt,
+          expiresAt: claim.expiresAt,
+        }
+      : null,
     notes: store.notes(taskID, limits.notes ?? 50),
     checkpoints: store.checkpoints(taskID, limits.checkpoints ?? 10),
     handoffs: store.handoffs({ taskID, limit: limits.handoffs ?? 10 }).reverse(),
