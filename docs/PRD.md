@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** George
-**Updated:** 2026-08-14
+**Updated:** 2026-08-16
 
 ## Product statement
 
@@ -141,3 +141,14 @@ A handoff is valid only when:
    token-threshold integration.
 5. **Personal UI:** fast portfolio and project board views.
 6. **Optional mobility:** encrypted operator-only cross-host transport.
+
+## Current delivery status
+
+The foundation and most atmux parity surfaces are implemented. Seven non-empty
+legacy project sources have been imported into healthy private boards without
+activation, producing a 3,042-row fleet preparation receipt. The aggregate
+dashboard is usable now. Authority cutover remains gated on durable Kanban
+handoffs for live agents, stopped writers, per-project activation receipts,
+consumer restart verification, and a no-legacy-write observation period.
+
+See [the 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).
