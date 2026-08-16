@@ -65,4 +65,105 @@ describe("CLI vertical slice", () => {
     expect(context.stdout).toContain("Inspected the project");
     expect(context.stdout).toContain("Next action: Run tests");
   });
+
+  it("attaches a worktree and performs a handoff through separate CLI processes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "kanban-handoff-cli-"));
+    dirs.push(root);
+    const main = join(root, "main");
+    const worktree = join(root, "worktree");
+    const data = join(root, "data");
+    mkdirSync(main);
+    mkdirSync(worktree);
+
+    expect((await cli(main, data, ["init", "--name", "Demo"])).exitCode).toBe(0);
+    expect(
+      (await cli(worktree, data, ["workspace", "attach", "--to", main])).exitCode,
+    ).toBe(0);
+    expect(
+      (
+        await cli(main, data, [
+          "task",
+          "add",
+          "Transfer me",
+          "--id",
+          "t-transfer",
+          "--lane",
+          "be",
+          "--assignee",
+          "outgoing",
+          "--driver-only",
+        ])
+      ).exitCode,
+    ).toBe(0);
+    const updated = await cli(main, data, [
+      "task",
+      "update",
+      "t-transfer",
+      "--as",
+      "operator",
+      "--deliverable",
+      "src/adapter.ts",
+      "--stale-minutes",
+      "30",
+      "--json",
+    ]);
+    expect(updated.exitCode).toBe(0);
+    expect(updated.stdout).toContain('"lane": "be"');
+    expect(updated.stdout).toContain('"deliverable": "src/adapter.ts"');
+    const claimed = await cli(worktree, data, [
+      "claim",
+      "t-transfer",
+      "--as",
+      "outgoing",
+      "--caller-scope",
+      "driver",
+      "--json",
+    ]);
+    const lease = (JSON.parse(claimed.stdout) as { leaseToken: string }).leaseToken;
+    const created = await cli(worktree, data, [
+      "handoff",
+      "create",
+      "t-transfer",
+      "--lease",
+      lease,
+      "--as",
+      "outgoing",
+      "--summary",
+      "Token budget is low",
+      "--intent",
+      "Resume in a fresh session",
+      "--next-action",
+      "Run the remaining tests",
+      "--json",
+    ]);
+    expect(created.exitCode).toBe(0);
+    const handoffID = (JSON.parse(created.stdout) as { id: string }).id;
+
+    const accepted = await cli(main, data, [
+      "handoff",
+      "accept",
+      handoffID,
+      "--as",
+      "incoming",
+      "--caller-scope",
+      "driver",
+      "--json",
+    ]);
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.stdout).toContain('"agentID": "incoming"');
+
+    const dashboard = await cli(main, data, ["dashboard", "--json"]);
+    expect(dashboard.exitCode).toBe(0);
+    expect(dashboard.stdout).toContain('"workspaceRoots"');
+    expect(dashboard.stdout).toContain(worktree);
+
+    const doctor = await cli(main, data, ["doctor", "--json"]);
+    expect(doctor.exitCode).toBe(0);
+    expect(doctor.stdout).toContain('"healthy": true');
+
+    const backupDir = join(root, "backup");
+    const backup = await cli(main, data, ["backup", "--output", backupDir, "--json"]);
+    expect(backup.exitCode).toBe(0);
+    expect(backup.stdout).toContain(backupDir);
+  });
 });

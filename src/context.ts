@@ -1,5 +1,5 @@
 import type { KanbanStore } from "./store.js";
-import type { Checkpoint, ContextPacket, Task, TaskNote } from "./types.js";
+import type { Checkpoint, ContextPacket, Handoff, Task, TaskNote } from "./types.js";
 
 function iso(epochMs: number | null): string {
   return epochMs === null ? "-" : new Date(epochMs).toISOString();
@@ -32,6 +32,21 @@ function renderNote(note: TaskNote): string {
   return `- ${iso(note.createdAt)} · ${note.kind} · ${note.author}: ${note.body}`;
 }
 
+function renderHandoff(handoff: Handoff): string {
+  const target = handoff.toAgent ?? "next compatible agent";
+  const acceptance = handoff.acceptedBy
+    ? `Accepted by: ${handoff.acceptedBy} · ${iso(handoff.acceptedAt)}`
+    : "Accepted by: (pending)";
+  return [
+    `### Handoff ${handoff.id} · ${handoff.status} · ${handoff.reason}`,
+    `From: ${handoff.fromAgent} · To: ${target}`,
+    `Summary: ${handoff.summary}`,
+    `Intent: ${handoff.intent}`,
+    `Next action: ${handoff.nextAction}`,
+    acceptance,
+  ].join("\n");
+}
+
 function clip(value: string, max: number): string {
   if (value.length <= max) return value;
   return `${value.slice(0, Math.max(0, max - 15))}…[truncated]`;
@@ -40,7 +55,7 @@ function clip(value: string, max: number): string {
 export function contextPacket(
   store: KanbanStore,
   taskID: string,
-  limits: { notes?: number; checkpoints?: number } = {},
+  limits: { notes?: number; checkpoints?: number; handoffs?: number } = {},
 ): ContextPacket {
   return {
     task: store.requireTask(taskID),
@@ -49,6 +64,7 @@ export function contextPacket(
     claim: store.getClaim(taskID),
     notes: store.notes(taskID, limits.notes ?? 50),
     checkpoints: store.checkpoints(taskID, limits.checkpoints ?? 10),
+    handoffs: store.handoffs({ taskID, limit: limits.handoffs ?? 10 }).reverse(),
     generatedAt: Date.now(),
     truncated: false,
   };
@@ -89,11 +105,15 @@ export function renderContext(packet: ContextPacket, maxChars = 20_000): string 
   ].join("\n");
 
   const newestCheckpoint = packet.checkpoints.at(-1);
+  const newestHandoff = packet.handoffs.at(-1);
   const required = [
     fixed,
     "",
     "## Latest checkpoint",
     newestCheckpoint ? renderCheckpoint(newestCheckpoint) : "(none)",
+    "",
+    "## Latest handoff",
+    newestHandoff ? renderHandoff(newestHandoff) : "(none)",
   ].join("\n");
   if (required.length > maxChars) {
     // Compact layout keeps the operational handoff (especially next action)
@@ -111,6 +131,7 @@ export function renderContext(packet: ContextPacket, maxChars = 20_000): string 
       `Summary: ${clip(checkpoint?.summary ?? "(none)", 180)}`,
       `Blockers: ${clip(checkpoint?.blockers.join("; ") || "(none)", 100)}`,
       `Validations: ${clip(checkpoint?.validations.join("; ") || "(none)", 100)}`,
+      `Handoff: ${clip(newestHandoff ? `${newestHandoff.id} ${newestHandoff.status} from ${newestHandoff.fromAgent}; next ${newestHandoff.nextAction}` : "(none)", 240)}`,
       "",
       `Dependencies: ${clip(packet.dependencies.map((d) => `${d.id}:${d.status}`).join(", ") || "(none)", 140)}`,
       `Body: ${clip(task.body ?? "(none)", Math.max(80, Math.floor(maxChars / 4)))}`,
@@ -148,7 +169,13 @@ export function renderContext(packet: ContextPacket, maxChars = 20_000): string 
     noteLines.unshift(line);
   }
   text += `\n\n## Recent notes\n${noteLines.length ? noteLines.join("").trimStart() : "(none)"}`;
-  if (truncated) text += "\n\n[older history omitted]";
+  if (truncated) {
+    const marker = "\n\n[older history omitted]";
+    if (text.length + marker.length > maxChars) {
+      text = text.slice(0, maxChars - marker.length).trimEnd();
+    }
+    text += marker;
+  }
   return text;
 }
 

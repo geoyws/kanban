@@ -2,6 +2,9 @@
 
 Durable, local-first work state for long-horizon agents and swarms.
 
+Kanban is an operator-private personal work system across projects and Git
+worktrees. It is not a shared team issue tracker.
+
 Kanban is not primarily a board UI. It is an **agent-work ledger** designed
 around one failure condition: an agent may disappear at any token boundary,
 and a replacement must be able to resume safely without conversation history.
@@ -21,6 +24,8 @@ fan-out. Kanban moves the minimum safe handoff contract out of chat:
 - append-only plan, progress, blocker, decision, and evidence notes;
 - structured checkpoints containing intent, next action, validations, and
   repository state;
+- transactional token-pressure handoffs between outgoing and replacement
+  agents;
 - bounded cold-start context for the next model turn;
 - workspace state outside managed product repositories.
 
@@ -78,6 +83,20 @@ claim task
 `blocked` and `done` checkpoints atomically update the task and release its
 lease. A `continue` checkpoint retains the lease.
 
+When a model turn is ending, transfer ownership through Kanban itself:
+
+```bash
+kanban handoff create t-resume \
+  --lease "$LEASE_TOKEN" --as outgoing-agent --reason token_pressure \
+  --summary "Implemented the schema" \
+  --intent "Keep the migration append-only" \
+  --next-action "Run the importer contract test"
+
+kanban handoff list --status pending --json
+kanban handoff accept h-12345678 --as incoming-agent --json
+kanban context t-resume
+```
+
 ## Storage and privacy
 
 `kanban init` registers the current workspace in an operator-private registry:
@@ -92,25 +111,49 @@ No state is written into the managed repository. Override discovery with
 `KANBAN_DATA_DIR`, `KANBAN_DB`, or `--db PATH`. This permits atmux to retain
 per-team databases while orch and other harnesses share the same API.
 
+Initialize a project once, then attach additional Git worktrees to the same
+board:
+
+```bash
+kanban init --name my-project --workspace /path/to/main-worktree
+cd /path/to/another-worktree
+kanban workspace attach --to /path/to/main-worktree
+kanban dashboard
+```
+
 SQLite runs in WAL mode with foreign keys and a five-second busy timeout.
 Mutations use prepared statements and `BEGIN IMMEDIATE` where ownership is
 decided. Agents should use the typed library or CLI; arbitrary write SQL is
 not part of the public contract.
 
+The registry directory is mode `0700`; database files and snapshots are mode
+`0600`. Check and back up all registered boards with:
+
+```bash
+kanban doctor
+kanban backup --json
+```
+
 ## Current scope
 
-Version 0.1 is the substrate and CLI vertical slice. Planned adapters:
+Version 0.2 is the installed private multi-project CLI and continuity slice.
+It includes worktree aliases, aggregate dashboard reads, lane-aware claims,
+structured handoffs, integrity checks, snapshots, and legacy atmux task import.
+Planned adapters:
 
 1. opencode-plugin-orch long-horizon workflow;
-2. atmux compatibility adapter and migration path;
+2. atmux feature parity, state importer, compatibility adapter, and verified
+   removal of atmux's duplicate Kanban implementation;
 3. MCP surface for other compatible harnesses;
 4. optional board UI and cross-host synchronization.
 
 Integration handoffs: [orch](docs/integrating-orch.md) and
 [atmux](docs/integrating-atmux.md).
 
-See [ADR-001](docs/adr/ADR-001-durable-agent-work-ledger.md) for the decisions
-and migration strategy.
+See the [product requirements](docs/PRD.md),
+[ADR-001](docs/adr/ADR-001-durable-agent-work-ledger.md),
+[ADR-003](docs/adr/ADR-003-private-multi-project-personal-work-system.md), and
+[ADR-004](docs/adr/ADR-004-token-pressure-handoffs-through-kanban.md).
 
 ## Development
 

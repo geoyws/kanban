@@ -1,29 +1,37 @@
-# Integrating atmux
+# Replacing atmux's embedded Kanban
 
-atmux already has production SQLite task state. Integration must preserve that
-history and command behavior; it is not a big-bang replacement.
+Kanban becomes the sole owner of personal work state. atmux keeps its session,
+pane, worktree, routing, and cockpit responsibilities and calls this package for
+task, story, epic, progress, claim, and handoff operations.
 
 ## Migration sequence
 
-1. Extract shared contract tests for WAL setup, immediate claim transactions,
-   dependency eligibility, append-only notes, and cold-start context.
-2. Add an atmux adapter implementing Kanban's repository interface over the
-   existing `.atmux/state.db` schema.
-3. Ship `atmux task note` and structured checkpoints using the next free,
-   append-only atmux migration rung.
-4. Make handoff/resume render the Kanban context packet while preserving
-   existing human-readable handoff artifacts.
-5. Dogfood with parity checks before moving or renaming any existing table.
+1. Freeze an inventory and contract suite for every atmux Kanban reader and
+   writer, including task/story/epic lifecycle, lanes, inbox dispatch, cron,
+   hygiene, dashboard, publish, and rotation flows.
+2. Port missing behavior into this repository without importing atmux process
+   orchestration into the domain model.
+3. Add an importer for `.atmux/state.db` and legacy `kanban.json`; compare IDs,
+   row counts, relationships, status, timestamps, notes, and extension fields.
+4. Add an atmux compatibility adapter backed by the private Kanban registry.
+   Canonical team roots and their driver worktrees attach to one project board.
+5. Switch readers, then writers, then handoff/rotation consumers. During the
+   transition, prevent dual writes from becoming two authorities.
+6. Dogfood through a rollback-capable observation period and run old/new parity
+   receipts against real private state.
+7. Remove atmux's duplicate Kanban schemas, repositories, migrations, JSON
+   writers, and Markdown handoff artifacts only after every consumer is moved.
 
 ## Compatibility rules
 
 - Existing task IDs, epics, stories, dependencies, owners, and timestamps are
   stable identities and must not be regenerated.
-- Existing per-team databases remain valid boards. atmux passes an explicit
-  board path instead of registering product workspaces globally.
-- `tasks.note` may remain the closing-note compatibility field while new
-  progress history appends to `task_notes`/checkpoints.
-- No state database, WAL, generated TODO, or registry pointer enters a managed
-  product repository.
+- Existing per-team databases remain immutable migration sources until the
+  imported Kanban board is verified and backed up.
+- `tasks.note` and unknown extension fields must survive import even when the
+  new native representation uses append-only notes/checkpoints.
+- No state database, WAL, generated TODO, handoff file, or registry pointer
+  enters a managed product repository.
 - Cross-team dashboards read boards serially or through bounded concurrency;
   they do not hold many read transactions open at once.
+- Do not delete or rewrite non-Kanban atmux SQLite tables during takeover.

@@ -1,14 +1,19 @@
 #!/usr/bin/env bun
-import { writeFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { contextPacket, renderContext, renderTodo } from "./context.js";
-import { Registry } from "./registry.js";
+import { dataRoot, Registry } from "./registry.js";
 import { KanbanStore } from "./store.js";
+import { importAtmuxTasks, type LegacyAtmuxTask } from "./import-atmux.js";
 import {
   NOTE_KINDS,
+  HANDOFF_REASONS,
+  HANDOFF_STATUSES,
   TASK_STATUSES,
   TASK_TYPES,
   type CheckpointState,
+  type HandoffReason,
+  type HandoffStatus,
   type NoteKind,
   type TaskStatus,
   type TaskType,
@@ -19,12 +24,24 @@ const HELP = `kanban — durable work ledger for agents
 Usage:
   kanban init [--name NAME] [--workspace PATH]
   kanban workspace list [--json]
+  kanban workspace attach --to REGISTERED_PATH [--workspace PATH]
+  kanban dashboard [--json]
+  kanban doctor [--json]
+  kanban backup [--output DIRECTORY] [--json]
   kanban task add TITLE [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT] [--status STATUS] [--priority N] [--depends-on ID ...]
+             [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
+             [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--json]
   kanban task show ID [--json]
   kanban task move ID STATUS --as ACTOR
-  kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N] [--json]
+  kanban task update ID --as ACTOR [--title TEXT] [--body TEXT] [--priority N]
+             [--assignee AGENT|--unassign] [--lane LANE|--clear-lane]
+             [--deliverable TEXT|--clear-deliverable] [--stale-minutes N]
+             [--driver-only|--no-driver-only] [--depends-on ID ...]
+  kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
+             [--lane LANE] [--role LANE] [--caller-scope member|driver]
+             [--no-cross-lane] [--allow-reassign] [--json]
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
   kanban note ID TEXT --as AGENT [--kind KIND]
@@ -32,6 +49,14 @@ Usage:
              [--state continue|blocked|done] [--blocker TEXT ...] [--validation TEXT ...]
              [--session ID] [--model ID] [--repo PATH] [--branch NAME] [--head SHA]
              [--dirty TEXT]
+  kanban handoff create ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
+             [--reason token_pressure|provider_limit|session_end|manual] [--to AGENT]
+             [--blocker TEXT ...] [--validation TEXT ...] [--session ID] [--model ID]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT]
+  kanban handoff list [--task ID] [--status pending|accepted|cancelled] [--json]
+  kanban handoff accept HANDOFF_ID --as AGENT [--session ID] [--lease-minutes N]
+             [--caller-scope member|driver] [--json]
+  kanban import atmux-json PATH --as ACTOR [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
 
@@ -42,7 +67,19 @@ Board discovery:
 
 SQLite is authoritative. Generated TODO files are read-only projections.`;
 
-const BOOLEAN_FLAGS = new Set(["help", "json", "next", "keep-status"]);
+const BOOLEAN_FLAGS = new Set([
+  "help",
+  "json",
+  "next",
+  "keep-status",
+  "driver-only",
+  "no-driver-only",
+  "unassign",
+  "clear-lane",
+  "clear-deliverable",
+  "no-cross-lane",
+  "allow-reassign",
+]);
 
 interface ParsedArgs {
   positionals: string[];
@@ -95,6 +132,15 @@ function integer(value: string | undefined, fallback: number, label: string): nu
 
 function has(args: ParsedArgs, name: string): boolean {
   return args.flags.has(name);
+}
+
+function callerScope(args: ParsedArgs): "member" | "driver" | undefined {
+  const value = one(args, "caller-scope");
+  if (value === undefined) return undefined;
+  if (value !== "member" && value !== "driver") {
+    throw new Error("caller scope must be member or driver");
+  }
+  return value;
 }
 
 function output(value: unknown, json: boolean): void {
@@ -161,6 +207,93 @@ export function run(argv: string[], cwd = process.cwd()): void {
     return;
   }
 
+  if (command === "workspace" && subcommand === "attach") {
+    const registry = new Registry();
+    try {
+      output(
+        registry.attach(resolve(one(args, "workspace") ?? cwd), requireFlag(args, "to")),
+        has(args, "json"),
+      );
+    } finally {
+      registry.close();
+    }
+    return;
+  }
+
+  if (command === "dashboard") {
+    const registry = new Registry();
+    try {
+      const projects = registry.projects().map((project) => {
+        const projectStore = new KanbanStore(project.boardPath);
+        try {
+          const tasks = projectStore.listTasks();
+          return {
+            ...project,
+            taskCounts: Object.fromEntries(
+              TASK_STATUSES.map((status) => [status, tasks.filter((task) => task.status === status).length]),
+            ),
+            pendingHandoffs: projectStore.handoffs({ status: "pending" }).length,
+            totalTasks: tasks.length,
+          };
+        } finally {
+          projectStore.close();
+        }
+      });
+      output(projects, has(args, "json"));
+    } finally {
+      registry.close();
+    }
+    return;
+  }
+
+  if (command === "doctor") {
+    const registry = new Registry();
+    try {
+      const projects = registry.projects().map((project) => {
+        const projectStore = new KanbanStore(project.boardPath);
+        try {
+          return { name: project.name, boardPath: project.boardPath, integrity: projectStore.integrityCheck() };
+        } finally {
+          projectStore.close();
+        }
+      });
+      const report = { registry: registry.integrityCheck(), projects };
+      const healthy =
+        report.registry.length === 1 &&
+        report.registry[0] === "ok" &&
+        projects.every((project) => project.integrity.length === 1 && project.integrity[0] === "ok");
+      output(has(args, "json") ? { healthy, ...report } : healthy ? "Kanban integrity: ok" : report, has(args, "json"));
+      if (!healthy) process.exitCode = 1;
+    } finally {
+      registry.close();
+    }
+    return;
+  }
+
+  if (command === "backup") {
+    const registry = new Registry();
+    try {
+      const timestamp = new Date().toISOString().replaceAll(":", "-");
+      const directory = resolve(one(args, "output") ?? join(dataRoot(), "backups", timestamp));
+      registry.backup(join(directory, "registry.db"));
+      const boards: string[] = [];
+      for (const project of registry.projects()) {
+        const projectStore = new KanbanStore(project.boardPath);
+        try {
+          const destination = join(directory, "boards", basename(project.boardPath));
+          projectStore.backup(destination);
+          boards.push(destination);
+        } finally {
+          projectStore.close();
+        }
+      }
+      output({ directory, registry: join(directory, "registry.db"), boards }, has(args, "json"));
+    } finally {
+      registry.close();
+    }
+    return;
+  }
+
   const opened = openStore(args, cwd);
   const { store } = opened;
   try {
@@ -178,6 +311,13 @@ export function run(argv: string[], cwd = process.cwd()): void {
           ...(one(args, "parent") ? { parentID: one(args, "parent")! } : {}),
           title,
           ...(one(args, "body") ? { body: one(args, "body")! } : {}),
+          ...(one(args, "assignee") ? { assignee: one(args, "assignee")! } : {}),
+          ...(one(args, "lane") ? { lane: one(args, "lane")! } : {}),
+          ...(one(args, "deliverable") ? { deliverable: one(args, "deliverable")! } : {}),
+          ...(one(args, "stale-minutes")
+            ? { staleMinutes: integer(one(args, "stale-minutes"), 0, "stale minutes") }
+            : {}),
+          ...(has(args, "driver-only") ? { driverOnly: true } : {}),
           status,
           priority: integer(one(args, "priority"), 3, "priority"),
           dependencies: args.flags.get("depends-on") ?? [],
@@ -205,6 +345,7 @@ export function run(argv: string[], cwd = process.cwd()): void {
           claim: store.getClaim(task.id),
           notes: store.notes(task.id),
           checkpoints: store.checkpoints(task.id),
+          handoffs: store.handoffs({ taskID: task.id }),
         },
         has(args, "json"),
       );
@@ -219,6 +360,64 @@ export function run(argv: string[], cwd = process.cwd()): void {
       return;
     }
 
+    if (command === "task" && subcommand === "update") {
+      const taskID = rest[0];
+      if (!taskID) throw new Error("task id is required");
+      if (has(args, "driver-only") && has(args, "no-driver-only")) {
+        throw new Error("--driver-only and --no-driver-only are mutually exclusive");
+      }
+      if (one(args, "assignee") && has(args, "unassign")) {
+        throw new Error("--assignee and --unassign are mutually exclusive");
+      }
+      if (one(args, "lane") && has(args, "clear-lane")) {
+        throw new Error("--lane and --clear-lane are mutually exclusive");
+      }
+      if (one(args, "deliverable") && has(args, "clear-deliverable")) {
+        throw new Error("--deliverable and --clear-deliverable are mutually exclusive");
+      }
+      output(
+        store.updateTask(
+          taskID,
+          {
+            ...(one(args, "title") ? { title: one(args, "title")! } : {}),
+            ...(args.flags.has("body") ? { body: one(args, "body")! } : {}),
+            ...(one(args, "priority")
+              ? { priority: integer(one(args, "priority"), 3, "priority") }
+              : {}),
+            ...(one(args, "assignee")
+              ? { assignee: one(args, "assignee")! }
+              : has(args, "unassign")
+                ? { assignee: null }
+                : {}),
+            ...(one(args, "lane")
+              ? { lane: one(args, "lane")! }
+              : has(args, "clear-lane")
+                ? { lane: null }
+                : {}),
+            ...(one(args, "deliverable")
+              ? { deliverable: one(args, "deliverable")! }
+              : has(args, "clear-deliverable")
+                ? { deliverable: null }
+                : {}),
+            ...(one(args, "stale-minutes")
+              ? { staleMinutes: integer(one(args, "stale-minutes"), 0, "stale minutes") }
+              : {}),
+            ...(has(args, "driver-only")
+              ? { driverOnly: true }
+              : has(args, "no-driver-only")
+                ? { driverOnly: false }
+                : {}),
+            ...(args.flags.has("depends-on")
+              ? { dependencies: args.flags.get("depends-on") ?? [] }
+              : {}),
+          },
+          requireFlag(args, "as"),
+        ),
+        has(args, "json"),
+      );
+      return;
+    }
+
     if (command === "claim") {
       const taskID = has(args, "next") ? undefined : subcommand;
       if (!taskID && !has(args, "next")) throw new Error("task id or --next is required");
@@ -228,6 +427,11 @@ export function run(argv: string[], cwd = process.cwd()): void {
           agentID: requireFlag(args, "as"),
           ...(one(args, "session") ? { sessionID: one(args, "session")! } : {}),
           leaseMs: minutes * 60_000,
+          ...(one(args, "lane") ? { callerLane: one(args, "lane")! } : {}),
+          ...(one(args, "role") ? { roleFilter: one(args, "role")! } : {}),
+          ...(callerScope(args) ? { callerScope: callerScope(args)! } : {}),
+          crossLaneClaim: !has(args, "no-cross-lane"),
+          allowReassign: has(args, "allow-reassign"),
         }),
         has(args, "json"),
       );
@@ -277,6 +481,78 @@ export function run(argv: string[], cwd = process.cwd()): void {
           ...(one(args, "head") ? { headSha: one(args, "head")! } : {}),
           ...(one(args, "dirty") ? { dirtySummary: one(args, "dirty")! } : {}),
         }),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "handoff" && subcommand === "create") {
+      const taskID = rest[0];
+      if (!taskID) throw new Error("task id is required");
+      const reason = (one(args, "reason") ?? "token_pressure") as HandoffReason;
+      if (!HANDOFF_REASONS.includes(reason)) throw new Error(`invalid handoff reason ${reason}`);
+      output(
+        store.createHandoff({
+          taskID,
+          leaseToken: requireFlag(args, "lease"),
+          fromAgent: requireFlag(args, "as"),
+          reason,
+          summary: requireFlag(args, "summary"),
+          intent: requireFlag(args, "intent"),
+          nextAction: requireFlag(args, "next-action"),
+          blockers: args.flags.get("blocker") ?? [],
+          validations: args.flags.get("validation") ?? [],
+          ...(one(args, "session") ? { fromSession: one(args, "session")! } : {}),
+          ...(one(args, "model") ? { fromModel: one(args, "model")! } : {}),
+          ...(one(args, "to") ? { toAgent: one(args, "to")! } : {}),
+          ...(one(args, "repo") ? { repoPath: one(args, "repo")! } : {}),
+          ...(one(args, "branch") ? { branch: one(args, "branch")! } : {}),
+          ...(one(args, "head") ? { headSha: one(args, "head")! } : {}),
+          ...(one(args, "dirty") ? { dirtySummary: one(args, "dirty")! } : {}),
+        }),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "handoff" && subcommand === "list") {
+      const status = one(args, "status") as HandoffStatus | undefined;
+      if (status && !HANDOFF_STATUSES.includes(status)) {
+        throw new Error(`invalid handoff status ${status}`);
+      }
+      output(
+        store.handoffs({
+          ...(one(args, "task") ? { taskID: one(args, "task")! } : {}),
+          ...(status ? { status } : {}),
+        }),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "handoff" && subcommand === "accept") {
+      const handoffID = rest[0];
+      if (!handoffID) throw new Error("handoff id is required");
+      const minutes = integer(one(args, "lease-minutes"), 15, "lease minutes");
+      output(
+        store.acceptHandoff(handoffID, {
+          agentID: requireFlag(args, "as"),
+          ...(one(args, "session") ? { sessionID: one(args, "session")! } : {}),
+          leaseMs: minutes * 60_000,
+          ...(callerScope(args) ? { callerScope: callerScope(args)! } : {}),
+        }),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "import" && subcommand === "atmux-json") {
+      const path = rest[0];
+      if (!path) throw new Error("atmux kanban.json path is required");
+      const parsed = JSON.parse(readFileSync(resolve(path), "utf8")) as { tasks?: unknown };
+      if (!Array.isArray(parsed.tasks)) throw new Error("atmux JSON must contain a tasks array");
+      output(
+        importAtmuxTasks(store, parsed.tasks as LegacyAtmuxTask[], requireFlag(args, "as")),
         has(args, "json"),
       );
       return;

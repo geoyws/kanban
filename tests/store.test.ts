@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contextPacket, renderContext, renderTodo } from "../src/context.js";
+import { importAtmuxTasks } from "../src/import-atmux.js";
 import { Registry } from "../src/registry.js";
 import { KanbanStore } from "../src/store.js";
 
@@ -28,6 +29,37 @@ afterEach(() => {
 });
 
 describe("task graph and atomic claims", () => {
+  it("updates atmux-compatible routing fields and dependencies atomically", () => {
+    const store = makeStore();
+    store.addTask({ id: "t-base", title: "Base" });
+    store.addTask({ id: "t-next", title: "Next" });
+
+    const updated = store.updateTask(
+      "t-next",
+      {
+        assignee: "driver-2",
+        lane: "be",
+        deliverable: "src/adapter.ts",
+        staleMinutes: 45,
+        driverOnly: true,
+        priority: 1,
+        dependencies: ["t-base"],
+      },
+      "operator",
+    );
+
+    expect(updated.assignee).toBe("driver-2");
+    expect(updated.lane).toBe("be");
+    expect(updated.deliverable).toBe("src/adapter.ts");
+    expect(updated.staleMinutes).toBe(45);
+    expect(updated.driverOnly).toBe(true);
+    expect(store.dependencies("t-next").map((task) => task.id)).toEqual(["t-base"]);
+    expect(() =>
+      store.updateTask("t-base", { dependencies: ["t-next"] }, "operator"),
+    ).toThrow(/create a cycle/);
+    expect(store.dependencies("t-base")).toEqual([]);
+  });
+
   it("claims only dependency-ready work in priority order", () => {
     const store = makeStore();
     const foundation = store.addTask({ id: "t-base", title: "Foundation", priority: 2 });
@@ -41,6 +73,43 @@ describe("task graph and atomic claims", () => {
     const second = store.claim(undefined, { agentID: "worker-b" });
     expect(second.taskID).toBe("t-ready");
     expect(() => store.claim("t-blocked", { agentID: "worker-c" })).toThrow(/unmet dependencies/);
+  });
+
+  it("selects next work by assignee, lane, role, and driver scope", () => {
+    const store = makeStore();
+    store.addTask({ id: "t-fe", title: "Frontend", lane: "fe", priority: 2 });
+    store.addTask({ id: "t-be", title: "Backend", lane: "be", priority: 1 });
+    store.addTask({ id: "t-free", title: "General", priority: 3 });
+    store.addTask({
+      id: "t-driver",
+      title: "Driver decision",
+      lane: "ops",
+      driverOnly: true,
+      priority: 0,
+    });
+    store.addTask({
+      id: "t-other",
+      title: "Owned elsewhere",
+      assignee: "worker-b",
+      priority: 0,
+    });
+
+    expect(
+      store.claim(undefined, { agentID: "worker-a", callerLane: "fe" }).taskID,
+    ).toBe("t-fe");
+    expect(
+      store.claim(undefined, { agentID: "worker-a", roleFilter: "be" }).taskID,
+    ).toBe("t-be");
+    expect(
+      store.claim(undefined, {
+        agentID: "driver",
+        roleFilter: "ops",
+        callerScope: "driver",
+      }).taskID,
+    ).toBe("t-driver");
+    expect(() =>
+      store.claim("t-other", { agentID: "worker-a" }),
+    ).toThrow(/assigned to worker-b/);
   });
 
   it("prevents double claims across database connections", () => {
@@ -143,6 +212,89 @@ describe("durable continuity", () => {
     expect(second.boardName()).toBe("Persistent");
     expect(second.requireTask("t-one").title).toBe("Survive restart");
   });
+
+  it("checks integrity and creates a private recoverable snapshot", () => {
+    const root = tempDir();
+    const path = join(root, "board.db");
+    const backup = join(root, "backup", "board.db");
+    const store = new KanbanStore(path);
+    stores.push(store);
+    store.initialize("Protected");
+    store.addTask({ id: "t-one", title: "Back me up" });
+
+    expect(store.integrityCheck()).toEqual(["ok"]);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    store.backup(backup);
+    expect(statSync(backup).mode & 0o777).toBe(0o600);
+    expect(() => store.backup(backup)).toThrow(/already exists/);
+
+    const restored = new KanbanStore(backup);
+    stores.push(restored);
+    expect(restored.integrityCheck()).toEqual(["ok"]);
+    expect(restored.requireTask("t-one").title).toBe("Back me up");
+  });
+});
+
+describe("agent handoffs", () => {
+  it("atomically checkpoints, releases, and transfers a token-pressure handoff", () => {
+    const store = makeStore();
+    store.addTask({ id: "t-one", title: "Continue across agents" });
+    const outgoing = store.claim("t-one", { agentID: "agent-old", sessionID: "turn-1" });
+
+    const handoff = store.createHandoff({
+      taskID: "t-one",
+      leaseToken: outgoing.leaseToken,
+      fromAgent: "agent-old",
+      fromSession: "turn-1",
+      reason: "token_pressure",
+      summary: "Implemented the schema",
+      intent: "Keep the migration append-only",
+      nextAction: "Run the handoff acceptance test",
+      validations: ["typecheck passed"],
+      repoPath: "/work/repo",
+      branch: "main",
+      headSha: "abc123",
+    });
+
+    expect(handoff.status).toBe("pending");
+    expect(store.getClaim("t-one")).toBeNull();
+    expect(store.requireTask("t-one").status).toBe("todo");
+    expect(store.checkpoints("t-one").at(-1)?.nextAction).toBe(
+      "Run the handoff acceptance test",
+    );
+    expect(() => store.heartbeat("t-one", outgoing.leaseToken)).toThrow(/no active claim/);
+
+    const incoming = store.acceptHandoff(handoff.id, {
+      agentID: "agent-new",
+      sessionID: "turn-2",
+    });
+    expect(incoming.handoff.status).toBe("accepted");
+    expect(incoming.handoff.acceptedBy).toBe("agent-new");
+    expect(incoming.claim.agentID).toBe("agent-new");
+    expect(incoming.claim.leaseToken).not.toBe(outgoing.leaseToken);
+    expect(store.requireTask("t-one").status).toBe("in_progress");
+  });
+
+  it("enforces a named replacement agent", () => {
+    const store = makeStore();
+    store.addTask({ id: "t-one", title: "Targeted handoff" });
+    const claim = store.claim("t-one", { agentID: "agent-old" });
+    const handoff = store.createHandoff({
+      taskID: "t-one",
+      leaseToken: claim.leaseToken,
+      fromAgent: "agent-old",
+      toAgent: "agent-new",
+      summary: "Ready to transfer",
+      intent: "Preserve continuity",
+      nextAction: "Load the context",
+    });
+
+    expect(() => store.acceptHandoff(handoff.id, { agentID: "someone-else" })).toThrow(
+      /targets agent-new/,
+    );
+    expect(store.requireHandoff(handoff.id).status).toBe("pending");
+    expect(store.getClaim("t-one")).toBeNull();
+  });
 });
 
 describe("cold-start projections", () => {
@@ -185,6 +337,24 @@ describe("cold-start projections", () => {
     expect(todo).toContain("Projection only. SQLite is authoritative");
     expect(todo).toContain("Write the adapter");
   });
+
+  it("includes the newest handoff in cold-start context", () => {
+    const store = makeStore();
+    store.addTask({ id: "t-one", title: "Resume from Kanban" });
+    const claim = store.claim("t-one", { agentID: "outgoing" });
+    store.createHandoff({
+      taskID: "t-one",
+      leaseToken: claim.leaseToken,
+      fromAgent: "outgoing",
+      summary: "Tokens are sparse",
+      intent: "Switch agents safely",
+      nextAction: "Inspect the pending migration diff",
+    });
+    const text = renderContext(contextPacket(store, "t-one"));
+    expect(text).toContain("Latest handoff");
+    expect(text).toContain("Tokens are sparse");
+    expect(text).toContain("Inspect the pending migration diff");
+  });
 });
 
 describe("workspace registry", () => {
@@ -198,8 +368,87 @@ describe("workspace registry", () => {
       const registered = registry.register(workspace, "Project");
       expect(registry.resolve(nested)?.boardPath).toBe(registered.boardPath);
       expect(registered.boardPath.startsWith(join(root, "data"))).toBe(true);
+      expect(statSync(join(root, "data")).mode & 0o777).toBe(0o700);
+      expect(registry.integrityCheck()).toEqual(["ok"]);
     } finally {
       registry.close();
     }
+  });
+
+  it("attaches multiple worktrees to one project board", () => {
+    const root = tempDir();
+    const main = join(root, "main");
+    const worktree = join(root, "driver-2");
+    mkdirSync(main);
+    mkdirSync(join(worktree, "src"), { recursive: true });
+    const registry = new Registry(join(root, "data"));
+    try {
+      const project = registry.register(main, "Project");
+      const attached = registry.attach(worktree, main);
+      expect(attached.canonical).toBe(false);
+      expect(attached.boardPath).toBe(project.boardPath);
+      expect(registry.resolve(join(worktree, "src"))?.boardPath).toBe(project.boardPath);
+      expect(registry.projects()[0]?.workspaceRoots).toEqual([main, worktree]);
+    } finally {
+      registry.close();
+    }
+  });
+});
+
+describe("atmux migration", () => {
+  it("imports stable task identities, routing fields, dependencies, and notes", () => {
+    const store = makeStore();
+    const imported = importAtmuxTasks(
+      store,
+      [
+        {
+          id: "t-00000001",
+          subject: "Foundation",
+          status: "done",
+          owner: "driver",
+          lane: "be",
+          createdAt: 1_700_000_000,
+          completedAt: 1_700_000_100,
+          note: "Verified in atmux",
+        },
+        {
+          id: "t-00000002",
+          subject: "Adapter",
+          status: "in-progress",
+          owner: "driver-2",
+          deps: ["t-00000001"],
+          deliverable: "src/adapter.ts",
+          staleMin: 45,
+          driverOnly: true,
+          createdAt: 1_700_000_200,
+          customField: "preserved",
+        },
+      ],
+      "operator",
+    );
+
+    expect(imported.map((task) => task.id)).toEqual(["t-00000001", "t-00000002"]);
+    expect(store.requireTask("t-00000001").createdAt).toBe(1_700_000_000_000);
+    expect(store.requireTask("t-00000002").status).toBe("in_progress");
+    expect(store.requireTask("t-00000002").assignee).toBe("driver-2");
+    expect(store.requireTask("t-00000002").driverOnly).toBe(true);
+    expect(store.dependencies("t-00000002").map((task) => task.id)).toEqual(["t-00000001"]);
+    expect(store.notes("t-00000001")[0]?.body).toBe("Verified in atmux");
+    expect(
+      (store.requireTask("t-00000002").metadata.atmuxExtra as Record<string, unknown>)
+        .customField,
+    ).toBe("preserved");
+  });
+
+  it("rolls back the whole import when a dependency is missing", () => {
+    const store = makeStore();
+    expect(() =>
+      importAtmuxTasks(
+        store,
+        [{ id: "t-one", subject: "Broken", deps: ["t-missing"] }],
+        "operator",
+      ),
+    ).toThrow(/t-missing not found/);
+    expect(store.getTask("t-one")).toBeNull();
   });
 });
