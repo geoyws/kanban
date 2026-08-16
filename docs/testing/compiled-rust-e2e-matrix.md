@@ -1,0 +1,36 @@
+# Compiled Rust E2E matrix
+
+The release gate runs `cargo test --test e2e` after Cargo builds the production
+`kanban` executable. Each test invokes `CARGO_BIN_EXE_kanban` through
+`std::process::Command`; no test calls Kanban domain functions in-process.
+
+| Requirement | Process-boundary evidence |
+| --- | --- |
+| SQLite persistence and restart | Separate `init`, `task add`, `note`, `claim`, `handoff`, `context`, and `checkpoint` processes reopen the same board. |
+| Multiple worktrees | A second directory attaches to the canonical project and reads/writes the same board; dashboard reports both roots. |
+| Atomic ownership | Two compiled processes race to claim one task; exactly one exit status may succeed. |
+| Token-pressure handoff | The outgoing process creates the structured handoff, releases its lease, and an incoming process accepts with a different token. |
+| Stale-token exclusion | The outgoing token is used for a post-handoff heartbeat and must fail. |
+| Secret-safe read models | `task show` and rendered context are checked for both the literal token and the `leaseToken` field name. |
+| atmux JSON import | A real source file containing epic, story, and task hierarchy is imported through the compiled CLI and the parent link is read back. |
+| atmux SQLite import | A real legacy SQLite database is created and imported by a separate CLI process; duplicate insert-only import is rejected, then explicit reconciliation refreshes the existing rows and reports created/updated counts. |
+| Operations | Dashboard counts, `doctor` integrity, multi-board backup, and reopening a copied board through `--db` are exercised. |
+| Existing-format compatibility | The binary opens a separately created `user_version=3` database matching the released TypeScript task schema without migration/export. |
+| Pull routing and task graph | Separate CLI processes exercise `claim --next`, priority/dependency readiness, lane preference, role filtering, driver scope, assignee gates, and cycle rejection. |
+| Story lifecycle | Separate processes exercise planning through done, child-lane gates, epic activation, review signoff/revocation, reviewer/committer dispatch, and merge completion. |
+| Bounded projections | Long append-only history is rendered within the requested context bound while preserving the newest next action; generated TODO output declares SQLite authority. |
+
+Passing library/unit tests or invoking `rust/main.rs` through an interpreter is
+not E2E evidence. The gate is incomplete until the compiled executable passes
+this matrix on a clean test data directory.
+
+## 2026-08-16 release receipt
+
+- `cargo clippy --all-targets --locked -- -D warnings`: pass.
+- `cargo test --locked`: 5 compiled-binary E2E scenarios pass.
+- `cargo build --release --locked`: pass.
+- Eight read-consistent private-board snapshots opened with the release binary:
+  3,046 tasks total with per-board counts 9, 4, 308, 1,211, 24, 1,343, 90,
+  and 57.
+- atmux `tests/unit/adapters/kanban-cli.test.ts` against the release binary:
+  10 tests and 58 assertions pass.

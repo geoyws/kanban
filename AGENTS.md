@@ -2,11 +2,13 @@
 
 ## Runtime and package management
 
-- Use Bun only for this project.
-- Use `bun install`, `bun run`, `bun test`, `bunx`, and the `#!/usr/bin/env bun` runtime.
-- Do not invoke `node`, `npm`, `npx`, `pnpm`, `yarn`, or Corepack for project work.
-- Do not add `package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock`; `bun.lock` is the only package-manager lockfile.
-- Node-compatible standard-library imports are allowed when executed by Bun.
+- Kanban's production runtime is Rust. Use `cargo build`, `cargo test`,
+  `cargo fmt`, and `cargo clippy`; `Cargo.lock` is authoritative.
+- The installed `kanban` command must execute the compiled Rust binary.
+- Do not add Bun, Node, npm, pnpm, Yarn, or Corepack runtime dependencies.
+- Every release gate must spawn the compiled binary across real process
+  boundaries; in-process domain tests do not count as E2E evidence.
+- See [ADR-006](docs/adr/ADR-006-rust-runtime-and-compiled-binary-e2e.md).
 
 ## Agent topology
 

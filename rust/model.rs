@@ -1,0 +1,238 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const TASK_STATUSES: [&str; 7] = [
+    "backlog",
+    "todo",
+    "in_progress",
+    "blocked",
+    "review",
+    "done",
+    "cancelled",
+];
+pub const TASK_TYPES: [&str; 3] = ["epic", "story", "task"];
+pub const NOTE_KINDS: [&str; 6] = [
+    "plan", "progress", "blocker", "decision", "evidence", "done",
+];
+pub const HANDOFF_REASONS: [&str; 4] =
+    ["token_pressure", "provider_limit", "session_end", "manual"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub task_type: String,
+    #[serde(rename = "parentID")]
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub body: Option<String>,
+    pub assignee: Option<String>,
+    pub lane: Option<String>,
+    pub deliverable: Option<String>,
+    pub stale_minutes: Option<i64>,
+    pub driver_only: bool,
+    pub status: String,
+    pub priority: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Claim {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    #[serde(rename = "agentID")]
+    pub agent_id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: Option<String>,
+    pub lease_token: String,
+    pub claimed_at: i64,
+    pub heartbeat_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimSummary {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    #[serde(rename = "agentID")]
+    pub agent_id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: Option<String>,
+    pub claimed_at: i64,
+    pub heartbeat_at: i64,
+    pub expires_at: i64,
+}
+
+impl From<&Claim> for ClaimSummary {
+    fn from(value: &Claim) -> Self {
+        Self {
+            task_id: value.task_id.clone(),
+            agent_id: value.agent_id.clone(),
+            session_id: value.session_id.clone(),
+            claimed_at: value.claimed_at,
+            heartbeat_at: value.heartbeat_at,
+            expires_at: value.expires_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskNote {
+    pub seq: i64,
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub author: String,
+    pub kind: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub seq: i64,
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub author: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub state: String,
+    pub summary: String,
+    pub intent: String,
+    pub next_action: String,
+    pub blockers: Vec<String>,
+    pub validations: Vec<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub dirty_summary: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Handoff {
+    pub id: String,
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub checkpoint_seq: i64,
+    pub reason: String,
+    pub status: String,
+    pub from_agent: String,
+    pub from_session: Option<String>,
+    pub from_model: Option<String>,
+    pub to_agent: Option<String>,
+    pub summary: String,
+    pub intent: String,
+    pub next_action: String,
+    pub blockers: Vec<String>,
+    pub validations: Vec<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub dirty_summary: Option<String>,
+    pub created_at: i64,
+    pub accepted_at: Option<i64>,
+    pub accepted_by: Option<String>,
+    pub accepted_session: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRecord {
+    pub root_path: String,
+    pub name: String,
+    pub board_path: String,
+    pub canonical: bool,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecord {
+    pub name: String,
+    pub board_path: String,
+    pub canonical_root: String,
+    pub workspace_roots: Vec<String>,
+    pub last_used_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPacket {
+    pub task: Task,
+    pub ancestors: Vec<Task>,
+    pub dependencies: Vec<Task>,
+    pub claim: Option<ClaimSummary>,
+    pub notes: Vec<TaskNote>,
+    pub checkpoints: Vec<Checkpoint>,
+    pub handoffs: Vec<Handoff>,
+    pub generated_at: i64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddTask {
+    pub id: Option<String>,
+    pub task_type: String,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub body: Option<String>,
+    pub assignee: Option<String>,
+    pub lane: Option<String>,
+    pub deliverable: Option<String>,
+    pub stale_minutes: Option<i64>,
+    pub driver_only: bool,
+    pub status: String,
+    pub priority: i64,
+    pub dependencies: Vec<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointInput {
+    pub task_id: String,
+    pub lease_token: String,
+    pub author: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub state: String,
+    pub summary: String,
+    pub intent: String,
+    pub next_action: String,
+    pub blockers: Vec<String>,
+    pub validations: Vec<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub dirty_summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandoffInput {
+    pub task_id: String,
+    pub lease_token: String,
+    pub from_agent: String,
+    pub from_session: Option<String>,
+    pub from_model: Option<String>,
+    pub to_agent: Option<String>,
+    pub reason: String,
+    pub summary: String,
+    pub intent: String,
+    pub next_action: String,
+    pub blockers: Vec<String>,
+    pub validations: Vec<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub dirty_summary: Option<String>,
+}

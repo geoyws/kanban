@@ -13,6 +13,8 @@ task, story, epic, progress, claim, and handoff operations.
    orchestration into the domain model.
 3. Add an importer for `.atmux/state.db` and legacy `kanban.json`; compare IDs,
    row counts, relationships, status, timestamps, notes, and extension fields.
+   Re-import is insert-only unless the operator confirms all legacy writers are
+   stopped and uses the explicit reconciliation path.
 4. Add an atmux compatibility adapter backed by the private Kanban registry.
    Canonical team roots and their driver worktrees attach to one project board.
 5. Switch readers, then writers, then handoff/rotation consumers. During the
@@ -28,6 +30,8 @@ task, story, epic, progress, claim, and handoff operations.
   stable identities and must not be regenerated.
 - Existing per-team databases remain immutable migration sources until the
   imported Kanban board is verified and backed up.
+- Reconciliation is an atomic pre-cutover refresh. It must never run while
+  atmux or orchd can still mutate the legacy work tables.
 - `tasks.note` and unknown extension fields must survive import even when the
   new native representation uses append-only notes/checkpoints.
 - No state database, WAL, generated TODO, handoff file, or registry pointer

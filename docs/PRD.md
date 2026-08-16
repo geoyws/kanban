@@ -74,7 +74,8 @@ write domains.
 - Include handoffs in cold-start context.
 - Preserve the existing task, dependency, claim, note, checkpoint, and TODO
   projection contracts.
-- Bun-only CLI, library, tests, and development workflow.
+- Rust-only production CLI and domain engine, with Cargo-based development and
+  compiled-binary end-to-end tests.
 
 ### P1
 
@@ -82,7 +83,8 @@ write domains.
   gates, stories, epics, readiness, sign-off, dispatch/inbox integration,
   hygiene checks, and cockpit projections.
 - Importer for atmux `state.db` and legacy `kanban.json`, preserving stable
-  identities, relationships, timestamps, notes, and extension fields.
+  identities, relationships, timestamps, notes, and extension fields, with an
+  explicit atomic reconcile mode for stopped-writer cutover refreshes.
 - Compatibility adapter followed by the verified removal of duplicate atmux
   Kanban storage and repository code.
 - Operator-oriented terminal or web board over the same APIs.
@@ -150,5 +152,11 @@ activation, producing a 3,042-row fleet preparation receipt. The aggregate
 dashboard is usable now. Authority cutover remains gated on durable Kanban
 handoffs for live agents, stopped writers, per-project activation receipts,
 consumer restart verification, and a no-legacy-write observation period.
+
+The production runtime is Rust per ADR-006. The compiled executable passes the
+full process-boundary E2E gate, opens read-consistent snapshots of all eight
+existing private boards (3,046 tasks), and satisfies atmux's focused CLI adapter
+contract suite. TypeScript and Bun are not production or development
+dependencies of Kanban.
 
 See [the 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).

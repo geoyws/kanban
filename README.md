@@ -31,11 +31,10 @@ fan-out. Kanban moves the minimum safe handoff contract out of chat:
 
 ## Quick start
 
-Requires [Bun](https://bun.sh/).
+Requires a Rust toolchain with Cargo.
 
 ```bash
-bun install
-bun link
+cargo install --path . --locked
 
 cd /path/to/project
 kanban init --name my-project
@@ -141,6 +140,19 @@ writing to the source database:
 kanban import atmux-sqlite /path/to/.atmux/state.db --as operator --json
 ```
 
+Imports are insert-only by default. If a previously imported board must be
+refreshed before cutover, stop every legacy writer and opt in explicitly:
+
+```bash
+kanban import atmux-sqlite /path/to/.atmux/state.db \
+  --as operator --reconcile --json
+```
+
+Reconciliation atomically refreshes the imported records and relationships,
+clears obsolete imported claims, preserves durable history, and reports
+created versus updated counts. It is a pre-cutover operation, not a dual-write
+mode.
+
 Epics, stories, tasks, hierarchy, stable IDs, timestamps, routing fields,
 notes, and unknown extension JSON are preserved. Dangling historical
 relationships are retained as warning metadata rather than inserted as invalid
@@ -148,7 +160,7 @@ foreign-key edges.
 
 ## Current scope
 
-Version 0.2 is the installed private multi-project CLI and continuity slice.
+Version 0.3 is the compiled Rust private multi-project CLI and continuity slice.
 It includes worktree aliases, aggregate dashboard reads, lane-aware claims,
 structured handoffs, integrity checks, snapshots, and legacy atmux task import.
 Planned adapters:
@@ -170,9 +182,16 @@ See the [product requirements](docs/PRD.md),
 ## Development
 
 ```bash
-bun install
-bun run check
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
 ```
+
+The E2E suite invokes `CARGO_BIN_EXE_kanban` as separate operating-system
+processes. It covers persistence and restart, concurrent claims, worktree
+aliases, token-pressure handoffs, story gates, imports, backup/reopen, bounded
+context, TODO projection, and the released SQLite v3 format.
 
 The database migration ladder is append-only. Never edit a released migration;
 add the next rung.
