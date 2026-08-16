@@ -529,6 +529,26 @@ describe("atmux migration", () => {
     ]);
   });
 
+  it("preserves anomalous completion timestamps on non-done legacy tasks", () => {
+    const store = makeStore();
+    importAtmuxTasks(
+      store,
+      [
+        {
+          id: "t-active-completed",
+          subject: "Still active",
+          status: "in-progress",
+          completedAt: 1_700_000_100,
+        },
+      ],
+      "operator",
+    );
+
+    const imported = store.requireTask("t-active-completed");
+    expect(imported.completedAt).toBeNull();
+    expect(imported.metadata.legacyCompletedAt).toBe(1_700_000_100_000);
+  });
+
   it("imports a JSON-only atmux hierarchy with parent links intact", () => {
     const store = makeStore();
     const receipt = importAtmuxJson(
@@ -570,6 +590,32 @@ describe("atmux migration", () => {
     expect(store.requireTask("s-json").parentID).toBe("e-json");
     expect(store.requireTask("t-json").parentID).toBe("s-json");
     expect(store.requireTask("e-json").metadata.isReady).toBe(true);
+  });
+
+  it("reports nonterminal completion timestamps in JSON import receipts", () => {
+    const store = makeStore();
+    const receipt = importAtmuxJson(
+      store,
+      {
+        tasks: [
+          {
+            id: "t-active-completed",
+            subject: "Still active",
+            status: "todo",
+            completedAt: 1_700_000_100,
+          },
+        ],
+      },
+      "operator",
+    );
+
+    expect(receipt.warnings.nonterminalCompletions).toEqual([
+      {
+        taskID: "t-active-completed",
+        status: "todo",
+        completedAt: 1_700_000_100_000,
+      },
+    ]);
   });
 
   it("imports an atmux state.db hierarchy without mutating the source", () => {

@@ -78,6 +78,7 @@ function nullableString(value: unknown): string | undefined {
 interface RelationshipWarnings {
   danglingDependencies: Array<{ taskID: string; dependencyID: string }>;
   missingParents: Array<{ taskID: string; parentID: string }>;
+  nonterminalCompletions: Array<{ taskID: string; status: TaskStatus; completedAt: number }>;
 }
 
 function normalizeRelationships(inputs: ImportTaskInput[]): {
@@ -85,7 +86,11 @@ function normalizeRelationships(inputs: ImportTaskInput[]): {
   warnings: RelationshipWarnings;
 } {
   const known = new Set(inputs.map((input) => input.id));
-  const warnings: RelationshipWarnings = { danglingDependencies: [], missingParents: [] };
+  const warnings: RelationshipWarnings = {
+    danglingDependencies: [],
+    missingParents: [],
+    nonterminalCompletions: [],
+  };
   const normalized = inputs.map((input) => {
     const { parentID: originalParentID, ...rest } = input;
     const dependencies: string[] = [];
@@ -102,6 +107,15 @@ function normalizeRelationships(inputs: ImportTaskInput[]): {
       warnings.missingParents.push({ taskID: input.id, parentID });
       parentID = undefined;
     }
+    const nonterminalCompletion =
+      input.completedAt != null && input.status !== "done" ? input.completedAt : null;
+    if (nonterminalCompletion != null) {
+      warnings.nonterminalCompletions.push({
+        taskID: input.id,
+        status: input.status ?? "todo",
+        completedAt: nonterminalCompletion,
+      });
+    }
     return {
       ...rest,
       ...(parentID ? { parentID } : {}),
@@ -110,6 +124,9 @@ function normalizeRelationships(inputs: ImportTaskInput[]): {
         ...(input.metadata ?? {}),
         ...(dangling.length ? { legacyDanglingDependencies: dangling } : {}),
         ...(originalParentID && !parentID ? { legacyMissingParent: originalParentID } : {}),
+        ...(nonterminalCompletion == null
+          ? {}
+          : { legacyCompletedAt: nonterminalCompletion }),
       },
     };
   });
