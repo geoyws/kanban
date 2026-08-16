@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contextPacket, renderContext, renderTodo } from "../src/context.js";
-import { importAtmuxSqlite, importAtmuxTasks } from "../src/import-atmux.js";
+import { importAtmuxJson, importAtmuxSqlite, importAtmuxTasks } from "../src/import-atmux.js";
 import { Registry } from "../src/registry.js";
 import { KanbanStore } from "../src/store.js";
 
@@ -527,6 +527,49 @@ describe("atmux migration", () => {
     expect(store.requireTask("t-one").metadata.legacyDanglingDependencies).toEqual([
       "t-missing",
     ]);
+  });
+
+  it("imports a JSON-only atmux hierarchy with parent links intact", () => {
+    const store = makeStore();
+    const receipt = importAtmuxJson(
+      store,
+      {
+        epics: [
+          {
+            id: "e-json",
+            title: "JSON epic",
+            status: "in-progress",
+            createdAt: 1_700_000_000,
+            isReady: true,
+          },
+        ],
+        stories: [
+          {
+            id: "s-json",
+            epic: "e-json",
+            title: "JSON story",
+            status: "testing",
+            createdAt: 1_700_000_010,
+          },
+        ],
+        tasks: [
+          {
+            id: "t-json",
+            story: "s-json",
+            epic: "e-json",
+            subject: "JSON task",
+            status: "in-progress",
+            createdAt: 1_700_000_020,
+          },
+        ],
+      },
+      "operator",
+    );
+
+    expect(receipt.counts).toEqual({ epics: 1, stories: 1, tasks: 1 });
+    expect(store.requireTask("s-json").parentID).toBe("e-json");
+    expect(store.requireTask("t-json").parentID).toBe("s-json");
+    expect(store.requireTask("e-json").metadata.isReady).toBe(true);
   });
 
   it("imports an atmux state.db hierarchy without mutating the source", () => {

@@ -5,9 +5,9 @@ import { contextPacket, renderContext, renderTodo } from "./context.js";
 import { dataRoot, Registry } from "./registry.js";
 import { KanbanStore } from "./store.js";
 import {
+  importAtmuxJson,
   importAtmuxSqlite,
-  importAtmuxTasks,
-  type LegacyAtmuxTask,
+  type LegacyAtmuxJson,
 } from "./import-atmux.js";
 import {
   NOTE_KINDS,
@@ -651,14 +651,17 @@ export function run(argv: string[], cwd = process.cwd()): void {
     if (command === "import" && subcommand === "atmux-json") {
       const path = rest[0];
       if (!path) throw new Error("atmux kanban.json path is required");
-      const parsed = JSON.parse(readFileSync(resolve(path), "utf8")) as { tasks?: unknown };
+      const parsed = JSON.parse(readFileSync(resolve(path), "utf8")) as LegacyAtmuxJson;
       if (!Array.isArray(parsed.tasks)) throw new Error("atmux JSON must contain a tasks array");
-      const imported = importAtmuxTasks(
-        store,
-        parsed.tasks as LegacyAtmuxTask[],
-        requireFlag(args, "as"),
+      const receipt = importAtmuxJson(store, parsed, requireFlag(args, "as"));
+      output(
+        {
+          ...receipt,
+          source: resolve(path),
+          imported: receipt.imported.length,
+        },
+        has(args, "json"),
       );
-      output({ source: resolve(path), counts: { tasks: imported.length } }, has(args, "json"));
       return;
     }
 
