@@ -38,12 +38,13 @@ Usage:
              [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--with-relations] [--json]
   kanban task show ID [--json]
-  kanban task move ID STATUS --as ACTOR
+  kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT]
   kanban task update ID --as ACTOR [--title TEXT] [--body TEXT] [--priority N]
              [--parent ID|--clear-parent]
              [--assignee AGENT|--unassign] [--lane LANE|--clear-lane]
              [--deliverable TEXT|--clear-deliverable] [--stale-minutes N]
              [--driver-only|--no-driver-only] [--depends-on ID ...|--clear-dependencies]
+  kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role LANE] [--caller-scope member|driver]
              [--no-cross-lane] [--allow-reassign] [--json]
@@ -384,7 +385,35 @@ export function run(argv: string[], cwd = process.cwd()): void {
       if (!rest[0] || !rest[1]) throw new Error("task id and target status are required");
       const status = rest[1] as TaskStatus;
       if (!TASK_STATUSES.includes(status)) throw new Error(`invalid task status ${status}`);
-      output(store.moveTask(rest[0], status, requireFlag(args, "as")), has(args, "json"));
+      const rawPatch = one(args, "metadata-patch-json");
+      const parsedPatch = rawPatch === undefined ? {} : (JSON.parse(rawPatch) as unknown);
+      if (parsedPatch === null || Array.isArray(parsedPatch) || typeof parsedPatch !== "object") {
+        throw new Error("--metadata-patch-json must be a JSON object");
+      }
+      output(
+        store.moveTask(
+          rest[0],
+          status,
+          requireFlag(args, "as"),
+          parsedPatch as Record<string, unknown>,
+        ),
+        has(args, "json"),
+      );
+      return;
+    }
+
+    if (command === "task" && subcommand === "metadata") {
+      const taskID = rest[0];
+      if (!taskID) throw new Error("task id is required");
+      const raw = requireFlag(args, "patch-json");
+      const patch = JSON.parse(raw) as unknown;
+      if (patch === null || Array.isArray(patch) || typeof patch !== "object") {
+        throw new Error("--patch-json must be a JSON object");
+      }
+      output(
+        store.patchTaskMetadata(taskID, patch as Record<string, unknown>, requireFlag(args, "as")),
+        has(args, "json"),
+      );
       return;
     }
 

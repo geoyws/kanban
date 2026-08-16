@@ -344,8 +344,8 @@ export class KanbanStore {
   }
 
   addTask(input: AddTaskInput): Task {
-    const id = input.id ?? `t-${randomUUID().slice(0, 8)}`;
     const type = input.type ?? "task";
+    const id = input.id ?? `${type === "epic" ? "e" : type === "story" ? "s" : "t"}-${randomUUID().slice(0, 8)}`;
     const status = input.status ?? "todo";
     assertOneOf(type, TASK_TYPES, "task type");
     assertOneOf(status, TASK_STATUSES, "task status");
@@ -483,6 +483,23 @@ export class KanbanStore {
     return this.requireTask(taskID);
   }
 
+  patchTaskMetadata(taskID: string, patch: Record<string, unknown>, actor: string): Task {
+    const who = nonempty(actor, "actor");
+    this.db.transaction(() => {
+      const current = this.requireTask(taskID);
+      const metadata = { ...current.metadata };
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === null) delete metadata[key];
+        else metadata[key] = value;
+      }
+      this.db
+        .query("UPDATE tasks SET metadata=?,updated_at=? WHERE id=?")
+        .run(JSON.stringify(metadata), this.now(), taskID);
+      this.event(taskID, "task_metadata_patched", who, { keys: Object.keys(patch) });
+    }).immediate();
+    return this.requireTask(taskID);
+  }
+
   importTasks(inputs: ImportTaskInput[], actor: string): Task[] {
     const who = nonempty(actor, "actor");
     const ids = new Set<string>();
@@ -580,19 +597,29 @@ export class KanbanStore {
     return rows.map(taskFromRow);
   }
 
-  moveTask(taskID: string, status: TaskStatus, actor: string): Task {
+  moveTask(
+    taskID: string,
+    status: TaskStatus,
+    actor: string,
+    metadataPatch: Record<string, unknown> = {},
+  ): Task {
     assertOneOf(status, TASK_STATUSES, "task status");
     const who = nonempty(actor, "actor");
     this.db.transaction(() => {
-      this.requireTask(taskID);
+      const current = this.requireTask(taskID);
       const now = this.now();
+      const metadata = { ...current.metadata };
+      for (const [key, value] of Object.entries(metadataPatch)) {
+        if (value === null) delete metadata[key];
+        else metadata[key] = value;
+      }
       this.db
-        .query("UPDATE tasks SET status=?,updated_at=?,completed_at=? WHERE id=?")
-        .run(status, now, status === "done" ? now : null, taskID);
+        .query("UPDATE tasks SET status=?,metadata=?,updated_at=?,completed_at=? WHERE id=?")
+        .run(status, JSON.stringify(metadata), now, status === "done" ? now : null, taskID);
       if (status !== "in_progress") {
         this.db.query("DELETE FROM task_claims WHERE task_id=?").run(taskID);
       }
-      this.event(taskID, "task_moved", who, { status });
+      this.event(taskID, "task_moved", who, { status, metadataKeys: Object.keys(metadataPatch) });
     }).immediate();
     return this.requireTask(taskID);
   }

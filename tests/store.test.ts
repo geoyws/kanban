@@ -43,6 +43,24 @@ describe("task graph and atomic claims", () => {
     );
   });
 
+  it("patches metadata atomically and treats null as deletion", () => {
+    const store = makeStore();
+    store.addTask({ id: "e-one", type: "epic", title: "One", metadata: { keep: true, drop: 1 } });
+
+    expect(
+      store.patchTaskMetadata("e-one", { workflowStatus: "ready", drop: null }, "operator").metadata,
+    ).toEqual({ keep: true, workflowStatus: "ready" });
+  });
+
+  it("moves status and workflow metadata in one transaction", () => {
+    const store = makeStore();
+    store.addTask({ id: "e-one", type: "epic", title: "One" });
+
+    const moved = store.moveTask("e-one", "review", "operator", { workflowStatus: "review" });
+    expect(moved.status).toBe("review");
+    expect(moved.metadata.workflowStatus).toBe("review");
+  });
+
   it("updates atmux-compatible routing fields and dependencies atomically", () => {
     const store = makeStore();
     store.addTask({ id: "t-base", title: "Base" });

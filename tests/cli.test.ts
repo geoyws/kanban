@@ -55,9 +55,31 @@ describe("CLI vertical slice", () => {
         .stdout,
     ).toContain('"id": "t-demo"');
     expect(
-      (await cli(workspace, data, ["task", "move", "e-parent", "done", "--as", "operator"]))
+      (
+        await cli(workspace, data, [
+          "task",
+          "move",
+          "e-parent",
+          "done",
+          "--as",
+          "operator",
+          "--metadata-patch-json",
+          JSON.stringify({ workflowStatus: "done" }),
+        ])
+      )
         .exitCode,
     ).toBe(0);
+    const metadata = await cli(workspace, data, [
+      "task",
+      "metadata",
+      "e-parent",
+      "--as",
+      "operator",
+      "--patch-json",
+      JSON.stringify({ workflowStatus: "review" }),
+      "--json",
+    ]);
+    expect(JSON.parse(metadata.stdout).metadata.workflowStatus).toBe("review");
 
     const claimed = await cli(workspace, data, ["claim", "t-demo", "--as", "deepseek", "--json"]);
     expect(claimed.exitCode).toBe(0);
