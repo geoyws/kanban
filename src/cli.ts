@@ -4,7 +4,11 @@ import { basename, join, resolve } from "node:path";
 import { contextPacket, renderContext, renderTodo } from "./context.js";
 import { dataRoot, Registry } from "./registry.js";
 import { KanbanStore } from "./store.js";
-import { importAtmuxTasks, type LegacyAtmuxTask } from "./import-atmux.js";
+import {
+  importAtmuxSqlite,
+  importAtmuxTasks,
+  type LegacyAtmuxTask,
+} from "./import-atmux.js";
 import {
   NOTE_KINDS,
   HANDOFF_REASONS,
@@ -57,6 +61,7 @@ Usage:
   kanban handoff accept HANDOFF_ID --as AGENT [--session ID] [--lease-minutes N]
              [--caller-scope member|driver] [--json]
   kanban import atmux-json PATH --as ACTOR [--json]
+  kanban import atmux-sqlite PATH --as ACTOR [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
 
@@ -551,8 +556,26 @@ export function run(argv: string[], cwd = process.cwd()): void {
       if (!path) throw new Error("atmux kanban.json path is required");
       const parsed = JSON.parse(readFileSync(resolve(path), "utf8")) as { tasks?: unknown };
       if (!Array.isArray(parsed.tasks)) throw new Error("atmux JSON must contain a tasks array");
+      const imported = importAtmuxTasks(
+        store,
+        parsed.tasks as LegacyAtmuxTask[],
+        requireFlag(args, "as"),
+      );
+      output({ source: resolve(path), counts: { tasks: imported.length } }, has(args, "json"));
+      return;
+    }
+
+    if (command === "import" && subcommand === "atmux-sqlite") {
+      const path = rest[0];
+      if (!path) throw new Error("atmux state.db path is required");
+      const receipt = importAtmuxSqlite(store, resolve(path), requireFlag(args, "as"));
       output(
-        importAtmuxTasks(store, parsed.tasks as LegacyAtmuxTask[], requireFlag(args, "as")),
+        {
+          source: receipt.source,
+          counts: receipt.counts,
+          warnings: receipt.warnings,
+          imported: receipt.imported.length,
+        },
         has(args, "json"),
       );
       return;

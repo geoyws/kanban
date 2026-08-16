@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contextPacket, renderContext, renderTodo } from "../src/context.js";
-import { importAtmuxTasks } from "../src/import-atmux.js";
+import { importAtmuxSqlite, importAtmuxTasks } from "../src/import-atmux.js";
 import { Registry } from "../src/registry.js";
 import { KanbanStore } from "../src/store.js";
 
@@ -440,15 +441,67 @@ describe("atmux migration", () => {
     ).toBe("preserved");
   });
 
-  it("rolls back the whole import when a dependency is missing", () => {
+  it("preserves a missing legacy dependency without creating a corrupt edge", () => {
     const store = makeStore();
-    expect(() =>
-      importAtmuxTasks(
-        store,
-        [{ id: "t-one", subject: "Broken", deps: ["t-missing"] }],
-        "operator",
-      ),
-    ).toThrow(/t-missing not found/);
-    expect(store.getTask("t-one")).toBeNull();
+    importAtmuxTasks(
+      store,
+      [{ id: "t-one", subject: "Historical", deps: ["t-missing"] }],
+      "operator",
+    );
+    expect(store.dependencies("t-one")).toEqual([]);
+    expect(store.requireTask("t-one").metadata.legacyDanglingDependencies).toEqual([
+      "t-missing",
+    ]);
+  });
+
+  it("imports an atmux state.db hierarchy without mutating the source", () => {
+    const root = tempDir();
+    const sourcePath = join(root, "state.db");
+    const source = new Database(sourcePath, { create: true, strict: true });
+    source.exec(`
+      CREATE TABLE epics (
+        id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, driver_ref TEXT,
+        created_at INTEGER, completed_at INTEGER, stories TEXT, depends_on TEXT,
+        is_ready INTEGER, spawned_at INTEGER, extra TEXT
+      );
+      CREATE TABLE stories (
+        id TEXT PRIMARY KEY, epic TEXT, title TEXT, body TEXT, acceptance_criteria TEXT,
+        status TEXT, created_at INTEGER, completed_at INTEGER, advanced_at INTEGER,
+        review_signoff INTEGER, merge_task_id TEXT, merge_mode TEXT, extra TEXT
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, subject TEXT, body TEXT, status TEXT, owner TEXT, deps TEXT,
+        priority INTEGER, epic TEXT, story TEXT, lane TEXT, deliverable TEXT,
+        stale_min INTEGER, driver_only INTEGER, created_at INTEGER, claimed_at INTEGER,
+        completed_at INTEGER, claimed_from TEXT, created_from TEXT, note TEXT, extra TEXT
+      );
+      INSERT INTO epics VALUES (
+        'e-1','Migration epic','Body','in-progress','main',1700000000,NULL,
+        '["s-1"]','[]',1,NULL,'{"autoSpawn":{"enabled":false}}'
+      );
+      INSERT INTO stories VALUES (
+        's-1','e-1','Adapter story','Story body','Must preserve IDs','testing',
+        1700000010,NULL,1700000020,0,NULL,'feature-branch','{}'
+      );
+      INSERT INTO tasks VALUES (
+        't-1','Port adapter','Task body','done','driver','[]',1,'e-1','s-1','be',
+        'src/adapter.ts',30,1,1700000030,1700000040,1700000050,NULL,NULL,
+        'Verified','{"custom":"kept"}'
+      );
+    `);
+    source.close();
+    const before = statSync(sourcePath).size;
+    const store = makeStore();
+
+    const receipt = importAtmuxSqlite(store, sourcePath, "operator", 1_800_000_000_000);
+
+    expect(receipt.counts).toEqual({ epics: 1, stories: 1, tasks: 1 });
+    expect(store.requireTask("e-1").type).toBe("epic");
+    expect(store.requireTask("s-1").parentID).toBe("e-1");
+    expect(store.requireTask("s-1").metadata.workflowStatus).toBe("testing");
+    expect(store.requireTask("t-1").parentID).toBe("s-1");
+    expect(store.requireTask("t-1").driverOnly).toBe(true);
+    expect(store.notes("t-1")[0]?.body).toBe("Verified");
+    expect(statSync(sourcePath).size).toBe(before);
   });
 });

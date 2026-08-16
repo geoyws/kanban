@@ -10,6 +10,6 @@ export type {
 } from "./store.js";
 export { Registry, dataRoot } from "./registry.js";
 export { contextPacket, renderContext, renderTodo } from "./context.js";
-export { importAtmuxTasks } from "./import-atmux.js";
-export type { LegacyAtmuxTask } from "./import-atmux.js";
+export { importAtmuxSqlite, importAtmuxTasks } from "./import-atmux.js";
+export type { AtmuxSqliteImportReceipt, LegacyAtmuxTask } from "./import-atmux.js";
 export * from "./types.js";

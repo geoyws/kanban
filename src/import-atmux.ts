@@ -1,5 +1,7 @@
+import { Database } from "bun:sqlite";
 import type { KanbanStore } from "./store.js";
-import type { Task, TaskStatus } from "./types.js";
+import type { ImportTaskInput } from "./store.js";
+import type { Task, TaskStatus, TaskType } from "./types.js";
 
 export interface LegacyAtmuxTask {
   id: string;
@@ -34,9 +36,84 @@ const ATMUX_STATUS: Record<string, TaskStatus> = {
   wontfix: "cancelled",
 };
 
+const WORKFLOW_STATUS: Record<string, TaskStatus> = {
+  planning: "backlog",
+  ready: "todo",
+  "in-progress": "in_progress",
+  testing: "review",
+  review: "review",
+  merging: "review",
+  done: "done",
+};
+
 function epochMs(value: number | null | undefined, fallback: number): number {
   if (value === null || value === undefined) return fallback;
   return value < 100_000_000_000 ? value * 1_000 : value;
+}
+
+function json(value: unknown, fallback: unknown): unknown {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function status(value: unknown, workflow = false): TaskStatus {
+  const raw = typeof value === "string" ? value : workflow ? "planning" : "todo";
+  const mapped = (workflow ? WORKFLOW_STATUS : ATMUX_STATUS)[raw];
+  if (!mapped) throw new Error(`unsupported atmux status ${JSON.stringify(value)}`);
+  return mapped;
+}
+
+function integer(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) ? value : fallback;
+}
+
+function nullableString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+interface RelationshipWarnings {
+  danglingDependencies: Array<{ taskID: string; dependencyID: string }>;
+  missingParents: Array<{ taskID: string; parentID: string }>;
+}
+
+function normalizeRelationships(inputs: ImportTaskInput[]): {
+  inputs: ImportTaskInput[];
+  warnings: RelationshipWarnings;
+} {
+  const known = new Set(inputs.map((input) => input.id));
+  const warnings: RelationshipWarnings = { danglingDependencies: [], missingParents: [] };
+  const normalized = inputs.map((input) => {
+    const { parentID: originalParentID, ...rest } = input;
+    const dependencies: string[] = [];
+    const dangling: string[] = [];
+    for (const dependency of input.dependencies ?? []) {
+      if (known.has(dependency)) dependencies.push(dependency);
+      else {
+        dangling.push(dependency);
+        warnings.danglingDependencies.push({ taskID: input.id, dependencyID: dependency });
+      }
+    }
+    let parentID = originalParentID;
+    if (parentID && !known.has(parentID)) {
+      warnings.missingParents.push({ taskID: input.id, parentID });
+      parentID = undefined;
+    }
+    return {
+      ...rest,
+      ...(parentID ? { parentID } : {}),
+      dependencies,
+      metadata: {
+        ...(input.metadata ?? {}),
+        ...(dangling.length ? { legacyDanglingDependencies: dangling } : {}),
+        ...(originalParentID && !parentID ? { legacyMissingParent: originalParentID } : {}),
+      },
+    };
+  });
+  return { inputs: normalized, warnings };
 }
 
 export function importAtmuxTasks(
@@ -102,5 +179,157 @@ export function importAtmuxTasks(
         : {}),
     };
   });
-  return store.importTasks(inputs, actor);
+  return store.importTasks(normalizeRelationships(inputs).inputs, actor);
+}
+
+export interface AtmuxSqliteImportReceipt {
+  source: string;
+  counts: { epics: number; stories: number; tasks: number };
+  warnings: RelationshipWarnings;
+  imported: Task[];
+}
+
+export function importAtmuxSqlite(
+  store: KanbanStore,
+  path: string,
+  actor: string,
+  importedAt = Date.now(),
+): AtmuxSqliteImportReceipt {
+  const source = new Database(path, { readonly: true, strict: true });
+  try {
+    const tables = new Set(
+      (
+        source
+          .query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tasks','stories','epics')")
+          .all() as Array<{ name: string }>
+      ).map((row) => row.name),
+    );
+    if (!tables.has("tasks")) throw new Error("atmux state.db has no tasks table");
+    const taskRows = source.query("SELECT * FROM tasks ORDER BY created_at,id").all() as Array<
+      Record<string, unknown>
+    >;
+    const storyRows = tables.has("stories")
+      ? (source.query("SELECT * FROM stories ORDER BY created_at,id").all() as Array<
+          Record<string, unknown>
+        >)
+      : [];
+    const epicRows = tables.has("epics")
+      ? (source.query("SELECT * FROM epics ORDER BY created_at,id").all() as Array<
+          Record<string, unknown>
+        >)
+      : [];
+    const inputs: ImportTaskInput[] = [];
+
+    for (const row of epicRows) {
+      const createdAt = epochMs(row.created_at as number | null, importedAt);
+      const completedAt =
+        row.completed_at == null ? null : epochMs(row.completed_at as number, createdAt);
+      inputs.push({
+        id: String(row.id),
+        type: "epic",
+        title: nullableString(row.title) ?? String(row.id),
+        ...(nullableString(row.body) ? { body: String(row.body) } : {}),
+        status: status(row.status, true),
+        priority: 1,
+        dependencies: (json(row.depends_on, []) as string[]) ?? [],
+        createdAt,
+        updatedAt: completedAt ?? createdAt,
+        completedAt,
+        metadata: {
+          importedFrom: "atmux/state.db",
+          workflowStatus: typeof row.status === "string" ? row.status : "planning",
+          driverRef: row.driver_ref ?? null,
+          isReady: row.is_ready === 1,
+          spawnedAt: row.spawned_at ?? null,
+          legacyStories: json(row.stories, []),
+          atmuxExtra: json(row.extra, {}),
+        },
+      });
+    }
+
+    for (const row of storyRows) {
+      const createdAt = epochMs(row.created_at as number | null, importedAt);
+      const completedAt =
+        row.completed_at == null ? null : epochMs(row.completed_at as number, createdAt);
+      inputs.push({
+        id: String(row.id),
+        type: "story",
+        ...(nullableString(row.epic) ? { parentID: String(row.epic) } : {}),
+        title: nullableString(row.title) ?? String(row.id),
+        ...(nullableString(row.body) ? { body: String(row.body) } : {}),
+        status: status(row.status, true),
+        priority: 2,
+        createdAt,
+        updatedAt: completedAt ?? epochMs(row.advanced_at as number | null, createdAt),
+        completedAt,
+        metadata: {
+          importedFrom: "atmux/state.db",
+          workflowStatus: typeof row.status === "string" ? row.status : "planning",
+          acceptanceCriteria: row.acceptance_criteria ?? null,
+          reviewSignoff: row.review_signoff === 1,
+          mergeTaskID: row.merge_task_id ?? null,
+          mergeMode: row.merge_mode ?? "feature-branch",
+          advancedAt: row.advanced_at ?? null,
+          atmuxExtra: json(row.extra, {}),
+        },
+      });
+    }
+
+    for (const row of taskRows) {
+      const createdAt = epochMs(row.created_at as number | null, importedAt);
+      const claimedAt = epochMs(row.claimed_at as number | null, createdAt);
+      const completedAt =
+        row.completed_at == null ? null : epochMs(row.completed_at as number, claimedAt);
+      const parentID = nullableString(row.story) ?? nullableString(row.epic);
+      const note = nullableString(row.note);
+      inputs.push({
+        id: String(row.id),
+        type: "task" as TaskType,
+        ...(parentID ? { parentID } : {}),
+        title: nullableString(row.subject) ?? String(row.id),
+        ...(nullableString(row.body) ? { body: String(row.body) } : {}),
+        status: status(row.status),
+        ...(nullableString(row.owner) ? { assignee: String(row.owner) } : {}),
+        dependencies: (json(row.deps, []) as string[]) ?? [],
+        priority: integer(row.priority, 3),
+        ...(nullableString(row.lane) ? { lane: String(row.lane) } : {}),
+        ...(nullableString(row.deliverable) ? { deliverable: String(row.deliverable) } : {}),
+        ...(row.stale_min == null ? {} : { staleMinutes: integer(row.stale_min, 0) }),
+        driverOnly: row.driver_only === 1,
+        createdAt,
+        updatedAt: completedAt ?? claimedAt,
+        completedAt,
+        metadata: {
+          importedFrom: "atmux/state.db",
+          claimedFrom: json(row.claimed_from, row.claimed_from ?? null),
+          createdFrom: json(row.created_from, row.created_from ?? null),
+          legacyEpic: row.epic ?? null,
+          legacyStory: row.story ?? null,
+          atmuxExtra: json(row.extra, {}),
+        },
+        ...(note
+          ? {
+              notes: [
+                {
+                  author: "atmux/import",
+                  kind: "progress" as const,
+                  body: note,
+                  createdAt: completedAt ?? claimedAt,
+                },
+              ],
+            }
+          : {}),
+      });
+    }
+
+    const normalized = normalizeRelationships(inputs);
+    return {
+      source: path,
+      counts: { epics: epicRows.length, stories: storyRows.length, tasks: taskRows.length },
+      warnings: normalized.warnings,
+      imported: store.importTasks(normalized.inputs, actor),
+    };
+  } finally {
+    source.close();
+  }
 }

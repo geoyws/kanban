@@ -134,6 +134,18 @@ kanban doctor
 kanban backup --json
 ```
 
+Import an existing atmux board into the currently registered project without
+writing to the source database:
+
+```bash
+kanban import atmux-sqlite /path/to/.atmux/state.db --as operator --json
+```
+
+Epics, stories, tasks, hierarchy, stable IDs, timestamps, routing fields,
+notes, and unknown extension JSON are preserved. Dangling historical
+relationships are retained as warning metadata rather than inserted as invalid
+foreign-key edges.
+
 ## Current scope
 
 Version 0.2 is the installed private multi-project CLI and continuity slice.
