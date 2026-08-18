@@ -51,6 +51,17 @@ Usage:
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
 
+Global options (accepted by every board command):
+  --project NAME     address a registered project by name, from any directory
+  --workspace PATH   use the project containing PATH instead of the cwd
+  --db PATH          operate on a board file directly
+
+Environment:
+  KANBAN_PROJECT     default for --project
+  KANBAN_DB          default for --db
+  KANBAN_DATA_DIR    private data root (else $XDG_DATA_HOME/kanban, else
+                     ~/.local/share/kanban)
+
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
 const BOOLEAN: [&str; 15] = [
@@ -142,6 +153,52 @@ fn cwd() -> Result<PathBuf> {
     env::current_dir().context("read current directory")
 }
 
+/// Comma-listed project names, for error messages. Empty when the registry is
+/// empty, so a first-run error is not padded with a pointless "known projects:".
+fn known_projects(registry: &Registry) -> Result<String> {
+    let names = registry
+        .projects()?
+        .into_iter()
+        .map(|project| project.name)
+        .collect::<Vec<_>>();
+    Ok(if names.is_empty() {
+        String::new()
+    } else {
+        format!("\nknown projects: {}", names.join(", "))
+    })
+}
+
+/// Resolve a project by registry name. Names are NOT unique — two projects may
+/// share one — so an ambiguous name is an error naming the candidates, never a
+/// silent pick: writing to the wrong board is unrecoverable work-state damage.
+fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
+    let matches = registry.by_name(name)?;
+    match matches.as_slice() {
+        [project] => {
+            registry.touch_board(&project.board_path)?;
+            Ok(PathBuf::from(&project.board_path))
+        }
+        [] => bail!("no Kanban project named {name}{}", known_projects(registry)?),
+        many => bail!(
+            "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
+            many.len(),
+            many.iter()
+                .map(|project| project.canonical_root.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Board selection, most explicit first:
+///   1. `--db` / `KANBAN_DB`        — a board file directly
+///   2. `--project` / `KANBAN_PROJECT` — a registered project by name, from anywhere
+///   3. `--workspace PATH`          — the project containing PATH
+///   4. the current directory       — the project containing it
+///
+/// (2) and (3) are what make the CLI usable outside a registered tree: an agent
+/// in an unrelated cage, a cron line, or any shell in $HOME can address a board
+/// without cd-ing into it.
 fn store_path(args: &Args) -> Result<PathBuf> {
     if let Some(path) = args
         .one("db")
@@ -151,10 +208,23 @@ fn store_path(args: &Args) -> Result<PathBuf> {
         return Ok(path);
     }
     let mut registry = Registry::open()?;
-    registry
-        .resolve(&cwd()?)?
-        .map(|record| PathBuf::from(record.board_path))
-        .context("no Kanban workspace contains the current directory; run 'kanban init' first")
+    let named = args.one("project").map(str::to_owned).or_else(|| {
+        env::var("KANBAN_PROJECT")
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
+    if let Some(name) = named {
+        return board_by_name(&registry, &name);
+    }
+    let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
+    if let Some(record) = registry.resolve(&workspace)? {
+        return Ok(PathBuf::from(record.board_path));
+    }
+    bail!(
+        "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT, or run 'kanban init' there{}",
+        workspace.display(),
+        known_projects(&registry)?
+    )
 }
 
 fn open_store(args: &Args) -> Result<Store> {

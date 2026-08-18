@@ -212,6 +212,31 @@ impl Registry {
         Ok(projects)
     }
 
+    /// Projects carrying `name`. Names are not unique in the registry, so
+    /// callers must handle 0 and >1 rather than assume a single hit.
+    pub fn by_name(&self, name: &str) -> Result<Vec<ProjectRecord>> {
+        Ok(self
+            .projects()?
+            .into_iter()
+            .filter(|project| project.name == name)
+            .collect())
+    }
+
+    /// Mark a board used. Path-based resolution updates `last_used_at` as a
+    /// side effect of walking the registry; name-based resolution has no walk,
+    /// so without this the dashboard's recency ordering would freeze for any
+    /// project addressed only by name.
+    pub fn touch_board(&self, board_path: &str) -> Result<()> {
+        let now = now_ms();
+        for table in ["workspaces", "workspace_aliases"] {
+            self.connection.execute(
+                &format!("UPDATE {table} SET last_used_at=? WHERE board_path=?"),
+                params![now, board_path],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn integrity(&self) -> Result<Vec<String>> {
         integrity(&self.connection)
     }

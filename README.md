@@ -110,6 +110,28 @@ No state is written into the managed repository. Override discovery with
 `KANBAN_DATA_DIR`, `KANBAN_DB`, or `--db PATH`. This permits atmux to retain
 per-team databases while orch and other harnesses share the same API.
 
+## Working from anywhere
+
+Boards are addressable from any directory, not only from inside the project
+tree. Board selection runs most explicit first ([ADR-007](docs/adr/ADR-007-global-project-addressing.md)):
+
+| Selector | Meaning |
+| --- | --- |
+| `--db PATH` / `KANBAN_DB` | a board file directly |
+| `--project NAME` / `KANBAN_PROJECT` | a registered project by name, from anywhere |
+| `--workspace PATH` | the project containing `PATH` |
+| _(none)_ | the project containing the working directory |
+
+```bash
+kanban task list --project my-project          # from any directory
+export KANBAN_PROJECT=my-project               # or once per shell or agent cage
+kanban task add "ships from anywhere"
+kanban workspace list                          # the registered names to choose from
+```
+
+Project names are not unique. If two projects share one, `--project` refuses and
+names the candidate roots; use `--workspace PATH` to pick one.
+
 Initialize a project once, then attach additional Git worktrees to the same
 board:
 

@@ -904,3 +904,119 @@ fn compiled_binary_imports_both_atmux_formats_backs_up_and_opens_v3_databases() 
             .contains("Existing TypeScript board")
     );
 }
+
+/// Global addressing: a board must be reachable from a directory that belongs
+/// to no registered project at all, and reachable BY NAME rather than by
+/// knowing where its board file lives.
+///
+/// Honest-test note: every leg asserts the board it actually landed on, not
+/// merely that the command exited 0. A `--project` that silently fell back to
+/// the cwd-resolved board would still exit 0 — so the reads assert which task
+/// came back, the write asserts the task appears on the target board AND is
+/// absent from the other, and the ambiguous-name leg asserts a refusal rather
+/// than a lucky pick.
+#[test]
+fn compiled_binary_addresses_projects_globally_without_cwd() {
+    let fixture = Fixture::new("global");
+    let beta = fixture.root.join("beta");
+    let alpha_twin = fixture.root.join("alpha-twin");
+    fs::create_dir_all(&beta).unwrap();
+    fs::create_dir_all(&alpha_twin).unwrap();
+
+    let alpha = fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let alpha_board = alpha["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(&beta, &["init", "--name", "Beta", "--json"]);
+    fixture.ok_json(&fixture.main, &["task", "add", "alpha work", "--id", "t-alpha", "--json"]);
+    fixture.ok_json(&beta, &["task", "add", "beta work", "--id", "t-beta", "--json"]);
+
+    let ids = |value: &Value| -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // `fixture.root` is inside no registered project: it is the parent of the
+    // registered roots, and resolution walks UP, never down.
+    let outside = fixture.root.clone();
+
+    // (1) With nothing to go on, the CLI must refuse — and the refusal must
+    // teach the global route, or the operator's only recourse is to cd.
+    let bare = fixture.run(&outside, &["task", "list", "--json"]);
+    assert!(!bare.status.success(), "bare command outside a project must fail");
+    let message = String::from_utf8_lossy(&bare.stderr).into_owned();
+    assert!(message.contains("--project"), "refusal must name --project: {message}");
+    assert!(message.contains("KANBAN_PROJECT"), "refusal must name the env var: {message}");
+    assert!(message.contains("Alpha") && message.contains("Beta"), "refusal must list known projects: {message}");
+
+    // (2) --project reaches a board from a directory owning no project.
+    assert_eq!(
+        ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Alpha", "--json"])),
+        vec!["t-alpha".to_owned()]
+    );
+
+    // (3) KANBAN_PROJECT does the same, so a cage can export it once.
+    let env_output = fixture
+        .command(&outside)
+        .env("KANBAN_PROJECT", "Beta")
+        .args(["task", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(env_output.status.success(), "{}", String::from_utf8_lossy(&env_output.stderr));
+    assert_eq!(
+        ids(&serde_json::from_slice::<Value>(&env_output.stdout).unwrap()),
+        vec!["t-beta".to_owned()]
+    );
+
+    // (4) --workspace resolves the project containing a path other than cwd.
+    assert_eq!(
+        ids(&fixture.ok_json(&outside, &["task", "list", "--workspace", fixture.main.to_str().unwrap(), "--json"])),
+        vec!["t-alpha".to_owned()]
+    );
+
+    // (5) Precedence — an explicit --project beats the cwd it is standing in,
+    // and an explicit --db beats --project.
+    assert_eq!(
+        ids(&fixture.ok_json(&fixture.main, &["task", "list", "--project", "Beta", "--json"])),
+        vec!["t-beta".to_owned()]
+    );
+    assert_eq!(
+        ids(&fixture.ok_json(&fixture.main, &["task", "list", "--project", "Beta", "--db", &alpha_board, "--json"])),
+        vec!["t-alpha".to_owned()]
+    );
+
+    // (6) Writes land on the named board, and nowhere else.
+    fixture.ok_json(&outside, &["task", "add", "written from outside", "--id", "t-remote", "--project", "Beta", "--json"]);
+    let beta_ids = ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Beta", "--json"]));
+    assert!(beta_ids.contains(&"t-remote".to_owned()), "write did not land on Beta: {beta_ids:?}");
+    let alpha_ids = ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Alpha", "--json"]));
+    assert!(!alpha_ids.contains(&"t-remote".to_owned()), "write leaked onto Alpha: {alpha_ids:?}");
+
+    // (7) An unknown name fails with the roster rather than an empty board.
+    let unknown = fixture.run(&outside, &["task", "list", "--project", "Gamma", "--json"]);
+    assert!(!unknown.status.success());
+    let unknown_message = String::from_utf8_lossy(&unknown.stderr).into_owned();
+    assert!(unknown_message.contains("no Kanban project named Gamma"), "{unknown_message}");
+    assert!(unknown_message.contains("Alpha"), "{unknown_message}");
+
+    // (8) Registry names are not unique. A duplicate must refuse and name the
+    // candidate roots — picking one would corrupt the loser's work state.
+    fixture.ok_json(&alpha_twin, &["init", "--name", "Alpha", "--json"]);
+    let ambiguous = fixture.run(&outside, &["task", "list", "--project", "Alpha", "--json"]);
+    assert!(!ambiguous.status.success(), "duplicate project name must not resolve silently");
+    let ambiguous_message = String::from_utf8_lossy(&ambiguous.stderr).into_owned();
+    assert!(ambiguous_message.contains("2 Kanban projects are named Alpha"), "{ambiguous_message}");
+    assert!(
+        ambiguous_message.contains(fixture.main.canonicalize().unwrap().to_str().unwrap())
+            && ambiguous_message.contains(alpha_twin.canonicalize().unwrap().to_str().unwrap()),
+        "{ambiguous_message}"
+    );
+
+    // (9) --workspace still disambiguates what the name cannot.
+    assert_eq!(
+        ids(&fixture.ok_json(&outside, &["task", "list", "--workspace", fixture.main.to_str().unwrap(), "--json"])),
+        vec!["t-alpha".to_owned()]
+    );
+}
