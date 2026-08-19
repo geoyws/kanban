@@ -1164,6 +1164,25 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "a mistyped --status must not list everything"
     );
 
+    // Sibling commands do not lend each other flags: --reason belongs to
+    // `handoff create`, not `checkpoint`, and must not be quietly swallowed.
+    let borrowed = fixture.run(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-real",
+            "--lease",
+            "x",
+            "--as",
+            "a",
+            "--reason",
+            "manual",
+            "--json",
+        ],
+    );
+    assert!(!borrowed.status.success());
+    assert!(String::from_utf8_lossy(&borrowed.stderr).contains("unknown flag --reason"));
+
     // Valid flags, including the globals, keep working.
     fixture.ok_json(
         &fixture.main,
