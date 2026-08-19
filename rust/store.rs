@@ -1377,6 +1377,45 @@ impl Store {
         )
     }
 
+    /// Tasks that have overrun their own `stale_minutes` budget.
+    ///
+    /// Idleness is measured from the claim heartbeat when one exists, and from
+    /// `updated_at` otherwise, so a task dispatched into `in_progress` without
+    /// a claim is still covered.
+    pub fn stale_tasks(&self) -> Result<Vec<StaleTask>> {
+        let now = now_ms();
+        let mut statement = self.connection.prepare(
+            "SELECT t.*, c.heartbeat_at AS claim_heartbeat FROM tasks t
+             LEFT JOIN task_claims c ON c.task_id=t.id
+             WHERE t.status='in_progress' AND t.stale_minutes IS NOT NULL
+             ORDER BY t.priority,t.created_at,t.id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let heartbeat: Option<i64> = row.get("claim_heartbeat")?;
+                Ok((task_row(row)?, heartbeat))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = Vec::new();
+        for (task, heartbeat) in rows {
+            let budget = task.stale_minutes.unwrap_or_default();
+            let (since, last_signal) = match heartbeat {
+                Some(at) => (at, "heartbeat"),
+                None => (task.updated_at, "updated"),
+            };
+            let idle_minutes = (now - since).max(0) / 60_000;
+            if idle_minutes > budget {
+                out.push(StaleTask {
+                    task,
+                    idle_minutes,
+                    overdue_minutes: idle_minutes - budget,
+                    last_signal: last_signal.to_owned(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn context_packet(&self, id: &str) -> Result<ContextPacket> {
         const NOTES: usize = 100;
         const CHECKPOINTS: usize = 20;

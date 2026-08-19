@@ -160,6 +160,22 @@ pub struct Event {
     pub created_at: i64,
 }
 
+/// A task that has been in progress longer than its own `stale_minutes`
+/// budget allows. The column was accepted, stored and imported from atmux, but
+/// nothing read it, so a task could be configured stale-aware and never
+/// reported.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleTask {
+    #[serde(flatten)]
+    pub task: Task,
+    /// Minutes since the last heartbeat, or since the last update when the
+    /// task carries no claim.
+    pub idle_minutes: i64,
+    pub overdue_minutes: i64,
+    pub last_signal: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {

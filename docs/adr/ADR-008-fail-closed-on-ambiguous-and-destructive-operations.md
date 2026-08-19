@@ -69,6 +69,11 @@ is *suggested*, which costs nothing because the command still fails.
 derived by over-fetching one row past each cap. A constant that happens to be
 right most of the time is a lie the rest of the time.
 
+**Destroying state Kanban did not create is out of scope.** `--keep` prunes
+only the stamped snapshots under the managed backups root; a snapshot directory
+reached through `--output` belongs to the operator and is left alone. Deleting
+from a path someone else chose is the same overreach as re-permissioning one.
+
 **Kanban re-permissions only the tree it owns.** Directories it creates are
 0700 from creation; the private data root is asserted to 0700 because Kanban
 owns it outright. A directory the operator pointed at with `--db` is never

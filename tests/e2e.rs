@@ -1734,3 +1734,193 @@ fn compiled_binary_exposes_the_audit_trail_it_writes() {
             .success()
     );
 }
+
+#[test]
+fn compiled_binary_reports_tasks_that_overran_their_stale_budget() {
+    let fixture = Fixture::new("stale");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Stale", "--json"]);
+    // `stale_minutes` was accepted, stored and imported from atmux, and then
+    // read by nothing: a task could be configured stale-aware and never
+    // reported. Only tasks that carry a budget are in scope.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "budgeted",
+            "--id",
+            "t-slow",
+            "--stale-minutes",
+            "1",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "no budget", "--id", "t-free", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-slow", "--as", "worker", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-free", "--as", "worker", "--json"],
+    );
+
+    // A live heartbeat is not stale, whatever the budget says.
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["stale", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a task heartbeating now is not stale"
+    );
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE task_claims SET heartbeat_at=heartbeat_at-600000",
+            [],
+        )
+        .unwrap();
+
+    let stale = fixture.ok_json(&fixture.main, &["stale", "--json"]);
+    let rows = stale.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the budgeted task is stale: {stale}");
+    assert_eq!(rows[0]["id"], "t-slow");
+    assert_eq!(rows[0]["idleMinutes"], 10);
+    assert_eq!(rows[0]["overdueMinutes"], 9);
+    assert_eq!(rows[0]["lastSignal"], "heartbeat");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["dashboard", "--json"])[0]["staleTasks"],
+        1
+    );
+}
+
+#[test]
+fn compiled_binary_restores_a_snapshot_over_destroyed_work_state() {
+    let fixture = Fixture::new("restore");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Recover", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "real work", "--id", "t-keep", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["note", "t-keep", "evidence", "--as", "worker", "--json"],
+    );
+
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Destroy the work the snapshot holds.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "t-keep", "--as", "oops", "--json"],
+    );
+    assert!(
+        !fixture
+            .run(&fixture.main, &["task", "show", "t-keep", "--json"])
+            .status
+            .success()
+    );
+
+    // Restore overwrites live state, so it refuses until asked twice.
+    let unforced = fixture.run(&fixture.main, &["restore", "--from", &snapshot, "--json"]);
+    assert!(
+        !unforced.status.success(),
+        "restore must not overwrite live state by default"
+    );
+    assert!(String::from_utf8_lossy(&unforced.stderr).contains("--force"));
+
+    let restored = fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+    // A mistaken restore has to be recoverable in turn.
+    let rescue = restored["rescueSnapshot"].as_str().unwrap();
+    assert!(
+        Path::new(rescue).join("registry.db").is_file(),
+        "no rescue snapshot at {rescue}"
+    );
+
+    let recovered = fixture.ok_json(&fixture.main, &["task", "show", "t-keep", "--json"]);
+    assert_eq!(recovered["title"], "real work");
+    assert_eq!(
+        recovered["notes"][0]["body"], "evidence",
+        "durable history came back too"
+    );
+
+    // A directory that is not a snapshot is rejected before anything is touched.
+    let bogus = fixture.root.join("not-a-snapshot");
+    fs::create_dir_all(&bogus).unwrap();
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "restore",
+            "--from",
+            bogus.to_str().unwrap(),
+            "--force",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no registry.db"));
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-keep", "--json"])["title"],
+        "real work",
+        "a refused restore must leave live state untouched"
+    );
+}
+
+#[test]
+fn compiled_binary_prunes_only_the_backups_directory_it_manages() {
+    let fixture = Fixture::new("prune");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Prune", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "work", "--id", "t-1", "--json"],
+    );
+    for _ in 0..3 {
+        fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    }
+    let kept = fixture.ok_json(&fixture.main, &["backup", "--keep", "2", "--json"]);
+    assert_eq!(
+        kept["pruned"].as_array().unwrap().len(),
+        2,
+        "4 snapshots, keep 2"
+    );
+    let remaining = fs::read_dir(fixture.data.join("backups")).unwrap().count();
+    assert_eq!(remaining, 2);
+
+    // Deleting from a directory the operator chose is the same overreach as
+    // re-permissioning one, so --keep refuses outside the managed root.
+    let mine = fixture.root.join("mine/snap");
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "backup",
+            "--output",
+            mine.to_str().unwrap(),
+            "--keep",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("only prunes the managed"));
+    assert!(
+        !fixture
+            .run(&fixture.main, &["backup", "--keep", "0", "--json"])
+            .status
+            .success()
+    );
+}

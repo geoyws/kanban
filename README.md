@@ -214,6 +214,32 @@ command or flag added later silently retargets callers that already work
 Sub-aliases apply only where the second word is a subcommand, so a task whose
 id happens to be `rm` is still addressable.
 
+## Staleness, audit and recovery
+
+`stale_minutes` is a per-task budget for how long work may sit without a
+signal. `kb stale` lists tasks that have overrun theirs, measured from the
+claim heartbeat when there is one and from `updated_at` otherwise, and
+`kb dashboard` carries the count per project.
+
+```bash
+kb stale --json           # [{ id, staleMinutes, idleMinutes, overdueMinutes, lastSignal }]
+kb events --kind lease_seized
+```
+
+Snapshots are restorable, not just writable:
+
+```bash
+kb backup --keep 7                 # snapshot, then keep the newest 7
+kb restore --from <SNAPSHOT> --force
+```
+
+`restore` verifies every file in the snapshot before it touches live state,
+refuses without `--force`, and writes a `pre-restore-<stamp>` rescue snapshot of
+what it replaced, so a mistaken restore is recoverable in turn. Stop other
+kanban processes first. `--keep` prunes only the managed backups directory and
+only the stamped snapshots Kanban itself wrote — never a directory reached via
+`--output`, and never a rescue snapshot.
+
 ## Failing closed
 
 Kanban is driven by agents that cannot notice a mistake: a turn issues a

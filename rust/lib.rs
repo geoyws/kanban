@@ -27,7 +27,8 @@ Usage:
   kanban workspace attach --to REGISTERED_PATH [--workspace PATH]
   kanban dashboard [--json]
   kanban doctor [--json]
-  kanban backup [--output DIRECTORY] [--json]
+  kanban backup [--output DIRECTORY] [--keep N] [--json]
+  kanban restore --from DIRECTORY --force [--json]
   kanban task add TITLE [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT] [--status STATUS] [--priority N] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
@@ -50,6 +51,7 @@ Usage:
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
+  kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
 
@@ -101,20 +103,28 @@ const BOOLEAN: [&str; 17] = [
 /// Accepted on every board command; see `store_path`.
 const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
-/// Every flag each command accepts.
+/// Every command, and every flag it accepts.
 ///
 /// An unrecognized flag is an error, never a silent no-op. A mistyped
 /// `--projct alpha` used to fall through to directory resolution and write to
 /// whichever board contained the working directory — the exact "wrong board"
 /// damage ADR-007 exists to prevent, reported as success.
-fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static str]> {
-    Some(match (command, sub) {
-        ("init", _) => &["name", "force"],
-        ("workspace", Some("list")) => &[],
-        ("workspace", Some("attach")) => &["to"],
-        ("dashboard", _) | ("doctor", _) => &[],
-        ("backup", _) => &["output"],
-        ("task", Some("add")) => &[
+///
+/// This is the single description of the command surface: `allowed_flags`
+/// reads it, and the drift guards in the test module iterate it, so a command
+/// added without its flag list fails the gate instead of reaching an operator.
+const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
+    ("init", None, &["name", "force"]),
+    ("workspace", Some("list"), &[]),
+    ("workspace", Some("attach"), &["to"]),
+    ("dashboard", None, &[]),
+    ("doctor", None, &[]),
+    ("backup", None, &["output", "keep"]),
+    ("restore", None, &["from", "force"]),
+    (
+        "task",
+        Some("add"),
+        &[
             "id",
             "type",
             "parent",
@@ -128,12 +138,20 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
             "stale-minutes",
             "driver-only",
         ],
-        ("task", Some("list")) => &["status", "with-relations"],
-        ("task", Some("show")) => &[],
-        ("task", Some("move")) => &["as", "metadata-patch-json", "force"],
-        ("task", Some("remove")) => &["as", "force"],
-        ("task", Some("metadata")) => &["as", "patch-json"],
-        ("task", Some("update")) => &[
+    ),
+    ("task", Some("list"), &["status", "with-relations"]),
+    ("task", Some("show"), &[]),
+    (
+        "task",
+        Some("move"),
+        &["as", "metadata-patch-json", "force"],
+    ),
+    ("task", Some("remove"), &["as", "force"]),
+    ("task", Some("metadata"), &["as", "patch-json"]),
+    (
+        "task",
+        Some("update"),
+        &[
             "as",
             "parent",
             "clear-parent",
@@ -152,9 +170,18 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
             "depends-on",
             "clear-dependencies",
         ],
-        ("story", Some("advance")) => &["as", "to", "reviewer", "committer"],
-        ("story", Some("signoff")) | ("story", Some("unsignoff")) => &["as", "note"],
-        ("claim", _) => &[
+    ),
+    (
+        "story",
+        Some("advance"),
+        &["as", "to", "reviewer", "committer"],
+    ),
+    ("story", Some("signoff"), &["as", "note"]),
+    ("story", Some("unsignoff"), &["as", "note"]),
+    (
+        "claim",
+        None,
+        &[
             "as",
             "session",
             "lease-minutes",
@@ -165,10 +192,14 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
             "allow-reassign",
             "next",
         ],
-        ("heartbeat", _) => &["lease", "lease-minutes"],
-        ("release", _) => &["lease", "keep-status"],
-        ("note", _) => &["as", "kind"],
-        ("checkpoint", _) => &[
+    ),
+    ("heartbeat", None, &["lease", "lease-minutes"]),
+    ("release", None, &["lease", "keep-status"]),
+    ("note", None, &["as", "kind"]),
+    (
+        "checkpoint",
+        None,
+        &[
             "lease",
             "as",
             "session",
@@ -184,7 +215,11 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
             "head",
             "dirty",
         ],
-        ("handoff", Some("create")) => &[
+    ),
+    (
+        "handoff",
+        Some("create"),
+        &[
             "lease",
             "as",
             "session",
@@ -201,14 +236,26 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
             "head",
             "dirty",
         ],
-        ("handoff", Some("list")) => &["task", "status"],
-        ("handoff", Some("accept")) => &["as", "session", "lease-minutes", "caller-scope"],
-        ("import", Some("atmux-json")) | ("import", Some("atmux-sqlite")) => &["as", "reconcile"],
-        ("events", _) => &["task", "kind", "limit"],
-        ("context", _) => &["max-chars"],
-        ("todo", _) => &["output"],
-        _ => return None,
-    })
+    ),
+    ("handoff", Some("list"), &["task", "status"]),
+    (
+        "handoff",
+        Some("accept"),
+        &["as", "session", "lease-minutes", "caller-scope"],
+    ),
+    ("import", Some("atmux-json"), &["as", "reconcile"]),
+    ("import", Some("atmux-sqlite"), &["as", "reconcile"]),
+    ("events", None, &["task", "kind", "limit"]),
+    ("stale", None, &[]),
+    ("context", None, &["max-chars"]),
+    ("todo", None, &["output"]),
+];
+
+fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static str]> {
+    COMMANDS
+        .iter()
+        .find(|(name, expected, _)| *name == command && *expected == sub)
+        .map(|(_, _, flags)| *flags)
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
@@ -549,6 +596,120 @@ fn list_json(store: &Store, status: Option<&str>, relations: bool) -> Result<Val
     Ok(Value::Array(out))
 }
 
+/// Delete all but the newest `keep` snapshots under the managed backups root.
+///
+/// Only ever prunes the directory Kanban itself writes snapshots into, and only
+/// entries whose names are the millisecond stamps it generates. An operator who
+/// passed `--output` gets their directory left alone: deleting from a path
+/// someone else chose is the same overreach as re-permissioning one.
+fn prune_backups(keep: i64, just_written: &Path) -> Result<Vec<String>> {
+    if keep < 1 {
+        bail!("--keep must be at least 1");
+    }
+    let root = data_root()?.join("backups");
+    if just_written.parent() != Some(root.as_path()) {
+        bail!(
+            "--keep only prunes the managed backups directory ({}); \
+             remove snapshots under --output yourself",
+            root.display()
+        );
+    }
+    let mut snapshots = fs::read_dir(&root)?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.parse::<i64>().ok().map(|stamp| (stamp, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
+    let mut pruned = Vec::new();
+    for (_, path) in snapshots.into_iter().skip(keep as usize) {
+        fs::remove_dir_all(&path).with_context(|| format!("prune snapshot {}", path.display()))?;
+        pruned.push(path.to_string_lossy().into_owned());
+    }
+    Ok(pruned)
+}
+
+/// Replace the live registry and boards with a snapshot.
+///
+/// A backup nobody can restore is not a recovery path, but this overwrites
+/// live work state, so it verifies the source first, refuses without --force,
+/// and snapshots what it is about to replace.
+fn restore(args: &Args) -> Result<()> {
+    let source = PathBuf::from(args.require("from")?);
+    let registry_source = source.join("registry.db");
+    if !registry_source.is_file() {
+        bail!(
+            "{} is not a Kanban snapshot: no registry.db",
+            source.display()
+        );
+    }
+    // Verify before destroying: restoring a corrupt snapshot over good state
+    // would turn a recovery into the incident.
+    let mut boards = Vec::new();
+    for entry in fs::read_dir(source.join("boards"))
+        .with_context(|| format!("read {}/boards", source.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("db") {
+            boards.push(path);
+        }
+    }
+    for path in std::iter::once(&registry_source).chain(boards.iter()) {
+        let check = db::verify(path)?;
+        if check != vec!["ok"] {
+            bail!(
+                "snapshot file {} failed integrity check: {:?}",
+                path.display(),
+                check
+            );
+        }
+    }
+    if !args.has("force") {
+        bail!(
+            "restore replaces the live registry and {} board(s) from {}; \
+             rerun with --force once every kanban process is stopped",
+            boards.len(),
+            source.display()
+        );
+    }
+    // Snapshot what is about to be overwritten, so a mistaken restore is itself
+    // recoverable.
+    let root = data_root()?;
+    let rescue = root
+        .join("backups")
+        .join(format!("pre-restore-{}", now_ms()));
+    let registry = Registry::open()?;
+    registry.backup(&rescue.join("registry.db"))?;
+    for project in registry.projects()? {
+        let file_name = Path::new(&project.board_path)
+            .file_name()
+            .with_context(|| format!("board path has no file name: {}", project.board_path))?;
+        Store::open(Path::new(&project.board_path))?
+            .backup(&rescue.join("boards").join(file_name))?;
+    }
+    drop(registry);
+
+    let mut restored = Vec::new();
+    for (from, to) in std::iter::once((registry_source.clone(), root.join("registry.db"))).chain(
+        boards.iter().map(|path| {
+            (
+                path.clone(),
+                root.join("boards")
+                    .join(path.file_name().unwrap_or_default()),
+            )
+        }),
+    ) {
+        db::replace_database(&from, &to)?;
+        restored.push(to.to_string_lossy().into_owned());
+    }
+    print(
+        &json!({"restored":restored,"from":source,"rescueSnapshot":rescue}),
+        args.has("json"),
+    )
+}
+
 /// Shared entry point for both installed binaries, `kanban` and `kb`.
 pub fn entrypoint() -> ! {
     match run() {
@@ -634,6 +795,7 @@ fn run() -> Result<()> {
                 json!(store.handoffs(None, Some("pending"), 100)?.len()),
             );
             value.insert("totalTasks".into(), json!(tasks.len()));
+            value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
             output.push(Value::Object(value));
         }
         return print(&output, args.has("json"));
@@ -676,10 +838,17 @@ fn run() -> Result<()> {
             store.backup(&destination)?;
             boards.push(destination.to_string_lossy().into_owned());
         }
+        let pruned = match args.one("keep") {
+            Some(_) => prune_backups(args.integer("keep", 0)?, &directory)?,
+            None => Vec::new(),
+        };
         return print(
-            &json!({"directory":directory,"registry":registry_path,"boards":boards}),
+            &json!({"directory":directory,"registry":registry_path,"boards":boards,"pruned":pruned}),
             args.has("json"),
         );
+    }
+    if command == "restore" {
+        return restore(&args);
     }
 
     let mut store = open_store(&args)?;
@@ -959,6 +1128,9 @@ fn run() -> Result<()> {
         };
         return print(&receipt, args.has("json"));
     }
+    if command == "stale" {
+        return print(&store.stale_tasks()?, args.has("json"));
+    }
     if command == "events" {
         return print(
             &store.events(
@@ -1001,40 +1173,6 @@ mod tests {
     fn args(values: &[&str]) -> Args {
         Args::parse(values.iter().map(|value| (*value).to_owned()).collect()).unwrap()
     }
-
-    /// Every command reachable from `run`, as (command, subcommand).
-    /// Kept here so the drift guards below cover the real surface.
-    const SURFACE: [(&str, Option<&str>); 29] = [
-        ("init", None),
-        ("workspace", Some("list")),
-        ("workspace", Some("attach")),
-        ("dashboard", None),
-        ("doctor", None),
-        ("backup", None),
-        ("task", Some("add")),
-        ("task", Some("list")),
-        ("task", Some("show")),
-        ("task", Some("move")),
-        ("task", Some("remove")),
-        ("task", Some("metadata")),
-        ("task", Some("update")),
-        ("story", Some("advance")),
-        ("story", Some("signoff")),
-        ("story", Some("unsignoff")),
-        ("claim", None),
-        ("heartbeat", None),
-        ("release", None),
-        ("note", None),
-        ("checkpoint", None),
-        ("handoff", Some("create")),
-        ("handoff", Some("list")),
-        ("handoff", Some("accept")),
-        ("events", None),
-        ("context", None),
-        ("import", Some("atmux-json")),
-        ("import", Some("atmux-sqlite")),
-        ("todo", None),
-    ];
 
     #[test]
     fn edit_distance_counts_single_edits() {
@@ -1113,9 +1251,7 @@ mod tests {
 
     #[test]
     fn every_command_declares_its_flags_without_duplicates() {
-        for (command, sub) in SURFACE {
-            let flags = allowed_flags(command, sub)
-                .unwrap_or_else(|| panic!("{command} {sub:?} has no flag declaration"));
+        for (command, sub, flags) in COMMANDS {
             let mut seen = flags.to_vec();
             seen.sort_unstable();
             let before = seen.len();
@@ -1125,13 +1261,28 @@ mod tests {
                 seen.len(),
                 "{command} {sub:?} declares a flag twice"
             );
-            for flag in flags {
+            for flag in *flags {
                 assert!(
                     !GLOBAL_FLAGS.contains(flag),
                     "{command} {sub:?} redeclares the global --{flag}"
                 );
             }
+            // The lookup must actually reach this row.
+            assert_eq!(allowed_flags(command, *sub), Some(*flags));
         }
+        // No command is described twice, which would make the second row dead.
+        let mut keys = COMMANDS
+            .iter()
+            .map(|(command, sub, _)| (*command, *sub))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(
+            unique,
+            keys.len(),
+            "a command is declared twice in COMMANDS"
+        );
         assert!(allowed_flags("frobnicate", None).is_none());
         assert!(allowed_flags("task", Some("frobnicate")).is_none());
     }
@@ -1141,9 +1292,7 @@ mod tests {
         for flag in BOOLEAN {
             let declared = GLOBAL_FLAGS.contains(&flag)
                 || flag == "version"
-                || SURFACE.iter().any(|(command, sub)| {
-                    allowed_flags(command, *sub).is_some_and(|flags| flags.contains(&flag))
-                });
+                || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&flag));
             assert!(
                 declared,
                 "--{flag} parses as a boolean but no command accepts it"
@@ -1160,18 +1309,19 @@ mod tests {
             let resolved = canonical_command(alias);
             assert_ne!(resolved, alias, "{alias} is not wired up");
             assert!(
-                resolved == "version" || SURFACE.iter().any(|(command, _)| *command == resolved),
+                resolved == "version"
+                    || COMMANDS.iter().any(|(command, _, _)| *command == resolved),
                 "alias {alias} resolves to unknown command {resolved}"
             );
             // ...and must not be the name of a different real command.
             assert!(
-                !SURFACE.iter().any(|(command, _)| *command == alias),
+                !COMMANDS.iter().any(|(command, _, _)| *command == alias),
                 "alias {alias} shadows a real command"
             );
         }
         // A canonical name passes through untouched.
-        for (command, _) in SURFACE {
-            assert_eq!(canonical_command(command), command);
+        for (command, _, _) in COMMANDS {
+            assert_eq!(canonical_command(command), *command);
         }
     }
 

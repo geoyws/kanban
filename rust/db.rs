@@ -217,3 +217,38 @@ pub fn checkpoint(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(())
 }
+
+/// Integrity-check a database file without registering or migrating it.
+/// Used to verify a snapshot before it is allowed to overwrite live state.
+pub fn verify(path: &Path) -> Result<Vec<String>> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open snapshot {}", path.display()))?;
+    integrity(&connection)
+}
+
+/// Put `source` in place of `destination`, atomically as far as readers are
+/// concerned.
+///
+/// Copies to a temporary sibling first and renames over the target, so an
+/// interrupted restore cannot leave a half-written board. Any `-wal`/`-shm`
+/// belonging to the replaced database is removed: they describe the file that
+/// just went away, and leaving them would let SQLite replay the old log over
+/// the new contents.
+pub fn replace_database(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        create_private_dir_all(parent)?;
+    }
+    let staging = destination.with_extension("db.restoring");
+    let _ = fs::remove_file(&staging);
+    fs::copy(source, &staging)
+        .with_context(|| format!("copy {} to {}", source.display(), staging.display()))?;
+    fs::set_permissions(&staging, Permissions::from_mode(0o600))?;
+    fs::rename(&staging, destination)
+        .with_context(|| format!("replace {}", destination.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = destination.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(Path::new(&sidecar));
+    }
+    Ok(())
+}
