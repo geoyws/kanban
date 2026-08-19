@@ -290,9 +290,88 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self {
+        let mut store = Self {
             connection: open_board(path)?,
-        })
+        };
+        store.sweep_expired_claims()?;
+        Ok(store)
+    }
+
+    /// Retire leases that have run out, before anything reads the board.
+    ///
+    /// Expiry used to happen only inside `claim` and `accept_handoff`, so a
+    /// vanished agent left its task reading `in_progress · assignee: ghost`
+    /// on every read path while `claim --next` handed the same task to someone
+    /// else. The board and the scheduler disagreed, and the generated TODO
+    /// contradicted itself in one card ("Restart here … Owner: unclaimed").
+    ///
+    /// Doing it here keeps one definition of what expiry means. The common
+    /// case is a single indexed count over `idx_task_claims_expiry` and takes
+    /// no write lock; only an actual expiry opens a transaction.
+    pub fn sweep_expired_claims(&mut self) -> Result<usize> {
+        // A board written by the released TypeScript implementation can sit at
+        // user_version=3 with no `task_claims` table, so the migration ladder
+        // never creates one. Those boards must still open; there is simply
+        // nothing to sweep.
+        let claims_exist: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_claims')",
+            [],
+            |row| row.get(0),
+        )?;
+        if claims_exist == 0 {
+            return Ok(0);
+        }
+        let expired: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM task_claims WHERE expires_at<=?",
+            [now_ms()],
+            |row| row.get(0),
+        )?;
+        if expired == 0 {
+            return Ok(0);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_claims(&transaction, now_ms())?;
+        transaction.commit()?;
+        Ok(expired as usize)
+    }
+
+    /// Recorded ledger events, newest first. The `events` table is the audit
+    /// trail for lease seizures and destructive removals, so it needs a reader.
+    pub fn events(&self, task: Option<&str>, kind: Option<&str>, limit: i64) -> Result<Vec<Event>> {
+        if let Some(id) = task {
+            require_task(&self.connection, id)?;
+        }
+        let mut sql = String::from("SELECT * FROM events WHERE 1=1");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(id) = task {
+            sql.push_str(" AND task_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind=?");
+            values.push(Box::new(kind.to_owned()));
+        }
+        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok(Event {
+                        seq: row.get("seq")?,
+                        task_id: row.get("task_id")?,
+                        kind: row.get("kind")?,
+                        actor: row.get("actor")?,
+                        payload: parse_value(row.get("payload")?),
+                        created_at: row.get("created_at")?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn initialize(&self, name: &str) -> Result<()> {

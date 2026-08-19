@@ -1616,3 +1616,121 @@ fn compiled_binary_suggests_the_flag_an_abbreviation_was_reaching_for() {
     // A stem is a suggestion, never an alias: it must still fail.
     assert!(stderr(&["task", "list", "--proj", "Hints"]).contains("unknown flag --proj"));
 }
+
+#[test]
+fn compiled_binary_retires_dead_leases_before_any_read_and_records_them() {
+    let fixture = Fixture::new("sweep");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Sweep", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "abandoned", "--id", "t-1", "--json"],
+    );
+    fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "ghost", "--json"]);
+
+    // Simulate the agent vanishing: the lease runs out with nobody to release
+    // it. Expiry used to happen only inside claim/accept_handoff, so every read
+    // path kept reporting the task as owned while `claim --next` gave it away.
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute("UPDATE task_claims SET expires_at=1", [])
+        .unwrap();
+
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert_eq!(
+        listed[0]["status"], "todo",
+        "a dead lease must not read as in_progress"
+    );
+    assert!(
+        listed[0]["assignee"].is_null(),
+        "a dead lease must not keep its assignee"
+    );
+    assert!(fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["claim"].is_null());
+
+    // The TODO projection used to contradict itself: the task appeared under
+    // "Restart here" as in-progress with "Owner: unclaimed" beneath it.
+    let todo = String::from_utf8_lossy(&fixture.run(&fixture.main, &["todo"]).stdout).into_owned();
+    assert!(todo.contains("No task is currently in progress."), "{todo}");
+    assert!(!todo.contains("Owner: unclaimed"), "{todo}");
+
+    // The sweep is itself durable history, not a silent correction.
+    let expired = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "claim_expired", "--json"],
+    );
+    assert_eq!(expired.as_array().unwrap().len(), 1);
+    assert_eq!(expired[0]["actor"], "ghost");
+}
+
+#[test]
+fn compiled_binary_exposes_the_audit_trail_it_writes() {
+    let fixture = Fixture::new("events");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Events", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "audited", "--id", "t-1", "--json"],
+    );
+    fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+
+    // A forced override is only a safety feature if someone can review it.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "move", "t-1", "todo", "--as", "operator", "--force", "--json",
+        ],
+    );
+    let seized = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "lease_seized", "--json"],
+    );
+    assert_eq!(seized.as_array().unwrap().len(), 1);
+    assert_eq!(seized[0]["actor"], "operator");
+    assert_eq!(seized[0]["payload"]["heldBy"], "worker");
+    assert_eq!(seized[0]["payload"]["action"], "move");
+
+    // A destructive removal records what it destroyed, before it is gone.
+    fixture.ok_json(
+        &fixture.main,
+        &["note", "t-1", "evidence", "--as", "worker", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "t-1", "--as", "operator", "--json"],
+    );
+    let removed = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "task_removed", "--json"],
+    );
+    assert_eq!(removed[0]["payload"]["discardedNotes"], 1);
+
+    // Newest first, filterable by task, and bounded.
+    let all = fixture.ok_json(&fixture.main, &["events", "--json"]);
+    let seqs: Vec<i64> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] > pair[1]),
+        "not newest-first: {seqs:?}"
+    );
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--limit", "2", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // Filtering by a task that does not exist is an error, not an empty list.
+    assert!(
+        !fixture
+            .run(&fixture.main, &["events", "--task", "t-nope", "--json"])
+            .status
+            .success()
+    );
+}

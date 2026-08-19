@@ -145,6 +145,21 @@ pub struct Handoff {
     pub accepted_session: Option<String>,
 }
 
+/// One row of the durable audit trail. `lease_seized` and `task_removed`
+/// carry who overrode what, so this is the record an operator reviews after a
+/// forced override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    pub seq: i64,
+    #[serde(rename = "taskID")]
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub actor: Option<String>,
+    pub payload: Value,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {

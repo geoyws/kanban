@@ -233,9 +233,21 @@ interpreted unambiguously is refused rather than guessed
   registered tree points at `kanban workspace attach --to ROOT`, which is
   almost always what was meant. `--force` creates a genuinely separate nested
   board.
+- **A dead lease is retired before anything reads it.** Expiry used to happen
+  only when a claim was attempted, so a vanished agent left its task reading
+  `in_progress` on every read path while `claim --next` gave the same task
+  away. Every board command now sweeps first, and each expiry is recorded as a
+  `claim_expired` event.
 - **`context` declares what it dropped.** `truncated` is computed by
   over-fetching past each cap, so a resuming agent is never told it holds the
   complete record when it does not.
+
+Overrides are reviewable, because forcing one writes durable history:
+
+```bash
+kb events --kind lease_seized        # who overrode whose lease, and when
+kb events --task t-resume --limit 20
+```
 
 Every command still prints JSON whether or not `--json` is passed.
 

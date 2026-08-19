@@ -49,6 +49,7 @@ Usage:
   kanban handoff list [--task ID] [--status STATUS] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--json]
+  kanban events [--task ID] [--kind KIND] [--limit N] [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
 
@@ -65,7 +66,7 @@ Environment:
 
 Aliases (the binary installs as both `kanban` and `kb`):
   t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
-  ctx=context  dash=dashboard  rel=release  n=note  v=version
+  ctx=context  ev=events  dash=dashboard  rel=release  n=note  v=version
   task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
   story:     adv=advance
   handoff:   ls=list  new=create  acc=accept
@@ -203,6 +204,7 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
         ("handoff", Some("list")) => &["task", "status"],
         ("handoff", Some("accept")) => &["as", "session", "lease-minutes", "caller-scope"],
         ("import", Some("atmux-json")) | ("import", Some("atmux-sqlite")) => &["as", "reconcile"],
+        ("events", _) => &["task", "kind", "limit"],
         ("context", _) => &["max-chars"],
         ("todo", _) => &["output"],
         _ => return None,
@@ -226,6 +228,7 @@ fn canonical_command(value: &str) -> &str {
         "cp" => "checkpoint",
         "hb" => "heartbeat",
         "ctx" => "context",
+        "ev" => "events",
         "dash" => "dashboard",
         "rel" => "release",
         "n" => "note",
@@ -955,6 +958,16 @@ fn run() -> Result<()> {
             import_sqlite(&mut store, Path::new(path), actor, reconcile)?
         };
         return print(&receipt, args.has("json"));
+    }
+    if command == "events" {
+        return print(
+            &store.events(
+                args.one("task"),
+                args.one("kind"),
+                args.integer("limit", 50)?,
+            )?,
+            args.has("json"),
+        );
     }
     if command == "context" {
         let id = sub.context("task id is required")?;
