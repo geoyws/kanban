@@ -1,0 +1,98 @@
+# ADR-008: Fail closed on ambiguous input and destructive operations
+
+**Status:** Accepted
+**Date:** 2026-08-19
+**Deciders:** George
+
+## Context
+
+Kanban is written for agents that cannot notice a mistake. A model turn issues
+a command, reads the exit status, and moves on. Anything the CLI accepts
+quietly becomes part of the durable record, and nothing later in the pipeline
+re-reads it with fresh eyes.
+
+An audit of the 0.3 binary found six defects that share one shape: an operation
+that should have refused instead succeeded, and reported success.
+
+- **A mistyped flag was a silent no-op.** `--projct alpha` was parsed, stored,
+  and never read. Board selection fell through to working-directory resolution
+  and wrote to whichever board happened to contain the process. `--statis done`
+  listed the entire board instead of one status.
+  [ADR-007](ADR-007-global-project-addressing.md) claims "a mistyped project
+  name is a refusal rather than a wrong-board write"; that held for a bad
+  *value* and not for a bad *flag*, which is the likelier slip.
+- **`kanban init` below a registered root created a second board.** Tasks added
+  from the subdirectory resolved to the nearer board and were invisible from
+  the project root. Both boards reported success and neither mentioned the
+  other.
+- **`task move` and `task remove` deleted a live claim row.** The lease is an
+  agent's authority to write; voiding it from outside left the holder to
+  discover the loss when its checkpoint failed, after the work was done.
+- **`context` reported `truncated: false` unconditionally.** Past the note cap
+  the packet silently dropped the oldest history while telling the resuming
+  agent it held the complete record. Bounded cold-start context is the
+  product's central promise, and the field that qualifies it was a constant.
+- **`--lease-minutes` overflowed the conversion to milliseconds.** A panic in
+  debug; in release, a wrap to a negative lease.
+- **`--db PATH` re-permissioned the containing directory to 0700.** Kanban
+  narrowed a directory it did not create. `KANBAN_DB=/tmp/board.db` run as root
+  locks `/tmp` away from every other process on the host. Separately, board
+  files were created 0644 and narrowed afterwards, leaving a window in which
+  any local user could open one and keep the descriptor.
+
+## Decision
+
+**An operation that cannot be unambiguously interpreted is refused, not
+guessed.** Every flag is declared per command and an unrecognized one is an
+error naming the nearest accepted flag. Silent acceptance is never the
+fallback, because the caller has no way to detect it.
+
+**An operation that destroys or overrides another agent's state requires
+`--force`, and records the override.** This covers `task move` and
+`task remove` against a live lease, and `kanban init` inside an enclosing
+project. The refusal names the holder or the enclosing project and prints the
+command that does what the operator most likely meant — `workspace attach` for
+a nested init. Forcing is a first-class, audited path, not a workaround: a
+seizure writes a `lease_seized` event, and a removal records the count of notes
+and checkpoints it discarded.
+
+**A field that qualifies the data is computed, never assumed.** `truncated` is
+derived by over-fetching one row past each cap. A constant that happens to be
+right most of the time is a lie the rest of the time.
+
+**Kanban re-permissions only the tree it owns.** Directories it creates are
+0700 from creation; the private data root is asserted to 0700 because Kanban
+owns it outright. A directory the operator pointed at with `--db` is never
+modified. Database and snapshot files are created 0600 by `O_EXCL` before
+SQLite opens them, so there is no window in which they are public.
+
+**`synchronous=FULL`, not `NORMAL`.** A checkpoint that survives the agent but
+not the host is not durable, and resumption is the reason this ledger exists.
+Write volume is a handful of rows per model turn, so the extra fsync is not a
+meaningful cost.
+
+## Consequences
+
+Some previously-accepted command lines now fail. That is the point: each one
+was already doing something other than what it said. The break is loud and
+names its own fix, which is the failure mode an unattended agent can act on.
+
+`--force` concentrates the destructive paths behind one reviewable flag, so
+"which commands can destroy work state" is answerable by grepping for it.
+
+Flag declarations must be extended whenever a command gains a flag, or the new
+flag is rejected. The e2e suite exercises the accepted set for each command it
+covers, so a missing declaration fails the gate rather than reaching an
+operator.
+
+Deliberately not decided: changing the default output format. Every command
+still prints JSON whether or not `--json` is passed. Making the default
+human-readable would break existing consumers for a cosmetic gain, and no
+safety property depends on it.
+
+## References
+
+- [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract
+- [ADR-003](ADR-003-private-multi-project-personal-work-system.md) — private storage
+- [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md) — compiled-binary E2E
+- [ADR-007](ADR-007-global-project-addressing.md) — board selection chain

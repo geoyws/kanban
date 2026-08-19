@@ -1,11 +1,9 @@
-use crate::db::{checkpoint as wal_checkpoint, integrity, open_board};
+use crate::db::{checkpoint as wal_checkpoint, create_backup_target, integrity, open_board};
 use crate::model::*;
 use crate::registry::now_ms;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
 use serde_json::{Value, json};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -208,6 +206,51 @@ fn expire_claims(connection: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// A live lease is another agent's authority to write this task. Operator
+/// commands that would void it (`task move`, `task remove`) refuse by default
+/// and name the holder; `--force` seizes it and records who did.
+///
+/// Without this, `kanban task move t-1 todo --as anyone` silently deleted the
+/// claim row, and the holder's next checkpoint failed with "no active lease"
+/// after the work was already done.
+fn require_free_lease(
+    connection: &Connection,
+    task_id: &str,
+    actor: &str,
+    force: bool,
+    action: &str,
+) -> Result<Option<Claim>> {
+    let Some(claim) = active_claim(connection, task_id, now_ms())? else {
+        return Ok(None);
+    };
+    if !force {
+        bail!(
+            "task {task_id} is leased by {} until {} (session {}); rerun with --force to {action} it anyway",
+            claim.agent_id,
+            claim.expires_at,
+            claim.session_id.as_deref().unwrap_or("-")
+        );
+    }
+    event(
+        connection,
+        Some(task_id),
+        "lease_seized",
+        Some(actor),
+        json!({"heldBy": claim.agent_id, "action": action, "expiresAt": claim.expires_at}),
+    )?;
+    Ok(Some(claim))
+}
+
+/// Keep the newest `limit` entries of an oldest-first list.
+/// Returns true when anything was dropped.
+fn keep_newest<T>(list: &mut Vec<T>, limit: usize) -> bool {
+    if list.len() <= limit {
+        return false;
+    }
+    list.drain(..list.len() - limit);
+    true
+}
+
 fn depends_transitively(connection: &Connection, start: &str, target: &str) -> Result<bool> {
     Ok(connection.query_row(
         "WITH RECURSIVE chain(id) AS (SELECT depends_on FROM task_dependencies WHERE task_id=? UNION SELECT d.depends_on FROM task_dependencies d JOIN chain c ON d.task_id=c.id) SELECT EXISTS(SELECT 1 FROM chain WHERE id=?)",
@@ -357,13 +400,21 @@ impl Store {
         Ok(out)
     }
 
-    pub fn move_task(&mut self, id: &str, status: &str, actor: &str, patch: Value) -> Result<Task> {
+    pub fn move_task(
+        &mut self,
+        id: &str,
+        status: &str,
+        actor: &str,
+        patch: Value,
+        force: bool,
+    ) -> Result<Task> {
         validate(status, &TASK_STATUSES, "task status")?;
         let actor = nonempty(actor, "actor")?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = require_task(&transaction, id)?;
+        let seized = require_free_lease(&transaction, id, &actor, force, "move")?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let patch = patch
             .as_object()
@@ -394,25 +445,58 @@ impl Store {
             Some(id),
             "task_moved",
             Some(&actor),
-            json!({"status": status}),
+            json!({"status": status, "seizedFrom": seized.map(|claim| claim.agent_id)}),
         )?;
         transaction.commit()?;
         self.require_task(id)
     }
 
-    pub fn remove_task(&mut self, id: &str, actor: &str) -> Result<()> {
+    pub fn remove_task(&mut self, id: &str, actor: &str, force: bool) -> Result<()> {
         let actor = nonempty(actor, "actor")?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = require_task(&transaction, id)?;
+        let seized = require_free_lease(&transaction, id, &actor, force, "remove")?;
+        // Children have no ON DELETE CASCADE, so the raw foreign-key failure is
+        // the only signal the operator would otherwise get. Name the children.
+        let mut statement =
+            transaction.prepare("SELECT id FROM tasks WHERE parent_id=? ORDER BY id")?;
+        let children = statement
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if !children.is_empty() {
+            bail!(
+                "task {id} still has {} child task(s): {}; remove or reparent them first",
+                children.len(),
+                children.join(", ")
+            );
+        }
+        // The delete cascades this task's notes, checkpoints and handoffs, so
+        // record what is being destroyed before it is gone.
+        let notes = transaction.query_row(
+            "SELECT COUNT(*) FROM task_notes WHERE task_id=?",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let checkpoints = transaction.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE task_id=?",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )?;
         transaction.execute("DELETE FROM tasks WHERE id=?", [id])?;
         event(
             &transaction,
             Some(id),
             "task_removed",
             Some(&actor),
-            json!({"task":task}),
+            json!({
+                "task": task,
+                "discardedNotes": notes,
+                "discardedCheckpoints": checkpoints,
+                "seizedFrom": seized.map(|claim| claim.agent_id),
+            }),
         )?;
         transaction.commit()?;
         Ok(())
@@ -1215,19 +1299,30 @@ impl Store {
     }
 
     pub fn context_packet(&self, id: &str) -> Result<ContextPacket> {
+        const NOTES: usize = 100;
+        const CHECKPOINTS: usize = 20;
+        const HANDOFFS: usize = 20;
         let task = self.require_task(id)?;
-        let mut handoffs = self.handoffs(Some(id), None, 20)?;
+        // Over-fetch by one so "there is older history" is measured, not
+        // assumed. `truncated` was hardcoded false, so a resuming agent was
+        // told it held the whole record while notes were being dropped.
+        let mut notes = self.notes(id, NOTES as i64 + 1)?;
+        let mut checkpoints = self.checkpoints(id, CHECKPOINTS as i64 + 1)?;
+        let mut handoffs = self.handoffs(Some(id), None, HANDOFFS as i64 + 1)?;
         handoffs.reverse();
+        let mut truncated = keep_newest(&mut notes, NOTES);
+        truncated |= keep_newest(&mut checkpoints, CHECKPOINTS);
+        truncated |= keep_newest(&mut handoffs, HANDOFFS);
         Ok(ContextPacket {
             task,
             ancestors: self.ancestors(id)?,
             dependencies: self.dependencies(id)?,
             claim: self.get_claim(id)?.as_ref().map(ClaimSummary::from),
-            notes: self.notes(id, 100)?,
-            checkpoints: self.checkpoints(id, 20)?,
+            notes,
+            checkpoints,
             handoffs,
             generated_at: now_ms(),
-            truncated: false,
+            truncated,
         })
     }
 
@@ -1236,19 +1331,9 @@ impl Store {
     }
 
     pub fn backup(&self, destination: &Path) -> Result<()> {
-        if destination.exists() {
-            bail!(
-                "backup destination already exists: {}",
-                destination.display()
-            );
-        }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut target = Connection::open(destination)?;
+        let mut target = create_backup_target(destination)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut target)?;
         backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 }

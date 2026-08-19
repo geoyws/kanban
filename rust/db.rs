@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, TransactionBehavior};
 use std::fs::{self, Permissions};
-use std::os::unix::fs::PermissionsExt;
+use std::io::ErrorKind;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 const BOARD_V1: &str = r#"
@@ -89,22 +90,90 @@ CREATE TABLE workspace_aliases (
 CREATE INDEX idx_workspace_aliases_board ON workspace_aliases(board_path);
 "#;
 
-fn secure_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().context("database path has no parent")?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, Permissions::from_mode(0o700))?;
-    Ok(())
+/// Create `dir` and any missing ancestors, each mode 0700.
+///
+/// Directories that already exist are left exactly as the operator set them.
+/// Kanban must never re-permission a directory it does not own: the previous
+/// unconditional `chmod 0700` on the parent meant `--db /tmp/board.db` locked
+/// `/tmp` to the calling user, and as root that breaks every other process on
+/// the host. Use [`own_private_dir`] for the one tree Kanban does own.
+pub fn create_private_dir_all(dir: &Path) -> Result<()> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        create_private_dir_all(parent)?;
+    }
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        // A concurrent kanban process won the race; its mode is ours.
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("create directory {}", dir.display())),
+    }
+}
+
+/// Create `dir` if missing and assert mode 0700 on it. Only for the private
+/// data root, which Kanban owns outright; never for an operator-supplied path.
+pub fn own_private_dir(dir: &Path) -> Result<()> {
+    create_private_dir_all(dir)?;
+    fs::set_permissions(dir, Permissions::from_mode(0o700))
+        .with_context(|| format!("secure directory {}", dir.display()))
+}
+
+/// Create `path` with mode 0600 before anything can open it.
+///
+/// `Connection::open` creates with 0644 and a follow-up `chmod` leaves a window
+/// in which any local user can open the file and keep the descriptor across the
+/// narrowing. Boards hold private work state, so they are never briefly public.
+fn create_private_file(path: &Path) -> Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
 }
 
 fn open(path: &Path) -> Result<Connection> {
-    secure_parent(path)?;
+    let parent = path.parent().context("database path has no parent")?;
+    create_private_dir_all(parent)?;
+    create_private_file(path)?;
     let connection = Connection::open(path)
         .with_context(|| format!("open SQLite database {}", path.display()))?;
+    // Re-assert for databases created before this rule, or by another tool.
     fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    // synchronous=FULL, not NORMAL: a checkpoint that survives the agent but
+    // not the host is not durable, and this ledger exists to be resumed from.
+    // Write volume is a handful of rows per model turn, so the extra fsync is
+    // not a meaningful cost.
     connection.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
     )?;
     Ok(connection)
+}
+
+/// Open a fresh database file for a backup copy. Fails if the destination
+/// exists: creation is the existence check, so no window separates the two.
+pub fn create_backup_target(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| match error.kind() {
+            ErrorKind::AlreadyExists => {
+                anyhow::anyhow!("backup destination already exists: {}", path.display())
+            }
+            _ => anyhow::Error::new(error).context(format!("create {}", path.display())),
+        })?;
+    Connection::open(path).with_context(|| format!("open backup target {}", path.display()))
 }
 
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {

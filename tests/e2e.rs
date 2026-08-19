@@ -926,8 +926,14 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
     let alpha = fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
     let alpha_board = alpha["boardPath"].as_str().unwrap().to_owned();
     fixture.ok_json(&beta, &["init", "--name", "Beta", "--json"]);
-    fixture.ok_json(&fixture.main, &["task", "add", "alpha work", "--id", "t-alpha", "--json"]);
-    fixture.ok_json(&beta, &["task", "add", "beta work", "--id", "t-beta", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "alpha work", "--id", "t-alpha", "--json"],
+    );
+    fixture.ok_json(
+        &beta,
+        &["task", "add", "beta work", "--id", "t-beta", "--json"],
+    );
 
     let ids = |value: &Value| -> Vec<String> {
         value
@@ -945,11 +951,23 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
     // (1) With nothing to go on, the CLI must refuse — and the refusal must
     // teach the global route, or the operator's only recourse is to cd.
     let bare = fixture.run(&outside, &["task", "list", "--json"]);
-    assert!(!bare.status.success(), "bare command outside a project must fail");
+    assert!(
+        !bare.status.success(),
+        "bare command outside a project must fail"
+    );
     let message = String::from_utf8_lossy(&bare.stderr).into_owned();
-    assert!(message.contains("--project"), "refusal must name --project: {message}");
-    assert!(message.contains("KANBAN_PROJECT"), "refusal must name the env var: {message}");
-    assert!(message.contains("Alpha") && message.contains("Beta"), "refusal must list known projects: {message}");
+    assert!(
+        message.contains("--project"),
+        "refusal must name --project: {message}"
+    );
+    assert!(
+        message.contains("KANBAN_PROJECT"),
+        "refusal must name the env var: {message}"
+    );
+    assert!(
+        message.contains("Alpha") && message.contains("Beta"),
+        "refusal must list known projects: {message}"
+    );
 
     // (2) --project reaches a board from a directory owning no project.
     assert_eq!(
@@ -964,7 +982,11 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
         .args(["task", "list", "--json"])
         .output()
         .unwrap();
-    assert!(env_output.status.success(), "{}", String::from_utf8_lossy(&env_output.stderr));
+    assert!(
+        env_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&env_output.stderr)
+    );
     assert_eq!(
         ids(&serde_json::from_slice::<Value>(&env_output.stdout).unwrap()),
         vec!["t-beta".to_owned()]
@@ -972,42 +994,94 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
 
     // (4) --workspace resolves the project containing a path other than cwd.
     assert_eq!(
-        ids(&fixture.ok_json(&outside, &["task", "list", "--workspace", fixture.main.to_str().unwrap(), "--json"])),
+        ids(&fixture.ok_json(
+            &outside,
+            &[
+                "task",
+                "list",
+                "--workspace",
+                fixture.main.to_str().unwrap(),
+                "--json"
+            ]
+        )),
         vec!["t-alpha".to_owned()]
     );
 
     // (5) Precedence — an explicit --project beats the cwd it is standing in,
     // and an explicit --db beats --project.
     assert_eq!(
-        ids(&fixture.ok_json(&fixture.main, &["task", "list", "--project", "Beta", "--json"])),
+        ids(&fixture.ok_json(
+            &fixture.main,
+            &["task", "list", "--project", "Beta", "--json"]
+        )),
         vec!["t-beta".to_owned()]
     );
     assert_eq!(
-        ids(&fixture.ok_json(&fixture.main, &["task", "list", "--project", "Beta", "--db", &alpha_board, "--json"])),
+        ids(&fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "list",
+                "--project",
+                "Beta",
+                "--db",
+                &alpha_board,
+                "--json"
+            ]
+        )),
         vec!["t-alpha".to_owned()]
     );
 
     // (6) Writes land on the named board, and nowhere else.
-    fixture.ok_json(&outside, &["task", "add", "written from outside", "--id", "t-remote", "--project", "Beta", "--json"]);
-    let beta_ids = ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Beta", "--json"]));
-    assert!(beta_ids.contains(&"t-remote".to_owned()), "write did not land on Beta: {beta_ids:?}");
-    let alpha_ids = ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Alpha", "--json"]));
-    assert!(!alpha_ids.contains(&"t-remote".to_owned()), "write leaked onto Alpha: {alpha_ids:?}");
+    fixture.ok_json(
+        &outside,
+        &[
+            "task",
+            "add",
+            "written from outside",
+            "--id",
+            "t-remote",
+            "--project",
+            "Beta",
+            "--json",
+        ],
+    );
+    let beta_ids =
+        ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Beta", "--json"]));
+    assert!(
+        beta_ids.contains(&"t-remote".to_owned()),
+        "write did not land on Beta: {beta_ids:?}"
+    );
+    let alpha_ids =
+        ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Alpha", "--json"]));
+    assert!(
+        !alpha_ids.contains(&"t-remote".to_owned()),
+        "write leaked onto Alpha: {alpha_ids:?}"
+    );
 
     // (7) An unknown name fails with the roster rather than an empty board.
     let unknown = fixture.run(&outside, &["task", "list", "--project", "Gamma", "--json"]);
     assert!(!unknown.status.success());
     let unknown_message = String::from_utf8_lossy(&unknown.stderr).into_owned();
-    assert!(unknown_message.contains("no Kanban project named Gamma"), "{unknown_message}");
+    assert!(
+        unknown_message.contains("no Kanban project named Gamma"),
+        "{unknown_message}"
+    );
     assert!(unknown_message.contains("Alpha"), "{unknown_message}");
 
     // (8) Registry names are not unique. A duplicate must refuse and name the
     // candidate roots — picking one would corrupt the loser's work state.
     fixture.ok_json(&alpha_twin, &["init", "--name", "Alpha", "--json"]);
     let ambiguous = fixture.run(&outside, &["task", "list", "--project", "Alpha", "--json"]);
-    assert!(!ambiguous.status.success(), "duplicate project name must not resolve silently");
+    assert!(
+        !ambiguous.status.success(),
+        "duplicate project name must not resolve silently"
+    );
     let ambiguous_message = String::from_utf8_lossy(&ambiguous.stderr).into_owned();
-    assert!(ambiguous_message.contains("2 Kanban projects are named Alpha"), "{ambiguous_message}");
+    assert!(
+        ambiguous_message.contains("2 Kanban projects are named Alpha"),
+        "{ambiguous_message}"
+    );
     assert!(
         ambiguous_message.contains(fixture.main.canonicalize().unwrap().to_str().unwrap())
             && ambiguous_message.contains(alpha_twin.canonicalize().unwrap().to_str().unwrap()),
@@ -1016,7 +1090,383 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
 
     // (9) --workspace still disambiguates what the name cannot.
     assert_eq!(
-        ids(&fixture.ok_json(&outside, &["task", "list", "--workspace", fixture.main.to_str().unwrap(), "--json"])),
+        ids(&fixture.ok_json(
+            &outside,
+            &[
+                "task",
+                "list",
+                "--workspace",
+                fixture.main.to_str().unwrap(),
+                "--json"
+            ]
+        )),
         vec!["t-alpha".to_owned()]
+    );
+}
+
+/// Every fix below has a probe on the pre-fix binary behind it. These assert the
+/// dangerous behaviour is gone, not merely that the happy path still works.
+#[test]
+fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board() {
+    let fixture = Fixture::new("flags");
+    let beta = fixture.root.join("beta");
+    fs::create_dir_all(&beta).unwrap();
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    fixture.ok_json(&beta, &["init", "--name", "Beta", "--json"]);
+
+    // A typo in --project must not fall through to directory resolution. Before
+    // this guard the task landed on Beta's board and the command reported
+    // success, which is the wrong-board damage ADR-007 exists to prevent.
+    let typo = fixture.run(
+        &beta,
+        &[
+            "task",
+            "add",
+            "meant for alpha",
+            "--projct",
+            "Alpha",
+            "--id",
+            "t-oops",
+            "--json",
+        ],
+    );
+    assert!(
+        !typo.status.success(),
+        "a mistyped --project must not be ignored"
+    );
+    let message = String::from_utf8_lossy(&typo.stderr).into_owned();
+    assert!(message.contains("unknown flag --projct"), "{message}");
+    assert!(message.contains("did you mean --project?"), "{message}");
+    for cwd in [&fixture.main, &beta] {
+        let listed = fixture.ok_json(cwd, &["task", "list", "--json"]);
+        assert!(
+            listed.as_array().unwrap().is_empty(),
+            "a rejected command still wrote: {listed}"
+        );
+    }
+
+    // A flag that is real elsewhere is still wrong here.
+    let misplaced = fixture.run(&fixture.main, &["task", "list", "--lease", "x", "--json"]);
+    assert!(!misplaced.status.success());
+    assert!(String::from_utf8_lossy(&misplaced.stderr).contains("unknown flag --lease"));
+
+    // A silently-ignored --status typo used to return the whole board.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "real", "--id", "t-real", "--json"],
+    );
+    let status_typo = fixture.run(
+        &fixture.main,
+        &["task", "list", "--statis", "done", "--json"],
+    );
+    assert!(
+        !status_typo.status.success(),
+        "a mistyped --status must not list everything"
+    );
+
+    // Valid flags, including the globals, keep working.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--status", "todo", "--json"],
+    );
+    assert!(
+        String::from_utf8_lossy(&fixture.run(&fixture.main, &["version"]).stdout)
+            .contains("kanban"),
+    );
+}
+
+#[test]
+fn compiled_binary_never_repermissions_directories_it_does_not_own() {
+    let fixture = Fixture::new("perms");
+    let shared = fixture.root.join("shared");
+    fs::create_dir_all(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    let board = shared.join("board.db");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "--db",
+            board.to_str().unwrap(),
+            "task",
+            "add",
+            "external board",
+            "--json",
+        ],
+    );
+
+    // `--db /tmp/x.db` used to chmod the containing directory to 0700. As root
+    // that locks a shared directory away from every other process on the host.
+    assert_eq!(
+        fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "kanban re-permissioned an operator directory it does not own",
+    );
+    // The board itself is still private, and was never briefly world-readable.
+    assert_eq!(
+        fs::metadata(&board).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Directories kanban does create are private from creation.
+    let nested = shared.join("deep/nest/board.db");
+    fixture.ok_json(
+        &fixture.main,
+        &["--db", nested.to_str().unwrap(), "task", "list", "--json"],
+    );
+    assert_eq!(
+        fs::metadata(shared.join("deep"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+    );
+}
+
+#[test]
+fn compiled_binary_protects_live_leases_from_operator_overrides() {
+    let fixture = Fixture::new("leases");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Leases", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "leased", "--id", "t-lease", "--json"],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-lease", "--as", "worker", "--json"],
+    );
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+
+    // Moving a leased task used to delete the claim row silently, so the holder
+    // discovered it only when its checkpoint failed after the work was done.
+    let stolen = fixture.run(
+        &fixture.main,
+        &["task", "move", "t-lease", "todo", "--as", "other", "--json"],
+    );
+    assert!(
+        !stolen.status.success(),
+        "move must not void another agent's lease"
+    );
+    let message = String::from_utf8_lossy(&stolen.stderr).into_owned();
+    assert!(message.contains("leased by worker"), "{message}");
+    assert!(message.contains("--force"), "{message}");
+    let removed = fixture.run(
+        &fixture.main,
+        &["task", "remove", "t-lease", "--as", "other", "--json"],
+    );
+    assert!(
+        !removed.status.success(),
+        "remove must not void another agent's lease"
+    );
+
+    // The holder can still finish, which is the property the guard protects.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-lease",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "did the work",
+            "--intent",
+            "keep going",
+            "--next-action",
+            "ship it",
+            "--json",
+        ],
+    );
+
+    // A `continue` checkpoint retains the lease, so worker still holds it here.
+    // --force is the deliberate override, and it is recorded as a seizure.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "move", "t-lease", "todo", "--as", "operator", "--force", "--json",
+        ],
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let events = Connection::open(&board).unwrap();
+    let seized: i64 = events
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='lease_seized'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(seized, 1, "a forced seizure must be recorded in the ledger");
+
+    // Removing a parent names its children instead of raising a raw FK error.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "parent", "--id", "s-p", "--type", "story", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "child", "--id", "t-c", "--parent", "s-p", "--json",
+        ],
+    );
+    let parent = fixture.run(
+        &fixture.main,
+        &["task", "remove", "s-p", "--as", "operator", "--json"],
+    );
+    assert!(!parent.status.success());
+    let parent_message = String::from_utf8_lossy(&parent.stderr).into_owned();
+    assert!(
+        parent_message.contains("child task(s): t-c"),
+        "{parent_message}"
+    );
+
+    // A lease length that would overflow the millisecond conversion is refused,
+    // not panicked on.
+    let overflow = fixture.run(
+        &fixture.main,
+        &[
+            "claim",
+            "t-c",
+            "--as",
+            "worker",
+            "--lease-minutes",
+            "999999999999999",
+            "--json",
+        ],
+    );
+    assert!(!overflow.status.success());
+    let overflow_message = String::from_utf8_lossy(&overflow.stderr).into_owned();
+    assert!(
+        overflow_message.contains("lease minutes must be between"),
+        "{overflow_message}"
+    );
+    assert!(!overflow_message.contains("panicked"), "{overflow_message}");
+}
+
+#[test]
+fn compiled_binary_reports_context_truncation_truthfully() {
+    let fixture = Fixture::new("truncation");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Truncation", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "long history", "--id", "t-long", "--json"],
+    );
+
+    // Under the note cap the packet is complete and must not claim otherwise.
+    for index in 0..5 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "note",
+                "t-long",
+                &format!("early note {index}"),
+                "--as",
+                "worker",
+                "--json",
+            ],
+        );
+    }
+    let short = fixture.ok_json(&fixture.main, &["context", "t-long", "--json"]);
+    assert_eq!(short["truncated"], false);
+    assert_eq!(short["notes"].as_array().unwrap().len(), 5);
+
+    // Past it, `truncated` was hardcoded false: a resuming agent was told it
+    // held the whole record while the oldest notes were being dropped.
+    for index in 5..110 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "note",
+                "t-long",
+                &format!("later note {index}"),
+                "--as",
+                "worker",
+                "--json",
+            ],
+        );
+    }
+    let long = fixture.ok_json(&fixture.main, &["context", "t-long", "--json"]);
+    let notes = long["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 100, "the cap itself still holds");
+    assert_eq!(long["truncated"], true, "dropped history must be declared");
+    // The retained window is the newest, and the rendered packet says so.
+    assert_eq!(notes.last().unwrap()["body"], "later note 109");
+    assert!(notes.iter().all(|note| note["body"] != "early note 0"));
+    let rendered = fixture.run(&fixture.main, &["context", "t-long"]);
+    assert!(rendered.status.success());
+    assert!(String::from_utf8_lossy(&rendered.stdout).contains("[older history omitted]"));
+}
+
+#[test]
+fn compiled_binary_refuses_to_shadow_an_enclosing_project() {
+    let fixture = Fixture::new("nesting");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Outer", "--json"]);
+    let inner = fixture.main.join("packages/inner");
+    fs::create_dir_all(&inner).unwrap();
+
+    // `kanban init` in a subdirectory used to create a second board. Tasks added
+    // there resolved to the nearer board and were invisible from the root.
+    let nested = fixture.run(&inner, &["init", "--name", "Inner", "--json"]);
+    assert!(
+        !nested.status.success(),
+        "init must not silently shadow an enclosing board"
+    );
+    let message = String::from_utf8_lossy(&nested.stderr).into_owned();
+    assert!(
+        message.contains("already inside Kanban project Outer"),
+        "{message}"
+    );
+    assert!(message.contains("workspace attach --to"), "{message}");
+    assert!(message.contains("--force"), "{message}");
+
+    // Attaching is the documented route, and shares one board across worktrees.
+    fixture.ok_json(
+        &inner,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            fixture.main.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &inner,
+        &[
+            "task",
+            "add",
+            "from the subtree",
+            "--id",
+            "t-inner",
+            "--json",
+        ],
+    );
+    let from_root = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert_eq!(
+        from_root.as_array().unwrap().len(),
+        1,
+        "attached worktree wrote to a different board"
+    );
+    assert_eq!(from_root[0]["id"], "t-inner");
+
+    // A deliberate nested board is still reachable, but only when asked for.
+    let sibling = fixture.main.join("packages/separate");
+    fs::create_dir_all(&sibling).unwrap();
+    fixture.ok_json(
+        &sibling,
+        &["init", "--name", "Separate", "--force", "--json"],
+    );
+    assert!(
+        fixture
+            .ok_json(&sibling, &["task", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a forced nested board must be its own board",
     );
 }

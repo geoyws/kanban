@@ -1,10 +1,8 @@
-use crate::db::{checkpoint, integrity, open_registry};
+use crate::db::{checkpoint, create_backup_target, integrity, open_registry, own_private_dir};
 use crate::model::{ProjectRecord, WorkspaceRecord};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::env;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -45,17 +43,40 @@ pub struct Registry {
 impl Registry {
     pub fn open() -> Result<Self> {
         let root = data_root()?;
-        fs::create_dir_all(&root)?;
+        own_private_dir(&root)?;
         let connection = open_registry(&root.join("registry.db"))?;
         Ok(Self { connection, root })
     }
 
-    pub fn register(&mut self, workspace: &Path, name: &str) -> Result<WorkspaceRecord> {
+    pub fn register(
+        &mut self,
+        workspace: &Path,
+        name: &str,
+        force: bool,
+    ) -> Result<WorkspaceRecord> {
         let root_path = workspace
             .canonicalize()
             .with_context(|| format!("resolve workspace {}", workspace.display()))?;
         let root_text = root_path.to_string_lossy().into_owned();
         let now = now_ms();
+        // An init below a registered root used to create a second board that
+        // shadowed the first: tasks added from the subdirectory resolved to the
+        // nearer board and were invisible from the project root. Attaching is
+        // almost always what was meant; nesting has to be asked for.
+        if !force
+            && self.exact(&root_path)?.is_none()
+            && let Some(enclosing) = self.enclosing(&root_path)?
+        {
+            bail!(
+                "{} is already inside Kanban project {} ({}).\n\
+                 To share that project's board:   kanban workspace attach --to {}\n\
+                 To create a separate board here: kanban init --name {name} --force",
+                root_path.display(),
+                enclosing.name,
+                enclosing.root_path,
+                enclosing.root_path
+            );
+        }
         if let Some(existing) = self.exact(&root_path)? {
             let table = if existing.canonical {
                 "workspaces"
@@ -80,6 +101,18 @@ impl Registry {
         )?;
         self.exact(&root_path)?
             .context("registered workspace not found")
+    }
+
+    /// The nearest registered workspace strictly above `workspace`, if any.
+    /// Read-only: unlike `resolve`, it does not touch `last_used_at`.
+    fn enclosing(&self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
+        let mut cursor = workspace.to_path_buf();
+        while cursor.pop() {
+            if let Some(found) = self.exact(&cursor)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 
     pub fn exact(&self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
@@ -242,19 +275,9 @@ impl Registry {
     }
 
     pub fn backup(&self, destination: &Path) -> Result<()> {
-        if destination.exists() {
-            bail!(
-                "backup destination already exists: {}",
-                destination.display()
-            );
-        }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut target = Connection::open(destination)?;
+        let mut target = create_backup_target(destination)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut target)?;
         backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
-        fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 }

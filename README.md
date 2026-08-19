@@ -142,13 +142,17 @@ kanban workspace attach --to /path/to/main-worktree
 kanban dashboard
 ```
 
-SQLite runs in WAL mode with foreign keys and a five-second busy timeout.
-Mutations use prepared statements and `BEGIN IMMEDIATE` where ownership is
-decided. Agents should use the typed library or CLI; arbitrary write SQL is
-not part of the public contract.
+SQLite runs in WAL mode with `synchronous=FULL`, foreign keys, and a five-second
+busy timeout. Mutations use prepared statements and `BEGIN IMMEDIATE` where
+ownership is decided. Agents should use the typed library or CLI; arbitrary
+write SQL is not part of the public contract.
 
-The registry directory is mode `0700`; database files and snapshots are mode
-`0600`. Check and back up all registered boards with:
+The registry directory is mode `0700`; database files and snapshots are created
+mode `0600` before SQLite opens them, so they are never briefly world-readable.
+Directories Kanban creates are `0700` from creation. Kanban never re-permissions
+a directory it did not create, so pointing `--db` at a shared path leaves that
+path alone ([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)).
+Check and back up all registered boards with:
 
 ```bash
 kanban doctor
@@ -180,6 +184,31 @@ notes, and unknown extension JSON are preserved. Dangling historical
 relationships are retained as warning metadata rather than inserted as invalid
 foreign-key edges.
 
+## Failing closed
+
+Kanban is driven by agents that cannot notice a mistake: a turn issues a
+command, reads the exit status, and moves on. So an operation that cannot be
+interpreted unambiguously is refused rather than guessed
+([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)).
+
+- **Unknown flags are errors.** Every flag is declared per command, and an
+  unrecognized one names the nearest match. A mistyped `--projct alpha` used to
+  fall through to directory resolution and write to whichever board contained
+  the working directory.
+- **A live lease is not overridden silently.** `task move` and `task remove`
+  refuse against a claimed task, naming the holder and its expiry. `--force`
+  seizes the lease and writes a `lease_seized` event; a forced removal also
+  records how many notes and checkpoints it discarded.
+- **`init` will not shadow an enclosing project.** Running it inside a
+  registered tree points at `kanban workspace attach --to ROOT`, which is
+  almost always what was meant. `--force` creates a genuinely separate nested
+  board.
+- **`context` declares what it dropped.** `truncated` is computed by
+  over-fetching past each cap, so a resuming agent is never told it holds the
+  complete record when it does not.
+
+Every command still prints JSON whether or not `--json` is passed.
+
 ## Current scope
 
 Version 0.3 is the compiled Rust private multi-project CLI and continuity slice.
@@ -198,8 +227,9 @@ Integration handoffs: [orch](docs/integrating-orch.md) and
 
 See the [product requirements](docs/PRD.md),
 [ADR-001](docs/adr/ADR-001-durable-agent-work-ledger.md),
-[ADR-003](docs/adr/ADR-003-private-multi-project-personal-work-system.md), and
-[ADR-004](docs/adr/ADR-004-token-pressure-handoffs-through-kanban.md).
+[ADR-003](docs/adr/ADR-003-private-multi-project-personal-work-system.md),
+[ADR-004](docs/adr/ADR-004-token-pressure-handoffs-through-kanban.md), and
+[ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md).
 
 ## Development
 

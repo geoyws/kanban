@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 const HELP: &str = r#"kanban — durable work ledger for agents (Rust)
 
 Usage:
-  kanban init [--name NAME] [--workspace PATH]
+  kanban version
+  kanban init [--name NAME] [--workspace PATH] [--force]
   kanban workspace list [--json]
   kanban workspace attach --to REGISTERED_PATH [--workspace PATH]
   kanban dashboard [--json]
@@ -33,8 +34,8 @@ Usage:
              [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--with-relations] [--json]
   kanban task show ID [--json]
-  kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT]
-  kanban task remove ID --as ACTOR
+  kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
+  kanban task remove ID --as ACTOR [--force]
   kanban task update ID --as ACTOR [task fields]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
   kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
@@ -62,11 +63,16 @@ Environment:
   KANBAN_DATA_DIR    private data root (else $XDG_DATA_HOME/kanban, else
                      ~/.local/share/kanban)
 
+--force is required to override a live lease (task move/remove) or to nest a
+second board inside a registered project tree (init). Unknown flags are errors.
+
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-const BOOLEAN: [&str; 15] = [
+const BOOLEAN: [&str; 17] = [
     "help",
     "json",
+    "version",
+    "force",
     "next",
     "keep-status",
     "driver-only",
@@ -81,6 +87,106 @@ const BOOLEAN: [&str; 15] = [
     "clear-dependencies",
     "reconcile",
 ];
+
+/// Accepted on every board command; see `store_path`.
+const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
+
+/// Every flag each command accepts.
+///
+/// An unrecognized flag is an error, never a silent no-op. A mistyped
+/// `--projct alpha` used to fall through to directory resolution and write to
+/// whichever board contained the working directory — the exact "wrong board"
+/// damage ADR-007 exists to prevent, reported as success.
+fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static str]> {
+    Some(match (command, sub) {
+        ("init", _) => &["name", "force"],
+        ("workspace", Some("list")) => &[],
+        ("workspace", Some("attach")) => &["to"],
+        ("dashboard", _) | ("doctor", _) => &[],
+        ("backup", _) => &["output"],
+        ("task", Some("add")) => &[
+            "id",
+            "type",
+            "parent",
+            "body",
+            "status",
+            "priority",
+            "depends-on",
+            "assignee",
+            "lane",
+            "deliverable",
+            "stale-minutes",
+            "driver-only",
+        ],
+        ("task", Some("list")) => &["status", "with-relations"],
+        ("task", Some("show")) => &[],
+        ("task", Some("move")) => &["as", "metadata-patch-json", "force"],
+        ("task", Some("remove")) => &["as", "force"],
+        ("task", Some("metadata")) => &["as", "patch-json"],
+        ("task", Some("update")) => &[
+            "as",
+            "parent",
+            "clear-parent",
+            "title",
+            "body",
+            "assignee",
+            "unassign",
+            "lane",
+            "clear-lane",
+            "deliverable",
+            "clear-deliverable",
+            "stale-minutes",
+            "driver-only",
+            "no-driver-only",
+            "priority",
+            "depends-on",
+            "clear-dependencies",
+        ],
+        ("story", Some("advance")) => &["as", "to", "reviewer", "committer"],
+        ("story", Some("signoff")) | ("story", Some("unsignoff")) => &["as", "note"],
+        ("claim", _) => &[
+            "as",
+            "session",
+            "lease-minutes",
+            "lane",
+            "role",
+            "caller-scope",
+            "no-cross-lane",
+            "allow-reassign",
+            "next",
+        ],
+        ("heartbeat", _) => &["lease", "lease-minutes"],
+        ("release", _) => &["lease", "keep-status"],
+        ("note", _) => &["as", "kind"],
+        ("checkpoint", _) | ("handoff", Some("create")) => &[
+            "lease",
+            "as",
+            "session",
+            "model",
+            "state",
+            "to",
+            "reason",
+            "summary",
+            "intent",
+            "next-action",
+            "blocker",
+            "validation",
+            "repo",
+            "branch",
+            "head",
+            "dirty",
+        ],
+        ("handoff", Some("list")) => &["task", "status"],
+        ("handoff", Some("accept")) => &["as", "session", "lease-minutes", "caller-scope"],
+        ("import", Some("atmux-json")) | ("import", Some("atmux-sqlite")) => &["as", "reconcile"],
+        ("context", _) => &["max-chars"],
+        ("todo", _) => &["output"],
+        _ => return None,
+    })
+}
+
+/// Commands whose second positional is a subcommand rather than an id.
+const SUBCOMMAND_GROUPS: [&str; 5] = ["task", "story", "handoff", "import", "workspace"];
 
 struct Args {
     positionals: Vec<String>,
@@ -142,6 +248,84 @@ impl Args {
             .with_context(|| format!("{name} must be an integer"))
             .map(|v| v.unwrap_or(fallback))
     }
+
+    /// Fail on any flag this command does not define, naming the nearest match.
+    fn reject_unknown(&self, allowed: &[&str]) -> Result<()> {
+        let mut unknown = self
+            .flags
+            .keys()
+            .filter(|name| {
+                !allowed.contains(&name.as_str()) && !GLOBAL_FLAGS.contains(&name.as_str())
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        unknown.sort_unstable();
+        let mut known = allowed
+            .iter()
+            .chain(GLOBAL_FLAGS.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        known.sort_unstable();
+        let suggestion = nearest(unknown[0], &known)
+            .map(|hit| format!("; did you mean --{hit}?"))
+            .unwrap_or_default();
+        bail!(
+            "unknown flag{} {}{suggestion}\naccepted here: {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            unknown
+                .iter()
+                .map(|name| format!("--{name}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            known
+                .iter()
+                .map(|name| format!("--{name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+/// The closest accepted flag within one third of the typo's length, so a real
+/// slip is corrected and an unrelated word is not "corrected" into nonsense.
+fn nearest<'a>(value: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let budget = (value.chars().count() / 3).max(1);
+    candidates
+        .iter()
+        .map(|candidate| (edit_distance(value, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= budget)
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()))
+        .map(|(_, candidate)| candidate)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, a) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, b) in right.iter().enumerate() {
+            current[j + 1] = (previous[j] + usize::from(a != *b))
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+/// Minutes to milliseconds, refusing values that would overflow or expire
+/// instantly. `--lease-minutes 999999999999999` used to panic on the multiply.
+fn lease_ms(args: &Args) -> Result<i64> {
+    const MAX_MINUTES: i64 = 43_200; // 30 days
+    let minutes = args.integer("lease-minutes", 15)?;
+    if !(1..=MAX_MINUTES).contains(&minutes) {
+        bail!("lease minutes must be between 1 and {MAX_MINUTES}, got {minutes}");
+    }
+    Ok(minutes * 60_000)
 }
 
 fn print<T: Serialize>(value: &T, _pretty: bool) -> Result<()> {
@@ -178,7 +362,10 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
             registry.touch_board(&project.board_path)?;
             Ok(PathBuf::from(&project.board_path))
         }
-        [] => bail!("no Kanban project named {name}{}", known_projects(registry)?),
+        [] => bail!(
+            "no Kanban project named {name}{}",
+            known_projects(registry)?
+        ),
         many => bail!(
             "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
             many.len(),
@@ -235,35 +422,35 @@ fn option_string(args: &Args, name: &str) -> Option<String> {
     args.one(name).map(str::to_owned)
 }
 
+/// Serialize a struct that is always a JSON object, so callers can extend it.
+fn object_of<T: Serialize>(value: &T) -> Result<Map<String, Value>> {
+    match serde_json::to_value(value)? {
+        Value::Object(map) => Ok(map),
+        other => bail!("expected a JSON object, got {other}"),
+    }
+}
+
 fn list_json(store: &Store, status: Option<&str>, relations: bool) -> Result<Value> {
     let tasks = store.list_tasks(status)?;
     if !relations {
         return Ok(serde_json::to_value(tasks)?);
     }
-    Ok(Value::Array(
-        tasks
-            .into_iter()
-            .map(|task| {
-                let mut value = serde_json::to_value(&task)
-                    .unwrap()
-                    .as_object()
-                    .unwrap()
-                    .clone();
-                value.insert(
-                    "dependencies".into(),
-                    json!(
-                        store
-                            .dependencies(&task.id)
-                            .unwrap()
-                            .into_iter()
-                            .map(|d| d.id)
-                            .collect::<Vec<_>>()
-                    ),
-                );
-                Value::Object(value)
-            })
-            .collect(),
-    ))
+    let mut out = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let mut value = object_of(&task)?;
+        value.insert(
+            "dependencies".into(),
+            json!(
+                store
+                    .dependencies(&task.id)?
+                    .into_iter()
+                    .map(|dependency| dependency.id)
+                    .collect::<Vec<_>>()
+            ),
+        );
+        out.push(Value::Object(value));
+    }
+    Ok(Value::Array(out))
 }
 
 fn main() {
@@ -275,6 +462,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
+    if args.has("version") {
+        println!("kanban {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.positionals.is_empty() || args.has("help") {
         println!("{HELP}");
         return Ok(());
@@ -283,6 +474,17 @@ fn run() -> Result<()> {
     let sub = args.positionals.get(1).map(String::as_str);
     let rest = args.positionals.get(2..).unwrap_or(&[]);
 
+    if command == "version" {
+        println!("kanban {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
+    match allowed_flags(command, spec_sub) {
+        Some(allowed) => args.reject_unknown(allowed)?,
+        None => bail!("unknown command; run kanban --help"),
+    }
+
     if command == "init" {
         let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
         let fallback = workspace
@@ -290,7 +492,11 @@ fn run() -> Result<()> {
             .and_then(|v| v.to_str())
             .unwrap_or("project");
         let mut registry = Registry::open()?;
-        let record = registry.register(&workspace, args.one("name").unwrap_or(fallback))?;
+        let record = registry.register(
+            &workspace,
+            args.one("name").unwrap_or(fallback),
+            args.has("force"),
+        )?;
         let store = Store::open(Path::new(&record.board_path))?;
         store.initialize(&record.name)?;
         return print(&record, args.has("json"));
@@ -317,7 +523,7 @@ fn run() -> Result<()> {
                     json!(tasks.iter().filter(|task| task.status == status).count()),
                 );
             }
-            let mut value = serde_json::to_value(&project)?.as_object().unwrap().clone();
+            let mut value = object_of(&project)?;
             value.insert("taskCounts".into(), Value::Object(counts));
             value.insert(
                 "pendingHandoffs".into(),
@@ -359,9 +565,10 @@ fn run() -> Result<()> {
         let mut boards = Vec::new();
         for project in registry.projects()? {
             let store = Store::open(Path::new(&project.board_path))?;
-            let destination = directory
-                .join("boards")
-                .join(Path::new(&project.board_path).file_name().unwrap());
+            let file_name = Path::new(&project.board_path)
+                .file_name()
+                .with_context(|| format!("board path has no file name: {}", project.board_path))?;
+            let destination = directory.join("boards").join(file_name);
             store.backup(&destination)?;
             boards.push(destination.to_string_lossy().into_owned());
         }
@@ -402,7 +609,7 @@ fn run() -> Result<()> {
         let id = rest.first().context("task id is required")?;
         let task = store.require_task(id)?;
         let claim = store.get_claim(id)?.as_ref().map(ClaimSummary::from);
-        let mut value = serde_json::to_value(task)?.as_object().unwrap().clone();
+        let mut value = object_of(&task)?;
         value.insert(
             "dependencies".into(),
             serde_json::to_value(store.dependencies(id)?)?,
@@ -427,12 +634,12 @@ fn run() -> Result<()> {
             .map(serde_json::from_str)
             .transpose()?
             .unwrap_or_else(|| json!({}));
-        let task = store.move_task(id, status, args.require("as")?, patch)?;
+        let task = store.move_task(id, status, args.require("as")?, patch, args.has("force"))?;
         return print(&task, args.has("json"));
     }
     if command == "task" && sub == Some("remove") {
         let id = rest.first().context("task id is required")?;
-        store.remove_task(id, args.require("as")?)?;
+        store.remove_task(id, args.require("as")?, args.has("force"))?;
         return print(&json!({"removed":id}), args.has("json"));
     }
     if command == "task" && sub == Some("metadata") {
@@ -542,7 +749,7 @@ fn run() -> Result<()> {
             ClaimOptions {
                 agent_id: args.require("as")?.into(),
                 session_id: option_string(&args, "session"),
-                lease_ms: args.integer("lease-minutes", 15)? * 60_000,
+                lease_ms: lease_ms(&args)?,
                 caller_lane: option_string(&args, "lane"),
                 role_filter: option_string(&args, "role"),
                 caller_scope: option_string(&args, "caller-scope"),
@@ -555,11 +762,7 @@ fn run() -> Result<()> {
     if command == "heartbeat" {
         let id = sub.context("task id is required")?;
         return print(
-            &store.heartbeat(
-                id,
-                args.require("lease")?,
-                args.integer("lease-minutes", 15)? * 60_000,
-            )?,
+            &store.heartbeat(id, args.require("lease")?, lease_ms(&args)?)?,
             args.has("json"),
         );
     }
@@ -636,7 +839,7 @@ fn run() -> Result<()> {
             id,
             args.require("as")?,
             option_string(&args, "session"),
-            args.integer("lease-minutes", 15)? * 60_000,
+            lease_ms(&args)?,
             args.one("caller-scope"),
         )?;
         return print(&json!({"handoff":handoff,"claim":claim}), args.has("json"));
