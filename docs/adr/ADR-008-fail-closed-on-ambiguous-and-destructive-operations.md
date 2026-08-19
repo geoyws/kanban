@@ -56,6 +56,15 @@ a nested init. Forcing is a first-class, audited path, not a workaround: a
 seizure writes a `lease_seized` event, and a removal records the count of notes
 and checkpoints it discarded.
 
+**Short names are an exact-match table, never inferred.** The crate installs
+`kanban` and `kb`, and commands carry short forms (`t ls`, `t mv`, `t rm`). Every
+one is written down. Prefix inference is refused in both directions: `--proj` is
+not accepted as `--project`, and `task li` is not accepted as `task list`,
+because adding a `--projection` or a `task link` later would silently retarget
+callers that already work — the same silent change of meaning as a mistyped flag,
+arriving through a feature instead of a slip. An unknown flag close to a real one
+is *suggested*, which costs nothing because the command still fails.
+
 **A field that qualifies the data is computed, never assumed.** `truncated` is
 derived by over-fetching one row past each cap. A constant that happens to be
 right most of the time is a lie the rest of the time.

@@ -34,7 +34,7 @@ fan-out. Kanban moves the minimum safe handoff contract out of chat:
 Requires a Rust toolchain with Cargo.
 
 ```bash
-cargo install --path . --locked
+cargo install --path . --locked   # installs both `kanban` and `kb`
 
 cd /path/to/project
 kanban init --name my-project
@@ -184,6 +184,36 @@ notes, and unknown extension JSON are preserved. Dangling historical
 relationships are retained as warning metadata rather than inserted as invalid
 foreign-key edges.
 
+## Short names
+
+The crate installs two binaries, `kanban` and `kb`, which are the same program.
+`kb` is a real binary rather than a shell alias because agents invoke it from
+non-interactive cages that never source a shell profile.
+
+Commands and subcommands have short forms:
+
+| Scope | Aliases |
+| --- | --- |
+| command | `t`=task · `s`=story · `h`=handoff · `w`/`ws`=workspace · `cp`=checkpoint · `hb`=heartbeat · `ctx`=context · `dash`=dashboard · `rel`=release · `n`=note · `v`=version |
+| `task` | `ls`=list · `mv`=move · `rm`=remove · `new`=add · `up`=update · `meta`=metadata · `cat`=show |
+| `story` | `adv`=advance |
+| `handoff` | `ls`=list · `new`=create · `acc`=accept |
+| `workspace` | `ls`=list · `att`=attach |
+
+```bash
+kb t ls --status todo
+kb t mv t-resume done --as deepseek
+```
+
+Aliases resolve by exact match against the table above. Unlisted short forms
+stay unknown commands, and flags are never abbreviated — `--proj` is an error
+that suggests `--project`, not a synonym for it. Prefix inference would mean a
+command or flag added later silently retargets callers that already work
+([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)).
+
+Sub-aliases apply only where the second word is a subcommand, so a task whose
+id happens to be `rm` is still addressable.
+
 ## Failing closed
 
 Kanban is driven by agents that cannot notice a mistake: a turn issues a
@@ -240,8 +270,10 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-The E2E suite invokes `CARGO_BIN_EXE_kanban` as separate operating-system
-processes. It covers persistence and restart, concurrent claims, worktree
+The program lives in the crate's library; `kanban` and `kb` are thin binary
+shims over it, so the crate is compiled once rather than twice. The E2E suite
+invokes `CARGO_BIN_EXE_kanban` and `CARGO_BIN_EXE_kb` as separate
+operating-system processes. It covers persistence and restart, concurrent claims, worktree
 aliases, token-pressure handoffs, story gates, imports, backup/reopen, bounded
 context, TODO projection, and the released SQLite v3 format.
 

@@ -5,9 +5,21 @@ edition = "2024"
 description = "Durable private work ledger for long-horizon agents"
 license = "MIT"
 
+[lib]
+name = "kanban"
+path = "rust/lib.rs"
+
 [[bin]]
 name = "kanban"
-path = "rust/main.rs"
+path = "rust/bin/kanban.rs"
+
+# `kb` is the same program under a shorter name. Agents type this hundreds of
+# times per session, and a shell alias would not reach the non-interactive
+# cages that call it. Both binaries are shims over one library, so the crate is
+# compiled once.
+[[bin]]
+name = "kb"
+path = "rust/bin/kb.rs"
 
 [dependencies]
 anyhow = "1.0.104"

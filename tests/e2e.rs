@@ -1489,3 +1489,130 @@ fn compiled_binary_refuses_to_shadow_an_enclosing_project() {
         "a forced nested board must be its own board",
     );
 }
+
+#[test]
+fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
+    let fixture = Fixture::new("aliases");
+    // `kb` is a second binary, not a shell alias: agents call it from
+    // non-interactive cages that never source a shell profile.
+    let kb = |cwd: &Path, args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_kb"))
+            .current_dir(cwd)
+            .env("KANBAN_DATA_DIR", &fixture.data)
+            .env_remove("KANBAN_DB")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let kb_json = |cwd: &Path, args: &[&str]| -> Value {
+        let output = kb(cwd, args);
+        assert!(
+            output.status.success(),
+            "kb failed: {args:?}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    assert!(String::from_utf8_lossy(&kb(&fixture.main, &["version"]).stdout).contains("kanban"));
+    kb_json(&fixture.main, &["init", "--name", "Aliased", "--json"]);
+
+    // Every alias reaches the same command as its long form.
+    kb_json(
+        &fixture.main,
+        &["t", "new", "aliased", "--id", "t-1", "--json"],
+    );
+    assert_eq!(
+        kb_json(&fixture.main, &["t", "ls", "--json"])[0]["id"],
+        "t-1"
+    );
+    kb_json(
+        &fixture.main,
+        &["t", "mv", "t-1", "review", "--as", "geo", "--json"],
+    );
+    assert_eq!(
+        kb_json(&fixture.main, &["t", "cat", "t-1", "--json"])["status"],
+        "review"
+    );
+    kb_json(
+        &fixture.main,
+        &["t", "up", "t-1", "--as", "geo", "--priority", "1", "--json"],
+    );
+    kb_json(
+        &fixture.main,
+        &["n", "t-1", "a note", "--as", "geo", "--json"],
+    );
+    assert!(kb(&fixture.main, &["ctx", "t-1"]).status.success());
+    assert!(kb(&fixture.main, &["dash"]).status.success());
+    kb_json(&fixture.main, &["w", "ls", "--json"]);
+
+    // Both binaries are one program over one board.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["priority"],
+        1
+    );
+    kb_json(&fixture.main, &["t", "rm", "t-1", "--as", "geo", "--json"]);
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["task", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Sub-aliases apply only where the second positional is a subcommand. A
+    // task genuinely called `rm` must not be rewritten into a removal.
+    kb_json(
+        &fixture.main,
+        &["t", "new", "edge case", "--id", "rm", "--json"],
+    );
+    kb_json(
+        &fixture.main,
+        &["n", "rm", "note on task rm", "--as", "geo", "--json"],
+    );
+    assert_eq!(
+        kb_json(&fixture.main, &["t", "cat", "rm", "--json"])["id"],
+        "rm"
+    );
+
+    // Aliases are an exact-match table, so an unlisted one stays unknown
+    // rather than being inferred (ADR-008).
+    let invented = kb(&fixture.main, &["t", "zz", "--json"]);
+    assert!(!invented.status.success());
+    assert!(String::from_utf8_lossy(&invented.stderr).contains("unknown command"));
+    let stem = kb(&fixture.main, &["task", "li", "--json"]);
+    assert!(
+        !stem.status.success(),
+        "an unlisted stem must not resolve to list"
+    );
+}
+
+#[test]
+fn compiled_binary_suggests_the_flag_an_abbreviation_was_reaching_for() {
+    let fixture = Fixture::new("hints");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Hints", "--json"]);
+    let stderr = |args: &[&str]| -> String {
+        let output = fixture.run(&fixture.main, args);
+        assert!(!output.status.success(), "{args:?} should have failed");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    // Abbreviating is at least as common as mistyping, and edit distance alone
+    // misses it: `proj` is three edits from `project`.
+    assert!(stderr(&["task", "list", "--proj", "Hints"]).contains("did you mean --project?"));
+    assert!(stderr(&["task", "list", "--pro", "Hints"]).contains("did you mean --project?"));
+    assert!(stderr(&["task", "list", "--projct", "Hints"]).contains("did you mean --project?"));
+    assert!(stderr(&["heartbeat", "t-1", "--lese", "x"]).contains("did you mean --lease?"));
+
+    // An ambiguous stem is not guessed at. Under `task add`, --p could be
+    // parent, priority or project, so the accepted list is the answer.
+    let ambiguous = stderr(&["task", "add", "T", "--p", "x"]);
+    assert!(!ambiguous.contains("did you mean"), "{ambiguous}");
+    assert!(
+        ambiguous.contains("--parent") && ambiguous.contains("--priority"),
+        "{ambiguous}"
+    );
+
+    // A stem is a suggestion, never an alias: it must still fail.
+    assert!(stderr(&["task", "list", "--proj", "Hints"]).contains("unknown flag --proj"));
+}

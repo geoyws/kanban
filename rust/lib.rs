@@ -63,6 +63,15 @@ Environment:
   KANBAN_DATA_DIR    private data root (else $XDG_DATA_HOME/kanban, else
                      ~/.local/share/kanban)
 
+Aliases (the binary installs as both `kanban` and `kb`):
+  t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
+  ctx=context  dash=dashboard  rel=release  n=note  v=version
+  task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
+  story:     adv=advance
+  handoff:   ls=list  new=create  acc=accept
+  workspace: ls=list  att=attach
+Aliases resolve by exact match; abbreviations such as --proj are not accepted.
+
 --force is required to override a live lease (task move/remove) or to nest a
 second board inside a registered project tree (init). Unknown flags are errors.
 
@@ -203,6 +212,53 @@ fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static 
 /// Commands whose second positional is a subcommand rather than an id.
 const SUBCOMMAND_GROUPS: [&str; 5] = ["task", "story", "handoff", "import", "workspace"];
 
+/// Short names for commands, resolved by exact match only.
+///
+/// Never prefix inference: every alias is written down, so adding a command
+/// later cannot silently retarget one that already exists (ADR-008). An alias
+/// that is not listed stays an unknown command.
+fn canonical_command(value: &str) -> &str {
+    match value {
+        "t" => "task",
+        "s" => "story",
+        "h" => "handoff",
+        "w" | "ws" => "workspace",
+        "cp" => "checkpoint",
+        "hb" => "heartbeat",
+        "ctx" => "context",
+        "dash" => "dashboard",
+        "rel" => "release",
+        "n" => "note",
+        "v" => "version",
+        other => other,
+    }
+}
+
+/// Short names for subcommands, scoped to their group so `ls` can mean the
+/// obvious thing under each without ever being ambiguous.
+///
+/// Only applied to [`SUBCOMMAND_GROUPS`]: for `claim`, `note` or `checkpoint`
+/// the second positional is a task id, and a task genuinely called `rm` must
+/// not be rewritten.
+fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
+    match (command, value) {
+        ("task", "ls") => "list",
+        ("task", "mv") => "move",
+        ("task", "rm") => "remove",
+        ("task", "new") => "add",
+        ("task", "up") => "update",
+        ("task", "meta") => "metadata",
+        ("task", "cat") => "show",
+        ("story", "adv") => "advance",
+        ("handoff", "ls") => "list",
+        ("handoff", "new") => "create",
+        ("handoff", "acc") => "accept",
+        ("workspace", "ls") => "list",
+        ("workspace", "att") => "attach",
+        (_, other) => other,
+    }
+}
+
 struct Args {
     positionals: Vec<String>,
     flags: HashMap<String, Vec<String>>,
@@ -304,9 +360,31 @@ impl Args {
     }
 }
 
-/// The closest accepted flag within one third of the typo's length, so a real
-/// slip is corrected and an unrelated word is not "corrected" into nonsense.
+/// The accepted flag the operator most likely meant, or nothing.
+///
+/// Abbreviating is at least as common as mistyping, and edit distance scores a
+/// truncation badly — `proj` is three edits from `project`, so a typo-sized
+/// budget misses it entirely. Try prefixes first, then typos.
+///
+/// This only ever suggests. `--proj` stays an error rather than an alias for
+/// `--project`: accepting unambiguous prefixes means adding a `--projection`
+/// later silently retargets every existing `--proj` caller, which is the
+/// silent-change-of-meaning this guard exists to remove.
 fn nearest<'a>(value: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut prefixed = candidates
+        .iter()
+        .filter(|candidate| candidate.starts_with(value));
+    match (prefixed.next(), prefixed.next()) {
+        // Exactly one flag extends this stem.
+        (Some(only), None) => return Some(only),
+        // Several do. Guessing between them would be a coin flip, and the
+        // error already prints every flag accepted here.
+        (Some(_), Some(_)) => return None,
+        (None, _) => {}
+    }
     let budget = (value.chars().count() / 3).max(1);
     candidates
         .iter()
@@ -468,10 +546,14 @@ fn list_json(store: &Store, status: Option<&str>, relations: bool) -> Result<Val
     Ok(Value::Array(out))
 }
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("Error: {error:#}");
-        std::process::exit(1);
+/// Shared entry point for both installed binaries, `kanban` and `kb`.
+pub fn entrypoint() -> ! {
+    match run() {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1)
+        }
     }
 }
 
@@ -485,8 +567,12 @@ fn run() -> Result<()> {
         println!("{HELP}");
         return Ok(());
     }
-    let command = args.positionals[0].as_str();
-    let sub = args.positionals.get(1).map(String::as_str);
+    let command = canonical_command(args.positionals[0].as_str());
+    let sub = args
+        .positionals
+        .get(1)
+        .map(String::as_str)
+        .map(|value| canonical_sub(command, value));
     let rest = args.positionals.get(2..).unwrap_or(&[]);
 
     if command == "version" {
