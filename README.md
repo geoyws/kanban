@@ -282,6 +282,13 @@ cargo test --locked
 cargo build --release --locked
 ```
 
+`cargo test` runs unit tests for the pure logic (flag validation, the
+nearest-match hint, the alias tables, context trimming) alongside the E2E
+suite. Several are drift guards rather than behaviour tests: they assert every
+command declares its flags without duplicates, every boolean flag is accepted
+somewhere, and no alias shadows a real command — so extending the CLI without
+extending its tables fails the gate.
+
 The program lives in the crate's library; `kanban` and `kb` are thin binary
 shims over it, so the crate is compiled once rather than twice. The E2E suite
 invokes `CARGO_BIN_EXE_kanban` and `CARGO_BIN_EXE_kb` as separate

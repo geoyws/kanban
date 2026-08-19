@@ -993,3 +993,203 @@ fn run() -> Result<()> {
     }
     bail!("unknown command; run kanban --help")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Args {
+        Args::parse(values.iter().map(|value| (*value).to_owned()).collect()).unwrap()
+    }
+
+    /// Every command reachable from `run`, as (command, subcommand).
+    /// Kept here so the drift guards below cover the real surface.
+    const SURFACE: [(&str, Option<&str>); 29] = [
+        ("init", None),
+        ("workspace", Some("list")),
+        ("workspace", Some("attach")),
+        ("dashboard", None),
+        ("doctor", None),
+        ("backup", None),
+        ("task", Some("add")),
+        ("task", Some("list")),
+        ("task", Some("show")),
+        ("task", Some("move")),
+        ("task", Some("remove")),
+        ("task", Some("metadata")),
+        ("task", Some("update")),
+        ("story", Some("advance")),
+        ("story", Some("signoff")),
+        ("story", Some("unsignoff")),
+        ("claim", None),
+        ("heartbeat", None),
+        ("release", None),
+        ("note", None),
+        ("checkpoint", None),
+        ("handoff", Some("create")),
+        ("handoff", Some("list")),
+        ("handoff", Some("accept")),
+        ("events", None),
+        ("context", None),
+        ("import", Some("atmux-json")),
+        ("import", Some("atmux-sqlite")),
+        ("todo", None),
+    ];
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("status", "status"), 0);
+        assert_eq!(edit_distance("statis", "status"), 1); // substitution
+        assert_eq!(edit_distance("staus", "status"), 1); // deletion
+        assert_eq!(edit_distance("statuss", "status"), 1); // insertion
+        assert_eq!(edit_distance("proj", "project"), 3); // truncation scores badly
+        assert_eq!(edit_distance("", "status"), 6);
+    }
+
+    #[test]
+    fn nearest_prefers_prefixes_then_typos() {
+        let flags = ["db", "help", "json", "project", "status", "workspace"];
+        // A truncation is what edit distance alone misses.
+        assert_eq!(nearest("proj", &flags), Some("project"));
+        assert_eq!(nearest("pro", &flags), Some("project"));
+        assert_eq!(nearest("p", &flags), Some("project"));
+        // A typo still resolves.
+        assert_eq!(nearest("statis", &flags), Some("status"));
+        assert_eq!(nearest("wrokspace", &flags), Some("workspace")); // transposition
+        // Nothing close is better than a confident wrong answer.
+        assert_eq!(nearest("frobnicate", &flags), None);
+        assert_eq!(nearest("", &flags), None);
+    }
+
+    #[test]
+    fn nearest_refuses_to_guess_between_equally_valid_stems() {
+        let flags = ["parent", "priority", "project"];
+        // `--p` could be any of three: the caller gets the accepted list instead.
+        assert_eq!(nearest("p", &flags), None);
+        assert_eq!(nearest("pr", &flags), None);
+        // Once the stem is decisive, it resolves again.
+        assert_eq!(nearest("pare", &flags), Some("parent"));
+        assert_eq!(nearest("prio", &flags), Some("priority"));
+    }
+
+    #[test]
+    fn lease_minutes_is_bounded_and_cannot_overflow() {
+        assert_eq!(
+            lease_ms(&args(&["--lease-minutes", "15"])).unwrap(),
+            900_000
+        );
+        assert_eq!(lease_ms(&args(&[])).unwrap(), 900_000); // default
+        assert_eq!(
+            lease_ms(&args(&["--lease-minutes", "43200"])).unwrap(),
+            2_592_000_000
+        );
+        for bad in ["0", "-1", "43201", "999999999999999", &i64::MAX.to_string()] {
+            assert!(
+                lease_ms(&args(&["--lease-minutes", bad])).is_err(),
+                "--lease-minutes {bad} must be refused, not wrapped"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_flags_are_rejected_and_globals_are_not() {
+        let allowed = ["status", "with-relations"];
+        assert!(args(&["--status", "todo"]).reject_unknown(&allowed).is_ok());
+        for global in GLOBAL_FLAGS {
+            assert!(
+                args(&[&format!("--{global}"), "x"])
+                    .reject_unknown(&allowed)
+                    .is_ok(),
+                "--{global} must be accepted everywhere"
+            );
+        }
+        let error = args(&["--projct", "x"])
+            .reject_unknown(&allowed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown flag --projct"), "{error}");
+        assert!(error.contains("did you mean --project?"), "{error}");
+    }
+
+    #[test]
+    fn every_command_declares_its_flags_without_duplicates() {
+        for (command, sub) in SURFACE {
+            let flags = allowed_flags(command, sub)
+                .unwrap_or_else(|| panic!("{command} {sub:?} has no flag declaration"));
+            let mut seen = flags.to_vec();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(
+                before,
+                seen.len(),
+                "{command} {sub:?} declares a flag twice"
+            );
+            for flag in flags {
+                assert!(
+                    !GLOBAL_FLAGS.contains(flag),
+                    "{command} {sub:?} redeclares the global --{flag}"
+                );
+            }
+        }
+        assert!(allowed_flags("frobnicate", None).is_none());
+        assert!(allowed_flags("task", Some("frobnicate")).is_none());
+    }
+
+    #[test]
+    fn every_boolean_flag_is_declared_by_some_command() {
+        for flag in BOOLEAN {
+            let declared = GLOBAL_FLAGS.contains(&flag)
+                || flag == "version"
+                || SURFACE.iter().any(|(command, sub)| {
+                    allowed_flags(command, *sub).is_some_and(|flags| flags.contains(&flag))
+                });
+            assert!(
+                declared,
+                "--{flag} parses as a boolean but no command accepts it"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_resolve_to_real_commands_and_shadow_nothing() {
+        // Every alias must land on a command that exists...
+        for alias in [
+            "t", "s", "h", "w", "ws", "cp", "hb", "ctx", "ev", "dash", "rel", "n", "v",
+        ] {
+            let resolved = canonical_command(alias);
+            assert_ne!(resolved, alias, "{alias} is not wired up");
+            assert!(
+                resolved == "version" || SURFACE.iter().any(|(command, _)| *command == resolved),
+                "alias {alias} resolves to unknown command {resolved}"
+            );
+            // ...and must not be the name of a different real command.
+            assert!(
+                !SURFACE.iter().any(|(command, _)| *command == alias),
+                "alias {alias} shadows a real command"
+            );
+        }
+        // A canonical name passes through untouched.
+        for (command, _) in SURFACE {
+            assert_eq!(canonical_command(command), command);
+        }
+    }
+
+    #[test]
+    fn subcommand_aliases_are_scoped_to_their_group() {
+        assert_eq!(canonical_sub("task", "ls"), "list");
+        assert_eq!(canonical_sub("task", "mv"), "move");
+        assert_eq!(canonical_sub("task", "rm"), "remove");
+        assert_eq!(canonical_sub("workspace", "ls"), "list");
+        assert_eq!(canonical_sub("handoff", "ls"), "list");
+        // `ls` means nothing under story, so it stays a bad subcommand.
+        assert_eq!(canonical_sub("story", "ls"), "ls");
+        // Groups that take an id rather than a subcommand never rewrite it: a
+        // task genuinely called `rm` must stay addressable.
+        assert_eq!(canonical_sub("note", "rm"), "rm");
+        assert!(!SUBCOMMAND_GROUPS.contains(&"note"));
+        assert!(!SUBCOMMAND_GROUPS.contains(&"claim"));
+        // Unlisted stems are not inferred.
+        assert_eq!(canonical_sub("task", "li"), "li");
+    }
+}

@@ -1422,3 +1422,40 @@ impl Drop for Store {
         let _ = wal_checkpoint(&self.connection);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_newest_trims_from_the_front_and_reports_it() {
+        // Lists arrive oldest-first, so the surplus to drop is the front.
+        let mut list = vec![1, 2, 3, 4, 5];
+        assert!(keep_newest(&mut list, 3));
+        assert_eq!(list, vec![3, 4, 5], "must retain the newest window");
+    }
+
+    #[test]
+    fn keep_newest_reports_nothing_dropped_when_under_the_cap() {
+        let mut exact = vec![1, 2, 3];
+        assert!(
+            !keep_newest(&mut exact, 3),
+            "a full-but-not-over list is not truncated"
+        );
+        assert_eq!(exact, vec![1, 2, 3]);
+
+        let mut under = vec![1];
+        assert!(!keep_newest(&mut under, 3));
+        assert_eq!(under, vec![1]);
+
+        let mut empty: Vec<i32> = vec![];
+        assert!(!keep_newest(&mut empty, 3));
+    }
+
+    #[test]
+    fn keep_newest_handles_a_zero_cap() {
+        let mut list = vec![1, 2];
+        assert!(keep_newest(&mut list, 0));
+        assert!(list.is_empty());
+    }
+}
