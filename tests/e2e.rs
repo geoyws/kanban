@@ -2056,3 +2056,93 @@ fn compiled_binary_locks_only_the_data_root_it_was_asked_to_touch() {
         String::from_utf8_lossy(&refused.stderr)
     );
 }
+
+#[test]
+fn compiled_binary_bounds_priority_without_rewriting_history() {
+    let fixture = Fixture::new("priority");
+    let project = fixture.ok_json(&fixture.main, &["init", "--name", "Priority", "--json"]);
+    let board = project["boardPath"].as_str().unwrap().to_owned();
+
+    // The band is the one the ledger already uses: 0 is the routing tier
+    // driver-only work sorts on, 9 the least urgent.
+    for good in ["0", "3", "9"] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                "in band",
+                "--id",
+                &format!("t-{good}"),
+                "--priority",
+                good,
+                "--json",
+            ],
+        );
+    }
+
+    // `claim --next` hands work out in ascending priority, so an unbounded
+    // field let a negative value hold the head of every queue permanently:
+    // nothing can outrank the bottom of an i64.
+    for bad in ["-1", "10", "-9223372036854775808", "9223372036854775807"] {
+        let refused = fixture.run(
+            &fixture.main,
+            &["task", "add", "out of band", "--priority", bad, "--json"],
+        );
+        assert!(
+            !refused.status.success(),
+            "task add --priority {bad} was accepted"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("most urgent"),
+            "stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    // The same band applies on update, and a refused update changes nothing.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-3",
+            "--as",
+            "geo",
+            "--priority",
+            "-1",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-3", "--json"])["priority"],
+        3,
+        "a refused update must leave the recorded priority alone"
+    );
+
+    // A row that already holds an out-of-band priority — an atmux import, or a
+    // board written before this rule — keeps it. Validating what a caller
+    // types is not a licence to rewrite recorded history to match.
+    let database = Connection::open(&board).unwrap();
+    database
+        .execute("UPDATE tasks SET priority=99 WHERE id='t-3'", [])
+        .unwrap();
+    drop(database);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-3", "--json"])["priority"],
+        99,
+        "an existing out-of-band priority must still be readable"
+    );
+    let updated = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "update", "t-3", "--as", "geo", "--title", "renamed", "--json",
+        ],
+    );
+    assert_eq!(updated["title"], "renamed");
+    assert_eq!(
+        updated["priority"], 99,
+        "an update that never mentioned priority silently normalized it"
+    );
+}

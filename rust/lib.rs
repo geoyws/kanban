@@ -31,7 +31,7 @@ Usage:
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban restore --from DIRECTORY --force [--json]
   kanban task add TITLE [--id ID] [--type epic|story|task] [--parent ID]
-             [--body TEXT] [--status STATUS] [--priority N] [--depends-on ID ...]
+             [--body TEXT] [--status STATUS] [--priority 0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--with-relations] [--json]

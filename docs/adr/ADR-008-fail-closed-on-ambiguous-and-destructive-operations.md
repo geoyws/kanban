@@ -132,6 +132,17 @@ root, because conjuring a private directory to lock is the same overreach as
 re-permissioning one — while a `--db` path that resolves *inside* the root is
 covered, traversal included.
 
+**A numeric field with no band is not validated, it is undefined.** `priority`
+accepted any `i64`. `claim --next` hands work out in ascending priority, so a
+negative value took the head of every queue permanently — nothing can outrank
+the bottom of the range — and no value in the type had a stated meaning. The
+band is `0` (most urgent, the tier driver-only work already sorts on) through
+`9`, default `3`; it follows what the ledger already meant by the field rather
+than imposing a new scale on it. Only a value a caller supplies is checked: a
+row holding something out of band, from an atmux import or a board written
+before this rule, keeps it. Validating input is not a licence to rewrite
+recorded history to match.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

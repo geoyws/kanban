@@ -265,6 +265,12 @@ interpreted unambiguously is refused rather than guessed
   `in_progress` on every read path while `claim --next` gave the same task
   away. Every board command now sweeps first, and each expiry is recorded as a
   `claim_expired` event.
+- **`priority` is a band, not any integer.** `0` (most urgent, the tier
+  driver-only work sorts on) through `9`, default `3`. `claim --next` hands out
+  work in ascending priority, so an unbounded field let a negative value hold
+  the head of every queue permanently — nothing can outrank the bottom of an
+  `i64`. Only a value you type is checked: a row that already holds something
+  out of band, from an atmux import or an older board, keeps it.
 - **`context` declares what it dropped.** `truncated` is computed by
   over-fetching past each cap, so a resuming agent is never told it holds the
   complete record when it does not.

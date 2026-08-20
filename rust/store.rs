@@ -22,6 +22,35 @@ fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Queue position: 0 is the most urgent, 9 the least, 3 the default.
+///
+/// The band follows what the ledger already means by the field rather than
+/// imposing a new scale on it: `0` is the routing tier the driver-only tasks
+/// use to sort ahead of everything an epic team can claim.
+const MOST_URGENT: i64 = 0;
+const LEAST_URGENT: i64 = 9;
+
+/// Refuse a priority outside the documented band.
+///
+/// `claim --next` hands work out in ascending priority, so this is the field
+/// that decides what an agent picks up. It accepted any `i64`: no value in the
+/// type had a stated meaning, and a negative one took the head of every queue
+/// permanently, because nothing can outrank the bottom of the range.
+///
+/// Only a value a caller supplies is checked. A row already in the ledger — an
+/// atmux import, a board written before this rule — keeps whatever it holds:
+/// validating input is not a licence to rewrite recorded history to match.
+fn validate_priority(value: Option<i64>) -> Result<()> {
+    if let Some(value) = value
+        && !(MOST_URGENT..=LEAST_URGENT).contains(&value)
+    {
+        bail!(
+            "task priority must be between {MOST_URGENT} (most urgent) and {LEAST_URGENT}, got {value}"
+        );
+    }
+    Ok(())
+}
+
 fn parse_value(text: String) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| json!({ "legacyInvalidJson": text }))
 }
@@ -394,6 +423,7 @@ impl Store {
     pub fn add_task(&mut self, input: AddTask) -> Result<Task> {
         validate(&input.task_type, &TASK_TYPES, "task type")?;
         validate(&input.status, &TASK_STATUSES, "task status")?;
+        validate_priority(Some(input.priority))?;
         if input.stale_minutes.is_some_and(|value| value < 0) {
             bail!("stale minutes must be non-negative");
         }
@@ -615,6 +645,7 @@ impl Store {
 
     pub fn update_task(&mut self, id: &str, input: UpdateTask, actor: &str) -> Result<Task> {
         let actor = nonempty(actor, "actor")?.to_owned();
+        validate_priority(input.priority)?;
         if input.stale_minutes.flatten().is_some_and(|value| value < 0) {
             bail!("stale minutes must be non-negative");
         }
@@ -1465,6 +1496,22 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_is_bounded_to_the_documented_band() {
+        for good in [MOST_URGENT, 1, 3, LEAST_URGENT] {
+            assert!(validate_priority(Some(good)).is_ok(), "{good} is in band");
+        }
+        for bad in [-1, LEAST_URGENT + 1, i64::MIN, i64::MAX] {
+            let error = validate_priority(Some(bad))
+                .expect_err(&format!("priority {bad} must be refused"))
+                .to_string();
+            assert!(error.contains("most urgent"), "{error}");
+        }
+        // An absent priority is not a zero: `task update` without --priority
+        // must leave whatever the row already holds, in band or not.
+        assert!(validate_priority(None).is_ok());
+    }
 
     #[test]
     fn keep_newest_trims_from_the_front_and_reports_it() {
