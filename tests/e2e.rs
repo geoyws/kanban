@@ -2641,3 +2641,117 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
         .unwrap();
     assert_eq!(deps["dependencies"], json!(["t-first", "t-named"]));
 }
+
+#[test]
+fn compiled_binary_never_shortens_context_without_saying_so() {
+    let fixture = Fixture::new("context-budget");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Budget", "--json"]);
+    let long = "x".repeat(600);
+    let title = "T".repeat(300);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", &title, "--id", "t-1", "--json"],
+    );
+    let lease =
+        fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"])["leaseToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    for command in ["checkpoint", "handoff"] {
+        let mut args = vec![command];
+        if command == "handoff" {
+            args.push("create");
+        }
+        args.extend_from_slice(&[
+            "t-1",
+            "--lease",
+            &lease,
+            "--as",
+            "worker",
+            "--summary",
+            &long,
+            "--intent",
+            &long,
+            "--next-action",
+            &long,
+            "--json",
+        ]);
+        fixture.ok_json(&fixture.main, &args);
+    }
+    for index in 0..5 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "note",
+                "t-1",
+                &format!("note {index} {long}"),
+                "--as",
+                "worker",
+                "--json",
+            ],
+        );
+    }
+
+    // Every render is stamped, so two runs differ on that line alone.
+    let render = |budget: &str| -> String {
+        let output = fixture.run(&fixture.main, &["context", "t-1", "--max-chars", budget]);
+        assert!(
+            output.status.success(),
+            "context --max-chars {budget} failed"
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| {
+                if line.starts_with("Generated: ") {
+                    "Generated: N"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let complete = render("999999");
+
+    // The compact rendering used to append its marker and hope: past the
+    // smallest budgets the body already overran, `take_chars` cut from the
+    // end, and the marker was the first thing lost — precisely when the
+    // reader most needed telling that the ancestry, the dependencies, every
+    // earlier checkpoint and every note had gone.
+    for budget in [
+        "1000", "1001", "1100", "1200", "1500", "3000", "5000", "8000", "9000", "20000",
+    ] {
+        let text = render(budget);
+        let length = text.chars().count();
+        assert!(
+            length <= budget.parse::<usize>().unwrap(),
+            "--max-chars {budget} produced {length} characters"
+        );
+        if text != complete {
+            assert!(
+                text.contains("[context compacted") || text.contains("[older history omitted]"),
+                "--max-chars {budget} dropped history and said nothing (ends: {:?})",
+                &text.chars().rev().take(60).collect::<String>()
+            );
+        }
+    }
+
+    // --max-chars bounds the rendered text and never did anything here, so
+    // accepting it handed an unbounded packet to a caller asking for a bound.
+    let refused = fixture.run(
+        &fixture.main,
+        &["context", "t-1", "--json", "--max-chars", "1000"],
+    );
+    assert!(
+        !refused.status.success(),
+        "--json accepted --max-chars and ignored it"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("returns the whole packet"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // Each on its own still works.
+    fixture.ok_json(&fixture.main, &["context", "t-1", "--json"]);
+    assert!(!render("2000").is_empty());
+}

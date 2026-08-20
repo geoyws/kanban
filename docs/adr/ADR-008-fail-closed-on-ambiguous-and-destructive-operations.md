@@ -205,6 +205,24 @@ which was used. Flags whose value is genuinely a list (`--depends-on`,
 `--blocker`, `--validation`) are declared as such, and a compile-time guard
 ties that list to the call sites that collect them so the two cannot drift.
 
+**What declares the omission must survive the omission.** `truncated` was
+computed honestly at the fetch layer and the rendering dropped content
+independently of it. The compact form appended
+`[context compacted: …]` and then trimmed the whole string to `--max-chars`,
+so past the smallest budgets the marker was the first thing cut — the reader
+got a packet missing the ancestry, the dependencies, every earlier checkpoint
+and every note, ending mid-word, with nothing to say so. The marker is now
+reserved out of the budget before the body is trimmed, as the full rendering
+already did for `[older history omitted]`. A marker that a truncation can
+truncate is not a marker.
+
+**A flag that cannot apply on this path is refused, not ignored.**
+`--max-chars` bounds the rendered text; `context --json --max-chars 8000`
+accepted the flag and returned the whole packet, so a caller who asked for a
+bounded packet got an unbounded one and no way to tell. The unknown-flag rule
+exists because silent acceptance is undetectable by the caller; a known flag
+silently doing nothing is the same defect wearing a legal name.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

@@ -208,11 +208,20 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     240,
                 )
             ),
-            String::new(),
-            "[context compacted: full durable history remains in SQLite]".to_owned(),
         ]
         .join("\n");
-        return Ok(take_chars(&compact, max_chars));
+        // Reserved, not appended and hoped for. At the smallest budgets the
+        // compact body already overruns, and `take_chars` cut from the end —
+        // so the marker was the first thing lost, exactly when the reader most
+        // needed telling that the ancestry, dependencies, every earlier
+        // checkpoint and every note had gone. Same reservation the full path
+        // makes for `[older history omitted]`.
+        const MARKER: &str = "\n\n[context compacted: full durable history remains in SQLite]";
+        let budget = max_chars.saturating_sub(MARKER.chars().count());
+        return Ok(format!(
+            "{}{MARKER}",
+            take_chars(compact.trim_end(), budget)
+        ));
     }
 
     let mut text = format!("{required}\n\n## Earlier checkpoints");

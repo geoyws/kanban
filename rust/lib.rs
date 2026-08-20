@@ -1339,6 +1339,16 @@ fn run() -> Result<()> {
         let id = sub.context("task id is required")?;
         let packet = store.context_packet(id)?;
         if args.has("json") {
+            // --max-chars bounds the rendered text and has never had any
+            // effect here, so accepting it silently handed back an unbounded
+            // packet to a caller who had asked for a bounded one.
+            if args.has("max-chars") {
+                bail!(
+                    "--max-chars bounds the rendered context; --json returns the whole packet. \
+                     Drop one of them — the packet's `truncated` field already says whether \
+                     history was left out"
+                );
+            }
             return print(&packet, true);
         }
         let max_chars = args.integer("max-chars", 20_000)?;

@@ -318,7 +318,13 @@ interpreted unambiguously is refused rather than guessed
   out of band, from an atmux import or an older board, keeps it.
 - **`context` declares what it dropped.** `truncated` is computed by
   over-fetching past each cap, so a resuming agent is never told it holds the
-  complete record when it does not.
+  complete record when it does not. The rendering says so too: any output
+  shorter than the complete one carries `[older history omitted]` or
+  `[context compacted: …]`, and the marker is reserved out of `--max-chars`
+  rather than appended to it — at the smallest budgets, where compaction
+  matters most, the marker used to be the first thing cut. `--max-chars` with
+  `--json` is an error, because it bounds the rendered text and never bounded
+  the packet.
 - **A restore cannot race live work.** `restore` is the one operation that goes
   around SQLite, renaming whole database files into place. It now takes the
   data root exclusively and refuses while anything else holds it; board
