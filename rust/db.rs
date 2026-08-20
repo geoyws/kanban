@@ -280,6 +280,27 @@ pub fn integrity(connection: &Connection) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+/// Rows whose foreign key points at something that is not there.
+///
+/// `integrity_check` validates the b-tree and says nothing about referential
+/// consistency, so a board could be structurally perfect and still hold a note
+/// on a task that no longer exists — the shape a v3 board written by the
+/// retired TypeScript implementation, or a partial import, can leave behind.
+pub fn foreign_key_violations(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let rows = statement.query_map([], |row| {
+        Ok(format!(
+            "{} row {} references missing {}",
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?
+                .map_or_else(|| "?".to_owned(), |id| id.to_string()),
+            row.get::<_, String>(2)?
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 pub fn checkpoint(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
     Ok(())

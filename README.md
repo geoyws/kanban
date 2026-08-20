@@ -167,6 +167,20 @@ kanban doctor
 kanban backup --json
 ```
 
+`doctor` reports per project and exits non-zero if anything is wrong. It runs
+`integrity_check`, which validates the b-tree, and then the things a b-tree
+check cannot see: rows whose foreign key points at something that is gone
+(`orphanedRows`), tasks stamped in the future (`futureDatedTasks` — they sort
+ahead of real work, and on a claim they hold a lease no sweep will retire), and
+whether each registered board file is still on disk at all (`present`).
+
+That last one matters more than it sounds. Opening a board creates it, so a
+board file that has vanished used to be silently replaced with an empty one by
+whatever touched it next — `doctor` included, which then reported the result
+healthy. Commands that do work on one board now refuse and name the recovery;
+`doctor`, `dashboard` and `backup` report the gap and carry on, and `backup`
+lists what it could not include under `missingBoards`.
+
 Import an existing atmux board into the currently registered project without
 writing to the source database:
 

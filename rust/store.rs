@@ -1502,6 +1502,27 @@ impl Store {
         integrity(&self.connection)
     }
 
+    pub fn foreign_key_violations(&self) -> Result<Vec<String>> {
+        crate::db::foreign_key_violations(&self.connection)
+    }
+
+    /// Tasks stamped after the moment they are read.
+    ///
+    /// Leases expire by comparing stamps, so a record from the future is not a
+    /// cosmetic oddity: it sorts ahead of real work and, on a claim, holds a
+    /// lease that no sweep will ever retire. A minute of slack keeps ordinary
+    /// clock drift between hosts sharing a board out of the report.
+    pub fn future_dated_tasks(&self) -> Result<Vec<String>> {
+        const SLACK_MS: i64 = 60_000;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM tasks WHERE created_at>? OR updated_at>? ORDER BY id")?;
+        let horizon = now_ms() + SLACK_MS;
+        let rows = statement.query_map([horizon, horizon], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn backup(&self, destination: &Path) -> Result<()> {
         let mut target = create_backup_target(destination)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut target)?;

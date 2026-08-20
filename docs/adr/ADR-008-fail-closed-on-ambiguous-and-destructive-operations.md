@@ -158,6 +158,26 @@ import in full and rolls back, so the receipt describes the real code path
 rather than a second estimate of it that is free to drift. It reports the
 created and updated counts, the warnings, and the leases the run would seize.
 
+**A diagnostic never modifies what it diagnoses, and a missing board is
+never quietly replaced.** Opening a board creates it, which is how a board is
+made and not how a registered one should be found. A board file that has gone
+missing was destroyed, so standing an empty one up in its place converts
+recoverable data loss into a board that reports itself fine. `doctor` did
+exactly that: it recreated the file it was asked to inspect, then certified the
+empty result healthy — the health check erasing the evidence that anything was
+wrong. Commands that work on one board now refuse and name both recoveries;
+the commands that survey every board (`doctor`, `dashboard`, `backup`) report
+the gap and continue, because dying on the first missing board helps nobody who
+has to fix it, and `restore` cannot be blocked by the damage it exists to
+repair.
+
+**A health check reports what a b-tree check cannot see.** `integrity_check`
+validates page structure and says nothing about what the rows mean, so `doctor`
+also reports rows whose foreign key points at something that is gone, and tasks
+stamped in the future — which sort ahead of real work and, on a claim, hold a
+lease no sweep will ever retire. A green check that only ever proves the file
+parses is a reassurance, not a diagnosis.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

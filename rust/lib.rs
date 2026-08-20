@@ -561,16 +561,49 @@ fn store_path(args: &Args) -> Result<PathBuf> {
             .filter(|value| !value.is_empty())
     });
     if let Some(name) = named {
-        return board_by_name(&registry, &name);
+        let path = board_by_name(&registry, &name)?;
+        if !board_is_present(&path.to_string_lossy()) {
+            return Err(missing_board_error(&path.to_string_lossy()));
+        }
+        return Ok(path);
     }
     let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
     if let Some(record) = registry.resolve(&workspace)? {
+        if !board_is_present(&record.board_path) {
+            return Err(missing_board_error(&record.board_path));
+        }
         return Ok(PathBuf::from(record.board_path));
     }
     bail!(
         "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT, or run 'kanban init' there{}",
         workspace.display(),
         known_projects(&registry)?
+    )
+}
+
+/// Whether a registered board's file is still on disk.
+///
+/// Opening a board creates it, which is right for `--db` — that is how a board
+/// is made — and wrong for one the registry already knows about. A registered
+/// board file that has gone missing was destroyed, and standing an empty one
+/// up in its place turns recoverable data loss into a board that reports
+/// itself fine. `doctor` did exactly that: it recreated the file it was asked
+/// to inspect, then certified the result healthy.
+///
+/// Commands that do work on one board refuse. Commands that survey every board
+/// — `doctor`, `dashboard`, `backup` — report the gap and carry on, because
+/// dying on the first missing board is no use to whoever has to fix it, and
+/// `restore` would otherwise be unable to repair the very thing that stops it
+/// from running.
+fn board_is_present(board_path: &str) -> bool {
+    Path::new(board_path).is_file()
+}
+
+fn missing_board_error(board_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "board file {board_path} is registered but missing.\n\
+         Recover it:      kanban restore --from SNAPSHOT --force\n\
+         Or start over:   kanban init   (in the project, recreates it empty)"
     )
 }
 
@@ -700,6 +733,11 @@ fn restore(args: &Args) -> Result<()> {
     let registry = Registry::open()?;
     registry.backup(&rescue.join("registry.db"))?;
     for project in registry.projects()? {
+        // A board that is already gone is what a restore is often for; it
+        // cannot be a precondition of running one.
+        if !board_is_present(&project.board_path) {
+            continue;
+        }
         let file_name = Path::new(&project.board_path)
             .file_name()
             .with_context(|| format!("board path has no file name: {}", project.board_path))?;
@@ -815,6 +853,12 @@ fn run() -> Result<()> {
         let registry = Registry::open()?;
         let mut output = Vec::new();
         for project in registry.projects()? {
+            let mut value = object_of(&project)?;
+            if !board_is_present(&project.board_path) {
+                value.insert("boardMissing".into(), json!(true));
+                output.push(Value::Object(value));
+                continue;
+            }
             let store = Store::open(Path::new(&project.board_path))?;
             let tasks = store.list_tasks(None)?;
             let mut counts = Map::new();
@@ -824,7 +868,6 @@ fn run() -> Result<()> {
                     json!(tasks.iter().filter(|task| task.status == status).count()),
                 );
             }
-            let mut value = object_of(&project)?;
             value.insert("taskCounts".into(), Value::Object(counts));
             value.insert(
                 "pendingHandoffs".into(),
@@ -842,12 +885,33 @@ fn run() -> Result<()> {
         let mut projects = Vec::new();
         let mut healthy = registry_check == vec!["ok"];
         for project in registry.projects()? {
+            // Checked before opening, because opening would create it.
+            if !board_is_present(&project.board_path) {
+                healthy = false;
+                projects.push(json!({
+                    "name": project.name,
+                    "boardPath": project.board_path,
+                    "present": false,
+                }));
+                continue;
+            }
             let store = Store::open(Path::new(&project.board_path))?;
             let check = store.integrity()?;
-            healthy &= check == vec!["ok"];
-            projects.push(
-                json!({"name":project.name,"boardPath":project.board_path,"integrity":check}),
-            );
+            // `integrity_check` validates the b-tree and nothing about what
+            // the rows mean, so a structurally perfect board can still hold a
+            // note on a task that is gone, or work stamped in the future whose
+            // lease no sweep will ever retire.
+            let orphans = store.foreign_key_violations()?;
+            let future = store.future_dated_tasks()?;
+            healthy &= check == vec!["ok"] && orphans.is_empty() && future.is_empty();
+            projects.push(json!({
+                "name": project.name,
+                "boardPath": project.board_path,
+                "present": true,
+                "integrity": check,
+                "orphanedRows": orphans,
+                "futureDatedTasks": future,
+            }));
         }
         let result = json!({"healthy":healthy,"registry":registry_check,"projects":projects});
         print(&result, args.has("json"))?;
@@ -865,7 +929,14 @@ fn run() -> Result<()> {
         let registry_path = directory.join("registry.db");
         registry.backup(&registry_path)?;
         let mut boards = Vec::new();
+        let mut missing = Vec::new();
         for project in registry.projects()? {
+            // A snapshot of what is still here beats refusing to snapshot
+            // anything, but it has to say what it could not include.
+            if !board_is_present(&project.board_path) {
+                missing.push(project.board_path.clone());
+                continue;
+            }
             let store = Store::open(Path::new(&project.board_path))?;
             let file_name = Path::new(&project.board_path)
                 .file_name()
@@ -879,7 +950,7 @@ fn run() -> Result<()> {
             None => Vec::new(),
         };
         return print(
-            &json!({"directory":directory,"registry":registry_path,"boards":boards,"pruned":pruned}),
+            &json!({"directory":directory,"registry":registry_path,"boards":boards,"missingBoards":missing,"pruned":pruned}),
             args.has("json"),
         );
     }

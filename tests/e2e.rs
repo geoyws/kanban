@@ -2295,3 +2295,133 @@ fn compiled_binary_previews_an_import_and_will_not_void_a_live_lease_quietly() {
     assert_eq!(title(), "previewed");
     assert_eq!(seizures(), 1, "a forced seizure left no audit trail");
 }
+
+#[test]
+fn compiled_binary_reports_a_missing_board_instead_of_replacing_it() {
+    let fixture = Fixture::new("missing-board");
+    let project = fixture.ok_json(&fixture.main, &["init", "--name", "Gone", "--json"]);
+    let board = PathBuf::from(project["boardPath"].as_str().unwrap());
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "real work", "--id", "t-1", "--json"],
+    );
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A partial restore, a stray rm, a half-copied data root.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", board.display()));
+    }
+
+    // Opening a board creates it, so `doctor` used to recreate the very file
+    // it was asked to inspect and then certify the empty result healthy — the
+    // health check destroying the evidence that anything was wrong.
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        !checked.status.success(),
+        "doctor called a board with no file healthy"
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["projects"][0]["present"], false);
+    assert!(!board.is_file(), "doctor recreated the board it inspected");
+
+    // A command that does work on that board refuses, and names both ways out.
+    let refused = fixture.run(&fixture.main, &["task", "list", "--json"]);
+    assert!(
+        !refused.status.success(),
+        "a work command silently stood an empty board up in place of the lost one"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("registered but missing"),
+        "stderr: {message}"
+    );
+    assert!(message.contains("kanban restore"), "stderr: {message}");
+    assert!(
+        !board.is_file(),
+        "a refused command still created the board"
+    );
+
+    // A survey command snapshots what remains and says what it could not take.
+    let partial = fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    assert_eq!(partial["boards"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        partial["missingBoards"][0],
+        board.to_string_lossy().as_ref()
+    );
+
+    // And the documented recovery actually recovers.
+    fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["title"],
+        "real work"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["healthy"],
+        true
+    );
+}
+
+#[test]
+fn compiled_binary_doctor_looks_past_the_btree() {
+    let fixture = Fixture::new("doctor-depth");
+    let project = fixture.ok_json(&fixture.main, &["init", "--name", "Deep", "--json"]);
+    let board = project["boardPath"].as_str().unwrap().to_owned();
+    for id in ["t-ok", "t-future"] {
+        fixture.ok_json(&fixture.main, &["task", "add", id, "--id", id, "--json"]);
+    }
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["healthy"],
+        true
+    );
+
+    // `integrity_check` validates the b-tree and says nothing about what the
+    // rows mean, so both of these leave a structurally perfect board.
+    let database = Connection::open(&board).unwrap();
+    database
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO task_notes(task_id,author,kind,body,created_at)
+               VALUES('t-vanished','ghost','progress','orphan',1);",
+        )
+        .unwrap();
+    let horizon = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 86_400_000;
+    database
+        .execute(
+            "UPDATE tasks SET created_at=? WHERE id='t-future'",
+            [horizon],
+        )
+        .unwrap();
+    drop(database);
+
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(!checked.status.success());
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let board_report = &report["projects"][0];
+    assert_eq!(
+        board_report["integrity"],
+        json!(["ok"]),
+        "the b-tree really is intact; that is the point"
+    );
+    assert_eq!(report["healthy"], false);
+    assert!(
+        board_report["orphanedRows"][0]
+            .as_str()
+            .unwrap()
+            .contains("task_notes"),
+        "a note on a task that does not exist went unreported: {board_report}"
+    );
+    // A task stamped in the future sorts ahead of real work, and on a claim it
+    // holds a lease no sweep will ever retire.
+    assert_eq!(board_report["futureDatedTasks"], json!(["t-future"]));
+}
