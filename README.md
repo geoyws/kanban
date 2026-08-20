@@ -183,9 +183,22 @@ kanban import atmux-sqlite /path/to/.atmux/state.db \
 ```
 
 Reconciliation atomically refreshes the imported records and relationships,
-clears obsolete imported claims, preserves durable history, and reports
-created versus updated counts. It is a pre-cutover operation, not a dual-write
-mode.
+preserves durable history, and reports created versus updated counts. It is a
+pre-cutover operation, not a dual-write mode.
+
+Add `--dry-run` to any import to see the receipt it would produce without
+writing: the whole import runs and is rolled back, so the preview comes from
+the real code path rather than a second estimate of it.
+
+```bash
+kanban import atmux-sqlite /path/to/.atmux/state.db \
+  --as operator --reconcile --dry-run --json
+```
+
+Reconciling over a task somebody is holding refuses by default and names every
+holder, because overwriting it voids their lease. `--force` seizes them and
+records a `lease_seized` event apiece, exactly as `task move --force` does, and
+the receipt lists the tasks under `seizedLeases`.
 
 Epics, stories, tasks, hierarchy, stable IDs, timestamps, routing fields,
 notes, and unknown extension JSON are preserved. Dangling historical

@@ -7,7 +7,7 @@ mod registry;
 mod store;
 
 use crate::context::{render_context, render_todo};
-use crate::import::{import_json, import_sqlite};
+use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
 use crate::registry::{Registry, data_root, now_ms};
 use crate::store::{ClaimOptions, Store, UpdateTask};
@@ -50,7 +50,8 @@ Usage:
   kanban handoff create ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
   kanban handoff list [--task ID] [--status STATUS] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
-  kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--json]
+  kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
+             [--dry-run] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
@@ -81,7 +82,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-const BOOLEAN: [&str; 17] = [
+const BOOLEAN: [&str; 18] = [
     "help",
     "json",
     "version",
@@ -99,6 +100,7 @@ const BOOLEAN: [&str; 17] = [
     "clear-parent",
     "clear-dependencies",
     "reconcile",
+    "dry-run",
 ];
 
 /// Accepted on every board command; see `store_path`.
@@ -244,8 +246,16 @@ const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
         Some("accept"),
         &["as", "session", "lease-minutes", "caller-scope"],
     ),
-    ("import", Some("atmux-json"), &["as", "reconcile"]),
-    ("import", Some("atmux-sqlite"), &["as", "reconcile"]),
+    (
+        "import",
+        Some("atmux-json"),
+        &["as", "reconcile", "force", "dry-run"],
+    ),
+    (
+        "import",
+        Some("atmux-sqlite"),
+        &["as", "reconcile", "force", "dry-run"],
+    ),
     ("events", None, &["task", "kind", "limit"]),
     ("stale", None, &[]),
     ("context", None, &["max-chars"]),
@@ -1144,11 +1154,15 @@ fn run() -> Result<()> {
     if command == "import" && (sub == Some("atmux-json") || sub == Some("atmux-sqlite")) {
         let path = rest.first().context("import path is required")?;
         let actor = args.require("as")?;
-        let reconcile = args.has("reconcile");
+        let options = ImportOptions {
+            reconcile: args.has("reconcile"),
+            force: args.has("force"),
+            dry_run: args.has("dry-run"),
+        };
         let receipt = if sub == Some("atmux-json") {
-            import_json(&mut store, Path::new(path), actor, reconcile)?
+            import_json(&mut store, Path::new(path), actor, options)?
         } else {
-            import_sqlite(&mut store, Path::new(path), actor, reconcile)?
+            import_sqlite(&mut store, Path::new(path), actor, options)?
         };
         return print(&receipt, args.has("json"));
     }

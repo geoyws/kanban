@@ -1,6 +1,6 @@
 use crate::model::{TASK_STATUSES, TASK_TYPES};
 use crate::registry::now_ms;
-use crate::store::Store;
+use crate::store::{Store, event, live_claims};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -53,6 +53,7 @@ pub struct ImportCounts {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportReceipt {
     pub source: String,
     pub counts: ImportCounts,
@@ -60,6 +61,26 @@ pub struct ImportReceipt {
     pub imported: usize,
     pub created: usize,
     pub updated: usize,
+    /// True when nothing was written: the whole import ran and was rolled
+    /// back. Preview numbers come from the real code path, never a second
+    /// estimate of it that could drift.
+    pub dry_run: bool,
+    /// Tasks whose live lease this import voided, or would have.
+    pub seized_leases: Vec<String>,
+}
+
+/// What the caller asked an import to be allowed to do.
+///
+/// A struct rather than three positional `bool`s: at a call site,
+/// `(true, false, true)` says nothing about which of them is `--force`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportOptions {
+    /// Overwrite tasks that already exist, rather than refusing to collide.
+    pub reconcile: bool,
+    /// Void a live lease while doing so, recording each seizure.
+    pub force: bool,
+    /// Run everything and roll back, reporting what would have happened.
+    pub dry_run: bool,
 }
 
 struct Input {
@@ -302,7 +323,7 @@ fn normalize_and_insert(
     actor: &str,
     source: String,
     counts: ImportCounts,
-    reconcile: bool,
+    options: ImportOptions,
 ) -> Result<ImportReceipt> {
     if actor.trim().is_empty() {
         bail!("actor is required");
@@ -373,7 +394,7 @@ fn normalize_and_insert(
         .filter(|input| existing.contains(&input.id))
         .map(|input| input.id.as_str())
         .collect::<Vec<_>>();
-    if !reconcile && !overlap.is_empty() {
+    if !options.reconcile && !overlap.is_empty() {
         bail!(
             "import overlaps {} existing task(s), including {}; rerun with --reconcile only after source writers are stopped",
             overlap.len(),
@@ -385,6 +406,46 @@ fn normalize_and_insert(
                 .join(", ")
         );
     }
+
+    // `--reconcile` deleted the claim rows of every task it overwrote. That is
+    // the same silent lease void ADR-008 removed from `task move` and
+    // `task remove`, still reachable through the import path: the holder finds
+    // out when its next checkpoint fails, after the work is done. Refuse by
+    // default, name every holder at once, and record each seizure when forced.
+    let mut seized_leases = Vec::new();
+    if options.reconcile {
+        let overlapping = overlap
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect::<Vec<_>>();
+        let held = live_claims(&transaction, &overlapping)?;
+        if !held.is_empty() && !options.force {
+            bail!(
+                "import would void {} live lease(s): {}; rerun with --force to seize them, \
+                 or wait for the holders to finish",
+                held.len(),
+                held.iter()
+                    .take(5)
+                    .map(|claim| format!(
+                        "{} held by {} until {}",
+                        claim.task_id, claim.agent_id, claim.expires_at
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for claim in &held {
+            event(
+                &transaction,
+                Some(&claim.task_id),
+                "lease_seized",
+                Some(actor),
+                json!({"heldBy": claim.agent_id, "action": "reconcile an import over", "expiresAt": claim.expires_at}),
+            )?;
+            seized_leases.push(claim.task_id.clone());
+        }
+    }
+
     for input in &inputs {
         if !TASK_TYPES.contains(&input.task_type.as_str())
             || !TASK_STATUSES.contains(&input.status.as_str())
@@ -397,7 +458,7 @@ fn normalize_and_insert(
             None
         };
         transaction.execute("INSERT INTO tasks(id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET type=excluded.type,parent_id=NULL,title=excluded.title,body=excluded.body,assignee=excluded.assignee,lane=excluded.lane,deliverable=excluded.deliverable,stale_minutes=excluded.stale_minutes,driver_only=excluded.driver_only,status=excluded.status,priority=excluded.priority,created_at=excluded.created_at,updated_at=excluded.updated_at,completed_at=excluded.completed_at,metadata=excluded.metadata",params![input.id,input.task_type,Option::<String>::None,input.title,input.body,input.assignee,input.lane,input.deliverable,input.stale_minutes,input.driver_only as i64,input.status,input.priority,input.created_at,input.updated_at,completed,input.metadata.to_string()])?;
-        if reconcile && existing.contains(&input.id) {
+        if options.reconcile && existing.contains(&input.id) {
             transaction.execute("DELETE FROM task_claims WHERE task_id=?", [&input.id])?;
             transaction.execute("DELETE FROM task_dependencies WHERE task_id=?", [&input.id])?;
         }
@@ -431,12 +492,21 @@ fn normalize_and_insert(
         }
     }
     transaction.execute("INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(NULL,'tasks_imported',?,?,?)",params![actor,json!({"taskIDs":inputs.iter().map(|i|&i.id).collect::<Vec<_>>()}).to_string(),now_ms()])?;
-    transaction.commit()?;
+    // A preview that runs the real path and rolls back cannot disagree with
+    // the import it is previewing. Computing the same numbers a second way
+    // would be a second implementation, free to drift from this one.
+    if options.dry_run {
+        transaction.rollback()?;
+    } else {
+        transaction.commit()?;
+    }
     Ok(ImportReceipt {
         source,
         counts,
         warnings,
         imported: inputs.len(),
+        dry_run: options.dry_run,
+        seized_leases,
         created: inputs
             .iter()
             .filter(|input| !existing.contains(&input.id))
@@ -452,7 +522,7 @@ pub fn import_json(
     store: &mut Store,
     path: &Path,
     actor: &str,
-    reconcile: bool,
+    options: ImportOptions,
 ) -> Result<ImportReceipt> {
     let parsed: Value = serde_json::from_slice(&fs::read(path)?)?;
     let epics = parsed
@@ -504,7 +574,7 @@ pub fn import_json(
             stories: stories.len(),
             tasks: tasks.len(),
         },
-        reconcile,
+        options,
     )
 }
 
@@ -512,7 +582,7 @@ pub fn import_sqlite(
     store: &mut Store,
     path: &Path,
     actor: &str,
-    reconcile: bool,
+    options: ImportOptions,
 ) -> Result<ImportReceipt> {
     let source_db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut table_statement =
@@ -557,6 +627,6 @@ pub fn import_sqlite(
             stories: stories.len(),
             tasks: tasks.len(),
         },
-        reconcile,
+        options,
     )
 }

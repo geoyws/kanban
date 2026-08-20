@@ -143,6 +143,21 @@ row holding something out of band, from an atmux import or a board written
 before this rule, keeps it. Validating input is not a licence to rewrite
 recorded history to match.
 
+**A destructive path found once is looked for everywhere else.** The rule
+above — a live lease is not voided without `--force`, and a seizure is
+recorded — was implemented in `task move` and `task remove` and left
+unimplemented in `import --reconcile`, which deleted the claim rows of every
+task it overwrote. Same silent void, same discovery-by-failed-checkpoint, one
+command over. It now refuses by default naming every holder at once, seizes
+under `--force`, and writes the same `lease_seized` event. Fixing an instance
+of a defect class is not fixing the class; the grep for other call sites is
+part of the fix.
+
+**A destructive command can be asked what it would do.** `--dry-run` runs an
+import in full and rolls back, so the receipt describes the real code path
+rather than a second estimate of it that is free to drift. It reports the
+created and updated counts, the warnings, and the leases the run would seize.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

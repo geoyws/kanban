@@ -2195,3 +2195,103 @@ fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
         "queued behind a long writer"
     );
 }
+
+#[test]
+fn compiled_binary_previews_an_import_and_will_not_void_a_live_lease_quietly() {
+    let fixture = Fixture::new("import-safety");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Reconcile", "--json"]);
+    let export = fixture.root.join("export.json");
+    let write_export = |id: &str, title: &str| {
+        fs::write(
+            &export,
+            serde_json::to_vec(&json!({
+                "epics": [],
+                "stories": [],
+                "tasks": [{"id":id,"subject":title,"status":"todo"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    let import = |extra: &[&str]| {
+        let mut args = vec![
+            "import",
+            "atmux-json",
+            export.to_str().unwrap(),
+            "--as",
+            "operator",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        fixture.run(&fixture.main, &args)
+    };
+    let title = || {
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["title"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let seizures = || {
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["events", "--kind", "lease_seized", "--json"],
+            )
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    write_export("t-1", "original");
+    assert!(import(&[]).status.success());
+    assert_eq!(title(), "original");
+
+    // A dry run reports what it would create and leaves the board alone.
+    write_export("t-2", "previewed creation");
+    let preview: Value =
+        serde_json::from_slice(&import(&["--dry-run"]).stdout).expect("dry run must still report");
+    assert_eq!(preview["dryRun"], true);
+    assert_eq!(preview["created"], 1);
+    assert!(
+        !fixture
+            .run(&fixture.main, &["task", "show", "t-2", "--json"])
+            .status
+            .success(),
+        "a dry run wrote to the board"
+    );
+
+    write_export("t-1", "previewed");
+
+    // Claimed by a live agent, `--reconcile` used to delete the claim row on
+    // its way past — the same silent lease void that task move/remove refuse.
+    fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    let refused = import(&["--reconcile"]);
+    assert!(
+        !refused.status.success(),
+        "reconcile voided a live lease without being asked twice"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("live lease"), "stderr: {message}");
+    assert!(
+        message.contains("held by worker"),
+        "the refusal must name the holder: {message}"
+    );
+    assert_eq!(title(), "original", "a refused import wrote anyway");
+
+    // Forced, but previewed: it says which leases it would seize and still
+    // takes none of them.
+    let forecast: Value =
+        serde_json::from_slice(&import(&["--reconcile", "--force", "--dry-run"]).stdout)
+            .expect("forced dry run must report");
+    assert_eq!(forecast["seizedLeases"], json!(["t-1"]));
+    assert_eq!(title(), "original");
+    assert_eq!(seizures(), 0, "a dry run recorded a seizure it never made");
+
+    // Forced for real: the overwrite lands and the seizure is on the record.
+    let applied: Value =
+        serde_json::from_slice(&import(&["--reconcile", "--force"]).stdout).unwrap();
+    assert_eq!(applied["dryRun"], false);
+    assert_eq!(applied["seizedLeases"], json!(["t-1"]));
+    assert_eq!(title(), "previewed");
+    assert_eq!(seizures(), 1, "a forced seizure left no audit trail");
+}

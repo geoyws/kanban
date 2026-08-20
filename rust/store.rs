@@ -173,7 +173,7 @@ fn dependencies(connection: &Connection, task_id: &str) -> Result<Vec<Task>> {
         .map_err(Into::into)
 }
 
-fn event(
+pub(crate) fn event(
     connection: &Connection,
     task_id: Option<&str>,
     kind: &str,
@@ -185,6 +185,38 @@ fn event(
         params![task_id, kind, actor, payload.to_string(), now_ms()],
     )?;
     Ok(())
+}
+
+/// A board written by the released TypeScript implementation can sit at
+/// `user_version=3` with no `task_claims` table, so the migration ladder never
+/// creates one. Those boards must still open, and anything reading claims has
+/// to tolerate the table's absence rather than assume the schema it expects.
+pub(crate) fn has_claims_table(connection: &Connection) -> Result<bool> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_claims')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+/// Every live lease among `ids`, so a bulk operation can name all of them at
+/// once instead of failing on the first.
+///
+/// Expired leases are already gone: `Store::open` sweeps before anything
+/// reads, so a row still here is genuinely held by someone.
+pub(crate) fn live_claims(connection: &Connection, ids: &[String]) -> Result<Vec<Claim>> {
+    if ids.is_empty() || !has_claims_table(connection)? {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    let now = now_ms();
+    for id in ids {
+        if let Some(claim) = active_claim(connection, id, now)? {
+            found.push(claim);
+        }
+    }
+    Ok(found)
 }
 
 fn active_claim(connection: &Connection, task_id: &str, now: i64) -> Result<Option<Claim>> {
@@ -338,16 +370,7 @@ impl Store {
     /// case is a single indexed count over `idx_task_claims_expiry` and takes
     /// no write lock; only an actual expiry opens a transaction.
     pub fn sweep_expired_claims(&mut self) -> Result<usize> {
-        // A board written by the released TypeScript implementation can sit at
-        // user_version=3 with no `task_claims` table, so the migration ladder
-        // never creates one. Those boards must still open; there is simply
-        // nothing to sweep.
-        let claims_exist: i64 = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_claims')",
-            [],
-            |row| row.get(0),
-        )?;
-        if claims_exist == 0 {
+        if !has_claims_table(&self.connection)? {
             return Ok(0);
         }
         let expired: i64 = self.connection.query_row(
