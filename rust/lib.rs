@@ -116,14 +116,14 @@ const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 /// This is the single description of the command surface: `allowed_flags`
 /// reads it, and the drift guards in the test module iterate it, so a command
 /// added without its flag list fails the gate instead of reaching an operator.
-const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
-    ("init", None, &["name", "force"]),
-    ("workspace", Some("list"), &[]),
-    ("workspace", Some("attach"), &["to"]),
-    ("dashboard", None, &[]),
-    ("doctor", None, &[]),
-    ("backup", None, &["output", "keep"]),
-    ("restore", None, &["from", "force"]),
+const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
+    ("init", None, &["name", "force"], 1),
+    ("workspace", Some("list"), &[], 2),
+    ("workspace", Some("attach"), &["to"], 2),
+    ("dashboard", None, &[], 1),
+    ("doctor", None, &[], 1),
+    ("backup", None, &["output", "keep"], 1),
+    ("restore", None, &["from", "force"], 1),
     (
         "task",
         Some("add"),
@@ -141,16 +141,18 @@ const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
             "stale-minutes",
             "driver-only",
         ],
+        3,
     ),
-    ("task", Some("list"), &["status", "with-relations"]),
-    ("task", Some("show"), &[]),
+    ("task", Some("list"), &["status", "with-relations"], 2),
+    ("task", Some("show"), &[], 3),
     (
         "task",
         Some("move"),
         &["as", "metadata-patch-json", "force"],
+        4,
     ),
-    ("task", Some("remove"), &["as", "force"]),
-    ("task", Some("metadata"), &["as", "patch-json"]),
+    ("task", Some("remove"), &["as", "force"], 3),
+    ("task", Some("metadata"), &["as", "patch-json"], 3),
     (
         "task",
         Some("update"),
@@ -173,14 +175,16 @@ const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
             "depends-on",
             "clear-dependencies",
         ],
+        3,
     ),
     (
         "story",
         Some("advance"),
         &["as", "to", "reviewer", "committer"],
+        3,
     ),
-    ("story", Some("signoff"), &["as", "note"]),
-    ("story", Some("unsignoff"), &["as", "note"]),
+    ("story", Some("signoff"), &["as", "note"], 3),
+    ("story", Some("unsignoff"), &["as", "note"], 3),
     (
         "claim",
         None,
@@ -195,10 +199,11 @@ const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
             "allow-reassign",
             "next",
         ],
+        2,
     ),
-    ("heartbeat", None, &["lease", "lease-minutes"]),
-    ("release", None, &["lease", "keep-status"]),
-    ("note", None, &["as", "kind"]),
+    ("heartbeat", None, &["lease", "lease-minutes"], 2),
+    ("release", None, &["lease", "keep-status"], 2),
+    ("note", None, &["as", "kind"], 3),
     (
         "checkpoint",
         None,
@@ -218,6 +223,7 @@ const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
             "head",
             "dirty",
         ],
+        2,
     ),
     (
         "handoff",
@@ -239,34 +245,40 @@ const COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
             "head",
             "dirty",
         ],
+        3,
     ),
-    ("handoff", Some("list"), &["task", "status"]),
+    ("handoff", Some("list"), &["task", "status"], 2),
     (
         "handoff",
         Some("accept"),
         &["as", "session", "lease-minutes", "caller-scope"],
+        3,
     ),
     (
         "import",
         Some("atmux-json"),
         &["as", "reconcile", "force", "dry-run"],
+        3,
     ),
     (
         "import",
         Some("atmux-sqlite"),
         &["as", "reconcile", "force", "dry-run"],
+        3,
     ),
-    ("events", None, &["task", "kind", "limit"]),
-    ("stale", None, &[]),
-    ("context", None, &["max-chars"]),
-    ("todo", None, &["output"]),
+    ("events", None, &["task", "kind", "limit"], 1),
+    ("stale", None, &[], 1),
+    ("context", None, &["max-chars"], 2),
+    ("todo", None, &["output"], 1),
 ];
 
-fn allowed_flags(command: &str, sub: Option<&str>) -> Option<&'static [&'static str]> {
+/// The flags a command accepts, and the most positionals it can hold —
+/// counting the command word and any subcommand word.
+fn command_spec(command: &str, sub: Option<&str>) -> Option<(&'static [&'static str], usize)> {
     COMMANDS
         .iter()
-        .find(|(name, expected, _)| *name == command && *expected == sub)
-        .map(|(_, _, flags)| *flags)
+        .find(|(name, expected, _, _)| *name == command && *expected == sub)
+        .map(|(_, _, flags, positionals)| (*flags, *positionals))
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
@@ -379,6 +391,31 @@ impl Args {
             .transpose()
             .with_context(|| format!("{name} must be an integer"))
             .map(|v| v.unwrap_or(fallback))
+    }
+
+    /// Fail on an argument this command was never going to read.
+    ///
+    /// Extra positionals were silently dropped, so `kanban task add Fix the
+    /// parser` recorded the title `Fix` and reported success, and
+    /// `kanban note t-1 the build is red --as ci` recorded the body `the`.
+    /// Forgetting to quote is the likeliest slip at a shell and it produced a
+    /// durable record that was wrong with nothing to notice it by, so the
+    /// error leads with that possibility.
+    fn reject_extra_positionals(&self, allowed: usize) -> Result<()> {
+        if self.positionals.len() <= allowed {
+            return Ok(());
+        }
+        let (accepted, extra) = self.positionals.split_at(allowed);
+        bail!(
+            "unexpected argument{} {} after `{}`; quote anything that contains spaces",
+            if extra.len() == 1 { "" } else { "s" },
+            extra
+                .iter()
+                .map(|value| format!("{value:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            accepted.join(" ")
+        );
     }
 
     /// Fail on any flag this command does not define, naming the nearest match.
@@ -800,8 +837,11 @@ fn run() -> Result<()> {
     }
 
     let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
-    match allowed_flags(command, spec_sub) {
-        Some(allowed) => args.reject_unknown(allowed)?,
+    match command_spec(command, spec_sub) {
+        Some((allowed, positionals)) => {
+            args.reject_unknown(allowed)?;
+            args.reject_extra_positionals(positionals)?;
+        }
         None => bail!("unknown command; run kanban --help"),
     }
 
@@ -1362,7 +1402,7 @@ mod tests {
 
     #[test]
     fn every_command_declares_its_flags_without_duplicates() {
-        for (command, sub, flags) in COMMANDS {
+        for (command, sub, flags, positionals) in COMMANDS {
             let mut seen = flags.to_vec();
             seen.sort_unstable();
             let before = seen.len();
@@ -1379,12 +1419,19 @@ mod tests {
                 );
             }
             // The lookup must actually reach this row.
-            assert_eq!(allowed_flags(command, *sub), Some(*flags));
+            assert_eq!(command_spec(command, *sub), Some((*flags, *positionals)));
+            // A command has to leave room for the words that name it, and
+            // for whatever positional the dispatcher then reads.
+            let named = 1 + usize::from(sub.is_some());
+            assert!(
+                *positionals >= named,
+                "{command} {sub:?} accepts fewer positionals than its own name"
+            );
         }
         // No command is described twice, which would make the second row dead.
         let mut keys = COMMANDS
             .iter()
-            .map(|(command, sub, _)| (*command, *sub))
+            .map(|(command, sub, _, _)| (*command, *sub))
             .collect::<Vec<_>>();
         keys.sort_unstable();
         let unique = keys.len();
@@ -1394,8 +1441,8 @@ mod tests {
             keys.len(),
             "a command is declared twice in COMMANDS"
         );
-        assert!(allowed_flags("frobnicate", None).is_none());
-        assert!(allowed_flags("task", Some("frobnicate")).is_none());
+        assert!(command_spec("frobnicate", None).is_none());
+        assert!(command_spec("task", Some("frobnicate")).is_none());
     }
 
     #[test]
@@ -1403,7 +1450,9 @@ mod tests {
         for flag in BOOLEAN {
             let declared = GLOBAL_FLAGS.contains(&flag)
                 || flag == "version"
-                || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&flag));
+                || COMMANDS
+                    .iter()
+                    .any(|(_, _, flags, _)| flags.contains(&flag));
             assert!(
                 declared,
                 "--{flag} parses as a boolean but no command accepts it"
@@ -1421,17 +1470,19 @@ mod tests {
             assert_ne!(resolved, alias, "{alias} is not wired up");
             assert!(
                 resolved == "version"
-                    || COMMANDS.iter().any(|(command, _, _)| *command == resolved),
+                    || COMMANDS
+                        .iter()
+                        .any(|(command, _, _, _)| *command == resolved),
                 "alias {alias} resolves to unknown command {resolved}"
             );
             // ...and must not be the name of a different real command.
             assert!(
-                !COMMANDS.iter().any(|(command, _, _)| *command == alias),
+                !COMMANDS.iter().any(|(command, _, _, _)| *command == alias),
                 "alias {alias} shadows a real command"
             );
         }
         // A canonical name passes through untouched.
-        for (command, _, _) in COMMANDS {
+        for (command, _, _, _) in COMMANDS {
             assert_eq!(canonical_command(command), *command);
         }
     }

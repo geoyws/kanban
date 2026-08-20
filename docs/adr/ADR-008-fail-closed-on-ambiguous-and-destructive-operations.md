@@ -178,6 +178,19 @@ stamped in the future — which sort ahead of real work and, on a claim, hold a
 lease no sweep will ever retire. A green check that only ever proves the file
 parses is a reassurance, not a diagnosis.
 
+**An argument the command was never going to read is refused.** The
+unknown-flag rule covered `--flags` and left positionals alone, so extra ones
+were silently dropped: `kanban task add Fix the parser` recorded the title
+`Fix`, and `kanban note t-1 the build is red --as ci` recorded the body `the`.
+Both reported success. Forgetting to quote is the likeliest slip at a shell,
+and this turned it into a durable record that was wrong with nothing to notice
+it by — the ledger stating something untrue about work that was actually done.
+Each row of `COMMANDS` now declares how many positionals its invocation may
+hold, alongside its flags, so the table remains the single description of the
+command surface and a new command cannot be added without saying. The error
+prints the prefix it did accept — `after \`task add Fix\`` — because seeing
+where the title stopped is what makes the cause obvious.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

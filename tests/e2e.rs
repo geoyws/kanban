@@ -2425,3 +2425,86 @@ fn compiled_binary_doctor_looks_past_the_btree() {
     // holds a lease no sweep will ever retire.
     assert_eq!(board_report["futureDatedTasks"], json!(["t-future"]));
 }
+
+#[test]
+fn compiled_binary_refuses_arguments_it_would_have_dropped() {
+    let fixture = Fixture::new("positionals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Args", "--json"]);
+
+    // Forgetting to quote is the likeliest slip at a shell, and it used to
+    // produce a durable record that was wrong with nothing to notice it by:
+    // this recorded the title `Fix` and reported success.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task", "add", "Fix", "the", "broken", "parser", "--id", "t-1", "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an unquoted title was accepted and silently cut to its first word"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("unexpected arguments"),
+        "stderr: {message}"
+    );
+    assert!(
+        message.contains("after `task add Fix`"),
+        "the error must show what it thought the command was: {message}"
+    );
+    assert!(
+        !fixture
+            .run(&fixture.main, &["task", "show", "t-1", "--json"])
+            .status
+            .success(),
+        "a refused add wrote a task anyway"
+    );
+
+    // Quoted, the whole title lands.
+    let added = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Fix the broken parser",
+            "--id",
+            "t-1",
+            "--json",
+        ],
+    );
+    assert_eq!(added["title"], "Fix the broken parser");
+
+    // The same slip on a note body recorded `the`.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "note", "t-1", "the", "build", "is", "red", "--as", "ci", "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an unquoted note body was accepted"
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["note", "t-1", "the build is red", "--as", "ci", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["notes"][0]["body"],
+        "the build is red"
+    );
+
+    // An extra id is refused too — it was never going to be read.
+    let refused = fixture.run(&fixture.main, &["task", "show", "t-1", "t-2", "--json"]);
+    assert!(!refused.status.success(), "a second task id was ignored");
+
+    // And every arity the surface actually uses still parses: no positional,
+    // one, and the two `task move` takes.
+    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-1", "todo", "--as", "geo", "--json"],
+    );
+}

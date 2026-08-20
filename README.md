@@ -287,6 +287,11 @@ interpreted unambiguously is refused rather than guessed
   unrecognized one names the nearest match. A mistyped `--projct alpha` used to
   fall through to directory resolution and write to whichever board contained
   the working directory.
+- **Extra arguments are errors, not dropped.** Every command declares how many
+  positionals it takes. `kanban task add Fix the parser` used to record the
+  title `Fix` and report success; `kanban note t-1 the build is red --as ci`
+  recorded `the`. The error shows the prefix it accepted, so where the title
+  stopped is obvious.
 - **A live lease is not overridden silently.** `task move` and `task remove`
   refuse against a claimed task, naming the holder and its expiry. `--force`
   seizes the lease and writes a `lease_seized` event; a forced removal also
