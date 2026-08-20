@@ -1,6 +1,7 @@
 mod context;
 mod db;
 mod import;
+mod lock;
 mod model;
 mod registry;
 mod store;
@@ -529,12 +530,18 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
 /// (2) and (3) are what make the CLI usable outside a registered tree: an agent
 /// in an unrelated cage, a cron line, or any shell in $HOME can address a board
 /// without cd-ing into it.
-fn store_path(args: &Args) -> Result<PathBuf> {
-    if let Some(path) = args
-        .one("db")
+/// A board named straight by path, bypassing the registry entirely.
+///
+/// Read by both the board resolver and the data-root lock, so the two can
+/// never disagree about whether an invocation is registry-addressed.
+fn direct_db(args: &Args) -> Option<PathBuf> {
+    args.one("db")
         .map(PathBuf::from)
         .or_else(|| env::var_os("KANBAN_DB").map(PathBuf::from))
-    {
+}
+
+fn store_path(args: &Args) -> Result<PathBuf> {
+    if let Some(path) = direct_db(args) {
         return Ok(path);
     }
     let mut registry = Registry::open()?;
@@ -749,6 +756,23 @@ fn run() -> Result<()> {
         Some(allowed) => args.reject_unknown(allowed)?,
         None => bail!("unknown command; run kanban --help"),
     }
+
+    // Held until `run` returns. `restore` replaces database files behind
+    // SQLite's back, so it needs the data root to itself; everything else
+    // only needs the assurance that no restore is doing so underneath it.
+    // Acquired here rather than inside `Registry::open`, which `restore`
+    // itself calls to write its rescue snapshot — an flock conflicts with a
+    // second descriptor in the same process, so a lower-level acquire would
+    // deadlock restore against itself.
+    let _data_root = if lock::touches_data_root(direct_db(&args).as_deref()) {
+        Some(if command == "restore" {
+            lock::exclusive()?
+        } else {
+            lock::shared()?
+        })
+    } else {
+        None
+    };
 
     if command == "init" {
         let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);

@@ -235,10 +235,11 @@ kb restore --from <SNAPSHOT> --force
 
 `restore` verifies every file in the snapshot before it touches live state,
 refuses without `--force`, and writes a `pre-restore-<stamp>` rescue snapshot of
-what it replaced, so a mistaken restore is recoverable in turn. Stop other
-kanban processes first. `--keep` prunes only the managed backups directory and
-only the stamped snapshots Kanban itself wrote — never a directory reached via
-`--output`, and never a rescue snapshot.
+what it replaced, so a mistaken restore is recoverable in turn. It also takes
+the data root exclusively and refuses outright while any other kanban process
+holds it — you do not have to remember to stop them. `--keep` prunes only the
+managed backups directory and only the stamped snapshots Kanban itself wrote —
+never a directory reached via `--output`, and never a rescue snapshot.
 
 ## Failing closed
 
@@ -267,6 +268,13 @@ interpreted unambiguously is refused rather than guessed
 - **`context` declares what it dropped.** `truncated` is computed by
   over-fetching past each cap, so a resuming agent is never told it holds the
   complete record when it does not.
+- **A restore cannot race live work.** `restore` is the one operation that goes
+  around SQLite, renaming whole database files into place. It now takes the
+  data root exclusively and refuses while anything else holds it; board
+  commands take it shared, so they never block each other, and a command that
+  meets a restore in progress waits five seconds and then says so rather than
+  reading a half-replaced root. A board named by path outside the data root
+  (`--db /tmp/scratch.db`) is untouched by any of this.
 
 Overrides are reviewable, because forcing one writes durable history:
 

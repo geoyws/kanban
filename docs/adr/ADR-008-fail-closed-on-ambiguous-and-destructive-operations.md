@@ -1,7 +1,7 @@
 # ADR-008: Fail closed on ambiguous input and destructive operations
 
 **Status:** Accepted
-**Date:** 2026-08-19
+**Date:** 2026-08-19 (amended 2026-08-20)
 **Deciders:** George
 
 ## Context
@@ -103,6 +103,34 @@ Deliberately not decided: changing the default output format. Every command
 still prints JSON whether or not `--json` is passed. Making the default
 human-readable would break existing consumers for a cosmetic gain, and no
 safety property depends on it.
+
+## Amendment — 2026-08-20: a documented precondition is an enforced one
+
+`restore` replaces the live registry and every board file from a snapshot. It
+refused without `--force`, verified the snapshot's integrity first, and wrote a
+rescue copy of what it was about to overwrite — and then told the operator to
+"stop every kanban process first" while enforcing nothing. Nothing stopped it
+renaming a database file out from under an open SQLite connection: readers keep
+serving the unlinked inode, the next writer commits into a file no longer
+reachable by name, and the restore reports success over both.
+
+**A precondition the operator is told to satisfy is enforced by the program.**
+Prose in an error message is not a guard. A `--force` flag that implies more
+safety than it delivers is worse than no flag, because the operator stops
+checking for themselves.
+
+The data root now carries one advisory lock (`.lock`, an flock). Board commands
+take it shared and never exclude each other, so a swarm of agents is unaffected;
+`restore` takes it exclusively and refuses immediately when anything else holds
+the root, naming what to do. A board command that meets a restore in progress
+waits the same five seconds SQLite's `busy_timeout` gives it and then refuses
+rather than read a half-replaced root.
+
+The lock covers the data root and only the data root. A board addressed straight
+by path outside it (`--db /tmp/scratch.db`) takes no lock and creates no data
+root, because conjuring a private directory to lock is the same overreach as
+re-permissioning one — while a `--db` path that resolves *inside* the root is
+covered, traversal included.
 
 ## References
 

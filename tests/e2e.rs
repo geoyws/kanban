@@ -1924,3 +1924,135 @@ fn compiled_binary_prunes_only_the_backups_directory_it_manages() {
             .success()
     );
 }
+
+#[test]
+fn compiled_binary_locks_the_data_root_against_a_concurrent_restore() {
+    let fixture = Fixture::new("lock");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Locked", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "work", "--id", "t-1", "--json"],
+    );
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lock_path = fixture.data.join(".lock");
+    // Created here rather than assumed: the test must fail on the behaviour it
+    // asserts, not on the absence of a file that is an implementation detail.
+    let hold = || {
+        fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap()
+    };
+
+    // A live board command holds the data root shared. `restore --force` used
+    // to document "stop every kanban process first" and enforce nothing, so it
+    // would rename database files out from under an open SQLite connection.
+    {
+        let held = hold();
+        held.lock_shared().unwrap();
+        let refused = fixture.run(
+            &fixture.main,
+            &["restore", "--from", &snapshot, "--force", "--json"],
+        );
+        assert!(
+            !refused.status.success(),
+            "restore replaced the data root while another process held it open"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("another kanban process"),
+            "stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    // Released, the identical restore succeeds — so the refusal above was the
+    // lock, not something else about the snapshot.
+    fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+
+    // Shared holders never exclude each other: the lock must not serialize the
+    // agents it exists to protect.
+    {
+        let held = hold();
+        held.lock_shared().unwrap();
+        let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+        assert_eq!(listed[0]["id"], "t-1");
+    }
+
+    // While a restore holds it exclusively, a board command waits out its
+    // window and then says so, rather than reading a half-replaced root.
+    {
+        let held = hold();
+        held.lock().unwrap();
+        let refused = fixture.run(&fixture.main, &["task", "list", "--json"]);
+        assert!(
+            !refused.status.success(),
+            "a board command read the data root mid-restore"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("restore is replacing"),
+            "stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+}
+
+#[test]
+fn compiled_binary_locks_only_the_data_root_it_was_asked_to_touch() {
+    let fixture = Fixture::new("lock-scope");
+    let outside = fixture.root.join("outside.db");
+
+    // A board named straight by path, living elsewhere, is not data-root
+    // state. Locking it anyway would create a private data root as a side
+    // effect of a command that never wanted one — the same overreach as
+    // re-permissioning a directory we do not own.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "--db",
+            outside.to_str().unwrap(),
+            "task",
+            "add",
+            "standalone",
+            "--json",
+        ],
+    );
+    assert!(
+        !fixture.data.exists(),
+        "an external --db board created a data root it never needed"
+    );
+
+    // A board that does live under the data root is covered, even when the
+    // path spells the root through a traversal.
+    fixture.ok_json(&fixture.main, &["init", "--name", "Scoped", "--json"]);
+    let inside = fixture.data.join("boards/../boards/inside.db");
+    let held = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(fixture.data.join(".lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let refused = fixture.run(
+        &fixture.main,
+        &["--db", inside.to_str().unwrap(), "task", "list", "--json"],
+    );
+    assert!(
+        !refused.status.success(),
+        "a board inside the data root escaped the lock through .."
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("restore is replacing"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
