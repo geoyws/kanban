@@ -85,6 +85,46 @@ fn require_claimable_type(id: &str, task_type: &str) -> Result<()> {
     Ok(())
 }
 
+/// The story gate, in order. A story moves one step at a time along this list.
+const STORY_FLOW: [&str; 7] = [
+    "planning",
+    "ready",
+    "in-progress",
+    "testing",
+    "review",
+    "merging",
+    "done",
+];
+
+/// The task status a story's gate state projects onto the row.
+///
+/// A story carries two fields that say where it is: `workflowStatus` in its
+/// metadata, which the gate owns, and the `status` column every other reader
+/// uses. The column is not independent data — it is this projection of the
+/// gate, written by `advance_story` on every step.
+fn story_status_for(workflow: &str) -> &'static str {
+    match workflow {
+        "planning" => "backlog",
+        "ready" => "todo",
+        "in-progress" => "in_progress",
+        "done" => "done",
+        _ => "review",
+    }
+}
+
+/// Whether a status is one the story gate writes for itself.
+///
+/// Derived from `STORY_FLOW` through the same projection `advance_story` uses,
+/// so a new gate state cannot appear on one side and not the other. `blocked`
+/// and `cancelled` are deliberately absent: the gate is linear and cannot
+/// express either, so a direct move is the only way to say them and refusing
+/// it would remove the capability rather than protect anything.
+fn is_gate_owned_status(status: &str) -> bool {
+    STORY_FLOW
+        .iter()
+        .any(|workflow| story_status_for(workflow) == status)
+}
+
 fn parse_value(text: String) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| json!({ "legacyInvalidJson": text }))
 }
@@ -580,6 +620,22 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = require_task(&transaction, id)?;
+        // A story's status column is a projection of its gate, not a field the
+        // caller owns. Writing it directly leaves the row asserting one thing
+        // and its gate another — and a direct move to `done` stamps
+        // completed_at while the story never took a review signoff, never
+        // dispatched a merge task, and never flipped its parent epic.
+        let gate_bypassed = current.task_type == "story" && is_gate_owned_status(status);
+        if gate_bypassed && !force {
+            let workflow = current
+                .metadata
+                .get("workflowStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("planning");
+            bail!(
+                "story {id} status is projected from its gate, now at {workflow}: advance it with `story advance` (--force overwrites the projection and records it)"
+            );
+        }
         let seized = require_free_lease(&transaction, id, &actor, force, "move")?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let patch = patch
@@ -611,7 +667,7 @@ impl Store {
             Some(id),
             "task_moved",
             Some(&actor),
-            json!({"status": status, "seizedFrom": seized.map(|claim| claim.agent_id)}),
+            json!({"status": status, "seizedFrom": seized.map(|claim| claim.agent_id), "gateBypassed": gate_bypassed}),
         )?;
         transaction.commit()?;
         self.require_task(id)
@@ -1264,15 +1320,6 @@ impl Store {
         reviewer: Option<&str>,
         committer: Option<&str>,
     ) -> Result<Value> {
-        const FLOW: [&str; 7] = [
-            "planning",
-            "ready",
-            "in-progress",
-            "testing",
-            "review",
-            "merging",
-            "done",
-        ];
         let actor = nonempty(actor, "actor")?.to_owned();
         let transaction = self
             .connection
@@ -1310,7 +1357,7 @@ impl Store {
             .or(next);
         let target =
             target.with_context(|| format!("story {id} is in terminal state {current}"))?;
-        validate(target, &FLOW, "story workflow status")?;
+        validate(target, &STORY_FLOW, "story workflow status")?;
         if target != current && Some(target) != next {
             bail!("illegal story transition {current} -> {target}");
         }
@@ -1438,13 +1485,7 @@ impl Store {
             }
             dispatched = Some(child_id);
         }
-        let status = match target {
-            "planning" => "backlog",
-            "ready" => "todo",
-            "in-progress" => "in_progress",
-            "done" => "done",
-            _ => "review",
-        };
+        let status = story_status_for(target);
         transaction.execute(
             "UPDATE tasks SET status=?,metadata=?,updated_at=?,completed_at=? WHERE id=?",
             params![
@@ -1592,6 +1633,40 @@ mod tests {
         // An absent priority is not a zero: `task update` without --priority
         // must leave whatever the row already holds, in band or not.
         assert!(validate_priority(None).is_ok());
+    }
+
+    #[test]
+    fn every_gate_state_projects_a_status_the_gate_owns() {
+        // The guard and `advance_story` must read the same projection, or a new
+        // gate state becomes writable by hand on one side and not the other.
+        for workflow in STORY_FLOW {
+            let projected = story_status_for(workflow);
+            assert!(
+                TASK_STATUSES.contains(&projected),
+                "{workflow} projects {projected}, which is not a task status"
+            );
+            assert!(
+                is_gate_owned_status(projected),
+                "{workflow} projects {projected}, which the guard does not claim"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_does_not_own_what_it_cannot_express() {
+        // The gate is linear: it has no blocked and no cancelled state, so a
+        // direct move is the only way to say either. Guarding them would remove
+        // the capability rather than protect the projection.
+        for free in ["blocked", "cancelled"] {
+            assert!(
+                !is_gate_owned_status(free),
+                "{free} must stay writable — the gate cannot express it"
+            );
+            assert!(
+                !STORY_FLOW.iter().any(|w| story_status_for(w) == free),
+                "{free} became reachable from the gate; the guard must follow"
+            );
+        }
     }
 
     #[test]

@@ -250,6 +250,33 @@ symmetry. A board written before this rule, or imported from atmux, can still
 carry a pending handoff addressed to a container, and accepting it would mint
 exactly the lease `claim` now refuses.
 
+**A derived field is not writable by hand.** The same shape appeared one verb
+over. A story carries two statements of where it is: `workflowStatus` in its
+metadata, which the gate owns, and the `status` column every other reader uses.
+The column is not independent data — `story advance` writes it on every step as
+a projection of the gate (`planning`→`backlog`, `ready`→`todo`,
+`in-progress`→`in_progress`, `done`→`done`, everything else →`review`). The
+gate refuses an illegal transition by name, and then `task move` wrote the
+projected column directly with no reference to the gate at all: a guard that
+can be walked around is not a guard. `task move s-1 done` stamped `completed_at`
+on a story that had taken no review signoff, dispatched no merge task, and
+flipped no parent epic.
+
+`task move` on a story is refused for the statuses the gate projects, naming
+`story advance` and quoting where the gate actually stands, and `--force`
+performs it and records `gateBypassed` — the same audited-override shape a
+seized lease already uses. `blocked` and `cancelled` stay directly writable:
+the gate is linear and can express neither, so guarding them would remove the
+only way to say them rather than protect anything. The set of guarded statuses
+is derived by running the gate's own states through the gate's own projection,
+now one shared function rather than a literal repeated on each side, so a new
+gate state cannot become hand-writable by being added in one place only.
+
+Epics are deliberately untouched. An epic's status is moved by the gate only
+once — the flip to `in-progress` when its first story starts — and no
+`epic advance` verb exists, so `task move` is the intended mechanism for the
+rest of its life. Refusing it there would strand the row rather than protect it.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

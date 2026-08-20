@@ -2926,3 +2926,94 @@ fn a_handoff_addressed_to_a_container_cannot_be_accepted() {
         String::from_utf8_lossy(&accepted.stderr)
     );
 }
+
+#[test]
+fn a_story_status_is_not_writable_around_its_gate() {
+    let fixture = Fixture::new("story-projection");
+    fixture.ok_json(&fixture.main, &["init", "--name", "GATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Story", "--id", "s-1", "--type", "story", "--json",
+        ],
+    );
+
+    // Marking it done by hand would stamp completed_at while the gate never
+    // took a signoff, dispatched a merge task, or flipped a parent epic.
+    let direct = fixture.run(
+        &fixture.main,
+        &["task", "move", "s-1", "done", "--as", "geo", "--json"],
+    );
+    assert!(
+        !direct.status.success(),
+        "a story was completed around its gate"
+    );
+    let error = String::from_utf8_lossy(&direct.stderr).to_string();
+    assert!(error.contains("story advance"), "{error}");
+    assert!(
+        error.contains("planning"),
+        "the refusal must say where the gate actually is: {error}"
+    );
+
+    let untouched = fixture.ok_json(&fixture.main, &["task", "show", "s-1", "--json"]);
+    // `task add` defaults a story to todo regardless of type, so this is the
+    // status the row already held — the point is that the refused move did not
+    // change it, and did not stamp completedAt.
+    assert_eq!(untouched["status"], "todo", "the refused move still landed");
+    assert!(
+        untouched["completedAt"].is_null(),
+        "completedAt was stamped"
+    );
+
+    // The gate itself keeps writing the same column, and the projection holds.
+    fixture.ok_json(
+        &fixture.main,
+        &["story", "advance", "s-1", "--as", "geo", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "s-1", "--json"])["status"],
+        "todo",
+        "ready must project to todo"
+    );
+
+    // blocked is outside the gate's vocabulary, so it stays directly writable —
+    // refusing it would remove the only way to say it.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "s-1", "blocked", "--as", "geo", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "s-1", "--json"])["status"],
+        "blocked"
+    );
+
+    // --force overwrites the projection and says so in the ledger.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "move", "s-1", "done", "--as", "geo", "--force", "--json",
+        ],
+    );
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "s-1", "--json"]);
+    let bypassed = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["payload"]["gateBypassed"] == json!(true))
+        .count();
+    assert_eq!(bypassed, 1, "the forced override was not recorded once");
+
+    // A plain task is untouched by any of this.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-1", "done", "--as", "geo", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["status"],
+        "done"
+    );
+}
