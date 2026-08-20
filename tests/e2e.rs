@@ -3162,3 +3162,229 @@ fn a_task_cannot_be_made_to_contain_work() {
         );
     }
 }
+
+/// The bounded fresh-turn protocol of `docs/integrating-orch.md`, driven end to
+/// end against the compiled binary, including the restart it exists to survive.
+#[test]
+fn the_long_horizon_turn_protocol_survives_a_runner_restart() {
+    let fixture = Fixture::new("orch-protocol");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ORCH", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Long horizon work", "--id", "t-lh", "--json"],
+    );
+
+    // (1)-(2) The runner claims the task under its run identity.
+    let first = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-lh",
+            "--as",
+            "orch/run-1",
+            "--session",
+            "session-1",
+            "--json",
+        ],
+    );
+    let stale_token = first["leaseToken"].as_str().unwrap().to_owned();
+
+    // (3) Context is fetched before each model invocation, in both renderings.
+    let packet = fixture.ok_json(&fixture.main, &["context", "t-lh", "--json"]);
+    assert_eq!(packet["task"]["id"], "t-lh");
+    let rendered = fixture.run(&fixture.main, &["context", "t-lh"]);
+    assert!(rendered.status.success());
+
+    // The lease token authorizes writes and must never reach a prompt. No read
+    // surface may carry it, whichever rendering the runner feeds the model.
+    for surface in [
+        vec!["context", "t-lh"],
+        vec!["context", "t-lh", "--json"],
+        vec!["task", "show", "t-lh", "--json"],
+        vec!["events", "--task", "t-lh", "--json"],
+        vec!["dashboard", "--json"],
+    ] {
+        let out = fixture.run(&fixture.main, &surface);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !text.contains(&stale_token),
+            "{surface:?} leaked the lease token"
+        );
+    }
+
+    // (5)-(6) The runner writes the envelope itself. `continue` keeps the lease.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-lh",
+            "--lease",
+            &stale_token,
+            "--as",
+            "orch/run-1",
+            "--state",
+            "continue",
+            "--summary",
+            "turn one changed the parser",
+            "--intent",
+            "the next turn is the suite",
+            "--next-action",
+            "run cargo test",
+            "--validation",
+            "cargo build passed",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-lh", "--json"])["status"],
+        "in_progress",
+        "a continue checkpoint must keep the task running"
+    );
+
+    // The runner now dies. Its lease is still live, so nobody else may take the
+    // task -- a crash must not hand work to a second runner mid-turn.
+    let contested = fixture.run(
+        &fixture.main,
+        &["claim", "t-lh", "--as", "orch/run-2", "--json"],
+    );
+    assert!(!contested.status.success(), "a live lease was taken over");
+
+    // Time passes and the lease lapses. Expiry is what makes the work
+    // reclaimable, so drive it the way the sweep does.
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE task_claims SET expires_at=1 WHERE task_id='t-lh'",
+            [],
+        )
+        .unwrap();
+
+    // A restarted runner reacquires, and resumes from the newest durable
+    // checkpoint rather than from any memory of the old session.
+    let second = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-lh",
+            "--as",
+            "orch/run-2",
+            "--session",
+            "session-2",
+            "--json",
+        ],
+    );
+    let live_token = second["leaseToken"].as_str().unwrap().to_owned();
+    assert_ne!(live_token, stale_token, "a restart reused the dead lease");
+
+    let resumed = fixture.ok_json(&fixture.main, &["context", "t-lh", "--json"]);
+    let newest = resumed["checkpoints"].as_array().unwrap().last().unwrap();
+    assert_eq!(newest["nextAction"], "run cargo test");
+    assert_eq!(newest["state"], "continue");
+
+    // The hazard the protocol names: the crashed runner wakes up holding a
+    // token from before the handover. It must be refused, and told the truth --
+    // "no active lease" would send it to claim a task somebody else is running.
+    let zombie = fixture.run(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-lh",
+            "--lease",
+            &stale_token,
+            "--as",
+            "orch/run-1",
+            "--state",
+            "done",
+            "--summary",
+            "zombie write",
+            "--intent",
+            "stale",
+            "--next-action",
+            "stale",
+            "--json",
+        ],
+    );
+    assert!(!zombie.status.success(), "a superseded lease still wrote");
+    let refusal = String::from_utf8_lossy(&zombie.stderr).to_string();
+    assert!(
+        refusal.contains("orch/run-2"),
+        "the refusal must name the live holder: {refusal}"
+    );
+    assert!(
+        refusal.contains("superseded"),
+        "the refusal must say the lease was replaced, not that none exists: {refusal}"
+    );
+    assert!(
+        !refusal.contains(&live_token),
+        "the refusal handed out the live lease token"
+    );
+
+    // The live runner is untouched by the zombie, and closes the task. `done`
+    // atomically releases the lease in the same transaction as the checkpoint.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-lh",
+            "--lease",
+            &live_token,
+            "--as",
+            "orch/run-2",
+            "--state",
+            "done",
+            "--summary",
+            "the suite is green",
+            "--intent",
+            "nothing further is needed",
+            "--next-action",
+            "none",
+            "--json",
+        ],
+    );
+    let closed = fixture.ok_json(&fixture.main, &["task", "show", "t-lh", "--json"]);
+    assert_eq!(closed["status"], "done");
+    assert!(
+        !closed["completedAt"].is_null(),
+        "done left no completion stamp"
+    );
+    assert!(
+        closed["claim"].is_null(),
+        "done must release the lease in the same transaction"
+    );
+
+    // And a lease released that way cannot be used again by anyone.
+    let after_release = fixture.run(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-lh",
+            "--lease",
+            &live_token,
+            "--as",
+            "orch/run-2",
+            "--summary",
+            "after the close",
+            "--intent",
+            "stale",
+            "--next-action",
+            "stale",
+            "--json",
+        ],
+    );
+    assert!(
+        !after_release.status.success(),
+        "a released lease still wrote"
+    );
+    assert!(
+        String::from_utf8_lossy(&after_release.stderr).contains("no active lease"),
+        "a genuinely unheld task must say so"
+    );
+}

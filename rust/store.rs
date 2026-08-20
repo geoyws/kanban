@@ -349,15 +349,41 @@ fn active_claim(connection: &Connection, task_id: &str, now: i64) -> Result<Opti
         .map_err(Into::into)
 }
 
+/// Resolve the caller's lease, or say precisely why it is not theirs.
+///
+/// Three different situations used to print "no active lease for task X": the
+/// task is genuinely unheld, the caller's lease lapsed, and the task is held
+/// right now by somebody else. The third is the restart hazard — a runner that
+/// crashed and came back holding a token from before someone else reclaimed the
+/// work — and telling it "no active lease" states the opposite of the truth. A
+/// caller that believes the task is free reasonably goes on to claim it, and
+/// races the live holder for a task the ledger just told it nobody owned.
+///
+/// The current lease token is never named. A refusal identifies the holder,
+/// which the caller may act on, and not the secret that authorizes writes.
 fn require_lease(connection: &Connection, task_id: &str, token: &str, now: i64) -> Result<Claim> {
-    let claim = connection
+    if let Some(claim) = connection
         .query_row(
             "SELECT * FROM task_claims WHERE task_id=? AND lease_token=? AND expires_at>?",
             params![task_id, token, now],
             claim_row,
         )
-        .optional()?;
-    claim.with_context(|| format!("no active lease for task {task_id}"))
+        .optional()?
+    {
+        return Ok(claim);
+    }
+    match active_claim(connection, task_id, now)? {
+        Some(held) => bail!(
+            "task {task_id} is leased by {} until {}, and that is not the lease you presented: \
+             it was superseded, so reacquire the task before writing to it",
+            held.agent_id,
+            held.expires_at
+        ),
+        None => bail!(
+            "task {task_id} has no active lease: it was never claimed, or the lease expired and \
+             was retired; claim the task to write to it"
+        ),
+    }
 }
 
 fn expire_claims(connection: &Connection, now: i64) -> Result<()> {
