@@ -292,6 +292,11 @@ interpreted unambiguously is refused rather than guessed
   title `Fix` and report success; `kanban note t-1 the build is red --as ci`
   recorded `the`. The error shows the prefix it accepted, so where the title
   stopped is obvious.
+- **Two requests at once are refused.** `claim t-5 --next` named a task *and*
+  asked for whichever comes first; it used to drop the id and hand back a
+  different task. A single-valued flag given twice is an error rather than
+  last-wins — `--project alpha --project beta` wrote to beta. Flags whose value
+  is a list (`--depends-on`, `--blocker`, `--validation`) still repeat.
 - **A live lease is not overridden silently.** `task move` and `task remove`
   refuse against a claimed task, naming the holder and its expiry. `--force`
   seizes the lease and writes a `lease_seized` event; a forced removal also

@@ -103,6 +103,15 @@ const BOOLEAN: [&str; 18] = [
     "dry-run",
 ];
 
+/// Flags that may be given more than once, because their value is a list.
+///
+/// Everything else is single-valued, and repeating one used to keep the last
+/// occurrence silently. `--project alpha --project beta` wrote to beta: the
+/// wrong-board write ADR-007 exists to prevent, reached through a repeated
+/// flag instead of a mistyped one, and trivially produced by a wrapper script
+/// that appends a default the caller had already set.
+const REPEATABLE: [&str; 3] = ["depends-on", "blocker", "validation"];
+
 /// Accepted on every board command; see `store_path`.
 const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
@@ -415,6 +424,29 @@ impl Args {
                 .collect::<Vec<_>>()
                 .join(", "),
             accepted.join(" ")
+        );
+    }
+
+    /// Fail on a single-valued flag given more than once.
+    ///
+    /// Taking the last occurrence is a common convention and the wrong one
+    /// here: the values disagree, only one of them is what the caller meant,
+    /// and nothing in the receipt says which was used.
+    fn reject_repeated(&self) -> Result<()> {
+        let mut repeated = self
+            .flags
+            .iter()
+            .filter(|(name, values)| values.len() > 1 && !REPEATABLE.contains(&name.as_str()))
+            .map(|(name, values)| format!("--{name} ({})", values.join(", ")))
+            .collect::<Vec<_>>();
+        if repeated.is_empty() {
+            return Ok(());
+        }
+        repeated.sort_unstable();
+        bail!(
+            "{} given more than once; it takes a single value, and guessing which one \
+             was meant is how the wrong board gets written",
+            repeated.join(", ")
         );
     }
 
@@ -840,6 +872,7 @@ fn run() -> Result<()> {
     match command_spec(command, spec_sub) {
         Some((allowed, positionals)) => {
             args.reject_unknown(allowed)?;
+            args.reject_repeated()?;
             args.reject_extra_positionals(positionals)?;
         }
         None => bail!("unknown command; run kanban --help"),
@@ -1160,6 +1193,16 @@ fn run() -> Result<()> {
         return print(&value, args.has("json"));
     }
     if command == "claim" {
+        // `kanban claim t-5 --next` used to ignore the id and hand back
+        // whatever was at the head of the queue, so an agent that asked for a
+        // named task got a lease on a different one and no hint of the swap.
+        if sub.is_some() && args.has("next") {
+            bail!(
+                "claim takes a task id or --next, not both: `claim {} --next` asked for one \
+                 named task and for whichever comes first",
+                sub.unwrap_or_default()
+            );
+        }
         let id = if args.has("next") { None } else { sub };
         if id.is_none() && !args.has("next") {
             bail!("task id or --next is required");
@@ -1443,6 +1486,51 @@ mod tests {
         );
         assert!(command_spec("frobnicate", None).is_none());
         assert!(command_spec("task", Some("frobnicate")).is_none());
+    }
+
+    #[test]
+    fn every_list_valued_flag_is_declared_repeatable() {
+        // Read back at compile time so the two cannot drift: a flag whose
+        // value is collected with `many` but is missing from REPEATABLE would
+        // be refused the moment someone legitimately passed it twice, and the
+        // refusal would look like a rule rather than an oversight.
+        const SOURCE: &str = include_str!("lib.rs");
+        for (command, sub, flags, _) in COMMANDS {
+            for flag in *flags {
+                let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
+                assert_eq!(
+                    collected,
+                    REPEATABLE.contains(flag),
+                    "{command} {sub:?}: --{flag} is collected with many() but not listed \
+                     REPEATABLE, or listed and never collected"
+                );
+            }
+        }
+        for flag in REPEATABLE {
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(_, _, flags, _)| flags.contains(&flag)),
+                "--{flag} is repeatable but no command accepts it"
+            );
+        }
+    }
+
+    #[test]
+    fn repeating_a_single_valued_flag_is_refused() {
+        assert!(args(&["--project", "alpha"]).reject_repeated().is_ok());
+        assert!(args(&[]).reject_repeated().is_ok());
+        // A list-valued flag is exactly what repeating is for.
+        assert!(
+            args(&["--blocker", "a", "--blocker", "b"])
+                .reject_repeated()
+                .is_ok()
+        );
+        let error = args(&["--project", "alpha", "--project", "beta"])
+            .reject_repeated()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--project (alpha, beta)"), "{error}");
     }
 
     #[test]

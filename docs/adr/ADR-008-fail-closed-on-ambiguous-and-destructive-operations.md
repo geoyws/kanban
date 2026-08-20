@@ -191,6 +191,20 @@ command surface and a new command cannot be added without saying. The error
 prints the prefix it did accept — `after \`task add Fix\`` — because seeing
 where the title stopped is what makes the cause obvious.
 
+**Two requests at once is ambiguity, not a precedence puzzle.** `kanban claim
+t-5 --next` named one task and asked for whichever comes first; it dropped the
+id and handed back the head of the queue, so an agent that asked for `t-5` held
+a lease on something else and had no hint of the swap. And a single-valued flag
+given twice kept the last occurrence: `--project alpha --project beta` wrote to
+beta — the wrong-board write ADR-007 exists to prevent, reached through a
+repeated flag rather than a mistyped one, and trivially produced by a wrapper
+script appending a default the caller had already set. Both are refused.
+Last-wins is a common convention and the wrong one here, because the values
+disagree, only one is what the caller meant, and nothing in the receipt says
+which was used. Flags whose value is genuinely a list (`--depends-on`,
+`--blocker`, `--validation`) are declared as such, and a compile-time guard
+ties that list to the call sites that collect them so the two cannot drift.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

@@ -2508,3 +2508,136 @@ fn compiled_binary_refuses_arguments_it_would_have_dropped() {
         &["task", "move", "t-1", "todo", "--as", "geo", "--json"],
     );
 }
+
+#[test]
+fn compiled_binary_refuses_two_requests_dressed_as_one() {
+    let fixture = Fixture::new("ambiguous");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let other = fixture.root.join("other");
+    fs::create_dir_all(&other).unwrap();
+    fixture.ok_json(&other, &["init", "--name", "Beta", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "head of the queue",
+            "--id",
+            "t-first",
+            "--priority",
+            "1",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "the one asked for",
+            "--id",
+            "t-named",
+            "--priority",
+            "9",
+            "--json",
+        ],
+    );
+
+    // `claim t-named --next` used to drop the id and hand back t-first, so an
+    // agent that asked for a named task held a lease on a different one.
+    let refused = fixture.run(
+        &fixture.main,
+        &["claim", "t-named", "--next", "--as", "worker", "--json"],
+    );
+    assert!(
+        !refused.status.success(),
+        "claim ignored the task id it was given and picked a different task"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not both"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // Either request alone still means what it says.
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "t-named", "--as", "worker", "--json"]
+        )["taskID"],
+        "t-named"
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "--next", "--as", "other", "--json"]
+        )["taskID"],
+        "t-first"
+    );
+
+    // A repeated single-valued flag kept the last occurrence, so a wrapper
+    // appending a default --project silently retargeted the board.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "whose board?",
+            "--id",
+            "t-stray",
+            "--project",
+            "Alpha",
+            "--project",
+            "Beta",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a repeated --project picked one board without saying which"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--project (Alpha, Beta)"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    for project in ["Alpha", "Beta"] {
+        assert!(
+            !fixture
+                .run(
+                    &fixture.main,
+                    &["task", "show", "t-stray", "--project", project, "--json"]
+                )
+                .status
+                .success(),
+            "the refused task landed on {project} anyway"
+        );
+    }
+
+    // List-valued flags are exactly what repeating is for, and still repeat.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "with deps",
+            "--id",
+            "t-deps",
+            "--depends-on",
+            "t-first",
+            "--depends-on",
+            "t-named",
+            "--json",
+        ],
+    );
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--with-relations", "--json"],
+    );
+    let deps = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "t-deps")
+        .unwrap();
+    assert_eq!(deps["dependencies"], json!(["t-first", "t-named"]));
+}
