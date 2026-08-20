@@ -3017,3 +3017,82 @@ fn a_story_status_is_not_writable_around_its_gate() {
         "done"
     );
 }
+
+#[test]
+fn a_task_cannot_be_made_to_contain_work() {
+    let fixture = Fixture::new("nesting");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TREE", "--json"]);
+    for (id, kind) in [("e-1", "epic"), ("s-1", "story"), ("t-1", "task")] {
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", "Row", "--id", id, "--type", kind, "--json"],
+        );
+    }
+
+    // The three shapes the ledger is actually used in.
+    for (id, kind, parent) in [
+        ("s-ok", "story", "e-1"),
+        ("t-ok-epic", "task", "e-1"),
+        ("t-ok-story", "task", "s-1"),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task", "add", "Row", "--id", id, "--type", kind, "--parent", parent, "--json",
+            ],
+        );
+    }
+
+    // A story under a task is the costly one: `story advance` flips a parent
+    // only when it is an epic, so the mis-nested story would silently never
+    // flip anything and nothing would ever say so.
+    let inverted = fixture.run(
+        &fixture.main,
+        &[
+            "task", "add", "Row", "--id", "s-bad", "--type", "story", "--parent", "t-1", "--json",
+        ],
+    );
+    assert!(!inverted.status.success(), "a story nested under a task");
+    let error = String::from_utf8_lossy(&inverted.stderr).to_string();
+    assert!(error.contains("story") && error.contains("task"), "{error}");
+    assert!(error.contains("contains nothing"), "{error}");
+
+    let epic_under_task = fixture.run(
+        &fixture.main,
+        &[
+            "task", "add", "Row", "--id", "e-bad", "--type", "epic", "--parent", "t-1", "--json",
+        ],
+    );
+    assert!(
+        !epic_under_task.status.success(),
+        "an epic nested under a task"
+    );
+
+    // Re-parenting is the same rule: it is the other way to write the field.
+    let reparent = fixture.run(
+        &fixture.main,
+        &[
+            "task", "update", "s-ok", "--as", "geo", "--parent", "t-1", "--json",
+        ],
+    );
+    assert!(
+        !reparent.status.success(),
+        "a story was re-parented under a task"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "s-ok", "--json"])["parentID"],
+        "e-1",
+        "the refused re-parent still landed"
+    );
+
+    // Nothing the refusals touched was created.
+    for ghost in ["s-bad", "e-bad"] {
+        assert!(
+            !fixture
+                .run(&fixture.main, &["task", "show", ghost, "--json"])
+                .status
+                .success(),
+            "{ghost} was written despite the refusal"
+        );
+    }
+}

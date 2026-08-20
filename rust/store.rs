@@ -125,6 +125,35 @@ fn is_gate_owned_status(status: &str) -> bool {
         .any(|workflow| story_status_for(workflow) == status)
 }
 
+/// How wide a container each type is: an epic contains stories, a story
+/// contains tasks, and a task contains nothing.
+fn nesting_depth(task_type: &str) -> usize {
+    match task_type {
+        "epic" => 0,
+        "story" => 1,
+        _ => 2,
+    }
+}
+
+/// Refuse a parent that cannot contain this child.
+///
+/// The breakdown was implied everywhere and enforced nowhere: `advance_story`
+/// flips a parent only when it is an epic, and the id prefixes (`e-`/`s-`/`t-`)
+/// read as a hierarchy. All nine type pairings were accepted, so nesting a
+/// story under a task recorded a tree that no reader agrees with and produced
+/// no signal — the story simply never flips anything, forever, and the operator
+/// who mis-typed one `--parent` is never told.
+fn require_valid_nesting(child_id: &str, child_type: &str, parent: &Task) -> Result<()> {
+    if nesting_depth(child_type) <= nesting_depth(&parent.task_type) {
+        bail!(
+            "task {child_id} is a {child_type} and cannot nest under {}, which is a {}: an epic contains stories, a story contains tasks, and a task contains nothing",
+            parent.id,
+            parent.task_type
+        );
+    }
+    Ok(())
+}
+
 fn parse_value(text: String) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| json!({ "legacyInvalidJson": text }))
 }
@@ -538,7 +567,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         if let Some(parent) = &input.parent_id {
-            require_task(&transaction, parent)?;
+            let parent = require_task(&transaction, parent)?;
+            require_valid_nesting(&id, &input.task_type, &parent)?;
         }
         transaction.execute(
             "INSERT INTO tasks(id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -768,7 +798,8 @@ impl Store {
         let current = require_task(&transaction, id)?;
         let parent = input.parent_id.unwrap_or(current.parent_id);
         if let Some(parent_id) = &parent {
-            require_task(&transaction, parent_id)?;
+            let parent_task = require_task(&transaction, parent_id)?;
+            require_valid_nesting(id, &current.task_type, &parent_task)?;
             let mut cursor = Some(parent_id.clone());
             let mut seen = std::collections::HashSet::from([id.to_owned()]);
             while let Some(value) = cursor {
@@ -1633,6 +1664,49 @@ mod tests {
         // An absent priority is not a zero: `task update` without --priority
         // must leave whatever the row already holds, in band or not.
         assert!(validate_priority(None).is_ok());
+    }
+
+    #[test]
+    fn only_a_wider_container_can_hold_a_child() {
+        let parent_of = |kind: &str| Task {
+            id: format!("p-{kind}"),
+            task_type: kind.to_owned(),
+            parent_id: None,
+            title: "parent".into(),
+            body: None,
+            assignee: None,
+            lane: None,
+            deliverable: None,
+            stale_minutes: None,
+            driver_only: false,
+            status: "todo".into(),
+            priority: 3,
+            created_at: 0,
+            updated_at: 0,
+            completed_at: None,
+            metadata: json!({}),
+        };
+
+        // Exactly the three shapes the live boards use, and nothing else.
+        for (child, parent) in [("story", "epic"), ("task", "epic"), ("task", "story")] {
+            assert!(
+                require_valid_nesting("c-1", child, &parent_of(parent)).is_ok(),
+                "{child} under {parent} is how the breakdown is actually used"
+            );
+        }
+        for (child, parent) in [
+            ("epic", "epic"),
+            ("epic", "story"),
+            ("epic", "task"),
+            ("story", "story"),
+            ("story", "task"),
+            ("task", "task"),
+        ] {
+            let error = require_valid_nesting("c-1", child, &parent_of(parent))
+                .expect_err(&format!("{child} must not nest under {parent}"))
+                .to_string();
+            assert!(error.contains(child) && error.contains(parent), "{error}");
+        }
     }
 
     #[test]

@@ -277,6 +277,25 @@ once — the flip to `in-progress` when its first story starts — and no
 `epic advance` verb exists, so `task move` is the intended mechanism for the
 rest of its life. Refusing it there would strand the row rather than protect it.
 
+**A hierarchy that is read is a hierarchy that is enforced.** All nine pairings
+of parent and child type were accepted. Nothing in the ledger said an epic
+contains stories and a story contains tasks — but three things read as if it
+did: the id prefixes `e-`/`s-`/`t-`, the epic decomposition every consumer
+performs, and `advance_story`, which flips a parent only when that parent is an
+epic. So a story nested under a task was recorded, reported as success, and
+then silently never flipped anything for the rest of its life. There is no
+error to notice, because from the code's point of view the parent simply is not
+an epic — which is also exactly what a correctly-nested story under a
+mis-typed parent looks like.
+
+A child must be a narrower container than its parent: epic contains story
+contains task, and a task contains nothing. That is not a new model, it is the
+one the boards already use — across the twelve live boards all 420 parent links
+are epic→story, epic→task or story→task, and none of the six inverted shapes
+occurs even once. Both writers of the field are guarded, `task add --parent` and
+`task update --parent`, because re-parenting is the other way to say the same
+thing. Recorded rows are left as they are, as with the priority band.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract
