@@ -80,7 +80,10 @@ fn require_claimable_type(id: &str, task_type: &str) -> Result<()> {
             "story" => "advance it with `story advance` and claim the task that dispatches",
             _ => "claim one of its children instead",
         };
-        bail!("task {id} is a {task_type}, and only a {CLAIMABLE_TYPE} is claimable: {remedy}");
+        bail!(
+            "task {id} is {} {task_type}, and only a {CLAIMABLE_TYPE} is claimable: {remedy}",
+            article(task_type)
+        );
     }
     Ok(())
 }
@@ -125,6 +128,17 @@ fn is_gate_owned_status(status: &str) -> bool {
         .any(|workflow| story_status_for(workflow) == status)
 }
 
+/// The article a type name takes, so a refusal reads as English.
+///
+/// Only `epic` begins with a vowel, but a message an agent is meant to act on
+/// should not be the place a reader first wonders whether the tool is careful.
+fn article(word: &str) -> &'static str {
+    match word.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    }
+}
+
 /// How wide a container each type is: an epic contains stories, a story
 /// contains tasks, and a task contains nothing.
 fn nesting_depth(task_type: &str) -> usize {
@@ -146,8 +160,10 @@ fn nesting_depth(task_type: &str) -> usize {
 fn require_valid_nesting(child_id: &str, child_type: &str, parent: &Task) -> Result<()> {
     if nesting_depth(child_type) <= nesting_depth(&parent.task_type) {
         bail!(
-            "task {child_id} is a {child_type} and cannot nest under {}, which is a {}: an epic contains stories, a story contains tasks, and a task contains nothing",
+            "task {child_id} is {} {child_type} and cannot nest under {}, which is {} {}: an epic contains stories, a story contains tasks, and a task contains nothing",
+            article(child_type),
             parent.id,
+            article(&parent.task_type),
             parent.task_type
         );
     }
@@ -1664,6 +1680,19 @@ mod tests {
         // An absent priority is not a zero: `task update` without --priority
         // must leave whatever the row already holds, in band or not.
         assert!(validate_priority(None).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_names_a_type_with_the_right_article() {
+        assert_eq!(article("epic"), "an");
+        for consonant in ["story", "task"] {
+            assert_eq!(article(consonant), "a", "{consonant}");
+        }
+        let error = require_claimable_type("e-1", "epic")
+            .expect_err("an epic is not claimable")
+            .to_string();
+        assert!(error.contains("is an epic"), "{error}");
+        assert!(!error.contains("a epic"), "{error}");
     }
 
     #[test]
