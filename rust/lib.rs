@@ -9,7 +9,7 @@ mod store;
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
-use crate::registry::{Registry, data_root, now_ms};
+use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
 use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -766,6 +766,8 @@ fn run() -> Result<()> {
         Some(allowed) => args.reject_unknown(allowed)?,
         None => bail!("unknown command; run kanban --help"),
     }
+
+    require_sane_clock()?;
 
     // Held until `run` returns. `restore` replaces database files behind
     // SQLite's back, so it needs the data root to itself; everything else

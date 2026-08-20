@@ -6,11 +6,46 @@ use std::env;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+/// Milliseconds since the Unix epoch.
+///
+/// Infallible by construction rather than by `expect`: a panic here would
+/// abort mid-command with a Rust backtrace instead of an error an agent can
+/// read, and every caller writes the result into a durable record. The clamps
+/// are unreachable in practice because [`require_sane_clock`] refuses the run
+/// before any command gets this far — they exist so the function has no panic
+/// path at all, not as a fallback anybody should lean on.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_millis() as i64
+        .map_or(0, millis_of)
+}
+
+/// `Duration` to milliseconds, saturating rather than wrapping.
+///
+/// `as i64` on the `u128` this comes from truncates the high bits, so a clock
+/// far enough in the future produced a small or negative "now" — an ordering
+/// error rather than an obvious one.
+fn millis_of(elapsed: std::time::Duration) -> i64 {
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Refuse to run on a clock that cannot produce a timestamp.
+///
+/// Every task, note, checkpoint, event and lease is stamped, and leases expire
+/// by comparing stamps, so a clock before the epoch does not degrade the
+/// ledger — it makes every ordering in it meaningless. Saying so once, up
+/// front, beats writing records that are wrong in a way nothing later can
+/// detect.
+pub fn require_sane_clock() -> Result<()> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the system clock reads before 1970-01-01; kanban stamps every record it writes \
+                 and orders leases by those stamps, so it will not write a time it cannot compute"
+            )
+        })?;
+    Ok(())
 }
 
 pub fn data_root() -> Result<PathBuf> {
@@ -285,5 +320,32 @@ impl Registry {
 impl Drop for Registry {
     fn drop(&mut self) {
         let _ = checkpoint(&self.connection);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn millis_saturate_instead_of_wrapping() {
+        assert_eq!(millis_of(Duration::from_millis(1_234)), 1_234);
+        assert_eq!(millis_of(Duration::ZERO), 0);
+        // The old `as i64` truncated the high bits of the u128 here, so an
+        // absurd clock read as a small — or negative — instant.
+        assert_eq!(millis_of(Duration::MAX), i64::MAX);
+        assert!(millis_of(Duration::MAX) > 0);
+    }
+
+    #[test]
+    fn a_working_clock_is_accepted_and_produces_a_positive_now() {
+        // The refusal branch needs a system clock set before 1970, which this
+        // test will not do to the host it runs on. What is asserted here is
+        // that a sane clock is not refused, and that `now_ms` has no panic
+        // path left: `millis_saturate_instead_of_wrapping` covers the
+        // conversion that used to be the unsound part.
+        assert!(require_sane_clock().is_ok());
+        assert!(now_ms() > 1_700_000_000_000, "now_ms went backwards");
     }
 }
