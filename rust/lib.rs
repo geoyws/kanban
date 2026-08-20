@@ -56,6 +56,7 @@ Usage:
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
+  kanban schema [--json]
 
 Global options (accepted by every board command):
   --project NAME     address a registered project by name, from any directory
@@ -129,14 +130,26 @@ const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
 /// This is the single description of the command surface: `allowed_flags`
 /// reads it, and the drift guards in the test module iterate it, so a command
 /// added without its flag list fails the gate instead of reaching an operator.
-const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
-    ("init", None, &["name", "force"], 1),
-    ("workspace", Some("list"), &[], 2),
-    ("workspace", Some("attach"), &["to"], 2),
-    ("dashboard", None, &[], 1),
-    ("doctor", None, &[], 1),
-    ("backup", None, &["output", "keep"], 1),
-    ("restore", None, &["from", "force"], 1),
+/// One row of the command surface.
+///
+/// Name, subcommand, the flags it accepts, the most positionals it may hold
+/// counting its own name words, and whether it writes anything anywhere.
+type CommandRow = (
+    &'static str,
+    Option<&'static str>,
+    &'static [&'static str],
+    usize,
+    bool,
+);
+
+const COMMANDS: &[CommandRow] = &[
+    ("init", None, &["name", "force"], 1, false),
+    ("workspace", Some("list"), &[], 2, true),
+    ("workspace", Some("attach"), &["to"], 2, false),
+    ("dashboard", None, &[], 1, true),
+    ("doctor", None, &[], 1, true),
+    ("backup", None, &["output", "keep"], 1, false),
+    ("restore", None, &["from", "force"], 1, false),
     (
         "task",
         Some("add"),
@@ -155,17 +168,19 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
             "driver-only",
         ],
         3,
+        false,
     ),
-    ("task", Some("list"), &["status", "with-relations"], 2),
-    ("task", Some("show"), &[], 3),
+    ("task", Some("list"), &["status", "with-relations"], 2, true),
+    ("task", Some("show"), &[], 3, true),
     (
         "task",
         Some("move"),
         &["as", "metadata-patch-json", "force"],
         4,
+        false,
     ),
-    ("task", Some("remove"), &["as", "force"], 3),
-    ("task", Some("metadata"), &["as", "patch-json"], 3),
+    ("task", Some("remove"), &["as", "force"], 3, false),
+    ("task", Some("metadata"), &["as", "patch-json"], 3, false),
     (
         "task",
         Some("update"),
@@ -189,15 +204,17 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
             "clear-dependencies",
         ],
         3,
+        false,
     ),
     (
         "story",
         Some("advance"),
         &["as", "to", "reviewer", "committer"],
         3,
+        false,
     ),
-    ("story", Some("signoff"), &["as", "note"], 3),
-    ("story", Some("unsignoff"), &["as", "note"], 3),
+    ("story", Some("signoff"), &["as", "note"], 3, false),
+    ("story", Some("unsignoff"), &["as", "note"], 3, false),
     (
         "claim",
         None,
@@ -213,10 +230,11 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
             "next",
         ],
         2,
+        false,
     ),
-    ("heartbeat", None, &["lease", "lease-minutes"], 2),
-    ("release", None, &["lease", "keep-status"], 2),
-    ("note", None, &["as", "kind"], 3),
+    ("heartbeat", None, &["lease", "lease-minutes"], 2, false),
+    ("release", None, &["lease", "keep-status"], 2, false),
+    ("note", None, &["as", "kind"], 3, false),
     (
         "checkpoint",
         None,
@@ -237,6 +255,7 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
             "dirty",
         ],
         2,
+        false,
     ),
     (
         "handoff",
@@ -259,30 +278,35 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
             "dirty",
         ],
         3,
+        false,
     ),
-    ("handoff", Some("list"), &["task", "status"], 2),
+    ("handoff", Some("list"), &["task", "status"], 2, true),
     (
         "handoff",
         Some("accept"),
         &["as", "session", "lease-minutes", "caller-scope"],
         3,
+        false,
     ),
     (
         "import",
         Some("atmux-json"),
         &["as", "reconcile", "force", "dry-run", "verify"],
         3,
+        false,
     ),
     (
         "import",
         Some("atmux-sqlite"),
         &["as", "reconcile", "force", "dry-run", "verify"],
         3,
+        false,
     ),
-    ("events", None, &["task", "kind", "limit"], 1),
-    ("stale", None, &[], 1),
-    ("context", None, &["max-chars"], 2),
-    ("todo", None, &["output"], 1),
+    ("schema", None, &[], 1, true),
+    ("events", None, &["task", "kind", "limit"], 1, true),
+    ("stale", None, &[], 1, true),
+    ("context", None, &["max-chars"], 2, true),
+    ("todo", None, &["output"], 1, false),
 ];
 
 /// The flags a command accepts, and the most positionals it can hold —
@@ -290,8 +314,8 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
 fn command_spec(command: &str, sub: Option<&str>) -> Option<(&'static [&'static str], usize)> {
     COMMANDS
         .iter()
-        .find(|(name, expected, _, _)| *name == command && *expected == sub)
-        .map(|(_, _, flags, positionals)| (*flags, *positionals))
+        .find(|(name, expected, ..)| *name == command && *expected == sub)
+        .map(|(_, _, flags, positionals, _)| (*flags, *positionals))
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
@@ -662,6 +686,64 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
 /// (2) and (3) are what make the CLI usable outside a registered tree: an agent
 /// in an unrelated cage, a cron line, or any shell in $HOME can address a board
 /// without cd-ing into it.
+/// The operation surface, as data a harness can generate an adapter from.
+///
+/// [ADR-001](../docs/adr/ADR-001-durable-agent-work-ledger.md) §6 says
+/// consumers receive narrow operations rather than arbitrary write SQL, and
+/// that MCP and plugin adapters expose *the same operations* the CLI does. An
+/// adapter that hard-codes its own list of those operations is a second
+/// description of the surface, and it drifts the first time a command or a
+/// flag changes here — silently, because nothing compares them.
+///
+/// So the manifest is projected from `COMMANDS`, the same table the parser
+/// validates against. There is one description of the surface, and an adapter
+/// reads it rather than restating it.
+///
+/// `readOnly` is what lets a harness withhold mutation without maintaining its
+/// own allow-list. It means the operation writes nothing anywhere — not the
+/// board, not the registry, not a file — so `backup` and `todo` are not
+/// read-only even though neither changes work state.
+fn schema() -> Value {
+    let operations = COMMANDS
+        .iter()
+        .map(|(command, sub, flags, positionals, read_only)| {
+            let name = match sub {
+                Some(sub) => format!("{command} {sub}"),
+                None => (*command).to_owned(),
+            };
+            let flags = flags
+                .iter()
+                .map(|flag| {
+                    let kind = if REPEATABLE.contains(flag) {
+                        "list"
+                    } else if BOOLEAN.contains(flag) {
+                        "boolean"
+                    } else {
+                        "value"
+                    };
+                    json!({ "name": flag, "kind": kind })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "name": name,
+                "command": command,
+                "subcommand": sub,
+                "flags": flags,
+                // The words that name the operation are counted in, so a
+                // caller can tell how many arguments of its own it may pass.
+                "positionals": positionals,
+                "readOnly": read_only,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "globalFlags": GLOBAL_FLAGS,
+        "boardSelectors": BOARD_SELECTORS,
+        "operations": operations,
+    })
+}
+
 /// A board named straight by path, bypassing the registry entirely.
 ///
 /// Read by both the board resolver and the data-root lock, so the two can
@@ -919,6 +1001,11 @@ fn run() -> Result<()> {
     if command == "version" {
         println!("kanban {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+
+    // Describes the binary, not a board, so it resolves none and takes no lock.
+    if command == "schema" {
+        return print(&schema(), args.has("json"));
     }
 
     let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
@@ -1563,7 +1650,7 @@ mod tests {
 
     #[test]
     fn every_command_declares_its_flags_without_duplicates() {
-        for (command, sub, flags, positionals) in COMMANDS {
+        for (command, sub, flags, positionals, _) in COMMANDS {
             let mut seen = flags.to_vec();
             seen.sort_unstable();
             let before = seen.len();
@@ -1592,7 +1679,7 @@ mod tests {
         // No command is described twice, which would make the second row dead.
         let mut keys = COMMANDS
             .iter()
-            .map(|(command, sub, _, _)| (*command, *sub))
+            .map(|(command, sub, ..)| (*command, *sub))
             .collect::<Vec<_>>();
         keys.sort_unstable();
         let unique = keys.len();
@@ -1613,7 +1700,7 @@ mod tests {
         // be refused the moment someone legitimately passed it twice, and the
         // refusal would look like a rule rather than an oversight.
         const SOURCE: &str = include_str!("lib.rs");
-        for (command, sub, flags, _) in COMMANDS {
+        for (command, sub, flags, ..) in COMMANDS {
             for flag in *flags {
                 let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
                 assert_eq!(
@@ -1628,7 +1715,7 @@ mod tests {
             assert!(
                 COMMANDS
                     .iter()
-                    .any(|(_, _, flags, _)| flags.contains(&flag)),
+                    .any(|(_, _, flags, ..)| flags.contains(&flag)),
                 "--{flag} is repeatable but no command accepts it"
             );
         }
@@ -1658,7 +1745,7 @@ mod tests {
                 || flag == "version"
                 || COMMANDS
                     .iter()
-                    .any(|(_, _, flags, _)| flags.contains(&flag));
+                    .any(|(_, _, flags, ..)| flags.contains(&flag));
             assert!(
                 declared,
                 "--{flag} parses as a boolean but no command accepts it"
@@ -1675,20 +1762,17 @@ mod tests {
             let resolved = canonical_command(alias);
             assert_ne!(resolved, alias, "{alias} is not wired up");
             assert!(
-                resolved == "version"
-                    || COMMANDS
-                        .iter()
-                        .any(|(command, _, _, _)| *command == resolved),
+                resolved == "version" || COMMANDS.iter().any(|(command, ..)| *command == resolved),
                 "alias {alias} resolves to unknown command {resolved}"
             );
             // ...and must not be the name of a different real command.
             assert!(
-                !COMMANDS.iter().any(|(command, _, _, _)| *command == alias),
+                !COMMANDS.iter().any(|(command, ..)| *command == alias),
                 "alias {alias} shadows a real command"
             );
         }
         // A canonical name passes through untouched.
-        for (command, _, _, _) in COMMANDS {
+        for (command, ..) in COMMANDS {
             assert_eq!(canonical_command(command), *command);
         }
     }

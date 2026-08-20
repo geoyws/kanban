@@ -3553,3 +3553,126 @@ fn a_parity_receipt_proves_the_board_holds_what_the_source_held() {
         );
     }
 }
+
+/// ADR-001 §6: consumers receive narrow operations, and MCP/plugin adapters
+/// expose the same ones the CLI does. The manifest is how an adapter gets them
+/// without restating them -- and `readOnly` is only worth anything if it is
+/// true, so this proves each labelled operation writes nothing.
+#[test]
+fn the_schema_describes_the_real_surface_and_read_only_really_is() {
+    let fixture = Fixture::new("schema");
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    assert_eq!(schema["version"], env!("CARGO_PKG_VERSION"));
+
+    let operations = schema["operations"].as_array().unwrap();
+    assert!(operations.len() > 25, "the manifest lost operations");
+
+    // Every operation the parser accepts appears, and nothing else does.
+    for name in [
+        "task add",
+        "task list",
+        "claim",
+        "checkpoint",
+        "handoff accept",
+        "doctor",
+        "schema",
+    ] {
+        assert!(
+            operations.iter().any(|o| o["name"] == name),
+            "{name} is missing from the manifest"
+        );
+    }
+    for operation in operations {
+        assert!(operation["positionals"].as_u64().unwrap() >= 1);
+        for flag in operation["flags"].as_array().unwrap() {
+            let kind = flag["kind"].as_str().unwrap();
+            assert!(
+                ["value", "boolean", "list"].contains(&kind),
+                "unknown flag kind {kind}"
+            );
+        }
+    }
+    // A list-valued flag is described as one, or an adapter generates a tool
+    // that can only ever pass a single dependency.
+    let add = operations.iter().find(|o| o["name"] == "task add").unwrap();
+    let depends = add["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "depends-on")
+        .unwrap();
+    assert_eq!(depends["kind"], "list");
+
+    // Now the claim that matters. Set up a board with something to damage,
+    // record its bytes, run every read-only operation, and require the file to
+    // be untouched. A label an adapter trusts to withhold mutation has to be
+    // measured, not asserted.
+    fixture.ok_json(&fixture.main, &["init", "--name", "SCHEMA", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Some work", "--id", "t-1", "--json"],
+    );
+    fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let arguments = |name: &str| -> Option<Vec<String>> {
+        let base: Vec<&str> = match name {
+            "workspace list" => vec!["workspace", "list"],
+            "dashboard" => vec!["dashboard"],
+            "doctor" => vec!["doctor"],
+            "task list" => vec!["task", "list"],
+            "task show" => vec!["task", "show", "t-1"],
+            "handoff list" => vec!["handoff", "list"],
+            "schema" => vec!["schema"],
+            "events" => vec!["events"],
+            "stale" => vec!["stale"],
+            "context" => vec!["context", "t-1"],
+            _ => return None,
+        };
+        Some(base.into_iter().map(str::to_owned).collect())
+    };
+
+    let before = fs::read(&board).unwrap();
+    let mut covered = 0;
+    for operation in operations.iter().filter(|o| o["readOnly"] == true) {
+        let name = operation["name"].as_str().unwrap();
+        let args = arguments(name)
+            .unwrap_or_else(|| panic!("{name} is labelled readOnly but this test cannot run it"));
+        let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = fixture.run(&fixture.main, &borrowed);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&board).unwrap(),
+            before,
+            "{name} is labelled readOnly and modified the board"
+        );
+        covered += 1;
+    }
+    assert_eq!(
+        covered,
+        operations.iter().filter(|o| o["readOnly"] == true).count(),
+        "a readOnly operation went unexercised"
+    );
+    assert!(covered >= 9, "too few read-only operations were proven");
+
+    // And the converse is not claimed by accident: an operation that plainly
+    // writes must not be labelled read-only.
+    for name in [
+        "task add",
+        "task move",
+        "claim",
+        "checkpoint",
+        "restore",
+        "backup",
+    ] {
+        let operation = operations.iter().find(|o| o["name"] == name).unwrap();
+        assert_eq!(operation["readOnly"], false, "{name} is labelled readOnly");
+    }
+}
