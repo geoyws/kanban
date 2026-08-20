@@ -1007,8 +1007,9 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
         vec!["t-alpha".to_owned()]
     );
 
-    // (5) Precedence — an explicit --project beats the cwd it is standing in,
-    // and an explicit --db beats --project.
+    // (5) An explicit --project beats the cwd it is standing in. The working
+    // directory is a fallback, not a request, so there is nothing to disagree
+    // with.
     assert_eq!(
         ids(&fixture.ok_json(
             &fixture.main,
@@ -1016,19 +1017,84 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
         )),
         vec!["t-beta".to_owned()]
     );
+
+    // (5b) Two selectors a caller typed is ambiguity, not precedence. --db used
+    // to win silently, answering from a board the caller had also named
+    // otherwise — and creating it, empty, when the path did not exist.
+    let two_flags = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "list",
+            "--project",
+            "Beta",
+            "--db",
+            &alpha_board,
+            "--json",
+        ],
+    );
+    assert!(
+        !two_flags.status.success(),
+        "--db silently beat --project instead of refusing"
+    );
+    let conflict = String::from_utf8_lossy(&two_flags.stderr).to_string();
+    assert!(conflict.contains("--project Beta"), "{conflict}");
+    assert!(conflict.contains("--db"), "{conflict}");
+    assert!(conflict.contains("each name a board"), "{conflict}");
+
+    // The refusal must not have conjured or touched a board on the way.
     assert_eq!(
         ids(&fixture.ok_json(
             &fixture.main,
-            &[
-                "task",
-                "list",
-                "--project",
-                "Beta",
-                "--db",
-                &alpha_board,
-                "--json"
-            ]
+            &["task", "list", "--project", "Alpha", "--json"]
         )),
+        vec!["t-alpha".to_owned()]
+    );
+
+    // A --db path that does not exist is the sharper case: precedence used to
+    // answer from a file it created on the spot, so the caller who named a
+    // project got an empty board and no error.
+    let ghost = fixture.root.join("conjured.db");
+    let conjuring = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "list",
+            "--project",
+            "Beta",
+            "--db",
+            ghost.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        !conjuring.status.success(),
+        "a ghost --db won by precedence"
+    );
+    assert!(!ghost.exists(), "the refused command still created a board");
+
+    // Each selector alone still works, and the environment stays a default a
+    // flag is free to override.
+    assert_eq!(
+        ids(&fixture.ok_json(
+            &fixture.main,
+            &["task", "list", "--db", &alpha_board, "--json"]
+        )),
+        vec!["t-alpha".to_owned()]
+    );
+    let env_override = fixture
+        .command(&fixture.main)
+        .args(["task", "list", "--project", "Alpha", "--json"])
+        .env("KANBAN_PROJECT", "Beta")
+        .output()
+        .unwrap();
+    assert!(
+        env_override.status.success(),
+        "a flag overriding its own env default is not a conflict: {}",
+        String::from_utf8_lossy(&env_override.stderr)
+    );
+    assert_eq!(
+        ids(&serde_json::from_slice::<Value>(&env_override.stdout).unwrap()),
         vec!["t-alpha".to_owned()]
     );
 

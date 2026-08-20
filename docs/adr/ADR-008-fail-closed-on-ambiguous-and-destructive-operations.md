@@ -296,6 +296,29 @@ occurs even once. Both writers of the field are guarded, `task add --parent` and
 `task update --parent`, because re-parenting is the other way to say the same
 thing. Recorded rows are left as they are, as with the priority band.
 
+**Two requests at once, a fourth time: the board selectors.** The rule above —
+naming one thing two ways is ambiguity, not a precedence puzzle — was applied to
+`claim t-5 --next` and to a single-valued flag given twice, and left unapplied
+to the three flags that select a board. `--db`, `--project` and `--workspace`
+were read in that order, so `--project alpha --db /tmp/scratch.db` answered from
+the scratch file and `--project alpha --workspace ../beta` wrote to alpha. This
+is the wrong-board write [ADR-007](ADR-007-global-project-addressing.md) exists
+to prevent, reached through two valid flags instead of a mistyped one, and
+trivially produced by a wrapper appending a default the caller had already set.
+
+The `--db` case is the sharper one, because opening a board creates it: a
+`--db` path that did not exist was conjured empty and answered from, so a caller
+who had also named a project got a board with nothing in it and an exit status
+of zero.
+
+At most one board selector may be given as a flag. The chain still resolves a
+flag against its environment default and against the working directory, because
+neither of those is a second request — `KANBAN_DB` and `KANBAN_PROJECT` remain
+defaults a flag is free to override, and the working directory remains the
+fallback when nothing else is said. Only flags the caller supplied are counted.
+This supersedes the part of ADR-007's chain that let one explicit flag outrank
+another.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

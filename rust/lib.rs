@@ -115,6 +115,9 @@ const REPEATABLE: [&str; 3] = ["depends-on", "blocker", "validation"];
 /// Accepted on every board command; see `store_path`.
 const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
+/// The flags that each select a board. At most one may be given explicitly.
+const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
+
 /// Every command, and every flag it accepts.
 ///
 /// An unrecognized flag is an error, never a silent no-op. A mistyped
@@ -461,6 +464,39 @@ impl Args {
         );
     }
 
+    /// Fail when a command line names the board more than one way.
+    ///
+    /// `--db`, `--project` and `--workspace` each select a board, and the
+    /// resolver reads them in that order. Precedence is right for a flag
+    /// overriding its environment default, and for a flag overriding the
+    /// working directory — neither of those is a second request. It is wrong
+    /// for two flags a caller typed: the values disagree, only one is what they
+    /// meant, and nothing in the receipt says which was used.
+    ///
+    /// `--project alpha --db /tmp/scratch.db` answered from the scratch file,
+    /// conjuring it empty on the way, and `--project alpha --workspace ../beta`
+    /// wrote to alpha. Both are the wrong-board write ADR-007 exists to
+    /// prevent, reached through two valid flags instead of a mistyped one.
+    ///
+    /// Only flags the caller supplied are counted. `KANBAN_DB` and
+    /// `KANBAN_PROJECT` stay defaults that a flag overrides, because that is
+    /// what a default is.
+    fn reject_conflicting_board_selectors(&self) -> Result<()> {
+        let given = BOARD_SELECTORS
+            .iter()
+            .filter(|flag| self.flags.contains_key(**flag))
+            .map(|flag| format!("--{flag} {}", self.one(flag).unwrap_or_default()))
+            .collect::<Vec<_>>();
+        if given.len() < 2 {
+            return Ok(());
+        }
+        bail!(
+            "{} each name a board, and they disagree; give exactly one, because \
+             picking one by precedence is how the wrong board gets written",
+            given.join(" and ")
+        );
+    }
+
     /// Fail on any flag this command does not define, naming the nearest match.
     fn reject_unknown(&self, allowed: &[&str]) -> Result<()> {
         let mut unknown = self
@@ -616,6 +652,11 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
 ///   2. `--project` / `KANBAN_PROJECT` — a registered project by name, from anywhere
 ///   3. `--workspace PATH`          — the project containing PATH
 ///   4. the current directory       — the project containing it
+///
+/// The order resolves a flag against its environment default, and a flag
+/// against the working directory. It never resolves two flags against each
+/// other: `reject_conflicting_board_selectors` refuses that command line before
+/// this runs, so at most one of (1)-(3) is ever present as a flag here.
 ///
 /// (2) and (3) are what make the CLI usable outside a registered tree: an agent
 /// in an unrelated cage, a cron line, or any shell in $HOME can address a board
@@ -885,6 +926,7 @@ fn run() -> Result<()> {
             args.reject_unknown(allowed)?;
             args.reject_repeated()?;
             args.reject_extra_positionals(positionals)?;
+            args.reject_conflicting_board_selectors()?;
         }
         None => bail!("unknown command; run kanban --help"),
     }

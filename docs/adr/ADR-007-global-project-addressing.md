@@ -35,7 +35,17 @@ Board selection is an explicit chain, most explicit first:
 4. The working directory — the project containing it.
 
 Rule 4 is unchanged, so every existing caller keeps working; the change is
-purely additive. Rule 2 is the global route: an agent exports `KANBAN_PROJECT`
+purely additive.
+
+**Amended 2026-08-20 by [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md):
+the chain orders a flag against its environment default and against the working
+directory, and no longer orders two flags against each other.** Giving more than
+one of `--db`, `--project` or `--workspace` on one command line is refused
+rather than resolved by rank. The values disagree, only one is what the caller
+meant, and nothing in the receipt said which was used — which made rule 1
+outranking rule 2 a silent wrong-board write, the failure this ADR was written
+to remove. `KANBAN_DB` and `KANBAN_PROJECT` are unaffected: a default a flag
+overrides is not a second request. Rule 2 is the global route: an agent exports `KANBAN_PROJECT`
 once per cage, or passes `--project`, and never needs to know where a board
 lives or where it is standing.
 
