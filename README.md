@@ -110,6 +110,14 @@ No state is written into the managed repository. Override discovery with
 `KANBAN_DATA_DIR`, `KANBAN_DB`, or `--db PATH`. This permits atmux to retain
 per-team databases while orch and other harnesses share the same API.
 
+Concurrent writers queue rather than fail. Every transaction is
+`BEGIN IMMEDIATE`, and a board that is already being written is retried with
+randomized backoff for fifteen seconds before the command gives up
+([ADR-009](docs/adr/ADR-009-swarm-write-contention.md)). Measured on a
+sixteen-agent fan-out, that took the failure rate from 3% to zero and the
+slowest write from 6.7s to 4.5s: an agent reads an exit status and moves on, so
+a dropped write is lost work nothing downstream will notice is missing.
+
 ## Working from anywhere
 
 Boards are addressable from any directory, not only from inside the project

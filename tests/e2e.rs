@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
     root: PathBuf,
@@ -2144,5 +2144,54 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
     assert_eq!(
         updated["priority"], 99,
         "an update that never mentioned priority silently normalized it"
+    );
+}
+
+#[test]
+fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
+    let fixture = Fixture::new("busy");
+    let project = fixture.ok_json(&fixture.main, &["init", "--name", "Busy", "--json"]);
+    let board = project["boardPath"].as_str().unwrap().to_owned();
+
+    // Hold the write lock past the ceiling the binary used to give up at. A
+    // swarm write that loses the race has to queue, not fail: an agent reads
+    // an exit status and moves on, so a dropped write is lost work that
+    // nothing downstream will notice is missing.
+    let holder = std::thread::spawn(move || {
+        let connection = Connection::open(&board).unwrap();
+        connection
+            .busy_handler(Some(|_| {
+                std::thread::sleep(Duration::from_millis(50));
+                true
+            }))
+            .unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::sleep(Duration::from_millis(7_500));
+        connection.execute_batch("COMMIT").unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(250));
+
+    let started = Instant::now();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "queued behind a long writer",
+            "--id",
+            "t-queued",
+            "--json",
+        ],
+    );
+    let waited = started.elapsed();
+    holder.join().unwrap();
+
+    assert!(
+        waited >= Duration::from_secs(5),
+        "the write never queued behind the lock, so this proves nothing ({waited:?})"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-queued", "--json"])["title"],
+        "queued behind a long writer"
     );
 }
