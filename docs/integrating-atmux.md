@@ -24,6 +24,47 @@ task, story, epic, progress, claim, and handoff operations.
 7. Remove atmux's duplicate Kanban schemas, repositories, migrations, JSON
    writers, and Markdown handoff artifacts only after every consumer is moved.
 
+## Parity receipts
+
+Step 3 and step 6 both require the migration to be *checked*, not just run. An
+import receipt cannot serve as that check: its `counts` describe rows read from
+the source and its `created`/`updated` describe rows written to the board, which
+are two numbers about two different things. Neither says the board now holds
+what the source held.
+
+`kanban import atmux-sqlite <path> --as ACTOR --verify` re-reads the source and
+compares it against the board, writing nothing:
+
+```json
+{
+  "verified": false,
+  "compared": 4,
+  "matched": 2,
+  "missing": ["t-b"],
+  "differing": [
+    { "id": "t-a", "field": "title", "source": "Task A", "board": "TAMPERED" }
+  ],
+  "fields": ["type", "parentID", "title", "…", "atmuxExtra", "note"]
+}
+```
+
+`verified` is true only when nothing is missing and nothing differs. The receipt
+names the fields it covered, so a green result states its own scope instead of
+implying it checked everything: the identities the compatibility rules below
+call stable, plus the legacy note and the unknown extension fields they say must
+survive. Values the import itself stamps — `updated_at`, and the normalization
+metadata added only when a row raised a warning — are deliberately out of scope,
+since a receipt that flagged them would be red on a faithful import.
+
+The comparison is built from the same mapping the importer inserts through, not
+a second reading of the legacy schema. Two independent mappings would agree
+until the first time either changed, and drifting silently is precisely what the
+receipt exists to catch.
+
+`--verify` cannot be combined with `--reconcile`, `--force` or `--dry-run`.
+Those describe a write; letting one win silently is how an operator comes away
+believing a cutover was checked when it was performed.
+
 ## Compatibility rules
 
 - Existing task IDs, epics, stories, dependencies, owners, and timestamps are

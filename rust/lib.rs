@@ -51,7 +51,7 @@ Usage:
   kanban handoff list [--task ID] [--status STATUS] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
-             [--dry-run] [--json]
+             [--dry-run] [--verify] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
@@ -82,7 +82,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-const BOOLEAN: [&str; 18] = [
+const BOOLEAN: [&str; 19] = [
     "help",
     "json",
     "version",
@@ -101,6 +101,7 @@ const BOOLEAN: [&str; 18] = [
     "clear-dependencies",
     "reconcile",
     "dry-run",
+    "verify",
 ];
 
 /// Flags that may be given more than once, because their value is a list.
@@ -269,13 +270,13 @@ const COMMANDS: &[(&str, Option<&str>, &[&str], usize)] = &[
     (
         "import",
         Some("atmux-json"),
-        &["as", "reconcile", "force", "dry-run"],
+        &["as", "reconcile", "force", "dry-run", "verify"],
         3,
     ),
     (
         "import",
         Some("atmux-sqlite"),
-        &["as", "reconcile", "force", "dry-run"],
+        &["as", "reconcile", "force", "dry-run", "verify"],
         3,
     ),
     ("events", None, &["task", "kind", "limit"], 1),
@@ -1364,7 +1365,26 @@ fn run() -> Result<()> {
             reconcile: args.has("reconcile"),
             force: args.has("force"),
             dry_run: args.has("dry-run"),
+            verify: args.has("verify"),
         };
+        // --verify reads and reports; the others describe a write. Asking for
+        // both in one command line is two requests, and silently letting one
+        // win is how an operator comes away believing a cutover was checked
+        // when it was performed, or performed when it was checked.
+        if options.verify {
+            let writes = ["reconcile", "force", "dry-run"]
+                .into_iter()
+                .filter(|flag| args.has(flag))
+                .map(|flag| format!("--{flag}"))
+                .collect::<Vec<_>>();
+            if !writes.is_empty() {
+                bail!(
+                    "--verify compares the source against the board and writes nothing, so it \
+                     cannot be combined with {}; run the verification and the import separately",
+                    writes.join(" or ")
+                );
+            }
+        }
         let receipt = if sub == Some("atmux-json") {
             import_json(&mut store, Path::new(path), actor, options)?
         } else {

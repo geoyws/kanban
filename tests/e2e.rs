@@ -3388,3 +3388,168 @@ fn the_long_horizon_turn_protocol_survives_a_runner_restart() {
         "a genuinely unheld task must say so"
     );
 }
+
+/// Step 6 of `docs/integrating-atmux.md` requires a parity receipt against real
+/// private state before a cutover. This is that receipt, green and red.
+#[test]
+fn a_parity_receipt_proves_the_board_holds_what_the_source_held() {
+    let fixture = Fixture::new("parity");
+    let source = fixture.root.join("atmux-state.db");
+    fs::create_dir_all(&fixture.root).unwrap();
+    let legacy = Connection::open(&source).unwrap();
+    legacy
+        .execute_batch(
+            r#"
+            CREATE TABLE epics(id TEXT,title TEXT,status TEXT,created_at INTEGER,completed_at INTEGER,depends_on TEXT,stories TEXT,body TEXT,driver_ref TEXT,is_ready INTEGER,spawned_at INTEGER,extra TEXT);
+            CREATE TABLE stories(id TEXT,epic TEXT,title TEXT,status TEXT,created_at INTEGER,completed_at INTEGER,advanced_at INTEGER,body TEXT,acceptance_criteria TEXT,review_signoff INTEGER,merge_task_id TEXT,merge_mode TEXT,extra TEXT);
+            CREATE TABLE tasks(id TEXT,subject TEXT,status TEXT,created_at INTEGER,claimed_at INTEGER,completed_at INTEGER,epic TEXT,story TEXT,owner TEXT,deps TEXT,priority INTEGER,body TEXT,lane TEXT,deliverable TEXT,stale_min INTEGER,driver_only INTEGER,claimed_from TEXT,created_from TEXT,note TEXT,extra TEXT);
+            INSERT INTO epics VALUES('e-a','Epic A','ready',1700000000,NULL,'[]','["s-a"]','epic body','driver-1',1,1700000500,'{"customEpicField":"keep me"}');
+            INSERT INTO stories VALUES('s-a','e-a','Story A','review',1700000100,NULL,1700000600,'story body','AC text',1,'t-merge','feature-branch','{"customStoryField":"keep me too"}');
+            INSERT INTO tasks VALUES('t-a','Task A','in_progress',1700000200,1700000300,NULL,'e-a','s-a','agent-7','["t-b"]',2,'task body','fe','the deliverable',45,1,'driver-2','planner','a legacy note','{"customTaskField":"and me"}');
+            INSERT INTO tasks VALUES('t-b','Task B','done',1700000210,NULL,1700000400,'e-a',NULL,'agent-8','[]',1,NULL,'be',NULL,NULL,0,NULL,NULL,NULL,'{}');
+            "#,
+        )
+        .unwrap();
+    drop(legacy);
+
+    fixture.ok_json(&fixture.main, &["init", "--name", "PARITY", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "import",
+            "atmux-sqlite",
+            source.to_str().unwrap(),
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    // A faithful import verifies, and says how much it looked at. A receipt
+    // that reports "verified" without a scope is not evidence of anything.
+    let green = fixture.ok_json(
+        &fixture.main,
+        &[
+            "import",
+            "atmux-sqlite",
+            source.to_str().unwrap(),
+            "--as",
+            "operator",
+            "--verify",
+            "--json",
+        ],
+    );
+    assert_eq!(green["verified"], true, "a faithful import failed parity");
+    assert_eq!(green["compared"], 4);
+    assert_eq!(green["matched"], 4);
+    assert!(green["missing"].as_array().unwrap().is_empty());
+    assert!(green["differing"].as_array().unwrap().is_empty());
+    let fields = green["fields"].as_array().unwrap();
+    for named in [
+        "createdAt",
+        "dependencies",
+        "atmuxExtra",
+        "note",
+        "priority",
+    ] {
+        assert!(
+            fields.iter().any(|f| f == named),
+            "{named} is not in the stated scope"
+        );
+    }
+
+    // Now the board drifts from the source, the way a partial or interfered-with
+    // migration would leave it.
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tampered = Connection::open(&board).unwrap();
+    tampered
+        .execute(
+            "UPDATE tasks SET title='TAMPERED', priority=9 WHERE id='t-a'",
+            [],
+        )
+        .unwrap();
+    tampered
+        .execute("DELETE FROM tasks WHERE id='t-b'", [])
+        .unwrap();
+    drop(tampered);
+
+    let red = fixture.ok_json(
+        &fixture.main,
+        &[
+            "import",
+            "atmux-sqlite",
+            source.to_str().unwrap(),
+            "--as",
+            "operator",
+            "--verify",
+            "--json",
+        ],
+    );
+    assert_eq!(red["verified"], false, "a drifted board still verified");
+    assert_eq!(red["missing"], json!(["t-b"]));
+    let differing = red["differing"].as_array().unwrap();
+    let named = |field: &str| {
+        differing
+            .iter()
+            .any(|d| d["id"] == "t-a" && d["field"] == field)
+    };
+    assert!(named("title"), "the retitle was not reported");
+    assert!(named("priority"), "the repricing was not reported");
+    assert!(
+        named("dependencies"),
+        "the dependency lost with t-b was not reported"
+    );
+    for entry in differing {
+        assert_ne!(
+            entry["source"], entry["board"],
+            "a matching field was reported as differing"
+        );
+    }
+
+    // A diagnostic never modifies what it diagnoses: the two verifications
+    // above must not have repaired, re-imported, or otherwise touched the board.
+    let after = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let ids = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !ids.contains(&"t-b"),
+        "--verify re-imported the missing row"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-a", "--json"])["title"],
+        "TAMPERED",
+        "--verify repaired the row it was asked to report on"
+    );
+
+    // --verify reads; --reconcile, --force and --dry-run describe a write.
+    // Asking for both is two requests, not a precedence puzzle.
+    for conflicting in ["--reconcile", "--force", "--dry-run"] {
+        let both = fixture.run(
+            &fixture.main,
+            &[
+                "import",
+                "atmux-sqlite",
+                source.to_str().unwrap(),
+                "--as",
+                "operator",
+                "--verify",
+                conflicting,
+            ],
+        );
+        assert!(
+            !both.status.success(),
+            "--verify {conflicting} was accepted"
+        );
+        assert!(
+            String::from_utf8_lossy(&both.stderr).contains("writes nothing"),
+            "{conflicting}"
+        );
+    }
+}

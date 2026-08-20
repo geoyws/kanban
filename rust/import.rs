@@ -69,10 +69,55 @@ pub struct ImportReceipt {
     pub seized_leases: Vec<String>,
 }
 
+/// What an `import` invocation produced: a write, or a comparison.
+///
+/// `--verify` answers a different question from an import, so it returns a
+/// different receipt rather than an import receipt with half its fields left
+/// meaningless.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum Outcome {
+    Import(ImportReceipt),
+    Parity(ParityReceipt),
+}
+
+/// One field of one row where the board disagrees with the source.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParityDifference {
+    pub id: String,
+    pub field: String,
+    pub source: Value,
+    pub board: Value,
+}
+
+/// The receipt `--verify` produces: what was compared, and what disagreed.
+///
+/// Step 6 of `docs/integrating-atmux.md` requires parity receipts against real
+/// private state before a cutover. An import receipt cannot serve: it counts
+/// rows read from the source and rows written to the board, which is two
+/// numbers about two different things. This re-reads the source and checks the
+/// board actually holds it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParityReceipt {
+    pub source: String,
+    pub counts: ImportCounts,
+    /// True only when nothing is missing and nothing differs.
+    pub verified: bool,
+    pub compared: usize,
+    pub matched: usize,
+    /// Present in the source, absent from the board.
+    pub missing: Vec<String>,
+    pub differing: Vec<ParityDifference>,
+    /// The fields this receipt covers, so a green result states its own scope.
+    pub fields: Vec<String>,
+}
+
 /// What the caller asked an import to be allowed to do.
 ///
-/// A struct rather than three positional `bool`s: at a call site,
-/// `(true, false, true)` says nothing about which of them is `--force`.
+/// A struct rather than four positional `bool`s: at a call site,
+/// `(true, false, true, false)` says nothing about which of them is `--force`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImportOptions {
     /// Overwrite tasks that already exist, rather than refusing to collide.
@@ -81,6 +126,8 @@ pub struct ImportOptions {
     pub force: bool,
     /// Run everything and roll back, reporting what would have happened.
     pub dry_run: bool,
+    /// Compare the source against the board and report, writing nothing.
+    pub verify: bool,
 }
 
 struct Input {
@@ -518,12 +565,179 @@ fn normalize_and_insert(
     })
 }
 
+/// Compare a legacy source against the board and report the difference.
+///
+/// The comparison is built from the *same* `Input` rows the importer would
+/// insert, produced by the same mapping functions. A verifier with its own
+/// reading of the legacy schema would prove only that two mappings agree, and
+/// they would drift the first time either side changed — which is exactly the
+/// failure a pre-cutover receipt exists to catch.
+///
+/// It writes nothing. A diagnostic never modifies what it diagnoses.
+///
+/// Scope is stated in the receipt rather than implied. These are the fields
+/// `docs/integrating-atmux.md` calls stable identities, plus the two things its
+/// compatibility rules say must survive: the legacy note, and unknown extension
+/// fields. Volatile values the import itself stamps — `updated_at`, and the
+/// normalization metadata added only when a row raised a warning — are out of
+/// scope, because a receipt that flags them would be red on a faithful import.
+fn verify(
+    store: &Store,
+    inputs: Vec<Input>,
+    source: String,
+    counts: ImportCounts,
+) -> Result<ParityReceipt> {
+    const FIELDS: [&str; 15] = [
+        "type",
+        "parentID",
+        "title",
+        "body",
+        "assignee",
+        "lane",
+        "deliverable",
+        "staleMinutes",
+        "driverOnly",
+        "status",
+        "priority",
+        "createdAt",
+        "completedAt",
+        "dependencies",
+        "atmuxExtra",
+    ];
+    let mut missing = Vec::new();
+    let mut differing = Vec::new();
+    let mut matched = 0usize;
+    let compared = inputs.len();
+
+    for input in inputs {
+        let Ok(board) = store.require_task(&input.id) else {
+            missing.push(input.id);
+            continue;
+        };
+        let before = differing.len();
+        let mut check = |field: &str, source: Value, board: Value| {
+            if source != board {
+                differing.push(ParityDifference {
+                    id: input.id.clone(),
+                    field: field.to_owned(),
+                    source,
+                    board,
+                });
+            }
+        };
+        check("type", json!(input.task_type), json!(board.task_type));
+        check("parentID", json!(input.parent_id), json!(board.parent_id));
+        check("title", json!(input.title), json!(board.title));
+        check("body", json!(input.body), json!(board.body));
+        check("assignee", json!(input.assignee), json!(board.assignee));
+        check("lane", json!(input.lane), json!(board.lane));
+        check(
+            "deliverable",
+            json!(input.deliverable),
+            json!(board.deliverable),
+        );
+        check(
+            "staleMinutes",
+            json!(input.stale_minutes),
+            json!(board.stale_minutes),
+        );
+        check(
+            "driverOnly",
+            json!(input.driver_only),
+            json!(board.driver_only),
+        );
+        check("status", json!(input.status), json!(board.status));
+        check("priority", json!(input.priority), json!(board.priority));
+        check(
+            "createdAt",
+            json!(input.created_at),
+            json!(board.created_at),
+        );
+        check(
+            "completedAt",
+            json!(input.completed_at),
+            json!(board.completed_at),
+        );
+
+        // Dependencies the source declares but the board dropped. A dangling
+        // one the import deliberately recorded as a warning is not a
+        // difference, so compare against what the board could resolve.
+        let mut expected = input.dependencies.clone();
+        expected.sort();
+        let mut held = store
+            .dependencies(&input.id)?
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        held.sort();
+        let dangling = input
+            .metadata
+            .get("legacyDanglingDependencies")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        expected.retain(|id| !dangling.contains(id));
+        check("dependencies", json!(expected), json!(held));
+
+        // The two things the compatibility rules single out as must-survive.
+        check(
+            "atmuxExtra",
+            input
+                .metadata
+                .get("atmuxExtra")
+                .cloned()
+                .unwrap_or(Value::Null),
+            board
+                .metadata
+                .get("atmuxExtra")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        if let Some(note) = &input.note {
+            let kept = store
+                .notes(&input.id, 100)?
+                .into_iter()
+                .any(|held| &held.body == note);
+            if !kept {
+                differing.push(ParityDifference {
+                    id: input.id.clone(),
+                    field: "note".to_owned(),
+                    source: json!(note),
+                    board: Value::Null,
+                });
+            }
+        }
+        if differing.len() == before {
+            matched += 1;
+        }
+    }
+
+    let mut fields = FIELDS.map(str::to_owned).to_vec();
+    fields.push("note".to_owned());
+    Ok(ParityReceipt {
+        source,
+        counts,
+        verified: missing.is_empty() && differing.is_empty(),
+        compared,
+        matched,
+        missing,
+        differing,
+        fields,
+    })
+}
+
 pub fn import_json(
     store: &mut Store,
     path: &Path,
     actor: &str,
     options: ImportOptions,
-) -> Result<ImportReceipt> {
+) -> Result<Outcome> {
     let parsed: Value = serde_json::from_slice(&fs::read(path)?)?;
     let epics = parsed
         .get("epics")
@@ -564,18 +778,27 @@ pub fn import_json(
             source,
         )?);
     }
-    normalize_and_insert(
+    let counts = ImportCounts {
+        epics: epics.len(),
+        stories: stories.len(),
+        tasks: tasks.len(),
+    };
+    if options.verify {
+        return Ok(Outcome::Parity(verify(
+            store,
+            inputs,
+            path.to_string_lossy().into_owned(),
+            counts,
+        )?));
+    }
+    Ok(Outcome::Import(normalize_and_insert(
         store,
         inputs,
         actor,
         path.to_string_lossy().into_owned(),
-        ImportCounts {
-            epics: epics.len(),
-            stories: stories.len(),
-            tasks: tasks.len(),
-        },
+        counts,
         options,
-    )
+    )?))
 }
 
 pub fn import_sqlite(
@@ -583,7 +806,7 @@ pub fn import_sqlite(
     path: &Path,
     actor: &str,
     options: ImportOptions,
-) -> Result<ImportReceipt> {
+) -> Result<Outcome> {
     let source_db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut table_statement =
         source_db.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
@@ -617,16 +840,25 @@ pub fn import_sqlite(
     for row in &tasks {
         inputs.push(task(row.clone(), imported_at, source)?);
     }
-    normalize_and_insert(
+    let counts = ImportCounts {
+        epics: epics.len(),
+        stories: stories.len(),
+        tasks: tasks.len(),
+    };
+    if options.verify {
+        return Ok(Outcome::Parity(verify(
+            store,
+            inputs,
+            path.to_string_lossy().into_owned(),
+            counts,
+        )?));
+    }
+    Ok(Outcome::Import(normalize_and_insert(
         store,
         inputs,
         actor,
         path.to_string_lossy().into_owned(),
-        ImportCounts {
-            epics: epics.len(),
-            stories: stories.len(),
-            tasks: tasks.len(),
-        },
+        counts,
         options,
-    )
+    )?))
 }
