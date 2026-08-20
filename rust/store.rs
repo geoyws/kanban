@@ -51,6 +51,40 @@ fn validate_priority(value: Option<i64>) -> Result<()> {
     Ok(())
 }
 
+/// The only task type an agent can be handed to execute.
+///
+/// An epic and a story are containers, and their status is *derived*: a story
+/// walks its own gate under `story advance`, which dispatches a separate task
+/// row for the work and flips the parent epic when the first story starts. A
+/// lease asserts the opposite — that one named agent is executing this row now
+/// — and taking one writes `status='in_progress'` and an assignee straight
+/// onto the row.
+///
+/// Handing a container out therefore makes the ledger state two contradictory
+/// things about one row: the board reads `in_progress` while the gate still
+/// reads `planning`. It also parks a lease nobody can discharge, because a
+/// container is never finished by working it, and it hides the container from
+/// `claim --next` for the whole lease while none of its children moved.
+const CLAIMABLE_TYPE: &str = "task";
+
+/// Refuse a lease on anything but a task.
+///
+/// Both lease-minting paths call this — `claim` and `handoff accept` — because
+/// eligibility is a property of the row, not of the verb that reached it. A
+/// board written before this rule, or imported from atmux, can still carry a
+/// pending handoff addressed to a container; the guard is what stops that from
+/// becoming a live lease.
+fn require_claimable_type(id: &str, task_type: &str) -> Result<()> {
+    if task_type != CLAIMABLE_TYPE {
+        let remedy = match task_type {
+            "story" => "advance it with `story advance` and claim the task that dispatches",
+            _ => "claim one of its children instead",
+        };
+        bail!("task {id} is a {task_type}, and only a {CLAIMABLE_TYPE} is claimable: {remedy}");
+    }
+    Ok(())
+}
+
 fn parse_value(text: String) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| json!({ "legacyInvalidJson": text }))
 }
@@ -752,6 +786,7 @@ impl Store {
                 "SELECT t.* FROM tasks t
                  LEFT JOIN task_claims c ON c.task_id=t.id
                  WHERE t.status='todo'
+                   AND t.type=?
                    AND c.task_id IS NULL
                    AND NOT EXISTS (
                      SELECT 1 FROM task_dependencies d
@@ -761,7 +796,7 @@ impl Store {
                  ORDER BY t.priority,t.created_at,t.id",
             )?;
             let candidates = statement
-                .query_map([], task_row)?
+                .query_map([CLAIMABLE_TYPE], task_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             let candidates = candidates
@@ -798,6 +833,7 @@ impl Store {
             };
             selected.context("no claimable task")?
         };
+        require_claimable_type(&task.id, &task.task_type)?;
         if !["todo", "in_progress"].contains(&task.status.as_str()) {
             bail!("task {} is {}, not claimable", task.id, task.status);
         }
@@ -1112,6 +1148,7 @@ impl Store {
             );
         }
         let task = require_task(&transaction, &handoff.task_id)?;
+        require_claimable_type(&task.id, &task.task_type)?;
         if task.status != "todo" {
             bail!("task {} is {}, not claimable", task.id, task.status);
         }
@@ -1555,6 +1592,29 @@ mod tests {
         // An absent priority is not a zero: `task update` without --priority
         // must leave whatever the row already holds, in band or not.
         assert!(validate_priority(None).is_ok());
+    }
+
+    #[test]
+    fn only_a_task_is_claimable() {
+        assert!(
+            require_claimable_type("t-1", CLAIMABLE_TYPE).is_ok(),
+            "a task is the one claimable type"
+        );
+
+        // The message has to name the row, the type that disqualified it, and
+        // what to do instead — a bare refusal leaves the agent with no next move.
+        let story = require_claimable_type("s-1", "story")
+            .expect_err("a story must not be claimable")
+            .to_string();
+        assert!(story.contains("s-1"), "{story}");
+        assert!(story.contains("story"), "{story}");
+        assert!(story.contains("story advance"), "{story}");
+
+        let epic = require_claimable_type("e-1", "epic")
+            .expect_err("an epic must not be claimable")
+            .to_string();
+        assert!(epic.contains("e-1"), "{epic}");
+        assert!(epic.contains("children"), "{epic}");
     }
 
     #[test]

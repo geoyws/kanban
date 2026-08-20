@@ -223,6 +223,33 @@ bounded packet got an unbounded one and no way to tell. The unknown-flag rule
 exists because silent acceptance is undetectable by the caller; a known flag
 silently doing nothing is the same defect wearing a legal name.
 
+**A lease is granted on work, never on a container.** `claim` filtered on
+status, dependencies, lane, assignee and `driver_only` — every property except
+the one that says whether the row is executable at all. An epic and a story are
+containers whose status is *derived*: `story advance` walks a story through its
+gate and dispatches a separate task row for the actual work, and flips the
+parent epic when the first story starts. Taking a lease asserts the opposite —
+that one named agent is executing this row now — and writes `status='in_progress'`
+and an assignee straight onto it. So a claimed story read `in_progress` on the
+board while its own gate still read `planning`: the ledger stating two
+contradictory things about one row, which is the failure this project exists to
+prevent. It also parked a lease nobody could discharge, because a container is
+never finished by working it, and hid the container from the queue for the
+whole lease while not one of its children had moved. Worse, `claim --next`
+sorts on priority alone, so an epic at the head of the queue was handed to the
+first agent that asked for work.
+
+Only a `task` is claimable. `--next` *skips* a container rather than failing on
+it, because a row that was never claimable must not stall the queue behind it;
+naming one explicitly is refused, and the refusal points at the gate
+(`story advance`) or at the children, since an agent that is told only "no" has
+no next move. The guard sits on both paths that mint a lease — `claim` and
+`handoff accept` — rather than on the verb the operator happened to reach for:
+eligibility is a property of the row. That second call site is not hypothetical
+symmetry. A board written before this rule, or imported from atmux, can still
+carry a pending handoff addressed to a container, and accepting it would mint
+exactly the lease `claim` now refuses.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

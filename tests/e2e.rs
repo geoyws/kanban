@@ -2775,3 +2775,154 @@ fn compiled_binary_never_shortens_context_without_saying_so() {
     fixture.ok_json(&fixture.main, &["context", "t-1", "--json"]);
     assert!(!render("2000").is_empty());
 }
+
+#[test]
+fn a_lease_is_only_ever_granted_on_a_task() {
+    let fixture = Fixture::new("claimable-type");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TYPES", "--json"]);
+
+    // Both containers sort ahead of the real work on every tiebreak --next
+    // uses: lower priority number first, then created_at.
+    for (id, kind) in [("e-top", "epic"), ("s-top", "story")] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                "Container",
+                "--id",
+                id,
+                "--type",
+                kind,
+                "--priority",
+                "0",
+                "--json",
+            ],
+        );
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "The real work",
+            "--id",
+            "t-work",
+            "--priority",
+            "9",
+            "--json",
+        ],
+    );
+
+    // --next skips a container instead of failing on it: a row that was never
+    // claimable must not stall the queue behind it.
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "--next", "--as", "worker", "--json"]
+        )["taskID"],
+        "t-work"
+    );
+
+    // Naming one explicitly is refused, and the refusal says what to do instead.
+    let epic = fixture.run(
+        &fixture.main,
+        &["claim", "e-top", "--as", "worker", "--json"],
+    );
+    assert!(!epic.status.success(), "an epic was handed out as work");
+    let epic_error = String::from_utf8_lossy(&epic.stderr).to_string();
+    assert!(
+        epic_error.contains("only a task is claimable"),
+        "{epic_error}"
+    );
+    assert!(epic_error.contains("children"), "{epic_error}");
+
+    let story = fixture.run(
+        &fixture.main,
+        &["claim", "s-top", "--as", "worker", "--json"],
+    );
+    assert!(!story.status.success(), "a story was handed out as work");
+    let story_error = String::from_utf8_lossy(&story.stderr).to_string();
+    assert!(
+        story_error.contains("story advance"),
+        "a story refusal must point at its gate: {story_error}"
+    );
+
+    // The refusal left both rows exactly as they were — no assignee written,
+    // no status flipped, which is what made the ledger contradict itself.
+    for id in ["e-top", "s-top"] {
+        let shown = fixture.ok_json(&fixture.main, &["task", "show", id, "--json"]);
+        assert_eq!(shown["status"], "todo", "{id} was moved by a refused claim");
+        assert!(shown["assignee"].is_null(), "{id} was assigned anyway");
+        assert!(shown["claim"].is_null(), "{id} holds a lease");
+    }
+}
+
+#[test]
+fn a_handoff_addressed_to_a_container_cannot_be_accepted() {
+    // A board written before this rule — or imported from atmux — can still
+    // carry a pending handoff on a row that is not a task. Accepting it would
+    // mint exactly the lease `claim` now refuses, so the guard sits on both
+    // lease-minting paths rather than on the verb the operator happened to use.
+    let fixture = Fixture::new("handoff-container");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LEGACY", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Legacy row", "--id", "t-legacy", "--json"],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-legacy", "--as", "outgoing", "--json"],
+    );
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-legacy",
+            "--lease",
+            &token,
+            "--as",
+            "outgoing",
+            "--summary",
+            "Ran out of context",
+            "--intent",
+            "Continue the work",
+            "--next-action",
+            "Pick up where I stopped",
+            "--json",
+        ],
+    );
+    let handoff_id = handoff["id"].as_str().unwrap().to_owned();
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute("UPDATE tasks SET type='story' WHERE id='t-legacy'", [])
+        .unwrap();
+
+    let accepted = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &handoff_id,
+            "--as",
+            "incoming",
+            "--json",
+        ],
+    );
+    assert!(
+        !accepted.status.success(),
+        "a handoff on a container minted a lease"
+    );
+    assert!(
+        String::from_utf8_lossy(&accepted.stderr).contains("only a task is claimable"),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
