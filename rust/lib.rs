@@ -394,12 +394,23 @@ impl Args {
         self.one(name)
             .with_context(|| format!("--{name} is required"))
     }
+    /// A flag's value as an integer, naming both the flag and what it got.
+    ///
+    /// `str::parse` alone reports "invalid digit found in string", which does
+    /// not say which of several numeric flags was wrong — nothing an agent
+    /// that reads stderr and moves on can act on. Every numeric flag goes
+    /// through here so no call site can quietly parse without it.
+    fn optional_integer(&self, name: &str) -> Result<Option<i64>> {
+        let Some(raw) = self.one(name) else {
+            return Ok(None);
+        };
+        raw.parse::<i64>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("--{name} must be an integer, got {raw:?}"))
+    }
+
     fn integer(&self, name: &str, fallback: i64) -> Result<i64> {
-        self.one(name)
-            .map(str::parse::<i64>)
-            .transpose()
-            .with_context(|| format!("{name} must be an integer"))
-            .map(|v| v.unwrap_or(fallback))
+        Ok(self.optional_integer(name)?.unwrap_or(fallback))
     }
 
     /// Fail on an argument this command was never going to read.
@@ -1043,7 +1054,7 @@ fn run() -> Result<()> {
             assignee: option_string(&args, "assignee"),
             lane: option_string(&args, "lane"),
             deliverable: option_string(&args, "deliverable"),
-            stale_minutes: args.one("stale-minutes").map(str::parse).transpose()?,
+            stale_minutes: args.optional_integer("stale-minutes")?,
             driver_only: args.has("driver-only"),
             status: args.one("status").unwrap_or("todo").into(),
             priority: args.integer("priority", 3)?,
@@ -1146,10 +1157,7 @@ fn run() -> Result<()> {
             } else {
                 None
             },
-            stale_minutes: args
-                .one("stale-minutes")
-                .map(|v| v.parse().map(Some))
-                .transpose()?,
+            stale_minutes: args.optional_integer("stale-minutes")?.map(Some),
             driver_only: if args.has("driver-only") {
                 Some(true)
             } else if args.has("no-driver-only") {
@@ -1157,7 +1165,7 @@ fn run() -> Result<()> {
             } else {
                 None
             },
-            priority: args.one("priority").map(str::parse).transpose()?,
+            priority: args.optional_integer("priority")?,
             dependencies: if args.has("clear-dependencies") {
                 Some(vec![])
             } else if args.has("depends-on") {
@@ -1429,6 +1437,44 @@ mod tests {
             assert!(
                 lease_ms(&args(&["--lease-minutes", bad])).is_err(),
                 "--lease-minutes {bad} must be refused, not wrapped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_number_names_the_flag_and_the_value() {
+        assert_eq!(
+            args(&["--limit", "5"]).optional_integer("limit").unwrap(),
+            Some(5)
+        );
+        assert_eq!(args(&[]).optional_integer("limit").unwrap(), None);
+        assert_eq!(args(&["--limit", "5"]).integer("limit", 9).unwrap(), 5);
+        assert_eq!(args(&[]).integer("limit", 9).unwrap(), 9);
+
+        let error = args(&["--priority", "abc"])
+            .optional_integer("priority")
+            .unwrap_err()
+            .to_string();
+        // "invalid digit found in string" does not say which of several
+        // numeric flags was wrong.
+        assert!(error.contains("--priority"), "{error}");
+        assert!(error.contains("\"abc\""), "{error}");
+
+        // The helper is the only place that knows how to name what went
+        // wrong, so no call site may go back to parsing a value itself. Both
+        // of these were real: `--stale-minutes abc` and `--priority abc` on
+        // `task update` reported only "invalid digit found in string".
+        //
+        // The needles are assembled rather than written out, because this
+        // test reads its own file back and a literal would match itself.
+        const SOURCE: &str = include_str!("lib.rs");
+        for pattern in [
+            format!(".map({}::parse)", "str"),
+            format!(".parse().map({})", "Some"),
+        ] {
+            assert!(
+                !SOURCE.contains(&pattern),
+                "a flag value is parsed by `{pattern}`, which reports no flag name"
             );
         }
     }

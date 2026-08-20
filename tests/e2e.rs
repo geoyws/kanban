@@ -2100,6 +2100,26 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
         );
     }
 
+    // A value that is not a number at all names the flag it came from:
+    // "invalid digit found in string" does not say which of --priority,
+    // --stale-minutes or --lease-minutes was wrong, and an agent reading
+    // stderr has nothing to act on.
+    for (flag, value) in [("--priority", "abc"), ("--stale-minutes", "soon")] {
+        let refused = fixture.run(
+            &fixture.main,
+            &[
+                "task", "update", "t-3", "--as", "geo", flag, value, "--json",
+            ],
+        );
+        assert!(!refused.status.success(), "{flag} {value} was accepted");
+        let message = String::from_utf8_lossy(&refused.stderr);
+        assert!(message.contains(flag), "stderr must name {flag}: {message}");
+        assert!(
+            message.contains(value),
+            "stderr must quote the value: {message}"
+        );
+    }
+
     // The same band applies on update, and a refused update changes nothing.
     let refused = fixture.run(
         &fixture.main,
