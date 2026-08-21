@@ -1,7 +1,7 @@
 ---
 name: kb
 description: The kanban work-ledger CLI — tasks, claims and leases, checkpoints, handoffs (task and session), and attention items that need George. Use whenever recording, reading or handing over work state, raising something only George can settle, or resuming a lane from the board rather than a directory.
-argument-hint: [subcommand …]
+argument-hint: "[subcommand …]"
 ---
 
 # /kb — the kanban work ledger
