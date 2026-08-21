@@ -4509,3 +4509,224 @@ fn a_negative_limit_is_refused_rather_than_read_as_no_limit() {
         assert!(error.contains("-1"), "{error}");
     }
 }
+
+#[test]
+fn a_draft_task_is_not_offered_as_work_until_it_is_promoted() {
+    // `backlog` already meant real work that is simply unscheduled. There was
+    // nothing for the state before that -- a row still being written -- so an
+    // unfinished one read as a specification and got claimed and worked.
+    let fixture = Fixture::new("draft");
+    fixture.ok_json(&fixture.main, &["init", "--name", "DRAFT", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Still being written",
+            "--id",
+            "t-draft",
+            "--status",
+            "draft",
+            "--priority",
+            "0",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ready to work",
+            "--id",
+            "t-ready",
+            "--priority",
+            "9",
+            "--json",
+        ],
+    );
+
+    // The draft sorts ahead on every tiebreak --next uses and is still skipped:
+    // being unfinished outranks being urgent.
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "--next", "--as", "worker", "--json"]
+        )["taskID"],
+        "t-ready"
+    );
+
+    // Naming it explicitly is refused, and the refusal says which state stopped it.
+    let explicit = fixture.run(
+        &fixture.main,
+        &["claim", "t-draft", "--as", "worker", "--json"],
+    );
+    assert!(!explicit.status.success(), "a draft was handed out as work");
+    let error = String::from_utf8_lossy(&explicit.stderr).to_string();
+    assert!(error.contains("draft"), "{error}");
+    assert!(error.contains("not claimable"), "{error}");
+
+    // A draft is not touched by the refusal, and is not a stale-work candidate.
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-draft", "--json"]);
+    assert_eq!(shown["status"], "draft");
+    assert!(shown["assignee"].is_null());
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["stale", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Promoting it is an ordinary move, and then it is work like any other.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-draft", "todo", "--as", "geo", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "t-draft", "--as", "worker", "--json"]
+        )["taskID"],
+        "t-draft"
+    );
+
+    // It is a first-class status: filterable, and counted where the others are.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Another draft",
+            "--id",
+            "t-d2",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    let drafts = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--status", "draft", "--json"],
+    );
+    assert_eq!(drafts.as_array().unwrap().len(), 1);
+    assert_eq!(drafts[0]["id"], "t-d2");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["dashboard", "--json"])[0]["taskCounts"]["draft"],
+        1
+    );
+
+    // An invented status is still refused -- the set stays closed.
+    let invented = fixture.run(
+        &fixture.main,
+        &["task", "add", "x", "--status", "nearly", "--json"],
+    );
+    assert!(!invented.status.success());
+    assert!(String::from_utf8_lossy(&invented.stderr).contains("invalid task status"));
+}
+
+#[test]
+fn the_draft_migration_preserves_the_table_it_rebuilds() {
+    // Widening a CHECK means rebuilding the table, and a rebuild is the easiest
+    // place in a schema to change something nobody asked to change. The one
+    // that matters here: parent_id has no ON DELETE clause, so removing a
+    // parent is meant to fail and name its children rather than orphan them.
+    let fixture = Fixture::new("draft-migration");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MIGRATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Epic", "--id", "e-1", "--type", "epic", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Child", "--id", "t-1", "--parent", "e-1", "--json",
+        ],
+    );
+
+    let refused = fixture.run(
+        &fixture.main,
+        &["task", "remove", "e-1", "--as", "geo", "--force", "--json"],
+    );
+    assert!(
+        !refused.status.success(),
+        "a parent with children was removed, orphaning them"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("t-1"),
+        "the refusal must name the child"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["parentID"],
+        "e-1",
+        "the child lost its parent"
+    );
+
+    // The default the rebuilt table has to keep.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Plain", "--id", "t-2", "--json"],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-2", "--json"])["priority"],
+        3,
+        "the priority default was lost in the rebuild"
+    );
+
+    // Read the schema itself. The behaviour above is defended twice -- the
+    // remove path names children in code before the foreign key is consulted --
+    // so it cannot see a changed ON DELETE clause. The DDL can, and that clause
+    // is the difference between a removal that refuses and one that silently
+    // orphans, so it is asserted where it is actually written.
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connection = Connection::open(&board).unwrap();
+    let schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        schema.contains("parent_id TEXT REFERENCES tasks(id),"),
+        "parent_id gained an ON DELETE clause in the rebuild: {schema}"
+    );
+    assert!(
+        !schema.contains("ON DELETE"),
+        "the rebuilt tasks table carries a delete rule it never had: {schema}"
+    );
+    assert!(
+        schema.contains("priority INTEGER NOT NULL DEFAULT 3"),
+        "{schema}"
+    );
+    assert!(schema.contains("'draft'"), "the widened CHECK is missing");
+
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='tasks'")
+        .unwrap();
+    let indexes = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for expected in [
+        "idx_tasks_status_priority",
+        "idx_tasks_parent",
+        "idx_tasks_assignee_status",
+        "idx_tasks_lane_status",
+    ] {
+        assert!(
+            indexes.iter().any(|name| name == expected),
+            "{expected} did not survive the rebuild: {indexes:?}"
+        );
+    }
+    drop(statement);
+
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(doctor["healthy"], true, "{doctor}");
+}

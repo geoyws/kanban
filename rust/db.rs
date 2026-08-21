@@ -170,6 +170,49 @@ CREATE INDEX idx_attention_status_created ON attention(status,created_at);
 CREATE INDEX idx_attention_task ON attention(task_id);
 "#;
 
+/// A task that is not finished being written.
+///
+/// `backlog` already meant "real work, not scheduled yet". There was nothing
+/// for the state before that: a row someone is still drafting, whose title,
+/// body or scope may still be wrong. Agents treat every row on the board as a
+/// specification, so an unfinished one gets decomposed, depended on, and worked
+/// as though it were settled — and the ledger said nothing to stop it.
+///
+/// `draft` is that state. It is not claimable, which needs no new rule: `claim`
+/// already accepts only `todo` and `in_progress`, and `--next` selects `todo`
+/// alone. Widening the CHECK is the whole schema change.
+///
+/// SQLite cannot alter a CHECK in place, so the table is rebuilt. Foreign keys
+/// are already off across the ladder (see `open_board`), which is what lets the
+/// referencing tables survive the drop.
+///
+/// The rebuilt table reproduces the original exactly apart from the widened
+/// CHECK — same `DEFAULT 3` on priority, same four indexes, and `parent_id`
+/// still `REFERENCES tasks(id)` with no `ON DELETE` clause. That last one is
+/// load-bearing: removal is meant to fail and name the children, and giving it
+/// `SET NULL` here would silently orphan them instead. A rebuild is the easiest
+/// place in a schema to change something nobody asked to change.
+const BOARD_V6: &str = r#"
+CREATE TABLE tasks_next (
+ id TEXT PRIMARY KEY NOT NULL,type TEXT NOT NULL CHECK(type IN ('epic','story','task')),
+ parent_id TEXT REFERENCES tasks(id),title TEXT NOT NULL,body TEXT,
+ status TEXT NOT NULL CHECK(status IN ('draft','backlog','todo','in_progress','blocked','review','done','cancelled')),
+ priority INTEGER NOT NULL DEFAULT 3,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,
+ completed_at INTEGER,metadata TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(metadata)),
+ assignee TEXT,lane TEXT,deliverable TEXT,
+ stale_minutes INTEGER CHECK(stale_minutes IS NULL OR stale_minutes >= 0),
+ driver_only INTEGER NOT NULL DEFAULT 0 CHECK(driver_only IN (0,1))
+) STRICT;
+INSERT INTO tasks_next(id,type,parent_id,title,body,status,priority,created_at,updated_at,completed_at,metadata,assignee,lane,deliverable,stale_minutes,driver_only)
+ SELECT id,type,parent_id,title,body,status,priority,created_at,updated_at,completed_at,metadata,assignee,lane,deliverable,stale_minutes,driver_only FROM tasks;
+DROP TABLE tasks;
+ALTER TABLE tasks_next RENAME TO tasks;
+CREATE INDEX idx_tasks_status_priority ON tasks(status,priority,created_at);
+CREATE INDEX idx_tasks_parent ON tasks(parent_id);
+CREATE INDEX idx_tasks_assignee_status ON tasks(assignee,status);
+CREATE INDEX idx_tasks_lane_status ON tasks(lane,status);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -371,7 +414,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     connection.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate(
         &mut connection,
-        &[BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5],
+        &[BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6],
     );
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;

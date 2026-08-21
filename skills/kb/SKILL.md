@@ -159,6 +159,7 @@ Handoffs are **history**: removing a task drops the link and keeps the account.
 
 ```bash
 kb t new "Title" --priority 3 --lane fe --json     # 0 most urgent … 9 least, 3 default
+kb t new "Half-formed idea" --status draft --json  # not ready for action yet
 kb t ls --status todo --json
 kb claim --next --as "$AGENT" --json               # or: kb claim <id> --as "$AGENT"
 kb hb <id> --lease "$TOKEN" --lease-minutes 30     # renew
@@ -170,6 +171,14 @@ kb rel <id> --lease "$TOKEN"
 `--state done` or `blocked` on a checkpoint **releases the lease in the same
 transaction** that records it — there is no window where the work reads finished
 but the lease is still held.
+
+**A `draft` is not work yet.** It is the state before `backlog`: a row still
+being written, whose title, body or scope may still be wrong. `claim --next`
+skips it however urgent its priority, and naming it explicitly is refused.
+Promote it with `kb t mv <id> todo --as "$ACTOR"` when it is ready to be acted
+on. Use it for anything you are still specifying — an agent reads every row on
+the board as a specification, and an unfinished one gets decomposed and worked
+as though it were settled.
 
 **Only a task is claimable.** An epic and a story are containers whose status is
 derived from what is beneath them; `claim --next` skips them, and naming one

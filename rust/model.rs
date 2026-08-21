@@ -1,7 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const TASK_STATUSES: [&str; 7] = [
+/// Every status a task row may hold.
+///
+/// `draft` leads because it precedes the rest: a row still being written, whose
+/// title, body or scope may yet be wrong. `backlog` already meant real work
+/// that is simply unscheduled, and there was nothing for the state before that
+/// — so an unfinished row read as a specification, and agents decomposed,
+/// depended on and worked it as though it were settled.
+pub const TASK_STATUSES: [&str; 8] = [
+    "draft",
     "backlog",
     "todo",
     "in_progress",
