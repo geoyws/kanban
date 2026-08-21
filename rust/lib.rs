@@ -79,6 +79,7 @@ Environment:
 Aliases (the binary installs as both `kanban` and `kb`):
   t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
   ctx=context  ev=events  dash=dashboard  rel=release  n=note  v=version
+  att/attn=attention
   task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
   story:     adv=advance
   handoff:   ls=list  new=create  acc=accept
