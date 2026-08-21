@@ -4446,3 +4446,66 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         "removing a task answered nothing"
     );
 }
+
+#[test]
+fn a_negative_limit_is_refused_rather_than_read_as_no_limit() {
+    // SQLite reads LIMIT -1 as *no limit*, so a caller who explicitly bounded
+    // a listing got every row of it back and reported success -- the same
+    // shape as a --max-chars that is accepted and ignored.
+    let fixture = Fixture::new("limit");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LIMIT", "--json"]);
+    for index in 0..4 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                &format!("item {index}"),
+                "--as",
+                "agent",
+                "--kind",
+                "risk",
+                "--json",
+            ],
+        );
+    }
+
+    // A bound is honoured, and zero means zero.
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--limit", "2", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--limit", "0", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a limit of zero asks for nothing"
+    );
+
+    // A negative is refused on every command that takes the flag.
+    for command in [
+        vec!["attention", "list", "--limit", "-1", "--json"],
+        vec!["events", "--limit", "-1", "--json"],
+    ] {
+        let refused = fixture.run(&fixture.main, &command);
+        assert!(
+            !refused.status.success(),
+            "{command:?} accepted a negative limit"
+        );
+        let error = String::from_utf8_lossy(&refused.stderr).to_string();
+        assert!(error.contains("--limit"), "{error}");
+        assert!(error.contains("-1"), "{error}");
+    }
+}

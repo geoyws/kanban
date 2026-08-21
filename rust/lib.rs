@@ -514,6 +514,32 @@ impl Args {
         Ok(self.optional_integer(name)?.unwrap_or(fallback))
     }
 
+    /// `--limit`, refusing a value SQL would read as the opposite of a bound.
+    ///
+    /// `LIMIT -1` means *no limit* in SQLite, so `--limit -1` returned every
+    /// row a caller had explicitly asked to bound, and reported success. That
+    /// is the same defect as a `--max-chars` that is accepted and ignored: the
+    /// caller asked for a bounded answer, got an unbounded one, and has no way
+    /// to tell from the result.
+    ///
+    /// Every other numeric flag here already carries a band — `--priority`,
+    /// `--max-chars`, `--keep`, `--lease-minutes`, `--stale-minutes`. This was
+    /// the one that did not, which is why it is a helper rather than a check
+    /// repeated at each call site.
+    ///
+    /// Zero is allowed. It asks for nothing and returns nothing, which is
+    /// exactly what it says; a script computing a limit that comes out zero is
+    /// not making a mistake the way a negative one is.
+    fn limit(&self, fallback: i64) -> Result<i64> {
+        let value = self.integer("limit", fallback)?;
+        if value < 0 {
+            bail!(
+                "--limit must be zero or more, got {value}: a negative limit reads as no limit at all"
+            );
+        }
+        Ok(value)
+    }
+
     /// Fail on an argument this command was never going to read.
     ///
     /// Extra positionals were silently dropped, so `kanban task add Fix the
@@ -1588,7 +1614,7 @@ fn run() -> Result<()> {
                 args.one("status"),
                 args.one("kind"),
                 args.one("task"),
-                args.integer("limit", 100)?,
+                args.limit(100)?,
             )?,
             args.has("json"),
         );
@@ -1602,11 +1628,7 @@ fn run() -> Result<()> {
     }
     if command == "events" {
         return print(
-            &store.events(
-                args.one("task"),
-                args.one("kind"),
-                args.integer("limit", 50)?,
-            )?,
+            &store.events(args.one("task"), args.one("kind"), args.limit(50)?)?,
             args.has("json"),
         );
     }
@@ -1706,6 +1728,47 @@ mod tests {
                 "--lease-minutes {bad} must be refused, not wrapped"
             );
         }
+    }
+
+    #[test]
+    fn a_limit_cannot_ask_for_the_opposite_of_a_bound() {
+        assert_eq!(args(&["--limit", "5"]).limit(9).unwrap(), 5);
+        assert_eq!(args(&[]).limit(9).unwrap(), 9, "the default still applies");
+        // Zero asks for nothing and gets nothing, which is what it says.
+        assert_eq!(args(&["--limit", "0"]).limit(9).unwrap(), 0);
+        for bad in ["-1", "-5000"] {
+            let error = args(&["--limit", bad])
+                .limit(9)
+                .expect_err("a negative limit must be refused")
+                .to_string();
+            assert!(error.contains("--limit"), "{error}");
+            assert!(error.contains(bad), "{error}");
+        }
+    }
+
+    #[test]
+    fn every_limit_is_read_through_the_bounded_reader() {
+        // Read the file back so the two cannot drift: a call site that goes
+        // straight to `integer("limit", ..)` skips the floor, and SQLite reads
+        // the negative it lets through as no limit at all -- silently handing
+        // back every row the caller had asked to bound.
+        const SOURCE: &str = include_str!("lib.rs");
+        // Only the shipping half of the file: the tests below legitimately
+        // exercise the generic reader, and counting those in would make the
+        // guard fire on its own coverage.
+        let shipped = SOURCE
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(SOURCE);
+        // Assembled rather than written out, because this test reads its own
+        // source and a literal would match itself.
+        let bypass = format!(".{}(\"{}\"", "integer", "limit");
+        assert_eq!(
+            shipped.matches(bypass.as_str()).count(),
+            1,
+            "a --limit call site bypasses `limit()` and loses the floor; \
+             only `limit()` itself may read the flag directly"
+        );
     }
 
     #[test]

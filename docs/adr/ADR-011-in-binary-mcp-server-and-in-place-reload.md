@@ -97,10 +97,23 @@ up without a client noticing, and a broken build is declined rather than adopted
 The reload is Unix-specific: it rests on `execve` preserving descriptors and on
 a rename-over leaving the old inode intact. That is the platform this runs on.
 
-Deliberately not decided: an HTTP or SSE transport. Nothing needs it yet, and
-the stdio server is the one a local harness spawns. The reload design does not
-transfer to a long-lived socket server holding client state, and that would be a
-different decision rather than an extension of this one.
+**Decided 2026-08-21: stdio only, no HTTP or SSE transport.** Every consumer
+this exists for — Claude Code, Codex, Kimi, orch, atmux — spawns a local
+subprocess, which is what stdio is. A socket transport would add a listener, a
+port, an authentication story and a lifetime nobody currently owns, to reach
+clients that do not exist.
+
+It would also cost the reload. The whole in-place swap rests on the server
+holding nothing between requests and on `execve` inheriting the client's pipe. A
+long-lived socket server holds accepted connections and per-client protocol
+state, so replacing its image mid-flight drops them; that is a different design
+with a different mechanism (drain, hand off the listening descriptor, or accept
+a restart), not an extension of this one. Adding the transport would therefore
+quietly downgrade the property that made this worth building.
+
+If a remote consumer ever appears, the honest shape is a separate front end that
+speaks the network protocol and drives this binary, keeping the local server —
+and its reload — exactly as it is.
 
 Not offered: read-only mode as a server flag. `readOnly` travels with every tool
 so a harness can withhold mutation where it configures its tools, which is where

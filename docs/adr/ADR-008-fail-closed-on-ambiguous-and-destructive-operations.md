@@ -319,6 +319,24 @@ fallback when nothing else is said. Only flags the caller supplied are counted.
 This supersedes the part of ADR-007's chain that let one explicit flag outrank
 another.
 
+**A bound that can ask for the opposite of a bound.** `--limit` was the one
+numeric flag with no band: `--priority`, `--max-chars`, `--keep`,
+`--lease-minutes` and `--stale-minutes` all validate, and this one went straight
+into the query. SQLite reads `LIMIT -1` as *no limit*, so `attention list
+--limit -1` and `events --limit -1` returned every row a caller had explicitly
+asked to bound, and exited zero. It is the `--max-chars` defect exactly — the
+caller asked for a bounded answer, got an unbounded one, and nothing in the
+result says which they received — reached through a value the storage layer
+reinterprets rather than a flag the command ignores.
+
+Negative is refused; zero is not, because zero asks for nothing and returns
+nothing, which is what it says, and a script computing a limit that comes out
+zero is not making the mistake a negative one is. One reader owns the flag, and
+a compile-time guard reads the shipping half of the file back and fails if any
+call site goes around it — the same defense the numeric-parsing helper already
+carries, for the same reason: this class of defect is introduced by a new call
+site, not by changing the old one.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract
