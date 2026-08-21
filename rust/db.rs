@@ -78,6 +78,98 @@ CREATE INDEX idx_tasks_assignee_status ON tasks(assignee,status);
 CREATE INDEX idx_tasks_lane_status ON tasks(lane,status);
 "#;
 
+/// A handoff no longer has to be about a task.
+///
+/// `task_id` and `checkpoint_seq` were both NOT NULL, so the only handoff that
+/// could exist was one taken over a claimed task — the record of a lease
+/// changing hands. There was nowhere to put the other kind: what a session
+/// itself learned, spanning several tasks or none, which is the thing a
+/// successor most needs and the thing no task owns.
+///
+/// SQLite cannot relax NOT NULL in place, so the table is rebuilt. At creation
+/// the two columns move together — a handoff is about a task and carries the
+/// checkpoint that closed it, or it is about neither — and `create_handoff`
+/// enforces that, because it is a rule about how a handoff is made.
+///
+/// It is deliberately not a CHECK, because it must not hold forever. Both
+/// columns are now `ON DELETE SET NULL` rather than `CASCADE`: removing a task
+/// used to delete every handoff ever taken over it, so the record of who
+/// handed what to whom vanished with the row it described. A handoff is a
+/// historical account of a handover that happened, and deleting the subject
+/// does not un-happen it. The links are dropped and the account survives.
+///
+/// The rebuild starts by creating the *old* shape if it is missing. A v3 board
+/// written by the retired TypeScript implementation can lack tables entirely,
+/// so there may be nothing to copy from; standing the old shape up first means
+/// one path handles both, and such a board ends the migration with the table it
+/// should have had. The columns are listed in the original order because the
+/// copy is positional.
+const BOARD_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS handoffs (
+ id TEXT PRIMARY KEY NOT NULL,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ checkpoint_seq INTEGER NOT NULL REFERENCES checkpoints(seq),
+ reason TEXT NOT NULL CHECK(reason IN ('token_pressure','provider_limit','session_end','manual')),
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','cancelled')),
+ from_agent TEXT NOT NULL,from_session TEXT,from_model TEXT,to_agent TEXT,
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL,accepted_at INTEGER,
+ accepted_by TEXT,accepted_session TEXT
+) STRICT;
+CREATE TABLE handoffs_next (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ checkpoint_seq INTEGER REFERENCES checkpoints(seq) ON DELETE SET NULL,
+ reason TEXT NOT NULL CHECK(reason IN ('token_pressure','provider_limit','session_end','manual')),
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','cancelled')),
+ from_agent TEXT NOT NULL,from_session TEXT,from_model TEXT,to_agent TEXT,
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL,accepted_at INTEGER,
+ accepted_by TEXT,accepted_session TEXT
+) STRICT;
+INSERT INTO handoffs_next SELECT * FROM handoffs;
+DROP TABLE handoffs;
+ALTER TABLE handoffs_next RENAME TO handoffs;
+CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at);
+CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at);
+"#;
+
+/// Things that need the operator, kept where the work is.
+///
+/// Agents surface blockers, decisions and approvals in whatever they happen to
+/// be writing — a report, a commit message, a chat reply — and every one of
+/// those is a channel that scrolls away. An item raised at 03:00 and never
+/// acted on leaves no trace that it was ever raised, so the same question gets
+/// asked again three sessions later, or worse, quietly answered by an agent
+/// that should not have decided it.
+///
+/// This is the durable place for them. Rows are resolved, never deleted, so
+/// what was asked, by whom, when, and how it was settled stays on the board —
+/// which is the point: the trail is the feature, not a side effect of storing
+/// them.
+///
+/// `task_id` is optional and `ON DELETE SET NULL` for the same reason handoffs
+/// are: an item may be about the session rather than one row, and removing the
+/// row it referred to does not un-ask the question.
+const BOARD_V5: &str = r#"
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk')),
+ body TEXT NOT NULL,
+ raised_by TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ CHECK((status = 'open') = (resolved_at IS NULL))
+) STRICT;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at);
+CREATE INDEX idx_attention_task ON attention(task_id);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -263,7 +355,26 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
 
 pub fn open_board(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
-    migrate(&mut connection, &[BOARD_V1, BOARD_V2, BOARD_V3])?;
+    // Foreign keys are off across the upgrade, and on for everything after.
+    //
+    // This is SQLite's own procedure for rebuilding a table, and it has to
+    // happen out here: `PRAGMA foreign_keys` is a no-op inside a transaction,
+    // which is where every migration runs. Rebuilding `handoffs` in V4 drops
+    // and recreates a table carrying references, and with enforcement on that
+    // reads the tables it points at — including `checkpoints`, which a v3
+    // board written by the retired TypeScript implementation may not have.
+    //
+    // Nothing is weakened by this: the rows are copied verbatim from a board
+    // that already satisfied its own constraints, `foreign_key_check` is what
+    // `doctor` runs to prove it afterwards, and enforcement is restored before
+    // the connection does any work.
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let outcome = migrate(
+        &mut connection,
+        &[BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5],
+    );
+    connection.pragma_update(None, "foreign_keys", true)?;
+    outcome?;
     Ok(connection)
 }
 

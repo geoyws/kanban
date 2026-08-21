@@ -3645,6 +3645,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "task list" => vec!["task", "list"],
             "task show" => vec!["task", "show", "t-1"],
             "handoff list" => vec!["handoff", "list"],
+            "attention list" => vec!["attention", "list"],
             "schema" => vec!["schema"],
             "events" => vec!["events"],
             "stale" => vec!["stale"],
@@ -3688,6 +3689,9 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         "task move",
         "claim",
         "checkpoint",
+        "attention raise",
+        "attention resolve",
+        "handoff create",
         "restore",
         "backup",
     ] {
@@ -4088,5 +4092,357 @@ done
         answered,
         vec![2, 3],
         "a request already on the wire was lost across the reload"
+    );
+}
+
+#[test]
+fn a_handoff_can_be_about_the_session_rather_than_one_task() {
+    let fixture = Fixture::new("session-handoff");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SESSION", "--json"]);
+
+    // No task id and no lease: a handoff about the work as a whole. This is
+    // the shape a lane hands to its successor, and it had nowhere to live --
+    // task_id and checkpoint_seq were both NOT NULL.
+    let session = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "claude@driver-2",
+            "--to",
+            "driver-2",
+            "--reason",
+            "session_end",
+            "--summary",
+            "Phase 3 landed",
+            "--intent",
+            "the successor continues at the merge gate",
+            "--next-action",
+            "run the tenancy leg then push",
+            "--branch",
+            "px-crm-geoyws-driver-2",
+            "--json",
+        ],
+    );
+    assert!(session["taskID"].is_null(), "a session handoff took a task");
+    assert!(session["checkpointSeq"].is_null());
+    assert_eq!(session["status"], "pending");
+
+    // Found by who it is for, not by where it was written. A successor knows
+    // its own lane; it does not necessarily know which directory the previous
+    // session was standing in.
+    let addressed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff", "list", "--status", "pending", "--to", "driver-2", "--json",
+        ],
+    );
+    assert_eq!(addressed.as_array().unwrap().len(), 1);
+    assert_eq!(addressed[0]["id"], session["id"]);
+    assert_eq!(addressed[0]["branch"], "px-crm-geoyws-driver-2");
+    // Someone else's lane must not see it.
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["handoff", "list", "--to", "driver-1", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Accepting one is an acknowledgement: there is no task, so no lease.
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            session["id"].as_str().unwrap(),
+            "--as",
+            "driver-2",
+            "--json",
+        ],
+    );
+    assert_eq!(accepted["handoff"]["status"], "accepted");
+    assert!(
+        accepted["claim"].is_null(),
+        "a session handoff minted a lease over nothing"
+    );
+
+    // A task id and a lease travel together; neither half means anything alone.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+    let no_lease = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-1",
+            "--as",
+            "a",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+        ],
+    );
+    assert!(!no_lease.status.success(), "a task was handed over unheld");
+    assert!(String::from_utf8_lossy(&no_lease.stderr).contains("--lease"));
+
+    let no_task = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--lease",
+            "made-up",
+            "--as",
+            "a",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+        ],
+    );
+    assert!(
+        !no_task.status.success(),
+        "a lease was accepted with no task"
+    );
+    assert!(String::from_utf8_lossy(&no_task.stderr).contains("task id"));
+}
+
+#[test]
+fn handoff_history_survives_the_task_it_was_about() {
+    // A handoff is an account of a handover that happened. Removing the task
+    // does not un-happen it -- but task_id was ON DELETE CASCADE, so every
+    // handoff ever taken over a task vanished with it.
+    let fixture = Fixture::new("handoff-trail");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TRAIL", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-1", "--as", "agent-a", "--json"],
+    );
+    let created = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-1",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "agent-a",
+            "--summary",
+            "ran out of context mid-parser",
+            "--intent",
+            "continue from the checkpoint",
+            "--next-action",
+            "finish the parser",
+            "--json",
+        ],
+    );
+    assert_eq!(created["taskID"], "t-1");
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "t-1", "--as", "geo", "--force", "--json"],
+    );
+
+    let after = fixture.ok_json(&fixture.main, &["handoff", "list", "--json"]);
+    let kept = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == created["id"])
+        .expect("the handoff was deleted with its task");
+    assert_eq!(
+        kept["summary"], "ran out of context mid-parser",
+        "the account did not survive"
+    );
+    assert_eq!(kept["fromAgent"], "agent-a");
+    assert!(
+        kept["taskID"].is_null(),
+        "the link to a removed task should be dropped, not dangle"
+    );
+
+    // And the board is still consistent: a dangling reference would show here.
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(doctor["healthy"], true, "{doctor}");
+}
+
+#[test]
+fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
+    let fixture = Fixture::new("attention");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ATTN", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+
+    let blocking = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "field set contradicts the manual; confirm which wins",
+            "--as",
+            "claude/driver-2",
+            "--kind",
+            "blocking",
+            "--task",
+            "t-1",
+            "--json",
+        ],
+    );
+    assert_eq!(blocking["status"], "open");
+    assert_eq!(blocking["taskID"], "t-1");
+    let approval = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "2 commits ready for a staging push, which is George-manual",
+            "--as",
+            "claude/driver-1",
+            "--kind",
+            "approval",
+            "--json",
+        ],
+    );
+    assert!(approval["taskID"].is_null(), "an item may be about no task");
+
+    // A kind outside the closed set is refused: "what sort of thing is this"
+    // is the part a reader needs first, and free text would not answer it.
+    let invented = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "x",
+            "--as",
+            "a",
+            "--kind",
+            "vibes",
+            "--json",
+        ],
+    );
+    assert!(!invented.status.success(), "an invented kind was accepted");
+    assert!(String::from_utf8_lossy(&invented.stderr).contains("attention kind"));
+
+    // Open first, and oldest first within that -- an unanswered question does
+    // not get less urgent by being ignored.
+    let listed = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    let ids = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            blocking["id"].as_str().unwrap(),
+            approval["id"].as_str().unwrap()
+        ]
+    );
+
+    // Settling one keeps it: the trail is the feature.
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--note",
+            "approved and pushed",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["resolvedBy"], "geo");
+    assert_eq!(settled["resolution"], "approved and pushed");
+    assert!(!settled["resolvedAt"].is_null());
+
+    let still_there = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(
+        still_there.as_array().unwrap().len(),
+        2,
+        "a resolved item was dropped from the record"
+    );
+    // Resolved sinks below open, so the queue reads as a queue.
+    assert_eq!(still_there[1]["id"], approval["id"]);
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--status", "open", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Resolving twice would overwrite who settled it and when, which is the
+    // part worth keeping.
+    let again = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "someone-else",
+            "--json",
+        ],
+    );
+    assert!(!again.status.success(), "a settled item was re-settled");
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already resolved by geo"));
+
+    // The operator sees the count without having to ask for it.
+    let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    assert_eq!(dashboard[0]["openAttention"], 1);
+
+    // Raised and settled are both on the durable audit trail.
+    let events = fixture.ok_json(&fixture.main, &["events", "--json"]);
+    let kinds = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"attention_raised"), "{kinds:?}");
+    assert!(kinds.contains(&"attention_resolved"), "{kinds:?}");
+
+    // An item about a removed task keeps its text, like a handoff does.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "t-1", "--as", "geo", "--force", "--json"],
+    );
+    let orphaned = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    let survivor = orphaned
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == blocking["id"])
+        .expect("the item was deleted with its task");
+    assert!(survivor["taskID"].is_null());
+    assert_eq!(
+        survivor["status"], "open",
+        "removing a task answered nothing"
     );
 }

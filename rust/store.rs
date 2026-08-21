@@ -243,6 +243,21 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     })
 }
 
+fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
+    Ok(Attention {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        kind: row.get("kind")?,
+        body: row.get("body")?,
+        raised_by: row.get("raised_by")?,
+        created_at: row.get("created_at")?,
+        status: row.get("status")?,
+        resolved_at: row.get("resolved_at")?,
+        resolved_by: row.get("resolved_by")?,
+        resolution: row.get("resolution")?,
+    })
+}
+
 fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
     Ok(Handoff {
         id: row.get("id")?,
@@ -1149,10 +1164,152 @@ impl Store {
         Ok(result)
     }
 
+    /// Handoffs, newest first, narrowed by any combination of filters.
+    ///
+    /// `to_agent` is the one that makes a session handoff findable. A task
+    /// handoff is reachable through its task; a session handoff is about no
+    /// task, so without a way to ask "what is waiting for driver-2" the only
+    /// route to it would be reading the whole list. The successor knows who it
+    /// is, and that is the key it should be able to look itself up by.
+    /// Record something only the operator can retire.
+    ///
+    /// The agent raising it names the kind, because "what sort of thing is
+    /// this" is the part a reader needs first and the part an agent knows and
+    /// a reader would have to infer from prose.
+    pub fn raise_attention(
+        &mut self,
+        body: &str,
+        kind: &str,
+        raised_by: &str,
+        task_id: Option<&str>,
+    ) -> Result<Attention> {
+        validate(kind, &ATTENTION_KINDS, "attention kind")?;
+        let body = nonempty(body, "attention body")?.to_owned();
+        let raised_by = nonempty(raised_by, "raised by")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(id) = task_id {
+            require_task(&transaction, id)?;
+        }
+        let now = now_ms();
+        let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        transaction.execute(
+            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL)",
+            params![id, task_id, kind, body, raised_by, now],
+        )?;
+        event(
+            &transaction,
+            task_id,
+            "attention_raised",
+            Some(&raised_by),
+            json!({"attentionID": id, "kind": kind}),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Open items first, oldest first within each state.
+    ///
+    /// Oldest-first is the opposite of every other listing here, and
+    /// deliberate: an unanswered question does not get less urgent by being
+    /// ignored, and newest-first buries exactly the item that has been waiting
+    /// longest.
+    pub fn attention(
+        &self,
+        status: Option<&str>,
+        kind: Option<&str>,
+        task: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Attention>> {
+        if let Some(value) = status {
+            validate(value, &["open", "resolved"], "attention status")?;
+        }
+        if let Some(value) = kind {
+            validate(value, &ATTENTION_KINDS, "attention kind")?;
+        }
+        if let Some(id) = task {
+            require_task(&self.connection, id)?;
+        }
+        let mut clauses = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(status) = status {
+            clauses.push("status=?");
+            values.push(Box::new(status.to_owned()));
+        }
+        if let Some(kind) = kind {
+            clauses.push("kind=?");
+            values.push(Box::new(kind.to_owned()));
+        }
+        if let Some(task) = task {
+            clauses.push("task_id=?");
+            values.push(Box::new(task.to_owned()));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        values.push(Box::new(limit));
+        let sql = format!(
+            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',created_at ASC,id ASC LIMIT ?"
+        );
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(params_from_iter(refs), attention_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Settle an item. The row stays; only its state moves.
+    pub fn resolve_attention(
+        &mut self,
+        id: &str,
+        actor: &str,
+        resolution: Option<&str>,
+    ) -> Result<Attention> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?
+            .with_context(|| format!("attention {id} not found"))?;
+        // Resolving twice would overwrite who settled it and when, which is
+        // the part of the record worth keeping.
+        if existing.status != "open" {
+            bail!(
+                "attention {id} was already resolved by {} — it is history, not a queue entry",
+                existing.resolved_by.unwrap_or_else(|| "someone".into())
+            );
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=? WHERE id=?",
+            params![now, actor, resolution, id],
+        )?;
+        event(
+            &transaction,
+            existing.task_id.as_deref(),
+            "attention_resolved",
+            Some(&actor),
+            json!({"attentionID": id, "kind": existing.kind}),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub fn handoffs(
         &self,
         task: Option<&str>,
         status: Option<&str>,
+        to_agent: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Handoff>> {
         if let Some(value) = status {
@@ -1165,30 +1322,33 @@ impl Store {
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
-        let (sql, values): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (task, status) {
-            (Some(task), Some(status)) => (
-                "SELECT * FROM handoffs WHERE task_id=? AND status=? ORDER BY created_at DESC,id DESC LIMIT ?",
-                vec![
-                    Box::new(task.to_owned()),
-                    Box::new(status.to_owned()),
-                    Box::new(limit),
-                ],
-            ),
-            (Some(task), None) => (
-                "SELECT * FROM handoffs WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT ?",
-                vec![Box::new(task.to_owned()), Box::new(limit)],
-            ),
-            (None, Some(status)) => (
-                "SELECT * FROM handoffs WHERE status=? ORDER BY created_at DESC,id DESC LIMIT ?",
-                vec![Box::new(status.to_owned()), Box::new(limit)],
-            ),
-            (None, None) => (
-                "SELECT * FROM handoffs ORDER BY created_at DESC,id DESC LIMIT ?",
-                vec![Box::new(limit)],
-            ),
+        // Built up rather than enumerated: three optional filters is eight
+        // hand-written queries, and the eighth is the one that gets forgotten.
+        let mut clauses = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(task) = task {
+            clauses.push("task_id=?");
+            values.push(Box::new(task.to_owned()));
+        }
+        if let Some(status) = status {
+            clauses.push("status=?");
+            values.push(Box::new(status.to_owned()));
+        }
+        if let Some(agent) = to_agent {
+            clauses.push("to_agent=?");
+            values.push(Box::new(agent.to_owned()));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
         };
+        values.push(Box::new(limit));
+        let sql = format!(
+            "SELECT * FROM handoffs{where_clause} ORDER BY created_at DESC,id DESC LIMIT ?"
+        );
         let refs = values.iter().map(|value| value.as_ref());
-        let mut statement = self.connection.prepare(sql)?;
+        let mut statement = self.connection.prepare(&sql)?;
         statement
             .query_map(params_from_iter(refs), handoff_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -1201,37 +1361,65 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
-        let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
-        if claim.agent_id != input.from_agent {
-            bail!(
-                "lease belongs to {}, not {}",
-                claim.agent_id,
-                input.from_agent
-            );
-        }
+        // A task and a lease travel together: a lease exists only over a task,
+        // and handing a task over without one would let any caller move work
+        // they do not hold. Neither half is meaningful alone, so the pair is
+        // resolved once here rather than checked at each use.
+        let claim = match (&input.task_id, &input.lease_token) {
+            (Some(task_id), Some(token)) => {
+                let claim = require_lease(&transaction, task_id, token, now)?;
+                if claim.agent_id != input.from_agent {
+                    bail!(
+                        "lease belongs to {}, not {}",
+                        claim.agent_id,
+                        input.from_agent
+                    );
+                }
+                Some(claim)
+            }
+            (None, None) => None,
+            (Some(_), None) => bail!("handing over a task needs its lease: pass --lease"),
+            (None, Some(_)) => {
+                bail!("a lease is held over a task, so --lease needs the task id it belongs to")
+            }
+        };
         let summary = nonempty(&input.summary, "summary")?.to_owned();
         let intent = nonempty(&input.intent, "intent")?.to_owned();
         let next = nonempty(&input.next_action, "next action")?.to_owned();
         let blockers = serde_json::to_string(&input.blockers)?;
         let validations = serde_json::to_string(&input.validations)?;
-        transaction.execute(
-            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at) VALUES(?,?,?,?,? ,?,?,?,?,?,?,?,?,?,?)",
-            params![input.task_id,input.from_agent,input.from_session.clone().or(claim.session_id),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now],
-        )?;
-        let checkpoint_seq = transaction.last_insert_rowid();
+        // A task handoff closes the task with a checkpoint, so a successor
+        // resumes from the durable record rather than the handoff's prose. A
+        // session handoff has no task to checkpoint, and inventing one would
+        // put a checkpoint on a row that was never worked.
+        let checkpoint_seq = match (&input.task_id, claim) {
+            (Some(task_id), claim) => {
+                transaction.execute(
+                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at) VALUES(?,?,?,?,? ,?,?,?,?,?,?,?,?,?,?)",
+                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now],
+                )?;
+                Some(transaction.last_insert_rowid())
+            }
+            (None, _) => None,
+        };
         let id = format!("h-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
             "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
             params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now],
         )?;
-        transaction.execute("DELETE FROM task_claims WHERE task_id=?", [&input.task_id])?;
-        transaction.execute(
-            "UPDATE tasks SET status='todo',updated_at=?,completed_at=NULL WHERE id=?",
-            params![now, input.task_id],
-        )?;
+        // Releasing the lease and returning the task to the queue is the point
+        // of a task handoff. A session handoff holds nothing and releases
+        // nothing, so there is no task state to disturb.
+        if let Some(task_id) = &input.task_id {
+            transaction.execute("DELETE FROM task_claims WHERE task_id=?", [task_id])?;
+            transaction.execute(
+                "UPDATE tasks SET status='todo',updated_at=?,completed_at=NULL WHERE id=?",
+                params![now, task_id],
+            )?;
+        }
         event(
             &transaction,
-            Some(&input.task_id),
+            input.task_id.as_deref(),
             "handoff_created",
             Some(&input.from_agent),
             json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent}),
@@ -1249,7 +1437,7 @@ impl Store {
         session: Option<String>,
         lease_ms: i64,
         caller_scope: Option<&str>,
-    ) -> Result<(Handoff, Claim)> {
+    ) -> Result<(Handoff, Option<Claim>)> {
         let agent = nonempty(agent, "agent id")?.to_owned();
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
@@ -1276,7 +1464,24 @@ impl Store {
                 handoff.to_agent.unwrap()
             );
         }
-        let task = require_task(&transaction, &handoff.task_id)?;
+        // A session handoff carries no task, so there is nothing to lease and
+        // nothing to make claimable. Accepting it is an acknowledgement: it
+        // records who picked the thread up and stops it being offered again.
+        let Some(task_id) = handoff.task_id.clone() else {
+            transaction.execute("UPDATE handoffs SET status='accepted',accepted_at=?,accepted_by=?,accepted_session=? WHERE id=? AND status='pending'",params![now,agent,session,id])?;
+            event(
+                &transaction,
+                None,
+                "handoff_accepted",
+                Some(&agent),
+                json!({"handoffID":id,"session":true}),
+            )?;
+            let updated =
+                transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
+            transaction.commit()?;
+            return Ok((updated, None));
+        };
+        let task = require_task(&transaction, &task_id)?;
         require_claimable_type(&task.id, &task.task_type)?;
         if task.status != "todo" {
             bail!("task {} is {}, not claimable", task.id, task.status);
@@ -1318,7 +1523,7 @@ impl Store {
         let claim =
             active_claim(&transaction, &task.id, now)?.context("accepted claim disappeared")?;
         transaction.commit()?;
-        Ok((updated, claim))
+        Ok((updated, Some(claim)))
     }
 
     pub fn signoff_story(
@@ -1631,7 +1836,7 @@ impl Store {
         // told it held the whole record while notes were being dropped.
         let mut notes = self.notes(id, NOTES as i64 + 1)?;
         let mut checkpoints = self.checkpoints(id, CHECKPOINTS as i64 + 1)?;
-        let mut handoffs = self.handoffs(Some(id), None, HANDOFFS as i64 + 1)?;
+        let mut handoffs = self.handoffs(Some(id), None, None, HANDOFFS as i64 + 1)?;
         handoffs.reverse();
         let mut truncated = keep_newest(&mut notes, NOTES);
         truncated |= keep_newest(&mut checkpoints, CHECKPOINTS);

@@ -48,11 +48,16 @@ Usage:
   kanban release ID --lease TOKEN [--keep-status]
   kanban note ID TEXT --as AGENT [--kind KIND]
   kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
-  kanban handoff create ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
-  kanban handoff list [--task ID] [--status STATUS] [--json]
+  kanban handoff create [ID --lease TOKEN] --as AGENT --summary TEXT --intent TEXT
+             --next-action TEXT     (without ID: a session handoff, about no one task)
+  kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
+  kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
+             [--task ID] [--json]
+  kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--limit N] [--json]
+  kanban attention resolve ID --as ACTOR [--note TEXT] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
@@ -297,10 +302,16 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "head",
             "dirty",
         ],
-        &["id"],
+        &["?id"],
         false,
     ),
-    ("handoff", Some("list"), &["task", "status"], &[], true),
+    (
+        "handoff",
+        Some("list"),
+        &["task", "status", "to"],
+        &[],
+        true,
+    ),
     (
         "handoff",
         Some("accept"),
@@ -324,6 +335,27 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("schema", None, &[], &[], true),
     ("mcp", None, &[], &[], false),
+    (
+        "attention",
+        Some("raise"),
+        &["as", "kind", "task"],
+        &["text"],
+        false,
+    ),
+    (
+        "attention",
+        Some("list"),
+        &["status", "kind", "task", "limit"],
+        &[],
+        true,
+    ),
+    (
+        "attention",
+        Some("resolve"),
+        &["as", "note"],
+        &["id"],
+        false,
+    ),
     ("events", None, &["task", "kind", "limit"], &[], true),
     ("stale", None, &[], &[], true),
     ("context", None, &["max-chars"], &["id"], true),
@@ -352,7 +384,14 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 5] = ["task", "story", "handoff", "import", "workspace"];
+const SUBCOMMAND_GROUPS: [&str; 6] = [
+    "task",
+    "story",
+    "handoff",
+    "import",
+    "workspace",
+    "attention",
+];
 
 /// Short names for commands, resolved by exact match only.
 ///
@@ -368,6 +407,7 @@ fn canonical_command(value: &str) -> &str {
         "cp" => "checkpoint",
         "hb" => "heartbeat",
         "ctx" => "context",
+        "att" | "attn" => "attention",
         "ev" => "events",
         "dash" => "dashboard",
         "rel" => "release",
@@ -1125,7 +1165,13 @@ fn run() -> Result<()> {
             value.insert("taskCounts".into(), Value::Object(counts));
             value.insert(
                 "pendingHandoffs".into(),
-                json!(store.handoffs(None, Some("pending"), 100)?.len()),
+                json!(store.handoffs(None, Some("pending"), None, 100)?.len()),
+            );
+            // The count an operator most needs to see without being asked: a
+            // record raised for them that nobody has settled.
+            value.insert(
+                "openAttention".into(),
+                json!(store.attention(Some("open"), None, None, 1000)?.len()),
             );
             value.insert("totalTasks".into(), json!(tasks.len()));
             value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
@@ -1256,7 +1302,7 @@ fn run() -> Result<()> {
         );
         value.insert(
             "handoffs".into(),
-            serde_json::to_value(store.handoffs(Some(id), None, 100)?)?,
+            serde_json::to_value(store.handoffs(Some(id), None, None, 100)?)?,
         );
         return print(&Value::Object(value), args.has("json"));
     }
@@ -1447,10 +1493,12 @@ fn run() -> Result<()> {
         return print(&value, args.has("json"));
     }
     if command == "handoff" && sub == Some("create") {
-        let id = rest.first().context("task id is required")?;
+        // No task id makes it a session handoff: about the work as a whole
+        // rather than one row of it. The store refuses an id without its lease
+        // and a lease without its id, since neither half means anything alone.
         let value = store.create_handoff(HandoffInput {
-            task_id: id.into(),
-            lease_token: args.require("lease")?.into(),
+            task_id: rest.first().map(|id| (*id).to_owned()),
+            lease_token: args.one("lease").map(str::to_owned),
             from_agent: args.require("as")?.into(),
             from_session: option_string(&args, "session"),
             from_model: option_string(&args, "model"),
@@ -1470,7 +1518,7 @@ fn run() -> Result<()> {
     }
     if command == "handoff" && sub == Some("list") {
         return print(
-            &store.handoffs(args.one("task"), args.one("status"), 100)?,
+            &store.handoffs(args.one("task"), args.one("status"), args.one("to"), 100)?,
             args.has("json"),
         );
     }
@@ -1521,6 +1569,36 @@ fn run() -> Result<()> {
     }
     if command == "stale" {
         return print(&store.stale_tasks()?, args.has("json"));
+    }
+    if command == "attention" && sub == Some("raise") {
+        let text = rest.first().context("attention text is required")?;
+        return print(
+            &store.raise_attention(
+                text,
+                args.one("kind").unwrap_or("decision"),
+                args.require("as")?,
+                args.one("task"),
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "attention" && sub == Some("list") {
+        return print(
+            &store.attention(
+                args.one("status"),
+                args.one("kind"),
+                args.one("task"),
+                args.integer("limit", 100)?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "attention" && sub == Some("resolve") {
+        let id = rest.first().context("attention id is required")?;
+        return print(
+            &store.resolve_attention(id, args.require("as")?, args.one("note"))?,
+            args.has("json"),
+        );
     }
     if command == "events" {
         return print(

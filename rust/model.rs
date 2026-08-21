@@ -121,9 +121,11 @@ pub struct Checkpoint {
 #[serde(rename_all = "camelCase")]
 pub struct Handoff {
     pub id: String,
+    /// Absent when the handoff is about the session rather than one task.
     #[serde(rename = "taskID")]
-    pub task_id: String,
-    pub checkpoint_seq: i64,
+    pub task_id: Option<String>,
+    /// The checkpoint that closed the task, and so absent for the same reason.
+    pub checkpoint_seq: Option<i64>,
     pub reason: String,
     pub status: String,
     pub from_agent: String,
@@ -248,10 +250,37 @@ pub struct CheckpointInput {
     pub dirty_summary: Option<String>,
 }
 
+/// The kinds of thing that can need the operator, and nothing else.
+///
+/// Deliberately no `info`: a note that does not need anyone is a note, and
+/// `task note` already holds those. Everything here is something only the
+/// operator can retire.
+pub const ATTENTION_KINDS: [&str; 5] = ["blocking", "decision", "approval", "review", "risk"];
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attention {
+    pub id: String,
+    #[serde(rename = "taskID")]
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub body: String,
+    pub raised_by: String,
+    pub created_at: i64,
+    pub status: String,
+    pub resolved_at: Option<i64>,
+    pub resolved_by: Option<String>,
+    pub resolution: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandoffInput {
-    pub task_id: String,
-    pub lease_token: String,
+    /// The task being handed over, or `None` for a session handoff that is
+    /// about the work as a whole rather than one row of it.
+    pub task_id: Option<String>,
+    /// The lease authorizing the handover. Travels with `task_id`: a lease
+    /// exists only over a task, and a task cannot be handed over without one.
+    pub lease_token: Option<String>,
     pub from_agent: String,
     pub from_session: Option<String>,
     pub from_model: Option<String>,
