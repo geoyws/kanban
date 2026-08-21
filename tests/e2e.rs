@@ -4915,3 +4915,163 @@ fn a_plan_is_an_epic_whose_body_survives_being_revised() {
     );
     assert!(!missing.status.success(), "a missing body file was ignored");
 }
+
+/// Make `dir` a git repository with one commit, so provenance has something to
+/// resolve. Returns false when git is unavailable, which is not a test failure.
+fn make_repo(dir: &Path) -> bool {
+    let run = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !run(&["init", "-q", "-b", "work"]) {
+        return false;
+    }
+    fs::write(dir.join("seed.txt"), "seed").unwrap();
+    run(&["add", "-A"]) && run(&["commit", "-qm", "seed"])
+}
+
+#[test]
+fn where_work_happened_is_captured_rather_than_asked_for() {
+    // The columns for this existed and were empty: measured across the live
+    // boards, 0 of 20 checkpoints carried a HEAD sha, because filling them
+    // meant passing --repo --branch --head by hand and nobody did.
+    let fixture = Fixture::new("provenance");
+    fs::create_dir_all(&fixture.main).unwrap();
+    if !make_repo(&fixture.main) {
+        eprintln!("git unavailable; skipping provenance assertions");
+        return;
+    }
+    fixture.ok_json(&fixture.main, &["init", "--name", "PROV", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Work",
+            "--id",
+            "t-1",
+            "--as",
+            "claude@solo",
+            "--json",
+        ],
+    );
+
+    // A claim now says where it was taken, which on a box running several lanes
+    // of one repository is the first question anyone asks.
+    let claim = fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    let worktree = claim["worktree"].as_str().expect("no worktree recorded");
+    assert!(
+        worktree.ends_with("main"),
+        "the recorded worktree is not where the command ran: {worktree}"
+    );
+    assert_eq!(claim["branch"], "work");
+    assert_eq!(claim["worktreeKind"], "main");
+    assert_eq!(
+        claim["headSha"].as_str().unwrap().len(),
+        40,
+        "a HEAD sha should be a full object id"
+    );
+
+    // Creating a task is attributable. Every other event kind recorded who did
+    // it; this one could not, because there was no --as to record.
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "t-1", "--json"]);
+    let added = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "task_added")
+        .expect("no task_added event");
+    assert_eq!(
+        added["actor"], "claude@solo",
+        "the creator was not recorded"
+    );
+    assert_eq!(added["payload"]["type"], "task");
+
+    // A checkpoint fills the columns that used to be null.
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+    let checkpoint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-1",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--json",
+        ],
+    );
+    assert_eq!(checkpoint["branch"], "work");
+    assert!(!checkpoint["headSha"].is_null(), "head was not captured");
+    assert!(
+        !checkpoint["repoPath"].is_null(),
+        "repo path was not captured"
+    );
+    assert_eq!(
+        checkpoint["dirtySummary"], "clean",
+        "a clean tree should say so"
+    );
+
+    // An explicit flag still wins: capture is a default, not an override.
+    let explicit = fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-1",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--branch",
+            "stated-by-hand",
+            "--json",
+        ],
+    );
+    assert_eq!(explicit["branch"], "stated-by-hand");
+}
+
+#[test]
+fn a_command_outside_a_repository_records_no_provenance() {
+    // Capture is opportunistic. Running outside a repository is not an error --
+    // it simply has no git context, and recording none is the truthful outcome.
+    let fixture = Fixture::new("provenance-none");
+    fs::create_dir_all(&fixture.main).unwrap();
+    fixture.ok_json(&fixture.main, &["init", "--name", "NONE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+
+    let claim = fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    assert!(claim["worktree"].is_null(), "provenance was invented");
+    assert!(claim["branch"].is_null());
+    assert!(claim["headSha"].is_null());
+
+    // And the command itself is unaffected.
+    assert_eq!(claim["taskID"], "t-1");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["status"],
+        "in_progress"
+    );
+}

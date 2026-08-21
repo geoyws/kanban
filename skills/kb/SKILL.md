@@ -225,6 +225,28 @@ directly writable, since the gate cannot express either.
 **The tree is enforced**: an epic contains stories, a story contains tasks, a
 task contains nothing.
 
+## Provenance — where and when work happened
+
+Recorded automatically. You do not pass it, and you should not have to:
+
+- **A claim** records the worktree it was taken in, whether that worktree is a
+  lane (`linked`) or an ordinary checkout (`main`), the branch, the HEAD sha,
+  and — for a checkout nested inside a superproject — the **root** commit of the
+  outermost repository. That last one is what says which revision of the whole
+  tree was checked out; a submodule's own sha does not.
+- **Checkpoints and handoffs** fill `repoPath`, `branch`, `headSha`,
+  `dirtySummary` and `rootHead` the same way. An explicit `--repo` / `--branch` /
+  `--head` / `--dirty` still wins: capture is a default, not an override.
+- **Timestamps** are on every row already — `createdAt`, `updatedAt`,
+  `completedAt`, `claimedAt`, `heartbeatAt`, `expiresAt`, `acceptedAt`,
+  `resolvedAt`.
+- **`kb ev`** is the audit trail: every mutation, its actor, and what changed.
+  Pass `--as` to `kb t new` so the row's creation is attributable — without it
+  the trail records the creation with no actor, which is honest but useless.
+
+Run outside a git repository and provenance is recorded as absent rather than
+invented, and the command works exactly the same.
+
 ## Reading
 
 ```bash

@@ -61,6 +61,15 @@ pub struct Claim {
     pub claimed_at: i64,
     pub heartbeat_at: i64,
     pub expires_at: i64,
+    /// Where the claim was taken, when the claimer was standing in a
+    /// repository. A lane is a `linked` worktree; an ordinary checkout is
+    /// `main`.
+    pub worktree: Option<String>,
+    pub worktree_kind: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    /// The outermost superproject's commit, for a nested checkout.
+    pub root_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +132,8 @@ pub struct Checkpoint {
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
     pub created_at: i64,
+    /// The outermost superproject's commit, for a nested checkout.
+    pub root_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +164,8 @@ pub struct Handoff {
     pub accepted_at: Option<i64>,
     pub accepted_by: Option<String>,
     pub accepted_session: Option<String>,
+    /// The outermost superproject's commit, for a nested checkout.
+    pub root_head: Option<String>,
 }
 
 /// One row of the durable audit trail. `lease_seized` and `task_removed`
@@ -237,6 +250,9 @@ pub struct AddTask {
     pub priority: i64,
     pub dependencies: Vec<String>,
     pub metadata: Value,
+    /// Who created the row. Optional, so existing callers keep working; an
+    /// absent actor is recorded as absent rather than invented.
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +272,7 @@ pub struct CheckpointInput {
     pub branch: Option<String>,
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
+    pub root_head: Option<String>,
 }
 
 /// The kinds of thing that can need the operator, and nothing else.
@@ -303,4 +320,5 @@ pub struct HandoffInput {
     pub branch: Option<String>,
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
+    pub root_head: Option<String>,
 }

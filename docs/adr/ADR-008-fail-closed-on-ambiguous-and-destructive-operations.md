@@ -363,6 +363,43 @@ supply the body, so giving both is refused rather than ranked, exactly as the
 board selectors are. `--body-file` exists because a plan is markdown measured in
 kilobytes, and putting that on a command line works and is miserable.
 
+**A column that is always empty is not a record, it is a promise.** Checkpoints
+and handoffs carried `repo_path`, `branch`, `head_sha` and `dirty_summary` from
+the beginning, and filling them meant the caller passing `--repo --branch --head
+--dirty` by hand. Measured 2026-08-21 across the twelve live boards, **0 of 20
+checkpoints and 0 of 3 handoffs held a HEAD sha**. A resuming agent read
+`branch: null` and guessed. The schema described provenance the ledger never had.
+
+Provenance is now captured from the working directory rather than requested, and
+an explicit flag still wins — capture is a default, not an override. A claim
+records it too, which is what answers "which worktree is this lane in" on a box
+running several lanes of one repository. A nested checkout also records the
+outermost superproject's commit: a submodule's own sha says nothing about which
+revision of the whole tree it belonged to, and the chain is followed to its end
+rather than one level, because nesting is not limited to one level.
+
+It asks git rather than reading `.git`. The layouts on a real machine disagree
+with the tutorial — here a submodule has a real `.git` directory while its
+superproject's is a file, lanes redirect through `gitdir:`, refs may be packed
+and HEAD may be detached — and parsing that subtly wrong writes *wrong*
+provenance into a durable record, which is worse than writing none. Every
+failure degrades to absent: a command run outside a repository records no
+provenance and is not an error.
+
+**The trail could not say who created a task.** Every other event kind named its
+actor; `task_added` recorded `None`, 132 times across the live boards, because
+`task add` had no `--as` to record. It does now, and an absent actor is still
+recorded as absent — inventing one would be worse than the gap.
+
+**A migration that is never run is invisible.** `BOARD_V7` was written,
+reviewed and compiled with the constant referenced nowhere: the build was clean,
+the tests passed, and the first sign was a column missing at runtime on a board
+that believed it was current. A guard now reads the file back and fails if any
+declared migration is absent from the ladder that applies it. Its first two
+versions were themselves wrong — one counted a text span that swept up the
+test's own source, the next broke the moment `cargo fmt` wrapped the list — so
+it checks by name, which no formatting can move.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

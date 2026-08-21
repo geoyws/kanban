@@ -1,5 +1,6 @@
 mod context;
 mod db;
+mod gitctx;
 mod import;
 mod lock;
 mod mcp;
@@ -31,7 +32,7 @@ Usage:
   kanban doctor [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban restore --from DIRECTORY --force [--json]
-  kanban task add TITLE [--id ID] [--type epic|story|task] [--parent ID]
+  kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
              [--priority 0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
@@ -163,6 +164,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "task",
         Some("add"),
         &[
+            "as",
             "body-file",
             "id",
             "type",
@@ -873,6 +875,16 @@ pub(crate) fn schema() -> Value {
     })
 }
 
+/// Where this invocation is standing, as git sees it.
+///
+/// Resolved once per command from the working directory and handed to whatever
+/// records provenance. It is the *caller's* location, not the addressed
+/// project's: for a driver lane those differ, and the lane is the answer to
+/// "where is this work happening".
+fn here() -> Option<gitctx::GitContext> {
+    gitctx::resolve(&cwd().ok()?)
+}
+
 /// A board named straight by path, bypassing the registry entirely.
 ///
 /// Read by both the board resolver and the data-root lock, so the two can
@@ -1321,6 +1333,7 @@ fn run() -> Result<()> {
             task_type: args.one("type").unwrap_or("task").into(),
             parent_id: option_string(&args, "parent"),
             title,
+            actor: option_string(&args, "as"),
             body: args.body()?,
             assignee: option_string(&args, "assignee"),
             lane: option_string(&args, "lane"),
@@ -1489,6 +1502,7 @@ fn run() -> Result<()> {
         let value = store.claim(
             id,
             ClaimOptions {
+                git: here(),
                 agent_id: args.require("as")?.into(),
                 session_id: option_string(&args, "session"),
                 lease_ms: lease_ms(&args)?,
@@ -1528,6 +1542,9 @@ fn run() -> Result<()> {
     }
     if command == "checkpoint" {
         let id = sub.context("task id is required")?;
+        // Captured, not asked for: these columns were 100% empty because they
+        // depended on the caller passing them. An explicit flag still wins.
+        let git = here();
         let value = store.checkpoint(CheckpointInput {
             task_id: id.into(),
             lease_token: args.require("lease")?.into(),
@@ -1540,10 +1557,14 @@ fn run() -> Result<()> {
             next_action: args.require("next-action")?.into(),
             blockers: args.many("blocker"),
             validations: args.many("validation"),
-            repo_path: option_string(&args, "repo"),
-            branch: option_string(&args, "branch"),
-            head_sha: option_string(&args, "head"),
-            dirty_summary: option_string(&args, "dirty"),
+            repo_path: option_string(&args, "repo")
+                .or_else(|| git.as_ref().map(|g| g.worktree.clone())),
+            branch: option_string(&args, "branch")
+                .or_else(|| git.as_ref().and_then(|g| g.branch.clone())),
+            head_sha: option_string(&args, "head").or_else(|| git.as_ref().map(|g| g.head.clone())),
+            dirty_summary: option_string(&args, "dirty")
+                .or_else(|| git.as_ref().map(gitctx::dirty_summary)),
+            root_head: git.as_ref().and_then(|g| g.root_head.clone()),
         })?;
         return print(&value, args.has("json"));
     }
@@ -1551,6 +1572,7 @@ fn run() -> Result<()> {
         // No task id makes it a session handoff: about the work as a whole
         // rather than one row of it. The store refuses an id without its lease
         // and a lease without its id, since neither half means anything alone.
+        let git = here();
         let value = store.create_handoff(HandoffInput {
             task_id: rest.first().map(|id| (*id).to_owned()),
             lease_token: args.one("lease").map(str::to_owned),
@@ -1564,10 +1586,14 @@ fn run() -> Result<()> {
             next_action: args.require("next-action")?.into(),
             blockers: args.many("blocker"),
             validations: args.many("validation"),
-            repo_path: option_string(&args, "repo"),
-            branch: option_string(&args, "branch"),
-            head_sha: option_string(&args, "head"),
-            dirty_summary: option_string(&args, "dirty"),
+            repo_path: option_string(&args, "repo")
+                .or_else(|| git.as_ref().map(|g| g.worktree.clone())),
+            branch: option_string(&args, "branch")
+                .or_else(|| git.as_ref().and_then(|g| g.branch.clone())),
+            head_sha: option_string(&args, "head").or_else(|| git.as_ref().map(|g| g.head.clone())),
+            dirty_summary: option_string(&args, "dirty")
+                .or_else(|| git.as_ref().map(gitctx::dirty_summary)),
+            root_head: git.as_ref().and_then(|g| g.root_head.clone()),
         })?;
         return print(&value, args.has("json"));
     }
@@ -1579,12 +1605,14 @@ fn run() -> Result<()> {
     }
     if command == "handoff" && sub == Some("accept") {
         let id = rest.first().context("handoff id is required")?;
+        let git = here();
         let (handoff, claim) = store.accept_handoff(
             id,
             args.require("as")?,
             option_string(&args, "session"),
             lease_ms(&args)?,
             args.one("caller-scope"),
+            git,
         )?;
         return print(&json!({"handoff":handoff,"claim":claim}), args.has("json"));
     }

@@ -218,6 +218,11 @@ fn claim_row(row: &Row<'_>) -> rusqlite::Result<Claim> {
         claimed_at: row.get("claimed_at")?,
         heartbeat_at: row.get("heartbeat_at")?,
         expires_at: row.get("expires_at")?,
+        worktree: row.get("worktree")?,
+        worktree_kind: row.get("worktree_kind")?,
+        branch: row.get("branch")?,
+        head_sha: row.get("head_sha")?,
+        root_head: row.get("root_head")?,
     })
 }
 
@@ -249,6 +254,7 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
         branch: row.get("branch")?,
         head_sha: row.get("head_sha")?,
         dirty_summary: row.get("dirty_summary")?,
+        root_head: row.get("root_head")?,
         created_at: row.get("created_at")?,
     })
 }
@@ -288,6 +294,7 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         branch: row.get("branch")?,
         head_sha: row.get("head_sha")?,
         dirty_summary: row.get("dirty_summary")?,
+        root_head: row.get("root_head")?,
         created_at: row.get("created_at")?,
         accepted_at: row.get("accepted_at")?,
         accepted_by: row.get("accepted_by")?,
@@ -513,6 +520,9 @@ pub struct ClaimOptions {
     pub caller_scope: Option<String>,
     pub cross_lane: bool,
     pub allow_reassign: bool,
+    /// Where the claimer is standing, resolved by the caller so the store stays
+    /// free of subprocesses and remains testable without a repository.
+    pub git: Option<crate::gitctx::GitContext>,
 }
 
 pub struct Store {
@@ -654,7 +664,18 @@ impl Store {
                 params![id, dependency],
             )?;
         }
-        event(&transaction, Some(&id), "task_added", None, json!({}))?;
+        // Every other event kind names who did it; creating a task was the one
+        // action the trail could not attribute, because there was no `--as` to
+        // record. Measured 2026-08-21 across the live boards, 132 of these
+        // carried no actor. An absent actor is still recorded as absent —
+        // inventing one would be worse than the gap.
+        event(
+            &transaction,
+            Some(&id),
+            "task_added",
+            input.actor.as_deref(),
+            json!({ "type": input.task_type, "status": input.status }),
+        )?;
         transaction.commit()?;
         self.require_task(&id)
     }
@@ -1049,8 +1070,15 @@ impl Store {
         }
         let token = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at) VALUES(?,?,?,?,?,?,?)",
-            params![task.id,agent,options.session_id,token,now,now,now+options.lease_ms],
+            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                task.id,agent,options.session_id,token,now,now,now+options.lease_ms,
+                options.git.as_ref().map(|g| g.worktree.clone()),
+                options.git.as_ref().map(|g| g.worktree_kind.to_owned()),
+                options.git.as_ref().and_then(|g| g.branch.clone()),
+                options.git.as_ref().map(|g| g.head.clone()),
+                options.git.as_ref().and_then(|g| g.root_head.clone()),
+            ],
         )?;
         transaction.execute(
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",
@@ -1177,8 +1205,8 @@ impl Store {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
         transaction.execute(
-            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now],
+            "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![input.task_id,input.author,input.session_id,input.model,input.state,nonempty(&input.summary,"summary")?,nonempty(&input.intent,"intent")?,nonempty(&input.next_action,"next action")?,serde_json::to_string(&input.blockers)?,serde_json::to_string(&input.validations)?,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
         )?;
         let seq = transaction.last_insert_rowid();
         let (status, completed): (&str, Option<i64>) = match input.state.as_str() {
@@ -1440,8 +1468,8 @@ impl Store {
         let checkpoint_seq = match (&input.task_id, claim) {
             (Some(task_id), claim) => {
                 transaction.execute(
-                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at) VALUES(?,?,?,?,? ,?,?,?,?,?,?,?,?,?,?)",
-                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now],
+                    "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,? ,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![task_id,input.from_agent,input.from_session.clone().or(claim.and_then(|claim| claim.session_id)),input.from_model,"continue",summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
                 )?;
                 Some(transaction.last_insert_rowid())
             }
@@ -1449,8 +1477,8 @@ impl Store {
         };
         let id = format!("h-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
-            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now],
+            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
+            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
         )?;
         // Releasing the lease and returning the task to the queue is the point
         // of a task handoff. A session handoff holds nothing and releases
@@ -1482,6 +1510,7 @@ impl Store {
         session: Option<String>,
         lease_ms: i64,
         caller_scope: Option<&str>,
+        git: Option<crate::gitctx::GitContext>,
     ) -> Result<(Handoff, Option<Claim>)> {
         let agent = nonempty(agent, "agent id")?.to_owned();
         if lease_ms < 1000 {
@@ -1550,7 +1579,14 @@ impl Store {
             bail!("task {} is already claimed", task.id);
         }
         let token = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at) VALUES(?,?,?,?,?,?,?)",params![task.id,agent,session,token,now,now,now+lease_ms])?;
+        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![
+            task.id,agent,session,token,now,now,now+lease_ms,
+            git.as_ref().map(|g| g.worktree.clone()),
+            git.as_ref().map(|g| g.worktree_kind.to_owned()),
+            git.as_ref().and_then(|g| g.branch.clone()),
+            git.as_ref().map(|g| g.head.clone()),
+            git.as_ref().and_then(|g| g.root_head.clone()),
+        ])?;
         transaction.execute(
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",
             params![agent, now, task.id],

@@ -213,6 +213,50 @@ CREATE INDEX idx_tasks_assignee_status ON tasks(assignee,status);
 CREATE INDEX idx_tasks_lane_status ON tasks(lane,status);
 "#;
 
+/// Where work happened, recorded on the rows that describe work happening.
+///
+/// A claim said who held a task and until when, and nothing about where they
+/// were holding it. On a box running several driver lanes of the same
+/// repository that is the first question anyone asks — which worktree is this
+/// lane in — and the ledger could not answer it.
+///
+/// Checkpoints and handoffs already had `repo_path`, `branch` and `head_sha`.
+/// They gain `root_head`: a submodule's own commit says nothing about which
+/// revision of the whole tree it belonged to, and for a nested checkout the
+/// answer to "what was checked out" is the outermost superproject's commit.
+///
+/// Every column is nullable. Provenance is captured when the caller is standing
+/// in a repository and recorded as absent when they are not, which is the
+/// truthful outcome rather than a failure.
+///
+/// The two `CREATE TABLE IF NOT EXISTS` are for the same reason V4 carries one:
+/// a v3 board written by the retired TypeScript implementation can lack tables
+/// outright, and `ALTER TABLE` has no `IF EXISTS`. Standing the original shape
+/// up first means one path handles both, and such a board finishes the ladder
+/// with the tables it should have had.
+const BOARD_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS task_claims (
+ task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL,session_id TEXT,lease_token TEXT NOT NULL UNIQUE,
+ claimed_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,expires_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS checkpoints (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ author TEXT NOT NULL,session_id TEXT,model TEXT,state TEXT NOT NULL CHECK(state IN ('continue','blocked','done')),
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL
+) STRICT;
+ALTER TABLE task_claims ADD COLUMN worktree TEXT;
+ALTER TABLE task_claims ADD COLUMN worktree_kind TEXT;
+ALTER TABLE task_claims ADD COLUMN branch TEXT;
+ALTER TABLE task_claims ADD COLUMN head_sha TEXT;
+ALTER TABLE task_claims ADD COLUMN root_head TEXT;
+ALTER TABLE checkpoints ADD COLUMN root_head TEXT;
+ALTER TABLE handoffs ADD COLUMN root_head TEXT;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -414,7 +458,9 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     connection.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate(
         &mut connection,
-        &[BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6],
+        &[
+            BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7,
+        ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
@@ -497,6 +543,43 @@ pub fn replace_database(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Every migration that exists is in the ladder that runs it.
+    ///
+    /// A migration can be written, reviewed and committed without ever being
+    /// added to `open_board`'s list, and nothing says so: the constant is used
+    /// nowhere, the build is clean, the tests pass, and the first sign is a
+    /// column missing at runtime on a board that thought it was current. That
+    /// happened once here, which is why this reads the file back.
+    #[test]
+    fn every_board_migration_is_in_the_ladder() {
+        const SOURCE: &str = include_str!("db.rs");
+        // Assembled, because this test reads its own source and a literal
+        // would match itself.
+        let declaration = format!("{} BOARD_V", "const");
+        let declared = SOURCE.matches(declaration.as_str()).count();
+        // Checked by name rather than by counting a text span: the list is
+        // formatter-wrapped, so any span-based guard is one `cargo fmt` away
+        // from measuring the wrong thing.
+        let applied = SOURCE
+            .split_once("pub fn open_board")
+            .map(|(_, rest)| rest)
+            .expect("open_board must exist");
+        for n in 1..=declared {
+            let name = format!("BOARD_V{n}");
+            assert!(
+                applied.contains(&name),
+                "{name} is declared but never applied; a migration that does not \
+                 run is invisible until a column is missing at runtime"
+            );
+        }
+        let ladder = declared;
+        assert_eq!(
+            declared, ladder,
+            "{declared} board migrations are declared but {ladder} are applied; \
+             a migration that is never run is invisible until a column is missing"
+        );
+    }
+
     use super::*;
 
     #[test]
