@@ -2,6 +2,7 @@ mod context;
 mod db;
 mod import;
 mod lock;
+mod mcp;
 mod model;
 mod registry;
 mod store;
@@ -57,6 +58,7 @@ Usage:
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
   kanban schema [--json]
+  kanban mcp
 
 Global options (accepted by every board command):
   --project NAME     address a registered project by name, from any directory
@@ -83,7 +85,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-const BOOLEAN: [&str; 19] = [
+pub(crate) const BOOLEAN: [&str; 19] = [
     "help",
     "json",
     "version",
@@ -112,10 +114,10 @@ const BOOLEAN: [&str; 19] = [
 /// wrong-board write ADR-007 exists to prevent, reached through a repeated
 /// flag instead of a mistyped one, and trivially produced by a wrapper script
 /// that appends a default the caller had already set.
-const REPEATABLE: [&str; 3] = ["depends-on", "blocker", "validation"];
+pub(crate) const REPEATABLE: [&str; 3] = ["depends-on", "blocker", "validation"];
 
 /// Accepted on every board command; see `store_path`.
-const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
+pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
 /// The flags that each select a board. At most one may be given explicitly.
 const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
@@ -134,22 +136,22 @@ const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
 ///
 /// Name, subcommand, the flags it accepts, the most positionals it may hold
 /// counting its own name words, and whether it writes anything anywhere.
-type CommandRow = (
+pub(crate) type CommandRow = (
     &'static str,
     Option<&'static str>,
     &'static [&'static str],
-    usize,
+    &'static [&'static str],
     bool,
 );
 
-const COMMANDS: &[CommandRow] = &[
-    ("init", None, &["name", "force"], 1, false),
-    ("workspace", Some("list"), &[], 2, true),
-    ("workspace", Some("attach"), &["to"], 2, false),
-    ("dashboard", None, &[], 1, true),
-    ("doctor", None, &[], 1, true),
-    ("backup", None, &["output", "keep"], 1, false),
-    ("restore", None, &["from", "force"], 1, false),
+pub(crate) const COMMANDS: &[CommandRow] = &[
+    ("init", None, &["name", "force"], &[], false),
+    ("workspace", Some("list"), &[], &[], true),
+    ("workspace", Some("attach"), &["to"], &[], false),
+    ("dashboard", None, &[], &[], true),
+    ("doctor", None, &[], &[], true),
+    ("backup", None, &["output", "keep"], &[], false),
+    ("restore", None, &["from", "force"], &[], false),
     (
         "task",
         Some("add"),
@@ -167,20 +169,32 @@ const COMMANDS: &[CommandRow] = &[
             "stale-minutes",
             "driver-only",
         ],
-        3,
+        &["title"],
         false,
     ),
-    ("task", Some("list"), &["status", "with-relations"], 2, true),
-    ("task", Some("show"), &[], 3, true),
+    (
+        "task",
+        Some("list"),
+        &["status", "with-relations"],
+        &[],
+        true,
+    ),
+    ("task", Some("show"), &[], &["id"], true),
     (
         "task",
         Some("move"),
         &["as", "metadata-patch-json", "force"],
-        4,
+        &["id", "status"],
         false,
     ),
-    ("task", Some("remove"), &["as", "force"], 3, false),
-    ("task", Some("metadata"), &["as", "patch-json"], 3, false),
+    ("task", Some("remove"), &["as", "force"], &["id"], false),
+    (
+        "task",
+        Some("metadata"),
+        &["as", "patch-json"],
+        &["id"],
+        false,
+    ),
     (
         "task",
         Some("update"),
@@ -203,18 +217,18 @@ const COMMANDS: &[CommandRow] = &[
             "depends-on",
             "clear-dependencies",
         ],
-        3,
+        &["id"],
         false,
     ),
     (
         "story",
         Some("advance"),
         &["as", "to", "reviewer", "committer"],
-        3,
+        &["id"],
         false,
     ),
-    ("story", Some("signoff"), &["as", "note"], 3, false),
-    ("story", Some("unsignoff"), &["as", "note"], 3, false),
+    ("story", Some("signoff"), &["as", "note"], &["id"], false),
+    ("story", Some("unsignoff"), &["as", "note"], &["id"], false),
     (
         "claim",
         None,
@@ -229,12 +243,18 @@ const COMMANDS: &[CommandRow] = &[
             "allow-reassign",
             "next",
         ],
-        2,
+        &["?id"],
         false,
     ),
-    ("heartbeat", None, &["lease", "lease-minutes"], 2, false),
-    ("release", None, &["lease", "keep-status"], 2, false),
-    ("note", None, &["as", "kind"], 3, false),
+    (
+        "heartbeat",
+        None,
+        &["lease", "lease-minutes"],
+        &["id"],
+        false,
+    ),
+    ("release", None, &["lease", "keep-status"], &["id"], false),
+    ("note", None, &["as", "kind"], &["id", "text"], false),
     (
         "checkpoint",
         None,
@@ -254,7 +274,7 @@ const COMMANDS: &[CommandRow] = &[
             "head",
             "dirty",
         ],
-        2,
+        &["id"],
         false,
     ),
     (
@@ -277,45 +297,58 @@ const COMMANDS: &[CommandRow] = &[
             "head",
             "dirty",
         ],
-        3,
+        &["id"],
         false,
     ),
-    ("handoff", Some("list"), &["task", "status"], 2, true),
+    ("handoff", Some("list"), &["task", "status"], &[], true),
     (
         "handoff",
         Some("accept"),
         &["as", "session", "lease-minutes", "caller-scope"],
-        3,
+        &["id"],
         false,
     ),
     (
         "import",
         Some("atmux-json"),
         &["as", "reconcile", "force", "dry-run", "verify"],
-        3,
+        &["path"],
         false,
     ),
     (
         "import",
         Some("atmux-sqlite"),
         &["as", "reconcile", "force", "dry-run", "verify"],
-        3,
+        &["path"],
         false,
     ),
-    ("schema", None, &[], 1, true),
-    ("events", None, &["task", "kind", "limit"], 1, true),
-    ("stale", None, &[], 1, true),
-    ("context", None, &["max-chars"], 2, true),
-    ("todo", None, &["output"], 1, false),
+    ("schema", None, &[], &[], true),
+    ("mcp", None, &[], &[], false),
+    ("events", None, &["task", "kind", "limit"], &[], true),
+    ("stale", None, &[], &[], true),
+    ("context", None, &["max-chars"], &["id"], true),
+    ("todo", None, &["output"], &[], false),
 ];
 
-/// The flags a command accepts, and the most positionals it can hold —
-/// counting the command word and any subcommand word.
-fn command_spec(command: &str, sub: Option<&str>) -> Option<(&'static [&'static str], usize)> {
+/// The flags a command accepts, and the positionals it takes after its own
+/// name, in order. A leading `?` marks one the command can do without.
+///
+/// The arity the parser enforces is derived from those names rather than
+/// stored beside them, so a command cannot declare that it takes two arguments
+/// and then name three.
+fn command_spec(
+    command: &str,
+    sub: Option<&str>,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
     COMMANDS
         .iter()
         .find(|(name, expected, ..)| *name == command && *expected == sub)
         .map(|(_, _, flags, positionals, _)| (*flags, *positionals))
+}
+
+/// The most positionals an invocation may hold, counting the words that name it.
+fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
+    1 + usize::from(sub.is_some()) + positionals.len()
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
@@ -703,7 +736,7 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
 /// own allow-list. It means the operation writes nothing anywhere — not the
 /// board, not the registry, not a file — so `backup` and `todo` are not
 /// read-only even though neither changes work state.
-fn schema() -> Value {
+pub(crate) fn schema() -> Value {
     let operations = COMMANDS
         .iter()
         .map(|(command, sub, flags, positionals, read_only)| {
@@ -729,8 +762,9 @@ fn schema() -> Value {
                 "command": command,
                 "subcommand": sub,
                 "flags": flags,
-                // The words that name the operation are counted in, so a
-                // caller can tell how many arguments of its own it may pass.
+                // Named and in order, so an adapter can build an argument
+                // list rather than guess at what the slots mean. A leading
+                // `?` marks one the command can do without.
                 "positionals": positionals,
                 "readOnly": read_only,
             })
@@ -1008,12 +1042,18 @@ fn run() -> Result<()> {
         return print(&schema(), args.has("json"));
     }
 
+    // Speaks the protocol on stdout, so it must reach it before anything else
+    // can print there, and it resolves each call's board per call instead.
+    if command == "mcp" {
+        return mcp::serve();
+    }
+
     let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
     match command_spec(command, spec_sub) {
         Some((allowed, positionals)) => {
             args.reject_unknown(allowed)?;
             args.reject_repeated()?;
-            args.reject_extra_positionals(positionals)?;
+            args.reject_extra_positionals(arity(spec_sub, positionals))?;
             args.reject_conflicting_board_selectors()?;
         }
         None => bail!("unknown command; run kanban --help"),
@@ -1651,6 +1691,7 @@ mod tests {
     #[test]
     fn every_command_declares_its_flags_without_duplicates() {
         for (command, sub, flags, positionals, _) in COMMANDS {
+            let arity = arity(*sub, positionals);
             let mut seen = flags.to_vec();
             seen.sort_unstable();
             let before = seen.len();
@@ -1668,11 +1709,23 @@ mod tests {
             }
             // The lookup must actually reach this row.
             assert_eq!(command_spec(command, *sub), Some((*flags, *positionals)));
+            // A named positional is either required or explicitly optional;
+            // nothing else is a marker, and an empty name is not a name.
+            for name in *positionals {
+                let bare = name.strip_prefix('?').unwrap_or(name);
+                assert!(
+                    !bare.is_empty(),
+                    "{command} {sub:?} has an unnamed positional"
+                );
+                assert!(
+                    bare.chars().all(|c| c.is_ascii_lowercase()),
+                    "{command} {sub:?}: positional {name} is not a plain lowercase name"
+                );
+            }
             // A command has to leave room for the words that name it, and
             // for whatever positional the dispatcher then reads.
-            let named = 1 + usize::from(sub.is_some());
             assert!(
-                *positionals >= named,
+                arity > usize::from(sub.is_some()),
                 "{command} {sub:?} accepts fewer positionals than its own name"
             );
         }

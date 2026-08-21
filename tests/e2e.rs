@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -3583,7 +3584,15 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         );
     }
     for operation in operations {
-        assert!(operation["positionals"].as_u64().unwrap() >= 1);
+        // Positionals are named and ordered, so an adapter can build an
+        // argument list instead of guessing what the slots mean.
+        for positional in operation["positionals"].as_array().unwrap() {
+            let name = positional.as_str().unwrap();
+            assert!(
+                !name.is_empty(),
+                "an unnamed positional reached the manifest"
+            );
+        }
         for flag in operation["flags"].as_array().unwrap() {
             let kind = flag["kind"].as_str().unwrap();
             assert!(
@@ -3595,6 +3604,16 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
     // A list-valued flag is described as one, or an adapter generates a tool
     // that can only ever pass a single dependency.
     let add = operations.iter().find(|o| o["name"] == "task add").unwrap();
+    assert_eq!(add["positionals"], json!(["title"]));
+    let move_op = operations
+        .iter()
+        .find(|o| o["name"] == "task move")
+        .unwrap();
+    assert_eq!(move_op["positionals"], json!(["id", "status"]));
+    // `claim` takes an id or `--next`, so its positional is marked optional
+    // rather than silently required.
+    let claim = operations.iter().find(|o| o["name"] == "claim").unwrap();
+    assert_eq!(claim["positionals"], json!(["?id"]));
     let depends = add["flags"]
         .as_array()
         .unwrap()
@@ -3675,4 +3694,324 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         let operation = operations.iter().find(|o| o["name"] == name).unwrap();
         assert_eq!(operation["readOnly"], false, "{name} is labelled readOnly");
     }
+}
+
+/// A live MCP session, spoken over real pipes to the real binary.
+struct Session {
+    child: std::process::Child,
+    outgoing: std::process::ChildStdin,
+    incoming: std::sync::mpsc::Receiver<String>,
+}
+
+impl Session {
+    fn start(binary: &Path, cwd: &Path, data: &Path) -> Self {
+        let mut child = Command::new(binary)
+            .arg("mcp")
+            .current_dir(cwd)
+            .env("KANBAN_DATA_DIR", data)
+            .env_remove("KANBAN_DB")
+            .env_remove("KANBAN_PROJECT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let outgoing = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, incoming) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            child,
+            outgoing,
+            incoming,
+        }
+    }
+
+    /// Write several requests in one syscall, so the server can pull more than
+    /// one into a single read and genuinely hold an unparsed one in memory.
+    /// Two separate writes usually arrive as two reads and never produce the
+    /// state this is here to create.
+    fn send_batch(&mut self, requests: &[Value]) {
+        let mut frame = String::new();
+        for request in requests {
+            frame.push_str(&request.to_string());
+            frame.push('\n');
+        }
+        self.outgoing.write_all(frame.as_bytes()).unwrap();
+        self.outgoing.flush().unwrap();
+    }
+
+    /// The next reply, whichever request it belongs to.
+    fn recv(&mut self) -> Value {
+        let line = self
+            .incoming
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the server owed a reply and did not send one");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// Send one request and wait for its reply. Never blocks forever: a hung
+    /// server is a failure, not a test that runs until someone kills it.
+    fn ask(&mut self, request: Value) -> Value {
+        writeln!(self.outgoing, "{request}").unwrap();
+        self.outgoing.flush().unwrap();
+        let line = self
+            .incoming
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("no reply to {request}"));
+        serde_json::from_str(&line).unwrap()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn write_executable(path: &Path, body: &str) {
+    // Written beside the target and renamed over it, because that is how a
+    // binary is actually replaced -- and the rename is what leaves the running
+    // process holding an unlinked inode.
+    let staging = path.with_extension("staging");
+    fs::write(&staging, body).unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&staging, path).unwrap();
+}
+
+#[test]
+fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
+    let fixture = Fixture::new("mcp");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MCP", "--json"]);
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+
+    let initialized = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "kanban");
+    assert_eq!(
+        initialized["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // The tool list is the manifest, so it cannot describe a surface the CLI
+    // does not have.
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "task_add"));
+    assert!(tools.iter().any(|t| t["name"] == "import_atmux_sqlite"));
+    let read_only = tools.iter().find(|t| t["name"] == "doctor").unwrap();
+    assert_eq!(read_only["annotations"]["readOnlyHint"], true);
+    let writes = tools.iter().find(|t| t["name"] == "claim").unwrap();
+    assert_eq!(writes["annotations"]["readOnlyHint"], false);
+    // A list-valued flag must be typed as an array, or an agent can only ever
+    // pass one dependency and the rest are dropped without a word.
+    let add = tools.iter().find(|t| t["name"] == "task_add").unwrap();
+    assert_eq!(
+        add["inputSchema"]["properties"]["depends-on"]["type"],
+        "array"
+    );
+    assert_eq!(add["inputSchema"]["required"], json!(["title"]));
+
+    // A call writes through the real CLI, and the board shows it.
+    let created = session.ask(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "task_add", "arguments": { "title": "Over the wire", "id": "t-wire" } }
+    }));
+    assert_eq!(created["result"]["isError"], false);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-wire", "--json"])["title"],
+        "Over the wire"
+    );
+
+    // A refusal is a tool result carrying the CLI's own message, not a
+    // transport error: the refusal names the fix, and an agent needs to read it.
+    let refused = session.ask(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "task_move", "arguments": { "id": "t-wire", "status": "nonsense", "as": "geo" } }
+    }));
+    assert_eq!(refused["result"]["isError"], true);
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("invalid task status"),
+        "the CLI's refusal did not reach the caller"
+    );
+
+    // An argument the operation does not define is refused rather than dropped.
+    let unknown = session.ask(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": { "name": "task_add", "arguments": { "title": "x", "frobnicate": "y" } }
+    }));
+    assert_eq!(unknown["result"]["isError"], true);
+    assert!(
+        unknown["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("frobnicate")
+    );
+
+    // A notification has no id and must not be answered at all. Asking a real
+    // question afterwards proves the stream is still aligned: a stray reply
+    // would arrive here, one response out of step, and fail the assertion.
+    writeln!(
+        session.outgoing,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+    session.outgoing.flush().unwrap();
+    let ping = session.ask(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}));
+    assert_eq!(ping["id"], 6, "a notification was answered");
+
+    let unknown_method = session.ask(json!({"jsonrpc": "2.0", "id": 7, "method": "no/such"}));
+    assert_eq!(unknown_method["error"]["code"], -32601);
+}
+
+#[test]
+fn the_mcp_server_replaces_itself_without_dropping_the_session() {
+    let fixture = Fixture::new("mcp-reload");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RELOAD", "--json"]);
+
+    // Serve from a copy, so the test can replace the binary underneath it the
+    // way `install` does.
+    let binary = fixture.root.join("kanban");
+    fs::copy(env!("CARGO_BIN_EXE_kanban"), &binary).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut session = Session::start(&binary, &fixture.main, &fixture.data);
+    let pid = session.child.id();
+    let before =
+        session.ask(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}));
+    assert_eq!(
+        before["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // A replacement is noticed between requests, so a swap lands on a request
+    // boundary and never mid-reply. The check runs before the server blocks
+    // reading, so a binary that appears while it is blocked is acted on at the
+    // end of the next turn -- one request later. Every phase below therefore
+    // sends two requests: the first finishes the turn in flight, the second is
+    // the first one the check has had its chance at.
+    //
+    // A replacement that cannot run must not be adopted: exec'ing a program
+    // that exits immediately closes the pipe, which is indistinguishable from
+    // a crashed server. Both requests must come back on the previous build,
+    // and the second is the one that proves the health probe refused it.
+    write_executable(&binary, "#!/bin/sh\nexit 1\n");
+    for id in [2, 3] {
+        let survived =
+            session.ask(json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {}}));
+        assert_eq!(
+            survived["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION"),
+            "a broken build was adopted at request {id}"
+        );
+        assert_eq!(session.child.id(), pid, "the process was replaced anyway");
+    }
+
+    // Now a replacement that works. It answers `version` like the real binary,
+    // so the health probe passes, and reports a version of its own so the swap
+    // is observable from the client side.
+    write_executable(
+        &binary,
+        r#"#!/bin/sh
+if [ "$1" = "version" ]; then echo "kanban 9.9.9"; exit 0; fi
+while IFS= read -r line; do
+  id=`printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'`
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"kanban","version":"9.9.9"}}}\n' "${id:-0}"
+done
+"#,
+    );
+
+    // Same two-request shape: the first finishes the turn in flight, the
+    // second is served by the build that replaced it.
+    let last_of_the_old =
+        session.ask(json!({"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}}));
+    assert_eq!(last_of_the_old["id"], 4);
+    let after =
+        session.ask(json!({"jsonrpc": "2.0", "id": 5, "method": "initialize", "params": {}}));
+    assert_eq!(
+        after["result"]["serverInfo"]["version"], "9.9.9",
+        "the new build never took over"
+    );
+    assert_eq!(after["id"], 5, "the reply belongs to a different request");
+
+    // The whole point: same process, same pipes, no reconnection. A client
+    // that had to restart the server would not be undisturbed.
+    assert_eq!(
+        session.child.id(),
+        pid,
+        "the process id changed, so the client's pipe did too"
+    );
+}
+
+#[test]
+fn a_reload_never_swallows_a_request_already_on_the_wire() {
+    // A client may pipeline: two requests can be sitting in one read before
+    // either is parsed. `execve` keeps the file descriptors and discards
+    // memory, so a swap performed while anything is buffered would take the
+    // unparsed request with it -- and the client would wait forever for a
+    // reply to a request the server did receive. The reload is therefore
+    // skipped whenever the buffer is not empty.
+    let fixture = Fixture::new("mcp-pipeline");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PIPELINE", "--json"]);
+
+    let binary = fixture.root.join("kanban");
+    fs::copy(env!("CARGO_BIN_EXE_kanban"), &binary).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut session = Session::start(&binary, &fixture.main, &fixture.data);
+    assert_eq!(
+        session.ask(json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))["id"],
+        1
+    );
+
+    // Make a replacement available, then put two requests on the wire before
+    // the server has parsed either.
+    write_executable(
+        &binary,
+        r#"#!/bin/sh
+if [ "$1" = "version" ]; then echo "kanban 9.9.9"; exit 0; fi
+while IFS= read -r line; do
+  id=`printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'`
+  printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "${id:-0}"
+done
+"#,
+    );
+    session.send_batch(&[
+        json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+    ]);
+
+    // Both are answered, whichever build ends up answering them. Losing one is
+    // the failure this guards against, and it presents as a client hanging.
+    let mut answered = vec![
+        session.recv()["id"].as_i64().unwrap(),
+        session.recv()["id"].as_i64().unwrap(),
+    ];
+    answered.sort_unstable();
+    assert_eq!(
+        answered,
+        vec![2, 3],
+        "a request already on the wire was lost across the reload"
+    );
 }
