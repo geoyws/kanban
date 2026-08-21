@@ -3881,7 +3881,82 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     let ping = session.ask(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}));
     assert_eq!(ping["id"], 6, "a notification was answered");
 
-    let unknown_method = session.ask(json!({"jsonrpc": "2.0", "id": 7, "method": "no/such"}));
+    // `--help` would answer the call with the usage page. Accepting it meant an
+    // agent that asked for a task list got the manual, reported as success,
+    // with the operation never run and nothing saying so.
+    let helped = session.ask(json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": { "name": "task_list", "arguments": { "help": true } }
+    }));
+    assert_eq!(
+        helped["result"]["isError"], true,
+        "--help answered a tool call"
+    );
+    let helped_text = helped["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(helped_text.contains("help"), "{helped_text}");
+    assert!(
+        !helped_text.contains("durable work ledger"),
+        "the usage page was returned instead of a refusal"
+    );
+
+    // `--json` is supplied by this layer, so accepting it again produced
+    // "given more than once" -- a refusal naming a flag the caller passed once.
+    let doubled = session.ask(json!({
+        "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+        "params": { "name": "task_list", "arguments": { "json": true } }
+    }));
+    assert_eq!(doubled["result"]["isError"], true);
+    let doubled_text = doubled["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !doubled_text.contains("more than once"),
+        "the caller was blamed for a flag this layer added: {doubled_text}"
+    );
+    assert!(doubled_text.contains("json"), "{doubled_text}");
+
+    // A list where one value belongs is refused, not flattened into a title
+    // that reads `["a","b"]` and is reported as success.
+    let flattened = session.ask(json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": { "name": "task_add", "arguments": { "title": ["a", "b"], "id": "t-flat" } }
+    }));
+    assert_eq!(
+        flattened["result"]["isError"], true,
+        "a list became a title"
+    );
+    assert!(
+        !fixture
+            .run(&fixture.main, &["task", "show", "t-flat", "--json"])
+            .status
+            .success(),
+        "the refused call still wrote a row"
+    );
+
+    // Arguments that are not an object were read as "no arguments", so a call
+    // meant to be constrained ran unconstrained and reported success.
+    let malformed = session.ask(json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": { "name": "task_list", "arguments": "not-an-object" }
+    }));
+    assert_eq!(malformed["result"]["isError"], true);
+    assert!(
+        malformed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("must be an object")
+    );
+
+    // A scalar still reaches a value flag, and a number is not a type error.
+    let numeric = session.ask(json!({
+        "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+        "params": { "name": "task_add", "arguments": { "title": "numeric", "id": "t-num", "priority": 2 } }
+    }));
+    assert_eq!(numeric["result"]["isError"], false);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-num", "--json"])["priority"],
+        2
+    );
+
+    let unknown_method = session.ask(json!({"jsonrpc": "2.0", "id": 12, "method": "no/such"}));
     assert_eq!(unknown_method["error"]["code"], -32601);
 }
 

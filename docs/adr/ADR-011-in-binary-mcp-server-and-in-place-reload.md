@@ -107,6 +107,38 @@ so a harness can withhold mutation where it configures its tools, which is where
 that policy belongs. A flag here would be a second place to express it, and the
 two would disagree.
 
+## Amendment — 2026-08-21: what the adapter must not forward
+
+Auditing the surface immediately after it shipped found three ways a tool call
+could report success without doing what was asked. All three had one shape: a
+value this layer accepted and quietly reinterpreted.
+
+**`--help` and `--json` were advertised as absent and accepted anyway.** They
+were filtered out of the generated schema and left in the set the argument check
+allowed, because those were two lists rather than one. `help: true` answered a
+`task_list` call with the usage page and reported `isError: false` — the
+operation never ran, and nothing said so. `json: true` produced `--json given
+more than once`, since this layer appends it to every call: a refusal blaming
+the caller for a flag they passed once. One list now feeds the schema and the
+check, so a flag cannot be advertised and honoured differently.
+
+**A composite value was flattened into a single argument.** `title: ["a", "b"]`
+recorded the title `["a","b"]` and returned success. Stringifying a caller's
+mistake into durable state is precisely what this ledger exists to prevent, and
+an array where one value belongs is not a value. Scalars still convert — a JSON
+number reaching `--priority` is not a type error — but an array or an object
+where one value is expected is refused, and an array is accepted only for the
+flags declared repeatable.
+
+**`arguments` that was not an object was read as no arguments at all.** A call
+whose parameters were malformed ran unconstrained and reported success, which is
+the worst of the three: the caller asked for something narrow and got everything.
+
+The common lesson is the one ADR-008 already states, arriving through a new
+surface: an adapter that accepts more than it advertises has silently taken on a
+second, undocumented contract, and every difference between the two is a defect
+waiting to be reported as success.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) §6 — narrow operations, not arbitrary write SQL

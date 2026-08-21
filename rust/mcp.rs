@@ -13,7 +13,7 @@
 //! empty the moment it has answered. That is what makes it safe to replace
 //! itself in place: see `Reload`.
 
-use crate::{COMMANDS, GLOBAL_FLAGS};
+use crate::COMMANDS;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::fs::File;
@@ -183,6 +183,34 @@ impl Reload {
     }
 }
 
+/// The global flags a tool call may carry.
+///
+/// `--json` is supplied by this layer on every call, so accepting it again
+/// produced "given more than once" — a refusal naming a flag the caller never
+/// passed twice. `--help` was worse: it answered the tool call with the usage
+/// page and reported success, so an agent asking for a task list received the
+/// manual and nothing said the operation had not run.
+///
+/// Both were kept out of the generated schema and both were still accepted,
+/// because the schema filtered them and the argument check did not. One list
+/// now feeds both, so a flag cannot be advertised and honoured differently.
+const TOOL_GLOBALS: [&str; 3] = ["db", "project", "workspace"];
+
+/// A single argument value, or a refusal.
+///
+/// An array or an object where one value belongs is not a value: passing
+/// `["a", "b"]` as a title used to record the title `["a","b"]`, reported as
+/// success. Silently stringifying a caller's mistake into durable state is the
+/// defect this ledger exists to prevent, so it is refused instead.
+fn scalar(name: &str, value: &Value) -> Result<String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Bool(flag) => Ok(flag.to_string()),
+        _ => bail!("{name} takes a single value, not {value}"),
+    }
+}
+
 /// An MCP tool name: the operation with its spaces and dashes flattened.
 fn tool_name(command: &str, sub: Option<&str>) -> String {
     match sub {
@@ -216,11 +244,7 @@ fn tools() -> Vec<Value> {
                     required.push(name.to_owned());
                 }
             }
-            for flag in flags.iter().chain(GLOBAL_FLAGS.iter().filter(|global| {
-                // `--json` is always supplied; `--help` would answer the tool
-                // call with a usage page instead of doing anything.
-                !["json", "help"].contains(global)
-            })) {
+            for flag in flags.iter().chain(TOOL_GLOBALS.iter()) {
                 let (kind, description): (Value, String) = if crate::REPEATABLE.contains(flag) {
                     (
                         json!({ "type": "array", "items": { "type": "string" } }),
@@ -274,20 +298,26 @@ fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
         bail!("no such tool {name}");
     };
     let empty = serde_json::Map::new();
-    let supplied = arguments.as_object().unwrap_or(&empty);
+    // Anything else was read as "no arguments", so a call whose arguments were
+    // malformed ran unconstrained and reported success.
+    let supplied = match arguments {
+        Value::Object(supplied) => supplied,
+        Value::Null => &empty,
+        other => bail!("arguments must be an object, not {other}"),
+    };
     let mut argv = vec![(*command).to_owned()];
     argv.extend(sub.map(str::to_owned));
     for positional in *positionals {
         let key = positional.trim_start_matches('?');
         match supplied.get(key) {
             Some(Value::Null) | None => {}
-            Some(value) => argv.push(text_of(value)),
+            Some(value) => argv.push(scalar(key, value)?),
         }
     }
     let allowed = flags
         .iter()
         .copied()
-        .chain(GLOBAL_FLAGS.iter().copied())
+        .chain(TOOL_GLOBALS.iter().copied())
         .collect::<Vec<_>>();
     for (key, value) in supplied {
         if positionals
@@ -303,31 +333,28 @@ fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
             // the refusal somewhere less obvious.
             bail!("{name} has no argument {key}");
         }
+        let repeatable = crate::REPEATABLE.contains(&key.as_str());
         match value {
             Value::Null => {}
-            Value::Bool(false) => {}
-            Value::Bool(true) => argv.push(format!("--{key}")),
-            Value::Array(values) => {
+            // A boolean flag is present or absent; false means absent.
+            Value::Bool(false) if crate::BOOLEAN.contains(&key.as_str()) => {}
+            Value::Bool(true) if crate::BOOLEAN.contains(&key.as_str()) => {
+                argv.push(format!("--{key}"))
+            }
+            Value::Array(values) if repeatable => {
                 for value in values {
                     argv.push(format!("--{key}"));
-                    argv.push(text_of(value));
+                    argv.push(scalar(key, value)?);
                 }
             }
             value => {
                 argv.push(format!("--{key}"));
-                argv.push(text_of(value));
+                argv.push(scalar(key, value)?);
             }
         }
     }
     argv.push("--json".to_owned());
     Ok(argv)
-}
-
-fn text_of(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// Run one tool call by running the binary, and report what it said.
@@ -438,5 +465,78 @@ pub fn serve() -> Result<()> {
             writeln!(output, "{response}")?;
             output.flush()?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tool_only_offers_globals_the_cli_accepts() {
+        // TOOL_GLOBALS is a subset of the real global flags with the two this
+        // layer supplies or must never forward removed. Drifting from
+        // GLOBAL_FLAGS would advertise a flag the CLI refuses.
+        for flag in TOOL_GLOBALS {
+            assert!(
+                crate::GLOBAL_FLAGS.contains(&flag),
+                "--{flag} is offered on every tool but is not a global flag"
+            );
+        }
+        for excluded in ["json", "help"] {
+            assert!(
+                !TOOL_GLOBALS.contains(&excluded),
+                "--{excluded} must never be forwarded from a tool call"
+            );
+            assert!(
+                crate::GLOBAL_FLAGS.contains(&excluded),
+                "{excluded} is excluded from a set it was never in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_is_not_one_value_is_refused() {
+        assert_eq!(scalar("title", &json!("a title")).unwrap(), "a title");
+        assert_eq!(scalar("priority", &json!(3)).unwrap(), "3");
+        for bad in [json!(["a", "b"]), json!({ "a": 1 })] {
+            let error = scalar("title", &bad)
+                .expect_err("a composite value must not be flattened into one")
+                .to_string();
+            assert!(error.contains("title"), "{error}");
+            assert!(error.contains("single value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_names_are_flattened_and_reversible() {
+        assert_eq!(tool_name("task", Some("add")), "task_add");
+        assert_eq!(
+            tool_name("import", Some("atmux-sqlite")),
+            "import_atmux_sqlite"
+        );
+        assert_eq!(tool_name("claim", None), "claim");
+        // Every operation must round-trip, or a tool exists that cannot be
+        // called: `tools/list` advertises the name and `tools/call` looks it up.
+        for (command, sub, ..) in COMMANDS {
+            let name = tool_name(command, *sub);
+            assert!(
+                COMMANDS.iter().any(|(c, s, ..)| tool_name(c, *s) == name),
+                "{name} does not resolve back to an operation"
+            );
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{name} is not a usable MCP tool name"
+            );
+        }
+        // And no two operations collapse onto one name.
+        let mut names = COMMANDS
+            .iter()
+            .map(|(c, s, ..)| tool_name(c, *s))
+            .collect::<Vec<_>>();
+        names.sort();
+        let total = names.len();
+        names.dedup();
+        assert_eq!(total, names.len(), "two operations share a tool name");
     }
 }
