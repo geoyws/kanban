@@ -52,6 +52,33 @@ duplicate implementation cannot be removed safely until those consumers are
 adapted and parity receipts pass. During migration, compatibility adapters are
 required and both codebases must be changed in a controlled sequence.
 
+## Amendment — 2026-08-21: the parity receipt exists
+
+Step 5 above requires "old/new parity tests and row-count and field-level
+migration receipts" before the duplicate implementation can be removed. There was
+no way to produce one. The import receipt could not serve: its `counts` describes
+rows read from the source and its `created`/`updated` describes rows written to
+the board, which are two numbers about two different things, and neither says the
+board now holds what the source held.
+
+`import atmux-sqlite <path> --as ACTOR --verify` re-reads the source, compares it
+against the board, and reports. It writes nothing — a diagnostic never modifies
+what it diagnoses — and `verified` is true only when nothing is missing and
+nothing differs. The receipt names the fields it covered, so a green result
+states its own scope rather than implying it checked everything: the identities
+this ADR calls stable, plus the legacy note and the unknown extension fields the
+compatibility rules single out as must-survive.
+
+The comparison is built from the same rows the importer would insert, produced by
+the same mapping functions. A verifier with its own reading of the legacy schema
+would prove only that two mappings agree, and they would drift the first time
+either side changed — which is the failure a pre-cutover receipt exists to catch.
+
+`--verify` cannot be combined with `--reconcile`, `--force` or `--dry-run`: those
+describe a write, and letting one win silently is how an operator comes away
+believing a cutover was checked when it was performed. Details and the receipt's
+shape are in [the atmux integration plan](../integrating-atmux.md).
+
 ## References
 
 - [ADR-003](ADR-003-private-multi-project-personal-work-system.md)
