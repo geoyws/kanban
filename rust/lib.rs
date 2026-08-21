@@ -32,14 +32,15 @@ Usage:
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban restore --from DIRECTORY --force [--json]
   kanban task add TITLE [--id ID] [--type epic|story|task] [--parent ID]
-             [--body TEXT] [--status draft|backlog|todo|…] [--priority 0-9] [--depends-on ID ...]
+             [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
+             [--priority 0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--with-relations] [--json]
   kanban task show ID [--json]
   kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
-  kanban task update ID --as ACTOR [task fields]
+  kanban task update ID --as ACTOR [task fields, incl. --body-file PATH]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
   kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
@@ -162,6 +163,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "task",
         Some("add"),
         &[
+            "body-file",
             "id",
             "type",
             "parent",
@@ -205,6 +207,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "task",
         Some("update"),
         &[
+            "body-file",
             "as",
             "parent",
             "clear-parent",
@@ -513,6 +516,31 @@ impl Args {
 
     fn integer(&self, name: &str, fallback: i64) -> Result<i64> {
         Ok(self.optional_integer(name)?.unwrap_or(fallback))
+    }
+
+    /// The body text, from `--body` or from a file.
+    ///
+    /// A plan is an epic's body, and a plan is markdown measured in kilobytes.
+    /// Passing that on a command line works and is miserable, so `--body-file`
+    /// reads it from disk instead.
+    ///
+    /// Giving both is refused rather than ranked: they are two answers to one
+    /// question, only one is what the caller meant, and nothing in the receipt
+    /// would say which was stored — the same rule the board selectors follow.
+    fn body(&self) -> Result<Option<String>> {
+        match (self.one("body"), self.one("body-file")) {
+            (Some(_), Some(_)) => bail!(
+                "--body and --body-file both give the body; pass one, because \
+                 picking between them is not something a receipt can explain"
+            ),
+            (Some(text), None) => Ok(Some(text.to_owned())),
+            (None, Some(path)) => {
+                let text =
+                    fs::read_to_string(path).with_context(|| format!("read body from {path}"))?;
+                Ok(Some(text))
+            }
+            (None, None) => Ok(None),
+        }
     }
 
     /// `--limit`, refusing a value SQL would read as the opposite of a bound.
@@ -1293,7 +1321,7 @@ fn run() -> Result<()> {
             task_type: args.one("type").unwrap_or("task").into(),
             parent_id: option_string(&args, "parent"),
             title,
-            body: option_string(&args, "body"),
+            body: args.body()?,
             assignee: option_string(&args, "assignee"),
             lane: option_string(&args, "lane"),
             deliverable: option_string(&args, "deliverable"),
@@ -1378,7 +1406,7 @@ fn run() -> Result<()> {
                 None
             },
             title: option_string(&args, "title"),
-            body: args.one("body").map(|v| Some(v.into())),
+            body: args.body()?.map(Some),
             assignee: if let Some(v) = args.one("assignee") {
                 Some(Some(v.into()))
             } else if args.has("unassign") {

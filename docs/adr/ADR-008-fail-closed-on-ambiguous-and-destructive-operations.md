@@ -288,8 +288,14 @@ error to notice, because from the code's point of view the parent simply is not
 an epic — which is also exactly what a correctly-nested story under a
 mis-typed parent looks like.
 
-A child must be a narrower container than its parent: epic contains story
-contains task, and a task contains nothing. That is not a new model, it is the
+A child must be a container its parent can hold: an epic contains epics,
+stories and tasks; a story contains tasks; a task contains nothing.
+(**Amended 2026-08-21** — this first shipped as "strictly narrower than its
+parent", which refused epic-under-epic. A plan is an epic, so a programme plan
+has to hold its sub-plans; the rule is stated as containment now rather than
+computed from a depth, because depth arithmetic could only express that as an
+exception bolted onto a rule it contradicts. Story-under-story, task-under-task
+and container-under-something-narrower stay refused.) That is not a new model, it is the
 one the boards already use — across the twelve live boards all 420 parent links
 are epic→story, epic→task or story→task, and none of the six inverted shapes
 occurs even once. Both writers of the field are guarded, `task add --parent` and
@@ -336,6 +342,26 @@ a compile-time guard reads the shipping half of the file back and fails if any
 call site goes around it — the same defense the numeric-parsing helper already
 carries, for the same reason: this class of defect is introduced by a new call
 site, not by changing the old one.
+
+**An audit trail that records that something changed, and nothing about what.**
+`task_updated` wrote an empty payload. For most fields that is merely thin — the
+current value is on the row. For a body it is destructive: a plan is an epic's
+body, and revising one replaced it with no record that the previous version had
+ever existed. The trail is meant to be the thing you can reconstruct history
+from, and here it recorded the fact of an edit as if that were the interesting
+part.
+
+The event now names every field that moved and carries the previous body when
+the body moved. Only the body: everything else can be read off the row, and a
+replaced body cannot. That makes `kb ev --task <epic>` the revision history of a
+plan, which is history by construction rather than by anyone remembering to keep
+a copy — the same reason attention items are resolved rather than deleted and
+handoffs survive the task they were about.
+
+**Two answers to one question, once more.** `--body` and `--body-file` both
+supply the body, so giving both is refused rather than ranked, exactly as the
+board selectors are. `--body-file` exists because a plan is markdown measured in
+kilobytes, and putting that on a command line works and is miserable.
 
 ## References
 

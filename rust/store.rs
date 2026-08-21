@@ -141,11 +141,21 @@ fn article(word: &str) -> &'static str {
 
 /// How wide a container each type is: an epic contains stories, a story
 /// contains tasks, and a task contains nothing.
-fn nesting_depth(task_type: &str) -> usize {
-    match task_type {
-        "epic" => 0,
-        "story" => 1,
-        _ => 2,
+/// What each type may contain.
+///
+/// Stated as containment rather than computed from a depth, because the rule is
+/// not "narrower than its parent" — an epic may hold another epic. A plan is an
+/// epic (its body is the plan, its children are the work), so a programme needs
+/// to hold sub-plans, and depth arithmetic could only express that as an
+/// exception bolted onto a rule it contradicts.
+///
+/// A story holds tasks and nothing else; nesting a story in a story has no
+/// meaning. A task is a leaf.
+fn can_contain(parent_type: &str, child_type: &str) -> bool {
+    match parent_type {
+        "epic" => true,
+        "story" => child_type == "task",
+        _ => false,
     }
 }
 
@@ -158,9 +168,9 @@ fn nesting_depth(task_type: &str) -> usize {
 /// no signal — the story simply never flips anything, forever, and the operator
 /// who mis-typed one `--parent` is never told.
 fn require_valid_nesting(child_id: &str, child_type: &str, parent: &Task) -> Result<()> {
-    if nesting_depth(child_type) <= nesting_depth(&parent.task_type) {
+    if !can_contain(&parent.task_type, child_type) {
         bail!(
-            "task {child_id} is {} {child_type} and cannot nest under {}, which is {} {}: an epic contains stories, a story contains tasks, and a task contains nothing",
+            "task {child_id} is {} {child_type} and cannot nest under {}, which is {} {}: an epic contains epics, stories and tasks; a story contains tasks; a task contains nothing",
             article(child_type),
             parent.id,
             article(&parent.task_type),
@@ -853,6 +863,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = require_task(&transaction, id)?;
+        let previous_parent = current.parent_id.clone();
         let parent = input.parent_id.unwrap_or(current.parent_id);
         if let Some(parent_id) = &parent {
             let parent_task = require_task(&transaction, parent_id)?;
@@ -866,6 +877,18 @@ impl Store {
                 cursor = require_task(&transaction, &value)?.parent_id;
             }
         }
+        // Snapshot before the fields below consume `current`. A plan is an
+        // epic's body, so an edit that leaves no record of what it replaced
+        // destroys the previous plan outright — and `task_updated` recorded an
+        // empty payload, saying that something changed and nothing about what.
+        let previous_title = current.title.clone();
+        let previous_body = current.body.clone();
+        let previous_assignee = current.assignee.clone();
+        let previous_lane = current.lane.clone();
+        let previous_deliverable = current.deliverable.clone();
+        let previous_stale = current.stale_minutes;
+        let previous_driver = current.driver_only;
+        let previous_priority = current.priority;
         let title = input.title.unwrap_or(current.title);
         let body = input.body.unwrap_or(current.body);
         let assignee = input.assignee.unwrap_or(current.assignee);
@@ -902,12 +925,34 @@ impl Store {
                 )?;
             }
         }
+        // Name what moved, and keep the one value whose loss is unrecoverable.
+        // Everything else can be read off the row; a replaced body cannot.
+        let mut changed = Vec::new();
+        for (field, moved) in [
+            ("title", title != previous_title),
+            ("body", body != previous_body),
+            ("assignee", assignee != previous_assignee),
+            ("lane", lane != previous_lane),
+            ("deliverable", deliverable != previous_deliverable),
+            ("staleMinutes", stale != previous_stale),
+            ("driverOnly", driver != previous_driver),
+            ("priority", priority != previous_priority),
+            ("parentID", parent != previous_parent),
+        ] {
+            if moved {
+                changed.push(field);
+            }
+        }
+        let mut payload = json!({ "changed": changed });
+        if body != previous_body {
+            payload["previousBody"] = json!(previous_body);
+        }
         event(
             &transaction,
             Some(id),
             "task_updated",
             Some(&actor),
-            json!({}),
+            payload,
         )?;
         transaction.commit()?;
         self.require_task(id)
@@ -1927,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_wider_container_can_hold_a_child() {
+    fn a_container_holds_only_what_it_can_contain() {
         let parent_of = |kind: &str| Task {
             id: format!("p-{kind}"),
             task_type: kind.to_owned(),
@@ -1947,15 +1992,22 @@ mod tests {
             metadata: json!({}),
         };
 
-        // Exactly the three shapes the live boards use, and nothing else.
-        for (child, parent) in [("story", "epic"), ("task", "epic"), ("task", "story")] {
-            assert!(
-                require_valid_nesting("c-1", child, &parent_of(parent)).is_ok(),
-                "{child} under {parent} is how the breakdown is actually used"
-            );
-        }
+        // An epic holds anything, including another epic: a plan is an epic, so
+        // a programme plan has to be able to hold its sub-plans.
         for (child, parent) in [
             ("epic", "epic"),
+            ("story", "epic"),
+            ("task", "epic"),
+            ("task", "story"),
+        ] {
+            assert!(
+                require_valid_nesting("c-1", child, &parent_of(parent)).is_ok(),
+                "{child} under {parent} must be allowed"
+            );
+        }
+        // The rest still have no meaning: a story in a story, a leaf holding
+        // anything, or a container inside something narrower than itself.
+        for (child, parent) in [
             ("epic", "story"),
             ("epic", "task"),
             ("story", "story"),

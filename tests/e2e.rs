@@ -3124,6 +3124,31 @@ fn a_task_cannot_be_made_to_contain_work() {
     assert!(error.contains("story") && error.contains("task"), "{error}");
     assert!(error.contains("contains nothing"), "{error}");
 
+    // An epic nests under an epic: a plan is an epic, so a programme plan holds
+    // its sub-plans. This was refused until plans had somewhere to live.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Sub-plan", "--id", "e-sub", "--type", "epic", "--parent", "e-1",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "e-sub", "--json"])["parentID"],
+        "e-1"
+    );
+    // A story in a story still has no meaning, and neither does a container
+    // inside something narrower than itself.
+    for (id, kind, parent) in [("s-bad", "story", "s-1"), ("e-bad2", "epic", "s-1")] {
+        let refused = fixture.run(
+            &fixture.main,
+            &[
+                "task", "add", "Row", "--id", id, "--type", kind, "--parent", parent, "--json",
+            ],
+        );
+        assert!(!refused.status.success(), "{kind} nested under a story");
+    }
+
     let epic_under_task = fixture.run(
         &fixture.main,
         &[
@@ -4729,4 +4754,164 @@ fn the_draft_migration_preserves_the_table_it_rebuilds() {
 
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true, "{doctor}");
+}
+
+#[test]
+fn a_plan_is_an_epic_whose_body_survives_being_revised() {
+    // A plan is an epic: its body is the plan, its children are the work it
+    // became, and `draft` is a plan saved up but not ready to act on. Two
+    // things had to be true for that to hold -- a body can come from a file,
+    // and revising one does not destroy what it replaced.
+    let fixture = Fixture::new("plan");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PLAN", "--json"]);
+
+    let first = "# Q4 migration\n\n## Phase 1\nEnumerate every consumer.\n";
+    let plan_file = fixture.root.join("plan.md");
+    fs::write(&plan_file, first).unwrap();
+
+    let plan = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Q4 migration",
+            "--id",
+            "e-plan",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--body-file",
+            plan_file.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(plan["status"], "draft", "a plan saved up is not yet work");
+    assert_eq!(plan["body"], first, "the body did not come from the file");
+
+    // The work it becomes hangs beneath it, so "what did this plan produce" is
+    // answered by the tree rather than by a link nobody maintains.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Phase 1", "--id", "e-phase1", "--type", "epic", "--parent", "e-plan",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Enumerate consumers",
+            "--id",
+            "t-enum",
+            "--parent",
+            "e-phase1",
+            "--json",
+        ],
+    );
+
+    // Revise it. The previous plan has to survive, or a revision is a deletion
+    // with extra steps.
+    let second = "# Q4 migration\n\n## Phase 1\nEnumerate every consumer, with receipts.\n";
+    fs::write(&plan_file, second).unwrap();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "e-plan",
+            "--as",
+            "geo",
+            "--body-file",
+            plan_file.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "e-plan", "--json"])["body"],
+        second
+    );
+
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "e-plan", "--json"]);
+    let updated = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "task_updated")
+        .expect("the revision was not recorded");
+    assert_eq!(
+        updated["payload"]["changed"],
+        json!(["body"]),
+        "the trail must name what moved, not just that something did"
+    );
+    assert_eq!(
+        updated["payload"]["previousBody"], first,
+        "the plan it replaced was destroyed"
+    );
+
+    // A change that is not the body records what moved and carries no body.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "e-plan",
+            "--as",
+            "geo",
+            "--title",
+            "Q4 migration programme",
+            "--json",
+        ],
+    );
+    let latest = fixture.ok_json(&fixture.main, &["events", "--task", "e-plan", "--json"]);
+    let title_only = latest
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "task_updated" && e["payload"]["changed"] == json!(["title"]))
+        .expect("a title-only change was not recorded");
+    assert!(
+        title_only["payload"]["previousBody"].is_null(),
+        "a body was recorded for a change that did not touch it"
+    );
+
+    // Two answers to one question is refused rather than ranked.
+    let both = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ambiguous",
+            "--body",
+            "inline",
+            "--body-file",
+            plan_file.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        !both.status.success(),
+        "--body and --body-file were both taken"
+    );
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("pass one"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
+    // A body file that is not there is an error, not an empty plan.
+    let missing = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ghost",
+            "--body-file",
+            "/nonexistent/plan.md",
+            "--json",
+        ],
+    );
+    assert!(!missing.status.success(), "a missing body file was ignored");
 }

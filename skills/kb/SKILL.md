@@ -172,6 +172,40 @@ kb rel <id> --lease "$TOKEN"
 transaction** that records it — there is no window where the work reads finished
 but the lease is still held.
 
+## Plans
+
+**A plan is an epic.** Its body is the plan, its children are the work it became,
+and `draft` is a plan saved up but not ready to act on. There is no separate plan
+object: the container already exists, and `--parent` answers "what did this plan
+produce" better than any link would.
+
+```bash
+kb t new "Q4 migration" --type epic --status draft --body-file plan.md --json
+kb t new "Phase 1" --type epic --parent e-q4 --status draft --json   # a sub-plan
+kb t new "Enumerate consumers" --parent e-q4-p1 --json               # the work
+kb t mv e-q4 todo --as geo                                           # ready to act on
+```
+
+`--body-file` reads the body from disk, because a plan is markdown measured in
+kilobytes. Passing `--body` and `--body-file` together is refused — two answers
+to one question.
+
+**Revising a plan keeps the old one.** `task update --body-file` records the
+previous body on the event trail, so the plan's history is
+`kb ev --task <epic-id> --json` and needs nobody to have kept a copy:
+
+```json
+{ "kind": "task_updated",
+  "payload": { "changed": ["body"], "previousBody": "# Q4 migration\n…" } }
+```
+
+An epic holds epics, stories and tasks; a story holds tasks; a task holds
+nothing. So plans nest and work hangs off them, while a story inside a story is
+still refused.
+
+A plan is not an ADR. An ADR records a decision and why it was taken; a plan
+records intended work. Keep ADRs in the repo.
+
 **A `draft` is not work yet.** It is the state before `backlog`: a row still
 being written, whose title, body or scope may still be wrong. `claim --next`
 skips it however urgent its priority, and naming it explicitly is refused.
