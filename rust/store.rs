@@ -159,6 +159,44 @@ fn can_contain(parent_type: &str, child_type: &str) -> bool {
     }
 }
 
+/// The nearest ancestor still in draft, if any.
+///
+/// A draft protects the row it is on and, until this, nothing beneath it. A
+/// plan is an epic, so drafting a plan and hanging work under it produced tasks
+/// that were immediately claimable: a driver picked up work from a plan nobody
+/// had opened yet. Whether the plan was ready was recorded on the plan and
+/// consulted by no one.
+///
+/// The walk is bounded by the same cycle guard the parent chain already has,
+/// so a malformed tree cannot hang a claim.
+fn draft_ancestor(connection: &Connection, id: &str) -> Result<Option<Task>> {
+    let mut current = require_task(connection, id)?;
+    let mut seen = std::collections::HashSet::from([id.to_owned()]);
+    while let Some(parent) = current.parent_id.clone() {
+        if !seen.insert(parent.clone()) {
+            bail!("parent cycle detected at {parent}");
+        }
+        current = require_task(connection, &parent)?;
+        if current.status == "draft" {
+            return Ok(Some(current));
+        }
+    }
+    Ok(None)
+}
+
+/// Refuse work whose plan has not been opened yet.
+fn require_no_draft_ancestor(connection: &Connection, id: &str) -> Result<()> {
+    if let Some(draft) = draft_ancestor(connection, id)? {
+        bail!(
+            "task {id} sits under {}, which is still a draft: open it with \
+             `task move {} todo` before this can be worked",
+            draft.id,
+            draft.id
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a parent that cannot contain this child.
 ///
 /// The breakdown was implied everywhere and enforced nowhere: `advance_story`
@@ -1009,17 +1047,23 @@ impl Store {
                 .query_map([CLAIMABLE_TYPE], task_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            let candidates = candidates
-                .into_iter()
-                .filter(|candidate| {
-                    (!candidate.driver_only || options.caller_scope.as_deref() == Some("driver"))
-                        && (candidate
-                            .assignee
-                            .as_ref()
-                            .is_none_or(|value| value == &agent)
-                            || options.allow_reassign)
-                })
-                .collect::<Vec<_>>();
+            // Work under an unopened plan is not offered. Filtered here rather
+            // than in the query so that `--next` and an explicit claim refuse
+            // for the same reason, computed once.
+            let mut eligible = Vec::new();
+            for candidate in candidates {
+                let routable = (!candidate.driver_only
+                    || options.caller_scope.as_deref() == Some("driver"))
+                    && (candidate
+                        .assignee
+                        .as_ref()
+                        .is_none_or(|value| value == &agent)
+                        || options.allow_reassign);
+                if routable && draft_ancestor(&transaction, &candidate.id)?.is_none() {
+                    eligible.push(candidate);
+                }
+            }
+            let candidates = eligible;
             let selected = if let Some(role) = options.role_filter.as_deref() {
                 candidates
                     .into_iter()
@@ -1044,6 +1088,7 @@ impl Store {
             selected.context("no claimable task")?
         };
         require_claimable_type(&task.id, &task.task_type)?;
+        require_no_draft_ancestor(&transaction, &task.id)?;
         if !["todo", "in_progress"].contains(&task.status.as_str()) {
             bail!("task {} is {}, not claimable", task.id, task.status);
         }
@@ -1557,6 +1602,7 @@ impl Store {
         };
         let task = require_task(&transaction, &task_id)?;
         require_claimable_type(&task.id, &task.task_type)?;
+        require_no_draft_ancestor(&transaction, &task.id)?;
         if task.status != "todo" {
             bail!("task {} is {}, not claimable", task.id, task.status);
         }

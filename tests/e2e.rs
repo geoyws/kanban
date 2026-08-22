@@ -5075,3 +5075,107 @@ fn a_command_outside_a_repository_records_no_provenance() {
         "in_progress"
     );
 }
+
+#[test]
+fn work_under_an_unopened_plan_is_not_handed_to_a_driver() {
+    // A plan is an epic, so drafting a plan and hanging work under it produced
+    // tasks that were immediately claimable: whether the plan was ready was
+    // recorded on the plan and consulted by nobody. A draft protected the row
+    // it sat on and nothing beneath it.
+    let fixture = Fixture::new("draft-gate");
+    fixture.ok_json(&fixture.main, &["init", "--name", "GATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Q4 plan", "--id", "e-plan", "--type", "epic", "--status", "draft",
+            "--json",
+        ],
+    );
+    // Two levels down, because a plan holds sub-plans and the gate has to reach
+    // through them rather than only checking the immediate parent.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Phase 1", "--id", "e-p1", "--type", "epic", "--parent", "e-plan",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "The work", "--id", "t-work", "--parent", "e-p1", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Unrelated", "--id", "t-free", "--json"],
+    );
+
+    // --next steps over the whole drafted tree and finds the open work instead.
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "--next", "--as", "driver-1", "--json"]
+        )["taskID"],
+        "t-free",
+        "a driver was handed work from a plan nobody had opened"
+    );
+
+    // Naming it explicitly is refused, and the refusal names the plan and the
+    // command that opens it -- an agent told only "no" has no next move.
+    let refused = fixture.run(
+        &fixture.main,
+        &["claim", "t-work", "--as", "driver-2", "--json"],
+    );
+    assert!(!refused.status.success(), "work under a draft was claimed");
+    let error = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        error.contains("e-plan"),
+        "the draft ancestor is not named: {error}"
+    );
+    assert!(error.contains("draft"), "{error}");
+    assert!(error.contains("task move e-plan todo"), "{error}");
+
+    // Opening the plan makes its work available to any driver.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "e-plan", "todo", "--as", "geo", "--json"],
+    );
+    let claimed = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-work", "--as", "driver-2", "--json"],
+    );
+    assert_eq!(claimed["taskID"], "t-work");
+    assert_eq!(claimed["agentID"], "driver-2");
+
+    // And a second driver gets the ordinary already-claimed refusal, not the
+    // draft one -- drivers are just identities competing for the same work.
+    let contested = fixture.run(
+        &fixture.main,
+        &["claim", "t-work", "--as", "driver-3", "--json"],
+    );
+    assert!(!contested.status.success());
+    assert!(
+        String::from_utf8_lossy(&contested.stderr).contains("already claimed"),
+        "{}",
+        String::from_utf8_lossy(&contested.stderr)
+    );
+
+    // Every driver sees the same board, drafts included. Visibility was never
+    // per-driver and is not being made so: a draft is hidden from the queue,
+    // not from the reader.
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 4);
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["task", "list", "--status", "draft", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "e-plan was opened above, so nothing should still read as draft"
+    );
+}

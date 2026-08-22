@@ -206,9 +206,16 @@ still refused.
 A plan is not an ADR. An ADR records a decision and why it was taken; a plan
 records intended work. Keep ADRs in the repo.
 
-**A `draft` is not work yet.** It is the state before `backlog`: a row still
-being written, whose title, body or scope may still be wrong. `claim --next`
-skips it however urgent its priority, and naming it explicitly is refused.
+**A `draft` is not work yet, and neither is anything under it.** It is the state
+before `backlog`: a row still being written, whose title, body or scope may still
+be wrong. `claim --next` skips it however urgent its priority, and naming it
+explicitly is refused.
+
+Because a plan is an epic, a drafted plan holds back its whole tree: no task
+beneath it is offered or granted until the plan is opened, however deep it sits.
+Drafts stay **visible to every driver** — a draft is hidden from the queue, not
+from the reader — so anyone can read a plan being written and nobody can start
+on it by accident.
 Promote it with `kb t mv <id> todo --as "$ACTOR"` when it is ready to be acted
 on. Use it for anything you are still specifying — an agent reads every row on
 the board as a specification, and an unfinished one gets decomposed and worked

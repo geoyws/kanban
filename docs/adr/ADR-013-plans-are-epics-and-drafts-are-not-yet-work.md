@@ -82,6 +82,30 @@ The two decisions are one design. **A plan saved up but not ready to act on is a
 draft epic** — which is what "projects can have plans saved up" asks for, without
 either feature needing to know about the other.
 
+### A draft holds back the work beneath it
+
+**Amended 2026-08-22.** `draft` first shipped protecting only the row it sat on.
+Since a plan is an epic, drafting a plan and hanging work under it produced tasks
+that were immediately claimable: `claim --next` handed a driver work from a plan
+nobody had opened, and naming that task explicitly worked too. Whether the plan
+was ready was recorded on the plan and consulted by no one.
+
+Nothing under a draft is offered or granted. The walk goes to the top of the
+parent chain rather than checking the immediate parent, because a plan holds
+sub-plans and the drafted thing is usually two levels up. `--next` steps over the
+whole drafted tree; an explicit claim is refused naming the draft ancestor and
+the command that opens it, since an agent told only "no" has no next move. All
+three paths that mint a lease share one implementation — `claim` by id,
+`claim --next`, and `handoff accept` — so they cannot refuse for different
+reasons.
+
+This is what makes the driver model work as stated: **drafts are visible to
+every driver, and pickable by none until opened.** A draft is hidden from the
+queue, not from the reader. Nothing else about drivers needed changing — they
+were already just identities passed to `--as`, competing for the same board, and
+an unlaned unassigned task was always claimable by any of them. Lanes,
+assignees and `driver_only` remain opt-in narrowing on top of that default.
+
 ## Consequences
 
 Widening the status `CHECK` meant rebuilding the `tasks` table, and a rebuild is
