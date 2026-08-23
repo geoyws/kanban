@@ -299,7 +299,8 @@ kb ctx <id> --json              # the bounded cold-start packet for a resuming a
 kb dash --json                  # per-board counts, incl. openAttention + pendingHandoffs
 kb ev --task <id> --json        # the durable audit trail
 kb stale --json                 # work that overran its stale budget
-kb doctor --json                # integrity, orphaned rows, future-stamped tasks
+kb doctor --json                # integrity, orphaned rows, unreachable roots
+kb w repoint --json             # after moving a repo: point its registered roots at it
 ```
 
 `ev` is machine-written and append-only — `task_created`, `task_moved`,

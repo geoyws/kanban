@@ -28,6 +28,7 @@ Usage:
   kanban init [--name NAME] [--workspace PATH] [--force]
   kanban workspace list [--json]
   kanban workspace attach --to REGISTERED_PATH [--workspace PATH]
+  kanban workspace repoint [--root PATH] [--json]
   kanban dashboard [--json]
   kanban doctor [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
@@ -160,6 +161,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("init", None, &["name", "force"], &[], false),
     ("workspace", Some("list"), &[], &[], true),
     ("workspace", Some("attach"), &["to"], &[], false),
+    ("workspace", Some("repoint"), &["root"], &[], false),
     ("dashboard", None, &[], &[], true),
     ("doctor", None, &[], &[], true),
     ("backup", None, &["output", "keep"], &[], false),
@@ -1229,6 +1231,28 @@ fn run() -> Result<()> {
         let record = registry.attach(&workspace, Path::new(args.require("to")?))?;
         return print(&record, args.has("json"));
     }
+    if command == "workspace" && sub == Some("repoint") {
+        let mut registry = Registry::open()?;
+        // Without --root, repoint every broken row: the usual cause is one tree
+        // moving, which breaks its project root and each lane beneath it at
+        // once, and repairing them one command at a time invites stopping half
+        // way. Naming one is for the case where only that one should move.
+        let broken = registry.unreachable_roots()?;
+        let targets = match args.one("root") {
+            Some(root) => vec![root.to_owned()],
+            None => {
+                if broken.is_empty() {
+                    bail!("every registered root already resolves to itself; nothing to repoint");
+                }
+                broken.iter().map(|item| item.root_path.clone()).collect()
+            }
+        };
+        let mut repointed = Vec::new();
+        for root in targets {
+            repointed.push(registry.repoint(&root)?);
+        }
+        return print(&repointed, args.has("json"));
+    }
     if command == "dashboard" {
         let registry = Registry::open()?;
         let mut output = Vec::new();
@@ -1269,7 +1293,14 @@ fn run() -> Result<()> {
         let registry = Registry::open()?;
         let registry_check = registry.integrity()?;
         let mut projects = Vec::new();
-        let mut healthy = registry_check == vec!["ok"];
+        // A stored root is canonical when written and can only become wrong
+        // afterwards -- the tree moves and a symlink takes its place, which is
+        // exactly what happened to this repository. Resolution canonicalises
+        // the caller's cwd, so from that moment no directory inside the tree
+        // resolves to the board and the project is reachable only by name.
+        // `integrity_check` sees a perfect database throughout.
+        let unreachable = registry.unreachable_roots()?;
+        let mut healthy = registry_check == vec!["ok"] && unreachable.is_empty();
         for project in registry.projects()? {
             // Checked before opening, because opening would create it.
             if !board_is_present(&project.board_path) {
@@ -1299,7 +1330,12 @@ fn run() -> Result<()> {
                 "futureDatedTasks": future,
             }));
         }
-        let result = json!({"healthy":healthy,"registry":registry_check,"projects":projects});
+        let result = json!({
+            "healthy": healthy,
+            "registry": registry_check,
+            "unreachableRoots": unreachable,
+            "projects": projects,
+        });
         print(&result, args.has("json"))?;
         if !healthy {
             bail!("Kanban integrity check failed");

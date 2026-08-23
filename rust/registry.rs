@@ -1,5 +1,5 @@
 use crate::db::{checkpoint, create_backup_target, integrity, open_registry, own_private_dir};
-use crate::model::{ProjectRecord, WorkspaceRecord};
+use crate::model::{ProjectRecord, UnreachableRoot, WorkspaceRecord};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::env;
@@ -320,6 +320,76 @@ impl Registry {
 impl Drop for Registry {
     fn drop(&mut self) {
         let _ = checkpoint(&self.connection);
+    }
+}
+
+impl Registry {
+    /// Registered roots that no longer resolve to themselves.
+    pub fn unreachable_roots(&self) -> Result<Vec<UnreachableRoot>> {
+        let mut out = Vec::new();
+        for record in self.list()? {
+            let stored = Path::new(&record.root_path);
+            let resolved = stored.canonicalize().ok();
+            let reachable = resolved
+                .as_ref()
+                .is_some_and(|actual| actual.as_path() == stored);
+            if reachable {
+                continue;
+            }
+            out.push(UnreachableRoot {
+                name: record.name,
+                root_path: record.root_path,
+                board_path: record.board_path,
+                resolves_to: resolved.map(|p| p.to_string_lossy().into_owned()),
+                canonical: record.canonical,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Point a registered root at where it actually lives now.
+    ///
+    /// The board, its name and every other root keep their identity: only the
+    /// spelling of one path changes, which is the whole defect. A root that is
+    /// simply gone is refused rather than guessed at — there is nothing to
+    /// repoint it to, and inventing a path would be worse than the gap.
+    pub fn repoint(&mut self, root_path: &str) -> Result<UnreachableRoot> {
+        let broken = self
+            .unreachable_roots()?
+            .into_iter()
+            .find(|item| item.root_path == root_path)
+            .with_context(|| {
+                format!("{root_path} is not a registered root that needs repointing")
+            })?;
+        let Some(target) = broken.resolves_to.clone() else {
+            bail!(
+                "{root_path} does not exist, so there is nowhere to repoint it. \
+                 Register the project where it lives now with `kanban init`, or \
+                 drop this root."
+            );
+        };
+        // A row already standing at the destination would collide on the
+        // primary key, and silently dropping either one loses a registration.
+        if self.exact(Path::new(&target))?.is_some() {
+            bail!(
+                "{target} is already registered, so {root_path} has nothing to \
+                 repoint to — the two would be one row"
+            );
+        }
+        let table = if broken.canonical {
+            "workspaces"
+        } else {
+            "workspace_aliases"
+        };
+        self.connection.execute(
+            &format!("UPDATE {table} SET root_path=?, last_used_at=? WHERE root_path=?"),
+            params![target, now_ms(), root_path],
+        )?;
+        Ok(UnreachableRoot {
+            root_path: target.clone(),
+            resolves_to: Some(target),
+            ..broken
+        })
     }
 }
 

@@ -5448,3 +5448,122 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
         "tags must not leak between boards"
     );
 }
+
+#[test]
+fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
+    // Registration canonicalises, so a stored root is right when written and
+    // can only go wrong afterwards. This repository is the worked example: it
+    // was moved into the dotfiles and a symlink left at the old path, and from
+    // that moment no directory inside it resolved to its own board. The
+    // database was perfect throughout and `doctor` said healthy.
+    let fixture = Fixture::new("moved-tree");
+    let original = fixture.root.join("project");
+    let lane = original.join("lane");
+    let moved = fixture.root.join("elsewhere");
+    fs::create_dir_all(&lane).unwrap();
+
+    fixture.ok_json(&original, &["init", "--name", "MOVED", "--json"]);
+    fixture.ok_json(
+        &lane,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            original.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &original,
+        &["task", "add", "Real work", "--id", "t-1", "--json"],
+    );
+
+    // The move: the tree goes elsewhere and a symlink stands where it was, so
+    // every path anyone has written down still works at the shell.
+    fs::rename(&original, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &original).unwrap();
+    assert!(original.join("lane").is_dir(), "the symlink must be usable");
+
+    // And yet the board is gone from the inside: the caller's cwd resolves to
+    // the new physical path, and the registry only knows the old spelling.
+    let lost = fixture.run(&original, &["task", "list", "--json"]);
+    assert!(
+        !lost.status.success(),
+        "the board resolved by cwd, so this test is no longer testing the defect"
+    );
+    assert!(
+        String::from_utf8_lossy(&lost.stderr).contains("no Kanban project contains"),
+        "{}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+
+    // doctor is the thing that has to notice, because nothing else can: the
+    // database passes every structural check ever written.
+    let sick = fixture.run(&original, &["doctor", "--json"]);
+    assert!(
+        !sick.status.success(),
+        "doctor called a lost project healthy"
+    );
+    let report: Value = serde_json::from_slice(&sick.stdout).unwrap();
+    assert_eq!(report["healthy"], false);
+    let roots = report["unreachableRoots"].as_array().unwrap();
+    assert_eq!(
+        roots.len(),
+        2,
+        "the project root and the lane beneath it both broke: {roots:?}"
+    );
+    let project_root = roots
+        .iter()
+        .find(|item| item["canonical"] == true)
+        .expect("the canonical root must be named");
+    assert_eq!(project_root["name"], "MOVED");
+    assert_eq!(
+        project_root["resolvesTo"],
+        moved.to_string_lossy().into_owned(),
+        "the report must say where the path leads now, not merely that it is wrong"
+    );
+
+    // Repointing takes every broken row by default, because one tree moving
+    // breaks its root and each lane beneath it at once.
+    let fixed = fixture.ok_json(&original, &["workspace", "repoint", "--json"]);
+    assert_eq!(fixed.as_array().unwrap().len(), 2);
+
+    // The board is reachable from the inside again, and it is the same board --
+    // repointing changes one path's spelling and nothing about identity.
+    let rows = fixture.ok_json(&original, &["task", "list", "--json"]);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], "t-1");
+    assert_eq!(
+        fixture.ok_json(&lane, &["task", "list", "--json"])[0]["id"],
+        "t-1",
+        "the lane alias must resolve to the same board it always did"
+    );
+    assert!(
+        fixture.ok_json(&original, &["doctor", "--json"])["unreachableRoots"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // A second repoint has nothing to do and says so rather than reporting a
+    // successful no-op, which would read as a repair that happened.
+    let again = fixture.run(&original, &["workspace", "repoint", "--json"]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("nothing to repoint"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+
+    // A root that is simply gone has nowhere to be repointed to, and guessing
+    // would be worse than the gap.
+    fs::remove_file(&original).unwrap();
+    fs::rename(&moved, fixture.root.join("gone")).unwrap();
+    let vanished = fixture.run(&fixture.root, &["workspace", "repoint", "--json"]);
+    assert!(!vanished.status.success(), "a deleted root was repointed");
+    assert!(
+        String::from_utf8_lossy(&vanished.stderr).contains("nowhere to repoint"),
+        "{}",
+        String::from_utf8_lossy(&vanished.stderr)
+    );
+}

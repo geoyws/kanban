@@ -30,6 +30,25 @@ pub struct Tag {
     pub uses: i64,
 }
 
+/// A registered root that no longer names the directory it was registered for.
+///
+/// Registration canonicalises, so a stored root is correct the moment it is
+/// written and can only become wrong afterwards — the directory is deleted, or
+/// moved and replaced by a symlink to its new home. Resolution canonicalises
+/// the caller's cwd, so once the two spellings differ **no cwd inside that tree
+/// resolves to the board at all**: the project is reachable only by name, and
+/// nothing said so.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreachableRoot {
+    pub name: String,
+    pub root_path: String,
+    pub board_path: String,
+    /// Where the stored path leads today, or `None` when nothing is there.
+    pub resolves_to: Option<String>,
+    pub canonical: bool,
+}
+
 pub const TASK_TYPES: [&str; 3] = ["epic", "story", "task"];
 pub const NOTE_KINDS: [&str; 6] = [
     "plan", "progress", "blocker", "decision", "evidence", "done",

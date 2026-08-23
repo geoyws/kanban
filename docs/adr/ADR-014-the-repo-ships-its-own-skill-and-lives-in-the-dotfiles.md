@@ -75,8 +75,37 @@ pattern. This one earned it because it ships a skill describing itself and is
 driven by the harnesses the dotfiles configure. A repository with neither
 property gains nothing but the two-commit cost.
 
+## Amendment — 2026-08-23: the move made this repository's own board unreachable
+
+Leaving a symlink at `~/work/src/kanban` kept every documented path working at
+the shell and broke the one thing nobody thought to check. Registration stores a
+**canonical** path, and resolution canonicalises the caller's cwd — so once the
+tree lived at `_dotfiles/kanban`, `getcwd()` inside it returned the physical
+path while the registry still held the old one, and **no directory in this
+repository resolved to its own board**. It stayed reachable by `--project
+kanban`, which is why the breakage went unnoticed for two days.
+
+`doctor` could not have caught it: the database was structurally perfect, every
+board file present, and it reported `healthy: true`. It now checks whether each
+registered root still resolves to itself, names where a broken one leads today,
+and refuses to call the registry healthy while one is unreachable. `kanban
+workspace repoint` repairs them — by default all of them, because one tree
+moving breaks its project root and each lane beneath it at once, and repairing
+one command at a time invites stopping half way. A root that is simply gone is
+refused rather than guessed at.
+
+Measured 2026-08-23: exactly two rows were affected, both from this move — the
+project root and its `driver-2` lane. Nothing else on the box registers a path
+that is now a symlink.
+
+The general lesson is the one this repository keeps relearning: **a path stored
+as text is a claim about the filesystem that stops being true without anything
+writing to the database.** Provenance capture reached the same conclusion from
+the other side and chose to ask git rather than parse `.git`.
+
 ## References
 
 - [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md) — the binary the skill documents
 - [ADR-010](ADR-010-adapters-generated-from-the-command-surface.md) — one description of the surface, not two
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md) — the exact-match alias rule that makes writing them down load-bearing
+- [ADR-007](ADR-007-global-project-addressing.md) — the addressing chain the move broke, and `--project` which kept working

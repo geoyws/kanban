@@ -147,6 +147,13 @@ board:
 kanban init --name my-project --workspace /path/to/main-worktree
 cd /path/to/another-worktree
 kanban workspace attach --to /path/to/main-worktree
+
+If a registered tree is later moved and a symlink left where it was, every path
+still works at the shell but none of them resolve to the board: registration
+stores a canonical path, resolution canonicalises the caller's cwd, and the two
+spellings no longer meet. `doctor` reports those roots and where they lead now;
+`kanban workspace repoint` points them at the tree's new home, repairing the
+project root and every lane beneath it together.
 kanban dashboard
 ```
 
