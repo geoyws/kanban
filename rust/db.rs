@@ -257,6 +257,41 @@ ALTER TABLE checkpoints ADD COLUMN root_head TEXT;
 ALTER TABLE handoffs ADD COLUMN root_head TEXT;
 "#;
 
+/// Tags, and the master file that says which ones exist.
+///
+/// A board needs an axis that says *what a row is about* — `infra`, `queuer`,
+/// `askie` — and had none. `lane` is the nearest field and is the wrong one: it
+/// carries the *kind of work* (`fe`, `be`, `ops`, `test`, `review`) and
+/// `claim --next` routes on it, so overloading it with subsystems would both
+/// lose a distinction and change who gets handed what. `metadata` is free JSON
+/// and would make every tag a spelling.
+///
+/// So tags are registered before they are used. That is the difference between
+/// a vocabulary and a habit: without a master file, `infra`, `Infra` and
+/// `infrastructure` all exist, nothing says which is meant, and every filter
+/// silently misses rows. Applying an unregistered tag is refused, with the
+/// nearest registered name suggested and the command that would add it — the
+/// same shape as a mistyped flag.
+///
+/// `ON DELETE RESTRICT` on the tag reference is what makes the master file
+/// authoritative: a tag in use cannot quietly disappear from under the rows
+/// carrying it. Removing one names how many rows would be orphaned and requires
+/// `--force`, like every other destructive path here.
+const BOARD_V8: &str = r#"
+CREATE TABLE tags (
+ name TEXT PRIMARY KEY NOT NULL,
+ description TEXT,
+ created_by TEXT,
+ created_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE task_tags (
+ task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ tag TEXT NOT NULL REFERENCES tags(name) ON DELETE RESTRICT,
+ PRIMARY KEY(task_id,tag)
+) STRICT;
+CREATE INDEX idx_task_tags_tag ON task_tags(tag);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -459,7 +494,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     let outcome = migrate(
         &mut connection,
         &[
-            BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7,
+            BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

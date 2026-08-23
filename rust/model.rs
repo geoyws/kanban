@@ -18,6 +18,18 @@ pub const TASK_STATUSES: [&str; 8] = [
     "done",
     "cancelled",
 ];
+/// A registered tag: an entry in the board's master file.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub name: String,
+    pub description: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+    /// How many rows currently carry it, so a listing answers "is this used".
+    pub uses: i64,
+}
+
 pub const TASK_TYPES: [&str; 3] = ["epic", "story", "task"];
 pub const NOTE_KINDS: [&str; 6] = [
     "plan", "progress", "blocker", "decision", "evidence", "done",
@@ -46,6 +58,9 @@ pub struct Task {
     pub updated_at: i64,
     pub completed_at: Option<i64>,
     pub metadata: Value,
+    /// Registered tags carried by this row, sorted. What the row is *about*,
+    /// as opposed to `lane`, which is what kind of work it is.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +268,8 @@ pub struct AddTask {
     /// Who created the row. Optional, so existing callers keep working; an
     /// absent actor is recorded as absent rather than invented.
     pub actor: Option<String>,
+    /// Registered tags to apply. Unregistered ones are refused.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -273,7 +273,7 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
 
 pub fn render_todo(store: &Store) -> Result<String> {
     let name = store.board_name()?.unwrap_or_else(|| "Kanban".to_owned());
-    let tasks = store.list_tasks(None)?;
+    let tasks = store.list_tasks(None, None)?;
     let active = tasks
         .iter()
         .filter(|task| task.status != "done" && task.status != "cancelled")

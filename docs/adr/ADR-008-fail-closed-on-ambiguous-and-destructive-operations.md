@@ -400,9 +400,26 @@ versions were themselves wrong — one counted a text span that swept up the
 test's own source, the next broke the moment `cargo fmt` wrapped the list — so
 it checks by name, which no formatting can move.
 
+**An empty answer is not a safe answer.** `task list --tag infr` could have
+returned nothing and exited zero, and the caller would have read "no infra work"
+rather than "that tag does not exist". A filter on an unregistered value is now
+refused and names the nearest registered one, because an empty list is the one
+wrong answer that looks exactly like a right one. The same reasoning already
+applies to a mistyped flag and a mistyped board; a mistyped filter had been
+missed because it fails silently rather than loudly.
+
+**A clearing flag needs the flag it clears declared beside it.**
+`--tag infra --clear-tags` was accepted and silently preferred one of them —
+two answers to one question, decided by whichever branch the dispatch tested
+first. The `clear-` family is now paired in the mutually-exclusive list, and a
+guard reads the file back so the next `--clear-x` cannot ship without its pair.
+`--no-cross-lane` is deliberately exempt: there is no `--cross-lane` to
+contradict, so a pair would be a flag nobody needs.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract
 - [ADR-003](ADR-003-private-multi-project-personal-work-system.md) — private storage
 - [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md) — compiled-binary E2E
 - [ADR-007](ADR-007-global-project-addressing.md) — board selection chain
+- [ADR-015](ADR-015-tags-are-a-per-board-master-file.md) — the tag registry, whose refusals are these rules applied to a vocabulary

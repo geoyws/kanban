@@ -37,7 +37,7 @@ Usage:
              [--priority 0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
-  kanban task list [--status STATUS] [--with-relations] [--json]
+  kanban task list [--status STATUS] [--tag NAME] [--with-relations] [--json]
   kanban task show ID [--json]
   kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
@@ -56,6 +56,9 @@ Usage:
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
+  kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
+  kanban tag list [--json]
+  kanban tag remove NAME [--force] [--as ACTOR] [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--task ID] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--limit N] [--json]
@@ -93,7 +96,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 19] = [
+pub(crate) const BOOLEAN: [&str; 20] = [
     "help",
     "json",
     "version",
@@ -110,6 +113,7 @@ pub(crate) const BOOLEAN: [&str; 19] = [
     "with-relations",
     "clear-parent",
     "clear-dependencies",
+    "clear-tags",
     "reconcile",
     "dry-run",
     "verify",
@@ -122,7 +126,7 @@ pub(crate) const BOOLEAN: [&str; 19] = [
 /// wrong-board write ADR-007 exists to prevent, reached through a repeated
 /// flag instead of a mistyped one, and trivially produced by a wrapper script
 /// that appends a default the caller had already set.
-pub(crate) const REPEATABLE: [&str; 3] = ["depends-on", "blocker", "validation"];
+pub(crate) const REPEATABLE: [&str; 4] = ["depends-on", "blocker", "validation", "tag"];
 
 /// Accepted on every board command; see `store_path`.
 pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
@@ -164,6 +168,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "task",
         Some("add"),
         &[
+            "tag",
             "as",
             "body-file",
             "id",
@@ -185,7 +190,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "task",
         Some("list"),
-        &["status", "with-relations"],
+        &["status", "with-relations", "tag"],
         &[],
         true,
     ),
@@ -209,6 +214,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "task",
         Some("update"),
         &[
+            "clear-tags",
+            "tag",
             "body-file",
             "as",
             "parent",
@@ -341,6 +348,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("schema", None, &[], &[], true),
     ("mcp", None, &[], &[], false),
+    ("tag", Some("add"), &["as", "description"], &["name"], false),
+    ("tag", Some("list"), &[], &[], true),
+    ("tag", Some("remove"), &["as", "force"], &["name"], false),
     (
         "attention",
         Some("raise"),
@@ -390,13 +400,14 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 6] = [
+const SUBCOMMAND_GROUPS: [&str; 7] = [
     "task",
     "story",
     "handoff",
     "import",
     "workspace",
     "attention",
+    "tag",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -444,6 +455,9 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("handoff", "acc") => "accept",
         ("workspace", "ls") => "list",
         ("workspace", "att") => "attach",
+        ("tag", "ls") => "list",
+        ("tag", "new") => "add",
+        ("tag", "rm") => "remove",
         (_, other) => other,
     }
 }
@@ -702,7 +716,7 @@ impl Args {
 /// `--project`: accepting unambiguous prefixes means adding a `--projection`
 /// later silently retargets every existing `--proj` caller, which is the
 /// silent-change-of-meaning this guard exists to remove.
-fn nearest<'a>(value: &str, candidates: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn nearest<'a>(value: &str, candidates: &[&'a str]) -> Option<&'a str> {
     if value.is_empty() {
         return None;
     }
@@ -968,8 +982,13 @@ fn object_of<T: Serialize>(value: &T) -> Result<Map<String, Value>> {
     }
 }
 
-fn list_json(store: &Store, status: Option<&str>, relations: bool) -> Result<Value> {
-    let tasks = store.list_tasks(status)?;
+fn list_json(
+    store: &Store,
+    status: Option<&str>,
+    tag: Option<&str>,
+    relations: bool,
+) -> Result<Value> {
+    let tasks = store.list_tasks(status, tag)?;
     if !relations {
         return Ok(serde_json::to_value(tasks)?);
     }
@@ -1221,7 +1240,7 @@ fn run() -> Result<()> {
                 continue;
             }
             let store = Store::open(Path::new(&project.board_path))?;
-            let tasks = store.list_tasks(None)?;
+            let tasks = store.list_tasks(None, None)?;
             let mut counts = Map::new();
             for status in TASK_STATUSES {
                 counts.insert(
@@ -1329,6 +1348,7 @@ fn run() -> Result<()> {
     if command == "task" && sub == Some("add") {
         let title = rest.first().context("task title is required")?.clone();
         let task = store.add_task(crate::model::AddTask {
+            tags: args.many("tag"),
             id: option_string(&args, "id"),
             task_type: args.one("type").unwrap_or("task").into(),
             parent_id: option_string(&args, "parent"),
@@ -1349,7 +1369,12 @@ fn run() -> Result<()> {
     }
     if command == "task" && sub == Some("list") {
         return print(
-            &list_json(&store, args.one("status"), args.has("with-relations"))?,
+            &list_json(
+                &store,
+                args.one("status"),
+                args.one("tag"),
+                args.has("with-relations"),
+            )?,
             args.has("json"),
         );
     }
@@ -1405,12 +1430,20 @@ fn run() -> Result<()> {
             ("deliverable", "clear-deliverable"),
             ("parent", "clear-parent"),
             ("depends-on", "clear-dependencies"),
+            ("tag", "clear-tags"),
         ] {
             if args.has(a) && args.has(b) {
                 bail!("--{a} and --{b} are mutually exclusive");
             }
         }
         let input = UpdateTask {
+            tags: if args.has("clear-tags") {
+                Some(Vec::new())
+            } else if args.flags.contains_key("tag") {
+                Some(args.many("tag"))
+            } else {
+                None
+            },
             parent_id: if let Some(v) = args.one("parent") {
                 Some(Some(v.into()))
             } else if args.has("clear-parent") {
@@ -1652,6 +1685,21 @@ fn run() -> Result<()> {
     }
     if command == "stale" {
         return print(&store.stale_tasks()?, args.has("json"));
+    }
+    if command == "tag" && sub == Some("add") {
+        let name = rest.first().context("tag name is required")?;
+        return print(
+            &store.add_tag(name, args.one("description"), args.one("as"))?,
+            args.has("json"),
+        );
+    }
+    if command == "tag" && sub == Some("list") {
+        return print(&store.tags()?, args.has("json"));
+    }
+    if command == "tag" && sub == Some("remove") {
+        let name = rest.first().context("tag name is required")?;
+        store.remove_tag(name, args.one("as"), args.has("force"))?;
+        return print(&json!({ "removed": name }), args.has("json"));
     }
     if command == "attention" && sub == Some("raise") {
         let text = rest.first().context("attention text is required")?;
@@ -1942,6 +1990,117 @@ mod tests {
         );
         assert!(command_spec("frobnicate", None).is_none());
         assert!(command_spec("task", Some("frobnicate")).is_none());
+    }
+
+    #[test]
+    fn every_clearing_flag_is_refused_alongside_the_flag_it_clears() {
+        // `--tag infra --clear-tags` is two answers to one question, and the
+        // receipt would not say which was stored (ADR-008). Every clearing flag
+        // is therefore declared mutually exclusive with the flag it undoes --
+        // and the pair list is prose inside a dispatch arm, so nothing but a
+        // read-back stops the next `--clear-x` from shipping without its pair.
+        const SOURCE: &str = include_str!("lib.rs");
+        let shipped = SOURCE
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(SOURCE);
+        for flag in BOOLEAN {
+            // Only the `clear-` family. `--no-cross-lane` reads the same way
+            // but has no positive counterpart to contradict -- cross-lane is
+            // the default and there is no `--cross-lane` -- so requiring it a
+            // pair would be requiring a flag nobody needs.
+            if !flag.starts_with("clear-") {
+                continue;
+            }
+            // The positive half is not derivable -- `--clear-dependencies`
+            // undoes `--depends-on` -- so the guard checks that the clearing
+            // flag is paired with *something*, and leaves naming it to the
+            // pair list. Assembled rather than written out, because this test
+            // reads its own source and a literal would match itself.
+            let paired = format!(", \"{flag}\")");
+            assert!(
+                shipped.contains(&paired),
+                "--{flag} undoes another flag but is in no mutually-exclusive \
+                 pair, so passing both silently prefers one"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skill_documents_aliases_that_actually_resolve() {
+        // The skill ships in this repository precisely so it versions with the
+        // binary (ADR-014), and that only holds if something checks. Writing
+        // `rm`=remove into the tag row before the alias existed produced a
+        // documented command that answers "unknown command" -- the drift
+        // ADR-010 exists to prevent, arriving through documentation.
+        const SKILL: &str = include_str!("../skills/kb/SKILL.md");
+
+        // | `att`, `attn` | `attention` |
+        let mut checked = 0;
+        for line in SKILL.lines() {
+            let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+            if cells.len() != 4 || !cells[0].is_empty() {
+                continue;
+            }
+            let (shorts, full) = (cells[1], cells[2]);
+            if !full.starts_with('`') || !full.ends_with('`') {
+                continue;
+            }
+            let full = full.trim_matches('`');
+            if full.contains('=') || full.contains(' ') {
+                continue;
+            }
+            // A command-alias row: every short form on the left must resolve.
+            if COMMANDS.iter().any(|(name, ..)| *name == full) && !shorts.contains('=') {
+                for short in shorts.split(',') {
+                    let short = short.trim().trim_matches('`');
+                    if short.is_empty() || short == "Short" {
+                        continue;
+                    }
+                    assert_eq!(
+                        canonical_command(short),
+                        full,
+                        "the skill documents `{short}` as {full}, and it resolves elsewhere"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 10, "only {checked} command aliases were checked");
+
+        // | `task` | `ls`=list `mv`=move … |
+        let mut subs = 0;
+        for line in SKILL.lines() {
+            let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+            if cells.len() != 4 || !cells[0].is_empty() || !cells[2].contains('=') {
+                continue;
+            }
+            let group = cells[1].trim_matches('`');
+            assert!(
+                SUBCOMMAND_GROUPS.contains(&group),
+                "the skill documents subcommands for `{group}`, which takes none"
+            );
+            for pair in cells[2].split_whitespace() {
+                let pair = pair.trim_matches('`');
+                let Some((short, full)) = pair.split_once('=') else {
+                    continue;
+                };
+                let (short, full) = (short.trim_matches('`'), full.trim_matches('`'));
+                assert_eq!(
+                    canonical_sub(group, short),
+                    full,
+                    "the skill documents `{group} {short}` as {full}"
+                );
+                assert!(
+                    COMMANDS
+                        .iter()
+                        .any(|(name, sub, ..)| *name == group && *sub == Some(full)),
+                    "the skill documents `{group} {full}`, which is not a command"
+                );
+                subs += 1;
+            }
+        }
+        assert!(subs >= 10, "only {subs} subcommand aliases were checked");
     }
 
     #[test]

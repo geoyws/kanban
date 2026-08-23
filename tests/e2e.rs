@@ -3671,6 +3671,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "task show" => vec!["task", "show", "t-1"],
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
+            "tag list" => vec!["tag", "list"],
             "schema" => vec!["schema"],
             "events" => vec!["events"],
             "stale" => vec!["stale"],
@@ -3716,6 +3717,8 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         "checkpoint",
         "attention raise",
         "attention resolve",
+        "tag add",
+        "tag remove",
         "handoff create",
         "restore",
         "backup",
@@ -5177,5 +5180,271 @@ fn work_under_an_unopened_plan_is_not_handed_to_a_driver() {
             .len(),
         0,
         "e-plan was opened above, so nothing should still read as draft"
+    );
+}
+
+#[test]
+fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
+    // Free-text labels are how one subsystem ends up spelled four ways --
+    // `infra`, `Infra`, `infrastructure`, `infra-` -- and a board that answers
+    // "show me infra" with three of the four is worse than one with no tags at
+    // all, because the answer looks complete. So a tag exists in a per-board
+    // master file first, and only a registered tag can be attached.
+    let fixture = Fixture::new("tags");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TAGS", "--json"]);
+
+    let registered = fixture.ok_json(
+        &fixture.main,
+        &[
+            "tag",
+            "add",
+            "infra",
+            "--description",
+            "hosts, containers, deploys",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(registered["name"], "infra");
+    assert_eq!(registered["description"], "hosts, containers, deploys");
+    assert_eq!(registered["createdBy"], "geo");
+    assert_eq!(registered["uses"], 0);
+
+    // Registering the same concept twice is the collision the file exists to
+    // prevent, so it is refused rather than treated as an upsert -- a silent
+    // second add would quietly discard the first one's description.
+    let again = fixture.run(&fixture.main, &["tag", "add", "infra", "--json"]);
+    assert!(!again.status.success(), "a tag was registered twice");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("already in the master file"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+
+    // The shape is fixed at the door: `Infra` is refused, not folded to `infra`,
+    // because folding decides on the caller's behalf which spelling was meant.
+    let shouted = fixture.run(&fixture.main, &["tag", "add", "Infra", "--json"]);
+    assert!(!shouted.status.success(), "an uppercase tag was registered");
+    assert!(
+        String::from_utf8_lossy(&shouted.stderr).contains("one concept"),
+        "{}",
+        String::from_utf8_lossy(&shouted.stderr)
+    );
+
+    fixture.ok_json(&fixture.main, &["tag", "add", "queuer", "--json"]);
+    fixture.ok_json(&fixture.main, &["tag", "add", "askie", "--json"]);
+
+    // Every row type carries tags, because the axis is "which subsystem" and a
+    // plan belongs to one as much as the task it produces does.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Queue rework",
+            "--id",
+            "e-plan",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--tag",
+            "queuer",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Retry backoff",
+            "--id",
+            "t-retry",
+            "--parent",
+            "e-plan",
+            "--tag",
+            "queuer",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Chat replies",
+            "--id",
+            "t-chat",
+            "--tag",
+            "askie",
+            "--json",
+        ],
+    );
+
+    let plan = fixture.ok_json(&fixture.main, &["task", "show", "e-plan", "--json"]);
+    assert_eq!(
+        plan["tags"],
+        json!(["infra", "queuer"]),
+        "a draft epic must carry its tags, and read back sorted"
+    );
+
+    // An unregistered tag is refused at the point of use, naming the nearest
+    // registered one and the command that would make this one real -- the same
+    // shape as a mistyped flag, because it is the same mistake.
+    let typo = fixture.run(
+        &fixture.main,
+        &[
+            "task", "update", "t-chat", "--tag", "askiee", "--as", "geo", "--json",
+        ],
+    );
+    assert!(!typo.status.success(), "an unregistered tag was attached");
+    let error = String::from_utf8_lossy(&typo.stderr).to_string();
+    assert!(error.contains("master file"), "{error}");
+    assert!(error.contains("did you mean askie?"), "{error}");
+    assert!(error.contains("tag add askiee"), "{error}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-chat", "--json"])["tags"],
+        json!(["askie"]),
+        "a refused update must leave the existing tags alone"
+    );
+
+    // Listing narrows by tag, and the count is the tag's own answer to
+    // "is anyone using this".
+    let queuer = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--tag", "queuer", "--json"],
+    );
+    let ids = queuer
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(
+        ids.contains(&"e-plan") && ids.contains(&"t-retry"),
+        "{ids:?}"
+    );
+
+    let listed = fixture.ok_json(&fixture.main, &["tag", "list", "--json"]);
+    let uses = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| (row["name"].as_str().unwrap(), row["uses"].as_i64().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        uses,
+        vec![("askie", 1), ("infra", 1), ("queuer", 2)],
+        "tag list must report real use counts, sorted by name"
+    );
+
+    // Filtering by a tag nobody registered is refused rather than answered with
+    // an empty list: an empty list reads as "nothing is tagged that", which is
+    // exactly how a typo becomes a wrong answer somebody acts on.
+    let ghost = fixture.run(&fixture.main, &["task", "list", "--tag", "infr", "--json"]);
+    assert!(!ghost.status.success(), "an unregistered filter answered");
+    let ghost_error = String::from_utf8_lossy(&ghost.stderr).to_string();
+    assert!(ghost_error.contains("did you mean infra?"), "{ghost_error}");
+    assert!(ghost_error.contains("read like an answer"), "{ghost_error}");
+
+    // --tag replaces wholesale rather than appending, and --clear-tags is the
+    // way to say "none" -- passing both is two answers to one question.
+    let both = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "e-plan",
+            "--tag",
+            "infra",
+            "--clear-tags",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !both.status.success(),
+        "--tag and --clear-tags were both taken"
+    );
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("mutually exclusive"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
+    let replaced = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "update", "e-plan", "--tag", "infra", "--as", "geo", "--json",
+        ],
+    );
+    assert_eq!(
+        replaced["tags"],
+        json!(["infra"]),
+        "--tag must replace, not append"
+    );
+
+    // Retiring a tag that rows still carry would strip them silently, so it is
+    // refused and says how many -- the operator gets the number they need to
+    // decide, not just a no.
+    let in_use = fixture.run(&fixture.main, &["tag", "remove", "queuer", "--json"]);
+    assert!(!in_use.status.success(), "an in-use tag was retired");
+    let in_use_error = String::from_utf8_lossy(&in_use.stderr).to_string();
+    assert!(in_use_error.contains("carried by 1 row"), "{in_use_error}");
+    assert!(in_use_error.contains("--force"), "{in_use_error}");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "tag", "remove", "queuer", "--force", "--as", "geo", "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-retry", "--json"])["tags"],
+        json!([]),
+        "forcing a removal must strip the tag from the rows that carried it"
+    );
+
+    // Both halves of the master file land in the audit trail, because a tag
+    // vanishing from every row it labelled is exactly the change someone will
+    // later need explained.
+    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "50", "--json"]);
+    let kinds = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"tag_added"), "{kinds:?}");
+    assert!(kinds.contains(&"tag_removed"), "{kinds:?}");
+    let removal = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "tag_removed")
+        .expect("the removal must be recorded");
+    assert_eq!(removal["payload"]["tag"], "queuer");
+    assert_eq!(
+        removal["payload"]["strippedFrom"], 1,
+        "the trail must say how many rows lost the tag"
+    );
+
+    // And the master file is per board: a second project starts empty rather
+    // than inheriting a vocabulary that was never about it.
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "OTHER", "--json"]);
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.worktree, &["tag", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "tags must not leak between boards"
     );
 }

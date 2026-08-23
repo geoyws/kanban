@@ -159,6 +159,84 @@ fn can_contain(parent_type: &str, child_type: &str) -> bool {
     }
 }
 
+/// A tag name the master file will accept.
+///
+/// Lowercase, digits and hyphens. The point of a registry is that one concept
+/// has one spelling, and `Infra` beside `infra` defeats it before anything else
+/// can — so the shape is fixed at the door rather than argued about later.
+fn validate_tag_name(name: &str) -> Result<String> {
+    let name = nonempty(name, "tag name")?.to_owned();
+    let shaped = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !shaped || name.starts_with('-') || name.ends_with('-') {
+        bail!(
+            "tag {name} is not a usable name: lowercase letters, digits and \
+             inner hyphens only, so one concept cannot arrive under two spellings"
+        );
+    }
+    Ok(name)
+}
+
+/// Attach registered tags to rows that were already read.
+///
+/// One query for the whole set rather than one per row: a board with a thousand
+/// tasks would otherwise pay a thousand round trips to render a list.
+fn attach_tags(connection: &Connection, tasks: &mut [Task]) -> Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let mut statement =
+        connection.prepare("SELECT task_id,tag FROM task_tags ORDER BY task_id,tag")?;
+    let mut by_task: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (task_id, tag) = row?;
+        by_task.entry(task_id).or_default().push(tag);
+    }
+    for task in tasks.iter_mut() {
+        if let Some(tags) = by_task.remove(&task.id) {
+            task.tags = tags;
+        }
+    }
+    Ok(())
+}
+
+/// Replace a row's tags, refusing any the master file does not hold.
+fn set_tags(connection: &Connection, id: &str, tags: &[String]) -> Result<()> {
+    let known = connection
+        .prepare("SELECT name FROM tags ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    connection.execute("DELETE FROM task_tags WHERE task_id=?", [id])?;
+    let mut applied = std::collections::HashSet::new();
+    for tag in tags {
+        let tag = validate_tag_name(tag)?;
+        if !known.contains(&tag) {
+            // The same shape as a mistyped flag: name the nearest thing that
+            // does exist, and the command that would make this one real.
+            let borrowed = known.iter().map(String::as_str).collect::<Vec<_>>();
+            let suggestion = crate::nearest(&tag, &borrowed)
+                .map(|near| format!(", did you mean {near}?"))
+                .unwrap_or_default();
+            bail!(
+                "tag {tag} is not in this board's master file{suggestion} — \
+                 register it first with `tag add {tag}`"
+            );
+        }
+        if applied.insert(tag.clone()) {
+            connection.execute(
+                "INSERT INTO task_tags(task_id,tag) VALUES(?,?)",
+                params![id, tag],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// The nearest ancestor still in draft, if any.
 ///
 /// A draft protects the row it is on and, until this, nothing beneath it. A
@@ -244,6 +322,9 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
         metadata: parse_value(row.get("metadata")?),
+        // Attached after the row is read: a join per task would be a query per
+        // task, and the readers below fill these in one pass.
+        tags: Vec::new(),
     })
 }
 
@@ -547,6 +628,8 @@ pub struct UpdateTask {
     pub driver_only: Option<bool>,
     pub priority: Option<i64>,
     pub dependencies: Option<Vec<String>>,
+    /// `None` leaves tags alone; `Some(list)` replaces them wholesale.
+    pub tags: Option<Vec<String>>,
 }
 
 pub struct ClaimOptions {
@@ -707,6 +790,7 @@ impl Store {
         // record. Measured 2026-08-21 across the live boards, 132 of these
         // carried no actor. An absent actor is still recorded as absent —
         // inventing one would be worse than the gap.
+        set_tags(&transaction, &id, &input.tags)?;
         event(
             &transaction,
             Some(&id),
@@ -719,29 +803,62 @@ impl Store {
     }
 
     pub fn require_task(&self, id: &str) -> Result<Task> {
-        require_task(&self.connection, id)
+        let mut one = vec![require_task(&self.connection, id)?];
+        attach_tags(&self.connection, &mut one)?;
+        Ok(one.remove(0))
     }
 
-    pub fn list_tasks(&self, status: Option<&str>) -> Result<Vec<Task>> {
+    /// Rows, optionally narrowed by status and by tag.
+    ///
+    /// A tag filter checks the master file first: asking for one that was never
+    /// registered returns an empty list otherwise, which reads exactly like
+    /// "nothing is tagged that" and is how a typo becomes a wrong answer.
+    pub fn list_tasks(&self, status: Option<&str>, tag: Option<&str>) -> Result<Vec<Task>> {
         if let Some(value) = status {
             validate(value, &TASK_STATUSES, "task status")?;
         }
-        let (sql, values) = if let Some(value) = status {
-            (
-                "SELECT * FROM tasks WHERE status=? ORDER BY priority,created_at,id",
-                vec![value],
-            )
+        let mut clauses = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(value) = status {
+            clauses.push("status=?");
+            values.push(Box::new(value.to_owned()));
+        }
+        if let Some(tag) = tag {
+            let tag = validate_tag_name(tag)?;
+            let known: Option<String> = self
+                .connection
+                .query_row("SELECT name FROM tags WHERE name=?", [&tag], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if known.is_none() {
+                let names = self.tags()?.into_iter().map(|t| t.name).collect::<Vec<_>>();
+                let borrowed = names.iter().map(String::as_str).collect::<Vec<_>>();
+                let suggestion = crate::nearest(&tag, &borrowed)
+                    .map(|near| format!(", did you mean {near}?"))
+                    .unwrap_or_default();
+                bail!(
+                    "tag {tag} is not in this board's master file{suggestion} — \
+                     an unregistered tag would filter to nothing and read like an answer"
+                );
+            }
+            clauses.push("id IN (SELECT task_id FROM task_tags WHERE tag=?)");
+            values.push(Box::new(tag));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
         } else {
-            (
-                "SELECT * FROM tasks ORDER BY priority,created_at,id",
-                Vec::new(),
-            )
+            format!(" WHERE {}", clauses.join(" AND "))
         };
-        let mut statement = self.connection.prepare(sql)?;
-        statement
-            .query_map(params_from_iter(values), task_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let sql = format!("SELECT * FROM tasks{where_clause} ORDER BY priority,created_at,id");
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement
+            .query_map(params_from_iter(refs), task_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_tags(&self.connection, &mut rows)?;
+        Ok(rows)
     }
 
     pub fn dependencies(&self, id: &str) -> Result<Vec<Task>> {
@@ -983,6 +1100,9 @@ impl Store {
                     params![id, dependency],
                 )?;
             }
+        }
+        if let Some(tags) = &input.tags {
+            set_tags(&transaction, id, tags)?;
         }
         // Name what moved, and keep the one value whose loss is unrecoverable.
         // Everything else can be read off the row; a replaced body cannot.
@@ -1294,6 +1414,102 @@ impl Store {
     /// The agent raising it names the kind, because "what sort of thing is
     /// this" is the part a reader needs first and the part an agent knows and
     /// a reader would have to infer from prose.
+    /// Register a tag in this board's master file.
+    pub fn add_tag(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        actor: Option<&str>,
+    ) -> Result<Tag> {
+        let name = validate_tag_name(name)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: Option<String> = transaction
+            .query_row("SELECT name FROM tags WHERE name=?", [&name], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if exists.is_some() {
+            bail!("tag {name} is already in the master file");
+        }
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO tags(name,description,created_by,created_at) VALUES(?,?,?,?)",
+            params![name, description, actor, now],
+        )?;
+        event(
+            &transaction,
+            None,
+            "tag_added",
+            actor,
+            json!({ "tag": name }),
+        )?;
+        transaction.commit()?;
+        self.tag(&name)
+    }
+
+    fn tag(&self, name: &str) -> Result<Tag> {
+        self.tags()?
+            .into_iter()
+            .find(|tag| tag.name == name)
+            .with_context(|| format!("tag {name} not found"))
+    }
+
+    /// The master file, with how many rows carry each entry.
+    pub fn tags(&self) -> Result<Vec<Tag>> {
+        let mut statement = self.connection.prepare(
+            "SELECT t.name,t.description,t.created_by,t.created_at,
+                    (SELECT count(*) FROM task_tags x WHERE x.tag=t.name) AS uses
+             FROM tags t ORDER BY t.name",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(Tag {
+                    name: row.get("name")?,
+                    description: row.get("description")?,
+                    created_by: row.get("created_by")?,
+                    created_at: row.get("created_at")?,
+                    uses: row.get("uses")?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Retire a tag. One still in use needs `--force`, and says how many rows.
+    pub fn remove_tag(&mut self, name: &str, actor: Option<&str>, force: bool) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let uses: i64 = transaction.query_row(
+            "SELECT count(*) FROM task_tags WHERE tag=?",
+            [name],
+            |row| row.get(0),
+        )?;
+        if uses > 0 && !force {
+            bail!(
+                "tag {name} is carried by {uses} row{}; removing it would strip them \
+                 silently — pass --force to do it anyway",
+                if uses == 1 { "" } else { "s" }
+            );
+        }
+        transaction.execute("DELETE FROM task_tags WHERE tag=?", [name])?;
+        let removed = transaction.execute("DELETE FROM tags WHERE name=?", [name])?;
+        if removed == 0 {
+            bail!("tag {name} is not in the master file");
+        }
+        event(
+            &transaction,
+            None,
+            "tag_removed",
+            actor,
+            json!({ "tag": name, "strippedFrom": uses }),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn raise_attention(
         &mut self,
         body: &str,
@@ -2072,6 +2288,7 @@ mod tests {
             updated_at: 0,
             completed_at: None,
             metadata: json!({}),
+            tags: Vec::new(),
         };
 
         // An epic holds anything, including another epic: a plan is an epic, so
@@ -2158,6 +2375,43 @@ mod tests {
             .to_string();
         assert!(epic.contains("e-1"), "{epic}");
         assert!(epic.contains("children"), "{epic}");
+    }
+
+    #[test]
+    fn a_tag_name_has_exactly_one_spelling() {
+        for good in ["infra", "queuer", "askie", "px-crm", "v2", "a"] {
+            assert_eq!(
+                validate_tag_name(good).expect("a plain name is usable"),
+                good
+            );
+        }
+
+        // The whole value of a master file is that one concept has one
+        // spelling. Case, spaces and punctuation are each a way for a second
+        // spelling of the same thing to enter, so all three are refused at the
+        // door rather than deduplicated afterwards.
+        for bad in ["Infra", "in fra", "in_fra", "in.fra", "infra!", "INFRA"] {
+            let error = validate_tag_name(bad)
+                .expect_err(&format!("tag {bad} must be refused"))
+                .to_string();
+            assert!(error.contains("one concept"), "{error}");
+        }
+
+        // A leading or trailing hyphen is legal ASCII but reads as the same tag
+        // as its trimmed form, which is the collision this is guarding.
+        for edge in ["-infra", "infra-", "-"] {
+            assert!(
+                validate_tag_name(edge).is_err(),
+                "tag {edge} must be refused"
+            );
+        }
+
+        // An empty name is caught before the shape check, so it must still say
+        // which field was empty rather than talking about hyphens.
+        let empty = validate_tag_name("  ")
+            .expect_err("an empty tag name is not a tag")
+            .to_string();
+        assert!(empty.contains("tag name"), "{empty}");
     }
 
     #[test]

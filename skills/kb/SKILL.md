@@ -47,6 +47,7 @@ Scoped to their group:
 | `story` | `adv`=advance |
 | `handoff` | `ls`=list `new`=create `acc`=accept |
 | `workspace` | `ls`=list `att`=attach |
+| `tag` | `ls`=list `rm`=remove `new`=add |
 
 ⚠ `att` means **attach** inside `workspace` and **attention** at the top level.
 Both are exact-match and scoped, so they never collide — but read
@@ -232,6 +233,43 @@ directly writable, since the gate cannot express either.
 **The tree is enforced**: an epic contains stories, a story contains tasks, a
 task contains nothing.
 
+## Tags — which part of the system this is about
+
+**Tag your rows.** A board that cannot say whether a task is infra, queuer or
+askie makes you read titles to find out, and you are the one who knows.
+
+```bash
+kb tag ls --json                                   # the vocabulary, with use counts
+kb tag new infra --description "hosts, containers, deploys" --as "$AGENT" --json
+kb t new "Retry backoff" --tag queuer --tag infra --json
+kb t up <id> --tag queuer --as "$AGENT" --json     # replaces, does not append
+kb t up <id> --clear-tags --as "$AGENT" --json     # the only way to say "none"
+kb t ls --status todo --tag queuer --json          # open work in one subsystem
+```
+
+**Read `kb tag ls` before you tag.** The vocabulary is a per-board **master
+file**: only a registered tag can be attached, and attaching an unregistered one
+is refused naming the nearest match. That refusal is the feature — it is what
+stops `infra`, `Infra` and `infrastructure` becoming three answers to one
+question.
+
+**If nothing fits, register it** with a description, then use it. Do not leave
+the row unfiled and do not smuggle the subject into the title. Registering is one
+command and it is paid once per concept, by whoever names it first.
+
+Names are lowercase letters, digits and inner hyphens. `Infra` is refused rather
+than folded — folding would decide for you which spelling you meant.
+
+Tags go on **every row type**, drafts and epics included: a plan belongs to a
+subsystem as much as the task it produces does.
+
+**Tags are not lanes.** `lane` is *who picks this up* and `claim --next` routes
+on it; a tag is *what part of the system this touches*. Putting a subsystem in
+`lane` silently changes which driver receives the work.
+
+Retiring a tag rows still carry is refused and says how many; `--force` strips it
+from them and records the count in the trail.
+
 ## Provenance — where and when work happened
 
 Recorded automatically. You do not pass it, and you should not have to:
@@ -304,10 +342,15 @@ once a silent wrong answer.
   reported, never silently recreated.
 - `restore` takes the data root exclusively and refuses while anything else
   holds it.
+- A tag that is not in the board's master file is refused on attach **and on
+  filter**. `kb t ls --tag infr` does not answer "nothing" — an empty list reads
+  like a finding, and that is how a typo becomes a wrong answer somebody acts on.
+- `--tag` and `--clear-tags` together are refused rather than ranked, like every
+  other pair of answers to one question.
 
 ## Reference
 
 `docs/adr/` in the kanban repo carries the reasoning. Most load-bearing:
 ADR-008 (fail closed), ADR-010 (adapters generated from the surface),
 ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
-attention).
+attention), ADR-013 (plans are epics), ADR-015 (tags are a master file).
