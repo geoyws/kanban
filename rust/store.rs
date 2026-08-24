@@ -27,6 +27,10 @@ fn validate_rule_body(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_rule_actor(value: &str) -> Result<&str> {
+    nonempty(value, "author")
+}
+
 fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     if !allowed.contains(&value) {
         bail!("invalid {label} {value}");
@@ -1578,7 +1582,7 @@ impl Store {
     pub fn add_rule(&mut self, body: &str, actor: &str) -> Result<Rule> {
         validate_rule_body(body)?;
         let body = body.to_owned();
-        let actor = nonempty(actor, "author")?.to_owned();
+        let actor = validate_rule_actor(actor)?.to_owned();
         let id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let transaction = self
             .connection
@@ -1654,7 +1658,7 @@ impl Store {
     pub fn update_rule(&mut self, id: &str, body: &str, actor: &str) -> Result<Rule> {
         validate_rule_body(body)?;
         let body = body.to_owned();
-        let actor = nonempty(actor, "author")?.to_owned();
+        let actor = validate_rule_actor(actor)?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1680,7 +1684,7 @@ impl Store {
 
     /// Retire a rule from the active set without erasing it.
     pub fn retire_rule(&mut self, id: &str, actor: &str) -> Result<Rule> {
-        let actor = nonempty(actor, "author")?.to_owned();
+        let actor = validate_rule_actor(actor)?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2560,6 +2564,37 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rule_requires_a_nonempty_first_line_and_preserves_valid_body_text() {
+        for invalid in ["", "   ", "\nDetail without a headline", "  \nDetail"] {
+            assert!(
+                validate_rule_body(invalid).is_err(),
+                "invalid rule body was accepted: {invalid:?}"
+            );
+        }
+
+        for valid in [
+            "One-line rule.",
+            "Headline.\n\nSupporting detail remains available lazily.\n",
+        ] {
+            assert!(
+                validate_rule_body(valid).is_ok(),
+                "valid rule body was refused: {valid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_actor_must_name_its_author() {
+        for invalid in ["", " ", "\n\t"] {
+            let error = validate_rule_actor(invalid)
+                .expect_err("an empty rule author was accepted")
+                .to_string();
+            assert!(error.contains("author"), "{error}");
+        }
+        assert_eq!(validate_rule_actor("codex@driver").unwrap(), "codex@driver");
+    }
 
     #[test]
     fn priority_is_bounded_to_the_documented_band() {
