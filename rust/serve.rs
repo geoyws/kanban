@@ -23,7 +23,7 @@
 //! state, and an HTTP server holds accepted connections. Saying so plainly is
 //! cheaper than someone discovering it during an update.
 
-use crate::model::{Attention, ProjectRecord, Task};
+use crate::model::{Attention, ProjectRecord, StatusUpdate, Task};
 use crate::registry::{Registry, now_ms};
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -105,6 +105,7 @@ fn render(url: &str) -> Result<String> {
         [] => needs_you(),
         ["boards"] => boards(),
         ["plans"] => plans(),
+        ["lanes"] => lanes(),
         ["board", project] => board(project),
         ["task", project, id] => task_detail(project, id),
         _ => Ok(page(
@@ -281,11 +282,11 @@ fn plans() -> Result<String> {
             html.push_str(&format!(
                 "<h2><a href=\"/task/{project}/{id}\">{title}</a></h2>\
                  <p class=meta><a href=\"/board/{project}\">{project}</a> · \
-                 {id} · drafted {age} ago{tags}</p>",
+                 {id} · drafted {age}{tags}</p>",
                 project = escape(&project.name),
                 id = escape(&plan.id),
                 title = escape(&plan.title),
-                age = age(plan.created_at),
+                age = ago(plan.created_at),
                 tags = tag_list(&plan.tags),
             ));
             let children = tasks
@@ -331,6 +332,66 @@ fn plans() -> Result<String> {
         );
     }
     Ok(page("Plans", &html))
+}
+
+/// Where every lane stands, newest first.
+///
+/// The counterpart to Needs you: that page is what waits on the operator, this
+/// is what the agents are doing. A lane that has been posting is legible here
+/// without anyone opening a terminal or waiting for a handoff.
+fn lanes() -> Result<String> {
+    let mut by_lane: std::collections::BTreeMap<(String, String), Vec<StatusUpdate>> =
+        std::collections::BTreeMap::new();
+    for (project, store) in projects()? {
+        for update in store.statuses(None, false, None, 200)? {
+            by_lane
+                .entry((project.name.clone(), update.lane.clone()))
+                .or_default()
+                .push(update);
+        }
+    }
+    let mut html = String::from("<h1>Lanes</h1>");
+    if by_lane.is_empty() {
+        html.push_str(
+            "<p class=empty>No lane has posted a status. \
+             <code>kb st new \"…\" --as AGENT --lane LANE</code> writes one — no task \
+             and no lease required, which is the point of it.</p>",
+        );
+        return Ok(page("Lanes", &html));
+    }
+    for ((project, lane), updates) in &by_lane {
+        html.push_str("<article class=item>");
+        html.push_str(&format!(
+            "<h2>{lane} <span class=count><a href=\"/board/{project_url}\">{project}</a></span></h2>",
+            lane = escape(lane),
+            project_url = escape(project),
+            project = escape(project),
+        ));
+        for update in updates {
+            html.push_str(&format!(
+                "<p class=meta>{author} · {age}{task}{branch}</p><p class=body>{body}</p>",
+                author = escape(&update.author),
+                age = ago(update.created_at),
+                task = update
+                    .task_id
+                    .as_ref()
+                    .map(|id| format!(
+                        " · <a href=\"/task/{project}/{id}\">{id}</a>",
+                        project = escape(project),
+                        id = escape(id)
+                    ))
+                    .unwrap_or_default(),
+                branch = update
+                    .branch
+                    .as_ref()
+                    .map(|branch| format!(" · <span class=lane>{}</span>", escape(branch)))
+                    .unwrap_or_default(),
+                body = escape(&update.body),
+            ));
+        }
+        html.push_str("</article>");
+    }
+    Ok(page("Lanes", &html))
 }
 
 /// One board's rows, grouped by status in workflow order.
@@ -606,6 +667,19 @@ fn age(ms: i64) -> String {
     }
 }
 
+/// How long ago, as a phrase that reads correctly in a sentence.
+///
+/// `age` alone produced "just now ago", because the shortest interval is
+/// already a complete phrase and the rest are bare durations.
+fn ago(ms: i64) -> String {
+    let text = age(ms);
+    if text == "just now" {
+        text
+    } else {
+        format!("{text} ago")
+    }
+}
+
 /// Days since the epoch to a civil date (Howard Hinnant's algorithm).
 ///
 /// Written out rather than pulled in: a date crate would be a sixth dependency
@@ -634,8 +708,8 @@ fn page(title: &str, body: &str) -> String {
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
-         <nav><a href=\"/\">Needs you</a><a href=\"/boards\">Boards</a>\
-         <a href=\"/plans\">Plans</a></nav><main>{body}</main>\
+         <nav><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
+         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a></nav><main>{body}</main>\
          <footer>read-only · <code>kanban serve</code></footer></body></html>",
         title = escape(title),
     )
@@ -800,6 +874,16 @@ mod tests {
         assert_eq!(age(now - 3 * 24 * 60 * 60_000), "72h");
         // A stamp from the future is not negative time; it is "just now".
         assert_eq!(age(now + 60_000), "just now");
+    }
+
+    #[test]
+    fn an_elapsed_phrase_reads_correctly_in_a_sentence() {
+        // "just now" is already a complete phrase; the rest are bare
+        // durations. Appending "ago" to both produced "just now ago".
+        let now = now_ms();
+        assert_eq!(ago(now), "just now");
+        assert_eq!(ago(now - 45 * 60_000), "45 min ago");
+        assert_eq!(ago(now - 90 * 60_000), "1h30m ago");
     }
 
     #[test]

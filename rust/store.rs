@@ -378,6 +378,23 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     })
 }
 
+fn status_row(row: &Row<'_>) -> rusqlite::Result<StatusUpdate> {
+    Ok(StatusUpdate {
+        id: row.get("id")?,
+        lane: row.get("lane")?,
+        task_id: row.get("task_id")?,
+        author: row.get("author")?,
+        body: row.get("body")?,
+        worktree: row.get("worktree")?,
+        branch: row.get("branch")?,
+        head_sha: row.get("head_sha")?,
+        root_head: row.get("root_head")?,
+        dirty_summary: row.get("dirty_summary")?,
+        archived: row.get::<_, i64>("archived")? != 0,
+        created_at: row.get("created_at")?,
+    })
+}
+
 fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
         id: row.get("id")?,
@@ -600,6 +617,27 @@ fn require_free_lease(
 
 /// Keep the newest `limit` entries of an oldest-first list.
 /// Returns true when anything was dropped.
+/// How many status updates stay *current* in one lane.
+///
+/// Ten is what a reader will actually read to answer "where are things". The
+/// eleventh does not stop existing, it stops being current — which is the
+/// distinction that makes bounding this safe.
+const CURRENT_STATUS_PER_LANE: i64 = 10;
+
+// Nothing deletes a status update.
+//
+// A hard retention cap was written here and then removed. It would have been
+// the first thing in this ledger that destroys a record — attention items are
+// resolved rather than deleted, handoffs outlive the task they were about,
+// and the event trail is append-only. Archiving bounds the *view*, which is
+// what "old entries get archived" asks for; bounding the *table* is a
+// deliberate operator-run prune over a whole board, not a silent side effect
+// of somebody posting an update.
+//
+// The growth this leaves is the growth `events` and `task_notes` already
+// have, so singling this table out would have been inconsistent as well as
+// destructive. Measured 2026-08-24: 9.6 MB across all thirteen boards.
+
 fn keep_newest<T>(list: &mut Vec<T>, limit: usize) -> bool {
     if list.len() <= limit {
         return false;
@@ -1510,6 +1548,117 @@ impl Store {
         Ok(())
     }
 
+    /// Post where a lane stands, and retire what that supersedes.
+    ///
+    /// No lease, no task, no ceremony: the cost of writing one has to stay low
+    /// enough that an agent writes twenty a day, because the alternative it is
+    /// competing with is a reply that scrolls away.
+    ///
+    /// Provenance is captured rather than asked for, the same way a claim's is
+    /// — an update that says "tests green" without saying which checkout is a
+    /// claim nobody can check.
+    pub fn post_status(
+        &mut self,
+        lane: &str,
+        body: &str,
+        author: &str,
+        task_id: Option<&str>,
+        git: Option<&crate::gitctx::GitContext>,
+    ) -> Result<StatusUpdate> {
+        let lane = nonempty(lane, "lane")?.to_owned();
+        let body = nonempty(body, "status body")?.to_owned();
+        let author = nonempty(author, "author")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(id) = task_id {
+            require_task(&transaction, id)?;
+        }
+        let now = now_ms();
+        let id = format!("u-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        transaction.execute(
+            "INSERT INTO status_updates(id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at) \
+             VALUES(?,?,?,?,?,?,?,?,?,?,0,?)",
+            params![
+                id,
+                lane,
+                task_id,
+                author,
+                body,
+                git.map(|c| c.worktree.clone()),
+                git.and_then(|c| c.branch.clone()),
+                git.map(|c| c.head.clone()),
+                git.and_then(|c| c.root_head.clone()),
+                git.map(crate::gitctx::dirty_summary),
+                now,
+            ],
+        )?;
+        // Archiving happens on write rather than on a timer. Nothing has to be
+        // scheduled, and the current view is bounded the moment it would have
+        // stopped being current.
+        let archived = transaction.execute(
+            "UPDATE status_updates SET archived=1 WHERE lane=? AND archived=0 AND id NOT IN \
+             (SELECT id FROM status_updates WHERE lane=? AND archived=0 ORDER BY created_at DESC, id DESC LIMIT ?)",
+            params![lane, lane, CURRENT_STATUS_PER_LANE],
+        )?;
+        event(
+            &transaction,
+            task_id,
+            "status_posted",
+            Some(&author),
+            json!({"statusID": id, "lane": lane, "archived": archived}),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM status_updates WHERE id=?", [&id], status_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Where things stand, newest first.
+    ///
+    /// Newest-first, unlike `attention`: the question this answers is "what is
+    /// true now", and the newest update is the answer. Archived rows are
+    /// excluded by default and readable on request — hidden, never gone.
+    pub fn statuses(
+        &self,
+        lane: Option<&str>,
+        include_archived: bool,
+        task: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StatusUpdate>> {
+        if let Some(id) = task {
+            require_task(&self.connection, id)?;
+        }
+        let mut clauses = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(lane) = lane {
+            clauses.push("lane=?");
+            values.push(Box::new(lane.to_owned()));
+        }
+        if let Some(task) = task {
+            clauses.push("task_id=?");
+            values.push(Box::new(task.to_owned()));
+        }
+        if !include_archived {
+            clauses.push("archived=0");
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        values.push(Box::new(limit));
+        let sql = format!(
+            "SELECT * FROM status_updates{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?"
+        );
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(params_from_iter(refs), status_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn raise_attention(
         &mut self,
         body: &str,
@@ -2173,6 +2322,7 @@ impl Store {
         const NOTES: usize = 100;
         const CHECKPOINTS: usize = 20;
         const HANDOFFS: usize = 20;
+        const STATUSES: usize = 20;
         let task = self.require_task(id)?;
         // Over-fetch by one so "there is older history" is measured, not
         // assumed. `truncated` was hardcoded false, so a resuming agent was
@@ -2181,9 +2331,15 @@ impl Store {
         let mut checkpoints = self.checkpoints(id, CHECKPOINTS as i64 + 1)?;
         let mut handoffs = self.handoffs(Some(id), None, None, HANDOFFS as i64 + 1)?;
         handoffs.reverse();
+        // Archived ones included: the packet is what a successor reads to
+        // reconstruct the work, and "superseded as the current view" is not
+        // the same as "not worth knowing" to somebody starting cold.
+        let mut statuses = self.statuses(None, true, Some(id), STATUSES as i64 + 1)?;
+        statuses.reverse();
         let mut truncated = keep_newest(&mut notes, NOTES);
         truncated |= keep_newest(&mut checkpoints, CHECKPOINTS);
         truncated |= keep_newest(&mut handoffs, HANDOFFS);
+        truncated |= keep_newest(&mut statuses, STATUSES);
         Ok(ContextPacket {
             task,
             ancestors: self.ancestors(id)?,
@@ -2192,6 +2348,7 @@ impl Store {
             notes,
             checkpoints,
             handoffs,
+            statuses,
             generated_at: now_ms(),
             truncated,
         })

@@ -29,6 +29,7 @@ near-miss flag is *suggested* in the error, never accepted.
 | `s` | `story` |
 | `h` | `handoff` |
 | `att`, `attn` | `attention` |
+| `st` | `status` |
 | `w`, `ws` | `workspace` |
 | `cp` | `checkpoint` |
 | `hb` | `heartbeat` |
@@ -48,6 +49,7 @@ Scoped to their group:
 | `handoff` | `ls`=list `new`=create `acc`=accept |
 | `workspace` | `ls`=list `att`=attach |
 | `tag` | `ls`=list `rm`=remove `new`=add |
+| `status` | `ls`=list `new`=post |
 
 ⚠ `att` means **attach** inside `workspace` and **attention** at the top level.
 Both are exact-match and scoped, so they never collide — but read
@@ -117,6 +119,46 @@ being ignored.
 
 Still surface the item in your reply as well. The board makes it survive; the
 reply makes George see it now. In one and not the other is a bug.
+
+## Status updates — where a lane stands, cheaply
+
+```bash
+kb st new "Retry path is the culprit; fix is in the queuer, tests still red." \
+  --as "$AGENT" --lane driver-2 --json          # --task <ID> optional
+kb st ls --lane driver-2 --json                 # the current view, newest first
+kb st ls --lane driver-2 --all --json           # including what it superseded
+```
+
+**No task, no lease, no ceremony** — that is the whole point. A note needs a
+task; a checkpoint needs a task *and* a live lease. Work done across tasks,
+between them, or before anything is claimed had nowhere to go, so it went into a
+reply that scrolls away.
+
+**Post often.** This is the one record here cheap enough to write twenty times a
+day, and it is what a successor reads when there was no time to write a handoff.
+`kb ctx <id>` carries the updates that mention a task, so they reach a resuming
+agent without anyone going looking.
+
+**Old entries archive themselves.** Posting retires everything past the newest
+ten in that lane. Archived updates are hidden from the default read and returned
+by `--all` — **nothing is ever deleted**, and archiving is per lane, so another
+driver's chatter cannot push yours out of view.
+
+Provenance rides along: worktree, branch, HEAD, root HEAD, dirty count are
+captured from where you ran it. "Tests green" that does not say which checkout is
+a claim nobody can check.
+
+**A status update is not a handoff, and not a task status.**
+
+| | what it is | costs |
+|---|---|---|
+| `kb st new` | where this lane stands right now | one command |
+| `kb cp` | a resumable point on a task you hold | a lease |
+| `kb h new` | *I am leaving, here is everything* | releases the lease, names a successor |
+
+A task's **status** is a workflow state (`todo`, `in_progress`) and is always the
+`--status` flag. A **status update** is prose about a lane and is always the
+`status` command. They never occupy the same position.
 
 ## Handoffs — task and session
 
@@ -321,6 +363,7 @@ renders what the CLI reads and writes nothing.
 
 - **Needs you** (the landing page) — every open attention item across every
   board, oldest first, with its kind, who raised it and how long it has waited.
+- **Lanes** — the counterpart: what every lane last reported, newest first.
 - **Boards** — the `kb dash` projection as a table.
 - **Plans** — draft epics with their bodies, each naming the work it holds back.
 - **Task detail** — notes, checkpoints, the event trail, and the provenance of
@@ -374,4 +417,4 @@ once a silent wrong answer.
 ADR-008 (fail closed), ADR-010 (adapters generated from the surface),
 ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
 attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
-ADR-016 (the web view).
+ADR-016 (the web view), ADR-017 (status updates).

@@ -67,6 +67,8 @@ Usage:
              [--task ID] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--limit N] [--json]
   kanban attention resolve ID --as ACTOR [--note TEXT] [--json]
+  kanban status post TEXT --as AGENT --lane LANE [--task ID] [--json]
+  kanban status list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
@@ -100,7 +102,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 20] = [
+pub(crate) const BOOLEAN: [&str; 21] = [
     "help",
     "json",
     "version",
@@ -121,6 +123,7 @@ pub(crate) const BOOLEAN: [&str; 20] = [
     "reconcile",
     "dry-run",
     "verify",
+    "all",
 ];
 
 /// Flags that may be given more than once, because their value is a list.
@@ -391,6 +394,20 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id"],
         false,
     ),
+    (
+        "status",
+        Some("post"),
+        &["as", "lane", "task"],
+        &["text"],
+        false,
+    ),
+    (
+        "status",
+        Some("list"),
+        &["lane", "task", "limit", "all"],
+        &[],
+        true,
+    ),
     ("events", None, &["task", "kind", "limit"], &[], true),
     ("stale", None, &[], &[], true),
     ("context", None, &["max-chars"], &["id"], true),
@@ -419,7 +436,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 7] = [
+const SUBCOMMAND_GROUPS: [&str; 8] = [
     "task",
     "story",
     "handoff",
@@ -427,6 +444,7 @@ const SUBCOMMAND_GROUPS: [&str; 7] = [
     "workspace",
     "attention",
     "tag",
+    "status",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -444,6 +462,7 @@ fn canonical_command(value: &str) -> &str {
         "hb" => "heartbeat",
         "ctx" => "context",
         "att" | "attn" => "attention",
+        "st" => "status",
         "ev" => "events",
         "dash" => "dashboard",
         "rel" => "release",
@@ -477,6 +496,8 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("tag", "ls") => "list",
         ("tag", "new") => "add",
         ("tag", "rm") => "remove",
+        ("status", "ls") => "list",
+        ("status", "new") => "post",
         (_, other) => other,
     }
 }
@@ -1835,6 +1856,30 @@ fn run() -> Result<()> {
         let id = rest.first().context("attention id is required")?;
         return print(
             &store.resolve_attention(id, args.require("as")?, args.one("note"))?,
+            args.has("json"),
+        );
+    }
+    if command == "status" && sub == Some("post") {
+        let text = rest.first().context("status text is required")?;
+        return print(
+            &store.post_status(
+                args.require("lane")?,
+                text,
+                args.require("as")?,
+                args.one("task"),
+                here().as_ref(),
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "status" && sub == Some("list") {
+        return print(
+            &store.statuses(
+                args.one("lane"),
+                args.has("all"),
+                args.one("task"),
+                args.limit(20)?,
+            )?,
             args.has("json"),
         );
     }

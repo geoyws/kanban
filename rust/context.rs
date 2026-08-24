@@ -1,4 +1,4 @@
-use crate::model::{Checkpoint, ContextPacket, Handoff, Task, TaskNote};
+use crate::model::{Checkpoint, ContextPacket, Handoff, StatusUpdate, Task, TaskNote};
 use crate::store::Store;
 use anyhow::{Result, bail};
 
@@ -42,6 +42,29 @@ fn render_checkpoint(checkpoint: &Checkpoint) -> String {
     }
     if let Some(dirty) = &checkpoint.dirty_summary {
         lines.push(format!("Working tree: {dirty}"));
+    }
+    lines.join("\n")
+}
+
+/// The most recent status update, which for a lane that has been posting is
+/// fresher than any checkpoint and cheaper than any handoff.
+fn render_status(status: &StatusUpdate) -> String {
+    let mut lines = vec![format!(
+        "[{}] {} · {}{}",
+        status.lane,
+        status.author,
+        status.body,
+        if status.archived { " (archived)" } else { "" }
+    )];
+    if let Some(branch) = &status.branch {
+        lines.push(format!(
+            "branch {branch}{}",
+            status
+                .head_sha
+                .as_deref()
+                .map(|sha| format!(" @ {}", &sha[..sha.len().min(8)]))
+                .unwrap_or_default()
+        ));
     }
     lines.join("\n")
 }
@@ -157,8 +180,10 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
     .join("\n");
     let newest_checkpoint = packet.checkpoints.last();
     let newest_handoff = packet.handoffs.last();
+    let newest_status = packet.statuses.last();
     let required = format!(
-        "{fixed}\n\n## Latest checkpoint\n{}\n\n## Latest handoff\n{}",
+        "{fixed}\n\n## Latest status\n{}\n\n## Latest checkpoint\n{}\n\n## Latest handoff\n{}",
+        newest_status.map_or_else(|| "(none)".to_owned(), render_status),
         newest_checkpoint.map_or_else(|| "(none)".to_owned(), render_checkpoint),
         newest_handoff.map_or_else(|| "(none)".to_owned(), render_handoff)
     );
@@ -178,6 +203,13 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .claim
                     .as_ref()
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
+            ),
+            format!(
+                "Status: {}",
+                clip(
+                    newest_status.map_or("(none)", |value| value.body.as_str()),
+                    240
+                )
             ),
             String::new(),
             "## Latest checkpoint".to_owned(),

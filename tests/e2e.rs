@@ -3672,6 +3672,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
             "tag list" => vec!["tag", "list"],
+            "status list" => vec!["status", "list"],
             "schema" => vec!["schema"],
             "events" => vec!["events"],
             "stale" => vec!["stale"],
@@ -5740,6 +5741,31 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     assert!(boards.contains("SERVED"), "{boards}");
 
     // Plans: a draft epic is the plan, and it names the work it holds back.
+    // Lanes: what the agents are doing, the counterpart to what waits on the
+    // operator. A status needs no task and no lease, which is the whole point.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "Queue rework <i>underway</i>; retry path is the culprit.",
+            "--as",
+            "claude@driver-2",
+            "--lane",
+            "driver-2",
+            "--json",
+        ],
+    );
+    let (status, lanes) = http_get(port, "/lanes");
+    assert_eq!(status, 200);
+    assert!(lanes.contains("driver-2"), "{lanes}");
+    assert!(lanes.contains("retry path is the culprit"), "{lanes}");
+    assert!(
+        lanes.contains("&lt;i&gt;underway&lt;/i&gt;"),
+        "a status body was not escaped: {lanes}"
+    );
+    assert!(!lanes.contains("<i>underway</i>"), "{lanes}");
+
     let (status, plans) = http_get(port, "/plans");
     assert_eq!(status, 200);
     assert!(plans.contains("Plan the migration"), "{plans}");
@@ -5906,5 +5932,244 @@ fn a_reader_that_hangs_up_ends_the_command_quietly() {
         String::from_utf8_lossy(&broken.stderr).contains("t-nope"),
         "{}",
         String::from_utf8_lossy(&broken.stderr)
+    );
+}
+
+#[test]
+fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
+    // A note needs a task. A checkpoint needs a task AND a lease. So an agent
+    // working across several tasks, between them, or exploring before it has
+    // claimed anything had nowhere to write down where things stand -- and it
+    // went into a reply that scrolls away. This is the low-ceremony sibling of
+    // a handoff: lane-keyed, no lease, no task required.
+    let fixture = Fixture::new("status");
+    fixture.ok_json(&fixture.main, &["init", "--name", "STATUS", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Some work", "--id", "t-1", "--json"],
+    );
+
+    // No lease anywhere in this call, and no task.
+    let first = fixture.ok_json(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "Reading the queue code; nothing changed yet.",
+            "--as",
+            "claude@driver-2",
+            "--lane",
+            "driver-2",
+            "--json",
+        ],
+    );
+    assert_eq!(first["lane"], "driver-2");
+    assert_eq!(first["author"], "claude@driver-2");
+    assert_eq!(first["archived"], false);
+    assert!(first["id"].as_str().unwrap().starts_with("u-"));
+    assert_eq!(first["taskID"], serde_json::Value::Null);
+
+    // A task link is optional, and a task that does not exist is refused --
+    // a status pointing at nothing would read as context and carry none.
+    let linked = fixture.ok_json(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "Retry path is the culprit.",
+            "--as",
+            "claude@driver-2",
+            "--lane",
+            "driver-2",
+            "--task",
+            "t-1",
+            "--json",
+        ],
+    );
+    assert_eq!(linked["taskID"], "t-1");
+    let ghost = fixture.run(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "About nothing",
+            "--as",
+            "a",
+            "--lane",
+            "driver-2",
+            "--task",
+            "t-nope",
+            "--json",
+        ],
+    );
+    assert!(
+        !ghost.status.success(),
+        "a status pointed at a missing task"
+    );
+    assert!(
+        String::from_utf8_lossy(&ghost.stderr).contains("t-nope"),
+        "{}",
+        String::from_utf8_lossy(&ghost.stderr)
+    );
+
+    // Lanes do not bleed into each other: the question is "where does THIS
+    // lane stand", and another driver's updates are not an answer to it.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "Different lane entirely.",
+            "--as",
+            "claude@driver-1",
+            "--lane",
+            "driver-1",
+            "--json",
+        ],
+    );
+    let mine = fixture.ok_json(
+        &fixture.main,
+        &["status", "list", "--lane", "driver-2", "--json"],
+    );
+    assert_eq!(mine.as_array().unwrap().len(), 2);
+    // Newest first: the question this answers is "what is true now".
+    assert_eq!(mine[0]["id"], linked["id"]);
+    assert_eq!(mine[1]["id"], first["id"]);
+
+    // Provenance is captured, not asked for -- an update saying "tests green"
+    // without saying which checkout is a claim nobody can check. The fixture
+    // is not a repository, so it is recorded as absent rather than invented.
+    assert_eq!(mine[0]["branch"], serde_json::Value::Null);
+
+    // Auto-archiving. Ten stay current per lane; the eleventh does not delete
+    // the first, it retires it.
+    for index in 0..12 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "status",
+                "post",
+                &format!("Update number {index}"),
+                "--as",
+                "claude@driver-2",
+                "--lane",
+                "driver-2",
+                "--json",
+            ],
+        );
+    }
+    let current = fixture.ok_json(
+        &fixture.main,
+        &[
+            "status", "list", "--lane", "driver-2", "--limit", "100", "--json",
+        ],
+    );
+    assert_eq!(
+        current.as_array().unwrap().len(),
+        10,
+        "the current view must stay bounded without anything running on a timer"
+    );
+    assert_eq!(current[0]["body"], "Update number 11");
+
+    // Retired, not destroyed: everything is still there on request.
+    let everything = fixture.ok_json(
+        &fixture.main,
+        &[
+            "status", "list", "--lane", "driver-2", "--all", "--limit", "100", "--json",
+        ],
+    );
+    assert_eq!(everything.as_array().unwrap().len(), 14);
+    assert!(
+        everything
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == first["id"] && row["archived"] == true),
+        "the oldest update must be archived and still readable"
+    );
+
+    // The other lane is untouched by all of that.
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["status", "list", "--lane", "driver-1", "--all", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Archiving lands in the trail, so a reader can see the current view was
+    // bounded rather than wonder where the rest went.
+    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "200", "--json"]);
+    let posted = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "status_posted")
+        .count();
+    assert_eq!(posted, 15, "every post must be recorded");
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "status_posted"
+                && event["payload"]["archived"].as_i64().unwrap_or(0) > 0),
+        "the trail must record that an update was retired"
+    );
+
+    // A status with no lane is refused rather than filed under a default: an
+    // update nobody can address is one nobody will read.
+    let laneless = fixture.run(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "Where does this go?",
+            "--as",
+            "a",
+            "--json",
+        ],
+    );
+    assert!(!laneless.status.success(), "a laneless status was accepted");
+    assert!(
+        String::from_utf8_lossy(&laneless.stderr).contains("lane"),
+        "{}",
+        String::from_utf8_lossy(&laneless.stderr)
+    );
+
+    // Empty prose is refused too. A status update that says nothing still
+    // reads on the board as though the lane reported in.
+    for empty in ["", "   "] {
+        let blank = fixture.run(
+            &fixture.main,
+            &[
+                "status", "post", empty, "--as", "a", "--lane", "driver-2", "--json",
+            ],
+        );
+        assert!(!blank.status.success(), "an empty status was accepted");
+    }
+
+    // The short forms, because an alias nobody wrote down is one nobody can
+    // use -- they resolve by exact match with no inference.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "st",
+            "new",
+            "Via the short forms.",
+            "--as",
+            "a",
+            "--lane",
+            "driver-3",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["st", "ls", "--lane", "driver-3", "--json"])[0]["body"],
+        "Via the short forms."
     );
 }

@@ -292,6 +292,35 @@ CREATE TABLE task_tags (
 CREATE INDEX idx_task_tags_tag ON task_tags(tag);
 "#;
 
+/// Status updates: the low-ceremony sibling of a handoff.
+///
+/// Keyed to a **lane**, not a task, which is the whole point. A note needs a
+/// task; a checkpoint needs a task *and* a lease. An agent working across
+/// several tasks, or between them, or exploring before it claims anything, had
+/// nowhere to write down where things stand — so it went in a reply that
+/// scrolls away, or it waited for a handoff nobody had time to write.
+///
+/// `archived` is set by the writer, not by a sweep: posting an update archives
+/// what it superseded, so the current view is bounded without anything having
+/// to run on a timer.
+const BOARD_V9: &str = r#"
+CREATE TABLE status_updates (
+ id TEXT PRIMARY KEY NOT NULL,
+ lane TEXT NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ author TEXT NOT NULL,
+ body TEXT NOT NULL,
+ worktree TEXT,
+ branch TEXT,
+ head_sha TEXT,
+ root_head TEXT,
+ dirty_summary TEXT,
+ archived INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_status_lane_created ON status_updates(lane,archived,created_at DESC);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -495,6 +524,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
+            BOARD_V9,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

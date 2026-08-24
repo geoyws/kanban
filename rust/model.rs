@@ -49,6 +49,38 @@ pub struct UnreachableRoot {
     pub canonical: bool,
 }
 
+/// Where a lane stands, written by whoever is working it.
+///
+/// The low-ceremony sibling of a [`Handoff`]. A handoff is deliberate — it says
+/// *I am leaving, here is everything you need*, releases a lease, and names a
+/// successor. A status update says only *here is where this stands right now*,
+/// costs one command, needs no lease and no task, and can be written twenty
+/// times a day. The handoff stays the thing you write when you go; this is the
+/// thing that means the handoff, or a successor without one, has something to
+/// stand on.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusUpdate {
+    pub id: String,
+    /// The lane this describes — `driver-2`, `solo`. Lane-keyed, not
+    /// task-keyed, because the work an agent does between and across tasks is
+    /// exactly what had nowhere to go.
+    pub lane: String,
+    #[serde(rename = "taskID")]
+    pub task_id: Option<String>,
+    pub author: String,
+    pub body: String,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub root_head: Option<String>,
+    pub dirty_summary: Option<String>,
+    /// Superseded by newer updates in the same lane. Hidden from the default
+    /// read; never deleted by archiving.
+    pub archived: bool,
+    pub created_at: i64,
+}
+
 pub const TASK_TYPES: [&str; 3] = ["epic", "story", "task"];
 pub const NOTE_KINDS: [&str; 6] = [
     "plan", "progress", "blocker", "decision", "evidence", "done",
@@ -264,6 +296,12 @@ pub struct ContextPacket {
     pub notes: Vec<TaskNote>,
     pub checkpoints: Vec<Checkpoint>,
     pub handoffs: Vec<Handoff>,
+    /// Status updates mentioning this task, newest first.
+    ///
+    /// A resuming agent reads the packet and nothing else, so an update that
+    /// only `status list` could see would be an update the reader it was
+    /// written for never gets.
+    pub statuses: Vec<StatusUpdate>,
     pub generated_at: i64,
     pub truncated: bool,
 }
