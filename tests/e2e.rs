@@ -5843,3 +5843,68 @@ fn the_server_refuses_a_port_it_could_not_be_found_on() {
         );
     }
 }
+
+#[test]
+fn a_reader_that_hangs_up_ends_the_command_quietly() {
+    // `kb task list --json | head` printed a Rust panic and a backtrace note
+    // over the output it had just produced, and exited non-zero. Every other
+    // Unix tool ends quietly when its reader leaves.
+    //
+    // The reader is closed here directly rather than through a shell pipeline,
+    // because a pipeline's exit status is the LAST command's -- `| head` exits
+    // 0 whatever happened upstream, so a shell test would have proved nothing
+    // about kanban's own status. That is not hypothetical: the first version of
+    // this test passed with the fix removed.
+    let fixture = Fixture::new("broken-pipe");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PIPE", "--json"]);
+    // Comfortably past a 64 KiB pipe buffer, so the writer is certain to still
+    // be writing when the reader goes away. Bulk comes from long titles rather
+    // than many rows: each row costs a process spawn, and 600 of them made this
+    // the slowest test in the suite for no extra coverage.
+    let padding = "x".repeat(2_000);
+    for index in 0..60 {
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", &format!("Row {index} {padding}"), "--json"],
+        );
+    }
+
+    let mut child = fixture
+        .command(&fixture.main)
+        .args(["task", "list", "--json"])
+        .spawn()
+        .unwrap();
+    // Close the read end while the child is mid-write. This is exactly what
+    // `head` does once it has what it wants.
+    drop(child.stdout.take());
+    let mut stderr = String::new();
+    if let Some(mut handle) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = handle.read_to_string(&mut stderr);
+    }
+    let status = child.wait().unwrap();
+
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe panicked: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe"),
+        "a closed pipe was reported as an error: {stderr}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a closed pipe must exit 0, got {status:?} with stderr: {stderr}"
+    );
+
+    // A real error still fails, and still says so: the quiet exit is scoped to
+    // the reader leaving, not to errors in general.
+    let broken = fixture.run(&fixture.main, &["task", "show", "t-nope", "--json"]);
+    assert!(!broken.status.success());
+    assert!(
+        String::from_utf8_lossy(&broken.stderr).contains("t-nope"),
+        "{}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+}

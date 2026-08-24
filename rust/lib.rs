@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 const HELP: &str = r#"kanban — durable work ledger for agents (Rust)
@@ -807,8 +808,32 @@ fn lease_ms(args: &Args) -> Result<i64> {
 }
 
 fn print<T: Serialize>(value: &T, _pretty: bool) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    emit(&serde_json::to_string_pretty(value)?)
+}
+
+/// Write one line to stdout, and let a closed pipe be a normal ending.
+///
+/// `println!` panics when the reader has gone — `kb task list --json | head`
+/// printed a Rust panic and a backtrace note over the output it had just
+/// produced, and exited non-zero, so a shell pipeline could not tell a closed
+/// pipe from a real failure. Every Unix tool ends quietly when its reader
+/// leaves; the error is returned here and recognised in [`entrypoint`].
+fn emit(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut out = io::stdout().lock();
+    writeln!(out, "{text}")?;
+    // Explicit, because a buffered line lost at exit is output that was
+    // reported as written and never arrived.
+    out.flush()?;
     Ok(())
+}
+
+/// Whether an error is only "the reader hung up".
+fn reader_left(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
 }
 
 fn cwd() -> Result<PathBuf> {
@@ -1173,8 +1198,13 @@ fn restore(args: &Args) -> Result<()> {
 pub fn entrypoint() -> ! {
     match run() {
         Ok(()) => std::process::exit(0),
+        // A closed pipe is not a failure: `kb task list --json | head` closes
+        // stdout the moment head has what it wants, and every other Unix tool
+        // ends quietly at that point rather than reporting an error the user
+        // did not cause.
+        Err(error) if reader_left(&error) => std::process::exit(0),
         Err(error) => {
-            eprintln!("Error: {error:#}");
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
             std::process::exit(1)
         }
     }
@@ -1183,11 +1213,11 @@ pub fn entrypoint() -> ! {
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
     if args.has("version") {
-        println!("kanban {}", env!("CARGO_PKG_VERSION"));
+        emit(&format!("kanban {}", env!("CARGO_PKG_VERSION")))?;
         return Ok(());
     }
     if args.positionals.is_empty() || args.has("help") {
-        println!("{HELP}");
+        emit(HELP)?;
         return Ok(());
     }
     let command = canonical_command(args.positionals[0].as_str());
@@ -1199,7 +1229,7 @@ fn run() -> Result<()> {
     let rest = args.positionals.get(2..).unwrap_or(&[]);
 
     if command == "version" {
-        println!("kanban {}", env!("CARGO_PKG_VERSION"));
+        emit(&format!("kanban {}", env!("CARGO_PKG_VERSION")))?;
         return Ok(());
     }
 
@@ -1834,7 +1864,7 @@ fn run() -> Result<()> {
         if max_chars < 0 {
             bail!("max chars must be positive");
         }
-        println!("{}", render_context(&packet, max_chars as usize)?);
+        emit(&render_context(&packet, max_chars as usize)?)?;
         return Ok(());
     }
     if command == "todo" {

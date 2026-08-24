@@ -416,6 +416,23 @@ guard reads the file back so the next `--clear-x` cannot ship without its pair.
 `--no-cross-lane` is deliberately exempt: there is no `--cross-lane` to
 contradict, so a pair would be a flag nobody needs.
 
+**A closed pipe was reported as a failure.** `kb task list --json | head`
+printed a Rust panic and a backtrace note over the output it had just produced,
+then exited non-zero, because `println!` unwraps its write. Every other Unix
+tool ends quietly when its reader leaves, and a pipeline could not tell "head
+had enough" from "the command failed". Output now goes through one writer whose
+`BrokenPipe` is recognised at the exit point and treated as a normal ending —
+scoped to that one error kind, so a real failure still exits 1 and still says
+why.
+
+The test for it was wrong before it was right, in a way worth recording: driven
+through a shell pipeline, it passed with the fix removed, because **a
+pipeline's exit status is the last command's** and `| head` exits 0 whatever
+happened upstream. It closes the reader directly now. The general form is the
+one this project keeps hitting — a test that exercises the right behaviour
+through a mechanism that cannot observe it is a test that reports success for
+the wrong reason.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract
