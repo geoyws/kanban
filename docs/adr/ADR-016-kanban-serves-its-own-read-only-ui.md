@@ -88,6 +88,19 @@ inherits one pipe. An HTTP server holds accepted connections. This one is
 *restartable* instead — it keeps no state, so updating is `install` then
 `systemctl restart`. The trick does not transfer and is not claimed to.
 
+That restart does **not** interrupt the agents using Kanban. CLI operations are
+short-lived processes which open the SQLite ledger directly, and MCP tool calls
+spawn that same installed binary; the long-lived MCP protocol process has
+ADR-011's in-place replacement. `kanban serve` is only the browser-facing web
+surface. At worst, a browser request arriving during the brief restart can fail
+and be retried; claims, leases, checkpoints and other ledger operations remain
+available throughout.
+
+Do not add application-level hot reload to remove that browser-only gap. If the
+web surface later requires uninterrupted availability, solve that at the HTTP
+process boundary with socket activation or a draining handover, not by importing
+the stdio reload mechanism into a server with accepted connections.
+
 ### A server is not an operation
 
 `mcp` and `serve` block until killed, which makes them meaningless as MCP tool
@@ -121,6 +134,11 @@ synchronous); no arbitrary SQL, ever (ADR-001 §6); no multi-user accounts or
 roles (drivers are identities that claim work, not people who log in); no
 editing plan bodies in a browser (a plan is markdown that belongs in a commit,
 and a textarea is the wrong tool for it).
+
+The accepted availability trade is therefore explicit: deploying the web view
+may create a momentary read-only browser error, while the agent-facing ledger
+path stays available. That is not a reason to add hot reload unless the web
+view's availability requirement changes.
 
 Deliberately not decided: what happens when one operator becomes two. Every
 choice above — one actor, one password, no sessions — is correct for one person
