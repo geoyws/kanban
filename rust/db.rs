@@ -374,6 +374,28 @@ CREATE TABLE workspace_aliases (
 CREATE INDEX idx_workspace_aliases_board ON workspace_aliases(board_path);
 "#;
 
+/// One audited rules document inherited by every registered project.
+const REGISTRY_V3: &str = r#"
+CREATE TABLE global_rules (
+ id TEXT PRIMARY KEY NOT NULL,
+ body TEXT NOT NULL,
+ author TEXT NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_global_rules_active ON global_rules(archived,created_at);
+CREATE TABLE global_rule_events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ rule_id TEXT NOT NULL,
+ kind TEXT NOT NULL,
+ actor TEXT NOT NULL,
+ payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+ created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_global_rule_events_rule_seq ON global_rule_events(rule_id,seq);
+"#;
+
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
 /// Directories that already exist are left exactly as the operator set them.
@@ -572,7 +594,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
-    migrate(&mut connection, &[REGISTRY_V1, REGISTRY_V2])?;
+    migrate(&mut connection, &[REGISTRY_V1, REGISTRY_V2, REGISTRY_V3])?;
     Ok(connection)
 }
 

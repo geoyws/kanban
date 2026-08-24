@@ -100,7 +100,7 @@ Aliases (the binary installs as both `kanban` and `kb`):
   story:     adv=advance
   handoff:   ls=list  new=create  acc=accept
   workspace: ls=list  att=attach
-  rule:      ls=list  new=add  up=update  cat=show
+  rule:      ls=list  new=add  up=update  cat=show; --global manages inherited rules
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
 --force is required to override a live lease (task move/remove) or to nest a
@@ -108,7 +108,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 22] = [
+pub(crate) const BOOLEAN: [&str; 23] = [
     "help",
     "json",
     "version",
@@ -131,6 +131,7 @@ pub(crate) const BOOLEAN: [&str; 22] = [
     "verify",
     "all",
     "full",
+    "global",
 ];
 
 /// Flags that may be given more than once, because their value is a list.
@@ -383,20 +384,20 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("add"),
-        &["as", "body", "body-file"],
+        &["as", "body", "body-file", "global"],
         &["?body"],
         false,
     ),
-    ("rule", Some("list"), &["all", "full"], &[], true),
-    ("rule", Some("show"), &[], &["id"], true),
+    ("rule", Some("list"), &["all", "full", "global"], &[], true),
+    ("rule", Some("show"), &["global"], &["id"], true),
     (
         "rule",
         Some("update"),
-        &["as", "body", "body-file"],
+        &["as", "body", "body-file", "global"],
         &["id"],
         false,
     ),
-    ("rule", Some("retire"), &["as"], &["id"], false),
+    ("rule", Some("retire"), &["as", "global"], &["id"], false),
     (
         "attention",
         Some("raise"),
@@ -432,7 +433,13 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[],
         true,
     ),
-    ("events", None, &["task", "kind", "limit"], &[], true),
+    (
+        "events",
+        None,
+        &["task", "rule", "kind", "limit", "global"],
+        &[],
+        true,
+    ),
     ("stale", None, &[], &[], true),
     ("context", None, &["max-chars"], &["id"], true),
     ("todo", None, &["output"], &[], false),
@@ -1086,6 +1093,29 @@ fn open_store(args: &Args) -> Result<Store> {
     Store::open(&store_path(args)?)
 }
 
+/// Global rules frame every board and always precede its local rules. Bodies
+/// remain lazy; this is only the complete table of contents.
+fn effective_rule_summaries(store: &Store) -> Result<Vec<RuleSummary>> {
+    let mut rules = Registry::open()?.global_rule_summaries(false)?;
+    rules.extend(store.rule_summaries(false)?);
+    Ok(rules)
+}
+
+fn reject_global_board_selectors(args: &Args) -> Result<()> {
+    let selectors = BOARD_SELECTORS
+        .iter()
+        .filter(|name| args.flags.contains_key(**name))
+        .map(|name| format!("--{name}"))
+        .collect::<Vec<_>>();
+    if !selectors.is_empty() {
+        bail!(
+            "--global addresses registry-wide state; it cannot be combined with {}",
+            selectors.join(" or ")
+        );
+    }
+    Ok(())
+}
+
 fn option_string(args: &Args, name: &str) -> Option<String> {
     args.one(name).map(str::to_owned)
 }
@@ -1502,6 +1532,74 @@ fn run() -> Result<()> {
         return restore(&args);
     }
 
+    if command == "events" && args.has("global") {
+        reject_global_board_selectors(&args)?;
+        if args.has("task") {
+            bail!("--task addresses a project event; use --rule ID with --global");
+        }
+        return print(
+            &Registry::open()?.global_rule_events(
+                args.one("rule"),
+                args.one("kind"),
+                args.limit(50)?,
+            )?,
+            args.has("json"),
+        );
+    }
+
+    if command == "rule" && args.has("global") {
+        reject_global_board_selectors(&args)?;
+        let mut registry = Registry::open()?;
+        if sub == Some("add") {
+            let flagged = args.body()?;
+            let positional = rest.first();
+            let body = match (positional, flagged.as_deref()) {
+                (Some(_), Some(_)) => bail!(
+                    "rule body was given as both a positional and --body/--body-file; pass one"
+                ),
+                (Some(body), None) => body.as_str(),
+                (None, Some(body)) => body,
+                (None, None) => bail!("rule body is required"),
+            };
+            return print(
+                &registry.add_global_rule(body, args.require("as")?)?,
+                args.has("json"),
+            );
+        }
+        if sub == Some("list") {
+            if args.has("full") {
+                return print(&registry.global_rules(args.has("all"))?, args.has("json"));
+            }
+            return print(
+                &registry.global_rule_summaries(args.has("all"))?,
+                args.has("json"),
+            );
+        }
+        if sub == Some("show") {
+            return print(
+                &registry.global_rule(rest.first().context("rule id is required")?)?,
+                args.has("json"),
+            );
+        }
+        if sub == Some("update") {
+            let id = rest.first().context("rule id is required")?;
+            let body = args.body()?.context("--body or --body-file is required")?;
+            return print(
+                &registry.update_global_rule(id, &body, args.require("as")?)?,
+                args.has("json"),
+            );
+        }
+        if sub == Some("retire") {
+            return print(
+                &registry.retire_global_rule(
+                    rest.first().context("rule id is required")?,
+                    args.require("as")?,
+                )?,
+                args.has("json"),
+            );
+        }
+    }
+
     let mut store = open_store(&args)?;
     if command == "task" && sub == Some("add") {
         let title = rest.first().context("task title is required")?.clone();
@@ -1690,7 +1788,7 @@ fn run() -> Result<()> {
         if id.is_none() && !args.has("next") {
             bail!("task id or --next is required");
         }
-        let value = store.claim(
+        let mut value = store.claim(
             id,
             ClaimOptions {
                 git: here(),
@@ -1704,6 +1802,7 @@ fn run() -> Result<()> {
                 allow_reassign: args.has("allow-reassign"),
             },
         )?;
+        value.rules = effective_rule_summaries(&store)?;
         return print(&value, args.has("json"));
     }
     if command == "heartbeat" {
@@ -1805,7 +1904,11 @@ fn run() -> Result<()> {
             args.one("caller-scope"),
             git,
         )?;
-        return print(&json!({"handoff":handoff,"claim":claim}), args.has("json"));
+        let rules = effective_rule_summaries(&store)?;
+        return print(
+            &json!({"handoff":handoff,"claim":claim,"rules":rules}),
+            args.has("json"),
+        );
     }
     if command == "import" && (sub == Some("atmux-json") || sub == Some("atmux-sqlite")) {
         let path = rest.first().context("import path is required")?;
@@ -1962,7 +2065,8 @@ fn run() -> Result<()> {
     }
     if command == "context" {
         let id = sub.context("task id is required")?;
-        let packet = store.context_packet(id)?;
+        let mut packet = store.context_packet(id)?;
+        packet.rules = effective_rule_summaries(&store)?;
         if args.has("json") {
             // --max-chars bounds the rendered text and has never had any
             // effect here, so accepting it silently handed back an unbounded

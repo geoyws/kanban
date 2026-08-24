@@ -91,16 +91,28 @@ kb r cat r-12345678 --json             # one full body, fetched lazily
 kb r up r-12345678 --body "Revised rule" --as "$AGENT" --json
 kb rule retire r-12345678 --as "$AGENT" --json
 kb r ls --all --full --json            # retired rows and full bodies
+
+# One rules document inherited by every project. No board selector belongs here.
+kb r new "Never store credentials in Kanban." --global --as "$AGENT" --json
+kb r ls --global --json
+kb r cat g-12345678 --global --json
+kb ev --global --rule g-12345678 --json  # audited global history
 ```
 
-The first line is the headline. `kb ctx <task>` and every successful new claim
-carry the complete active table of contents: id, headline, byte size and whether
-more body exists. Read a long body with `kb r cat ID`; do not load every detail
-into context speculatively. A claim receipt keeps its existing fields at the top
-level and adds `rules`; `kb t cat`'s stored claim deliberately does not pretend
-it re-read the board's current rules.
+The first line is the headline. `kb ctx <task>`, every successful new claim and
+every accepted handoff carry the complete active table of contents: global rules
+first, then project rules, each with scope, id, headline, byte size and whether
+more body exists.
+Rendered context marks them `[g]` and `[p]`. Read a long body with `kb r cat ID`
+and add `--global` for a global id; do not load every detail speculatively. Other
+commands do not repeat rules—the injection boundary is claim/resume, which saves
+tokens and preserves existing JSON shapes. A claim receipt keeps its existing
+fields at the top level and adds `rules`; `kb t cat`'s stored claim deliberately
+does not pretend it re-read the board's current rules.
 
-Rules are **audited and retire-only**. Updates retain the previous body in the
+Global rules live once in `registry.db`; `--global` with an explicit board
+selector is refused because those name different scopes. Rules are **audited
+and retire-only**. Updates retain the previous body in the
 event trail; retirement removes a rule from active claims, contexts and the web
 board without deleting history. There is no `rm` alias.
 
@@ -451,3 +463,4 @@ ADR-008 (fail closed), ADR-010 (adapters generated from the surface),
 ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
 attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
 ADR-016 (the web view), ADR-017 (sitreps), ADR-018 (project rules).
+ADR-019 adds the single-copy global rules inherited at claim/resume boundaries.

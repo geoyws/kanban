@@ -46,6 +46,8 @@ pub struct Rule {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSummary {
+    /// `global` rules precede `project` rules in effective work context.
+    pub scope: String,
     pub id: String,
     pub headline: String,
     pub has_more: bool,

@@ -407,16 +407,23 @@ fn lanes() -> Result<String> {
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None)?;
-    let rules = store.rules(false)?;
+    let global_rules = Registry::open()?.global_rules(false)?;
+    let project_rules = store.rules(false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
     html.push_str(&format!(
         "<p class=meta>{} · {} rows</p>",
         escape(&project.canonical_root),
         tasks.len()
     ));
-    if !rules.is_empty() {
+    for (heading, rules) in [
+        ("Global rules", global_rules),
+        ("Project rules", project_rules),
+    ] {
+        if rules.is_empty() {
+            continue;
+        }
         html.push_str(&format!(
-            "<h2>Project rules <span class=count>{}</span></h2>",
+            "<h2>{heading} <span class=count>{}</span></h2>",
             rules.len()
         ));
         for rule in rules {

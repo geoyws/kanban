@@ -1,10 +1,44 @@
 use crate::db::{checkpoint, create_backup_target, integrity, open_registry, own_private_dir};
-use crate::model::{ProjectRecord, UnreachableRoot, WorkspaceRecord};
+use crate::model::{Event, ProjectRecord, Rule, RuleSummary, UnreachableRoot, WorkspaceRecord};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
+use serde_json::json;
 use std::env;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+fn validate_rule_body(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("rule body is required");
+    }
+    if value
+        .lines()
+        .next()
+        .is_none_or(|line| line.trim().is_empty())
+    {
+        bail!("rule headline is required on the first line");
+    }
+    Ok(())
+}
+
+fn validate_rule_actor(value: &str) -> Result<&str> {
+    let actor = value.trim();
+    if actor.is_empty() {
+        bail!("author is required");
+    }
+    Ok(actor)
+}
+
+fn global_rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
+    Ok(Rule {
+        id: record.get("id")?,
+        body: record.get("body")?,
+        author: record.get("author")?,
+        archived: record.get("archived")?,
+        created_at: record.get("created_at")?,
+        updated_at: record.get("updated_at")?,
+    })
+}
 
 /// Milliseconds since the Unix epoch.
 ///
@@ -245,6 +279,197 @@ impl Registry {
         }
         out.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
         Ok(out)
+    }
+
+    pub fn add_global_rule(&mut self, body: &str, actor: &str) -> Result<Rule> {
+        validate_rule_body(body)?;
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let id = format!("g-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<i64> =
+            transaction.query_row("SELECT max(created_at) FROM global_rules", [], |row| {
+                row.get(0)
+            })?;
+        let now = now_ms().max(previous.unwrap_or(0).saturating_add(1));
+        transaction.execute(
+            "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at) VALUES(?,?,?,0,?,?)",
+            params![id, body, actor, now, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+            params![id, "global_rule_added", actor, json!({"ruleID": id}).to_string(), now],
+        )?;
+        let rule = transaction.query_row(
+            "SELECT * FROM global_rules WHERE id=?",
+            [&id],
+            global_rule_row,
+        )?;
+        transaction.commit()?;
+        Ok(rule)
+    }
+
+    pub fn global_rules(&self, include_archived: bool) -> Result<Vec<Rule>> {
+        let clause = if include_archived {
+            ""
+        } else {
+            " WHERE archived=0"
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT * FROM global_rules{clause} ORDER BY created_at,id"
+        ))?;
+        statement
+            .query_map([], global_rule_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn global_rule_summaries(&self, include_archived: bool) -> Result<Vec<RuleSummary>> {
+        self.global_rules(include_archived)?
+            .into_iter()
+            .map(|rule| {
+                let headline = rule
+                    .body
+                    .lines()
+                    .next()
+                    .context("stored global rule has no headline")?
+                    .trim()
+                    .to_owned();
+                let has_more = rule
+                    .body
+                    .lines()
+                    .skip(1)
+                    .any(|line| !line.trim().is_empty());
+                Ok(RuleSummary {
+                    scope: "global".into(),
+                    id: rule.id,
+                    headline,
+                    has_more,
+                    bytes: rule.body.len(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn global_rule(&self, id: &str) -> Result<Rule> {
+        self.connection
+            .query_row(
+                "SELECT * FROM global_rules WHERE id=?",
+                [id],
+                global_rule_row,
+            )
+            .optional()?
+            .with_context(|| format!("global rule {id} not found"))
+    }
+
+    pub fn update_global_rule(&mut self, id: &str, body: &str, actor: &str) -> Result<Rule> {
+        validate_rule_body(body)?;
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = transaction
+            .query_row("SELECT body FROM global_rules WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let previous = previous.with_context(|| format!("global rule {id} not found"))?;
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE global_rules SET body=?,author=?,updated_at=? WHERE id=?",
+            params![body, actor, now, id],
+        )?;
+        transaction.execute(
+            "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+            params![id, "global_rule_updated", actor, json!({"ruleID": id, "previousBody": previous}).to_string(), now],
+        )?;
+        let rule = transaction.query_row(
+            "SELECT * FROM global_rules WHERE id=?",
+            [id],
+            global_rule_row,
+        )?;
+        transaction.commit()?;
+        Ok(rule)
+    }
+
+    pub fn retire_global_rule(&mut self, id: &str, actor: &str) -> Result<Rule> {
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let changed = transaction.execute(
+            "UPDATE global_rules SET archived=1,author=?,updated_at=? WHERE id=? AND archived=0",
+            params![actor, now, id],
+        )?;
+        if changed == 0 {
+            let archived: Option<i64> = transaction
+                .query_row(
+                    "SELECT archived FROM global_rules WHERE id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match archived {
+                None => bail!("global rule {id} not found"),
+                Some(_) => bail!("global rule {id} is already retired"),
+            }
+        }
+        transaction.execute(
+            "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+            params![id, "global_rule_retired", actor, json!({"ruleID": id}).to_string(), now],
+        )?;
+        let rule = transaction.query_row(
+            "SELECT * FROM global_rules WHERE id=?",
+            [id],
+            global_rule_row,
+        )?;
+        transaction.commit()?;
+        Ok(rule)
+    }
+
+    /// Global rule history, newest first, from the same registry that owns the
+    /// single-copy document.
+    pub fn global_rule_events(
+        &self,
+        rule: Option<&str>,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        if let Some(id) = rule {
+            self.global_rule(id)?;
+        }
+        let mut sql = String::from("SELECT * FROM global_rule_events WHERE 1=1");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(id) = rule {
+            sql.push_str(" AND rule_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind=?");
+            values.push(Box::new(kind.to_owned()));
+        }
+        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok(Event {
+                        seq: row.get("seq")?,
+                        task_id: None,
+                        kind: row.get("kind")?,
+                        actor: Some(row.get("actor")?),
+                        payload: serde_json::from_str(&row.get::<_, String>("payload")?)
+                            .unwrap_or(json!({})),
+                        created_at: row.get("created_at")?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn projects(&self) -> Result<Vec<ProjectRecord>> {

@@ -1638,6 +1638,7 @@ impl Store {
                     .skip(1)
                     .any(|line| !line.trim().is_empty());
                 Ok(RuleSummary {
+                    scope: "project".into(),
                     id: rule.id,
                     headline,
                     has_more,

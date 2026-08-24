@@ -76,6 +76,29 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     let fixture = Fixture::new("handoff");
     fixture.ok_json(&fixture.main, &["init", "--name", "E2E", "--json"]);
     fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Global handoff rule.",
+            "--global",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Project handoff rule.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
         &fixture.worktree,
         &[
             "workspace",
@@ -171,6 +194,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     );
     let incoming_token = accepted["claim"]["leaseToken"].as_str().unwrap();
     assert_ne!(incoming_token, outgoing_token);
+    assert_eq!(accepted["rules"][0]["scope"], "global");
+    assert_eq!(accepted["rules"][1]["scope"], "project");
 
     let shown = fixture.run(&fixture.worktree, &["task", "show", "t-e2e", "--json"]);
     assert!(shown.status.success());
@@ -5829,6 +5854,18 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--json",
         ],
     );
+    let global_rule = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Global <em>rule</em> inherited everywhere.",
+            "--global",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
     let retired_rule = fixture.ok_json(
         &fixture.main,
         &[
@@ -5970,6 +6007,12 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "a script tag reached the page: {one}"
     );
     assert!(one.contains("Project rules"), "{one}");
+    assert!(one.contains("Global rules"), "{one}");
+    assert!(one.contains(global_rule["id"].as_str().unwrap()), "{one}");
+    assert!(
+        one.contains("Global &lt;em&gt;rule&lt;/em&gt; inherited everywhere."),
+        "a global rule was not escaped: {one}"
+    );
     assert!(one.contains(live_rule["id"].as_str().unwrap()), "{one}");
     assert!(
         one.contains("Never render &lt;b&gt;rules&lt;/b&gt; without escaping."),
@@ -6553,6 +6596,7 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
     assert_eq!(claim["rules"].as_array().unwrap().len(), 2);
     assert_eq!(claim["rules"][0]["id"], short["id"]);
     assert_eq!(claim["rules"][1]["id"], long["id"]);
+    assert_eq!(claim["rules"][0]["scope"], "project");
     assert_eq!(claim["rules"][0]["hasMore"], false);
     assert_eq!(claim["rules"][1]["hasMore"], true);
     assert!(claim["rules"][1]["bytes"].as_u64().unwrap() > 2_000);
@@ -6576,7 +6620,7 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
     assert!(rendered.status.success());
     let rendered = String::from_utf8(rendered.stdout).unwrap();
     assert!(
-        rendered.contains("## Project rules (2 · kb r ls)"),
+        rendered.contains("## Rules (0 global · 2 project; bodies lazy)"),
         "{rendered}"
     );
     assert!(
@@ -6596,4 +6640,111 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
         !rendered.contains("supporting detail supporting detail"),
         "context carried a full long rule instead of its table of contents"
     );
+}
+
+#[test]
+fn global_rules_are_stored_once_and_frame_every_projects_claim_and_context() {
+    let fixture = Fixture::new("global-rules");
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&second).unwrap();
+    fixture.ok_json(&fixture.main, &["init", "--name", "ONE", "--json"]);
+    fixture.ok_json(&second, &["init", "--name", "TWO", "--json"]);
+
+    let global = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Never store credentials in Kanban.\n\nKeep secrets in git-crypt.",
+            "--global",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(global["id"].as_str().unwrap().starts_with("g-"));
+    let global_id = global["id"].as_str().unwrap();
+
+    for (cwd, task, local) in [
+        (&fixture.main, "t-one", "ONE uses Rust."),
+        (&second, "t-two", "TWO uses SQLite."),
+    ] {
+        fixture.ok_json(cwd, &["task", "add", task, "--id", task, "--json"]);
+        fixture.ok_json(cwd, &["rule", "add", local, "--as", "geo", "--json"]);
+        let claim = fixture.ok_json(cwd, &["claim", task, "--as", "worker", "--json"]);
+        let rules = claim["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["id"], global["id"]);
+        assert_eq!(rules[0]["scope"], "global");
+        assert_eq!(rules[1]["scope"], "project");
+        let context = fixture.ok_json(cwd, &["context", task, "--json"]);
+        assert_eq!(context["rules"], claim["rules"]);
+    }
+
+    let registry_path = fixture.data.join("registry.db");
+    let registry = Connection::open(&registry_path).unwrap();
+    let board_paths = registry
+        .prepare("SELECT board_path FROM workspaces ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for board_path in board_paths {
+        let board = Connection::open(board_path).unwrap();
+        let copied: i64 = board
+            .query_row(
+                "SELECT count(*) FROM rules WHERE id=?",
+                [global_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 0, "a global rule was copied into a project board");
+    }
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            global_id,
+            "--global",
+            "--body",
+            "Never store secrets in Kanban.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--global", "--rule", global_id, "--json"],
+    );
+    assert!(
+        events[0]["payload"]["previousBody"]
+            .as_str()
+            .unwrap()
+            .starts_with("Never store credentials")
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule", "retire", global_id, "--global", "--as", "geo", "--json",
+        ],
+    );
+    let active = fixture.ok_json(&fixture.main, &["rule", "list", "--global", "--json"]);
+    assert_eq!(active, json!([]));
+    let retained = fixture.ok_json(
+        &fixture.main,
+        &["rule", "list", "--global", "--all", "--full", "--json"],
+    );
+    assert_eq!(retained[0]["archived"], true);
+
+    let conflicting = fixture.run(
+        &fixture.main,
+        &["rule", "list", "--global", "--project", "ONE", "--json"],
+    );
+    assert!(!conflicting.status.success());
+    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("cannot be combined"));
 }
