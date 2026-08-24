@@ -419,6 +419,7 @@ fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
         archived: row.get::<_, i64>("archived")? != 0,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        board_tags: None,
     })
 }
 
@@ -1643,6 +1644,7 @@ impl Store {
                     headline,
                     has_more,
                     bytes: rule.body.len(),
+                    board_tags: None,
                 })
             })
             .collect()

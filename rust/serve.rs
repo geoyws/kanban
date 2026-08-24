@@ -407,7 +407,7 @@ fn lanes() -> Result<String> {
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None)?;
-    let global_rules = Registry::open()?.global_rules(false)?;
+    let global_rules = Registry::open()?.global_rules_for(Some(&project.name), false)?;
     let project_rules = store.rules(false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
     html.push_str(&format!(
@@ -428,11 +428,17 @@ fn board(name: &str) -> Result<String> {
         ));
         for rule in rules {
             let headline = rule.body.lines().next().unwrap_or_default();
+            let targets = rule
+                .board_tags
+                .as_ref()
+                .map(|tags| format!(" <span class=lane>{}</span>", escape(&tags.join(", "))))
+                .unwrap_or_default();
             html.push_str(&format!(
-                "<details class=rule><summary><code>{id}</code> {headline}</summary>\
+                "<details class=rule><summary><code>{id}</code> {headline}{targets}</summary>\
                  <pre>{body}</pre></details>",
                 id = escape(&rule.id),
                 headline = escape(headline),
+                targets = targets,
                 body = escape(&rule.body),
             ));
         }

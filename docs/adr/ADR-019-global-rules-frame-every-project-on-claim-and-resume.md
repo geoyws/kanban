@@ -61,6 +61,8 @@ dotfiles.
 - A caller that bypasses claim/context also bypasses automatic rule injection;
   that is a workflow violation rather than a reason to mutate every response.
 - Registry backups now carry global rules and their audit trail automatically.
+- ADR-020 narrows inheritance with explicit board tags while retaining `ALL`
+  as the migration-safe and creation-time default.
 
 ## Verification
 
@@ -76,3 +78,4 @@ global rendering. Unit/in-process checks are not substituted for this E2E.
 - [ADR-007](ADR-007-global-project-addressing.md)
 - [ADR-010](ADR-010-adapters-generated-from-the-command-surface.md)
 - [ADR-018](ADR-018-project-rules-frame-work-without-replacing-private-memory.md)
+- [ADR-020](ADR-020-global-rules-use-explicit-board-tags.md)

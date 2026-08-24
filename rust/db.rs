@@ -396,6 +396,13 @@ CREATE TABLE global_rule_events (
 CREATE INDEX idx_global_rule_events_rule_seq ON global_rule_events(rule_id,seq);
 "#;
 
+/// Explicit board targeting for global rules. Existing rules retain their
+/// original every-board behavior through the reserved `ALL` tag.
+const REGISTRY_V4: &str = r#"
+ALTER TABLE global_rules ADD COLUMN board_tags TEXT NOT NULL DEFAULT '["ALL"]'
+ CHECK(json_valid(board_tags) AND json_type(board_tags) = 'array');
+"#;
+
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
 /// Directories that already exist are left exactly as the operator set them.
@@ -594,7 +601,10 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
-    migrate(&mut connection, &[REGISTRY_V1, REGISTRY_V2, REGISTRY_V3])?;
+    migrate(
+        &mut connection,
+        &[REGISTRY_V1, REGISTRY_V2, REGISTRY_V3, REGISTRY_V4],
+    )?;
     Ok(connection)
 }
 

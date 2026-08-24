@@ -137,6 +137,10 @@ kb r new "Never store credentials in Kanban." --global --as geo
 kb r ls --global
 kb r cat g-12345678 --global
 kb ev --global --rule g-12345678 # audited revision/retirement trail
+
+# Target one or more boards, or every board except named boards.
+kb r new "Kanban-only rule." --global --board kanban --as geo
+kb r new "Everywhere except project-a." --global --except-board project-a --as geo
 ```
 
 The first line is the headline. Every context packet, newly granted claim and
@@ -145,6 +149,12 @@ first, then project rules. Each compact summary names its scope, id, headline,
 byte size and whether more exists; a long body is fetched only with `kb r cat ID` (plus `--global` for
 a `g-` id). Other commands do not repeat rules. The claim receipt stays flat,
 while a stored claim remains the same shape it had before rules existed.
+
+Every global rule has explicit `boardTags`. Omitted targeting defaults to
+`ALL`; named includes render as `ONLY:<board>`, and exclusions render as
+`ALL, EXCEPT:<board>`. `--board` and `--except-board` are repeatable and accept
+exact registered board names. See
+[ADR-020](docs/adr/ADR-020-global-rules-use-explicit-board-tags.md).
 
 Rules are retire-only and audited: updating records the prior body, retirement
 removes a rule from active contexts without deleting it, and there is no `rm`

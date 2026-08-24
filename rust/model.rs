@@ -40,6 +40,10 @@ pub struct Rule {
     pub archived: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Present only for registry-wide rules. `ALL` and `EXCEPT:<name>` form an
+    /// all-minus set; `ONLY:<name>` rows form an explicit include set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_tags: Option<Vec<String>>,
 }
 
 /// The always-carried table-of-contents entry for a project rule.
@@ -52,6 +56,8 @@ pub struct RuleSummary {
     pub headline: String,
     pub has_more: bool,
     pub bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_tags: Option<Vec<String>>,
 }
 
 /// A registered root that no longer names the directory it was registered for.

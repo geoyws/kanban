@@ -97,6 +97,11 @@ kb r new "Never store credentials in Kanban." --global --as "$AGENT" --json
 kb r ls --global --json
 kb r cat g-12345678 --global --json
 kb ev --global --rule g-12345678 --json  # audited global history
+
+# Explicit board tags: ALL is the default; includes/exclusions are repeatable.
+kb r new "Kanban only." --global --board kanban --as "$AGENT" --json
+kb r new "All except project-a." --global --except-board project-a --as "$AGENT" --json
+kb r up g-12345678 --global --board kanban --as "$AGENT" --json
 ```
 
 The first line is the headline. `kb ctx <task>`, every successful new claim and
@@ -120,6 +125,14 @@ This is not the secret or long-form memory store. Keep credentials, secrets,
 long explanations and cross-machine knowledge in the versioned/git-crypt'd
 dotfiles, and let a short rule point there when needed. **Never put a secret
 value in the plaintext board database.**
+
+Every global rule carries `boardTags`. `ALL` is explicit and is the default,
+`ONLY:<name>` entries form a named include set, and `EXCEPT:<name>` entries
+subtract from `ALL`. Operators pass repeatable `--board NAME` and
+`--except-board NAME`; the CLI validates exact registered names and refuses
+ambiguous combinations. Injection and the web page include only rules whose
+board tags match the addressed project, saving irrelevant context tokens. See
+ADR-020.
 
 ## Attention — anything that needs George
 
@@ -464,3 +477,4 @@ ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
 attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
 ADR-016 (the web view), ADR-017 (sitreps), ADR-018 (project rules).
 ADR-019 adds the single-copy global rules inherited at claim/resume boundaries.
+ADR-020 adds explicit `ALL`, named-only and all-except board targeting.

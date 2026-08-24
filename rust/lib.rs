@@ -101,6 +101,7 @@ Aliases (the binary installs as both `kanban` and `kb`):
   handoff:   ls=list  new=create  acc=accept
   workspace: ls=list  att=attach
   rule:      ls=list  new=add  up=update  cat=show; --global manages inherited rules
+             repeat --board NAME; --except-board NAME means ALL except that board
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
 --force is required to override a live lease (task move/remove) or to nest a
@@ -141,7 +142,14 @@ pub(crate) const BOOLEAN: [&str; 23] = [
 /// wrong-board write ADR-007 exists to prevent, reached through a repeated
 /// flag instead of a mistyped one, and trivially produced by a wrapper script
 /// that appends a default the caller had already set.
-pub(crate) const REPEATABLE: [&str; 4] = ["depends-on", "blocker", "validation", "tag"];
+pub(crate) const REPEATABLE: [&str; 6] = [
+    "depends-on",
+    "blocker",
+    "validation",
+    "tag",
+    "board",
+    "except-board",
+];
 
 /// Commands that are processes rather than operations.
 ///
@@ -384,7 +392,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("add"),
-        &["as", "body", "body-file", "global"],
+        &["as", "body", "body-file", "global", "board", "except-board"],
         &["?body"],
         false,
     ),
@@ -393,7 +401,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("update"),
-        &["as", "body", "body-file", "global"],
+        &["as", "body", "body-file", "global", "board", "except-board"],
         &["id"],
         false,
     ),
@@ -1095,8 +1103,39 @@ fn open_store(args: &Args) -> Result<Store> {
 
 /// Global rules frame every board and always precede its local rules. Bodies
 /// remain lazy; this is only the complete table of contents.
-fn effective_rule_summaries(store: &Store) -> Result<Vec<RuleSummary>> {
-    let mut rules = Registry::open()?.global_rule_summaries(false)?;
+fn selected_board_name(args: &Args) -> Result<Option<String>> {
+    let mut registry = Registry::open()?;
+    if let Some(path) = direct_db(args) {
+        let resolved = path.canonicalize().unwrap_or(path);
+        let matches = registry
+            .projects()?
+            .into_iter()
+            .filter(|project| {
+                Path::new(&project.board_path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&project.board_path))
+                    == resolved
+            })
+            .collect::<Vec<_>>();
+        return Ok(match matches.as_slice() {
+            [project] => Some(project.name.clone()),
+            _ => None,
+        });
+    }
+    if let Some(name) = args.one("project").map(str::to_owned).or_else(|| {
+        env::var("KANBAN_PROJECT")
+            .ok()
+            .filter(|value| !value.is_empty())
+    }) {
+        return Ok(Some(name));
+    }
+    let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
+    Ok(registry.resolve(&workspace)?.map(|record| record.name))
+}
+
+fn effective_rule_summaries(args: &Args, store: &Store) -> Result<Vec<RuleSummary>> {
+    let board_name = selected_board_name(args)?;
+    let mut rules = Registry::open()?.global_rule_summaries_for(board_name.as_deref(), false)?;
     rules.extend(store.rule_summaries(false)?);
     Ok(rules)
 }
@@ -1561,8 +1600,10 @@ fn run() -> Result<()> {
                 (None, Some(body)) => body,
                 (None, None) => bail!("rule body is required"),
             };
+            let board_tags =
+                registry.canonical_board_tags(&args.many("board"), &args.many("except-board"))?;
             return print(
-                &registry.add_global_rule(body, args.require("as")?)?,
+                &registry.add_global_rule(body, args.require("as")?, &board_tags)?,
                 args.has("json"),
             );
         }
@@ -1583,9 +1624,20 @@ fn run() -> Result<()> {
         }
         if sub == Some("update") {
             let id = rest.first().context("rule id is required")?;
-            let body = args.body()?.context("--body or --body-file is required")?;
+            let body = args.body()?;
+            let targets_changed = args.has("board") || args.has("except-board");
+            let board_tags = targets_changed
+                .then(|| {
+                    registry.canonical_board_tags(&args.many("board"), &args.many("except-board"))
+                })
+                .transpose()?;
             return print(
-                &registry.update_global_rule(id, &body, args.require("as")?)?,
+                &registry.update_global_rule(
+                    id,
+                    body.as_deref(),
+                    board_tags.as_deref(),
+                    args.require("as")?,
+                )?,
                 args.has("json"),
             );
         }
@@ -1598,6 +1650,10 @@ fn run() -> Result<()> {
                 args.has("json"),
             );
         }
+    }
+
+    if command == "rule" && (args.has("board") || args.has("except-board")) {
+        bail!("--board and --except-board target global rules; add --global");
     }
 
     let mut store = open_store(&args)?;
@@ -1802,7 +1858,7 @@ fn run() -> Result<()> {
                 allow_reassign: args.has("allow-reassign"),
             },
         )?;
-        value.rules = effective_rule_summaries(&store)?;
+        value.rules = effective_rule_summaries(&args, &store)?;
         return print(&value, args.has("json"));
     }
     if command == "heartbeat" {
@@ -1904,7 +1960,7 @@ fn run() -> Result<()> {
             args.one("caller-scope"),
             git,
         )?;
-        let rules = effective_rule_summaries(&store)?;
+        let rules = effective_rule_summaries(&args, &store)?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),
             args.has("json"),
@@ -2066,7 +2122,7 @@ fn run() -> Result<()> {
     if command == "context" {
         let id = sub.context("task id is required")?;
         let mut packet = store.context_packet(id)?;
-        packet.rules = effective_rule_summaries(&store)?;
+        packet.rules = effective_rule_summaries(&args, &store)?;
         if args.has("json") {
             // --max-chars bounds the rendered text and has never had any
             // effect here, so accepting it silently handed back an unbounded

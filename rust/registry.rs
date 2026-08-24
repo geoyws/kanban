@@ -3,6 +3,7 @@ use crate::model::{Event, ProjectRecord, Rule, RuleSummary, UnreachableRoot, Wor
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::json;
+use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -30,6 +31,14 @@ fn validate_rule_actor(value: &str) -> Result<&str> {
 }
 
 fn global_rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
+    let encoded: String = record.get("board_tags")?;
+    let board_tags = serde_json::from_str(&encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            encoded.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
     Ok(Rule {
         id: record.get("id")?,
         body: record.get("body")?,
@@ -37,6 +46,22 @@ fn global_rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
         archived: record.get("archived")?,
         created_at: record.get("created_at")?,
         updated_at: record.get("updated_at")?,
+        board_tags: Some(board_tags),
+    })
+}
+
+fn board_tags_apply(tags: Option<&[String]>, board_name: Option<&str>) -> bool {
+    let tags = tags.unwrap_or(&[]);
+    if tags.iter().any(|tag| tag == "ALL") {
+        return board_name.is_none_or(|name| {
+            !tags
+                .iter()
+                .any(|tag| tag.strip_prefix("EXCEPT:") == Some(name))
+        });
+    }
+    board_name.is_some_and(|name| {
+        tags.iter()
+            .any(|tag| tag.strip_prefix("ONLY:") == Some(name))
     })
 }
 
@@ -281,7 +306,65 @@ impl Registry {
         Ok(out)
     }
 
-    pub fn add_global_rule(&mut self, body: &str, actor: &str) -> Result<Rule> {
+    /// Turn operator-facing include/exclude flags into the one canonical tag
+    /// representation stored and returned by every adapter.
+    pub fn canonical_board_tags(
+        &self,
+        boards: &[String],
+        except_boards: &[String],
+    ) -> Result<Vec<String>> {
+        let boards = if boards.is_empty() {
+            vec!["ALL".to_owned()]
+        } else {
+            boards.to_vec()
+        };
+        let mut seen = HashSet::new();
+        for name in boards.iter().chain(except_boards) {
+            if !seen.insert(name) {
+                bail!("board target {name:?} was given more than once");
+            }
+        }
+        let all = boards.iter().any(|name| name == "ALL");
+        if all && boards.len() != 1 {
+            bail!("ALL cannot be combined with named --board targets");
+        }
+        if !all && !except_boards.is_empty() {
+            bail!("--except-board requires ALL scope; omit --board or pass --board ALL");
+        }
+        for name in boards
+            .iter()
+            .filter(|name| name.as_str() != "ALL")
+            .chain(except_boards)
+        {
+            if name == "ALL" {
+                bail!("ALL is only valid as --board ALL, never --except-board ALL");
+            }
+            match self.by_name(name)?.len() {
+                1 => {}
+                0 => bail!("no registered Kanban board named {name}"),
+                count => bail!(
+                    "{count} registered Kanban boards are named {name}; board tags require a unique name"
+                ),
+            }
+        }
+        let mut tags = if all {
+            vec!["ALL".to_owned()]
+        } else {
+            boards
+                .into_iter()
+                .map(|name| format!("ONLY:{name}"))
+                .collect()
+        };
+        tags.extend(except_boards.iter().map(|name| format!("EXCEPT:{name}")));
+        Ok(tags)
+    }
+
+    pub fn add_global_rule(
+        &mut self,
+        body: &str,
+        actor: &str,
+        board_tags: &[String],
+    ) -> Result<Rule> {
         validate_rule_body(body)?;
         let actor = validate_rule_actor(actor)?.to_owned();
         let id = format!("g-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -294,12 +377,12 @@ impl Registry {
             })?;
         let now = now_ms().max(previous.unwrap_or(0).saturating_add(1));
         transaction.execute(
-            "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at) VALUES(?,?,?,0,?,?)",
-            params![id, body, actor, now, now],
+            "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags) VALUES(?,?,?,0,?,?,?)",
+            params![id, body, actor, now, now, serde_json::to_string(board_tags)?],
         )?;
         transaction.execute(
             "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-            params![id, "global_rule_added", actor, json!({"ruleID": id}).to_string(), now],
+            params![id, "global_rule_added", actor, json!({"ruleID": id, "boardTags": board_tags}).to_string(), now],
         )?;
         let rule = transaction.query_row(
             "SELECT * FROM global_rules WHERE id=?",
@@ -347,9 +430,34 @@ impl Registry {
                     headline,
                     has_more,
                     bytes: rule.body.len(),
+                    board_tags: rule.board_tags,
                 })
             })
             .collect()
+    }
+
+    pub fn global_rule_summaries_for(
+        &self,
+        board_name: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<RuleSummary>> {
+        Ok(self
+            .global_rule_summaries(include_archived)?
+            .into_iter()
+            .filter(|rule| board_tags_apply(rule.board_tags.as_deref(), board_name))
+            .collect())
+    }
+
+    pub fn global_rules_for(
+        &self,
+        board_name: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<Rule>> {
+        Ok(self
+            .global_rules(include_archived)?
+            .into_iter()
+            .filter(|rule| board_tags_apply(rule.board_tags.as_deref(), board_name))
+            .collect())
     }
 
     pub fn global_rule(&self, id: &str) -> Result<Rule> {
@@ -363,26 +471,59 @@ impl Registry {
             .with_context(|| format!("global rule {id} not found"))
     }
 
-    pub fn update_global_rule(&mut self, id: &str, body: &str, actor: &str) -> Result<Rule> {
-        validate_rule_body(body)?;
+    pub fn update_global_rule(
+        &mut self,
+        id: &str,
+        body: Option<&str>,
+        board_tags: Option<&[String]>,
+        actor: &str,
+    ) -> Result<Rule> {
+        if body.is_none() && board_tags.is_none() {
+            bail!("global rule update requires --body/--body-file, --board, or --except-board");
+        }
+        if let Some(body) = body {
+            validate_rule_body(body)?;
+        }
         let actor = validate_rule_actor(actor)?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<String> = transaction
-            .query_row("SELECT body FROM global_rules WHERE id=?", [id], |row| {
-                row.get(0)
-            })
+        let previous: Option<Rule> = transaction
+            .query_row(
+                "SELECT * FROM global_rules WHERE id=?",
+                [id],
+                global_rule_row,
+            )
             .optional()?;
         let previous = previous.with_context(|| format!("global rule {id} not found"))?;
         let now = now_ms();
         transaction.execute(
-            "UPDATE global_rules SET body=?,author=?,updated_at=? WHERE id=?",
-            params![body, actor, now, id],
+            "UPDATE global_rules SET body=?,board_tags=?,author=?,updated_at=? WHERE id=?",
+            params![
+                body.unwrap_or(&previous.body),
+                serde_json::to_string(
+                    board_tags.unwrap_or(previous.board_tags.as_deref().unwrap_or(&[]))
+                )?,
+                actor,
+                now,
+                id
+            ],
         )?;
+        let mut changed = Vec::new();
+        if body.is_some() {
+            changed.push("body");
+        }
+        if board_tags.is_some() {
+            changed.push("boardTags");
+        }
         transaction.execute(
             "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-            params![id, "global_rule_updated", actor, json!({"ruleID": id, "previousBody": previous}).to_string(), now],
+            params![id, "global_rule_updated", actor, json!({
+                "ruleID": id,
+                "previousBody": previous.body,
+                "previousBoardTags": previous.board_tags,
+                "changed": changed,
+            }).to_string(), now],
         )?;
         let rule = transaction.query_row(
             "SELECT * FROM global_rules WHERE id=?",
