@@ -251,6 +251,28 @@ A task's `status` is a workflow state and always a `--status` flag; a *status
 update* is prose about a lane and always the `status` command. Reasoning:
 `docs/adr/ADR-017-*`.
 
+## Off-site backup
+
+```bash
+./scripts/backup.sh                 # snapshot, encrypt, upload, verify, prune
+./scripts/backup.sh --rehearse      # restore the newest remote copy and doctor it
+./scripts/backup.sh --verify-only kanban-<stamp>.tar.gz.age
+```
+
+`kanban-backup.timer` runs it nightly at 02:50 and keeps 14 copies, age-encrypted,
+on the Hetzner Storage Box. `kanban-restore-rehearse.timer` runs a real restore
+monthly into a scratch data root and makes the restored copy answer `doctor`,
+because a backup nobody has restored is a backup nobody knows works. Neither
+touches the live data root.
+
+The verify step is not optional: every run re-downloads what it just uploaded,
+decrypts it, and asserts the registry and every board came back as valid SQLite.
+An unverified backup is a hope, not a backup.
+
+The decryption key is the **only** copy — `keys/kanban-backup-age.key` in the
+git-crypt'd dotfiles, which is where it must live, because it has to survive the
+loss of the machine the backups are taken from.
+
 ## The web view
 
 ```bash
