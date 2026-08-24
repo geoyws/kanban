@@ -407,12 +407,29 @@ fn lanes() -> Result<String> {
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None)?;
+    let rules = store.rules(false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
     html.push_str(&format!(
         "<p class=meta>{} · {} rows</p>",
         escape(&project.canonical_root),
         tasks.len()
     ));
+    if !rules.is_empty() {
+        html.push_str(&format!(
+            "<h2>Project rules <span class=count>{}</span></h2>",
+            rules.len()
+        ));
+        for rule in rules {
+            let headline = rule.body.lines().next().unwrap_or_default();
+            html.push_str(&format!(
+                "<details class=rule><summary><code>{id}</code> {headline}</summary>\
+                 <pre>{body}</pre></details>",
+                id = escape(&rule.id),
+                headline = escape(headline),
+                body = escape(&rule.body),
+            ));
+        }
+    }
     for status in crate::model::TASK_STATUSES {
         let rows = tasks
             .iter()

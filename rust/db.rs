@@ -343,6 +343,22 @@ SET kind = 'sitrep_posted',
 WHERE kind = 'status_posted';
 "#;
 
+/// Per-project operator rules: short constraints agents receive from the board.
+///
+/// These rows are a working copy, not a secret store or cross-machine source
+/// of truth. They retire rather than delete so their audit trail stays useful.
+const BOARD_V11: &str = r#"
+CREATE TABLE rules (
+ id TEXT PRIMARY KEY NOT NULL,
+ body TEXT NOT NULL,
+ author TEXT NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_rules_active ON rules(archived,created_at);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -546,7 +562,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10,
+            BOARD_V9, BOARD_V10, BOARD_V11,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

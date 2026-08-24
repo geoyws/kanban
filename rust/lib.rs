@@ -63,6 +63,11 @@ Usage:
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
   kanban tag list [--json]
   kanban tag remove NAME [--force] [--as ACTOR] [--json]
+  kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR [--json]
+  kanban rule list [--all] [--full] [--json]
+  kanban rule show ID [--json]
+  kanban rule update ID [--body TEXT | --body-file PATH] --as ACTOR [--json]
+  kanban rule retire ID --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--task ID] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--limit N] [--json]
@@ -89,12 +94,13 @@ Environment:
 
 Aliases (the binary installs as both `kanban` and `kb`):
   t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
-  ctx=context  ev=events  dash=dashboard  rel=release  n=note  sr=sitrep  v=version
+  ctx=context  ev=events  dash=dashboard  rel=release  n=note  r=rule  sr=sitrep  v=version
   att/attn=attention
   task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
   story:     adv=advance
   handoff:   ls=list  new=create  acc=accept
   workspace: ls=list  att=attach
+  rule:      ls=list  new=add  up=update  cat=show
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
 --force is required to override a live lease (task move/remove) or to nest a
@@ -102,7 +108,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 21] = [
+pub(crate) const BOOLEAN: [&str; 22] = [
     "help",
     "json",
     "version",
@@ -124,6 +130,7 @@ pub(crate) const BOOLEAN: [&str; 21] = [
     "dry-run",
     "verify",
     "all",
+    "full",
 ];
 
 /// Flags that may be given more than once, because their value is a list.
@@ -374,6 +381,23 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("tag", Some("list"), &[], &[], true),
     ("tag", Some("remove"), &["as", "force"], &["name"], false),
     (
+        "rule",
+        Some("add"),
+        &["as", "body", "body-file"],
+        &["?body"],
+        false,
+    ),
+    ("rule", Some("list"), &["all", "full"], &[], true),
+    ("rule", Some("show"), &[], &["id"], true),
+    (
+        "rule",
+        Some("update"),
+        &["as", "body", "body-file"],
+        &["id"],
+        false,
+    ),
+    ("rule", Some("retire"), &["as"], &["id"], false),
+    (
         "attention",
         Some("raise"),
         &["as", "kind", "task"],
@@ -436,7 +460,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 8] = [
+const SUBCOMMAND_GROUPS: [&str; 9] = [
     "task",
     "story",
     "handoff",
@@ -444,6 +468,7 @@ const SUBCOMMAND_GROUPS: [&str; 8] = [
     "workspace",
     "attention",
     "tag",
+    "rule",
     "sitrep",
 ];
 
@@ -467,6 +492,7 @@ fn canonical_command(value: &str) -> &str {
         "dash" => "dashboard",
         "rel" => "release",
         "n" => "note",
+        "r" => "rule",
         "v" => "version",
         other => other,
     }
@@ -496,6 +522,10 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("tag", "ls") => "list",
         ("tag", "new") => "add",
         ("tag", "rm") => "remove",
+        ("rule", "ls") => "list",
+        ("rule", "new") => "add",
+        ("rule", "up") => "update",
+        ("rule", "cat") => "show",
         ("sitrep", "ls") => "list",
         ("sitrep", "new") => "post",
         (_, other) => other,
@@ -1828,6 +1858,47 @@ fn run() -> Result<()> {
         let name = rest.first().context("tag name is required")?;
         store.remove_tag(name, args.one("as"), args.has("force"))?;
         return print(&json!({ "removed": name }), args.has("json"));
+    }
+    if command == "rule" && sub == Some("add") {
+        let flagged = args.body()?;
+        let positional = rest.first();
+        let body = match (positional, flagged.as_deref()) {
+            (Some(_), Some(_)) => {
+                bail!("rule body was given as both a positional and --body/--body-file; pass one")
+            }
+            (Some(body), None) => body.as_str(),
+            (None, Some(body)) => body,
+            (None, None) => bail!("rule body is required"),
+        };
+        return print(
+            &store.add_rule(body, args.require("as")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "rule" && sub == Some("list") {
+        if args.has("full") {
+            return print(&store.rules(args.has("all"))?, args.has("json"));
+        }
+        return print(&store.rule_summaries(args.has("all"))?, args.has("json"));
+    }
+    if command == "rule" && sub == Some("show") {
+        let id = rest.first().context("rule id is required")?;
+        return print(&store.rule(id)?, args.has("json"));
+    }
+    if command == "rule" && sub == Some("update") {
+        let id = rest.first().context("rule id is required")?;
+        let body = args.body()?.context("--body or --body-file is required")?;
+        return print(
+            &store.update_rule(id, &body, args.require("as")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "rule" && sub == Some("retire") {
+        let id = rest.first().context("rule id is required")?;
+        return print(
+            &store.retire_rule(id, args.require("as")?)?,
+            args.has("json"),
+        );
     }
     if command == "attention" && sub == Some("raise") {
         let text = rest.first().context("attention text is required")?;

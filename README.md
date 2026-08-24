@@ -118,6 +118,33 @@ sixteen-agent fan-out, that took the failure rate from 3% to zero and the
 slowest write from 6.7s to 4.5s: an agent reads an exit status and moves on, so
 a dropped write is lost work nothing downstream will notice is missing.
 
+## Project rules
+
+Short, non-secret constraints that must frame every task belong to the project
+board's ordered rules document:
+
+```bash
+kb r new "Production runtime is Rust." --as geo
+kb r new --body-file /tmp/non-secret-rule.md --as geo
+kb r ls                         # active table of contents, oldest first
+kb r cat r-12345678             # fetch one full body lazily
+kb r up r-12345678 --body "Production runtime is compiled Rust." --as geo
+kb rule retire r-12345678 --as geo
+kb r ls --all --full            # include retired rules and full bodies
+```
+
+The first line is the headline. Every context packet and newly granted claim
+carries the complete active table of contents; a long body is fetched only with
+`kb r cat ID`. The claim receipt stays flat, while a stored claim remains the
+same shape it had before rules existed.
+
+Rules are retire-only and audited: updating records the prior body, retirement
+removes a rule from active contexts without deleting it, and there is no `rm`
+alias. They do not replace private memory. Long-form context, cross-machine
+knowledge and anything secret remain in versioned/git-crypt'd dotfiles. Never
+put credentials or secret values in the plaintext board database. See
+[ADR-018](docs/adr/ADR-018-project-rules-frame-work-without-replacing-private-memory.md).
+
 ## Working from anywhere
 
 Boards are addressable from any directory, not only from inside the project

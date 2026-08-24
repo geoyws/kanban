@@ -30,6 +30,28 @@ pub struct Tag {
     pub uses: i64,
 }
 
+/// One project-level operator rule, ordered as part of a document.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rule {
+    pub id: String,
+    pub body: String,
+    pub author: String,
+    pub archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The always-carried table-of-contents entry for a project rule.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleSummary {
+    pub id: String,
+    pub headline: String,
+    pub has_more: bool,
+    pub bytes: usize,
+}
+
 /// A registered root that no longer names the directory it was registered for.
 ///
 /// Registration canonicalises, so a stored root is correct the moment it is
@@ -136,6 +158,19 @@ pub struct Claim {
     pub head_sha: Option<String>,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
+}
+
+/// A newly granted lease plus the active rules that frame its work.
+///
+/// Flattening preserves the existing top-level claim wire shape. This is not a
+/// field on [`Claim`]: `get_claim` must not serialize an empty rules array that
+/// falsely reads as proof that the project has no rules.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimReceipt {
+    #[serde(flatten)]
+    pub claim: Claim,
+    pub rules: Vec<RuleSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +331,8 @@ pub struct ContextPacket {
     pub notes: Vec<TaskNote>,
     pub checkpoints: Vec<Checkpoint>,
     pub handoffs: Vec<Handoff>,
+    /// Active project rules, as an untruncated table of contents.
+    pub rules: Vec<RuleSummary>,
     /// Sitreps mentioning this task, newest first.
     ///
     /// A resuming agent reads the packet and nothing else, so an update that

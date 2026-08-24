@@ -97,7 +97,6 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
             "--json",
         ],
     );
-
     let outgoing = fixture.ok_json(
         &fixture.worktree,
         &[
@@ -3661,6 +3660,18 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         &["task", "add", "Some work", "--id", "t-1", "--json"],
     );
     fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    let rule = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Read-only schema probe.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let rule_id = rule["id"].as_str().unwrap().to_owned();
     let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
         .as_str()
         .unwrap()
@@ -3676,6 +3687,8 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
             "tag list" => vec!["tag", "list"],
+            "rule list" => vec!["rule", "list"],
+            "rule show" => vec!["rule", "show", &rule_id],
             "sitrep list" => vec!["sitrep", "list"],
             "schema" => vec!["schema"],
             "events" => vec!["events"],
@@ -3743,6 +3756,9 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         "attention resolve",
         "tag add",
         "tag remove",
+        "rule add",
+        "rule update",
+        "rule retire",
         "handoff create",
         "restore",
         "backup",
@@ -4805,6 +4821,8 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
             DROP INDEX idx_sitreps_lane_created;
             ALTER TABLE sitreps RENAME TO status_updates;
             CREATE INDEX idx_status_lane_created ON status_updates(lane,archived,created_at DESC);
+            DROP INDEX idx_rules_active;
+            DROP TABLE rules;
             INSERT INTO status_updates VALUES(
               'u-11111111','driver-2',NULL,'claude@driver-2','first body',
               '/repo','main','abc123',NULL,'clean',1,1000
@@ -4859,7 +4877,14 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM rules", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "V11 did not recreate the rules table after the V10 fixture migrated"
     );
     let mut statement = connection
         .prepare("SELECT kind,payload FROM events WHERE kind='sitrep_posted' ORDER BY seq")
@@ -5793,6 +5818,39 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--json",
         ],
     );
+    let live_rule = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Never render <b>rules</b> without escaping.\n\nThe full body is visible.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let retired_rule = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "RETIRED RULE MUST NOT RENDER",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "retire",
+            retired_rule["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
 
     // A port nobody else on the box is using, derived from this process so a
     // concurrent test run cannot collide with it.
@@ -5910,6 +5968,21 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     assert!(
         !one.contains("<script>alert"),
         "a script tag reached the page: {one}"
+    );
+    assert!(one.contains("Project rules"), "{one}");
+    assert!(one.contains(live_rule["id"].as_str().unwrap()), "{one}");
+    assert!(
+        one.contains("Never render &lt;b&gt;rules&lt;/b&gt; without escaping."),
+        "a rule headline was not escaped: {one}"
+    );
+    assert!(one.contains("The full body is visible."), "{one}");
+    assert!(
+        !one.contains("<b>rules</b>"),
+        "raw rule markup reached the page: {one}"
+    );
+    assert!(
+        !one.contains("RETIRED RULE MUST NOT RENDER"),
+        "a retired rule remained in force on the board page: {one}"
     );
 
     let (status, detail) = http_get(port, "/task/SERVED/t-hostile");
@@ -6308,5 +6381,219 @@ fn a_sitrep_costs_one_command_and_retires_what_it_supersedes() {
         String::from_utf8_lossy(&old_name.stderr).contains("unknown command"),
         "{}",
         String::from_utf8_lossy(&old_name.stderr)
+    );
+}
+
+#[test]
+fn project_rules_have_an_ordered_audited_retire_only_lifecycle() {
+    let fixture = Fixture::new("rules");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RULES", "--json"]);
+
+    let first = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Never touch the PX database layer.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(first["id"].as_str().unwrap().starts_with("r-"));
+    assert_eq!(first["author"], "geo");
+    assert_eq!(first["archived"], false);
+
+    let body_file = fixture.root.join("rule.md");
+    fs::write(
+        &body_file,
+        "crm-react only.\n\nPX repositories are read-only references.\n",
+    )
+    .unwrap();
+    let second = fixture.ok_json(
+        &fixture.main,
+        &[
+            "r",
+            "new",
+            "--body-file",
+            body_file.to_str().unwrap(),
+            "--as",
+            "codex@driver",
+            "--json",
+        ],
+    );
+    assert_eq!(second["body"], fs::read_to_string(&body_file).unwrap());
+
+    let listed = fixture.ok_json(&fixture.main, &["rule", "list", "--full", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(listed[0]["id"], first["id"], "rules are not oldest first");
+    assert_eq!(listed[1]["id"], second["id"]);
+
+    let first_id = first["id"].as_str().unwrap();
+    let revised = fixture.ok_json(
+        &fixture.main,
+        &[
+            "r",
+            "up",
+            first_id,
+            "--body",
+            "Never alter the PX database layer.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(revised["body"], "Never alter the PX database layer.");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["r", "cat", first_id, "--json"])["body"],
+        revised["body"]
+    );
+    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    let revision = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "rule_updated")
+        .expect("rule revision left no trail");
+    assert_eq!(
+        revision["payload"]["previousBody"],
+        "Never touch the PX database layer."
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &["rule", "retire", first_id, "--as", "geo", "--json"],
+    );
+    let active = fixture.ok_json(&fixture.main, &["rule", "list", "--json"]);
+    assert_eq!(active.as_array().unwrap().len(), 1);
+    assert_eq!(active[0]["id"], second["id"]);
+    let all = fixture.ok_json(
+        &fixture.main,
+        &["rule", "list", "--all", "--full", "--json"],
+    );
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    assert_eq!(all[0]["id"], first["id"]);
+    assert_eq!(all[0]["archived"], true);
+
+    let deletion_alias = fixture.run(&fixture.main, &["rule", "rm", first_id, "--json"]);
+    assert!(
+        !deletion_alias.status.success(),
+        "an rm alias implied a destructive operation that does not exist"
+    );
+
+    for args in [
+        vec!["rule", "add", "", "--as", "geo", "--json"],
+        vec!["rule", "add", "valid", "--as", "", "--json"],
+    ] {
+        let refused = fixture.run(&fixture.main, &args);
+        assert!(
+            !refused.status.success(),
+            "an empty rule field was accepted"
+        );
+    }
+    let two_bodies = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "positional",
+            "--body",
+            "flagged",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !two_bodies.status.success(),
+        "two rule bodies were silently ranked"
+    );
+}
+
+#[test]
+fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_claim() {
+    let fixture = Fixture::new("rule-context");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RULE-CONTEXT", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Rule-framed work",
+            "--id",
+            "t-rules",
+            "--json",
+        ],
+    );
+    let short = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Never touch the PX database layer.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let long_body = format!(
+        "crm-react only; PX repos are read-only references.\n\n{}",
+        "supporting detail ".repeat(160)
+    );
+    let long = fixture.ok_json(
+        &fixture.main,
+        &["rule", "add", "--body", &long_body, "--as", "geo", "--json"],
+    );
+
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-rules", "--as", "worker", "--json"],
+    );
+    assert_eq!(claim["taskID"], "t-rules", "claim wire shape was nested");
+    assert_eq!(claim["rules"].as_array().unwrap().len(), 2);
+    assert_eq!(claim["rules"][0]["id"], short["id"]);
+    assert_eq!(claim["rules"][1]["id"], long["id"]);
+    assert_eq!(claim["rules"][0]["hasMore"], false);
+    assert_eq!(claim["rules"][1]["hasMore"], true);
+    assert!(claim["rules"][1]["bytes"].as_u64().unwrap() > 2_000);
+    assert!(
+        claim.get("claim").is_none(),
+        "claim receipt stopped being flat"
+    );
+
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-rules", "--json"]);
+    assert!(
+        shown["claim"].get("rules").is_none(),
+        "get_claim serialized an empty rules field as if it had checked the board"
+    );
+
+    let packet = fixture.ok_json(&fixture.main, &["context", "t-rules", "--json"]);
+    assert_eq!(packet["rules"], claim["rules"]);
+    let rendered = fixture.run(
+        &fixture.main,
+        &["context", "t-rules", "--max-chars", "1000"],
+    );
+    assert!(rendered.status.success());
+    let rendered = String::from_utf8(rendered.stdout).unwrap();
+    assert!(
+        rendered.contains("## Project rules (2 · kb r ls)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Never touch the PX database layer."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("crm-react only; PX repos are read-only references."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("KB · kb r cat"), "{rendered}");
+    assert!(
+        rendered.contains(long["id"].as_str().unwrap()),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("supporting detail supporting detail"),
+        "context carried a full long rule instead of its table of contents"
     );
 }

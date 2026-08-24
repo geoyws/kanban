@@ -1,4 +1,4 @@
-use crate::model::{Checkpoint, ContextPacket, Handoff, Sitrep, Task, TaskNote};
+use crate::model::{Checkpoint, ContextPacket, Handoff, RuleSummary, Sitrep, Task, TaskNote};
 use crate::store::Store;
 use anyhow::{Result, bail};
 
@@ -65,6 +65,27 @@ fn render_sitrep(sitrep: &Sitrep) -> String {
                 .map(|sha| format!(" @ {}", &sha[..sha.len().min(8)]))
                 .unwrap_or_default()
         ));
+    }
+    lines.join("\n")
+}
+
+fn render_rules(rules: &[RuleSummary]) -> String {
+    let mut lines = vec![format!("## Project rules ({} · kb r ls)", rules.len())];
+    if rules.is_empty() {
+        lines.push("(none)".to_owned());
+        return lines.join("\n");
+    }
+    for rule in rules {
+        let detail = if rule.has_more {
+            format!(
+                "  (+{:.1} KB · kb r cat {})",
+                rule.bytes as f64 / 1024.0,
+                rule.id
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!("- {}  {}{detail}", rule.id, rule.headline));
     }
     lines.join("\n")
 }
@@ -181,8 +202,9 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
     let newest_checkpoint = packet.checkpoints.last();
     let newest_handoff = packet.handoffs.last();
     let newest_sitrep = packet.sitreps.last();
+    let rules = render_rules(&packet.rules);
     let required = format!(
-        "{fixed}\n\n## Latest sitrep\n{}\n\n## Latest checkpoint\n{}\n\n## Latest handoff\n{}",
+        "{fixed}\n\n{rules}\n\n## Latest sitrep\n{}\n\n## Latest checkpoint\n{}\n\n## Latest handoff\n{}",
         newest_sitrep.map_or_else(|| "(none)".to_owned(), render_sitrep),
         newest_checkpoint.map_or_else(|| "(none)".to_owned(), render_checkpoint),
         newest_handoff.map_or_else(|| "(none)".to_owned(), render_handoff)
@@ -204,6 +226,7 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .as_ref()
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
             ),
+            rules,
             format!(
                 "Sitrep: {}",
                 clip(

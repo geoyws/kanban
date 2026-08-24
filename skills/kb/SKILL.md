@@ -38,6 +38,7 @@ near-miss flag is *suggested* in the error, never accepted.
 | `ev` | `events` |
 | `dash` | `dashboard` |
 | `n` | `note` |
+| `r` | `rule` |
 | `v` | `version` |
 
 Scoped to their group:
@@ -49,6 +50,7 @@ Scoped to their group:
 | `handoff` | `ls`=list `new`=create `acc`=accept |
 | `workspace` | `ls`=list `att`=attach |
 | `tag` | `ls`=list `rm`=remove `new`=add |
+| `rule` | `ls`=list `new`=add `up`=update `cat`=show |
 | `sitrep` | `ls`=list `new`=post |
 
 ⚠ `att` means **attach** inside `workspace` and **attention** at the top level.
@@ -75,6 +77,37 @@ working directory.
 kb ws ls --json                 # every registered project and its board path
 kb init --name NAME             # register the current directory
 ```
+
+## Project rules — what frames every task
+
+Put short, non-secret operating constraints that apply across this project in
+the board's ordered rules document:
+
+```bash
+kb r new "Production runtime is Rust." --as "$AGENT" --json
+kb r new --body-file /tmp/non-secret-rule.md --as "$AGENT" --json
+kb r ls --json                         # active table of contents, oldest first
+kb r cat r-12345678 --json             # one full body, fetched lazily
+kb r up r-12345678 --body "Revised rule" --as "$AGENT" --json
+kb rule retire r-12345678 --as "$AGENT" --json
+kb r ls --all --full --json            # retired rows and full bodies
+```
+
+The first line is the headline. `kb ctx <task>` and every successful new claim
+carry the complete active table of contents: id, headline, byte size and whether
+more body exists. Read a long body with `kb r cat ID`; do not load every detail
+into context speculatively. A claim receipt keeps its existing fields at the top
+level and adds `rules`; `kb t cat`'s stored claim deliberately does not pretend
+it re-read the board's current rules.
+
+Rules are **audited and retire-only**. Updates retain the previous body in the
+event trail; retirement removes a rule from active claims, contexts and the web
+board without deleting history. There is no `rm` alias.
+
+This is not the secret or long-form memory store. Keep credentials, secrets,
+long explanations and cross-machine knowledge in the versioned/git-crypt'd
+dotfiles, and let a short rule point there when needed. **Never put a secret
+value in the plaintext board database.**
 
 ## Attention — anything that needs George
 
@@ -417,4 +450,4 @@ once a silent wrong answer.
 ADR-008 (fail closed), ADR-010 (adapters generated from the surface),
 ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
 attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
-ADR-016 (the web view), ADR-017 (sitreps).
+ADR-016 (the web view), ADR-017 (sitreps), ADR-018 (project rules).

@@ -15,6 +15,18 @@ fn nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+fn validate_rule_body(value: &str) -> Result<()> {
+    nonempty(value, "rule body")?;
+    if value
+        .lines()
+        .next()
+        .is_none_or(|line| line.trim().is_empty())
+    {
+        bail!("rule headline is required on the first line");
+    }
+    Ok(())
+}
+
 fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     if !allowed.contains(&value) {
         bail!("invalid {label} {value}");
@@ -392,6 +404,17 @@ fn sitrep_row(row: &Row<'_>) -> rusqlite::Result<Sitrep> {
         dirty_summary: row.get("dirty_summary")?,
         archived: row.get::<_, i64>("archived")? != 0,
         created_at: row.get("created_at")?,
+    })
+}
+
+fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
+    Ok(Rule {
+        id: row.get("id")?,
+        body: row.get("body")?,
+        author: row.get("author")?,
+        archived: row.get::<_, i64>("archived")? != 0,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
     })
 }
 
@@ -1175,7 +1198,7 @@ impl Store {
         self.require_task(id)
     }
 
-    pub fn claim(&mut self, id: Option<&str>, options: ClaimOptions) -> Result<Claim> {
+    pub fn claim(&mut self, id: Option<&str>, options: ClaimOptions) -> Result<ClaimReceipt> {
         let agent = nonempty(&options.agent_id, "agent id")?.to_owned();
         if options.lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
@@ -1296,7 +1319,10 @@ impl Store {
         )?;
         let result = active_claim(&transaction, &task.id, now)?.context("claim was not created")?;
         transaction.commit()?;
-        Ok(result)
+        Ok(ClaimReceipt {
+            claim: result,
+            rules: self.rule_summaries(false)?,
+        })
     }
 
     pub fn get_claim(&self, id: &str) -> Result<Option<Claim>> {
@@ -1546,6 +1572,143 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Add an operator rule at the end of this board's rule document.
+    pub fn add_rule(&mut self, body: &str, actor: &str) -> Result<Rule> {
+        validate_rule_body(body)?;
+        let body = body.to_owned();
+        let actor = nonempty(actor, "author")?.to_owned();
+        let id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_created: Option<i64> =
+            transaction.query_row("SELECT max(created_at) FROM rules", [], |row| row.get(0))?;
+        let now = now_ms().max(previous_created.unwrap_or(0).saturating_add(1));
+        transaction.execute(
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at) VALUES(?,?,?,0,?,?)",
+            params![id, body, actor, now, now],
+        )?;
+        event(
+            &transaction,
+            None,
+            "rule_added",
+            Some(&actor),
+            json!({"ruleID": id}),
+        )?;
+        let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [&id], rule_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Active rules are a document, so their order is oldest first.
+    pub fn rules(&self, include_archived: bool) -> Result<Vec<Rule>> {
+        let clause = if include_archived {
+            ""
+        } else {
+            " WHERE archived=0"
+        };
+        let sql = format!("SELECT * FROM rules{clause} ORDER BY created_at,id");
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map([], rule_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn rule_summaries(&self, include_archived: bool) -> Result<Vec<RuleSummary>> {
+        self.rules(include_archived)?
+            .into_iter()
+            .map(|rule| {
+                let headline = rule
+                    .body
+                    .lines()
+                    .next()
+                    .context("stored rule has no headline")?
+                    .trim()
+                    .to_owned();
+                let has_more = rule
+                    .body
+                    .lines()
+                    .skip(1)
+                    .any(|line| !line.trim().is_empty());
+                Ok(RuleSummary {
+                    id: rule.id,
+                    headline,
+                    has_more,
+                    bytes: rule.body.len(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn rule(&self, id: &str) -> Result<Rule> {
+        self.connection
+            .query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)
+            .optional()?
+            .with_context(|| format!("rule {id} not found"))
+    }
+
+    /// Revise a rule without destroying the text it replaced.
+    pub fn update_rule(&mut self, id: &str, body: &str, actor: &str) -> Result<Rule> {
+        validate_rule_body(body)?;
+        let body = body.to_owned();
+        let actor = nonempty(actor, "author")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = transaction
+            .query_row("SELECT body FROM rules WHERE id=?", [id], |row| row.get(0))
+            .optional()?;
+        let previous = previous.with_context(|| format!("rule {id} not found"))?;
+        transaction.execute(
+            "UPDATE rules SET body=?,author=?,updated_at=? WHERE id=?",
+            params![body, actor, now_ms(), id],
+        )?;
+        event(
+            &transaction,
+            None,
+            "rule_updated",
+            Some(&actor),
+            json!({"ruleID": id, "previousBody": previous}),
+        )?;
+        let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Retire a rule from the active set without erasing it.
+    pub fn retire_rule(&mut self, id: &str, actor: &str) -> Result<Rule> {
+        let actor = nonempty(actor, "author")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE rules SET archived=1,author=?,updated_at=? WHERE id=? AND archived=0",
+            params![actor, now_ms(), id],
+        )?;
+        if changed == 0 {
+            let archived: Option<i64> = transaction
+                .query_row("SELECT archived FROM rules WHERE id=?", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            match archived {
+                None => bail!("rule {id} not found"),
+                Some(_) => bail!("rule {id} is already retired"),
+            }
+        }
+        event(
+            &transaction,
+            None,
+            "rule_retired",
+            Some(&actor),
+            json!({"ruleID": id}),
+        )?;
+        let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// Post where a lane stands, and retire what that supersedes.
@@ -2348,6 +2511,7 @@ impl Store {
             notes,
             checkpoints,
             handoffs,
+            rules: self.rule_summaries(false)?,
             sitreps,
             generated_at: now_ms(),
             truncated,
