@@ -5743,6 +5743,20 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     // Plans: a draft epic is the plan, and it names the work it holds back.
     // Lanes: what the agents are doing, the counterpart to what waits on the
     // operator. A status needs no task and no lease, which is the whole point.
+    // A second lane, posted first, so the page's ordering is observable.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "status",
+            "post",
+            "An older lane that has since gone quiet.",
+            "--as",
+            "claude@driver-9",
+            "--lane",
+            "aaa-quiet-lane",
+            "--json",
+        ],
+    );
     fixture.ok_json(
         &fixture.main,
         &[
@@ -5759,6 +5773,13 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     let (status, lanes) = http_get(port, "/lanes");
     assert_eq!(status, 200);
     assert!(lanes.contains("driver-2"), "{lanes}");
+    // Most recently active first. Nothing deletes a status update, so a lane
+    // whose driver is long gone keeps its rows forever -- alphabetical order
+    // would park it permanently above the lanes actually working.
+    assert!(
+        lanes.find("driver-2").unwrap() < lanes.find("aaa-quiet-lane").unwrap(),
+        "a quiet lane sorted above an active one: {lanes}"
+    );
     assert!(lanes.contains("retry path is the culprit"), "{lanes}");
     assert!(
         lanes.contains("&lt;i&gt;underway&lt;/i&gt;"),

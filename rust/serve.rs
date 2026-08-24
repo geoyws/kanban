@@ -359,7 +359,16 @@ fn lanes() -> Result<String> {
         );
         return Ok(page("Lanes", &html));
     }
-    for ((project, lane), updates) in &by_lane {
+    // Most recently active first. Nothing deletes a status update, and nothing
+    // should — but that means a lane whose driver is long gone keeps its rows
+    // forever, and alphabetical order parks it at the top of the page. Sorting
+    // by recency lets a dead lane sink out of the way without destroying what
+    // it said, which is the same answer archiving gives within a lane.
+    let mut ordered = by_lane.into_iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, updates)| {
+        std::cmp::Reverse(updates.iter().map(|u| u.created_at).max().unwrap_or(0))
+    });
+    for ((project, lane), updates) in &ordered {
         html.push_str("<article class=item>");
         html.push_str(&format!(
             "<h2>{lane} <span class=count><a href=\"/board/{project_url}\">{project}</a></span></h2>",

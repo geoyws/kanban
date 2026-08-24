@@ -101,6 +101,13 @@ returns the task to the queue in one transaction. What changes is that a handoff
 `--all` is a new global-ish boolean, and the read-only guard exercises
 `status list` like every other read.
 
+Nothing deletes a lane, either — which surfaced immediately, from probing this
+on the live board and leaving eleven throwaway rows in a `probe-lane` that
+cannot be removed. The Lanes page therefore orders lanes by most recent
+activity, so a lane whose driver is long gone sinks out of the way without
+anything destroying what it said. That is the same answer archiving gives
+within a lane, applied between them.
+
 Not offered: editing or deleting an individual update. It is a record of what
 was believed at a moment, and a record that can be revised after the fact is
 worth less than one that cannot. Post another one; the newest is the answer.
