@@ -3683,7 +3683,23 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
 
     let before = fs::read(&board).unwrap();
     let mut covered = 0;
-    for operation in operations.iter().filter(|o| o["readOnly"] == true) {
+    // A server is not an operation: `mcp` and `serve` block until killed, so
+    // they cannot be run to completion and compared. They are excluded by the
+    // property the manifest publishes, not by name, so a third one added later
+    // is excluded by being declared rather than by editing this test.
+    let servers = operations
+        .iter()
+        .filter(|o| o["longRunning"] == true)
+        .map(|o| o["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        servers.contains(&"mcp") && servers.contains(&"serve"),
+        "the long-running commands must declare themselves: {servers:?}"
+    );
+    for operation in operations
+        .iter()
+        .filter(|o| o["readOnly"] == true && o["longRunning"] != true)
+    {
         let name = operation["name"].as_str().unwrap();
         let args = arguments(name)
             .unwrap_or_else(|| panic!("{name} is labelled readOnly but this test cannot run it"));
@@ -3703,7 +3719,10 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
     }
     assert_eq!(
         covered,
-        operations.iter().filter(|o| o["readOnly"] == true).count(),
+        operations
+            .iter()
+            .filter(|o| o["readOnly"] == true && o["longRunning"] != true)
+            .count(),
         "a readOnly operation went unexercised"
     );
     assert!(covered >= 9, "too few read-only operations were proven");
@@ -5566,4 +5585,261 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
         "{}",
         String::from_utf8_lossy(&vanished.stderr)
     );
+}
+
+/// One HTTP request to the running server, as a real socket conversation.
+///
+/// Hand-rolled rather than reached for a client crate: this must exercise the
+/// wire, and a test dependency that speaks HTTP for us would be one more thing
+/// between the assertion and what the server actually wrote.
+fn http_get(port: u16, path: &str) -> (u16, String) {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
+    // Approvals are the bottleneck, and settling one meant being at a terminal
+    // with the right board addressed. This is the page that answers "what is
+    // waiting on me" across every board at once. Phase 1 is read-only, and the
+    // load-bearing claim is that it stays that way.
+    let fixture = Fixture::new("serve");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SERVED", "--json"]);
+    fixture.ok_json(&fixture.main, &["tag", "add", "infra", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Plan the migration",
+            "--id",
+            "e-plan",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--body",
+            "## Why\nBecause the queue is wrong.",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Gated work",
+            "--id",
+            "t-gated",
+            "--parent",
+            "e-plan",
+            "--json",
+        ],
+    );
+    // A title carrying markup, because every row on a board is written by an
+    // agent and rendering one unescaped would run script in the operator's
+    // browser -- against a page that from phase 2 can approve things.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "<script>alert('xss')</script>",
+            "--id",
+            "t-hostile",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Staging push needs your call <b>now</b>",
+            "--as",
+            "claude@driver-1",
+            "--kind",
+            "approval",
+            "--task",
+            "t-hostile",
+            "--json",
+        ],
+    );
+
+    // A port nobody else on the box is using, derived from this process so a
+    // concurrent test run cannot collide with it.
+    let port = 21000 + (std::process::id() % 4000) as u16;
+    let mut server = fixture
+        .command(&fixture.main)
+        .args(["serve", "--port", &port.to_string()])
+        .spawn()
+        .expect("start kanban serve");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready, "kanban serve never bound {port}");
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = fs::read(&board).unwrap();
+
+    // The landing page is the reason this exists.
+    let (status, home) = http_get(port, "/");
+    assert_eq!(status, 200, "{home}");
+    assert!(home.contains("Needs you"), "{home}");
+    assert!(home.contains("approval"), "{home}");
+    assert!(home.contains("claude@driver-1"), "{home}");
+    assert!(home.contains("SERVED"), "{home}");
+
+    // Agent-authored text is escaped everywhere it lands, and the item's own
+    // body is agent-authored too.
+    assert!(
+        home.contains("&lt;b&gt;now&lt;/b&gt;"),
+        "attention body was not escaped: {home}"
+    );
+    assert!(
+        !home.contains("<b>now</b>"),
+        "raw markup reached the page: {home}"
+    );
+
+    let (status, boards) = http_get(port, "/boards");
+    assert_eq!(status, 200);
+    assert!(boards.contains("SERVED"), "{boards}");
+
+    // Plans: a draft epic is the plan, and it names the work it holds back.
+    let (status, plans) = http_get(port, "/plans");
+    assert_eq!(status, 200);
+    assert!(plans.contains("Plan the migration"), "{plans}");
+    assert!(plans.contains("Because the queue is wrong."), "{plans}");
+    assert!(
+        plans.contains("t-gated"),
+        "a plan must name the work it gates: {plans}"
+    );
+    assert!(plans.contains("infra"), "tags must render: {plans}");
+
+    // The hostile title survives as text on every page that renders it.
+    let (status, one) = http_get(port, "/board/SERVED");
+    assert_eq!(status, 200);
+    assert!(
+        one.contains("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"),
+        "a task title was not escaped: {one}"
+    );
+    assert!(
+        !one.contains("<script>alert"),
+        "a script tag reached the page: {one}"
+    );
+
+    let (status, detail) = http_get(port, "/task/SERVED/t-hostile");
+    assert_eq!(status, 200);
+    assert!(!detail.contains("<script>alert"), "{detail}");
+    assert!(
+        detail.contains("task_added"),
+        "the trail must render: {detail}"
+    );
+
+    // A lease token is a capability. A read surface that renders one hands
+    // whoever loads the page the ability to write.
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-hostile", "--as", "driver-1", "--json"],
+    );
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+    let (_, held) = http_get(port, "/task/SERVED/t-hostile");
+    assert!(
+        held.contains("driver-1"),
+        "the holder must be named: {held}"
+    );
+    assert!(
+        !held.contains(&token),
+        "the lease token was rendered into a page"
+    );
+
+    // An address that names nothing is a page, not a dropped connection.
+    let (status, missing) = http_get(port, "/task/SERVED/t-nope");
+    assert_eq!(status, 500, "{missing}");
+    assert!(missing.contains("t-nope"), "{missing}");
+    let (status, nowhere) = http_get(port, "/no/such/page");
+    assert_eq!(status, 200, "{nowhere}");
+    assert!(nowhere.contains("Not found"), "{nowhere}");
+
+    // The whole point of phase 1: after every page has been served, the board
+    // file is byte-for-byte what it was. Compared against the state captured
+    // before the reads, with the one deliberate CLI write above excluded by
+    // being re-read here.
+    let after = fs::read(&board).unwrap();
+    assert_ne!(
+        after, before,
+        "the claim above must have changed the board, or this comparison proves nothing"
+    );
+    let settled = fs::read(&board).unwrap();
+    for path in [
+        "/",
+        "/boards",
+        "/plans",
+        "/board/SERVED",
+        "/task/SERVED/t-gated",
+    ] {
+        let (status, _) = http_get(port, path);
+        assert_eq!(status, 200, "{path}");
+    }
+    assert_eq!(
+        fs::read(&board).unwrap(),
+        settled,
+        "serving a page modified the board"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn the_server_refuses_a_port_it_could_not_be_found_on() {
+    // Port 0 asks the kernel to choose, which for a server nginx reaches by
+    // number means listening somewhere nobody can find. An out-of-range value
+    // cannot be bound at all. Both are refused before the socket call, so the
+    // message names the flag rather than surfacing an opaque bind error.
+    let fixture = Fixture::new("serve-port");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PORT", "--json"]);
+    for bad in ["0", "-1", "65536", "999999999"] {
+        let output = fixture.run(&fixture.main, &["serve", "--port", bad]);
+        assert!(!output.status.success(), "--port {bad} was accepted");
+        let error = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            error.contains("--port") || error.contains("port"),
+            "--port {bad}: {error}"
+        );
+    }
 }

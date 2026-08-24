@@ -314,6 +314,25 @@ marker survives the truncation it describes.
 `--limit` must be zero or more. A negative one reads as *no limit* in SQL, so it
 is refused rather than silently handing back everything you asked to bound.
 
+## The web view
+
+`https://kb.geoy.ws` — every board at once, behind basic auth. Read-only: it
+renders what the CLI reads and writes nothing.
+
+- **Needs you** (the landing page) — every open attention item across every
+  board, oldest first, with its kind, who raised it and how long it has waited.
+- **Boards** — the `kb dash` projection as a table.
+- **Plans** — draft epics with their bodies, each naming the work it holds back.
+- **Task detail** — notes, checkpoints, the event trail, and the provenance of
+  whoever holds it. Never the lease token: that is a capability, and a page that
+  rendered one would hand it to whoever loaded the page.
+
+It is `kanban serve` on loopback 14200, kept up by `kanban-serve.service` and
+fronted by nginx. It binds `127.0.0.1` and has **no `--bind` flag** — kanban
+implements no authentication and trusts the edge, so the only correct value is
+the default. Updating is `install` then `systemctl restart kanban-serve`; the
+MCP server's in-place swap does not apply to an HTTP server.
+
 ## As an MCP server
 
 ```bash
@@ -354,4 +373,5 @@ once a silent wrong answer.
 `docs/adr/` in the kanban repo carries the reasoning. Most load-bearing:
 ADR-008 (fail closed), ADR-010 (adapters generated from the surface),
 ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
-attention), ADR-013 (plans are epics), ADR-015 (tags are a master file).
+attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
+ADR-016 (the web view).

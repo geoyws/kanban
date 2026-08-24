@@ -6,6 +6,7 @@ mod lock;
 mod mcp;
 mod model;
 mod registry;
+mod serve;
 mod store;
 
 use crate::context::{render_context, render_todo};
@@ -31,6 +32,7 @@ Usage:
   kanban workspace repoint [--root PATH] [--json]
   kanban dashboard [--json]
   kanban doctor [--json]
+  kanban serve [--port N]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban restore --from DIRECTORY --force [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
@@ -129,6 +131,19 @@ pub(crate) const BOOLEAN: [&str; 20] = [
 /// that appends a default the caller had already set.
 pub(crate) const REPEATABLE: [&str; 4] = ["depends-on", "blocker", "validation", "tag"];
 
+/// Commands that are processes rather than operations.
+///
+/// `mcp` and `serve` block until killed. That makes them meaningless as tool
+/// calls — the MCP layer spawns the binary and reads its result, so a tool that
+/// never returns hangs the caller — and impossible to exercise the way the
+/// read-only guard exercises everything else, which runs each operation and
+/// compares the board before and after.
+///
+/// This was a bare `!= "mcp"` inside the tool builder until `serve` arrived and
+/// the filter named only the first of two. It is a set with a guard now,
+/// because the next one will be the same mistake.
+pub(crate) const LONG_RUNNING: [&str; 2] = ["mcp", "serve"];
+
 /// Accepted on every board command; see `store_path`.
 pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
@@ -164,6 +179,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("workspace", Some("repoint"), &["root"], &[], false),
     ("dashboard", None, &[], &[], true),
     ("doctor", None, &[], &[], true),
+    ("serve", None, &["port"], &[], true),
     ("backup", None, &["output", "keep"], &[], false),
     ("restore", None, &["from", "force"], &[], false),
     (
@@ -587,6 +603,27 @@ impl Args {
         Ok(value)
     }
 
+    /// The TCP port `serve` listens on, bounded to the real range.
+    ///
+    /// A port outside 1-65535 cannot be bound, and 0 asks the kernel to choose
+    /// one — which for a server nginx reaches by number means listening
+    /// somewhere nobody can find. Both are refused here rather than turning
+    /// into an opaque bind failure, or worse a server that starts and is
+    /// unreachable. Privileged ports are allowed: this binds loopback and the
+    /// operator may have reason to.
+    fn port(&self, fallback: u16) -> Result<u16> {
+        let value = self.integer("port", fallback as i64)?;
+        u16::try_from(value)
+            .ok()
+            .filter(|port| *port != 0)
+            .with_context(|| {
+                format!(
+                    "--port must be between 1 and 65535, got {value}: port 0 asks the \
+                     kernel to pick one, and nginx reaches this server by number"
+                )
+            })
+    }
+
     /// Fail on an argument this command was never going to read.
     ///
     /// Extra positionals were silently dropped, so `kanban task add Fix the
@@ -874,6 +911,7 @@ pub(crate) fn schema() -> Value {
                 "name": name,
                 "command": command,
                 "subcommand": sub,
+                "longRunning": LONG_RUNNING.contains(command),
                 "flags": flags,
                 // Named and in order, so an adapter can build an argument
                 // list rather than guess at what the slots mean. A leading
@@ -1341,6 +1379,9 @@ fn run() -> Result<()> {
             bail!("Kanban integrity check failed");
         }
         return Ok(());
+    }
+    if command == "serve" {
+        return serve::serve(args.port(serve::DEFAULT_PORT)?);
     }
     if command == "backup" {
         let registry = Registry::open()?;

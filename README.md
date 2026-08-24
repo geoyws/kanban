@@ -226,6 +226,30 @@ notes, and unknown extension JSON are preserved. Dangling historical
 relationships are retained as warning metadata rather than inserted as invalid
 foreign-key edges.
 
+
+## The web view
+
+```bash
+kanban serve --port 14200      # loopback only; no --bind flag exists
+```
+
+Five server-rendered pages over every registered board: open attention items
+across all of them oldest-first, the dashboard projection, draft plans with the
+work each holds back, one board's rows, and one task in full. Every read goes
+through the same `Store` methods the CLI calls, so there is no second
+implementation to keep in step.
+
+It writes nothing. That is enforced twice — an end-to-end test compares the
+board file byte-for-byte across every page load, and a source read-back asserts
+the module names none of `Store`'s mutating methods, because a call that happens
+to be a no-op leaves the bytes identical and the capability in place.
+
+Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
+On this box that edge is nginx with `auth_basic` at `https://kb.geoy.ws`, and
+`kanban-serve.service` keeps the process up. There is deliberately no `--bind`
+flag — any value other than loopback publishes an unauthenticated surface.
+Reasoning: `docs/adr/ADR-016-*`.
+
 ## Short names
 
 The crate installs two binaries, `kanban` and `kb`, which are the same program.

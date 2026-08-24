@@ -229,7 +229,7 @@ fn tool_name(command: &str, sub: Option<&str>) -> String {
 fn tools() -> Vec<Value> {
     COMMANDS
         .iter()
-        .filter(|(command, ..)| *command != "mcp")
+        .filter(|(command, ..)| !crate::LONG_RUNNING.contains(command))
         .map(|(command, sub, flags, positionals, read_only)| {
             let mut properties = serde_json::Map::new();
             let mut required = Vec::new();
