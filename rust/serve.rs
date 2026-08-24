@@ -23,7 +23,7 @@
 //! state, and an HTTP server holds accepted connections. Saying so plainly is
 //! cheaper than someone discovering it during an update.
 
-use crate::model::{Attention, ProjectRecord, StatusUpdate, Task};
+use crate::model::{Attention, ProjectRecord, Sitrep, Task};
 use crate::registry::{Registry, now_ms};
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -340,10 +340,10 @@ fn plans() -> Result<String> {
 /// is what the agents are doing. A lane that has been posting is legible here
 /// without anyone opening a terminal or waiting for a handoff.
 fn lanes() -> Result<String> {
-    let mut by_lane: std::collections::BTreeMap<(String, String), Vec<StatusUpdate>> =
+    let mut by_lane: std::collections::BTreeMap<(String, String), Vec<Sitrep>> =
         std::collections::BTreeMap::new();
     for (project, store) in projects()? {
-        for update in store.statuses(None, false, None, 200)? {
+        for update in store.sitreps(None, false, None, 200)? {
             by_lane
                 .entry((project.name.clone(), update.lane.clone()))
                 .or_default()
@@ -353,13 +353,13 @@ fn lanes() -> Result<String> {
     let mut html = String::from("<h1>Lanes</h1>");
     if by_lane.is_empty() {
         html.push_str(
-            "<p class=empty>No lane has posted a status. \
-             <code>kb st new \"…\" --as AGENT --lane LANE</code> writes one — no task \
+            "<p class=empty>No lane has posted a sitrep. \
+             <code>kb sr new \"…\" --as AGENT --lane LANE</code> writes one — no task \
              and no lease required, which is the point of it.</p>",
         );
         return Ok(page("Lanes", &html));
     }
-    // Most recently active first. Nothing deletes a status update, and nothing
+    // Most recently active first. Nothing deletes a sitrep, and nothing
     // should — but that means a lane whose driver is long gone keeps its rows
     // forever, and alphabetical order parks it at the top of the page. Sorting
     // by recency lets a dead lane sink out of the way without destroying what

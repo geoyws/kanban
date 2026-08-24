@@ -53,14 +53,14 @@ pub struct UnreachableRoot {
 ///
 /// The low-ceremony sibling of a [`Handoff`]. A handoff is deliberate — it says
 /// *I am leaving, here is everything you need*, releases a lease, and names a
-/// successor. A status update says only *here is where this stands right now*,
+/// successor. A sitrep says only *here is where this stands right now*,
 /// costs one command, needs no lease and no task, and can be written twenty
 /// times a day. The handoff stays the thing you write when you go; this is the
 /// thing that means the handoff, or a successor without one, has something to
 /// stand on.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StatusUpdate {
+pub struct Sitrep {
     pub id: String,
     /// The lane this describes — `driver-2`, `solo`. Lane-keyed, not
     /// task-keyed, because the work an agent does between and across tasks is
@@ -296,12 +296,12 @@ pub struct ContextPacket {
     pub notes: Vec<TaskNote>,
     pub checkpoints: Vec<Checkpoint>,
     pub handoffs: Vec<Handoff>,
-    /// Status updates mentioning this task, newest first.
+    /// Sitreps mentioning this task, newest first.
     ///
     /// A resuming agent reads the packet and nothing else, so an update that
-    /// only `status list` could see would be an update the reader it was
+    /// only `sitrep list` could see would be an update the reader it was
     /// written for never gets.
-    pub statuses: Vec<StatusUpdate>,
+    pub sitreps: Vec<Sitrep>,
     pub generated_at: i64,
     pub truncated: bool,
 }

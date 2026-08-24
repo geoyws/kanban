@@ -321,6 +321,28 @@ CREATE TABLE status_updates (
 CREATE INDEX idx_status_lane_created ON status_updates(lane,archived,created_at DESC);
 "#;
 
+/// Rename the one-day-old status-update surface to the unambiguous `sitrep`.
+///
+/// V9 had reached live boards, so this is a data-preserving rename rather than
+/// an edit to the old migration. Its `u-` ids and event trail are rewritten as
+/// well because every existing row was still a probe. A mature table with real
+/// history would keep its old ids and accept that seam instead.
+const BOARD_V10: &str = r#"
+ALTER TABLE status_updates RENAME TO sitreps;
+DROP INDEX IF EXISTS idx_status_lane_created;
+CREATE INDEX idx_sitreps_lane_created ON sitreps(lane,archived,created_at DESC);
+UPDATE sitreps SET id = 'sr-' || substr(id, 3) WHERE id LIKE 'u-%';
+CREATE TABLE IF NOT EXISTS events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT,kind TEXT NOT NULL,actor TEXT,
+ payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_events_task_seq ON events(task_id,seq);
+UPDATE events
+SET kind = 'sitrep_posted',
+    payload = replace(replace(payload, '"statusID"', '"sitrepID"'), '"u-', '"sr-')
+WHERE kind = 'status_posted';
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -524,7 +546,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9,
+            BOARD_V9, BOARD_V10,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

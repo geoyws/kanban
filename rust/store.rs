@@ -378,8 +378,8 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     })
 }
 
-fn status_row(row: &Row<'_>) -> rusqlite::Result<StatusUpdate> {
-    Ok(StatusUpdate {
+fn sitrep_row(row: &Row<'_>) -> rusqlite::Result<Sitrep> {
+    Ok(Sitrep {
         id: row.get("id")?,
         lane: row.get("lane")?,
         task_id: row.get("task_id")?,
@@ -617,14 +617,14 @@ fn require_free_lease(
 
 /// Keep the newest `limit` entries of an oldest-first list.
 /// Returns true when anything was dropped.
-/// How many status updates stay *current* in one lane.
+/// How many sitreps stay *current* in one lane.
 ///
 /// Ten is what a reader will actually read to answer "where are things". The
 /// eleventh does not stop existing, it stops being current — which is the
 /// distinction that makes bounding this safe.
-const CURRENT_STATUS_PER_LANE: i64 = 10;
+const CURRENT_SITREPS_PER_LANE: i64 = 10;
 
-// Nothing deletes a status update.
+// Nothing deletes a sitrep.
 //
 // A hard retention cap was written here and then removed. It would have been
 // the first thing in this ledger that destroys a record — attention items are
@@ -1557,16 +1557,16 @@ impl Store {
     /// Provenance is captured rather than asked for, the same way a claim's is
     /// — an update that says "tests green" without saying which checkout is a
     /// claim nobody can check.
-    pub fn post_status(
+    pub fn post_sitrep(
         &mut self,
         lane: &str,
         body: &str,
         author: &str,
         task_id: Option<&str>,
         git: Option<&crate::gitctx::GitContext>,
-    ) -> Result<StatusUpdate> {
+    ) -> Result<Sitrep> {
         let lane = nonempty(lane, "lane")?.to_owned();
-        let body = nonempty(body, "status body")?.to_owned();
+        let body = nonempty(body, "sitrep body")?.to_owned();
         let author = nonempty(author, "author")?.to_owned();
         let transaction = self
             .connection
@@ -1575,9 +1575,9 @@ impl Store {
             require_task(&transaction, id)?;
         }
         let now = now_ms();
-        let id = format!("u-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let id = format!("sr-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO status_updates(id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at) \
+            "INSERT INTO sitreps(id,lane,task_id,author,body,worktree,branch,head_sha,root_head,dirty_summary,archived,created_at) \
              VALUES(?,?,?,?,?,?,?,?,?,?,0,?)",
             params![
                 id,
@@ -1597,19 +1597,19 @@ impl Store {
         // scheduled, and the current view is bounded the moment it would have
         // stopped being current.
         let archived = transaction.execute(
-            "UPDATE status_updates SET archived=1 WHERE lane=? AND archived=0 AND id NOT IN \
-             (SELECT id FROM status_updates WHERE lane=? AND archived=0 ORDER BY created_at DESC, id DESC LIMIT ?)",
-            params![lane, lane, CURRENT_STATUS_PER_LANE],
+            "UPDATE sitreps SET archived=1 WHERE lane=? AND archived=0 AND id NOT IN \
+             (SELECT id FROM sitreps WHERE lane=? AND archived=0 ORDER BY created_at DESC, id DESC LIMIT ?)",
+            params![lane, lane, CURRENT_SITREPS_PER_LANE],
         )?;
         event(
             &transaction,
             task_id,
-            "status_posted",
+            "sitrep_posted",
             Some(&author),
-            json!({"statusID": id, "lane": lane, "archived": archived}),
+            json!({"sitrepID": id, "lane": lane, "archived": archived}),
         )?;
         let result =
-            transaction.query_row("SELECT * FROM status_updates WHERE id=?", [&id], status_row)?;
+            transaction.query_row("SELECT * FROM sitreps WHERE id=?", [&id], sitrep_row)?;
         transaction.commit()?;
         Ok(result)
     }
@@ -1619,13 +1619,13 @@ impl Store {
     /// Newest-first, unlike `attention`: the question this answers is "what is
     /// true now", and the newest update is the answer. Archived rows are
     /// excluded by default and readable on request — hidden, never gone.
-    pub fn statuses(
+    pub fn sitreps(
         &self,
         lane: Option<&str>,
         include_archived: bool,
         task: Option<&str>,
         limit: i64,
-    ) -> Result<Vec<StatusUpdate>> {
+    ) -> Result<Vec<Sitrep>> {
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
@@ -1649,12 +1649,12 @@ impl Store {
         };
         values.push(Box::new(limit));
         let sql = format!(
-            "SELECT * FROM status_updates{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?"
+            "SELECT * FROM sitreps{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?"
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
         statement
-            .query_map(params_from_iter(refs), status_row)?
+            .query_map(params_from_iter(refs), sitrep_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -2322,7 +2322,7 @@ impl Store {
         const NOTES: usize = 100;
         const CHECKPOINTS: usize = 20;
         const HANDOFFS: usize = 20;
-        const STATUSES: usize = 20;
+        const SITREPS: usize = 20;
         let task = self.require_task(id)?;
         // Over-fetch by one so "there is older history" is measured, not
         // assumed. `truncated` was hardcoded false, so a resuming agent was
@@ -2334,12 +2334,12 @@ impl Store {
         // Archived ones included: the packet is what a successor reads to
         // reconstruct the work, and "superseded as the current view" is not
         // the same as "not worth knowing" to somebody starting cold.
-        let mut statuses = self.statuses(None, true, Some(id), STATUSES as i64 + 1)?;
-        statuses.reverse();
+        let mut sitreps = self.sitreps(None, true, Some(id), SITREPS as i64 + 1)?;
+        sitreps.reverse();
         let mut truncated = keep_newest(&mut notes, NOTES);
         truncated |= keep_newest(&mut checkpoints, CHECKPOINTS);
         truncated |= keep_newest(&mut handoffs, HANDOFFS);
-        truncated |= keep_newest(&mut statuses, STATUSES);
+        truncated |= keep_newest(&mut sitreps, SITREPS);
         Ok(ContextPacket {
             task,
             ancestors: self.ancestors(id)?,
@@ -2348,7 +2348,7 @@ impl Store {
             notes,
             checkpoints,
             handoffs,
-            statuses,
+            sitreps,
             generated_at: now_ms(),
             truncated,
         })

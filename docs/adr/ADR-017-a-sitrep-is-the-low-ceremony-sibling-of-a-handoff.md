@@ -1,4 +1,4 @@
-# ADR-017: A status update is the low-ceremony sibling of a handoff
+# ADR-017: A sitrep is the low-ceremony sibling of a handoff
 
 **Status:** Accepted
 **Date:** 2026-08-24
@@ -26,15 +26,15 @@ only durable places to put it were too expensive to use twenty times a day.
 
 ## Decision
 
-**`kanban status post TEXT --as AGENT --lane LANE` — keyed to a lane, needing no
+**`kanban sitrep post TEXT --as AGENT --lane LANE` — keyed to a lane, needing no
 task and no lease.**
 
 Lane-keyed is the load-bearing part. A session handoff is already findable by
 lane rather than by directory (`to_agent`), because worktrees get recreated and
-drivers renumbered. A status update is the same channel at a fraction of the
+drivers renumbered. A sitrep is the same channel at a fraction of the
 cost, which is what makes it the thing an agent actually reaches for.
 
-`--task` is optional and refuses an id that does not exist: a status pointing at
+`--task` is optional and refuses an id that does not exist: a sitrep pointing at
 nothing reads as context and carries none.
 
 **Provenance is captured, not requested** — worktree, branch, HEAD, root HEAD,
@@ -65,29 +65,33 @@ Three properties, each chosen against an alternative:
   table out would have been inconsistent as well as destructive — and measured
   2026-08-24, all thirteen boards together hold 9.6 MB.
 
-### The name, and the ambiguity it carries
+### The name is `sitrep`, not `status`
 
-`status` is what this is called because it is the plainest word for it, and the
-one that was asked for. It does collide: a task's `status` is a workflow state
-from a closed set, and `--status` is a flag on several commands.
+The surface first shipped as `status` in V9. That was wrong: a task's `status`
+is already a workflow state from a closed set, and `--status` is a flag on
+several commands. Two concepts with the same name made "post a status"
+genuinely ambiguous, even though command and flag occupied different positions.
 
-The collision is tolerated rather than ignored, on the grounds that the two
-never occupy the same position — `status` is always a top-level command here,
-`--status` is always a flag — and that the alternatives were worse. `pulse`
-duplicates `heartbeat`, which is already the liveness signal. `progress` is
-already a note kind. `log` invites confusion with `events`, the machine-written
-trail. `update` collides with `task update` and its alias `up`.
+`sitrep` means situation report and collides with nothing in the repository or
+the surrounding agent instructions. Its alias is `sr`. Alternatives were
+rejected because they already name nearby concepts: `checkpoint` is the
+lease-bound task record, `brief` is used for session handoffs, `pulse` is too
+close to heartbeat, `progress` is a note kind, `log` is too close to events, and
+`update` is already `task update`.
 
-The documentation therefore states the distinction once, sharply: **a task's
-status is a workflow state; a status update is prose about a lane.** If that
-proves insufficient in practice, renaming a command with two subcommands and one
-alias is cheap, and cheaper now than later.
+V10 renames `status_updates` to `sitreps`, rewrites the one-day-old probe ids
+from `u-` to `sr-`, and rewrites `status_posted`/`statusID` in the event trail.
+Rewriting ids is acceptable only because every existing row was a probe; a
+mature table with real history would keep its ids and live with the seam. The
+old `status` command and `st` alias are not deprecated aliases: they fail as
+unknown commands under ADR-008, so an operator can never believe a sitrep was
+posted when it was not.
 
 ### Where it surfaces
 
-- **`context`** carries the updates mentioning a task, archived ones included: a
-  resuming agent reads the packet and nothing else, so an update only
-  `status list` could see is an update its intended reader never gets.
+- **`context`** carries the sitreps mentioning a task, archived ones included: a
+  resuming agent reads the packet and nothing else, so a sitrep only
+  `sitrep list` could see is one its intended reader never gets.
 - **The web view** gains a **Lanes** page — the counterpart to Needs you. That
   page is what waits on the operator; this is what the agents are doing.
 
@@ -99,7 +103,7 @@ returns the task to the queue in one transaction. What changes is that a handoff
 — or a successor arriving without one — now has something to stand on.
 
 `--all` is a new global-ish boolean, and the read-only guard exercises
-`status list` like every other read.
+`sitrep list` like every other read.
 
 Nothing deletes a lane, either — which surfaced immediately, from probing this
 on the live board and leaving eleven throwaway rows in a `probe-lane` that
@@ -108,7 +112,7 @@ activity, so a lane whose driver is long gone sinks out of the way without
 anything destroying what it said. That is the same answer archiving gives
 within a lane, applied between them.
 
-Not offered: editing or deleting an individual update. It is a record of what
+Not offered: editing or deleting an individual sitrep. It is a record of what
 was believed at a moment, and a record that can be revised after the fact is
 worth less than one that cannot. Post another one; the newest is the answer.
 

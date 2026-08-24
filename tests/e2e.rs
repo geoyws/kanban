@@ -898,7 +898,11 @@ fn compiled_binary_imports_both_atmux_formats_backs_up_and_opens_v3_databases() 
         &fixture.main,
         &["task", "list", "--db", v3.to_str().unwrap(), "--json"],
     );
-    assert!(compatible.status.success());
+    assert!(
+        compatible.status.success(),
+        "opening a V3 board failed: {}",
+        String::from_utf8_lossy(&compatible.stderr)
+    );
     assert!(
         String::from_utf8(compatible.stdout)
             .unwrap()
@@ -3672,7 +3676,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
             "tag list" => vec!["tag", "list"],
-            "status list" => vec!["status", "list"],
+            "sitrep list" => vec!["sitrep", "list"],
             "schema" => vec!["schema"],
             "events" => vec!["events"],
             "stale" => vec!["stale"],
@@ -4780,6 +4784,105 @@ fn the_draft_migration_preserves_the_table_it_rebuilds() {
 }
 
 #[test]
+fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
+    let fixture = Fixture::new("sitrep-migration");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SITREP-MIGRATION", "--json"],
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Recreate the exact V9 surface on an otherwise current fixture. Opening
+    // it through the compiled binary below must run V10, not merely exercise
+    // fresh-board behaviour.
+    let connection = Connection::open(&board).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            DROP INDEX idx_sitreps_lane_created;
+            ALTER TABLE sitreps RENAME TO status_updates;
+            CREATE INDEX idx_status_lane_created ON status_updates(lane,archived,created_at DESC);
+            INSERT INTO status_updates VALUES(
+              'u-11111111','driver-2',NULL,'claude@driver-2','first body',
+              '/repo','main','abc123',NULL,'clean',1,1000
+            );
+            INSERT INTO status_updates VALUES(
+              'u-22222222','driver-2',NULL,'codex@driver-2','second body',
+              '/repo','main','def456',NULL,'1 file changed',0,2000
+            );
+            INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(
+              NULL,'status_posted','claude@driver-2',
+              '{"statusID":"u-11111111","lane":"driver-2","archived":0}',1000
+            );
+            INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(
+              NULL,'status_posted','codex@driver-2',
+              '{"statusID":"u-22222222","lane":"driver-2","archived":1}',2000
+            );
+            PRAGMA user_version=9;
+            "#,
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM status_updates", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2,
+        "the V9 setup wrote no rows, so the migration test would prove nothing"
+    );
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        9,
+        "the fixture was not actually held at V9"
+    );
+    drop(connection);
+
+    let rows = fixture.ok_json(
+        &fixture.main,
+        &["sitrep", "list", "--db", &board, "--all", "--json"],
+    );
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    assert_eq!(rows[0]["id"], "sr-22222222");
+    assert_eq!(rows[0]["body"], "second body");
+    assert_eq!(rows[0]["archived"], false);
+    assert_eq!(rows[1]["id"], "sr-11111111");
+    assert_eq!(rows[1]["body"], "first body");
+    assert_eq!(rows[1]["archived"], true);
+
+    let connection = Connection::open(&board).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        10
+    );
+    let mut statement = connection
+        .prepare("SELECT kind,payload FROM events WHERE kind='sitrep_posted' ORDER BY seq")
+        .unwrap();
+    let trail = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(trail.len(), 2, "V10 lost trail entries: {trail:?}");
+    assert!(trail.iter().all(|(kind, _)| kind == "sitrep_posted"));
+    assert!(trail[0].1.contains("\"sitrepID\":\"sr-11111111\""));
+    assert!(trail[1].1.contains("\"sitrepID\":\"sr-22222222\""));
+    assert!(
+        trail
+            .iter()
+            .all(|(_, payload)| !payload.contains("statusID"))
+    );
+}
+
+#[test]
 fn a_plan_is_an_epic_whose_body_survives_being_revised() {
     // A plan is an epic: its body is the plan, its children are the work it
     // became, and `draft` is a plan saved up but not ready to act on. Two
@@ -5742,12 +5845,12 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
 
     // Plans: a draft epic is the plan, and it names the work it holds back.
     // Lanes: what the agents are doing, the counterpart to what waits on the
-    // operator. A status needs no task and no lease, which is the whole point.
+    // operator. A sitrep needs no task and no lease, which is the whole point.
     // A second lane, posted first, so the page's ordering is observable.
     fixture.ok_json(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "An older lane that has since gone quiet.",
             "--as",
@@ -5760,7 +5863,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "Queue rework <i>underway</i>; retry path is the culprit.",
             "--as",
@@ -5773,7 +5876,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     let (status, lanes) = http_get(port, "/lanes");
     assert_eq!(status, 200);
     assert!(lanes.contains("driver-2"), "{lanes}");
-    // Most recently active first. Nothing deletes a status update, so a lane
+    // Most recently active first. Nothing deletes a sitrep, so a lane
     // whose driver is long gone keeps its rows forever -- alphabetical order
     // would park it permanently above the lanes actually working.
     assert!(
@@ -5783,7 +5886,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     assert!(lanes.contains("retry path is the culprit"), "{lanes}");
     assert!(
         lanes.contains("&lt;i&gt;underway&lt;/i&gt;"),
-        "a status body was not escaped: {lanes}"
+        "a sitrep body was not escaped: {lanes}"
     );
     assert!(!lanes.contains("<i>underway</i>"), "{lanes}");
 
@@ -5957,14 +6060,14 @@ fn a_reader_that_hangs_up_ends_the_command_quietly() {
 }
 
 #[test]
-fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
+fn a_sitrep_costs_one_command_and_retires_what_it_supersedes() {
     // A note needs a task. A checkpoint needs a task AND a lease. So an agent
     // working across several tasks, between them, or exploring before it has
     // claimed anything had nowhere to write down where things stand -- and it
     // went into a reply that scrolls away. This is the low-ceremony sibling of
     // a handoff: lane-keyed, no lease, no task required.
-    let fixture = Fixture::new("status");
-    fixture.ok_json(&fixture.main, &["init", "--name", "STATUS", "--json"]);
+    let fixture = Fixture::new("sitrep");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SITREP", "--json"]);
     fixture.ok_json(
         &fixture.main,
         &["task", "add", "Some work", "--id", "t-1", "--json"],
@@ -5974,7 +6077,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     let first = fixture.ok_json(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "Reading the queue code; nothing changed yet.",
             "--as",
@@ -5987,15 +6090,15 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     assert_eq!(first["lane"], "driver-2");
     assert_eq!(first["author"], "claude@driver-2");
     assert_eq!(first["archived"], false);
-    assert!(first["id"].as_str().unwrap().starts_with("u-"));
+    assert!(first["id"].as_str().unwrap().starts_with("sr-"));
     assert_eq!(first["taskID"], serde_json::Value::Null);
 
     // A task link is optional, and a task that does not exist is refused --
-    // a status pointing at nothing would read as context and carry none.
+    // a sitrep pointing at nothing would read as context and carry none.
     let linked = fixture.ok_json(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "Retry path is the culprit.",
             "--as",
@@ -6011,7 +6114,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     let ghost = fixture.run(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "About nothing",
             "--as",
@@ -6025,7 +6128,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     );
     assert!(
         !ghost.status.success(),
-        "a status pointed at a missing task"
+        "a sitrep pointed at a missing task"
     );
     assert!(
         String::from_utf8_lossy(&ghost.stderr).contains("t-nope"),
@@ -6038,7 +6141,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "Different lane entirely.",
             "--as",
@@ -6050,7 +6153,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     );
     let mine = fixture.ok_json(
         &fixture.main,
-        &["status", "list", "--lane", "driver-2", "--json"],
+        &["sitrep", "list", "--lane", "driver-2", "--json"],
     );
     assert_eq!(mine.as_array().unwrap().len(), 2);
     // Newest first: the question this answers is "what is true now".
@@ -6068,7 +6171,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
         fixture.ok_json(
             &fixture.main,
             &[
-                "status",
+                "sitrep",
                 "post",
                 &format!("Update number {index}"),
                 "--as",
@@ -6082,7 +6185,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     let current = fixture.ok_json(
         &fixture.main,
         &[
-            "status", "list", "--lane", "driver-2", "--limit", "100", "--json",
+            "sitrep", "list", "--lane", "driver-2", "--limit", "100", "--json",
         ],
     );
     assert_eq!(
@@ -6096,7 +6199,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     let everything = fixture.ok_json(
         &fixture.main,
         &[
-            "status", "list", "--lane", "driver-2", "--all", "--limit", "100", "--json",
+            "sitrep", "list", "--lane", "driver-2", "--all", "--limit", "100", "--json",
         ],
     );
     assert_eq!(everything.as_array().unwrap().len(), 14);
@@ -6114,7 +6217,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
         fixture
             .ok_json(
                 &fixture.main,
-                &["status", "list", "--lane", "driver-1", "--all", "--json"]
+                &["sitrep", "list", "--lane", "driver-1", "--all", "--json"]
             )
             .as_array()
             .unwrap()
@@ -6129,7 +6232,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|event| event["kind"] == "status_posted")
+        .filter(|event| event["kind"] == "sitrep_posted")
         .count();
     assert_eq!(posted, 15, "every post must be recorded");
     assert!(
@@ -6137,17 +6240,17 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|event| event["kind"] == "status_posted"
+            .any(|event| event["kind"] == "sitrep_posted"
                 && event["payload"]["archived"].as_i64().unwrap_or(0) > 0),
         "the trail must record that an update was retired"
     );
 
-    // A status with no lane is refused rather than filed under a default: an
+    // A sitrep with no lane is refused rather than filed under a default: an
     // update nobody can address is one nobody will read.
     let laneless = fixture.run(
         &fixture.main,
         &[
-            "status",
+            "sitrep",
             "post",
             "Where does this go?",
             "--as",
@@ -6155,23 +6258,23 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
             "--json",
         ],
     );
-    assert!(!laneless.status.success(), "a laneless status was accepted");
+    assert!(!laneless.status.success(), "a laneless sitrep was accepted");
     assert!(
         String::from_utf8_lossy(&laneless.stderr).contains("lane"),
         "{}",
         String::from_utf8_lossy(&laneless.stderr)
     );
 
-    // Empty prose is refused too. A status update that says nothing still
+    // Empty prose is refused too. A sitrep that says nothing still
     // reads on the board as though the lane reported in.
     for empty in ["", "   "] {
         let blank = fixture.run(
             &fixture.main,
             &[
-                "status", "post", empty, "--as", "a", "--lane", "driver-2", "--json",
+                "sitrep", "post", empty, "--as", "a", "--lane", "driver-2", "--json",
             ],
         );
-        assert!(!blank.status.success(), "an empty status was accepted");
+        assert!(!blank.status.success(), "an empty sitrep was accepted");
     }
 
     // The short forms, because an alias nobody wrote down is one nobody can
@@ -6179,7 +6282,7 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "st",
+            "sr",
             "new",
             "Via the short forms.",
             "--as",
@@ -6190,7 +6293,20 @@ fn a_status_update_costs_one_command_and_retires_what_it_supersedes() {
         ],
     );
     assert_eq!(
-        fixture.ok_json(&fixture.main, &["st", "ls", "--lane", "driver-3", "--json"])[0]["body"],
+        fixture.ok_json(&fixture.main, &["sr", "ls", "--lane", "driver-3", "--json"])[0]["body"],
         "Via the short forms."
+    );
+
+    // The old concept fails closed. Silently accepting it would let an agent
+    // believe it posted a sitrep when it did not.
+    let old_name = fixture.run(&fixture.main, &["status", "list", "--json"]);
+    assert!(
+        !old_name.status.success(),
+        "the old status command still resolves"
+    );
+    assert!(
+        String::from_utf8_lossy(&old_name.stderr).contains("unknown command"),
+        "{}",
+        String::from_utf8_lossy(&old_name.stderr)
     );
 }

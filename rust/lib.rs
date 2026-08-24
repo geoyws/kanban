@@ -67,8 +67,8 @@ Usage:
              [--task ID] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--limit N] [--json]
   kanban attention resolve ID --as ACTOR [--note TEXT] [--json]
-  kanban status post TEXT --as AGENT --lane LANE [--task ID] [--json]
-  kanban status list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
+  kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
+  kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
@@ -89,7 +89,7 @@ Environment:
 
 Aliases (the binary installs as both `kanban` and `kb`):
   t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
-  ctx=context  ev=events  dash=dashboard  rel=release  n=note  v=version
+  ctx=context  ev=events  dash=dashboard  rel=release  n=note  sr=sitrep  v=version
   att/attn=attention
   task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
   story:     adv=advance
@@ -395,14 +395,14 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     (
-        "status",
+        "sitrep",
         Some("post"),
         &["as", "lane", "task"],
         &["text"],
         false,
     ),
     (
-        "status",
+        "sitrep",
         Some("list"),
         &["lane", "task", "limit", "all"],
         &[],
@@ -444,7 +444,7 @@ const SUBCOMMAND_GROUPS: [&str; 8] = [
     "workspace",
     "attention",
     "tag",
-    "status",
+    "sitrep",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -462,7 +462,7 @@ fn canonical_command(value: &str) -> &str {
         "hb" => "heartbeat",
         "ctx" => "context",
         "att" | "attn" => "attention",
-        "st" => "status",
+        "sr" => "sitrep",
         "ev" => "events",
         "dash" => "dashboard",
         "rel" => "release",
@@ -496,8 +496,8 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("tag", "ls") => "list",
         ("tag", "new") => "add",
         ("tag", "rm") => "remove",
-        ("status", "ls") => "list",
-        ("status", "new") => "post",
+        ("sitrep", "ls") => "list",
+        ("sitrep", "new") => "post",
         (_, other) => other,
     }
 }
@@ -1859,10 +1859,10 @@ fn run() -> Result<()> {
             args.has("json"),
         );
     }
-    if command == "status" && sub == Some("post") {
-        let text = rest.first().context("status text is required")?;
+    if command == "sitrep" && sub == Some("post") {
+        let text = rest.first().context("sitrep text is required")?;
         return print(
-            &store.post_status(
+            &store.post_sitrep(
                 args.require("lane")?,
                 text,
                 args.require("as")?,
@@ -1872,9 +1872,9 @@ fn run() -> Result<()> {
             args.has("json"),
         );
     }
-    if command == "status" && sub == Some("list") {
+    if command == "sitrep" && sub == Some("list") {
         return print(
-            &store.statuses(
+            &store.sitreps(
                 args.one("lane"),
                 args.has("all"),
                 args.one("task"),

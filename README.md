@@ -227,13 +227,13 @@ relationships are retained as warning metadata rather than inserted as invalid
 foreign-key edges.
 
 
-## Status updates
+## Sitreps
 
 ```bash
-kanban status post "Retry path is the culprit; fix is in the queuer." \
+kanban sitrep post "Retry path is the culprit; fix is in the queuer." \
   --as claude@driver-2 --lane driver-2
-kanban status list --lane driver-2          # current view, newest first
-kanban status list --lane driver-2 --all    # including what it superseded
+kanban sitrep list --lane driver-2          # current view, newest first
+kanban sitrep list --lane driver-2 --all    # including what it superseded
 ```
 
 Keyed to a lane, needing no task and no lease — the low-ceremony sibling of a
@@ -241,14 +241,15 @@ handoff. A note requires a task; a checkpoint requires a task and a live lease;
 so work done across tasks, between them, or before anything is claimed had
 nowhere durable to go.
 
-Posting archives everything past the newest ten in that lane. Archived updates
+Posting archives everything past the newest ten in that lane. Archived sitreps
 are hidden from the default read and returned by `--all`; **nothing is deleted**
 — archiving bounds the view, not the table. Provenance (worktree, branch, HEAD,
 root HEAD, dirty count) is captured rather than requested, and `context` carries
-a task's updates so a resuming agent gets them without going looking.
+a task's sitreps so a resuming agent gets them without going looking.
 
-A task's `status` is a workflow state and always a `--status` flag; a *status
-update* is prose about a lane and always the `status` command. Reasoning:
+A task's `status` is a workflow state and always a `--status` flag; a *sitrep*
+is prose about a lane and always the `sitrep` command. The old `status` command
+is deliberately unknown rather than a deprecated alias. Reasoning:
 `docs/adr/ADR-017-*`.
 
 ## Off-site backup
@@ -306,11 +307,12 @@ Commands and subcommands have short forms:
 
 | Scope | Aliases |
 | --- | --- |
-| command | `t`=task · `s`=story · `h`=handoff · `w`/`ws`=workspace · `cp`=checkpoint · `hb`=heartbeat · `ctx`=context · `dash`=dashboard · `rel`=release · `n`=note · `v`=version |
+| command | `t`=task · `s`=story · `h`=handoff · `w`/`ws`=workspace · `cp`=checkpoint · `hb`=heartbeat · `ctx`=context · `dash`=dashboard · `rel`=release · `n`=note · `sr`=sitrep · `v`=version |
 | `task` | `ls`=list · `mv`=move · `rm`=remove · `new`=add · `up`=update · `meta`=metadata · `cat`=show |
 | `story` | `adv`=advance |
 | `handoff` | `ls`=list · `new`=create · `acc`=accept |
 | `workspace` | `ls`=list · `att`=attach |
+| `sitrep` | `ls`=list · `new`=post |
 
 ```bash
 kb t ls --status todo

@@ -1,4 +1,4 @@
-use crate::model::{Checkpoint, ContextPacket, Handoff, StatusUpdate, Task, TaskNote};
+use crate::model::{Checkpoint, ContextPacket, Handoff, Sitrep, Task, TaskNote};
 use crate::store::Store;
 use anyhow::{Result, bail};
 
@@ -46,20 +46,20 @@ fn render_checkpoint(checkpoint: &Checkpoint) -> String {
     lines.join("\n")
 }
 
-/// The most recent status update, which for a lane that has been posting is
+/// The most recent sitrep, which for a lane that has been posting is
 /// fresher than any checkpoint and cheaper than any handoff.
-fn render_status(status: &StatusUpdate) -> String {
+fn render_sitrep(sitrep: &Sitrep) -> String {
     let mut lines = vec![format!(
         "[{}] {} · {}{}",
-        status.lane,
-        status.author,
-        status.body,
-        if status.archived { " (archived)" } else { "" }
+        sitrep.lane,
+        sitrep.author,
+        sitrep.body,
+        if sitrep.archived { " (archived)" } else { "" }
     )];
-    if let Some(branch) = &status.branch {
+    if let Some(branch) = &sitrep.branch {
         lines.push(format!(
             "branch {branch}{}",
-            status
+            sitrep
                 .head_sha
                 .as_deref()
                 .map(|sha| format!(" @ {}", &sha[..sha.len().min(8)]))
@@ -180,10 +180,10 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
     .join("\n");
     let newest_checkpoint = packet.checkpoints.last();
     let newest_handoff = packet.handoffs.last();
-    let newest_status = packet.statuses.last();
+    let newest_sitrep = packet.sitreps.last();
     let required = format!(
-        "{fixed}\n\n## Latest status\n{}\n\n## Latest checkpoint\n{}\n\n## Latest handoff\n{}",
-        newest_status.map_or_else(|| "(none)".to_owned(), render_status),
+        "{fixed}\n\n## Latest sitrep\n{}\n\n## Latest checkpoint\n{}\n\n## Latest handoff\n{}",
+        newest_sitrep.map_or_else(|| "(none)".to_owned(), render_sitrep),
         newest_checkpoint.map_or_else(|| "(none)".to_owned(), render_checkpoint),
         newest_handoff.map_or_else(|| "(none)".to_owned(), render_handoff)
     );
@@ -205,9 +205,9 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
             ),
             format!(
-                "Status: {}",
+                "Sitrep: {}",
                 clip(
-                    newest_status.map_or("(none)", |value| value.body.as_str()),
+                    newest_sitrep.map_or("(none)", |value| value.body.as_str()),
                     240
                 )
             ),
