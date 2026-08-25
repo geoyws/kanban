@@ -448,7 +448,7 @@ pub struct SearchOptions {
     pub query: String,
     pub source: Option<String>,
     pub status: Option<String>,
-    pub tag: Option<String>,
+    pub tags: Vec<String>,
     pub lane: Option<String>,
     pub after: Option<i64>,
     pub before: Option<i64>,

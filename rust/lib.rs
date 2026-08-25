@@ -1196,7 +1196,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
         query: query.to_owned(),
         source: option_string(args, "source"),
         status: option_string(args, "status"),
-        tag: option_string(args, "tag"),
+        tags: args.many("tag"),
         lane: option_string(args, "lane"),
         after,
         before,

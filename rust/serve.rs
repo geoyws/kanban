@@ -255,7 +255,7 @@ fn search_page(query: &str) -> Result<String> {
         query: query.to_owned(),
         source: None,
         status: None,
-        tag: None,
+        tags: Vec::new(),
         lane: None,
         after: None,
         before: None,

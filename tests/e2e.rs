@@ -275,6 +275,10 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     );
     fixture.ok_json(
         &fixture.main,
+        &["tag", "add", "ops", "--as", "tester", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
         &[
             "task",
             "add",
@@ -285,6 +289,8 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "Install the optimized binary and restart the live service safely.",
             "--tag",
             "release",
+            "--tag",
+            "ops",
             "--as",
             "tester",
             "--json",
@@ -321,6 +327,8 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "deploy the live build",
             "--tag",
             "release",
+            "--tag",
+            "ops",
             "--max-chars",
             "1000",
             "--json",

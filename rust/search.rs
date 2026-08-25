@@ -201,7 +201,7 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
             values.push(Box::new(value.clone()));
         }
     }
-    if let Some(tag) = &options.tag {
+    for tag in &options.tags {
         sql.push_str(" AND instr(' ' || tags || ' ',' ' || ? || ' ')>0");
         values.push(Box::new(tag.clone()));
     }
@@ -416,7 +416,7 @@ pub fn search_global_rules(rules: &[Rule], options: &SearchOptions) -> Vec<Searc
         .source
         .as_deref()
         .is_some_and(|source| source != "rule" && source != "global-rule")
-        || options.tag.is_some()
+        || !options.tags.is_empty()
         || options.lane.is_some()
     {
         return Vec::new();
@@ -562,7 +562,7 @@ pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<
             query: "rebuild".to_owned(),
             source: None,
             status: None,
-            tag: None,
+            tags: Vec::new(),
             lane: None,
             after: None,
             before: None,
@@ -627,7 +627,7 @@ pub fn health(connection: &Connection) -> Result<SearchIndexHealth> {
             query: "health".to_owned(),
             source: None,
             status: None,
-            tag: None,
+            tags: Vec::new(),
             lane: None,
             after: None,
             before: None,
