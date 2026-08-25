@@ -453,8 +453,10 @@ executes the real transaction, reports its counts, and rolls it back. See ADR-02
 
 ## The web view
 
-`https://kb.geoy.ws` — every board at once, behind basic auth. Read-only: it
-renders what the CLI reads and writes nothing.
+`https://kb.geoy.ws` — every board at once. The persisted target gate is shared
+Google SSO with only `geoyws@gmail.com` allowed; until the cutover has a live
+receipt, expect the existing Basic Auth gate. Read-only: it renders what the CLI
+reads and writes nothing.
 
 - **Needs you** (the landing page) — every open attention item across every
   board, oldest first, with its kind, who raised it and how long it has waited.

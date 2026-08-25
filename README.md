@@ -381,7 +381,11 @@ the module names none of `Store`'s mutating methods, because a call that happens
 to be a no-op leaves the bytes identical and the capability in place.
 
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
-On this box that edge is nginx with `auth_basic` at `https://kb.geoy.ws`, and
+The persisted target edge is nginx `auth_request` backed by the shared Google
+SSO at `https://kb.geoy.ws`; after the recorded cutover only
+`geoyws@gmail.com` is allowed, and the `.geoy.ws` session cookie is shared with
+Paste, Snip and Docs. Until that cutover has a live receipt, the existing Basic
+Auth edge remains authoritative. The
 `kanban-serve.service` keeps the process up. There is deliberately no `--bind`
 flag — any value other than loopback publishes an unauthenticated surface.
 Reasoning: `docs/adr/ADR-016-*`.
