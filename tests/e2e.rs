@@ -4848,6 +4848,38 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
             CREATE INDEX idx_status_lane_created ON status_updates(lane,archived,created_at DESC);
             DROP INDEX idx_rules_active;
             DROP TABLE rules;
+            DROP INDEX idx_tasks_status_priority;
+            DROP INDEX idx_tasks_parent;
+            DROP INDEX idx_tasks_assignee_status;
+            DROP INDEX idx_tasks_lane_status;
+            DROP INDEX idx_task_notes_task_seq;
+            DROP INDEX idx_checkpoints_task_seq;
+            DROP INDEX idx_events_task_seq;
+            DROP INDEX idx_handoffs_task_created;
+            DROP INDEX idx_handoffs_status_created;
+            DROP INDEX idx_attention_status_created;
+            DROP INDEX idx_attention_task;
+            DROP INDEX idx_task_tags_tag;
+            ALTER TABLE tasks DROP COLUMN archived_at;
+            ALTER TABLE tasks DROP COLUMN archived;
+            ALTER TABLE task_notes DROP COLUMN archived;
+            ALTER TABLE checkpoints DROP COLUMN archived;
+            ALTER TABLE events DROP COLUMN archived;
+            ALTER TABLE handoffs DROP COLUMN archived;
+            ALTER TABLE attention DROP COLUMN archived;
+            ALTER TABLE task_tags DROP COLUMN archived;
+            CREATE INDEX idx_tasks_status_priority ON tasks(status,priority,created_at);
+            CREATE INDEX idx_tasks_parent ON tasks(parent_id);
+            CREATE INDEX idx_tasks_assignee_status ON tasks(assignee,status);
+            CREATE INDEX idx_tasks_lane_status ON tasks(lane,status);
+            CREATE INDEX idx_task_notes_task_seq ON task_notes(task_id,seq);
+            CREATE INDEX idx_checkpoints_task_seq ON checkpoints(task_id,seq);
+            CREATE INDEX idx_events_task_seq ON events(task_id,seq);
+            CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at);
+            CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at);
+            CREATE INDEX idx_attention_status_created ON attention(status,created_at);
+            CREATE INDEX idx_attention_task ON attention(task_id);
+            CREATE INDEX idx_task_tags_tag ON task_tags(tag);
             INSERT INTO status_updates VALUES(
               'u-11111111','driver-2',NULL,'claude@driver-2','first body',
               '/repo','main','abc123',NULL,'clean',1,1000
@@ -4902,7 +4934,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     assert_eq!(
         connection
@@ -6727,7 +6759,7 @@ fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -6991,4 +7023,206 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
             "accepted {args:?}"
         );
     }
+}
+
+#[test]
+fn compiled_binary_archives_settled_history_without_deleting_it() {
+    let fixture = Fixture::new("archive");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Archive", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Old closed work",
+            "--id",
+            "t-old",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-old",
+            "durable evidence",
+            "--as",
+            "worker",
+            "--kind",
+            "evidence",
+            "--json",
+        ],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-old", "--as", "worker", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-old",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "worker",
+            "--state",
+            "done",
+            "--summary",
+            "finished",
+            "--intent",
+            "close it",
+            "--next-action",
+            "none",
+            "--json",
+        ],
+    );
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Review old work",
+            "--as",
+            "worker",
+            "--kind",
+            "review",
+            "--task",
+            "t-old",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            attention["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--note",
+            "accepted",
+            "--json",
+        ],
+    );
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=1,updated_at=1 WHERE id='t-old'",
+            [],
+        )
+        .unwrap();
+
+    let preview = fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "system@archive",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_eq!(preview["dryRun"], true);
+    assert_eq!(preview["tasks"], 1);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"])[0]["id"],
+        "t-old",
+        "a dry run changed the board"
+    );
+
+    let archived = fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "system@archive",
+            "--json",
+        ],
+    );
+    assert_eq!(archived["tasks"], 1);
+    assert_eq!(archived["notes"], 1);
+    assert_eq!(archived["checkpoints"], 1);
+    assert_eq!(archived["attention"], 1);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        json!([])
+    );
+    let all = fixture.ok_json(&fixture.main, &["task", "list", "--all", "--json"]);
+    assert_eq!(all[0]["id"], "t-old");
+    assert_eq!(all[0]["archived"], true);
+    assert!(all[0]["archivedAt"].as_i64().is_some());
+
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["attention", "list", "--status", "resolved", "--json"]
+        ),
+        json!([])
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "list",
+                "--status",
+                "resolved",
+                "--all",
+                "--json"
+            ]
+        )[0]["archived"],
+        true
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--task", "t-old", "--json"]),
+        json!([])
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["events", "--task", "t-old", "--all", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["archived"] == true)
+    );
+
+    let rewrite = fixture.run(
+        &fixture.main,
+        &[
+            "task", "move", "t-old", "todo", "--as", "operator", "--json",
+        ],
+    );
+    assert!(
+        !rewrite.status.success(),
+        "archived history was silently reactivated"
+    );
+    assert!(
+        String::from_utf8_lossy(&rewrite.stderr).contains("archived history"),
+        "the refusal did not explain the archival boundary"
+    );
+
+    let database = Connection::open(&board).unwrap();
+    let index_sql: String = database
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_tasks_status_priority'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_sql.contains("WHERE archived=0"));
 }

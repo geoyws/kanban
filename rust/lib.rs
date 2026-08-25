@@ -35,13 +35,14 @@ Usage:
   kanban doctor [--json]
   kanban serve [--port N]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
+  kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
   kanban restore --from DIRECTORY --force [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
              [--priority 0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
-  kanban task list [--status STATUS] [--tag NAME] [--with-relations] [--json]
+  kanban task list [--status STATUS] [--tag NAME] [--with-relations] [--all] [--json]
   kanban task show ID [--json]
   kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
@@ -201,6 +202,13 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("doctor", None, &[], &[], true),
     ("serve", None, &["port"], &[], true),
     ("backup", None, &["output", "keep"], &[], false),
+    (
+        "archive",
+        None,
+        &["older-than-days", "as", "dry-run"],
+        &[],
+        false,
+    ),
     ("restore", None, &["from", "force"], &[], false),
     (
         "task",
@@ -228,7 +236,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "task",
         Some("list"),
-        &["status", "with-relations", "tag"],
+        &["status", "with-relations", "tag", "all"],
         &[],
         true,
     ),
@@ -359,7 +367,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "handoff",
         Some("list"),
-        &["task", "status", "to"],
+        &["task", "status", "to", "all"],
         &[],
         true,
     ),
@@ -416,7 +424,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("list"),
-        &["status", "kind", "task", "limit"],
+        &["status", "kind", "task", "limit", "all"],
         &[],
         true,
     ),
@@ -444,7 +452,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "events",
         None,
-        &["task", "rule", "kind", "limit", "global"],
+        &["task", "rule", "kind", "limit", "global", "all"],
         &[],
         true,
     ),
@@ -1172,8 +1180,9 @@ fn list_json(
     status: Option<&str>,
     tag: Option<&str>,
     relations: bool,
+    include_archived: bool,
 ) -> Result<Value> {
-    let tasks = store.list_tasks(status, tag)?;
+    let tasks = store.list_tasks(status, tag, include_archived)?;
     if !relations {
         return Ok(serde_json::to_value(tasks)?);
     }
@@ -1452,7 +1461,7 @@ fn run() -> Result<()> {
                 continue;
             }
             let store = Store::open(Path::new(&project.board_path))?;
-            let tasks = store.list_tasks(None, None)?;
+            let tasks = store.list_tasks(None, None, false)?;
             let mut counts = Map::new();
             for status in TASK_STATUSES {
                 counts.insert(
@@ -1463,13 +1472,21 @@ fn run() -> Result<()> {
             value.insert("taskCounts".into(), Value::Object(counts));
             value.insert(
                 "pendingHandoffs".into(),
-                json!(store.handoffs(None, Some("pending"), None, 100)?.len()),
+                json!(
+                    store
+                        .handoffs(None, Some("pending"), None, 100, false)?
+                        .len()
+                ),
             );
             // The count an operator most needs to see without being asked: a
             // record raised for them that nobody has settled.
             value.insert(
                 "openAttention".into(),
-                json!(store.attention(Some("open"), None, None, 1000)?.len()),
+                json!(
+                    store
+                        .attention(Some("open"), None, None, 1000, false)?
+                        .len()
+                ),
             );
             value.insert("totalTasks".into(), json!(tasks.len()));
             value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
@@ -1657,6 +1674,19 @@ fn run() -> Result<()> {
     }
 
     let mut store = open_store(&args)?;
+    if command == "archive" {
+        let days = args.integer("older-than-days", 90)?;
+        if days < 1 {
+            bail!("--older-than-days must be at least 1");
+        }
+        let age_ms = days
+            .checked_mul(24 * 60 * 60 * 1000)
+            .context("--older-than-days is too large")?;
+        return print(
+            &store.archive_settled(now_ms() - age_ms, args.require("as")?, args.has("dry-run"))?,
+            args.has("json"),
+        );
+    }
     if command == "task" && sub == Some("add") {
         let title = rest.first().context("task title is required")?.clone();
         let task = store.add_task(crate::model::AddTask {
@@ -1686,6 +1716,7 @@ fn run() -> Result<()> {
                 args.one("status"),
                 args.one("tag"),
                 args.has("with-relations"),
+                args.has("all"),
             )?,
             args.has("json"),
         );
@@ -1707,7 +1738,7 @@ fn run() -> Result<()> {
         );
         value.insert(
             "handoffs".into(),
-            serde_json::to_value(store.handoffs(Some(id), None, None, 100)?)?,
+            serde_json::to_value(store.handoffs(Some(id), None, None, 100, true)?)?,
         );
         return print(&Value::Object(value), args.has("json"));
     }
@@ -1945,7 +1976,13 @@ fn run() -> Result<()> {
     }
     if command == "handoff" && sub == Some("list") {
         return print(
-            &store.handoffs(args.one("task"), args.one("status"), args.one("to"), 100)?,
+            &store.handoffs(
+                args.one("task"),
+                args.one("status"),
+                args.one("to"),
+                100,
+                args.has("all"),
+            )?,
             args.has("json"),
         );
     }
@@ -2078,6 +2115,7 @@ fn run() -> Result<()> {
                 args.one("kind"),
                 args.one("task"),
                 args.limit(100)?,
+                args.has("all"),
             )?,
             args.has("json"),
         );
@@ -2115,7 +2153,12 @@ fn run() -> Result<()> {
     }
     if command == "events" {
         return print(
-            &store.events(args.one("task"), args.one("kind"), args.limit(50)?)?,
+            &store.events(
+                args.one("task"),
+                args.one("kind"),
+                args.limit(50)?,
+                args.has("all"),
+            )?,
             args.has("json"),
         );
     }

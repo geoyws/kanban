@@ -606,6 +606,7 @@ impl Registry {
                         payload: serde_json::from_str(&row.get::<_, String>("payload")?)
                             .unwrap_or(json!({})),
                         created_at: row.get("created_at")?,
+                        archived: false,
                     })
                 },
             )?

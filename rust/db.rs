@@ -359,6 +359,63 @@ CREATE TABLE rules (
 CREATE INDEX idx_rules_active ON rules(archived,created_at);
 "#;
 
+/// Cold history stays in the board but leaves every operational secondary index.
+///
+/// A sidecar would make backup, restore, addressing and task references span two
+/// databases. Marking settled rows and using partial indexes keeps the single-file
+/// durability contract while bounding the indexes used by day-to-day reads.
+const BOARD_V12: &str = r#"
+CREATE TABLE IF NOT EXISTS task_dependencies (
+ task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ PRIMARY KEY(task_id,depends_on),CHECK(task_id <> depends_on)
+) STRICT;
+CREATE TABLE IF NOT EXISTS task_notes (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ author TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_task_notes_task_seq ON task_notes(task_id,seq);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task_seq ON checkpoints(task_id,seq);
+ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE tasks ADD COLUMN archived_at INTEGER;
+ALTER TABLE task_notes ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE checkpoints ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE events ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE handoffs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE attention ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE task_tags ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+
+DROP INDEX idx_tasks_status_priority;
+DROP INDEX idx_tasks_parent;
+DROP INDEX idx_tasks_assignee_status;
+DROP INDEX idx_tasks_lane_status;
+DROP INDEX idx_task_notes_task_seq;
+DROP INDEX idx_checkpoints_task_seq;
+DROP INDEX idx_events_task_seq;
+DROP INDEX idx_handoffs_task_created;
+DROP INDEX idx_handoffs_status_created;
+DROP INDEX idx_attention_status_created;
+DROP INDEX idx_attention_task;
+DROP INDEX idx_task_tags_tag;
+DROP INDEX idx_sitreps_lane_created;
+DROP INDEX idx_rules_active;
+
+CREATE INDEX idx_tasks_status_priority ON tasks(status,priority,created_at) WHERE archived=0;
+CREATE INDEX idx_tasks_parent ON tasks(parent_id) WHERE archived=0;
+CREATE INDEX idx_tasks_assignee_status ON tasks(assignee,status) WHERE archived=0;
+CREATE INDEX idx_tasks_lane_status ON tasks(lane,status) WHERE archived=0;
+CREATE INDEX idx_task_notes_task_seq ON task_notes(task_id,seq) WHERE archived=0;
+CREATE INDEX idx_checkpoints_task_seq ON checkpoints(task_id,seq) WHERE archived=0;
+CREATE INDEX idx_events_task_seq ON events(task_id,seq) WHERE archived=0;
+CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_task_tags_tag ON task_tags(tag) WHERE archived=0;
+CREATE INDEX idx_sitreps_lane_created ON sitreps(lane,created_at DESC) WHERE archived=0;
+CREATE INDEX idx_rules_active ON rules(created_at) WHERE archived=0;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -401,6 +458,11 @@ CREATE INDEX idx_global_rule_events_rule_seq ON global_rule_events(rule_id,seq);
 const REGISTRY_V4: &str = r#"
 ALTER TABLE global_rules ADD COLUMN board_tags TEXT NOT NULL DEFAULT '["ALL"]'
  CHECK(json_valid(board_tags) AND json_type(board_tags) = 'array');
+"#;
+
+const REGISTRY_V5: &str = r#"
+DROP INDEX idx_global_rules_active;
+CREATE INDEX idx_global_rules_active ON global_rules(created_at) WHERE archived=0;
 "#;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -591,7 +653,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10, BOARD_V11,
+            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;
@@ -603,7 +665,13 @@ pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
     migrate(
         &mut connection,
-        &[REGISTRY_V1, REGISTRY_V2, REGISTRY_V3, REGISTRY_V4],
+        &[
+            REGISTRY_V1,
+            REGISTRY_V2,
+            REGISTRY_V3,
+            REGISTRY_V4,
+            REGISTRY_V5,
+        ],
     )?;
     Ok(connection)
 }

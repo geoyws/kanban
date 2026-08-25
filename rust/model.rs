@@ -138,6 +138,9 @@ pub struct Task {
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
+    /// Settled cold history. Hidden from default lists but retained in SQLite.
+    pub archived: bool,
+    pub archived_at: Option<i64>,
     pub metadata: Value,
     /// Registered tags carried by this row, sorted. What the row is *about*,
     /// as opposed to `lane`, which is what kind of work it is.
@@ -273,6 +276,7 @@ pub struct Handoff {
     pub accepted_at: Option<i64>,
     pub accepted_by: Option<String>,
     pub accepted_session: Option<String>,
+    pub archived: bool,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
 }
@@ -290,6 +294,7 @@ pub struct Event {
     pub actor: Option<String>,
     pub payload: Value,
     pub created_at: i64,
+    pub archived: bool,
 }
 
 /// A task that has been in progress longer than its own `stale_minutes`
@@ -415,6 +420,23 @@ pub struct Attention {
     pub resolved_at: Option<i64>,
     pub resolved_by: Option<String>,
     pub resolution: Option<String>,
+    pub archived: bool,
+}
+
+/// Receipt from one retention sweep.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveReport {
+    pub cutoff_at: i64,
+    pub dry_run: bool,
+    pub tasks: i64,
+    pub notes: i64,
+    pub checkpoints: i64,
+    pub events: i64,
+    pub handoffs: i64,
+    pub attention: i64,
+    pub sitreps: i64,
+    pub task_tags: i64,
 }
 
 #[derive(Debug, Clone)]

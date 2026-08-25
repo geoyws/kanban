@@ -111,6 +111,10 @@ not as a different database. Moving to a server would cost the property the rest
 of this design rests on — a board is a file that can be copied, backed up,
 addressed by path and handed to another machine with nothing running.
 
+**Superseded for retention shape by ADR-021.** The later decision keeps cold
+rows in the same board and removes them from operational partial indexes, which
+preserves the single-file property without the sidecar boundary anticipated here.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — the durable resume contract

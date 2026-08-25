@@ -337,6 +337,8 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
+        archived: row.get::<_, i64>("archived")? != 0,
+        archived_at: row.get("archived_at")?,
         metadata: parse_value(row.get("metadata")?),
         // Attached after the row is read: a join per task would be a query per
         // task, and the readers below fill these in one pass.
@@ -435,6 +437,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         resolved_at: row.get("resolved_at")?,
         resolved_by: row.get("resolved_by")?,
         resolution: row.get("resolution")?,
+        archived: row.get::<_, i64>("archived")? != 0,
     })
 }
 
@@ -463,6 +466,7 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         accepted_at: row.get("accepted_at")?,
         accepted_by: row.get("accepted_by")?,
         accepted_session: row.get("accepted_session")?,
+        archived: row.get::<_, i64>("archived")? != 0,
     })
 }
 
@@ -475,6 +479,14 @@ fn get_task(connection: &Connection, id: &str) -> Result<Option<Task>> {
 
 fn require_task(connection: &Connection, id: &str) -> Result<Task> {
     get_task(connection, id)?.with_context(|| format!("task {id} not found"))
+}
+
+fn require_active_task(connection: &Connection, id: &str) -> Result<Task> {
+    let task = require_task(connection, id)?;
+    if task.archived {
+        bail!("task {id} is archived history and cannot be changed");
+    }
+    Ok(task)
 }
 
 fn dependencies(connection: &Connection, task_id: &str) -> Result<Vec<Task>> {
@@ -758,7 +770,13 @@ impl Store {
 
     /// Recorded ledger events, newest first. The `events` table is the audit
     /// trail for lease seizures and destructive removals, so it needs a reader.
-    pub fn events(&self, task: Option<&str>, kind: Option<&str>, limit: i64) -> Result<Vec<Event>> {
+    pub fn events(
+        &self,
+        task: Option<&str>,
+        kind: Option<&str>,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<Vec<Event>> {
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
@@ -771,6 +789,9 @@ impl Store {
         if let Some(kind) = kind {
             sql.push_str(" AND kind=?");
             values.push(Box::new(kind.to_owned()));
+        }
+        if !include_archived {
+            sql.push_str(" AND archived=0");
         }
         sql.push_str(" ORDER BY seq DESC LIMIT ?");
         values.push(Box::new(limit));
@@ -786,6 +807,7 @@ impl Store {
                         actor: row.get("actor")?,
                         payload: parse_value(row.get("payload")?),
                         created_at: row.get("created_at")?,
+                        archived: row.get::<_, i64>("archived")? != 0,
                     })
                 },
             )?
@@ -879,12 +901,20 @@ impl Store {
     /// A tag filter checks the master file first: asking for one that was never
     /// registered returns an empty list otherwise, which reads exactly like
     /// "nothing is tagged that" and is how a typo becomes a wrong answer.
-    pub fn list_tasks(&self, status: Option<&str>, tag: Option<&str>) -> Result<Vec<Task>> {
+    pub fn list_tasks(
+        &self,
+        status: Option<&str>,
+        tag: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<Task>> {
         if let Some(value) = status {
             validate(value, &TASK_STATUSES, "task status")?;
         }
         let mut clauses = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !include_archived {
+            clauses.push("archived=0");
+        }
         if let Some(value) = status {
             clauses.push("status=?");
             values.push(Box::new(value.to_owned()));
@@ -908,7 +938,11 @@ impl Store {
                      an unregistered tag would filter to nothing and read like an answer"
                 );
             }
-            clauses.push("id IN (SELECT task_id FROM task_tags WHERE tag=?)");
+            clauses.push(if include_archived {
+                "id IN (SELECT task_id FROM task_tags WHERE tag=?)"
+            } else {
+                "id IN (SELECT task_id FROM task_tags WHERE tag=? AND archived=0)"
+            });
             values.push(Box::new(tag));
         }
         let where_clause = if clauses.is_empty() {
@@ -958,7 +992,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = require_task(&transaction, id)?;
+        let current = require_active_task(&transaction, id)?;
         // A story's status column is a projection of its gate, not a field the
         // caller owns. Writing it directly leaves the row asserting one thing
         // and its gate another — and a direct move to `done` stamps
@@ -1017,7 +1051,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task = require_task(&transaction, id)?;
+        let task = require_active_task(&transaction, id)?;
         let seized = require_free_lease(&transaction, id, &actor, force, "remove")?;
         // Children have no ON DELETE CASCADE, so the raw foreign-key failure is
         // the only signal the operator would otherwise get. Name the children.
@@ -1068,7 +1102,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = require_task(&transaction, id)?;
+        let current = require_active_task(&transaction, id)?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let object = patch
             .as_object()
@@ -1104,7 +1138,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = require_task(&transaction, id)?;
+        let current = require_active_task(&transaction, id)?;
         let previous_parent = current.parent_id.clone();
         let parent = input.parent_id.unwrap_or(current.parent_id);
         if let Some(parent_id) = &parent {
@@ -1214,12 +1248,13 @@ impl Store {
         let now = now_ms();
         expire_claims(&transaction, now)?;
         let task = if let Some(id) = id {
-            require_task(&transaction, id)?
+            require_active_task(&transaction, id)?
         } else {
             let mut statement = transaction.prepare(
                 "SELECT t.* FROM tasks t
                  LEFT JOIN task_claims c ON c.task_id=t.id
                  WHERE t.status='todo'
+                   AND t.archived=0
                    AND t.type=?
                    AND c.task_id IS NULL
                    AND NOT EXISTS (
@@ -1384,7 +1419,7 @@ impl Store {
 
     pub fn add_note(&mut self, id: &str, author: &str, kind: &str, body: &str) -> Result<TaskNote> {
         validate(kind, &NOTE_KINDS, "note kind")?;
-        require_task(&self.connection, id)?;
+        require_active_task(&self.connection, id)?;
         let now = now_ms();
         self.connection.execute(
             "INSERT INTO task_notes(task_id,author,kind,body,created_at) VALUES(?,?,?,?,?)",
@@ -1407,8 +1442,12 @@ impl Store {
     }
 
     pub fn notes(&self, id: &str, limit: i64) -> Result<Vec<TaskNote>> {
-        require_task(&self.connection, id)?;
-        let mut statement = self.connection.prepare("SELECT * FROM (SELECT * FROM task_notes WHERE task_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC")?;
+        let task = require_task(&self.connection, id)?;
+        let cold = if task.archived { "" } else { " AND archived=0" };
+        let sql = format!(
+            "SELECT * FROM (SELECT * FROM task_notes WHERE task_id=?{cold} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         statement
             .query_map(params![id, limit], note_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -1416,8 +1455,12 @@ impl Store {
     }
 
     pub fn checkpoints(&self, id: &str, limit: i64) -> Result<Vec<Checkpoint>> {
-        require_task(&self.connection, id)?;
-        let mut statement = self.connection.prepare("SELECT * FROM (SELECT * FROM checkpoints WHERE task_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC")?;
+        let task = require_task(&self.connection, id)?;
+        let cold = if task.archived { "" } else { " AND archived=0" };
+        let sql = format!(
+            "SELECT * FROM (SELECT * FROM checkpoints WHERE task_id=?{cold} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         statement
             .query_map(params![id, limit], checkpoint_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -1742,7 +1785,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(id) = task_id {
-            require_task(&transaction, id)?;
+            require_active_task(&transaction, id)?;
         }
         let now = now_ms();
         let id = format!("sr-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -1843,7 +1886,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(id) = task_id {
-            require_task(&transaction, id)?;
+            require_active_task(&transaction, id)?;
         }
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -1876,6 +1919,7 @@ impl Store {
         kind: Option<&str>,
         task: Option<&str>,
         limit: i64,
+        include_archived: bool,
     ) -> Result<Vec<Attention>> {
         if let Some(value) = status {
             validate(value, &["open", "resolved"], "attention status")?;
@@ -1888,6 +1932,9 @@ impl Store {
         }
         let mut clauses = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !include_archived {
+            clauses.push("archived=0");
+        }
         if let Some(status) = status {
             clauses.push("status=?");
             values.push(Box::new(status.to_owned()));
@@ -1964,6 +2011,7 @@ impl Store {
         status: Option<&str>,
         to_agent: Option<&str>,
         limit: i64,
+        include_archived: bool,
     ) -> Result<Vec<Handoff>> {
         if let Some(value) = status {
             validate(
@@ -1979,6 +2027,9 @@ impl Store {
         // hand-written queries, and the eighth is the one that gets forgotten.
         let mut clauses = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !include_archived {
+            clauses.push("archived=0");
+        }
         if let Some(task) = task {
             clauses.push("task_id=?");
             values.push(Box::new(task.to_owned()));
@@ -2199,7 +2250,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let story = require_task(&transaction, id)?;
+        let story = require_active_task(&transaction, id)?;
         if story.task_type != "story" {
             bail!("task {id} is not a story");
         }
@@ -2264,7 +2315,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let story = require_task(&transaction, id)?;
+        let story = require_active_task(&transaction, id)?;
         if story.task_type != "story" {
             bail!("task {id} is not a story");
         }
@@ -2459,7 +2510,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT t.*, c.heartbeat_at AS claim_heartbeat FROM tasks t
              LEFT JOIN task_claims c ON c.task_id=t.id
-             WHERE t.status='in_progress' AND t.stale_minutes IS NOT NULL
+             WHERE t.status='in_progress' AND t.archived=0 AND t.stale_minutes IS NOT NULL
              ORDER BY t.priority,t.created_at,t.id",
         )?;
         let rows = statement
@@ -2499,7 +2550,7 @@ impl Store {
         // told it held the whole record while notes were being dropped.
         let mut notes = self.notes(id, NOTES as i64 + 1)?;
         let mut checkpoints = self.checkpoints(id, CHECKPOINTS as i64 + 1)?;
-        let mut handoffs = self.handoffs(Some(id), None, None, HANDOFFS as i64 + 1)?;
+        let mut handoffs = self.handoffs(Some(id), None, None, HANDOFFS as i64 + 1, false)?;
         handoffs.reverse();
         // Archived ones included: the packet is what a successor reads to
         // reconstruct the work, and "superseded as the current view" is not
@@ -2555,6 +2606,101 @@ impl Store {
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut target)?;
         backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
         Ok(())
+    }
+
+    /// Move settled history out of operational views and secondary indexes.
+    ///
+    /// Rows stay in the same SQLite file and remain readable through `--all`.
+    /// This is intentionally an explicit sweep: opening or reading a board must
+    /// never mutate it merely because wall-clock time passed.
+    pub fn archive_settled(
+        &mut self,
+        cutoff_at: i64,
+        actor: &str,
+        dry_run: bool,
+    ) -> Result<ArchiveReport> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let archived_at = now_ms();
+
+        let tasks = transaction.execute(
+            "UPDATE tasks SET archived=1,archived_at=? \
+             WHERE archived=0 AND status IN ('done','cancelled') \
+             AND completed_at IS NOT NULL AND completed_at<=? \
+             AND id NOT IN (SELECT task_id FROM task_claims)",
+            params![archived_at, cutoff_at],
+        )? as i64;
+        let notes = transaction.execute(
+            "UPDATE task_notes SET archived=1 WHERE archived=0 \
+             AND task_id IN (SELECT id FROM tasks WHERE archived=1)",
+            [],
+        )? as i64;
+        let checkpoints = transaction.execute(
+            "UPDATE checkpoints SET archived=1 WHERE archived=0 \
+             AND task_id IN (SELECT id FROM tasks WHERE archived=1)",
+            [],
+        )? as i64;
+        let task_tags = transaction.execute(
+            "UPDATE task_tags SET archived=1 WHERE archived=0 \
+             AND task_id IN (SELECT id FROM tasks WHERE archived=1)",
+            [],
+        )? as i64;
+        let handoffs = transaction.execute(
+            "UPDATE handoffs SET archived=1 WHERE archived=0 AND status<>'pending' AND ( \
+               task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
+               (task_id IS NULL AND COALESCE(accepted_at,created_at)<=?) \
+             )",
+            [cutoff_at],
+        )? as i64;
+        let attention = transaction.execute(
+            "UPDATE attention SET archived=1 WHERE archived=0 AND status='resolved' AND ( \
+               task_id IN (SELECT id FROM tasks WHERE archived=1) OR resolved_at<=? \
+             )",
+            [cutoff_at],
+        )? as i64;
+        let sitreps = transaction.execute(
+            "UPDATE sitreps SET archived=1 WHERE archived=0 AND ( \
+               task_id IN (SELECT id FROM tasks WHERE archived=1) OR created_at<=? \
+             )",
+            [cutoff_at],
+        )? as i64;
+        let events = transaction.execute(
+            "UPDATE events SET archived=1 WHERE archived=0 AND ( \
+               task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
+               (task_id IS NULL AND created_at<=?) \
+             )",
+            [cutoff_at],
+        )? as i64;
+
+        let report = ArchiveReport {
+            cutoff_at,
+            dry_run,
+            tasks,
+            notes,
+            checkpoints,
+            events,
+            handoffs,
+            attention,
+            sitreps,
+            task_tags,
+        };
+        if dry_run {
+            transaction.rollback()?;
+            return Ok(report);
+        }
+        if tasks + notes + checkpoints + events + handoffs + attention + sitreps + task_tags > 0 {
+            event(
+                &transaction,
+                None,
+                "archive_swept",
+                Some(&actor),
+                serde_json::to_value(&report)?,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(report)
     }
 }
 
@@ -2646,6 +2792,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             completed_at: None,
+            archived: false,
+            archived_at: None,
             metadata: json!({}),
             tags: Vec::new(),
         };

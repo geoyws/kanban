@@ -400,6 +400,7 @@ kb dash --json                  # per-board counts, incl. openAttention + pendin
 kb ev --task <id> --json        # the durable audit trail
 kb stale --json                 # work that overran its stale budget
 kb doctor --json                # integrity, orphaned rows, unreachable roots
+kb archive --older-than-days 90 --as system@archive --json
 kb w repoint --json             # after moving a repo: point its registered roots at it
 ```
 
@@ -413,6 +414,26 @@ marker survives the truncation it describes.
 
 `--limit` must be zero or more. A negative one reads as *no limit* in SQL, so it
 is refused rather than silently handing back everything you asked to bound.
+
+## Archival — bounded hot indexes, intact history
+
+```bash
+kb archive --older-than-days 90 --as system@archive --dry-run --json
+kb archive --older-than-days 90 --as system@archive --json
+kb t ls --all --json             # active plus cold tasks
+kb ev --task <id> --all --json   # cold audit history for one task
+```
+
+The sweep archives only settled rows older than the cutoff: `done`/`cancelled`
+tasks without a lease, their notes/checkpoints/tags/events, settled handoffs,
+resolved attention and linked sitreps. Old taskless settled records are included.
+Rows remain in the same backed-up SQLite board and `--all` reads them; nothing is
+deleted. Operational secondary indexes contain only `archived=0` rows, so their
+size follows current work rather than the board's lifetime.
+
+Reads never run retention implicitly. The nightly backup timer explicitly sweeps
+every present registered board at 90 days before snapshotting it. `--dry-run`
+executes the real transaction, reports its counts, and rolls it back. See ADR-021.
 
 ## The web view
 
@@ -478,3 +499,4 @@ attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
 ADR-016 (the web view), ADR-017 (sitreps), ADR-018 (project rules).
 ADR-019 adds the single-copy global rules inherited at claim/resume boundaries.
 ADR-020 adds explicit `ALL`, named-only and all-except board targeting.
+ADR-021 keeps settled history while removing it from operational indexes.

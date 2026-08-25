@@ -47,8 +47,10 @@ say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ok()  { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 die() { printf '    \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+set -a
 # shellcheck disable=SC1090
-set -a; source "$KEYS_FILE"; set +a
+source "$KEYS_FILE"
+set +a
 : "${KANBAN_BACKUP_AGE_RECIPIENT:?missing KANBAN_BACKUP_AGE_RECIPIENT in $KEYS_FILE}"
 [[ -r "$AGE_KEY" ]] || die "age private key $AGE_KEY unreadable — backups could never be restored"
 
@@ -128,6 +130,21 @@ if [[ "${1:-}" == "--rehearse" ]]; then
   ok "restored $latest into a scratch root; doctor healthy across $n project(s)"
   exit 0
 fi
+
+# ── retention ────────────────────────────────────────────────────────
+# Archive before snapshot so a restored board serves the same hot/cold state.
+# History remains inside each SQLite file; only operational views and partial
+# indexes exclude it.
+say "Archive settled history"
+while IFS=$'\t' read -r project board; do
+  if [[ ! -f "$board" ]]; then
+    printf '    ! skipped missing board: %s (%s)\n' "$project" "$board"
+    continue
+  fi
+  "$KB" archive --project "$project" --older-than-days 90 --as system@archive --json \
+    >> "$WORK/archive.jsonl" || die "archive sweep failed for $project"
+done < <("$KB" workspace list --json | jq -r '.[] | [.name,.boardPath] | @tsv')
+ok "swept settled rows older than 90 days across every present board"
 
 # ── snapshot ─────────────────────────────────────────────────────────
 say "Snapshot"

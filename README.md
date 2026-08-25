@@ -298,6 +298,22 @@ is prose about a lane and always the `sitrep` command. The old `status` command
 is deliberately unknown rather than a deprecated alias. Reasoning:
 `docs/adr/ADR-017-*`.
 
+## Long-term archival
+
+Settled ledger history leaves default reads and operational secondary indexes
+after 90 days, while remaining inside the same SQLite board:
+
+```bash
+kb archive --older-than-days 90 --as system@archive --dry-run --json
+kb archive --older-than-days 90 --as system@archive --json
+kb task list --all --json
+kb events --task <id> --all --json
+```
+
+The nightly backup job runs the sweep across every present registered board
+before snapshotting. Nothing is deleted; `--all` is the explicit cold-history
+read. See ADR-021.
+
 ## Off-site backup
 
 ```bash

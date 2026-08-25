@@ -172,7 +172,7 @@ fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
 fn needs_you() -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     for (project, store) in projects()? {
-        for item in store.attention(Some("open"), None, None, 1000)? {
+        for item in store.attention(Some("open"), None, None, 1000, false)? {
             items.push((project.name.clone(), item));
         }
     }
@@ -235,9 +235,11 @@ fn boards() -> Result<String> {
         <th class=n>Handoffs</th><th class=n>Tasks</th></tr></thead><tbody>",
     );
     for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None)?;
+        let tasks = store.list_tasks(None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        let attention = store.attention(Some("open"), None, None, 1000)?.len();
+        let attention = store
+            .attention(Some("open"), None, None, 1000, false)?
+            .len();
         html.push_str(&format!(
             "<tr><td><a href=\"/board/{url}\">{name}</a></td>\
              <td class=\"n{flag}\">{attention}</td><td class=n>{todo}</td>\
@@ -249,7 +251,9 @@ fn boards() -> Result<String> {
             todo = count("todo"),
             doing = count("in_progress"),
             stale = store.stale_tasks()?.len(),
-            handoffs = store.handoffs(None, Some("pending"), None, 100)?.len(),
+            handoffs = store
+                .handoffs(None, Some("pending"), None, 100, false)?
+                .len(),
             total = tasks.len(),
         ));
     }
@@ -271,7 +275,7 @@ fn plans() -> Result<String> {
     let mut html = String::from("<h1>Plans</h1>");
     let mut found = 0;
     for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None)?;
+        let tasks = store.list_tasks(None, None, false)?;
         let drafts = tasks
             .iter()
             .filter(|task| task.status == "draft" && task.task_type == "epic")
@@ -406,7 +410,7 @@ fn lanes() -> Result<String> {
 /// One board's rows, grouped by status in workflow order.
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
-    let tasks = store.list_tasks(None, None)?;
+    let tasks = store.list_tasks(None, None, false)?;
     let global_rules = Registry::open()?.global_rules_for(Some(&project.name), false)?;
     let project_rules = store.rules(false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
@@ -565,7 +569,7 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         }
     }
 
-    let events = store.events(Some(&task.id), None, DETAIL_ROWS)?;
+    let events = store.events(Some(&task.id), None, DETAIL_ROWS, true)?;
     if !events.is_empty() {
         html.push_str(
             "<h2>Trail</h2><table><thead><tr><th>When</th><th>What</th>\
