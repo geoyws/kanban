@@ -63,6 +63,19 @@ write domains.
 
 ## Functional requirements
 
+### Retrieval and agent context
+
+- Search every durable work-knowledge source without requiring the caller to
+  know its project first.
+- Fuse exact identifier/text retrieval, SQLite full-text ranking, and private
+  local semantic similarity through one implementation shared by CLI, MCP, and
+  the served UI.
+- Return source-backed citations and bounded snippets, never an uncited
+  synthesized answer.
+- Support project, source, status, tag, lane, time, and archive filters.
+- Keep ordinary search read-only. Index repair and semantic-cache persistence
+  must be explicit, audited operations covered by backup and doctor workflows.
+
 ### P0 — first usable slice
 
 - One SQLite board per project and one private SQLite registry.

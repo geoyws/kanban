@@ -71,6 +71,33 @@ impl Drop for Fixture {
     }
 }
 
+/// Return a current fixture to the exact pre-search schema shape before a
+/// historical migration test removes or renames tables referenced by V13.
+fn remove_v13_search_schema(connection: &Connection) {
+    let trigger_names = {
+        let mut statement = connection
+            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'search_%'")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    for trigger in trigger_names {
+        connection
+            .execute_batch(&format!("DROP TRIGGER \"{trigger}\""))
+            .unwrap();
+    }
+    connection
+        .execute_batch(
+            "DROP VIEW search_source_rows;\
+             DROP TABLE search_fts;\
+             DROP TABLE search_documents;",
+        )
+        .unwrap();
+}
+
 #[test]
 fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     let fixture = Fixture::new("handoff");
@@ -236,6 +263,377 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["workspaceRoots"].as_array().unwrap().len(), 2);
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     assert!(fixture.ok_json(&fixture.main, &["doctor", "--json"])["healthy"] == true);
+}
+
+#[test]
+fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
+    let fixture = Fixture::new("rag-search");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SEARCH-A", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "release", "--as", "tester", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Production rollout checklist",
+            "--id",
+            "t-release",
+            "--body",
+            "Install the optimized binary and restart the live service safely.",
+            "--tag",
+            "release",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-release",
+            "Keep a rollback receipt and verify the public route.",
+            "--as",
+            "tester",
+            "--kind",
+            "evidence",
+            "--json",
+        ],
+    );
+
+    let exact = fixture.ok_json(
+        &fixture.main,
+        &["search", "t-release", "--limit", "3", "--json"],
+    );
+    assert_eq!(exact["results"][0]["sourceId"], "t-release");
+    assert_eq!(
+        exact["results"][0]["citation"],
+        "kanban://SEARCH-A/task/t-release"
+    );
+
+    let paraphrase = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "deploy the live build",
+            "--tag",
+            "release",
+            "--max-chars",
+            "1000",
+            "--json",
+        ],
+    );
+    assert_eq!(paraphrase["results"][0]["sourceId"], "t-release");
+    assert!(paraphrase["resultChars"].as_u64().unwrap() <= 1000);
+    assert_eq!(paraphrase["embeddingModel"], "kanban-semantic-lite-v1");
+
+    let rebuilt = fixture.ok_json(
+        &fixture.main,
+        &["search-rebuild", "--as", "tester", "--json"],
+    );
+    assert_eq!(rebuilt["documents"], rebuilt["embedded"]);
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(doctor["projects"][0]["searchIndex"]["healthy"], true);
+    assert_eq!(doctor["projects"][0]["searchIndex"]["missingEmbeddings"], 0);
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-release",
+            "--body",
+            "Deploy the release with a reversible restart and a public route receipt.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let after_mutation = fixture.ok_json(
+        &fixture.main,
+        &["search", "reversible deployment", "--json"],
+    );
+    assert_eq!(after_mutation["results"][0]["sourceId"], "t-release");
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(doctor["projects"][0]["searchIndex"]["healthy"], true);
+    assert!(
+        doctor["projects"][0]["searchIndex"]["missingEmbeddings"]
+            .as_i64()
+            .unwrap()
+            > 0,
+        "a source mutation did not invalidate its cached vector"
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Retired alias decision",
+            "--id",
+            "t-cold-search",
+            "--body",
+            "Cold history contains the retired alias decision.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-cold-search",
+            "done",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let board_path =
+        fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    Connection::open(board_path)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=1,updated_at=1 WHERE id='t-cold-search'",
+            [],
+        )
+        .unwrap();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let active = fixture.ok_json(
+        &fixture.main,
+        &["search", "retired alias decision", "--json"],
+    );
+    assert!(
+        active["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["sourceId"] != "t-cold-search")
+    );
+    let cold = fixture.ok_json(
+        &fixture.main,
+        &["search", "retired alias decision", "--all", "--json"],
+    );
+    assert!(
+        cold["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["sourceId"] == "t-cold-search" && result["archived"] == true)
+    );
+
+    let second = fixture.root.join("second-search-board");
+    fs::create_dir_all(&second).unwrap();
+    fixture.ok_json(&second, &["init", "--name", "SEARCH-B", "--json"]);
+    fixture.ok_json(
+        &second,
+        &[
+            "task",
+            "add",
+            "Authentication recovery",
+            "--id",
+            "t-auth",
+            "--body",
+            "Restore the login session without storing credentials.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let isolated = fixture.ok_json(
+        &fixture.main,
+        &["search", "credential session login", "--json"],
+    );
+    assert!(
+        isolated["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["sourceId"] != "t-auth")
+    );
+    let across = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "credential session login",
+            "--all-boards",
+            "--json",
+        ],
+    );
+    assert!(
+        across["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|board| board == "SEARCH-B")
+    );
+    assert!(
+        across["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["sourceId"] == "t-auth")
+    );
+}
+
+#[test]
+fn the_v13_search_migration_preserves_v12_knowledge() {
+    let fixture = Fixture::new("search-migration");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SEARCH-MIGRATION", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Knowledge present before V13",
+            "--id",
+            "t-before-search",
+            "--body",
+            "A durable handoff survives the search schema migration.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connection = Connection::open(&board).unwrap();
+    remove_v13_search_schema(&connection);
+    connection.execute_batch("PRAGMA user_version=12;").unwrap();
+    drop(connection);
+
+    let found = fixture.ok_json(&fixture.main, &["search", "durable handoff", "--json"]);
+    assert!(
+        found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["sourceId"] == "t-before-search")
+    );
+    let reopened = Connection::open(board).unwrap();
+    assert_eq!(
+        reopened
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        13
+    );
+    assert_eq!(
+        reopened
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id='t-before-search'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn semantic_lite_retrieves_the_checked_in_paraphrase_corpus() {
+    let fixture = Fixture::new("search-evaluation");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SEARCH-EVAL", "--json"]);
+    for (id, title, body) in [
+        (
+            "t-search-handoff",
+            "Token-pressure continuation",
+            "A successor resumes from the durable handoff after agent context exhaustion.",
+        ),
+        (
+            "t-search-context",
+            "Context budget",
+            "The bounded context packet preserves the newest evidence.",
+        ),
+        (
+            "t-search-release",
+            "Release installation",
+            "Deploy and publish the optimized binary, then restart the live website.",
+        ),
+        (
+            "t-search-archive",
+            "Settled-history retention",
+            "Archive and prune old completed tasks from the hot working set into cold history.",
+        ),
+        (
+            "t-search-auth",
+            "Public-board edge authentication",
+            "SSO login policy determines who may sign in to the public board.",
+        ),
+        (
+            "t-search-stale",
+            "Stale lease detection",
+            "Find overdue tasks when an owner stops heartbeat check-ins.",
+        ),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task", "add", title, "--id", id, "--body", body, "--as", "tester", "--json",
+            ],
+        );
+    }
+    let exact = fixture.ok_json(
+        &fixture.main,
+        &["search", "bounded context packet", "--limit", "5", "--json"],
+    );
+    assert_eq!(exact["results"][0]["sourceId"], "t-search-context");
+    for (query, expected) in [
+        (
+            "continue work after an agent runs out of context",
+            "t-search-handoff",
+        ),
+        (
+            "publish the new binary and restart the website",
+            "t-search-release",
+        ),
+        (
+            "keep old completed items out of the hot working set",
+            "t-search-archive",
+        ),
+        (
+            "who is allowed to sign in to the public board",
+            "t-search-auth",
+        ),
+        (
+            "find overdue work whose owner stopped checking in",
+            "t-search-stale",
+        ),
+    ] {
+        let found = fixture.ok_json(&fixture.main, &["search", query, "--limit", "5", "--json"]);
+        let rank = found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|result| result["sourceId"] == expected);
+        assert!(
+            rank.is_some(),
+            "{expected} was not top-five for {query:?}: {}",
+            found["results"]
+        );
+    }
 }
 
 #[test]
@@ -3707,6 +4105,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "workspace list" => vec!["workspace", "list"],
             "dashboard" => vec!["dashboard"],
             "doctor" => vec!["doctor"],
+            "search" => vec!["search", "Some work"],
             "task list" => vec!["task", "list"],
             "task show" => vec!["task", "show", "t-1"],
             "handoff list" => vec!["handoff", "list"],
@@ -3913,6 +4312,13 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     let tools = listed["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "task_add"));
     assert!(tools.iter().any(|t| t["name"] == "import_atmux_sqlite"));
+    let search = tools.iter().find(|t| t["name"] == "search").unwrap();
+    assert_eq!(search["annotations"]["readOnlyHint"], true);
+    let rebuild = tools
+        .iter()
+        .find(|t| t["name"] == "search_rebuild")
+        .unwrap();
+    assert_eq!(rebuild["annotations"]["readOnlyHint"], false);
     let read_only = tools.iter().find(|t| t["name"] == "doctor").unwrap();
     assert_eq!(read_only["annotations"]["readOnlyHint"], true);
     let writes = tools.iter().find(|t| t["name"] == "claim").unwrap();
@@ -3935,6 +4341,17 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-wire", "--json"])["title"],
         "Over the wire"
+    );
+    let found = session.ask(json!({
+        "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+        "params": { "name": "search", "arguments": { "query": "Over the wire" } }
+    }));
+    assert_eq!(found["result"]["isError"], false);
+    assert!(
+        found["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("kanban://MCP/task/t-wire")
     );
 
     // A refusal is a tool result carrying the CLI's own message, not a
@@ -4840,6 +5257,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
     // it through the compiled binary below must run V10, not merely exercise
     // fresh-board behaviour.
     let connection = Connection::open(&board).unwrap();
+    remove_v13_search_schema(&connection);
     connection
         .execute_batch(
             r#"
@@ -4934,7 +5352,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     assert_eq!(
         connection
@@ -6125,6 +6543,15 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     let (status, boards) = http_get(port, "/boards");
     assert_eq!(status, 200);
     assert!(boards.contains("SERVED"), "{boards}");
+
+    let (status, search) = http_get(port, "/search?q=migration");
+    assert_eq!(status, 200, "{search}");
+    assert!(search.contains("Search"), "{search}");
+    assert!(search.contains("Plan the migration"), "{search}");
+    assert!(
+        search.contains("kanban://SERVED/task/e-plan"),
+        "search omitted its source citation: {search}"
+    );
 
     // Plans: a draft epic is the plan, and it names the work it holds back.
     // Lanes: what the agents are doing, the counterpart to what waits on the

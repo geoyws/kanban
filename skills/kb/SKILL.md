@@ -180,6 +180,39 @@ being ignored.
 Still surface the item in your reply as well. The board makes it survive; the
 reply makes George see it now. In one and not the other is a bug.
 
+## Search and bounded RAG context
+
+Search before opening many cards speculatively. Results cover the board's
+tasks, notes, checkpoints, handoffs, attention, sitreps, rules, and selected
+audit events, with applicable global rules included. Each result has a stable
+`kanban://BOARD/KIND/ID` citation to the authoritative row.
+
+```bash
+kb search "resume the release handoff" --project kanban --json
+kb search t-12345678 --source task --limit 5 --max-chars 4000 --json
+kb search "authentication recovery" --tag auth --all-boards --json
+kb search "retired decision" --all --json       # include archived history
+```
+
+Use the returned snippets to choose sources, then read the cited task, rule, or
+trail through the ordinary narrow commands. Do not treat a similarity score as
+proof and do not cite a snippet without its source URI. `--limit` is 1–100 and
+`--max-chars` is 256–100000; use the smallest useful bounds. Filters are
+`--source`, `--status`, `--tag`, `--lane`, `--after`, and `--before`.
+
+`search` is read-only. It can calculate a missing deterministic local vector in
+memory, but it never writes the cache as a side effect. Cache refresh is an
+explicit audited maintenance operation:
+
+```bash
+kb search-rebuild --project kanban --as system@search-index --json
+kb search-rebuild --all-boards --as system@search-index --json
+```
+
+MCP exposes these as `search` (read-only) and `search_rebuild` (write). The web
+view at `/search` is cross-board and read-only. `kb doctor --json` reports
+`searchIndex` parity and cache freshness for every board.
+
 ## Sitreps — where a lane stands, cheaply
 
 ```bash
@@ -463,6 +496,7 @@ reads and writes nothing.
 - **Lanes** — the counterpart: what every lane last reported, newest first.
 - **Boards** — the `kb dash` projection as a table.
 - **Plans** — draft epics with their bodies, each naming the work it holds back.
+- **Search** — cited exact, lexical, and semantic retrieval across every board.
 - **Task detail** — notes, checkpoints, the event trail, and the provenance of
   whoever holds it. Never the lease token: that is a capability, and a page that
   rendered one would hand it to whoever loaded the page.

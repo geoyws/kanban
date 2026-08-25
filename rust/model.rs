@@ -442,6 +442,81 @@ pub struct ArchiveReport {
     pub task_tags: i64,
 }
 
+/// One bounded retrieval request over Kanban's derived search corpus.
+#[derive(Debug, Clone)]
+pub struct SearchOptions {
+    pub query: String,
+    pub source: Option<String>,
+    pub status: Option<String>,
+    pub tag: Option<String>,
+    pub lane: Option<String>,
+    pub after: Option<i64>,
+    pub before: Option<i64>,
+    pub include_archived: bool,
+    pub limit: usize,
+    pub max_chars: usize,
+}
+
+/// A source-backed retrieval result. The citation is stable and sufficient to
+/// retrieve the authoritative row; the snippet is deliberately bounded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub board: String,
+    pub source_kind: String,
+    pub source_id: String,
+    #[serde(rename = "taskID", skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub title: String,
+    pub snippet: String,
+    pub status: Option<String>,
+    pub lane: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived: bool,
+    pub exact_score: f64,
+    pub lexical_score: f64,
+    pub semantic_score: f64,
+    pub score: f64,
+    pub citation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchReceipt {
+    pub query: String,
+    pub embedding_model: String,
+    pub boards: Vec<String>,
+    pub missing_boards: Vec<String>,
+    pub results: Vec<SearchResult>,
+    pub result_chars: usize,
+    pub truncated: bool,
+    pub generated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIndexReport {
+    pub board: String,
+    pub documents: i64,
+    pub embedded: i64,
+    pub embedding_model: String,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIndexHealth {
+    pub healthy: bool,
+    pub source_rows: i64,
+    pub documents: i64,
+    pub fts_rows: i64,
+    pub missing_embeddings: i64,
+    pub stale_embeddings: i64,
+    pub embedding_model: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandoffInput {
     /// The task being handed over, or `None` for a session handoff that is

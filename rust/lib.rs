@@ -6,6 +6,7 @@ mod lock;
 mod mcp;
 mod model;
 mod registry;
+mod search;
 mod serve;
 mod store;
 
@@ -17,7 +18,7 @@ use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write as _};
@@ -34,6 +35,10 @@ Usage:
   kanban workspace repoint [--root PATH] [--json]
   kanban dashboard [--json]
   kanban doctor [--json]
+  kanban search QUERY [--source KIND] [--status STATUS] [--tag NAME] [--lane LANE]
+             [--after MS] [--before MS] [--all] [--all-boards]
+             [--limit N] [--max-chars N] [--json]
+  kanban search-rebuild --as ACTOR [--all-boards] [--json]
   kanban serve [--port N]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
@@ -111,7 +116,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 23] = [
+pub(crate) const BOOLEAN: [&str; 24] = [
     "help",
     "json",
     "version",
@@ -135,6 +140,7 @@ pub(crate) const BOOLEAN: [&str; 23] = [
     "all",
     "full",
     "global",
+    "all-boards",
 ];
 
 /// Flags that may be given more than once, because their value is a list.
@@ -202,6 +208,25 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("workspace", Some("repoint"), &["root"], &[], false),
     ("dashboard", None, &[], &[], true),
     ("doctor", None, &[], &[], true),
+    (
+        "search",
+        None,
+        &[
+            "source",
+            "status",
+            "tag",
+            "lane",
+            "after",
+            "before",
+            "all",
+            "all-boards",
+            "limit",
+            "max-chars",
+        ],
+        &["query"],
+        true,
+    ),
+    ("search-rebuild", None, &["as", "all-boards"], &[], false),
     ("serve", None, &["port"], &[], true),
     ("backup", None, &["output", "keep"], &[], false),
     (
@@ -1112,6 +1137,154 @@ fn open_store(args: &Args) -> Result<Store> {
     Store::open(&store_path(args)?)
 }
 
+fn reject_all_boards_selector(args: &Args) -> Result<()> {
+    let explicit = BOARD_SELECTORS
+        .iter()
+        .filter(|name| args.flags.contains_key(**name))
+        .map(|name| format!("--{name}"))
+        .collect::<Vec<_>>();
+    let mut selectors = explicit;
+    if env::var_os("KANBAN_DB").is_some() {
+        selectors.push("KANBAN_DB".to_owned());
+    }
+    if env::var_os("KANBAN_PROJECT").is_some() {
+        selectors.push("KANBAN_PROJECT".to_owned());
+    }
+    if !selectors.is_empty() {
+        bail!(
+            "--all-boards cannot be combined with a board selector ({}); unset or remove it",
+            selectors.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
+    let limit = args.limit(10)?;
+    let max_chars = args.integer("max-chars", 12_000)?;
+    if !(1..=100).contains(&limit) {
+        bail!("--limit must be between 1 and 100, got {limit}");
+    }
+    if !(256..=100_000).contains(&max_chars) {
+        bail!("--max-chars must be between 256 and 100000, got {max_chars}");
+    }
+    let after = args.optional_integer("after")?;
+    let before = args.optional_integer("before")?;
+    if after
+        .zip(before)
+        .is_some_and(|(after, before)| after > before)
+    {
+        bail!("--after must not be later than --before");
+    }
+    if let Some(source) = args.one("source") {
+        const SOURCES: [&str; 9] = [
+            "task",
+            "note",
+            "checkpoint",
+            "handoff",
+            "attention",
+            "sitrep",
+            "rule",
+            "global-rule",
+            "event",
+        ];
+        if !SOURCES.contains(&source) {
+            bail!("invalid --source {source}; expected {}", SOURCES.join(", "));
+        }
+    }
+    Ok(SearchOptions {
+        query: query.to_owned(),
+        source: option_string(args, "source"),
+        status: option_string(args, "status"),
+        tag: option_string(args, "tag"),
+        lane: option_string(args, "lane"),
+        after,
+        before,
+        include_archived: args.has("all"),
+        limit: limit as usize,
+        max_chars: max_chars as usize,
+    })
+}
+
+fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
+    let options = search_options(args, query)?;
+    if args.has("all-boards") {
+        reject_all_boards_selector(args)?;
+        let registry = Registry::open()?;
+        let mut results = Vec::new();
+        let mut boards = Vec::new();
+        let mut missing = Vec::new();
+        for project in registry.projects()? {
+            if !board_is_present(&project.board_path) {
+                missing.push(project.name);
+                continue;
+            }
+            let store = Store::open(Path::new(&project.board_path))?;
+            results.extend(store.search(&project.name, &options)?);
+            boards.push(project.name);
+        }
+        results.extend(search::search_global_rules(
+            &registry.global_rules(options.include_archived)?,
+            &options,
+        ));
+        let mut seen = HashSet::new();
+        results.retain(|result| seen.insert(result.citation.clone()));
+        return Ok(search::bound_receipt(
+            query,
+            boards,
+            missing,
+            results,
+            options.limit,
+            options.max_chars,
+        ));
+    }
+
+    let registry = Registry::open()?;
+    let board_name = selected_board_name(args)?;
+    let store = open_store(args)?;
+    let board = board_name
+        .clone()
+        .or(store.board_name()?)
+        .unwrap_or_else(|| "unregistered".to_owned());
+    let mut results = store.search(&board, &options)?;
+    results.extend(search::search_global_rules(
+        &registry.global_rules_for(board_name.as_deref(), options.include_archived)?,
+        &options,
+    ));
+    Ok(search::bound_receipt(
+        query,
+        vec![board],
+        Vec::new(),
+        results,
+        options.limit,
+        options.max_chars,
+    ))
+}
+
+fn rebuild_search_command(args: &Args) -> Result<Value> {
+    let actor = args.require("as")?;
+    if args.has("all-boards") {
+        reject_all_boards_selector(args)?;
+        let registry = Registry::open()?;
+        let mut reports = Vec::new();
+        let mut missing = Vec::new();
+        for project in registry.projects()? {
+            if !board_is_present(&project.board_path) {
+                missing.push(project.name);
+                continue;
+            }
+            let mut store = Store::open(Path::new(&project.board_path))?;
+            reports.push(store.rebuild_search(&project.name, actor)?);
+        }
+        return Ok(json!({"reports":reports,"missingBoards":missing}));
+    }
+    let mut store = open_store(args)?;
+    let board = selected_board_name(args)?
+        .or(store.board_name()?)
+        .unwrap_or_else(|| "unregistered".to_owned());
+    Ok(serde_json::to_value(store.rebuild_search(&board, actor)?)?)
+}
+
 /// Global rules frame every board and always precede its local rules. Bodies
 /// remain lazy; this is only the complete table of contents.
 fn selected_board_name(args: &Args) -> Result<Option<String>> {
@@ -1533,7 +1706,11 @@ fn run() -> Result<()> {
             // lease no sweep will ever retire.
             let orphans = store.foreign_key_violations()?;
             let future = store.future_dated_tasks()?;
-            healthy &= check == vec!["ok"] && orphans.is_empty() && future.is_empty();
+            let search_index = store.search_health()?;
+            healthy &= check == vec!["ok"]
+                && orphans.is_empty()
+                && future.is_empty()
+                && search_index.healthy;
             projects.push(json!({
                 "name": project.name,
                 "boardPath": project.board_path,
@@ -1541,6 +1718,7 @@ fn run() -> Result<()> {
                 "integrity": check,
                 "orphanedRows": orphans,
                 "futureDatedTasks": future,
+                "searchIndex": search_index,
             }));
         }
         let result = json!({
@@ -1679,6 +1857,17 @@ fn run() -> Result<()> {
 
     if command == "rule" && (args.has("board") || args.has("except-board")) {
         bail!("--board and --except-board target global rules; add --global");
+    }
+
+    if command == "search" {
+        let query = args
+            .positionals
+            .get(1)
+            .context("search query is required")?;
+        return print(&search_command(&args, query)?, args.has("json"));
+    }
+    if command == "search-rebuild" {
+        return print(&rebuild_search_command(&args)?, args.has("json"));
     }
 
     let mut store = open_store(&args)?;

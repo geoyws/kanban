@@ -737,6 +737,18 @@ impl Store {
         Ok(store)
     }
 
+    pub fn search(&self, board: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        crate::search::search(&self.connection, board, options)
+    }
+
+    pub fn rebuild_search(&mut self, board: &str, actor: &str) -> Result<SearchIndexReport> {
+        crate::search::rebuild(&mut self.connection, board, actor)
+    }
+
+    pub fn search_health(&self) -> Result<SearchIndexHealth> {
+        crate::search::health(&self.connection)
+    }
+
     /// Retire leases that have run out, before anything reads the board.
     ///
     /// Expiry used to happen only inside `claim` and `accept_handoff`, so a

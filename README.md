@@ -247,6 +247,39 @@ kanban doctor
 kanban backup --json
 ```
 
+## SQLite-native retrieval and RAG
+
+Kanban indexes its authoritative rows inside each board database. Search covers
+tasks, notes, checkpoints, handoffs, attention, sitreps, project rules, selected
+audit events, and applicable global rules. Every hit names the source with a
+stable `kanban://BOARD/KIND/ID` citation; it does not synthesize an answer.
+
+```bash
+kb search "deploy the live build" --project kanban --json
+kb search t-12345678 --source task --limit 5 --max-chars 4000 --json
+kb search "login recovery" --tag auth --all-boards --json
+kb search "old decision" --all --after 1780000000000 --json
+
+# Explicit maintenance write: refresh every cached local semantic vector.
+kb search-rebuild --project kanban --as system@search-index --json
+kb search-rebuild --all-boards --as system@search-index --json
+```
+
+Ranking fuses exact identifiers and phrases, SQLite FTS5/BM25, and a small
+deterministic local semantic model (`kanban-semantic-lite-v1`). The local model
+keeps retrieval private and offline; it is a retrieval aid, not a general
+embedding model. Missing or stale vector cache entries are computed in memory,
+so `search` remains read-only. Only `search-rebuild` persists the cache and
+writes an audit event. `--limit` and `--max-chars` bound agent context, and
+`--source`, `--status`, `--tag`, `--lane`, `--after`, `--before`, and `--all`
+filter it. `doctor` reports source/document/FTS parity plus cache freshness.
+
+The same command description generates the MCP `search` and `search_rebuild`
+tools. The served UI exposes cross-board search at `/search`; both surfaces call
+the same Rust retrieval implementation as the CLI. See
+[ADR-023](docs/adr/ADR-023-sqlite-native-hybrid-rag-search.md) and the
+[evaluation contract](docs/testing/rag-search-evaluation.md).
+
 `doctor` reports per project and exits non-zero if anything is wrong. It runs
 `integrity_check`, which validates the b-tree, and then the things a b-tree
 check cannot see: rows whose foreign key points at something that is gone
@@ -369,11 +402,11 @@ loss of the machine the backups are taken from.
 kanban serve --port 14200      # loopback only; no --bind flag exists
 ```
 
-Five server-rendered pages over every registered board: open attention items
+Six server-rendered pages over every registered board: open attention items
 across all of them oldest-first, the dashboard projection, draft plans with the
-work each holds back, one board's rows, and one task in full. Every read goes
-through the same `Store` methods the CLI calls, so there is no second
-implementation to keep in step.
+work each holds back, cross-board cited search, one board's rows, and one task in
+full. Every read goes through the same `Store` methods the CLI calls, so there
+is no second implementation to keep in step.
 
 It writes nothing. That is enforced twice — an end-to-end test compares the
 board file byte-for-byte across every page load, and a source read-back asserts

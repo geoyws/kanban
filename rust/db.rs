@@ -416,6 +416,295 @@ CREATE INDEX idx_sitreps_lane_created ON sitreps(lane,created_at DESC) WHERE arc
 CREATE INDEX idx_rules_active ON rules(created_at) WHERE archived=0;
 "#;
 
+/// One rebuildable search corpus over the board's authoritative rows.
+///
+/// FTS5 is part of the bundled SQLite amalgamation. The ordinary table keeps
+/// source metadata and optional semantic-vector bytes; the external-content
+/// virtual table owns only the lexical index. Source-table triggers rebuild the
+/// affected derived rows, and search-document triggers keep FTS5 in step. A
+/// source mutation deliberately clears its cached embedding: search computes a
+/// missing vector in memory, while the explicit rebuild operation persists the
+/// current model later without making an ordinary read write the board.
+const BOARD_V13: &str = r#"
+CREATE TABLE search_documents (
+ seq INTEGER PRIMARY KEY,
+ source_kind TEXT NOT NULL CHECK(source_kind IN ('task','note','checkpoint','handoff','attention','sitrep','rule','event')),
+ source_id TEXT NOT NULL,
+ task_id TEXT,
+ title TEXT NOT NULL,
+ body TEXT NOT NULL,
+ status TEXT,
+ lane TEXT,
+ tags TEXT NOT NULL DEFAULT '',
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ source_hash TEXT,
+ embedding_model TEXT,
+ embedding BLOB,
+ UNIQUE(source_kind,source_id)
+) STRICT;
+CREATE INDEX idx_search_documents_source ON search_documents(source_kind,source_id);
+CREATE INDEX idx_search_documents_task ON search_documents(task_id);
+CREATE INDEX idx_search_documents_active ON search_documents(updated_at DESC) WHERE archived=0;
+
+CREATE VIRTUAL TABLE search_fts USING fts5(
+ title,
+ body,
+ tags,
+ content='search_documents',
+ content_rowid='seq',
+ tokenize='porter unicode61 remove_diacritics 2',
+ prefix='2 3'
+);
+
+CREATE TRIGGER search_documents_ai AFTER INSERT ON search_documents BEGIN
+ INSERT INTO search_fts(rowid,title,body,tags)
+ VALUES(new.seq,new.title,new.body,new.tags);
+END;
+CREATE TRIGGER search_documents_ad AFTER DELETE ON search_documents BEGIN
+ INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+ VALUES('delete',old.seq,old.title,old.body,old.tags);
+END;
+CREATE TRIGGER search_documents_au AFTER UPDATE OF title,body,tags ON search_documents BEGIN
+ INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+ VALUES('delete',old.seq,old.title,old.body,old.tags);
+ INSERT INTO search_fts(rowid,title,body,tags)
+ VALUES(new.seq,new.title,new.body,new.tags);
+END;
+
+CREATE VIEW search_source_rows AS
+SELECT
+ 'task' AS source_kind,
+ t.id AS source_id,
+ t.id AS task_id,
+ t.title AS title,
+ COALESCE(t.body,'') || char(10) || COALESCE(t.deliverable,'') || char(10) || t.metadata AS body,
+ t.status AS status,
+ t.lane AS lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=t.id AND archived=0 ORDER BY tag)), '') AS tags,
+ t.created_at AS created_at,
+ t.updated_at AS updated_at,
+ t.archived AS archived
+FROM tasks t
+UNION ALL
+SELECT
+ 'note', CAST(n.seq AS TEXT), n.task_id,
+ n.kind || ' note on ' || n.task_id,
+ n.author || char(10) || n.body,
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=n.task_id AND archived=0 ORDER BY tag)), ''),
+ n.created_at, n.created_at, n.archived
+FROM task_notes n JOIN tasks t ON t.id=n.task_id
+UNION ALL
+SELECT
+ 'checkpoint', CAST(c.seq AS TEXT), c.task_id,
+ 'checkpoint: ' || c.summary,
+ c.author || char(10) || c.summary || char(10) || c.intent || char(10) || c.next_action ||
+   char(10) || c.blockers || char(10) || c.validations || char(10) ||
+   COALESCE(c.repo_path,'') || char(10) || COALESCE(c.branch,''),
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=c.task_id AND archived=0 ORDER BY tag)), ''),
+ c.created_at, c.created_at, c.archived
+FROM checkpoints c JOIN tasks t ON t.id=c.task_id
+UNION ALL
+SELECT
+ 'handoff', h.id, h.task_id,
+ 'handoff: ' || h.summary,
+ h.from_agent || char(10) || COALESCE(h.to_agent,'') || char(10) || h.summary ||
+   char(10) || h.intent || char(10) || h.next_action || char(10) || h.blockers ||
+   char(10) || h.validations || char(10) || COALESCE(h.repo_path,'') ||
+   char(10) || COALESCE(h.branch,''),
+ h.status,
+ (SELECT lane FROM tasks WHERE id=h.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=h.task_id AND archived=0 ORDER BY tag)), ''),
+ h.created_at, COALESCE(h.accepted_at,h.created_at), h.archived
+FROM handoffs h
+UNION ALL
+SELECT
+ 'attention', a.id, a.task_id,
+ 'attention: ' || a.kind,
+ a.raised_by || char(10) || a.body || char(10) || COALESCE(a.resolution,''),
+ a.status,
+ (SELECT lane FROM tasks WHERE id=a.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=a.task_id AND archived=0 ORDER BY tag)), ''),
+ a.created_at, COALESCE(a.resolved_at,a.created_at), a.archived
+FROM attention a
+UNION ALL
+SELECT
+ 'sitrep', s.id, s.task_id,
+ 'sitrep: ' || s.lane,
+ s.author || char(10) || s.body || char(10) || COALESCE(s.worktree,'') ||
+   char(10) || COALESCE(s.branch,''),
+ NULL, s.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=s.task_id AND archived=0 ORDER BY tag)), ''),
+ s.created_at, s.created_at, s.archived
+FROM sitreps s
+UNION ALL
+SELECT
+ 'rule', r.id, NULL,
+ substr(r.body,1,instr(r.body || char(10),char(10))-1),
+ r.body,
+ CASE WHEN r.archived=0 THEN 'active' ELSE 'retired' END,
+ NULL, '', r.created_at, r.updated_at, r.archived
+FROM rules r
+UNION ALL
+SELECT
+ 'event', CAST(e.seq AS TEXT), e.task_id,
+ 'event: ' || e.kind,
+ COALESCE(e.actor,'') || char(10) || e.payload,
+ (SELECT status FROM tasks WHERE id=e.task_id),
+ (SELECT lane FROM tasks WHERE id=e.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=e.task_id AND archived=0 ORDER BY tag)), ''),
+ e.created_at, e.created_at, e.archived
+FROM events e
+WHERE e.kind IN (
+ 'task_added','task_updated','task_moved','note_added','checkpoint_added',
+ 'handoff_created','handoff_accepted','attention_raised','attention_resolved',
+ 'sitrep_posted','rule_added','rule_updated','rule_retired','archive_swept'
+);
+
+CREATE TRIGGER search_tasks_ai AFTER INSERT ON tasks BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.id;
+END;
+CREATE TRIGGER search_tasks_au AFTER UPDATE ON tasks BEGIN
+ DELETE FROM search_documents WHERE task_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.id;
+END;
+CREATE TRIGGER search_tasks_ad AFTER DELETE ON tasks BEGIN
+ DELETE FROM search_documents WHERE task_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=old.id;
+END;
+
+CREATE TRIGGER search_task_tags_ai AFTER INSERT ON task_tags BEGIN
+ DELETE FROM search_documents WHERE task_id=new.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.task_id;
+END;
+CREATE TRIGGER search_task_tags_au AFTER UPDATE ON task_tags BEGIN
+ DELETE FROM search_documents WHERE task_id=old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=old.task_id;
+ DELETE FROM search_documents WHERE task_id=new.task_id AND new.task_id<>old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.task_id AND new.task_id<>old.task_id;
+END;
+CREATE TRIGGER search_task_tags_ad AFTER DELETE ON task_tags BEGIN
+ DELETE FROM search_documents WHERE task_id=old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=old.task_id;
+END;
+
+CREATE TRIGGER search_notes_ai AFTER INSERT ON task_notes BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='note' AND source_id=CAST(new.seq AS TEXT);
+END;
+CREATE TRIGGER search_notes_au AFTER UPDATE ON task_notes BEGIN
+ DELETE FROM search_documents WHERE source_kind='note' AND source_id=CAST(old.seq AS TEXT);
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='note' AND source_id=CAST(new.seq AS TEXT);
+END;
+CREATE TRIGGER search_notes_ad AFTER DELETE ON task_notes BEGIN
+ DELETE FROM search_documents WHERE source_kind='note' AND source_id=CAST(old.seq AS TEXT);
+END;
+
+CREATE TRIGGER search_checkpoints_ai AFTER INSERT ON checkpoints BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='checkpoint' AND source_id=CAST(new.seq AS TEXT);
+END;
+CREATE TRIGGER search_checkpoints_au AFTER UPDATE ON checkpoints BEGIN
+ DELETE FROM search_documents WHERE source_kind='checkpoint' AND source_id=CAST(old.seq AS TEXT);
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='checkpoint' AND source_id=CAST(new.seq AS TEXT);
+END;
+CREATE TRIGGER search_checkpoints_ad AFTER DELETE ON checkpoints BEGIN
+ DELETE FROM search_documents WHERE source_kind='checkpoint' AND source_id=CAST(old.seq AS TEXT);
+END;
+
+CREATE TRIGGER search_handoffs_ai AFTER INSERT ON handoffs BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_au AFTER UPDATE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_ad AFTER DELETE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+END;
+
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+
+CREATE TRIGGER search_sitreps_ai AFTER INSERT ON sitreps BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sitrep' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sitreps_au AFTER UPDATE ON sitreps BEGIN
+ DELETE FROM search_documents WHERE source_kind='sitrep' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sitrep' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sitreps_ad AFTER DELETE ON sitreps BEGIN
+ DELETE FROM search_documents WHERE source_kind='sitrep' AND source_id=old.id;
+END;
+
+CREATE TRIGGER search_rules_ai AFTER INSERT ON rules BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='rule' AND source_id=new.id;
+END;
+CREATE TRIGGER search_rules_au AFTER UPDATE ON rules BEGIN
+ DELETE FROM search_documents WHERE source_kind='rule' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='rule' AND source_id=new.id;
+END;
+CREATE TRIGGER search_rules_ad AFTER DELETE ON rules BEGIN
+ DELETE FROM search_documents WHERE source_kind='rule' AND source_id=old.id;
+END;
+
+CREATE TRIGGER search_events_ai AFTER INSERT ON events
+WHEN new.kind IN (
+ 'task_added','task_updated','task_moved','note_added','checkpoint_added',
+ 'handoff_created','handoff_accepted','attention_raised','attention_resolved',
+ 'sitrep_posted','rule_added','rule_updated','rule_retired','archive_swept'
+) BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='event' AND source_id=CAST(new.seq AS TEXT);
+END;
+CREATE TRIGGER search_events_au AFTER UPDATE ON events BEGIN
+ DELETE FROM search_documents WHERE source_kind='event' AND source_id=CAST(old.seq AS TEXT);
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='event' AND source_id=CAST(new.seq AS TEXT);
+END;
+CREATE TRIGGER search_events_ad AFTER DELETE ON events BEGIN
+ DELETE FROM search_documents WHERE source_kind='event' AND source_id=CAST(old.seq AS TEXT);
+END;
+
+INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+SELECT * FROM search_source_rows;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -684,7 +973,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12,
+            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

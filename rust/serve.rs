@@ -23,8 +23,9 @@
 //! state, and an HTTP server holds accepted connections. Saying so plainly is
 //! cheaper than someone discovering it during an update.
 
-use crate::model::{Attention, ProjectRecord, Sitrep, Task};
+use crate::model::{Attention, ProjectRecord, SearchOptions, Sitrep, Task};
 use crate::registry::{Registry, now_ms};
+use crate::search;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -92,9 +93,7 @@ fn respond(request: Request, body: Result<String>) {
 
 /// Route a URL to a rendered page.
 fn render(url: &str) -> Result<String> {
-    // Query strings are not used by any page yet; dropping one here means a
-    // bookmarked `?utm_...` still resolves rather than 404ing.
-    let path = url.split('?').next().unwrap_or(url);
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -106,6 +105,7 @@ fn render(url: &str) -> Result<String> {
         ["boards"] => boards(),
         ["plans"] => plans(),
         ["lanes"] => lanes(),
+        ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
         ["board", project] => board(project),
         ["task", project, id] => task_detail(project, id),
         _ => Ok(page(
@@ -114,6 +114,13 @@ fn render(url: &str) -> Result<String> {
              <a href=\"/\">Start over</a>.</p>",
         )),
     }
+}
+
+fn query_value(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (decode(&key.replace('+', " ")) == name).then(|| decode(&value.replace('+', " ")))
+    })
 }
 
 /// Percent-decoding, because a project name or task id may contain characters
@@ -224,6 +231,116 @@ fn needs_you() -> Result<String> {
         html.push_str("</article>");
     }
     Ok(page("Needs you", &html))
+}
+
+/// Cross-board retrieval for people who should not need to know which board
+/// owns a fact before they can find it. Ranking and bounds are the same shared
+/// implementation used by the CLI and MCP tool.
+fn search_page(query: &str) -> Result<String> {
+    let query = query.trim();
+    let mut html = format!(
+        "<h1>Search</h1><form class=search-page action=/search method=get>\
+         <input name=q value=\"{}\" placeholder=\"Task, decision, handoff, rule…\" autofocus>\
+         <button type=submit>Search</button></form>",
+        escape(query)
+    );
+    if query.is_empty() {
+        html.push_str(
+            "<p class=empty>Search every board, including tasks, notes, checkpoints, \
+             handoffs, attention, sitreps, rules, and their audit trail.</p>",
+        );
+        return Ok(page("Search", &html));
+    }
+    let options = SearchOptions {
+        query: query.to_owned(),
+        source: None,
+        status: None,
+        tag: None,
+        lane: None,
+        after: None,
+        before: None,
+        include_archived: false,
+        limit: 30,
+        max_chars: 30_000,
+    };
+    let registry = Registry::open()?;
+    let mut results = Vec::new();
+    let mut boards = Vec::new();
+    let mut missing = Vec::new();
+    for project in registry.projects()? {
+        if !Path::new(&project.board_path).is_file() {
+            missing.push(project.name);
+            continue;
+        }
+        let store = Store::open(Path::new(&project.board_path))?;
+        results.extend(store.search(&project.name, &options)?);
+        boards.push(project.name);
+    }
+    results.extend(search::search_global_rules(
+        &registry.global_rules(false)?,
+        &options,
+    ));
+    let receipt = search::bound_receipt(
+        query,
+        boards,
+        missing,
+        results,
+        options.limit,
+        options.max_chars,
+    );
+    html.push_str(&format!(
+        "<p class=count>{} result{} across {} board{} · model <code>{}</code>{}</p>",
+        receipt.results.len(),
+        if receipt.results.len() == 1 { "" } else { "s" },
+        receipt.boards.len(),
+        if receipt.boards.len() == 1 { "" } else { "s" },
+        escape(&receipt.embedding_model),
+        if receipt.truncated { " · bounded" } else { "" },
+    ));
+    if receipt.results.is_empty() {
+        html.push_str("<p class=empty>No matching Kanban knowledge.</p>");
+    }
+    for result in receipt.results {
+        let title = if let Some(task_id) = &result.task_id {
+            format!(
+                "<a href=\"/task/{}/{}\">{}</a>",
+                escape(&result.board),
+                escape(task_id),
+                escape(&result.title)
+            )
+        } else {
+            escape(&result.title)
+        };
+        html.push_str(&format!(
+            "<article class=search-result><h2>{title}</h2>\
+             <p class=meta>{board} · {kind} · score {score:.3}{status}{lane}{tags}</p>\
+             <p class=body>{snippet}</p><p class=citation><code>{citation}</code></p></article>",
+            title = title,
+            board = escape(&result.board),
+            kind = escape(&result.source_kind),
+            score = result.score,
+            status = result
+                .status
+                .as_ref()
+                .map(|status| format!(" · {}", escape(status)))
+                .unwrap_or_default(),
+            lane = result
+                .lane
+                .as_ref()
+                .map(|lane| format!(" · {}", escape(lane)))
+                .unwrap_or_default(),
+            tags = tag_list(&result.tags),
+            snippet = escape(&result.snippet),
+            citation = escape(&result.citation),
+        ));
+    }
+    if !receipt.missing_boards.is_empty() {
+        html.push_str(&format!(
+            "<p class=error>Missing board files: {}</p>",
+            escape(&receipt.missing_boards.join(", "))
+        ));
+    }
+    Ok(page(&format!("Search: {query}"), &html))
 }
 
 /// Every board at a glance — the `dashboard` projection, rendered.
@@ -752,7 +869,9 @@ fn page(title: &str, body: &str) -> String {
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
          <nav><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
-         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a></nav><main>{body}</main>\
+         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a>\
+         <form action=/search method=get><input name=q aria-label=Search placeholder=\"Search Kanban\"></form>\
+         </nav><main>{body}</main>\
          <footer>read-only · <code>kanban serve</code></footer></body></html>",
         title = escape(title),
     )
@@ -766,6 +885,11 @@ nav{display:flex;gap:1rem;padding:.9rem 1.2rem;background:#161b22;\
 border-bottom:1px solid #30363d;position:sticky;top:0}\
 nav a{color:#e6edf3;text-decoration:none;font-weight:600}\
 nav a:hover{color:#58a6ff}\
+nav form{margin-left:auto}\
+input,button{font:inherit;color:#e6edf3;background:#0d1117;border:1px solid #30363d;\
+border-radius:6px;padding:.35rem .55rem}\
+button{cursor:pointer;background:#1f6feb;border-color:#1f6feb;font-weight:600}\
+.search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
 main{max-width:60rem;margin:0 auto;padding:1.2rem}\
 footer{max-width:60rem;margin:0 auto;padding:1.2rem;color:#8b949e;font-size:.85rem}\
 h1{font-size:1.5rem;margin:.2rem 0 1rem}\
@@ -784,8 +908,9 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}\
 td.waiting{color:#f0883e;font-weight:700}\
 td.when{white-space:nowrap;color:#8b949e}\
 td.payload{color:#8b949e;font-size:.85rem;word-break:break-word}\
-.item,.note,.plan{border:1px solid #30363d;border-radius:8px;padding:.9rem;\
+.item,.note,.plan,.search-result{border:1px solid #30363d;border-radius:8px;padding:.9rem;\
 margin:.8rem 0;background:#0f141a}\
+.search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:#8b949e}\
 .meta{color:#8b949e;font-size:.85rem;margin:.2rem 0}\
 .body{margin:.5rem 0;white-space:pre-wrap}\
 .cmd{margin:.5rem 0 0;font-size:.85rem}\
