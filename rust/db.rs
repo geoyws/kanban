@@ -465,6 +465,37 @@ DROP INDEX idx_global_rules_active;
 CREATE INDEX idx_global_rules_active ON global_rules(created_at) WHERE archived=0;
 "#;
 
+/// Workspace aliases can outlive disposable worktrees. Retire them without
+/// erasing who attached what, while keeping active resolution and indexes
+/// bounded to roots that still participate in the project.
+const REGISTRY_V6: &str = r#"
+ALTER TABLE workspaces ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE workspaces ADD COLUMN archived_at INTEGER;
+ALTER TABLE workspaces ADD COLUMN archived_by TEXT;
+ALTER TABLE workspace_aliases ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE workspace_aliases ADD COLUMN archived_at INTEGER;
+ALTER TABLE workspace_aliases ADD COLUMN archived_by TEXT;
+DROP INDEX idx_workspace_aliases_board;
+CREATE INDEX idx_workspace_aliases_board ON workspace_aliases(board_path) WHERE archived=0;
+"#;
+
+/// Retired aliases live apart from active address resolution so a disposable
+/// worktree path may be reused after a rebuild without overwriting history or
+/// colliding with the active table's primary key.
+const REGISTRY_V7: &str = r#"
+CREATE TABLE workspace_alias_history (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ root_path TEXT NOT NULL,
+ name TEXT NOT NULL,
+ board_path TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ last_used_at INTEGER NOT NULL,
+ archived_at INTEGER NOT NULL,
+ archived_by TEXT NOT NULL
+) STRICT;
+CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
+"#;
+
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
 /// Directories that already exist are left exactly as the operator set them.
@@ -671,6 +702,8 @@ pub fn open_registry(path: &Path) -> Result<Connection> {
             REGISTRY_V3,
             REGISTRY_V4,
             REGISTRY_V5,
+            REGISTRY_V6,
+            REGISTRY_V7,
         ],
     )?;
     Ok(connection)

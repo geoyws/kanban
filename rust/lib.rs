@@ -28,8 +28,9 @@ const HELP: &str = r#"kanban — durable work ledger for agents (Rust)
 Usage:
   kanban version
   kanban init [--name NAME] [--workspace PATH] [--force]
-  kanban workspace list [--json]
+  kanban workspace list [--all] [--json]
   kanban workspace attach --to REGISTERED_PATH [--workspace PATH]
+  kanban workspace detach --root REGISTERED_PATH --as ACTOR
   kanban workspace repoint [--root PATH] [--json]
   kanban dashboard [--json]
   kanban doctor [--json]
@@ -100,7 +101,7 @@ Aliases (the binary installs as both `kanban` and `kb`):
   task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
   story:     adv=advance
   handoff:   ls=list  new=create  acc=accept
-  workspace: ls=list  att=attach
+  workspace: ls=list  att=attach  det=detach
   rule:      ls=list  new=add  up=update  cat=show; --global manages inherited rules
              repeat --board NAME; --except-board NAME means ALL except that board
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
@@ -195,8 +196,9 @@ pub(crate) type CommandRow = (
 
 pub(crate) const COMMANDS: &[CommandRow] = &[
     ("init", None, &["name", "force"], &[], false),
-    ("workspace", Some("list"), &[], &[], true),
+    ("workspace", Some("list"), &["all"], &[], true),
     ("workspace", Some("attach"), &["to"], &[], false),
+    ("workspace", Some("detach"), &["root", "as"], &[], false),
     ("workspace", Some("repoint"), &["root"], &[], false),
     ("dashboard", None, &[], &[], true),
     ("doctor", None, &[], &[], true),
@@ -542,6 +544,7 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("handoff", "acc") => "accept",
         ("workspace", "ls") => "list",
         ("workspace", "att") => "attach",
+        ("workspace", "det") => "detach",
         ("tag", "ls") => "list",
         ("tag", "new") => "add",
         ("tag", "rm") => "remove",
@@ -1420,12 +1423,17 @@ fn run() -> Result<()> {
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("list") {
-        return print(&Registry::open()?.list()?, args.has("json"));
+        return print(&Registry::open()?.list(args.has("all"))?, args.has("json"));
     }
     if command == "workspace" && sub == Some("attach") {
         let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
         let mut registry = Registry::open()?;
         let record = registry.attach(&workspace, Path::new(args.require("to")?))?;
+        return print(&record, args.has("json"));
+    }
+    if command == "workspace" && sub == Some("detach") {
+        let mut registry = Registry::open()?;
+        let record = registry.detach(args.require("root")?, args.require("as")?)?;
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("repoint") {

@@ -322,6 +322,9 @@ pub struct WorkspaceRecord {
     pub canonical: bool,
     pub created_at: i64,
     pub last_used_at: i64,
+    pub archived: bool,
+    pub archived_at: Option<i64>,
+    pub archived_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -48,7 +48,7 @@ Scoped to their group:
 | `task` | `ls`=list `mv`=move `rm`=remove `new`=add `up`=update `meta`=metadata `cat`=show |
 | `story` | `adv`=advance |
 | `handoff` | `ls`=list `new`=create `acc`=accept |
-| `workspace` | `ls`=list `att`=attach |
+| `workspace` | `ls`=list `att`=attach `det`=detach |
 | `tag` | `ls`=list `rm`=remove `new`=add |
 | `rule` | `ls`=list `new`=add `up`=update `cat`=show |
 | `sitrep` | `ls`=list `new`=post |
@@ -76,6 +76,8 @@ working directory.
 ```bash
 kb ws ls --json                 # every registered project and its board path
 kb init --name NAME             # register the current directory
+kb ws det --root /retired/worktree --as "$AGENT" --json
+kb ws ls --all --json           # including detached aliases
 ```
 
 ## Project rules — what frames every task

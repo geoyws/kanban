@@ -5773,6 +5773,131 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
     );
 }
 
+#[test]
+fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
+    let fixture = Fixture::new("detach-worktree");
+    let project = fixture.root.join("project");
+    let retired = fixture.root.join("retired-lane");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+
+    fixture.ok_json(&project, &["init", "--name", "DETACH", "--json"]);
+    fixture.ok_json(
+        &retired,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            project.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &project,
+        &["task", "add", "Kept work", "--id", "t-kept", "--json"],
+    );
+    fs::remove_dir_all(&retired).unwrap();
+
+    let detached = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            retired.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(detached["rootPath"], retired.to_string_lossy().as_ref());
+    assert_eq!(detached["canonical"], false);
+    assert_eq!(detached["archived"], true);
+    assert_eq!(detached["archivedBy"], "geo");
+    assert!(detached["archivedAt"].as_i64().is_some());
+
+    let active = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        active
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["rootPath"] != retired.to_string_lossy().as_ref())
+    );
+    let all = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
+    assert!(all.as_array().unwrap().iter().any(|row| {
+        row["rootPath"] == retired.to_string_lossy().as_ref() && row["archived"] == true
+    }));
+    assert_eq!(
+        fixture.ok_json(&project, &["task", "show", "t-kept", "--json"])["id"],
+        "t-kept",
+        "detaching an alias changed or orphaned its board"
+    );
+    assert!(
+        fixture.ok_json(&project, &["doctor", "--json"])["unreachableRoots"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let canonical = fixture.run(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            project.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(!canonical.status.success());
+    assert!(String::from_utf8_lossy(&canonical.stderr).contains("canonical project root"));
+
+    let twice = fixture.run(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            retired.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(!twice.status.success());
+    assert!(String::from_utf8_lossy(&twice.stderr).contains("already detached"));
+
+    // Disposable lane paths are reused after rebuilds. The retired row must
+    // not occupy the active table's primary key forever.
+    fs::create_dir_all(&retired).unwrap();
+    let reattached = fixture.ok_json(
+        &retired,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            project.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(reattached["rootPath"], retired.to_string_lossy().as_ref());
+    assert_eq!(reattached["archived"], false);
+    let history = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
+    assert_eq!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["rootPath"] == retired.to_string_lossy().as_ref())
+            .count(),
+        2,
+        "reattaching a reused path erased or replaced its retired history"
+    );
+}
+
 /// One HTTP request to the running server, as a real socket conversation.
 ///
 /// Hand-rolled rather than reached for a client crate: this must exercise the
@@ -6759,7 +6884,7 @@ fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        5
+        7
     );
 }
 

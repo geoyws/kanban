@@ -126,6 +126,23 @@ fn row(record: &rusqlite::Row<'_>, canonical: bool) -> rusqlite::Result<Workspac
         canonical,
         created_at: record.get("created_at")?,
         last_used_at: record.get("last_used_at")?,
+        archived: record.get::<_, i64>("archived")? != 0,
+        archived_at: record.get("archived_at")?,
+        archived_by: record.get("archived_by")?,
+    })
+}
+
+fn history_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        root_path: record.get("root_path")?,
+        name: record.get("name")?,
+        board_path: record.get("board_path")?,
+        canonical: false,
+        created_at: record.get("created_at")?,
+        last_used_at: record.get("last_used_at")?,
+        archived: true,
+        archived_at: record.get("archived_at")?,
+        archived_by: record.get("archived_by")?,
     })
 }
 
@@ -214,7 +231,7 @@ impl Registry {
         let canonical = self
             .connection
             .query_row(
-                "SELECT * FROM workspaces WHERE root_path=?",
+                "SELECT * FROM workspaces WHERE root_path=? AND archived=0",
                 [text.as_ref()],
                 |r| row(r, true),
             )
@@ -224,7 +241,7 @@ impl Registry {
         }
         self.connection
             .query_row(
-                "SELECT * FROM workspace_aliases WHERE root_path=?",
+                "SELECT * FROM workspace_aliases WHERE root_path=? AND archived=0",
                 [text.as_ref()],
                 |r| row(r, false),
             )
@@ -286,24 +303,100 @@ impl Registry {
         self.exact(&root)?.context("attached workspace not found")
     }
 
-    pub fn list(&self) -> Result<Vec<WorkspaceRecord>> {
+    pub fn list(&self, include_archived: bool) -> Result<Vec<WorkspaceRecord>> {
         let mut out = Vec::new();
-        for (sql, canonical) in [
-            ("SELECT * FROM workspaces ORDER BY last_used_at DESC", true),
-            (
-                "SELECT * FROM workspace_aliases ORDER BY last_used_at DESC",
-                false,
-            ),
-        ] {
-            let mut statement = self.connection.prepare(sql)?;
+        let suffix = if include_archived {
+            " ORDER BY last_used_at DESC"
+        } else {
+            " WHERE archived=0 ORDER BY last_used_at DESC"
+        };
+        for (table, canonical) in [("workspaces", true), ("workspace_aliases", false)] {
+            let sql = format!("SELECT * FROM {table}{suffix}");
+            let mut statement = self.connection.prepare(&sql)?;
             out.extend(
                 statement
                     .query_map([], |r| row(r, canonical))?
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             );
         }
+        if include_archived {
+            let mut statement = self.connection.prepare(
+                "SELECT * FROM workspace_alias_history ORDER BY archived_at DESC,seq DESC",
+            )?;
+            out.extend(
+                statement
+                    .query_map([], history_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
         out.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
         Ok(out)
+    }
+
+    /// Retire one attached worktree without deleting its historical registry
+    /// row or risking the canonical registration that keeps the board named.
+    pub fn detach(&mut self, root_path: &str, actor: &str) -> Result<WorkspaceRecord> {
+        let actor = actor.trim();
+        if actor.is_empty() {
+            bail!("actor is required");
+        }
+        let alias = self
+            .connection
+            .query_row(
+                "SELECT * FROM workspace_aliases WHERE root_path=?",
+                [root_path],
+                |record| row(record, false),
+            )
+            .optional()?;
+        let Some(alias) = alias else {
+            if self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM workspaces WHERE root_path=? AND archived=0",
+                    [root_path],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                bail!(
+                    "{root_path} is a canonical project root and cannot be detached; repoint it or attach another worktree instead"
+                );
+            }
+            let retired = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM workspace_alias_history WHERE root_path=? LIMIT 1",
+                    [root_path],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if retired {
+                bail!("workspace alias {root_path} is already detached");
+            }
+            bail!("workspace alias {root_path} is not registered");
+        };
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO workspace_alias_history(root_path,name,board_path,created_at,last_used_at,archived_at,archived_by) VALUES(?,?,?,?,?,?,?)",
+            params![alias.root_path,alias.name,alias.board_path,alias.created_at,alias.last_used_at,now,actor],
+        )?;
+        transaction.execute(
+            "DELETE FROM workspace_aliases WHERE root_path=?",
+            [root_path],
+        )?;
+        let retired = WorkspaceRecord {
+            archived: true,
+            archived_at: Some(now),
+            archived_by: Some(actor.to_owned()),
+            ..alias
+        };
+        transaction.commit()?;
+        Ok(retired)
     }
 
     /// Turn operator-facing include/exclude flags into the one canonical tag
@@ -620,7 +713,7 @@ impl Registry {
             .query_map([], |r| row(r, true))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let aliases = self
-            .list()?
+            .list(false)?
             .into_iter()
             .filter(|r| !r.canonical)
             .collect::<Vec<_>>();
@@ -694,7 +787,7 @@ impl Registry {
     /// Registered roots that no longer resolve to themselves.
     pub fn unreachable_roots(&self) -> Result<Vec<UnreachableRoot>> {
         let mut out = Vec::new();
-        for record in self.list()? {
+        for record in self.list(false)? {
             let stored = Path::new(&record.root_path);
             let resolved = stored.canonicalize().ok();
             let reachable = resolved
