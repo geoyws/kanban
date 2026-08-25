@@ -289,6 +289,19 @@ kb t new "Enumerate consumers" --parent e-q4-p1 --json               # the work
 kb t mv e-q4 todo --as geo                                           # ready to act on
 ```
 
+**Use this tree for durable todo lists.** For a multi-item roadmap, make the
+roadmap an epic and every top-level todo item a direct child epic. Put the
+actionable stories and tasks beneath that child, and use dependencies between
+child epics for ordering. The roadmap body records scope and success criteria;
+do not maintain a duplicate Markdown checkbox list. Any rendered checklist or
+progress count is a projection of the board.
+
+The child epic is the roadmap item's checkbox. The current CLI does not
+generically derive epic completion from all descendants, so move a child epic
+to `done` only after every non-cancelled descendant is settled and its evidence
+is durable. A single standalone action stays a task; do not wrap it in
+ornamental epics.
+
 `--body-file` reads the body from disk, because a plan is markdown measured in
 kilobytes. Passing `--body` and `--body-file` together is refused — two answers
 to one question.
@@ -324,9 +337,10 @@ on. Use it for anything you are still specifying — an agent reads every row on
 the board as a specification, and an unfinished one gets decomposed and worked
 as though it were settled.
 
-**Only a task is claimable.** An epic and a story are containers whose status is
-derived from what is beneath them; `claim --next` skips them, and naming one
-explicitly is refused pointing at `story advance` or at the children.
+**Only a task is claimable.** An epic and a story are containers;
+`claim --next` skips them, and naming one explicitly is refused pointing at
+`story advance` or at the children. Story gates project story status, while
+generic epic completion is still an explicit, agent-verified transition.
 
 **A story's status is projected from its gate.** `kb t mv <story> done` is
 refused — use `kb s adv <id> --as "$ACTOR"`. `blocked` and `cancelled` stay

@@ -106,6 +106,16 @@ were already just identities passed to `--as`, competing for the same board, and
 an unlaned unassigned task was always claimable by any of them. Lanes,
 assignees and `driver_only` remain opt-in narrowing on top of that default.
 
+### Roadmaps use direct child epics
+
+**Amended 2026-08-25.** A durable multi-item todo list uses the same model rather
+than inventing a checklist beside it: the roadmap is an epic, every top-level
+todo item is a direct child epic, and actionable stories and tasks sit beneath
+those children. The roadmap body explains the plan but does not duplicate live
+status as Markdown checkboxes. See
+[ADR-022](ADR-022-roadmap-todo-lists-are-child-epics.md) for the completion and
+projection contract.
+
 ## Consequences
 
 Widening the status `CHECK` meant rebuilding the `tasks` table, and a rebuild is
@@ -143,3 +153,4 @@ not before.
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — the work breakdown this extends
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md) — the nesting rule amended here, and the two-answers-to-one-question rule
 - [ADR-012](ADR-012-session-handoffs-and-durable-attention.md) — the same "keep the record, never overwrite it" reasoning
+- [ADR-022](ADR-022-roadmap-todo-lists-are-child-epics.md) — the roadmap todo-list convention

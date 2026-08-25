@@ -65,6 +65,29 @@ cannot claim the same task while its lease is live. If a worker disappears,
 the lease expires and the task becomes claimable again; the last durable
 checkpoint remains available.
 
+## Roadmap todo lists
+
+Use the board tree for every durable multi-item todo list. The roadmap is an
+epic, each top-level todo item is a direct child epic, and its stories and tasks
+are the work. Dependencies between child epics express ordering.
+
+```bash
+kb t new "Q4 roadmap" --type epic --status draft --body-file roadmap.md --tag planning --as "$AGENT" --json
+# Use the returned epic id as ROADMAP_ID.
+kb t new "Migrate billing" --type epic --parent "$ROADMAP_ID" --status draft --tag billing --as "$AGENT" --json
+# Use the returned child id as ITEM_ID.
+kb t new "Enumerate billing consumers" --parent "$ITEM_ID" --tag billing --as "$AGENT" --json
+kb t mv "$ROADMAP_ID" todo --as "$AGENT"
+```
+
+The tree and its statuses are authoritative. Keep scope and success criteria in
+the roadmap body, but do not maintain a second Markdown checkbox list. Any
+checklist view is a projection. A child epic may be marked done only after every
+non-cancelled descendant is settled and its completion evidence is durable;
+that check is agent-verified today, not automatically derived by the CLI. A
+single standalone action remains a task and needs no epic wrapper. See
+[ADR-022](docs/adr/ADR-022-roadmap-todo-lists-are-child-epics.md).
+
 ## Long-horizon loop
 
 An orchestrator should run fresh, bounded model turns instead of depending on
