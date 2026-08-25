@@ -143,7 +143,7 @@ while IFS=$'\t' read -r project board; do
   fi
   "$KB" archive --project "$project" --older-than-days 90 --as system@archive --json \
     >> "$WORK/archive.jsonl" || die "archive sweep failed for $project"
-done < <("$KB" workspace list --json | jq -r '.[] | [.name,.boardPath] | @tsv')
+done < <("$KB" workspace list --json | jq -r 'unique_by(.boardPath)[] | [.name,.boardPath] | @tsv')
 ok "swept settled rows older than 90 days across every present board"
 
 # ── snapshot ─────────────────────────────────────────────────────────
