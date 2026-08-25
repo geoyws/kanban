@@ -274,16 +274,26 @@ fn lexical_scores(connection: &Connection, query: &str) -> Result<HashMap<i64, f
 
 fn exact_score(document: &Document, query: &str, query_words: &[String]) -> f64 {
     let query = query.to_lowercase();
-    let haystack = format!(
-        "{}\n{}\n{}\n{}",
-        document.source_id, document.title, document.body, document.tags
-    )
-    .to_lowercase();
-    if document.source_id.to_lowercase() == query {
+    let source_id = document.source_id.to_lowercase();
+    let title = document.title.to_lowercase();
+    let body = format!("{}\n{}", document.body, document.tags).to_lowercase();
+    let haystack = format!("{source_id}\n{title}\n{body}");
+    if source_id == query {
         return 1.0;
     }
-    if !query.is_empty() && haystack.contains(&query) {
-        return 0.9;
+    if !query.is_empty() {
+        if title == query {
+            return 0.99;
+        }
+        if title.starts_with(&query) {
+            return 0.98;
+        }
+        if title.contains(&query) {
+            return 0.95;
+        }
+        if body.contains(&query) {
+            return 0.9;
+        }
     }
     if query_words.is_empty() {
         return 0.0;
@@ -364,6 +374,10 @@ pub fn search(
         }
         let score = if exact >= 1.0 {
             10.0 + lexical + semantic
+        } else if exact >= 0.98 {
+            8.0 + exact + lexical + semantic
+        } else if exact >= 0.95 {
+            6.0 + exact + lexical + semantic
         } else if exact >= 0.9 {
             4.0 + exact + lexical + semantic
         } else {

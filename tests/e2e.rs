@@ -320,6 +320,26 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
         "kanban://SEARCH-A/task/t-release"
     );
 
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-release",
+            "The Production rollout phrase is repeated in this supporting receipt.",
+            "--as",
+            "tester",
+            "--kind",
+            "evidence",
+            "--json",
+        ],
+    );
+    let title_phrase = fixture.ok_json(
+        &fixture.main,
+        &["search", "Production rollout", "--limit", "3", "--json"],
+    );
+    assert_eq!(title_phrase["results"][0]["sourceKind"], "task");
+    assert_eq!(title_phrase["results"][0]["sourceId"], "t-release");
+
     let paraphrase = fixture.ok_json(
         &fixture.main,
         &[
