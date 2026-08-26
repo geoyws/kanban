@@ -2402,7 +2402,10 @@ fn run() -> Result<()> {
         let rules = effective_rule_summaries(
             &args,
             &store,
-            claim.as_ref().map(|claim| claim.task_id.as_str()),
+            claim
+                .as_ref()
+                .map(|claim| claim.task_id.as_str())
+                .or(handoff.task_id.as_deref()),
         )?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),

@@ -31,6 +31,12 @@ validates eligibility, creates a fresh lease, marks the handoff accepted, and
 moves the task back to `in_progress`. The replacement starts by loading the
 task context, which includes the newest handoff and checkpoint.
 
+If another transition has since made the task `blocked`, `done`, or `cancelled`,
+acceptance is only an acknowledgement that the brief was absorbed. It marks the
+handoff accepted but preserves the task status and creates no lease. Otherwise
+old correspondence would remain permanently pending precisely when there is no
+claimable work left to protect.
+
 Handoffs may name a target agent, but an unnamed target is valid when the next
 compatible agent should pull the work. Lease tokens are authorization material
 and are never stored in handoff prose or model prompts.

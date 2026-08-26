@@ -2444,6 +2444,25 @@ impl Store {
             return Ok((updated, None));
         };
         let task = require_task(&transaction, &task_id)?;
+        // Once work has been blocked or settled, accepting an older brief is
+        // acknowledgement rather than ownership transfer. There is no
+        // claimable task to protect, and leaving the handoff pending forever
+        // makes every future lane resume rediscover correspondence it cannot
+        // clear. Keep the transition atomic and deliberately mint no lease.
+        if matches!(task.status.as_str(), "blocked" | "done" | "cancelled") {
+            transaction.execute("UPDATE handoffs SET status='accepted',accepted_at=?,accepted_by=?,accepted_session=? WHERE id=? AND status='pending'",params![now,agent,session,id])?;
+            event(
+                &transaction,
+                Some(&task.id),
+                "handoff_accepted",
+                Some(&agent),
+                json!({"handoffID":id,"acknowledged":true,"taskStatus":task.status}),
+            )?;
+            let updated =
+                transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
+            transaction.commit()?;
+            return Ok((updated, None));
+        }
         require_claimable_type(&task.id, &task.task_type)?;
         require_no_draft_ancestor(&transaction, &task.id)?;
         if task.status != "todo" {

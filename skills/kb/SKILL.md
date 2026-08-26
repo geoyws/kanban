@@ -278,7 +278,7 @@ its lane, so that is the key:
 
 ```bash
 kb h ls --project px-crm --status pending --to driver-2 --json
-kb h acc <id> --as driver-2 --json      # accept once absorbed; no lease for a session handoff
+kb h acc <id> --as driver-2 --json      # task lease when claimable; acknowledgement only when settled
 ```
 
 `--repo` and `--branch` ride inside the record, so the successor `cd`s from the

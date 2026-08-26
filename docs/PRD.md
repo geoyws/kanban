@@ -121,6 +121,8 @@ A handoff is valid only when:
 - its checkpoint and lease release commit in the same transaction;
 - the pending record is visible in task context;
 - acceptance creates a different live lease and records the incoming agent;
+- if the task is blocked, done, or cancelled, acceptance instead records that
+  the brief was absorbed without minting a lease or changing task status;
 - a named target cannot be accepted by a different agent; and
 - a stale outgoing token cannot mutate the task after handoff.
 

@@ -271,6 +271,127 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
 }
 
 #[test]
+fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
+    let fixture = Fixture::new("settled-handoff");
+    fixture.ok_json(&fixture.main, &["init", "--name", "E2E", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "tag",
+            "add",
+            "handoff",
+            "--description",
+            "handoff lifecycle",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Handoff-tagged task rule.",
+            "--as",
+            "geo",
+            "--tag",
+            "handoff",
+            "--json",
+        ],
+    );
+
+    for status in ["blocked", "done", "cancelled"] {
+        let task_id = format!("t-{status}");
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("{status} handoff"),
+                "--id",
+                &task_id,
+                "--tag",
+                "handoff",
+                "--json",
+            ],
+        );
+        let claim = fixture.ok_json(
+            &fixture.main,
+            &["claim", &task_id, "--as", "outgoing", "--json"],
+        );
+        let handoff = fixture.ok_json(
+            &fixture.main,
+            &[
+                "handoff",
+                "create",
+                &task_id,
+                "--lease",
+                claim["leaseToken"].as_str().unwrap(),
+                "--as",
+                "outgoing",
+                "--summary",
+                "The old brief was preserved",
+                "--intent",
+                "Let a successor absorb it",
+                "--next-action",
+                "Acknowledge without reopening work",
+                "--json",
+            ],
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task", "move", &task_id, status, "--as", "operator", "--json",
+            ],
+        );
+
+        let accepted = fixture.ok_json(
+            &fixture.main,
+            &[
+                "handoff",
+                "accept",
+                handoff["id"].as_str().unwrap(),
+                "--as",
+                "incoming",
+                "--json",
+            ],
+        );
+        assert_eq!(accepted["handoff"]["status"], "accepted");
+        assert!(accepted["claim"].is_null(), "{status} minted a lease");
+        assert!(
+            accepted["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["tags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tag| tag == "handoff")),
+            "task-scoped rules were lost when no claim was minted"
+        );
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["task", "show", &task_id, "--json"])["status"],
+            status,
+            "acknowledgement reopened {status} work"
+        );
+    }
+
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["handoff", "list", "--status", "pending", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "acknowledged handoffs stayed in the pending resume queue"
+    );
+}
+
+#[test]
 fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     let fixture = Fixture::new("rag-search");
     fixture.ok_json(&fixture.main, &["init", "--name", "SEARCH-A", "--json"]);
