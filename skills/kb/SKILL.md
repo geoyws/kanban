@@ -486,13 +486,14 @@ executes the real transaction, reports its counts, and rolls it back. See ADR-02
 
 ## The web view
 
-`https://kb.geoy.ws` — every board at once. The persisted target gate is shared
-Google SSO with only `geoyws@gmail.com` allowed; until the cutover has a live
-receipt, expect the existing Basic Auth gate. Read-only: it renders what the CLI
-reads and writes nothing.
+`https://kb.geoy.ws` — every board at once, behind shared Google SSO with only
+`geoyws@gmail.com` allowed. Reads use the same Store as the CLI. The sole shipped
+write is the Needs-you reply/resolve action, attributed to `geo`.
 
 - **Needs you** (the landing page) — every open attention item across every
-  board, oldest first, with its kind, who raised it and how long it has waited.
+  board, oldest first, with its kind, who raised it, how long it has waited, and
+  an inline reply plus quick decision buttons. A reply resolves the item and is
+  preserved as its resolution note.
 - **Lanes** — the counterpart: what every lane last reported, newest first.
 - **Boards** — the `kb dash` projection as a table.
 - **Plans** — draft epics with their bodies, each naming the work it holds back.
@@ -505,7 +506,9 @@ It is `kanban serve` on loopback 14200, kept up by `kanban-serve.service` and
 fronted by nginx. It binds `127.0.0.1` and has **no `--bind` flag** — kanban
 implements no authentication and trusts the edge, so the only correct value is
 the default. Updating is `install` then `systemctl restart kanban-serve`; the
-MCP server's in-place swap does not apply to an HTTP server.
+MCP server's in-place swap does not apply to an HTTP server. `/live` upgrades to
+a WebSocket and sends revision-only refresh notifications; agent CLI/MCP access
+does not depend on that socket.
 
 ## As an MCP server
 

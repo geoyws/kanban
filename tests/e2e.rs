@@ -6376,6 +6376,64 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
     (status, body)
 }
 
+fn http_post(port: u16, path: &str, origin: &str, body: &[u8]) -> (u16, String) {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+fn read_http_head(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+        assert!(bytes.len() < 16_384, "HTTP response headers never ended");
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+fn read_ws_text(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read as _;
+    let mut head = [0_u8; 2];
+    stream.read_exact(&mut head).unwrap();
+    assert_eq!(head[0] & 0x0f, 1, "expected a text frame: {head:?}");
+    assert_eq!(head[1] & 0x80, 0, "server frames must not be masked");
+    let mut length = u64::from(head[1] & 0x7f);
+    if length == 126 {
+        let mut extended = [0_u8; 2];
+        stream.read_exact(&mut extended).unwrap();
+        length = u64::from(u16::from_be_bytes(extended));
+    } else if length == 127 {
+        let mut extended = [0_u8; 8];
+        stream.read_exact(&mut extended).unwrap();
+        length = u64::from_be_bytes(extended);
+    }
+    let mut payload = vec![0_u8; length as usize];
+    stream.read_exact(&mut payload).unwrap();
+    String::from_utf8(payload).unwrap()
+}
+
 #[test]
 fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     // Approvals are the bottleneck, and settling one meant being at a terminal
@@ -6738,6 +6796,120 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         settled,
         "serving a page modified the board"
     );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
+    use std::io::Write as _;
+    use std::net::TcpStream;
+
+    let fixture = Fixture::new("serve-reply-live");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SERVEWRITE", "--json"]);
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Choose the rollout window",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    let attention_id = attention["id"].as_str().unwrap();
+    let port = 25000 + (std::process::id() % 4000) as u16;
+    let mut server = fixture
+        .command(&fixture.main)
+        .args(["serve", "--port", &port.to_string()])
+        .spawn()
+        .expect("start kanban serve");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "kanban serve never bound {port}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (status, home) = http_get(port, "/");
+    assert_eq!(status, 200, "{home}");
+    assert!(home.contains("Your reply"), "{home}");
+    assert!(home.contains("Approved. Proceed."), "{home}");
+    assert!(home.contains("new WebSocket"), "{home}");
+    assert!(
+        home.contains(&format!("/attention/SERVEWRITE/{attention_id}/reply")),
+        "{home}"
+    );
+
+    let path = format!("/attention/SERVEWRITE/{attention_id}/reply");
+    let (status, _) = http_post(port, &path, "https://hostile.example", b"reply=Approved");
+    assert_eq!(status, 403, "a cross-origin form was accepted");
+    let still_open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(still_open.as_array().unwrap().len(), 1);
+
+    let origin = format!("http://127.0.0.1:{port}");
+    let (status, _) = http_post(port, &path, &origin, b"reply=bad%XX");
+    assert_eq!(status, 400, "malformed form data was accepted");
+    let (status, response) = http_post(
+        port,
+        &path,
+        &origin,
+        b"reply=Approved%2E+Proceed+after+the+backup%2E",
+    );
+    assert_eq!(status, 303, "{response}");
+    assert!(response.contains("Location: /?replied="), "{response}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(resolved[0]["resolvedBy"], "geo");
+    assert_eq!(
+        resolved[0]["resolution"],
+        "Approved. Proceed after the backup."
+    );
+    let (status, _) = http_post(port, &path, &origin, b"reply=Resolve+twice");
+    assert_eq!(status, 409, "an already-resolved item changed twice");
+
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    write!(
+        socket,
+        "GET /live HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    )
+    .unwrap();
+    let headers = read_http_head(&mut socket);
+    assert!(headers.starts_with("HTTP/1.1 101"), "{headers}");
+    assert!(
+        headers.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+        "{headers}"
+    );
+    let ready: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket)).unwrap();
+    assert_eq!(ready["type"], "ready");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "A new live item",
+            "--as",
+            "codex@driver-2",
+            "--kind",
+            "review",
+            "--json",
+        ],
+    );
+    let changed: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket)).unwrap();
+    assert_eq!(changed["type"], "refresh", "{changed}");
+    assert_ne!(changed["revision"], ready["revision"]);
 
     let _ = server.kill();
     let _ = server.wait();

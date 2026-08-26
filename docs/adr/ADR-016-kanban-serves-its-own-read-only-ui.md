@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-24
+**Amended:** 2026-08-26
 **Deciders:** George
 
 ## Context
@@ -34,17 +35,23 @@ Five crates total (`tiny_http`, `ascii`, `chunked_transfer`, `httpdate`,
 synchronous throughout because rusqlite is.
 
 `axum` was the alternative and was rejected: it brings tokio, tower and hyper —
-roughly eighty crates — and an async rewrite of every store call, to buy
-streaming and websockets this page does not use. Hand-rolling HTTP on
+roughly eighty crates — and an async rewrite of every store call. Hand-rolling HTTP on
 `TcpListener` would have kept the dependency count at zero and meant
 maintaining an HTTP parser on an internet-facing surface, which is not a trade
 worth making for a page that renders tables.
 
+The 2026-08-26 live-status amendment does not reverse that stack decision.
+`tiny_http` exposes the standards-compliant HTTP upgrade boundary. A small
+thread per connected operator tab owns the upgraded socket; `sha1` and `base64`
+produce the RFC handshake. The synchronous Store remains synchronous and no
+async runtime enters the ledger.
+
 ### It binds loopback, and there is no flag to change that
 
-Kanban implements no authentication. It binds `127.0.0.1` and trusts the edge —
-`auth_basic` in the nginx already on this box, the pattern `dash`, `atmux` and
-`docs` all use.
+Kanban implements no authentication. It binds `127.0.0.1` and trusts the edge.
+That edge is now the shared Google SSO for `*.geoy.ws`, restricted to
+`geoyws@gmail.com`; nginx also forwards the original Host for same-origin write
+validation.
 
 **There is deliberately no `--bind` flag.** Its only correct value is the
 default, and any other value publishes an unauthenticated surface to the
@@ -52,12 +59,12 @@ network. A flag whose wrong setting is catastrophic and whose right setting is
 what you get by not passing it is not a flag, it is a footgun. Fronting this
 for remote access is the documented arrangement, not a workaround.
 
-Stated plainly, because it is the real risk: **basic auth in front of a write
-surface means whoever holds the password can approve anything.** For a
-single-operator tool that is an acceptable trade. The vhost strips
-`Authorization` before proxying, so the credential never reaches the binary.
+Stated plainly, because it is the real risk: **whoever controls the allowed
+Google account can resolve operator attention.** For a single-operator tool
+that is the intended authority. OAuth credentials, cookies and authorization
+headers never enter a rendered page or WebSocket message.
 
-### Phase 1 writes nothing, and that is enforced twice
+### Read routes write nothing; the one write route is allowlisted
 
 The e2e serves every page and compares the board file byte-for-byte before and
 after. That proves no page *did* write. It cannot prove no page *could*: a
@@ -66,20 +73,40 @@ and the capability in place — which was demonstrated, not assumed, by injectin
 a `sweep_expired_claims` call that the byte comparison passed straight over.
 
 So a second guard reads the module back and asserts it names none of `Store`'s
-twenty `&mut self` methods. Phase 2's two writes go in its allowlist with a
-reason, which is a decision someone makes on purpose rather than a check that
-quietly stops applying.
+twenty `&mut self` methods except `resolve_attention`, the one explicitly
+accepted browser capability. The compiled-binary E2E separately proves that
+cross-origin, malformed and duplicate submissions do not mutate a board.
 
 ### Write scope, decided 2026-08-24: two verbs, both approval-shaped
 
-Resolve an attention item with a note; open a draft (`draft` → `todo`), which
-is what releases a plan's work. Everything else stays read-only. Full board
+Resolve an attention item with a reply; open a draft (`draft` → `todo`), which
+is what releases a plan's work. The reply/resolve verb shipped first; draft
+opening remains its own child task under `e-ui`. Everything else stays read-only. Full board
 control would be a much larger surface to build, design and secure, and every
 verb in it becomes reachable with the password.
 
 The actor for a UI write is `geo`. There is one person behind that password, so
 the attribution is honest. If this ever has a second user that stops being
 true, and it needs revisiting before then rather than after.
+
+### Needs you is live, but WebSockets are not a second ledger
+
+The 2026-08-26 requirement changed from occasional refreshes to live operator
+status. `/live` therefore upgrades to a WebSocket after the same-origin check.
+Frames contain only `ready`, `refresh`, a non-sensitive revision fingerprint,
+and heartbeats. They contain no task or attention body, credential, cookie,
+lease token, or write capability.
+
+The server fingerprints the registered SQLite database, WAL and rollback
+journal file states. When one changes, the browser fetches and swaps in the
+canonical server-rendered projection. A draft reply blocks that swap so an
+agent update cannot erase text George is typing. This preserves one read path
+and makes the socket a notification channel rather than replicated state.
+
+Reply forms are bounded and strictly decoded. Browser POSTs require the Origin
+authority to equal Host, resolve through `Store::resolve_attention`, and are
+attributed to `geo`. Empty, oversized, malformed, cross-origin, unknown-board
+and already-resolved submissions fail without a partial write.
 
 ### No hot reload
 
@@ -115,8 +142,7 @@ literal in place of a set always eventually is.
 
 ## Consequences
 
-Live at `https://kb.geoy.ws`, five routes, 90 KB and 27 ms for the full
-75-item landing page. `systemd` keeps it up; the unit, the vhost and their
+Live at `https://kb.geoy.ws`; `systemd` keeps it up, and the unit, vhost and their
 `init.sh` lines are all in the dotfiles, so a rebuild reproduces them.
 
 The unit failed on its first start with `HOME is not set` — systemd sets no
@@ -128,10 +154,8 @@ The styling is structural, not a design. Phase 3 is the `/frontend-design`
 pass, once there is something real to look at; shipping plain markup first is
 deliberate, and the markup is semantic so that pass has a clean skeleton.
 
-Not offered, and each for a reason: no websockets or live updates (a refresh
-suffices for a page opened a few times a day, and it keeps the server
-synchronous); no arbitrary SQL, ever (ADR-001 §6); no multi-user accounts or
-roles (drivers are identities that claim work, not people who log in); no
+Not offered, and each for a reason: no arbitrary SQL, ever (ADR-001 §6); no
+multi-user accounts or roles (drivers are identities that claim work, not people who log in); no
 editing plan bodies in a browser (a plan is markdown that belongs in a commit,
 and a textarea is the wrong tool for it).
 

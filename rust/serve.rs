@@ -1,4 +1,4 @@
-//! A read-only web view of every registered board.
+//! The operator web view of every registered board.
 //!
 //! **Why this exists.** Approvals are the bottleneck. Attention items are
 //! raised durably and correctly, and settling one means being at a terminal
@@ -17,19 +17,25 @@
 //! whose only correct setting is the default. Fronting it for remote access is
 //! the documented arrangement, not a workaround.
 //!
-//! **It holds nothing between requests**, so updating is `install` then
-//! restart. The [`crate::mcp`] server's in-place `execve` swap does *not*
-//! transfer here — that trick rests on inheriting one pipe and holding no
-//! state, and an HTTP server holds accepted connections. Saying so plainly is
-//! cheaper than someone discovering it during an update.
+//! The write surface is deliberately narrow: an authenticated operator may
+//! reply to and resolve an attention item. WebSockets carry revision notices,
+//! never ledger content or capabilities; the browser fetches the canonical
+//! server-rendered projection after a notice.
 
 use crate::model::{Attention, ProjectRecord, SearchOptions, Sitrep, Task};
 use crate::registry::{Registry, now_ms};
 use crate::search;
 use crate::store::Store;
 use anyhow::{Context, Result};
-use std::path::Path;
-use tiny_http::{Header, Request, Response, Server};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use sha1::{Digest, Sha1};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 /// The loopback port `kanban serve` listens on.
 ///
@@ -44,6 +50,14 @@ pub const DEFAULT_PORT: u16 = 14200;
 /// slower to load and no more useful.
 const DETAIL_ROWS: i64 = 50;
 
+/// A browser reply is a decision note, not a document upload.
+const MAX_REPLY_BYTES: usize = 4_096;
+
+enum WebResponse {
+    Html(u16, String),
+    Redirect(String),
+}
+
 /// Serve until killed. Never returns `Ok`.
 pub fn serve(port: u16) -> Result<()> {
     let address = format!("127.0.0.1:{port}");
@@ -52,14 +66,13 @@ pub fn serve(port: u16) -> Result<()> {
         .with_context(|| format!("serve on {address}"))?;
     eprintln!("kanban serve: http://{address} (loopback only; front it with nginx)");
     for request in server.incoming_requests() {
-        // One request at a time, by design: rusqlite is synchronous, the store
-        // is synchronous, and a page opened a few times a day does not need a
-        // runtime. A panic in rendering would take the server down, so the
-        // render is caught and answered as a 500 with the message.
-        let url = request.url().to_owned();
-        let body = std::panic::catch_unwind(|| render(&url))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("the page renderer panicked")));
-        respond(request, body);
+        if request.url().split('?').next() == Some("/live") {
+            // An upgraded socket is long-lived. Keeping it on the accept loop
+            // would stop every ordinary page behind the first connected tab.
+            thread::spawn(move || websocket(request));
+            continue;
+        }
+        handle(request);
     }
     anyhow::bail!("the listener stopped accepting connections")
 }
@@ -67,9 +80,19 @@ pub fn serve(port: u16) -> Result<()> {
 /// Answer one request, turning an error into a page rather than a dropped
 /// connection: a browser given nothing shows its own error, which tells the
 /// reader nothing about what went wrong here.
-fn respond(request: Request, body: Result<String>) {
-    let (status, html) = match body {
-        Ok(html) => (200, html),
+fn handle(mut request: Request) {
+    let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(&mut request)))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("the page renderer panicked")));
+    let (status, html, location) = match response {
+        Ok(WebResponse::Html(status, html)) => (status, html, None),
+        Ok(WebResponse::Redirect(location)) => (
+            303,
+            page(
+                "Reply recorded",
+                "<h1>Reply recorded</h1><p><a href=\"/\">Return to Needs you</a>.</p>",
+            ),
+            Some(location),
+        ),
         Err(error) => (
             500,
             page(
@@ -79,16 +102,37 @@ fn respond(request: Request, body: Result<String>) {
                     escape(&error.to_string())
                 ),
             ),
+            None,
         ),
     };
     let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
         .expect("a static header is always valid");
-    let response = Response::from_string(html)
+    let mut response = Response::from_string(html)
         .with_status_code(status)
         .with_header(header);
+    if let Some(location) = location {
+        response = response.with_header(
+            Header::from_bytes(&b"Location"[..], location.as_bytes())
+                .expect("a generated relative location is valid"),
+        );
+    }
     // A client that hung up mid-write is not this server's problem, and
     // crashing on it would take down a page everyone else is still reading.
     let _ = request.respond(response);
+}
+
+fn route(request: &mut Request) -> Result<WebResponse> {
+    let url = request.url().to_owned();
+    if request.method() == &Method::Post {
+        return post(request, &url);
+    }
+    if request.method() != &Method::Get {
+        return Ok(WebResponse::Html(
+            405,
+            page("Method not allowed", "<h1>Method not allowed</h1>"),
+        ));
+    }
+    Ok(WebResponse::Html(200, render(&url)?))
 }
 
 /// Route a URL to a rendered page.
@@ -101,7 +145,7 @@ fn render(url: &str) -> Result<String> {
         .collect::<Vec<_>>();
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
-        [] => needs_you(),
+        [] => needs_you(query_value(query, "replied").as_deref()),
         ["boards"] => boards(),
         ["plans"] => plans(),
         ["lanes"] => lanes(),
@@ -116,11 +160,183 @@ fn render(url: &str) -> Result<String> {
     }
 }
 
+fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
+    let path = url.split('?').next().unwrap_or(url);
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(decode)
+        .collect::<Vec<_>>();
+    let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+    if !matches!(parts.as_slice(), ["attention", _, _, "reply"]) {
+        return Ok(WebResponse::Html(
+            404,
+            page("Not found", "<h1>Not found</h1>"),
+        ));
+    }
+    if !same_origin(request) {
+        return Ok(WebResponse::Html(
+            403,
+            page(
+                "Request refused",
+                "<h1>Request refused</h1><p class=error>The reply did not come from this site.</p>",
+            ),
+        ));
+    }
+    let length = request.body_length().unwrap_or(0);
+    if length == 0 || length > MAX_REPLY_BYTES {
+        return Ok(WebResponse::Html(
+            400,
+            page(
+                "Reply required",
+                "<h1>Reply required</h1><p class=error>Write a short reply before resolving this item.</p>",
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(length);
+    request
+        .as_reader()
+        .take((MAX_REPLY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_REPLY_BYTES {
+        return Ok(WebResponse::Html(
+            400,
+            page("Reply too long", "<h1>Reply too long</h1>"),
+        ));
+    }
+    let Ok(body) = std::str::from_utf8(&bytes) else {
+        return Ok(WebResponse::Html(
+            400,
+            page("Invalid reply", "<h1>Invalid reply</h1>"),
+        ));
+    };
+    let Ok(value) = strict_form_value(body, "reply") else {
+        return Ok(WebResponse::Html(
+            400,
+            page("Invalid reply", "<h1>Invalid reply</h1>"),
+        ));
+    };
+    let reply = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(reply) = reply else {
+        return Ok(WebResponse::Html(
+            400,
+            page(
+                "Reply required",
+                "<h1>Reply required</h1><p class=error>Write a short reply before resolving this item.</p>",
+            ),
+        ));
+    };
+    let [_, project, id, _] = parts.as_slice() else {
+        unreachable!("the route shape was checked above")
+    };
+    let Ok((_, mut store)) = project_named(project) else {
+        return Ok(WebResponse::Html(
+            404,
+            page("Board not found", "<h1>Board not found</h1>"),
+        ));
+    };
+    if let Err(error) = store.resolve_attention(id, "geo", Some(&reply)) {
+        return Ok(WebResponse::Html(
+            409,
+            page(
+                "Reply not recorded",
+                &format!(
+                    "<h1>Reply not recorded</h1><p class=error>{}</p>",
+                    escape(&error.to_string())
+                ),
+            ),
+        ));
+    }
+    Ok(WebResponse::Redirect(format!(
+        "/?replied={}",
+        url_encode(id)
+    )))
+}
+
 fn query_value(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (decode(&key.replace('+', " ")) == name).then(|| decode(&value.replace('+', " ")))
     })
+}
+
+fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|candidate| candidate.field.to_string().eq_ignore_ascii_case(name))
+        .map(|candidate| candidate.value.as_str())
+}
+
+/// Browser writes are accepted only from the authority they are addressed to.
+/// OAuth at the edge authenticates the person; this check prevents another
+/// origin from making that authenticated browser submit a hidden form.
+fn same_origin(request: &Request) -> bool {
+    let Some(host) = header(request, "Host") else {
+        return false;
+    };
+    let Some(origin) = header(request, "Origin") else {
+        return false;
+    };
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    !authority.is_empty() && authority.eq_ignore_ascii_case(host)
+}
+
+fn strict_form_value(form: &str, name: &str) -> Result<Option<String>> {
+    for pair in form.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if strict_form_decode(key)? == name {
+            return Ok(Some(strict_form_decode(value)?));
+        }
+    }
+    Ok(None)
+}
+
+fn strict_form_decode(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                anyhow::ensure!(index + 2 < bytes.len(), "malformed percent escape in reply");
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])?;
+                let byte = u8::from_str_radix(hex, 16)
+                    .with_context(|| format!("malformed percent escape %{hex}"))?;
+                out.push(byte);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).context("reply form contains invalid UTF-8")
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Percent-decoding, because a project name or task id may contain characters
@@ -172,11 +388,157 @@ fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
         .with_context(|| format!("no board named {name}"))
 }
 
+// --------------------------------------------------------------- live status
+
+fn websocket(request: Request) {
+    if request.method() != &Method::Get || !same_origin(&request) {
+        let response =
+            Response::from_string("websocket origin refused").with_status_code(StatusCode(403));
+        let _ = request.respond(response);
+        return;
+    }
+    let is_upgrade =
+        header(&request, "Upgrade").is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let version_ok = header(&request, "Sec-WebSocket-Version") == Some("13");
+    let Some(key) = header(&request, "Sec-WebSocket-Key").map(str::to_owned) else {
+        let _ =
+            request.respond(Response::from_string("websocket key required").with_status_code(400));
+        return;
+    };
+    if !is_upgrade || !version_ok {
+        let _ = request
+            .respond(Response::from_string("websocket upgrade required").with_status_code(400));
+        return;
+    }
+
+    let accept = websocket_accept(&key);
+    let response = Response::new_empty(StatusCode(101))
+        .with_header(
+            "Upgrade: websocket"
+                .parse::<Header>()
+                .expect("static header"),
+        )
+        .with_header(
+            "Connection: Upgrade"
+                .parse::<Header>()
+                .expect("static header"),
+        )
+        .with_header(
+            format!("Sec-WebSocket-Accept: {accept}")
+                .parse::<Header>()
+                .expect("SHA-1 base64 is a valid header"),
+        );
+    let mut stream = request.upgrade("websocket", response);
+    let Ok(mut revision) = ledger_revision() else {
+        return;
+    };
+    if write_ws_text(
+        &mut stream,
+        &format!(r#"{{"type":"ready","revision":"{revision:016x}"}}"#),
+    )
+    .is_err()
+    {
+        return;
+    }
+    let mut ticks = 0_u8;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        ticks = ticks.wrapping_add(1);
+        let Ok(current) = ledger_revision() else {
+            continue;
+        };
+        if current != revision {
+            revision = current;
+            if write_ws_text(
+                &mut stream,
+                &format!(r#"{{"type":"refresh","revision":"{revision:016x}"}}"#),
+            )
+            .is_err()
+            {
+                return;
+            }
+            ticks = 0;
+        } else if ticks >= 15 {
+            if write_ws_text(&mut stream, r#"{"type":"heartbeat"}"#).is_err() {
+                return;
+            }
+            ticks = 0;
+        }
+    }
+}
+
+fn websocket_accept(key: &str) -> String {
+    let mut digest = Sha1::new();
+    digest.update(key.as_bytes());
+    digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    BASE64.encode(digest.finalize())
+}
+
+fn write_ws_text(stream: &mut (impl Write + ?Sized), text: &str) -> std::io::Result<()> {
+    let bytes = text.as_bytes();
+    let mut frame = Vec::with_capacity(bytes.len() + 10);
+    frame.push(0x81); // FIN + text
+    match bytes.len() {
+        length @ 0..=125 => frame.push(length as u8),
+        length @ 126..=65_535 => {
+            frame.push(126);
+            frame.extend_from_slice(&(length as u16).to_be_bytes());
+        }
+        length => {
+            frame.push(127);
+            frame.extend_from_slice(&(length as u64).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(bytes);
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+/// Fingerprint the files SQLite can currently be writing. WAL mode updates the
+/// `-wal` inode rather than the main database, while rollback mode briefly uses
+/// `-journal`; both therefore participate in the revision.
+fn ledger_revision() -> Result<u64> {
+    let registry = Registry::open()?;
+    let mut hasher = DefaultHasher::new();
+    for project in registry.projects()? {
+        project.name.hash(&mut hasher);
+        project.board_path.hash(&mut hasher);
+        let board = PathBuf::from(&project.board_path);
+        hash_file_state(&board, &mut hasher);
+        hash_file_state(
+            &PathBuf::from(format!("{}-wal", board.display())),
+            &mut hasher,
+        );
+        hash_file_state(
+            &PathBuf::from(format!("{}-journal", board.display())),
+            &mut hasher,
+        );
+    }
+    Ok(hasher.finish())
+}
+
+fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
+    path.hash(hasher);
+    match path.metadata() {
+        Ok(metadata) => {
+            true.hash(hasher);
+            metadata.len().hash(hasher);
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .hash(hasher);
+        }
+        Err(_) => false.hash(hasher),
+    }
+}
+
 // ---------------------------------------------------------------- the screens
 
 /// The landing page, and the reason the server exists: everything open across
 /// every board, oldest first, so the thing that has waited longest is on top.
-fn needs_you() -> Result<String> {
+fn needs_you(replied: Option<&str>) -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     for (project, store) in projects()? {
         for item in store.attention(Some("open"), None, None, 1000, false)? {
@@ -185,7 +547,15 @@ fn needs_you() -> Result<String> {
     }
     items.sort_by_key(|(_, item)| item.created_at);
 
-    let mut html = String::from("<h1>Needs you</h1>");
+    let mut html = String::from(
+        "<div class=heading><h1>Needs you</h1><span class=live data-live>connecting</span></div>",
+    );
+    if let Some(id) = replied {
+        html.push_str(&format!(
+            "<p class=success>Reply recorded for <code>{}</code>.</p>",
+            escape(id)
+        ));
+    }
     if items.is_empty() {
         html.push_str(
             "<p class=empty>Nothing is waiting. \
@@ -222,11 +592,19 @@ fn needs_you() -> Result<String> {
                 task = escape(task),
             ));
         }
-        // Phase 1 is read-only, and says so rather than showing a control that
-        // would not work. The command is the honest thing to offer meanwhile.
         html.push_str(&format!(
-            "<p class=cmd><code>kb att resolve {id} --as geo --note \"…\"</code></p>",
-            id = escape(&item.id),
+            "<form class=reply method=post action=\"/attention/{project}/{id}/reply\">\
+             <label for=\"reply-{id}\">Your reply</label>\
+             <textarea id=\"reply-{id}\" name=reply maxlength={max} \
+             placeholder=\"Answer this item…\"></textarea>\
+             <div class=actions><button type=submit>Send reply</button>\
+             <button type=button class=quick data-reply=\"Approved. Proceed.\">Approve</button>\
+             <button type=button class=quick data-reply=\"Declined. Do not proceed.\">Decline</button>\
+             <button type=button class=quick data-reply=\"Proceed with the recommended option.\">Proceed</button>\
+             </div></form>",
+            project = escape(&url_encode(project)),
+            id = escape(&url_encode(&item.id)),
+            max = MAX_REPLY_BYTES,
         ));
         html.push_str("</article>");
     }
@@ -872,10 +1250,46 @@ fn page(title: &str, body: &str) -> String {
          <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a>\
          <form action=/search method=get><input name=q aria-label=Search placeholder=\"Search Kanban\"></form>\
          </nav><main>{body}</main>\
-         <footer>read-only · <code>kanban serve</code></footer></body></html>",
+         <footer>live operator view · <code>kanban serve</code></footer>\
+         <script>{JS}</script></body></html>",
         title = escape(title),
     )
 }
+
+const JS: &str = r#"
+const setLive = text => { const el = document.querySelector('[data-live]'); if (el) el.textContent = text; };
+const hasDraftReply = () => [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim());
+function bindQuickReplies() {
+  document.querySelectorAll('button.quick').forEach(button => {
+    button.onclick = () => {
+      const form = button.closest('form');
+      form.querySelector('textarea[name=reply]').value = button.dataset.reply;
+      form.requestSubmit();
+    };
+  });
+}
+async function refreshProjection() {
+  if (hasDraftReply()) { setLive('update waiting'); return; }
+  const response = await fetch(location.pathname + location.search, {credentials: 'same-origin'});
+  if (!response.ok) throw new Error(`refresh ${response.status}`);
+  const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
+  document.querySelector('main').replaceWith(next);
+  bindQuickReplies();
+  setLive('live');
+}
+function connectLive() {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const socket = new WebSocket(`${scheme}://${location.host}/live`);
+  socket.onopen = () => setLive('live');
+  socket.onmessage = event => {
+    try { if (JSON.parse(event.data).type === 'refresh') refreshProjection().catch(() => setLive('refresh failed')); } catch (_) {}
+  };
+  socket.onclose = () => { setLive('reconnecting'); setTimeout(connectLive, 1500); };
+  socket.onerror = () => socket.close();
+}
+bindQuickReplies();
+connectLive();
+"#;
 
 const CSS: &str = "\
 *{box-sizing:border-box}\
@@ -886,9 +1300,10 @@ border-bottom:1px solid #30363d;position:sticky;top:0}\
 nav a{color:#e6edf3;text-decoration:none;font-weight:600}\
 nav a:hover{color:#58a6ff}\
 nav form{margin-left:auto}\
-input,button{font:inherit;color:#e6edf3;background:#0d1117;border:1px solid #30363d;\
+input,button,textarea{font:inherit;color:#e6edf3;background:#0d1117;border:1px solid #30363d;\
 border-radius:6px;padding:.35rem .55rem}\
 button{cursor:pointer;background:#1f6feb;border-color:#1f6feb;font-weight:600}\
+.quick{background:#21262d;border-color:#30363d}\
 .search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
 main{max-width:60rem;margin:0 auto;padding:1.2rem}\
 footer{max-width:60rem;margin:0 auto;padding:1.2rem;color:#8b949e;font-size:.85rem}\
@@ -910,6 +1325,12 @@ td.when{white-space:nowrap;color:#8b949e}\
 td.payload{color:#8b949e;font-size:.85rem;word-break:break-word}\
 .item,.note,.plan,.search-result{border:1px solid #30363d;border-radius:8px;padding:.9rem;\
 margin:.8rem 0;background:#0f141a}\
+.heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
+.live{color:#3fb950;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}\
+.success{background:#12351f;border:1px solid #2c7a44;border-radius:6px;padding:.6rem .75rem}\
+.reply{margin-top:.8rem}.reply label{display:block;color:#8b949e;font-size:.8rem;margin-bottom:.25rem}\
+.reply textarea{display:block;width:100%;min-height:4.7rem;resize:vertical}\
+.actions{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:.5rem}\
 .search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:#8b949e}\
 .meta{color:#8b949e;font-size:.85rem;margin:.2rem 0}\
 .body{margin:.5rem 0;white-space:pre-wrap}\
@@ -952,7 +1373,10 @@ mod tests {
         // which is a decision someone has to make on purpose rather than a
         // check that quietly stops applying.
         const SOURCE: &str = include_str!("serve.rs");
-        const ALLOWED: [&str; 0] = [];
+        // The Needs-you reply form resolves exactly one attention item through
+        // the same audited Store operation as `kb att resolve`. No other web
+        // route is allowed a mutator.
+        const ALLOWED: [&str; 1] = ["resolve_attention"];
         let shipped = SOURCE
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)
@@ -1021,6 +1445,26 @@ mod tests {
         let html = page("<b>x</b>", "body");
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"), "{html}");
         assert!(!html.contains("<title><b>"), "{html}");
+    }
+
+    #[test]
+    fn websocket_accept_matches_the_rfc_example() {
+        assert_eq!(
+            websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn reply_form_decoding_is_strict() {
+        assert_eq!(
+            strict_form_value("reply=Proceed+with+%26+verify.", "reply")
+                .unwrap()
+                .as_deref(),
+            Some("Proceed with & verify.")
+        );
+        assert!(strict_form_value("reply=bad%2", "reply").is_err());
+        assert!(strict_form_value("reply=bad%XX", "reply").is_err());
     }
 
     #[test]

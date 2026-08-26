@@ -408,17 +408,22 @@ work each holds back, cross-board cited search, one board's rows, and one task i
 full. Every read goes through the same `Store` methods the CLI calls, so there
 is no second implementation to keep in step.
 
-It writes nothing. That is enforced twice — an end-to-end test compares the
-board file byte-for-byte across every page load, and a source read-back asserts
-the module names none of `Store`'s mutating methods, because a call that happens
-to be a no-op leaves the bytes identical and the capability in place.
+The **Needs you** page is the deliberately narrow exception to the read-only
+surface: reply inline to resolve an attention item as `geo`. Same-origin checks,
+strict bounded form decoding and the Store's duplicate-resolution refusal guard
+the write. Quick replies are available on a phone without removing free text.
+Every other route remains read-only, enforced by the source mutator allowlist
+and byte-for-byte process-boundary tests.
+
+`/live` is a WebSocket notification channel. It sends only revision notices and
+heartbeats; the browser fetches the canonical server-rendered page after a board
+changes. It never sends board content, cookies, credentials or lease tokens, and
+it defers a refresh while a reply is being typed.
 
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google
-SSO at `https://kb.geoy.ws`; after the recorded cutover only
-`geoyws@gmail.com` is allowed, and the `.geoy.ws` session cookie is shared with
-Paste, Snip and Docs. Until that cutover has a live receipt, the existing Basic
-Auth edge remains authoritative. The
+SSO at `https://kb.geoy.ws`; only `geoyws@gmail.com` is allowed, and the
+`.geoy.ws` session cookie is shared with Paste, Snip and Docs. The
 `kanban-serve.service` keeps the process up. There is deliberately no `--bind`
 flag — any value other than loopback publishes an unauthenticated surface.
 Reasoning: `docs/adr/ADR-016-*`.
