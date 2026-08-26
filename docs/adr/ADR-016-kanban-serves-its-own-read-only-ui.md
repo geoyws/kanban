@@ -64,7 +64,7 @@ Google account can resolve operator attention.** For a single-operator tool
 that is the intended authority. OAuth credentials, cookies and authorization
 headers never enter a rendered page or WebSocket message.
 
-### Read routes write nothing; the one write route is allowlisted
+### Read routes write nothing; the two write routes are allowlisted
 
 The e2e serves every page and compares the board file byte-for-byte before and
 after. That proves no page *did* write. It cannot prove no page *could*: a
@@ -73,15 +73,18 @@ and the capability in place — which was demonstrated, not assumed, by injectin
 a `sweep_expired_claims` call that the byte comparison passed straight over.
 
 So a second guard reads the module back and asserts it names none of `Store`'s
-twenty `&mut self` methods except `resolve_attention`, the one explicitly
-accepted browser capability. The compiled-binary E2E separately proves that
-cross-origin, malformed and duplicate submissions do not mutate a board.
+twenty `&mut self` methods except `resolve_attention` and `move_task`, the two
+explicitly accepted browser capabilities. The compiled-binary E2E separately
+proves that cross-origin, malformed and duplicate submissions do not mutate a
+board.
 
 ### Write scope, decided 2026-08-24: two verbs, both approval-shaped
 
 Resolve an attention item with a reply; open a draft (`draft` → `todo`), which
-is what releases a plan's work. The reply/resolve verb shipped first; draft
-opening remains its own child task under `e-ui`. Everything else stays read-only. Full board
+is what releases a plan's work. Both are now shipped. Plan opening accepts only
+an existing draft epic, uses the same audited `Store::move_task` operation as
+the CLI, and refuses cross-origin or duplicate submissions. It cannot move a
+task, story, or non-draft epic. Everything else stays read-only. Full board
 control would be a much larger surface to build, design and secure, and every
 verb in it becomes reachable with the password.
 

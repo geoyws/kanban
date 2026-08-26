@@ -6835,6 +6835,21 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         ],
     );
     let attention_id = attention["id"].as_str().unwrap();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Approve this roadmap",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--id",
+            "e-web-open",
+            "--json",
+        ],
+    );
     let port = 25000 + (std::process::id() % 4000) as u16;
     let mut server = fixture
         .command(&fixture.main)
@@ -6867,6 +6882,32 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(still_open.as_array().unwrap().len(), 1);
 
     let origin = format!("http://127.0.0.1:{port}");
+    let (status, plans) = http_get(port, "/plans");
+    assert_eq!(status, 200, "{plans}");
+    assert!(
+        plans.contains("/plan/SERVEWRITE/e-web-open/open"),
+        "the draft epic had no approval action: {plans}"
+    );
+    let (status, _) = http_post(
+        port,
+        "/plan/SERVEWRITE/e-web-open/open",
+        "https://hostile.example",
+        b"",
+    );
+    assert_eq!(status, 403, "a cross-origin plan approval was accepted");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "e-web-open", "--json"])["status"],
+        "draft"
+    );
+    let (status, opened) = http_post(port, "/plan/SERVEWRITE/e-web-open/open", &origin, b"");
+    assert_eq!(status, 303, "{opened}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "e-web-open", "--json"])["status"],
+        "todo"
+    );
+    let (status, duplicate) = http_post(port, "/plan/SERVEWRITE/e-web-open/open", &origin, b"");
+    assert_eq!(status, 409, "a plan was opened twice: {duplicate}");
+
     let (status, _) = http_post(port, &path, &origin, b"reply=bad%XX");
     assert_eq!(status, 400, "malformed form data was accepted");
     let (status, response) = http_post(

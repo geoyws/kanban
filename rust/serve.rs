@@ -18,9 +18,9 @@
 //! the documented arrangement, not a workaround.
 //!
 //! The write surface is deliberately narrow: an authenticated operator may
-//! reply to and resolve an attention item. WebSockets carry revision notices,
-//! never ledger content or capabilities; the browser fetches the canonical
-//! server-rendered projection after a notice.
+//! reply to and resolve an attention item, or open a draft epic. WebSockets
+//! carry revision notices, never ledger content or capabilities; the browser
+//! fetches the canonical server-rendered projection after a notice.
 
 use crate::model::{Attention, ProjectRecord, SearchOptions, Sitrep, Task};
 use crate::registry::{Registry, now_ms};
@@ -147,7 +147,7 @@ fn render(url: &str) -> Result<String> {
     match parts.as_slice() {
         [] => needs_you(query_value(query, "replied").as_deref()),
         ["boards"] => boards(),
-        ["plans"] => plans(),
+        ["plans"] => plans(query_value(query, "opened").as_deref()),
         ["lanes"] => lanes(),
         ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
         ["board", project] => board(project),
@@ -168,7 +168,10 @@ fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
         .map(decode)
         .collect::<Vec<_>>();
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
-    if !matches!(parts.as_slice(), ["attention", _, _, "reply"]) {
+    if !matches!(
+        parts.as_slice(),
+        ["attention", _, _, "reply"] | ["plan", _, _, "open"]
+    ) {
         return Ok(WebResponse::Html(
             404,
             page("Not found", "<h1>Not found</h1>"),
@@ -179,9 +182,46 @@ fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
             403,
             page(
                 "Request refused",
-                "<h1>Request refused</h1><p class=error>The reply did not come from this site.</p>",
+                "<h1>Request refused</h1><p class=error>The action did not come from this site.</p>",
             ),
         ));
+    }
+    if let ["plan", project, id, "open"] = parts.as_slice() {
+        let Ok((_, mut store)) = project_named(project) else {
+            return Ok(WebResponse::Html(
+                404,
+                page("Board not found", "<h1>Board not found</h1>"),
+            ));
+        };
+        let tasks = store.list_tasks(None, None, false)?;
+        let is_draft_epic = tasks
+            .iter()
+            .any(|task| task.id == *id && task.task_type == "epic" && task.status == "draft");
+        if !is_draft_epic {
+            return Ok(WebResponse::Html(
+                409,
+                page(
+                    "Plan not opened",
+                    "<h1>Plan not opened</h1><p class=error>Only an existing draft epic can be opened here.</p>",
+                ),
+            ));
+        }
+        if let Err(error) = store.move_task(id, "todo", "geo", serde_json::json!({}), false) {
+            return Ok(WebResponse::Html(
+                409,
+                page(
+                    "Plan not opened",
+                    &format!(
+                        "<h1>Plan not opened</h1><p class=error>{}</p>",
+                        escape(&error.to_string())
+                    ),
+                ),
+            ));
+        }
+        return Ok(WebResponse::Redirect(format!(
+            "/plans?opened={}",
+            url_encode(id)
+        )));
     }
     let length = request.body_length().unwrap_or(0);
     if length == 0 || length > MAX_REPLY_BYTES {
@@ -766,8 +806,14 @@ fn boards() -> Result<String> {
 /// A draft holds back everything beneath it, so this page is also the answer to
 /// "what work is currently gated" — the children are listed with each plan
 /// because opening the plan is what releases them.
-fn plans() -> Result<String> {
+fn plans(opened: Option<&str>) -> Result<String> {
     let mut html = String::from("<h1>Plans</h1>");
+    if let Some(id) = opened {
+        html.push_str(&format!(
+            "<p class=success>Opened plan <code>{}</code>. Its child work is now eligible for claims.</p>",
+            escape(id)
+        ));
+    }
     let mut found = 0;
     for (project, store) in projects()? {
         let tasks = store.list_tasks(None, None, false)?;
@@ -815,8 +861,11 @@ fn plans() -> Result<String> {
                 html.push_str(&format!("<pre class=plan-body>{}</pre>", escape(body)));
             }
             html.push_str(&format!(
-                "<p class=cmd><code>kb t mv {id} todo --as geo --project {project}</code> \
-                 opens it.</p>",
+                "<form method=post action=\"/plan/{project_path}/{id_path}/open\">\
+                 <button type=submit>Open plan</button></form>\
+                 <p class=cmd>Equivalent: <code>kb t mv {id} todo --as geo --project {project}</code></p>",
+                project_path = url_encode(&project.name),
+                id_path = url_encode(&plan.id),
                 id = escape(&plan.id),
                 project = escape(&project.name),
             ));
@@ -1376,7 +1425,7 @@ mod tests {
         // The Needs-you reply form resolves exactly one attention item through
         // the same audited Store operation as `kb att resolve`. No other web
         // route is allowed a mutator.
-        const ALLOWED: [&str; 1] = ["resolve_attention"];
+        const ALLOWED: [&str; 2] = ["move_task", "resolve_attention"];
         let shipped = SOURCE
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)

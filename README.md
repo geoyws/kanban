@@ -416,6 +416,11 @@ work each holds back, cross-board cited search, one board's rows, and one task i
 full. Every read goes through the same `Store` methods the CLI calls, so there
 is no second implementation to keep in step.
 
+The Plans page can open an existing draft epic as `geo`, moving it to `todo` and
+releasing its child work for claims. This is the only browser write besides an
+attention reply: it requires a same-origin POST and refuses any row that is not
+currently a draft epic.
+
 The **Needs you** page is the deliberately narrow exception to the read-only
 surface: reply inline to resolve an attention item as `geo`. Same-origin checks,
 strict bounded form decoding and the Store's duplicate-resolution refusal guard
