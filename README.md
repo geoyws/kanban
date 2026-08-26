@@ -411,10 +411,11 @@ kanban serve --port 14200      # loopback only; no --bind flag exists
 ```
 
 Six server-rendered pages over every registered board: open attention items
-across all of them oldest-first, the dashboard projection, draft plans with the
-work each holds back, cross-board cited search, one board's rows, and one task in
-full. Every read goes through the same `Store` methods the CLI calls, so there
-is no second implementation to keep in step.
+across all of them by priority then age, the dashboard projection, draft plans
+with the work each holds back, cross-board cited search, one board's rows, and
+one task in full. Priority badges use P0/P1/P2 everywhere a queued row appears.
+Every read goes through the same `Store` methods the CLI calls, so there is no
+second implementation to keep in step.
 
 The Plans page can open an existing draft epic as `geo`, moving it to `todo` and
 releasing its child work for claims. This is the only browser write besides an
@@ -477,7 +478,9 @@ id happens to be `rm` is still addressable.
 `stale_minutes` is a per-task budget for how long work may sit without a
 signal. `kb stale` lists tasks that have overrun theirs, measured from the
 claim heartbeat when there is one and from `updated_at` otherwise, and
-`kb dashboard` carries the count per project.
+`kb dashboard` carries the count per project plus `highestPriority` and
+`highestPriorityLevel`, and orders projects by that priority then the oldest
+row at the level. Projects with no queued work sink to the end.
 
 ```bash
 kb stale --json           # [{ id, staleMinutes, idleMinutes, overdueMinutes, lastSignal }]

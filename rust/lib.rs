@@ -1664,11 +1664,18 @@ fn run() -> Result<()> {
             let mut value = object_of(&project)?;
             if !board_is_present(&project.board_path) {
                 value.insert("boardMissing".into(), json!(true));
-                output.push(Value::Object(value));
+                output.push((
+                    i64::MAX,
+                    i64::MAX,
+                    project.name.clone(),
+                    Value::Object(value),
+                ));
                 continue;
             }
             let store = Store::open(Path::new(&project.board_path))?;
             let tasks = store.list_tasks(None, None, false)?;
+            let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
+            let attention = store.attention(Some("open"), None, None, 1000, false)?;
             let mut counts = Map::new();
             for status in TASK_STATUSES {
                 counts.insert(
@@ -1677,29 +1684,53 @@ fn run() -> Result<()> {
                 );
             }
             value.insert("taskCounts".into(), Value::Object(counts));
-            value.insert(
-                "pendingHandoffs".into(),
-                json!(
-                    store
-                        .handoffs(None, Some("pending"), None, 100, false)?
-                        .len()
-                ),
-            );
+            value.insert("pendingHandoffs".into(), json!(handoffs.len()));
             // The count an operator most needs to see without being asked: a
             // record raised for them that nobody has settled.
-            value.insert(
-                "openAttention".into(),
-                json!(
-                    store
-                        .attention(Some("open"), None, None, 1000, false)?
-                        .len()
-                ),
-            );
+            value.insert("openAttention".into(), json!(attention.len()));
             value.insert("totalTasks".into(), json!(tasks.len()));
             value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
-            output.push(Value::Object(value));
+            let queued = tasks
+                .iter()
+                .filter(|task| task.status == "todo")
+                .map(|task| (task.priority, task.created_at))
+                .chain(
+                    attention
+                        .iter()
+                        .map(|item| (item.priority, item.created_at)),
+                )
+                .chain(handoffs.iter().map(|item| (item.priority, item.created_at)))
+                .collect::<Vec<_>>();
+            let highest = queued.iter().map(|(priority, _)| *priority).min();
+            let oldest_at_highest = highest
+                .and_then(|priority| {
+                    queued
+                        .iter()
+                        .filter(|(candidate, _)| *candidate == priority)
+                        .map(|(_, created_at)| *created_at)
+                        .min()
+                })
+                .unwrap_or(i64::MAX);
+            value.insert("highestPriority".into(), json!(highest));
+            value.insert(
+                "highestPriorityLevel".into(),
+                json!(highest.and_then(priority_level)),
+            );
+            output.push((
+                highest.unwrap_or(i64::MAX),
+                oldest_at_highest,
+                project.name.clone(),
+                Value::Object(value),
+            ));
         }
-        return print(&output, args.has("json"));
+        output.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+        return print(
+            &output
+                .into_iter()
+                .map(|(_, _, _, value)| value)
+                .collect::<Vec<_>>(),
+            args.has("json"),
+        );
     }
     if command == "doctor" {
         let registry = Registry::open()?;

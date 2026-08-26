@@ -6954,6 +6954,155 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
 }
 
 #[test]
+fn priority_orders_cli_dashboard_and_web_queues_before_age() {
+    use std::net::TcpStream;
+
+    let fixture = Fixture::new("priority-queues");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "PRIORITY-MAIN", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Routine task",
+            "--id",
+            "t-routine",
+            "--priority",
+            "P2",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Committed task",
+            "--id",
+            "t-committed",
+            "--priority",
+            "P1",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "routine attention",
+            "--as",
+            "agent",
+            "--priority",
+            "P2",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "committed attention",
+            "--as",
+            "agent",
+            "--priority",
+            "P1",
+            "--json",
+        ],
+    );
+    for (summary, priority) in [("routine handoff", "P2"), ("committed handoff", "P1")] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "handoff",
+                "create",
+                "--as",
+                "agent",
+                "--summary",
+                summary,
+                "--intent",
+                "resume",
+                "--next-action",
+                "continue",
+                "--priority",
+                priority,
+                "--json",
+            ],
+        );
+    }
+
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(attention[0]["body"], "committed attention");
+    assert_eq!(attention[1]["body"], "routine attention");
+    let handoffs = fixture.ok_json(
+        &fixture.main,
+        &["handoff", "list", "--status", "pending", "--json"],
+    );
+    assert_eq!(handoffs[0]["summary"], "committed handoff");
+    assert_eq!(handoffs[1]["summary"], "routine handoff");
+
+    let urgent = fixture.root.join("urgent");
+    fs::create_dir_all(&urgent).unwrap();
+    fixture.ok_json(&urgent, &["init", "--name", "PRIORITY-URGENT", "--json"]);
+    fixture.ok_json(
+        &urgent,
+        &[
+            "attention",
+            "raise",
+            "interrupt attention",
+            "--as",
+            "agent",
+            "--priority",
+            "P0",
+            "--json",
+        ],
+    );
+    let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    assert_eq!(dashboard[0]["name"], "PRIORITY-URGENT");
+    assert_eq!(dashboard[0]["highestPriorityLevel"], "P0");
+    assert_eq!(dashboard[1]["name"], "PRIORITY-MAIN");
+    assert_eq!(dashboard[1]["highestPriorityLevel"], "P1");
+
+    let port = 28000 + (std::process::id() % 3000) as u16;
+    let mut server = fixture
+        .command(&fixture.main)
+        .args(["serve", "--port", &port.to_string()])
+        .spawn()
+        .expect("start kanban serve");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "kanban serve never bound {port}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (status, home) = http_get(port, "/");
+    assert_eq!(status, 200, "{home}");
+    assert!(home.find("interrupt attention").unwrap() < home.find("committed attention").unwrap());
+    assert!(home.find("committed attention").unwrap() < home.find("routine attention").unwrap());
+    assert!(home.contains("priority-p0"), "{home}");
+    assert!(home.contains("priority-p1"), "{home}");
+    assert!(home.contains("priority-p2"), "{home}");
+
+    let (status, board) = http_get(port, "/board/PRIORITY-MAIN");
+    assert_eq!(status, 200, "{board}");
+    assert!(board.find("t-committed").unwrap() < board.find("t-routine").unwrap());
+
+    let (status, boards) = http_get(port, "/boards");
+    assert_eq!(status, 200, "{boards}");
+    assert!(boards.find("PRIORITY-URGENT").unwrap() < boards.find("PRIORITY-MAIN").unwrap());
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
 fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     use std::io::Write as _;
     use std::net::TcpStream;

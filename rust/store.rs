@@ -1948,12 +1948,11 @@ impl Store {
         Ok(result)
     }
 
-    /// Open items first, oldest first within each state.
+    /// Open items first, then priority and age within each state.
     ///
-    /// Oldest-first is the opposite of every other listing here, and
-    /// deliberate: an unanswered question does not get less urgent by being
-    /// ignored, and newest-first buries exactly the item that has been waiting
-    /// longest.
+    /// An unanswered question does not get less urgent by being ignored, so
+    /// age breaks priority ties oldest-first. Explicit priority comes first:
+    /// a new P0 must not sit behind an old routine P2.
     pub fn attention(
         &self,
         status: Option<&str>,
@@ -1995,7 +1994,7 @@ impl Store {
         };
         values.push(Box::new(limit));
         let sql = format!(
-            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',created_at ASC,id ASC LIMIT ?"
+            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',priority ASC,created_at ASC,id ASC LIMIT ?"
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
@@ -2090,7 +2089,7 @@ impl Store {
         };
         values.push(Box::new(limit));
         let sql = format!(
-            "SELECT * FROM handoffs{where_clause} ORDER BY created_at DESC,id DESC LIMIT ?"
+            "SELECT * FROM handoffs{where_clause} ORDER BY status!='pending',priority ASC,created_at ASC,id ASC LIMIT ?"
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;

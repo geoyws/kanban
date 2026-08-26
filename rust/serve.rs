@@ -577,7 +577,8 @@ fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
 // ---------------------------------------------------------------- the screens
 
 /// The landing page, and the reason the server exists: everything open across
-/// every board, oldest first, so the thing that has waited longest is on top.
+/// every board, priority first and then oldest, so interrupts lead while age
+/// remains the tie-breaker that prevents starvation within a level.
 fn needs_you(replied: Option<&str>) -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     for (project, store) in projects()? {
@@ -585,7 +586,14 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
             items.push((project.name.clone(), item));
         }
     }
-    items.sort_by_key(|(_, item)| item.created_at);
+    items.sort_by(|(project_a, item_a), (project_b, item_b)| {
+        (item_a.priority, item_a.created_at, &item_a.id, project_a).cmp(&(
+            item_b.priority,
+            item_b.created_at,
+            &item_b.id,
+            project_b,
+        ))
+    });
 
     let mut html = String::from(
         "<div class=heading><h1>Needs you</h1><span class=live data-live>connecting</span></div>",
@@ -615,10 +623,11 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     for (project, item) in &items {
         html.push_str("<article class=item>");
         html.push_str(&format!(
-            "<p class=meta><span class=\"kind kind-{kind}\">{kind}</span> \
+            "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
              <a href=\"/board/{project_url}\">{project}</a> \
              · raised by {who} · waiting {age}</p>",
             kind = escape(&item.kind),
+            priority = priority_badge(item.priority, item.priority_level.as_deref()),
             project_url = escape(project),
             project = escape(project),
             who = escape(&item.raised_by),
@@ -769,28 +778,54 @@ fn boards() -> Result<String> {
         <th class=n>In progress</th><th class=n>Stale</th>\
         <th class=n>Handoffs</th><th class=n>Tasks</th></tr></thead><tbody>",
     );
+    let mut rows = Vec::new();
     for (project, store) in projects()? {
         let tasks = store.list_tasks(None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        let attention = store
-            .attention(Some("open"), None, None, 1000, false)?
-            .len();
-        html.push_str(&format!(
+        let attention = store.attention(Some("open"), None, None, 1000, false)?;
+        let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
+        let queued = tasks
+            .iter()
+            .filter(|task| task.status == "todo")
+            .map(|task| (task.priority, task.created_at))
+            .chain(
+                attention
+                    .iter()
+                    .map(|item| (item.priority, item.created_at)),
+            )
+            .chain(handoffs.iter().map(|item| (item.priority, item.created_at)))
+            .collect::<Vec<_>>();
+        let highest = queued
+            .iter()
+            .map(|(priority, _)| *priority)
+            .min()
+            .unwrap_or(i64::MAX);
+        let oldest = queued
+            .iter()
+            .filter(|(priority, _)| *priority == highest)
+            .map(|(_, created_at)| *created_at)
+            .min()
+            .unwrap_or(i64::MAX);
+        let row = format!(
             "<tr><td><a href=\"/board/{url}\">{name}</a></td>\
              <td class=\"n{flag}\">{attention}</td><td class=n>{todo}</td>\
              <td class=n>{doing}</td><td class=n>{stale}</td>\
              <td class=n>{handoffs}</td><td class=n>{total}</td></tr>",
             url = escape(&project.name),
             name = escape(&project.name),
-            flag = if attention > 0 { " waiting" } else { "" },
+            flag = if attention.is_empty() { "" } else { " waiting" },
+            attention = attention.len(),
             todo = count("todo"),
             doing = count("in_progress"),
             stale = store.stale_tasks()?.len(),
-            handoffs = store
-                .handoffs(None, Some("pending"), None, 100, false)?
-                .len(),
+            handoffs = handoffs.len(),
             total = tasks.len(),
-        ));
+        );
+        rows.push((highest, oldest, project.name.clone(), row));
+    }
+    rows.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+    for (_, _, _, row) in rows {
+        html.push_str(&row);
     }
     html.push_str("</tbody></table>");
     html.push_str(
@@ -827,10 +862,11 @@ fn plans(opened: Option<&str>) -> Result<String> {
             html.push_str(&format!(
                 "<h2><a href=\"/task/{project}/{id}\">{title}</a></h2>\
                  <p class=meta><a href=\"/board/{project}\">{project}</a> · \
-                 {id} · drafted {age}{tags}</p>",
+                 {id} · {priority} · drafted {age}{tags}</p>",
                 project = escape(&project.name),
                 id = escape(&plan.id),
                 title = escape(&plan.title),
+                priority = priority_badge(plan.priority, plan.priority_level.as_deref()),
                 age = ago(plan.created_at),
                 tags = tag_list(&plan.tags),
             ));
@@ -847,12 +883,13 @@ fn plans(opened: Option<&str>) -> Result<String> {
                 ));
                 for child in children {
                     html.push_str(&format!(
-                        "<li><a href=\"/task/{project}/{id}\">{id}</a> \
+                        "<li>{priority} <a href=\"/task/{project}/{id}\">{id}</a> \
                          <span class=status>{status}</span> {title}</li>",
                         project = escape(&project.name),
                         id = escape(&child.id),
                         status = escape(&child.status),
                         title = escape(&child.title),
+                        priority = priority_badge(child.priority, child.priority_level.as_deref()),
                     ));
                 }
                 html.push_str("</ul>");
@@ -1006,12 +1043,13 @@ fn board(name: &str) -> Result<String> {
         ));
         for task in rows {
             html.push_str(&format!(
-                "<li><a href=\"/task/{project}/{id}\">{id}</a> \
+                "<li>{priority} <a href=\"/task/{project}/{id}\">{id}</a> \
                  <span class=\"type type-{ty}\">{ty}</span> {title}{lane}{tags}</li>",
                 project = escape(&project.name),
                 id = escape(&task.id),
                 ty = escape(&task.task_type),
                 title = escape(&task.title),
+                priority = priority_badge(task.priority, task.priority_level.as_deref()),
                 lane = task
                     .lane
                     .as_ref()
@@ -1033,12 +1071,12 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
     html.push_str(&format!(
         "<p class=meta><a href=\"/board/{project}\">{project}</a> · {id} · \
          <span class=\"type type-{ty}\">{ty}</span> \
-         <span class=status>{status}</span> · priority {priority}{tags}</p>",
+         <span class=status>{status}</span> · {priority}{tags}</p>",
         project = escape(&project.name),
         id = escape(&task.id),
         ty = escape(&task.task_type),
         status = escape(&task.status),
-        priority = task.priority,
+        priority = priority_badge(task.priority, task.priority_level.as_deref()),
         tags = tag_list(&task.tags),
     ));
     html.push_str(&facts(&project.name, &task));
@@ -1183,6 +1221,19 @@ fn tag_list(tags: &[String]) -> String {
     tags.iter()
         .map(|tag| format!(" <span class=tag>{}</span>", escape(tag)))
         .collect()
+}
+
+fn priority_badge(priority: i64, level: Option<&str>) -> String {
+    match level {
+        Some(level) => format!(
+            "<span class=\"priority priority-{class}\" title=\"stored priority {priority}\">{level}</span>",
+            class = escape(&level.to_ascii_lowercase()),
+            level = escape(level),
+        ),
+        None => format!(
+            "<span class=\"priority priority-legacy\" title=\"legacy out-of-band priority\">{priority}</span>"
+        ),
+    }
 }
 
 /// A one-line rendering of an event payload, since the column is free JSON and
@@ -1386,13 +1437,17 @@ margin:.8rem 0;background:#0f141a}\
 .cmd{margin:.5rem 0 0;font-size:.85rem}\
 .empty{color:#8b949e}\
 .count{color:#8b949e;font-weight:400;font-size:.85rem}\
-.kind,.type,.status,.lane,.tag{display:inline-block;padding:.05em .5em;\
+.kind,.type,.status,.lane,.tag,.priority{display:inline-block;padding:.05em .5em;\
 border-radius:999px;font-size:.75rem;font-weight:600;border:1px solid #30363d}\
 .kind-blocking{background:#4a1d1d;border-color:#8b3232}\
 .kind-risk{background:#4a2f13;border-color:#9e5a1c}\
 .kind-approval{background:#13314a;border-color:#1c5a9e}\
 .kind-decision{background:#2a1d4a;border-color:#5a3a9e}\
 .kind-review{background:#12351f;border-color:#2c7a44}\
+.priority-p0{background:#4a1d1d;border-color:#c34a4a;color:#ffb3b3}\
+.priority-p1{background:#4a2f13;border-color:#b46a24;color:#ffd19a}\
+.priority-p2{background:#161b22;border-color:#30363d;color:#8b949e}\
+.priority-legacy{background:#2a1d4a;border-color:#5a3a9e;color:#d2b8ff}\
 .type-epic{background:#2a1d4a}.type-story{background:#13314a}\
 .tag{background:#161b22;color:#8b949e}\
 .lane{background:#161b22;color:#8b949e}\
