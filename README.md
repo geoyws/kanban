@@ -38,7 +38,7 @@ cargo install --path . --locked   # installs both `kanban` and `kb`
 
 cd /path/to/project
 kanban init --name my-project
-kanban task add "Implement durable resume" --id t-resume --priority 1
+kanban task add "Implement durable resume" --id t-resume --priority P1
 
 kanban claim t-resume --as deepseek --session turn-1 --json
 # Save the returned leaseToken.
@@ -533,12 +533,13 @@ interpreted unambiguously is refused rather than guessed
   `in_progress` on every read path while `claim --next` gave the same task
   away. Every board command now sweeps first, and each expiry is recorded as a
   `claim_expired` event.
-- **`priority` is a band, not any integer.** `0` (most urgent, the tier
-  driver-only work sorts on) through `9`, default `3`. `claim --next` hands out
-  work in ascending priority, so an unbounded field let a negative value hold
-  the head of every queue permanently — nothing can outrank the bottom of an
-  `i64`. Only a value you type is checked: a row that already holds something
-  out of band, from an atmux import or an older board, keeps it.
+- **Priority is P0, P1 or P2 on every actionable queue.** P0 interrupts, P1 is
+  committed to the current cycle, and P2 is routine and the default. Tasks,
+  attention items and handoffs accept those symbols case-insensitively; the
+  compatible numeric key remains `0` through `9` (`0`–`2` P0, `3`–`5`
+  P1, `6`–`9` P2), so existing rows and controlled within-band ordering are
+  preserved. JSON returns both `priority` and `priorityLevel`. See
+  [ADR-025](docs/adr/ADR-025-priority-levels-are-p0-p1-p2-across-queues.md).
 - **`context` declares what it dropped.** `truncated` is computed by
   over-fetching past each cap, so a resuming agent is never told it holds the
   complete record when it does not. The rendering says so too: any output

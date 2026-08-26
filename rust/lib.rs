@@ -45,7 +45,7 @@ Usage:
   kanban restore --from DIRECTORY --force [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
-             [--priority 0-9] [--depends-on ID ...]
+             [--priority P0|P1|P2|0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--tag NAME] [--with-relations] [--all] [--json]
@@ -62,7 +62,8 @@ Usage:
   kanban note ID TEXT --as AGENT [--kind KIND]
   kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
   kanban handoff create [ID --lease TOKEN] --as AGENT --summary TEXT --intent TEXT
-             --next-action TEXT     (without ID: a session handoff, about no one task)
+             --next-action TEXT [--priority P0|P1|P2|0-9]
+             (without ID: a session handoff, about no one task)
   kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
@@ -76,6 +77,7 @@ Usage:
   kanban rule update ID [--body TEXT | --body-file PATH] --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
+             [--priority P0|P1|P2|0-9]
              [--task ID] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--limit N] [--json]
   kanban attention resolve ID --as ACTOR [--note TEXT] [--json]
@@ -387,6 +389,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "branch",
             "head",
             "dirty",
+            "priority",
         ],
         &["?id"],
         false,
@@ -444,7 +447,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("raise"),
-        &["as", "kind", "task"],
+        &["as", "kind", "task", "priority"],
         &["text"],
         false,
     ),
@@ -653,6 +656,29 @@ impl Args {
 
     fn integer(&self, name: &str, fallback: i64) -> Result<i64> {
         Ok(self.optional_integer(name)?.unwrap_or(fallback))
+    }
+
+    /// Priority accepts the durable numeric key and the canonical operator
+    /// vocabulary. Symbols store their band anchor; explicit integers retain
+    /// controlled within-band ordering for compatibility.
+    fn optional_priority(&self) -> Result<Option<i64>> {
+        let Some(raw) = self.one("priority") else {
+            return Ok(None);
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "p0" => Ok(Some(0)),
+            "p1" => Ok(Some(3)),
+            "p2" => Ok(Some(6)),
+            _ => raw.parse::<i64>().map(Some).map_err(|_| {
+                anyhow::anyhow!(
+                    "--priority must be P0, P1, P2, or an integer from 0 through 9, got {raw:?}"
+                )
+            }),
+        }
+    }
+
+    fn priority(&self, fallback: i64) -> Result<i64> {
+        Ok(self.optional_priority()?.unwrap_or(fallback))
     }
 
     /// The body text, from `--body` or from a file.
@@ -1907,7 +1933,7 @@ fn run() -> Result<()> {
             stale_minutes: args.optional_integer("stale-minutes")?,
             driver_only: args.has("driver-only"),
             status: args.one("status").unwrap_or("todo").into(),
-            priority: args.integer("priority", 3)?,
+            priority: args.priority(6)?,
             dependencies: args.many("depends-on"),
             metadata: json!({}),
         })?;
@@ -2029,7 +2055,7 @@ fn run() -> Result<()> {
             } else {
                 None
             },
-            priority: args.optional_integer("priority")?,
+            priority: args.optional_priority()?,
             dependencies: if args.has("clear-dependencies") {
                 Some(vec![])
             } else if args.has("depends-on") {
@@ -2167,6 +2193,7 @@ fn run() -> Result<()> {
             from_model: option_string(&args, "model"),
             to_agent: option_string(&args, "to"),
             reason: args.one("reason").unwrap_or("token_pressure").into(),
+            priority: args.priority(6)?,
             summary: args.require("summary")?.into(),
             intent: args.require("intent")?.into(),
             next_action: args.require("next-action")?.into(),
@@ -2313,6 +2340,7 @@ fn run() -> Result<()> {
                 args.one("kind").unwrap_or("decision"),
                 args.require("as")?,
                 args.one("task"),
+                args.priority(6)?,
             )?,
             args.has("json"),
         );

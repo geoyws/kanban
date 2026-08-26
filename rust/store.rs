@@ -334,6 +334,7 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         driver_only: row.get::<_, i64>("driver_only")? != 0,
         status: row.get("status")?,
         priority: row.get("priority")?,
+        priority_level: priority_level(row.get("priority")?).map(str::to_owned),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
@@ -434,6 +435,8 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         raised_by: row.get("raised_by")?,
         created_at: row.get("created_at")?,
         status: row.get("status")?,
+        priority: row.get("priority")?,
+        priority_level: priority_level(row.get("priority")?).map(str::to_owned),
         resolved_at: row.get("resolved_at")?,
         resolved_by: row.get("resolved_by")?,
         resolution: row.get("resolution")?,
@@ -448,6 +451,8 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         checkpoint_seq: row.get("checkpoint_seq")?,
         reason: row.get("reason")?,
         status: row.get("status")?,
+        priority: row.get("priority")?,
+        priority_level: priority_level(row.get("priority")?).map(str::to_owned),
         from_agent: row.get("from_agent")?,
         from_session: row.get("from_session")?,
         from_model: row.get("from_model")?,
@@ -1912,8 +1917,10 @@ impl Store {
         kind: &str,
         raised_by: &str,
         task_id: Option<&str>,
+        priority: i64,
     ) -> Result<Attention> {
         validate(kind, &ATTENTION_KINDS, "attention kind")?;
+        validate_priority(Some(priority))?;
         let body = nonempty(body, "attention body")?.to_owned();
         let raised_by = nonempty(raised_by, "raised by")?.to_owned();
         let transaction = self
@@ -1925,15 +1932,15 @@ impl Store {
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL)",
-            params![id, task_id, kind, body, raised_by, now],
+            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?)",
+            params![id, task_id, kind, body, raised_by, now, priority],
         )?;
         event(
             &transaction,
             task_id,
             "attention_raised",
             Some(&raised_by),
-            json!({"attentionID": id, "kind": kind}),
+            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority)}),
         )?;
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
@@ -2095,6 +2102,7 @@ impl Store {
 
     pub fn create_handoff(&mut self, input: HandoffInput) -> Result<Handoff> {
         validate(&input.reason, &HANDOFF_REASONS, "handoff reason")?;
+        validate_priority(Some(input.priority))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2142,8 +2150,8 @@ impl Store {
         };
         let id = format!("h-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
-            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head],
+            "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head,accepted_at,accepted_by,accepted_session,priority) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
+            params![id,input.task_id,checkpoint_seq,input.reason,"pending",input.from_agent,input.from_session,input.from_model,input.to_agent,summary,intent,next,blockers,validations,input.repo_path,input.branch,input.head_sha,input.dirty_summary,now,input.root_head,input.priority],
         )?;
         // Releasing the lease and returning the task to the queue is the point
         // of a task handoff. A session handoff holds nothing and releases
@@ -2160,7 +2168,7 @@ impl Store {
             input.task_id.as_deref(),
             "handoff_created",
             Some(&input.from_agent),
-            json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent}),
+            json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent,"priority":input.priority,"priorityLevel":priority_level(input.priority)}),
         )?;
         let result =
             transaction.query_row("SELECT * FROM handoffs WHERE id=?", [&id], handoff_row)?;
@@ -2823,6 +2831,7 @@ mod tests {
             driver_only: false,
             status: "todo".into(),
             priority: 3,
+            priority_level: Some("P1".into()),
             created_at: 0,
             updated_at: 0,
             completed_at: None,

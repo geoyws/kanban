@@ -705,6 +705,19 @@ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lan
 SELECT * FROM search_source_rows;
 "#;
 
+/// One priority vocabulary for every actionable queue.
+///
+/// Existing tasks keep their original 0-9 values. Attention and handoff rows
+/// predate priority, so migration gives them the routine P2 anchor. CHECKs
+/// prevent new invalid history while the readers remain tolerant of legacy
+/// task values written before the band was enforced.
+const BOARD_V14: &str = r#"
+ALTER TABLE attention ADD COLUMN priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9);
+ALTER TABLE handoffs ADD COLUMN priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9);
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_priority ON handoffs(status,priority,created_at,id) WHERE archived=0;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -785,7 +798,7 @@ CREATE TABLE workspace_alias_history (
 CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 13;
+pub const BOARD_SCHEMA_VERSION: usize = 14;
 pub const REGISTRY_SCHEMA_VERSION: usize = 7;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -976,7 +989,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13,
+            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

@@ -118,6 +118,16 @@ pub const NOTE_KINDS: [&str; 6] = [
 pub const HANDOFF_REASONS: [&str; 4] =
     ["token_pressure", "provider_limit", "session_end", "manual"];
 
+/// Operator-facing projection of the durable 0-9 queue key.
+pub fn priority_level(priority: i64) -> Option<&'static str> {
+    match priority {
+        0..=2 => Some("P0"),
+        3..=5 => Some("P1"),
+        6..=9 => Some("P2"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -135,6 +145,8 @@ pub struct Task {
     pub driver_only: bool,
     pub status: String,
     pub priority: i64,
+    #[serde(default)]
+    pub priority_level: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
@@ -259,6 +271,9 @@ pub struct Handoff {
     pub checkpoint_seq: Option<i64>,
     pub reason: String,
     pub status: String,
+    pub priority: i64,
+    #[serde(default)]
+    pub priority_level: Option<String>,
     pub from_agent: String,
     pub from_session: Option<String>,
     pub from_model: Option<String>,
@@ -420,6 +435,8 @@ pub struct Attention {
     pub raised_by: String,
     pub created_at: i64,
     pub status: String,
+    pub priority: i64,
+    pub priority_level: Option<String>,
     pub resolved_at: Option<i64>,
     pub resolved_by: Option<String>,
     pub resolution: Option<String>,
@@ -530,6 +547,7 @@ pub struct HandoffInput {
     pub from_model: Option<String>,
     pub to_agent: Option<String>,
     pub reason: String,
+    pub priority: i64,
     pub summary: String,
     pub intent: String,
     pub next_action: String,

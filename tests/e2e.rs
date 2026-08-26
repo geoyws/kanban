@@ -266,9 +266,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 7);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 7);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 13);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 13);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 13);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 14);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 14);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 14);
 }
 
 #[test]
@@ -556,7 +556,17 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         .to_owned();
     let connection = Connection::open(&board).unwrap();
     remove_v13_search_schema(&connection);
-    connection.execute_batch("PRAGMA user_version=12;").unwrap();
+    connection
+        .execute_batch(
+            r#"
+            DROP INDEX idx_attention_status_priority;
+            DROP INDEX idx_handoffs_status_priority;
+            ALTER TABLE attention DROP COLUMN priority;
+            ALTER TABLE handoffs DROP COLUMN priority;
+            PRAGMA user_version=12;
+            "#,
+        )
+        .unwrap();
     drop(connection);
 
     let found = fixture.ok_json(&fixture.main, &["search", "durable handoff", "--json"]);
@@ -572,7 +582,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     assert_eq!(
         reopened
@@ -1719,7 +1729,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 13"),
+        version.contains("board schema 14"),
         "version output: {version}"
     );
     assert!(
@@ -2600,7 +2610,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
     // The band is the one the ledger already uses: 0 is the routing tier
     // driver-only work sorts on, 9 the least urgent.
     for good in ["0", "3", "9"] {
-        fixture.ok_json(
+        let task = fixture.ok_json(
             &fixture.main,
             &[
                 "task",
@@ -2613,7 +2623,81 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
                 "--json",
             ],
         );
+        let expected = match good {
+            "0" => "P0",
+            "3" => "P1",
+            _ => "P2",
+        };
+        assert_eq!(task["priorityLevel"], expected);
     }
+
+    let routine = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "routine default",
+            "--id",
+            "t-default",
+            "--json",
+        ],
+    );
+    assert_eq!(routine["priority"], 6);
+    assert_eq!(routine["priorityLevel"], "P2");
+
+    for (symbol, anchor) in [("P0", 0), ("p1", 3), ("P2", 6)] {
+        let task = fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                "symbolic",
+                "--id",
+                &format!("t-{symbol}"),
+                "--priority",
+                symbol,
+                "--json",
+            ],
+        );
+        assert_eq!(task["priority"], anchor);
+    }
+
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "interrupt",
+            "--as",
+            "agent",
+            "--priority",
+            "P0",
+            "--json",
+        ],
+    );
+    assert_eq!(attention["priority"], 0);
+    assert_eq!(attention["priorityLevel"], "P0");
+
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "agent",
+            "--summary",
+            "resume this",
+            "--intent",
+            "finish it",
+            "--next-action",
+            "claim work",
+            "--priority",
+            "P1",
+            "--json",
+        ],
+    );
+    assert_eq!(handoff["priority"], 3);
+    assert_eq!(handoff["priorityLevel"], "P1");
 
     // `claim --next` hands work out in ascending priority, so an unbounded
     // field let a negative value hold the head of every queue permanently:
@@ -2687,6 +2771,10 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
         fixture.ok_json(&fixture.main, &["task", "show", "t-3", "--json"])["priority"],
         99,
         "an existing out-of-band priority must still be readable"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-3", "--json"])["priorityLevel"],
+        Value::Null
     );
     let updated = fixture.ok_json(
         &fixture.main,
@@ -5215,14 +5303,15 @@ fn the_draft_migration_preserves_the_table_it_rebuilds() {
         "the child lost its parent"
     );
 
-    // The default the rebuilt table has to keep.
+    // Public writers now create routine work at P2 even on a board whose
+    // preserved historical table default remains the old numeric 3.
     fixture.ok_json(
         &fixture.main,
         &["task", "add", "Plain", "--id", "t-2", "--json"],
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-2", "--json"])["priority"],
-        3,
+        6,
         "the priority default was lost in the rebuild"
     );
 
@@ -5316,15 +5405,19 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
             DROP INDEX idx_events_task_seq;
             DROP INDEX idx_handoffs_task_created;
             DROP INDEX idx_handoffs_status_created;
+            DROP INDEX idx_handoffs_status_priority;
             DROP INDEX idx_attention_status_created;
             DROP INDEX idx_attention_task;
+            DROP INDEX idx_attention_status_priority;
             DROP INDEX idx_task_tags_tag;
             ALTER TABLE tasks DROP COLUMN archived_at;
             ALTER TABLE tasks DROP COLUMN archived;
             ALTER TABLE task_notes DROP COLUMN archived;
             ALTER TABLE checkpoints DROP COLUMN archived;
             ALTER TABLE events DROP COLUMN archived;
+            ALTER TABLE handoffs DROP COLUMN priority;
             ALTER TABLE handoffs DROP COLUMN archived;
+            ALTER TABLE attention DROP COLUMN priority;
             ALTER TABLE attention DROP COLUMN archived;
             ALTER TABLE task_tags DROP COLUMN archived;
             CREATE INDEX idx_tasks_status_priority ON tasks(status,priority,created_at);
@@ -5393,7 +5486,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     assert_eq!(
         connection
