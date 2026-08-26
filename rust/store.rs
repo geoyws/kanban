@@ -2159,14 +2159,21 @@ impl Store {
         Ok(rows)
     }
 
-    /// Replace an open attention row's subsystem tags without rewriting the
-    /// operator request itself. Resolved rows are immutable history.
-    pub fn update_attention_tags(
+    /// Correct an open attention row without settling it. The event retains
+    /// the text and tags that were superseded; resolved rows are immutable.
+    pub fn update_attention(
         &mut self,
         id: &str,
-        tags: &[String],
+        body: Option<&str>,
+        tags: Option<&[String]>,
         actor: &str,
     ) -> Result<Attention> {
+        if body.is_none() && tags.is_none() {
+            bail!("attention update requires --body/--body-file, --tag, or --clear-tags");
+        }
+        let body = body
+            .map(|value| nonempty(value, "attention body"))
+            .transpose()?;
         let actor = nonempty(actor, "actor")?.to_owned();
         let transaction = self
             .connection
@@ -2180,13 +2187,31 @@ impl Store {
         }
         let mut previous = vec![existing.clone()];
         attach_attention_tags(&transaction, &mut previous)?;
-        set_attention_tags(&transaction, id, tags)?;
+        transaction.execute(
+            "UPDATE attention SET body=? WHERE id=?",
+            params![body.unwrap_or(&existing.body), id],
+        )?;
+        if let Some(tags) = tags {
+            set_attention_tags(&transaction, id, tags)?;
+        }
+        let mut changed = Vec::new();
+        if body.is_some() {
+            changed.push("body");
+        }
+        if tags.is_some() {
+            changed.push("tags");
+        }
         event(
             &transaction,
             existing.task_id.as_deref(),
             "attention_updated",
             Some(&actor),
-            json!({"attentionID": id, "changed": ["tags"], "previousTags": previous[0].tags}),
+            json!({
+                "attentionID": id,
+                "changed": changed,
+                "previousBody": existing.body,
+                "previousTags": previous[0].tags,
+            }),
         )?;
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;

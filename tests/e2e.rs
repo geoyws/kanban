@@ -4987,6 +4987,39 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         ],
     );
     assert_eq!(retagged["tags"], json!(["infra", "ui"]));
+    let corrected = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            blocking["id"].as_str().unwrap(),
+            "--as",
+            "claude/driver-2",
+            "--body",
+            "The manual is authoritative; confirm the migration timing.",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        corrected["body"],
+        "The manual is authoritative; confirm the migration timing."
+    );
+    assert_eq!(corrected["tags"], json!(["infra", "ui"]));
+    let updates = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_updated", "--json"],
+    );
+    assert_eq!(updates[0]["payload"]["changed"], json!(["body"]));
+    assert_eq!(
+        updates[0]["payload"]["previousBody"],
+        "field set contradicts the manual; confirm which wins"
+    );
+    assert_eq!(
+        updates[0]["payload"]["previousTags"],
+        json!(["infra", "ui"])
+    );
+    assert_eq!(updates[1]["payload"]["changed"], json!(["tags"]));
+    assert_eq!(updates[1]["payload"]["previousTags"], json!(["infra"]));
     let infra = fixture.ok_json(
         &fixture.main,
         &["attention", "list", "--tag", "infra", "--json"],

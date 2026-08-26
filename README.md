@@ -205,14 +205,16 @@ Attention rows carry the same registered subsystem vocabulary as tasks:
 ```bash
 kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer
 kb att list --status open --tag queuer
+kb att update a-12345678 --body "Corrected request." --as codex@driver
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
 ```
 
-Several tags describe several touched subsystems. Updating tags is allowed only
-while the item is open; resolving it freezes its classification with the rest
-of the historical receipt. Unknown tags are refused rather than producing an
-empty-looking filter result.
+Several tags describe several touched subsystems. An agent may correct the body
+or tags only while the item remains open; the prior body and tags stay on the
+event trail, and the update does not settle the request. Resolving it freezes
+the row with the rest of the historical receipt. Unknown tags are refused
+rather than producing an empty-looking filter result.
 
 ## Working from anywhere
 

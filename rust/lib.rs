@@ -82,7 +82,8 @@ Usage:
              [--task ID] [--tag NAME ...] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--tag NAME]
              [--limit N] [--json]
-  kanban attention update ID --as ACTOR [--tag NAME ... | --clear-tags] [--json]
+  kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
+             [--tag NAME ... | --clear-tags] [--json]
   kanban attention resolve ID --as ACTOR [--note TEXT] [--json]
   kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
   kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
@@ -481,7 +482,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("update"),
-        &["as", "tag", "clear-tags"],
+        &["as", "body", "body-file", "tag", "clear-tags"],
         &["id"],
         false,
     ),
@@ -2466,17 +2467,17 @@ fn run() -> Result<()> {
         if args.has("tag") && args.has("clear-tags") {
             bail!("--tag and --clear-tags are mutually exclusive");
         }
-        if !args.has("tag") && !args.has("clear-tags") {
-            bail!("attention update requires --tag or --clear-tags");
-        }
         let id = rest.first().context("attention id is required")?;
+        let body = args.body()?;
         let tags = if args.has("clear-tags") {
-            Vec::new()
+            Some(Vec::new())
+        } else if args.has("tag") {
+            Some(args.many("tag"))
         } else {
-            args.many("tag")
+            None
         };
         return print(
-            &store.update_attention_tags(id, &tags, args.require("as")?)?,
+            &store.update_attention(id, body.as_deref(), tags.as_deref(), args.require("as")?)?,
             args.has("json"),
         );
     }
