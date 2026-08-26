@@ -596,7 +596,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     });
 
     let mut html = String::from(
-        "<div class=heading><h1>Needs you</h1><span class=live data-live>connecting</span></div>",
+        "<div class=heading><h1>Needs you</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
     );
     if let Some(id) = replied {
         html.push_str(&format!(
@@ -647,9 +647,9 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
              <label for=\"reply-{id}\">Your reply</label>\
              <textarea id=\"reply-{id}\" name=reply maxlength={max} \
              placeholder=\"Answer this item…\"></textarea>\
-             <div class=actions><button type=submit>Send reply</button>\
-             <button type=button class=quick data-reply=\"Approved. Proceed.\">Approve</button>\
-             <button type=button class=quick data-reply=\"Declined. Do not proceed.\">Decline</button>\
+             <div class=actions><button type=submit class=send>Send reply</button>\
+             <button type=button class=\"quick approve\" data-reply=\"Approved. Proceed.\">Approve</button>\
+             <button type=button class=\"quick decline\" data-reply=\"Declined. Do not proceed.\">Decline</button>\
              <button type=button class=quick data-reply=\"Proceed with the recommended option.\">Proceed</button>\
              </div></form>",
             project = escape(&url_encode(project)),
@@ -1338,19 +1338,18 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// The page shell.
 ///
-/// The styling here is structural, not a design: readable defaults so phase 1
-/// is usable, and a clean skeleton for the `/frontend-design` pass that phase 3
-/// is for. It is inline because a second request for a stylesheet is a second
-/// route to serve and cache, for a page this size.
+/// A phone-first operator shell. It stays inline because a second request for a
+/// stylesheet is another route and cache contract for a page this small.
 fn page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
-         <nav><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
-         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a>\
-         <form action=/search method=get><input name=q aria-label=Search placeholder=\"Search Kanban\"></form>\
-         </nav><main>{body}</main>\
+         <nav aria-label=Primary><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
+         <div class=nav-links><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
+         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a></div>\
+         <form action=/search method=get><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
+         </nav><main id=main>{body}</main>\
          <footer>live operator view · <code>kanban serve</code></footer>\
          <script>{JS}</script></body></html>",
         title = escape(title),
@@ -1394,23 +1393,32 @@ connectLive();
 
 const CSS: &str = "\
 *{box-sizing:border-box}\
-body{margin:0;font:16px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;\
-color:#e6edf3;background:#0d1117}\
-nav{display:flex;gap:1rem;padding:.9rem 1.2rem;background:#161b22;\
-border-bottom:1px solid #30363d;position:sticky;top:0}\
-nav a{color:#e6edf3;text-decoration:none;font-weight:600}\
-nav a:hover{color:#58a6ff}\
-nav form{margin-left:auto}\
-input,button,textarea{font:inherit;color:#e6edf3;background:#0d1117;border:1px solid #30363d;\
-border-radius:6px;padding:.35rem .55rem}\
-button{cursor:pointer;background:#1f6feb;border-color:#1f6feb;font-weight:600}\
-.quick{background:#21262d;border-color:#30363d}\
+:root{color-scheme:dark;--canvas:#090d12;--surface:#10161f;--raised:#161e29;\
+--line:#293241;--text:#f0f4f8;--muted:#9aa8b7;--accent:#58a6ff;--focus:#79c0ff}\
+body{margin:0;min-height:100vh;font:16px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;\
+color:var(--text);background:radial-gradient(circle at 50% -20rem,#172338 0,var(--canvas) 36rem)}\
+nav{z-index:10;display:flex;align-items:center;gap:.8rem;padding:.65rem max(1rem,env(safe-area-inset-right)) .65rem max(1rem,env(safe-area-inset-left));\
+background:rgba(16,22,31,.94);border-bottom:1px solid var(--line);position:sticky;top:0;backdrop-filter:blur(14px)}\
+.brand{display:grid;place-items:center;width:2.5rem;height:2.5rem;border-radius:.75rem;\
+background:#1f6feb;color:white;font:800 1rem ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.08em}\
+.nav-links{display:flex;align-items:center;gap:.15rem}\
+nav a{display:flex;align-items:center;min-height:2.5rem;padding:0 .65rem;color:var(--text);\
+text-decoration:none;font-weight:650;border-radius:.6rem;white-space:nowrap}\
+nav a:hover{color:white;background:#202a38}\
+nav form{margin-left:auto;min-width:8rem}nav form input{width:100%}\
+input,button,textarea{min-height:2.75rem;font:inherit;color:var(--text);background:#0b1119;\
+border:1px solid var(--line);border-radius:.65rem;padding:.55rem .7rem}\
+input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}\
+button{cursor:pointer;background:#1f6feb;border-color:#388bfd;font-weight:700;box-shadow:0 1px 1px #0008}\
+button:hover{filter:brightness(1.12)}button:active{transform:translateY(1px)}\
+.quick{background:#202a38;border-color:#3a4657}.quick.approve{background:#173e27;border-color:#2ea043}\
+.quick.decline{background:#4a2023;border-color:#b3454b}.send{order:4;margin-left:auto}\
 .search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
-main{max-width:60rem;margin:0 auto;padding:1.2rem}\
-footer{max-width:60rem;margin:0 auto;padding:1.2rem;color:#8b949e;font-size:.85rem}\
-h1{font-size:1.5rem;margin:.2rem 0 1rem}\
+main{max-width:64rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
+footer{max-width:64rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--muted);font-size:.85rem}\
+h1{font-size:clamp(1.65rem,5vw,2.2rem);letter-spacing:-.035em;line-height:1.15;margin:.2rem 0 1rem}\
 h2{font-size:1.05rem;margin:1.6rem 0 .5rem;color:#c9d1d9}\
-a{color:#58a6ff}\
+a{color:var(--accent)}\
 code{font:.85em ui-monospace,SFMono-Regular,Menlo,monospace;background:#161b22;\
 padding:.1em .35em;border-radius:4px}\
 pre{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.8rem;\
@@ -1424,16 +1432,17 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}\
 td.waiting{color:#f0883e;font-weight:700}\
 td.when{white-space:nowrap;color:#8b949e}\
 td.payload{color:#8b949e;font-size:.85rem;word-break:break-word}\
-.item,.note,.plan,.search-result{border:1px solid #30363d;border-radius:8px;padding:.9rem;\
-margin:.8rem 0;background:#0f141a}\
+.item,.note,.plan,.search-result{border:1px solid var(--line);border-radius:1rem;padding:clamp(.9rem,3vw,1.25rem);\
+margin:1rem 0;background:linear-gradient(145deg,var(--raised),var(--surface));box-shadow:0 12px 32px #0003}\
+.item:has(.priority-p0){border-color:#8b3232}.item:has(.priority-p1){border-color:#694521}\
 .heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
 .live{color:#3fb950;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}\
 .success{background:#12351f;border:1px solid #2c7a44;border-radius:6px;padding:.6rem .75rem}\
-.reply{margin-top:.8rem}.reply label{display:block;color:#8b949e;font-size:.8rem;margin-bottom:.25rem}\
-.reply textarea{display:block;width:100%;min-height:4.7rem;resize:vertical}\
-.actions{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:.5rem}\
+.reply{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--line)}.reply label{display:block;color:var(--muted);font-size:.8rem;margin-bottom:.35rem}\
+.reply textarea{display:block;width:100%;min-height:5.5rem;resize:vertical;line-height:1.45}\
+.actions{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.65rem}.actions button{min-width:6.5rem}\
 .search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:#8b949e}\
-.meta{color:#8b949e;font-size:.85rem;margin:.2rem 0}\
+.meta{color:var(--muted);font-size:.85rem;margin:.2rem 0}\
 .body{margin:.5rem 0;white-space:pre-wrap}\
 .cmd{margin:.5rem 0 0;font-size:.85rem}\
 .empty{color:#8b949e}\
@@ -1459,11 +1468,28 @@ dt{color:#8b949e;font-size:.85rem}\
 dd{margin:0;font-size:.9rem;word-break:break-word}\
 .plan-body{max-height:28rem;overflow-y:auto}\
 .error{color:#f85149}\
+@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.send{order:0;margin-left:0;width:100%}.actions button{flex:1}.heading{align-items:flex-start}table{min-width:38rem}}\
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}}\
 ";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_shell_keeps_phone_touch_and_live_status_contract() {
+        let rendered = page(
+            "Needs you",
+            "<span class=live data-live role=status aria-live=polite>live</span>",
+        );
+        assert!(rendered.contains("width=device-width,initial-scale=1"));
+        assert!(rendered.contains("<nav aria-label=Primary>"));
+        assert!(rendered.contains("role=status aria-live=polite"));
+        assert!(CSS.contains("min-height:2.75rem"));
+        assert!(CSS.contains("env(safe-area-inset-bottom)"));
+        assert!(CSS.contains("@media(max-width:700px)"));
+        assert!(CSS.contains(":focus-visible"));
+    }
 
     #[test]
     fn no_page_can_reach_a_method_that_writes() {
