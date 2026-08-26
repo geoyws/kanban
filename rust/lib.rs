@@ -80,6 +80,7 @@ Usage:
   kanban rule update ID [--body TEXT | --body-file PATH] [--tag NAME ... | --clear-tags]
              --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
+  kanban rule consolidate --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--priority P0|P1|P2|0-9]
              [--task ID] [--tag NAME ...] [--json]
@@ -473,6 +474,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("rule", Some("retire"), &["as", "global"], &["id"], false),
+    ("rule", Some("consolidate"), &["as"], &[], false),
     (
         "attention",
         Some("raise"),
@@ -1934,6 +1936,20 @@ fn run() -> Result<()> {
     }
     if command == "restore" {
         return restore(&args);
+    }
+
+    if command == "rule" && sub == Some("consolidate") {
+        for flag in ["project", "workspace", "db", "global"] {
+            if args.has(flag) {
+                bail!(
+                    "rule consolidate addresses every registered board; --{flag} would imply a partial migration"
+                );
+            }
+        }
+        return print(
+            &Registry::open()?.consolidate_board_rules(args.require("as")?)?,
+            args.has("json"),
+        );
     }
 
     if command == "events" && args.has("global") {

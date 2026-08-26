@@ -63,6 +63,18 @@ pub struct RuleSummary {
     pub task_tags: Vec<String>,
 }
 
+/// Receipt for the one-time, idempotent consolidation of board-local rules
+/// into ADR-027's registry-owned rules document.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleMigrationReport {
+    pub boards_migrated: usize,
+    pub boards_already_migrated: usize,
+    pub rules_imported: usize,
+    pub rules_already_imported: usize,
+    pub source_rules_retired: usize,
+}
+
 /// A registered root that no longer names the directory it was registered for.
 ///
 /// Registration canonicalises, so a stored root is correct the moment it is

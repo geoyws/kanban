@@ -872,8 +872,57 @@ ALTER TABLE global_rules ADD COLUMN task_tags TEXT NOT NULL DEFAULT '[]'
  CHECK(json_valid(task_tags) AND json_type(task_tags) = 'array');
 "#;
 
+/// One canonical tag-scoped rules document. The legacy registry tables remain
+/// readable during the rolling upgrade; board-local rows are consolidated by
+/// the explicit cross-database migration recorded in ADR-027.
+const REGISTRY_V9: &str = r#"
+CREATE TABLE rules (
+ id TEXT PRIMARY KEY NOT NULL,
+ body TEXT NOT NULL,
+ author TEXT NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ tags TEXT NOT NULL DEFAULT '["ALL"]'
+  CHECK(json_valid(tags) AND json_type(tags) = 'array'),
+ source_board TEXT,
+ source_rule_id TEXT,
+ CHECK((source_board IS NULL) = (source_rule_id IS NULL)),
+ UNIQUE(source_board,source_rule_id)
+) STRICT;
+CREATE INDEX idx_registry_rules_active ON rules(created_at,id) WHERE archived=0;
+CREATE TABLE rule_events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ rule_id TEXT NOT NULL,
+ kind TEXT NOT NULL,
+ actor TEXT NOT NULL,
+ payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+ created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_registry_rule_events_rule_seq ON rule_events(rule_id,seq);
+CREATE TABLE rule_board_migrations (
+ board_path TEXT PRIMARY KEY NOT NULL,
+ board_name TEXT NOT NULL,
+ source_count INTEGER NOT NULL,
+ actor TEXT NOT NULL,
+ migrated_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags)
+SELECT id,body,author,archived,created_at,updated_at,
+       (SELECT json_group_array(value)
+          FROM (SELECT value,0 AS family,CAST(key AS INTEGER) AS position
+                  FROM json_each(global_rules.board_tags)
+                UNION ALL
+                SELECT value,1 AS family,CAST(key AS INTEGER) AS position
+                  FROM json_each(global_rules.task_tags)
+                ORDER BY family,position))
+  FROM global_rules;
+INSERT INTO rule_events(rule_id,kind,actor,payload,created_at)
+SELECT rule_id,kind,actor,payload,created_at FROM global_rule_events ORDER BY seq;
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 17;
-pub const REGISTRY_SCHEMA_VERSION: usize = 8;
+pub const REGISTRY_SCHEMA_VERSION: usize = 9;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -1110,6 +1159,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V6,
     REGISTRY_V7,
     REGISTRY_V8,
+    REGISTRY_V9,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -1246,6 +1296,56 @@ mod tests {
         assert_eq!(
             REGISTRY_SCHEMA_VERSION,
             SOURCE.matches(registry_declaration.as_str()).count()
+        );
+    }
+
+    #[test]
+    fn registry_v9_preserves_existing_rule_order_and_combines_its_tags() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..8]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags,task_tags) VALUES(?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    "g-existing",
+                    "Keep evidence exact.",
+                    "geo",
+                    0,
+                    10,
+                    11,
+                    r#"["ALL","EXCEPT:px"]"#,
+                    r#"["testing","rules"]"#,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+                rusqlite::params!["g-existing", "global_rule_added", "geo", "{}", 10],
+            )
+            .unwrap();
+
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+
+        let (tags, source_board, source_rule): (String, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT tags,source_board,source_rule_id FROM rules WHERE id='g-existing'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&tags).unwrap(),
+            ["ALL", "EXCEPT:px", "testing", "rules"]
+        );
+        assert_eq!((source_board, source_rule), (None, None));
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM rule_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

@@ -2,8 +2,10 @@ use crate::db::{
     checkpoint, create_backup_target, integrity, open_board, open_registry, open_registry_readonly,
     own_private_dir,
 };
-use crate::model::{Event, ProjectRecord, Rule, RuleSummary, UnreachableRoot, WorkspaceRecord};
-use crate::store::validate_tag_name;
+use crate::model::{
+    Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, UnreachableRoot, WorkspaceRecord,
+};
+use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::json;
@@ -522,6 +524,152 @@ impl Registry {
         }
         canonical.sort();
         Ok(canonical)
+    }
+
+    /// Consolidate every legacy board-local rule into ADR-027's canonical
+    /// registry document. Registry insertion happens before source retirement,
+    /// so an interruption can duplicate no data and lose no active rule: the
+    /// unique source key lets the next run finish the retirement safely.
+    pub fn consolidate_board_rules(&mut self, actor: &str) -> Result<RuleMigrationReport> {
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let projects = {
+            let mut statement = self.connection.prepare(
+                "SELECT name,board_path FROM workspaces WHERE archived=0 ORDER BY name,board_path",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut report = RuleMigrationReport {
+            boards_migrated: 0,
+            boards_already_migrated: 0,
+            rules_imported: 0,
+            rules_already_imported: 0,
+            source_rules_retired: 0,
+        };
+
+        for (board_name, board_path) in projects {
+            let duplicate_names: i64 = self.connection.query_row(
+                "SELECT count(*) FROM workspaces WHERE archived=0 AND name=?",
+                [&board_name],
+                |row| row.get(0),
+            )?;
+            if duplicate_names != 1 {
+                bail!(
+                    "cannot consolidate rules for board {board_name}: {duplicate_names} active boards share that name"
+                );
+            }
+            if self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM rule_board_migrations WHERE board_path=?",
+                    [&board_path],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                report.boards_already_migrated += 1;
+                continue;
+            }
+            let path = Path::new(&board_path);
+            if !path.is_file() {
+                bail!(
+                    "cannot consolidate rules for board {board_name}: {} is not a readable board file",
+                    path.display()
+                );
+            }
+            let mut board = Store::open(path)
+                .with_context(|| format!("open board {board_name} for rule consolidation"))?;
+            let source_rules = board.rules(true)?;
+            for source in &source_rules {
+                let imported_id = self
+                    .connection
+                    .query_row(
+                        "SELECT id FROM rules WHERE source_board=? AND source_rule_id=?",
+                        params![board_name, source.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let canonical_id = if let Some(id) = imported_id {
+                    report.rules_already_imported += 1;
+                    id
+                } else {
+                    let mut id = source.id.clone();
+                    while self
+                        .connection
+                        .query_row("SELECT 1 FROM rules WHERE id=?", [&id], |_| Ok(()))
+                        .optional()?
+                        .is_some()
+                    {
+                        id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+                    }
+                    let mut tags = vec![format!("ONLY:{board_name}")];
+                    tags.extend(source.task_tags.iter().cloned());
+                    let now = now_ms();
+                    let transaction = self
+                        .connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    transaction.execute(
+                        "INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags,source_board,source_rule_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                        params![
+                            id,
+                            source.body,
+                            source.author,
+                            source.archived,
+                            source.created_at,
+                            source.updated_at,
+                            serde_json::to_string(&tags)?,
+                            board_name,
+                            source.id,
+                        ],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+                        params![
+                            id,
+                            "rule_consolidated",
+                            actor,
+                            json!({
+                                "ruleID": id,
+                                "sourceBoard": board_name,
+                                "sourceRuleID": source.id,
+                                "tags": tags,
+                            })
+                            .to_string(),
+                            now,
+                        ],
+                    )?;
+                    transaction.commit()?;
+                    report.rules_imported += 1;
+                    id
+                };
+
+                if !source.archived {
+                    board.retire_rule(&source.id, &actor)?;
+                    event(
+                        &board.connection,
+                        None,
+                        "rule_consolidated",
+                        Some(&actor),
+                        json!({
+                            "ruleID": source.id,
+                            "canonicalBoard": board_name,
+                            "canonicalRuleID": canonical_id,
+                        }),
+                    )?;
+                    report.source_rules_retired += 1;
+                }
+            }
+            self.connection.execute(
+                "INSERT INTO rule_board_migrations(board_path,board_name,source_count,actor,migrated_at) VALUES(?,?,?,?,?)",
+                params![board_path, board_name, source_rules.len(), actor, now_ms()],
+            )?;
+            report.boards_migrated += 1;
+        }
+        Ok(report)
     }
 
     pub fn add_global_rule(

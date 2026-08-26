@@ -264,8 +264,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 8);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 8);
+    assert_eq!(doctor["registrySchemaVersion"], 9);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 9);
     assert_eq!(doctor["supportedBoardSchemaVersion"], 17);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 17);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 17);
@@ -1859,7 +1859,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 8"),
+        version.contains("registry schema 9"),
         "version output: {version}"
     );
 }
@@ -8493,8 +8493,86 @@ fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
+}
+
+#[test]
+fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
+    let fixture = Fixture::new("unified-rule-consolidation");
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&second).unwrap();
+    fixture.ok_json(&fixture.main, &["init", "--name", "ONE", "--json"]);
+    fixture.ok_json(&second, &["init", "--name", "TWO", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "infra", "--as", "geo", "--json"],
+    );
+    let one = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "ONE infrastructure rule.",
+            "--tag",
+            "infra",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let two = fixture.ok_json(
+        &second,
+        &["rule", "add", "TWO board rule.", "--as", "geo", "--json"],
+    );
+
+    let first = fixture.ok_json(
+        &fixture.root,
+        &["rule", "consolidate", "--as", "geo", "--json"],
+    );
+    assert_eq!(first["boardsMigrated"], 2);
+    assert_eq!(first["rulesImported"], 2);
+    assert_eq!(first["sourceRulesRetired"], 2);
+
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    let imported_one: (String, String, String) = registry
+        .query_row(
+            "SELECT tags,source_board,source_rule_id FROM rules WHERE source_board='ONE'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&imported_one.0).unwrap(),
+        ["ONLY:ONE", "infra"]
+    );
+    assert_eq!(imported_one.1, "ONE");
+    assert_eq!(imported_one.2, one["id"]);
+    let imported_two: String = registry
+        .query_row(
+            "SELECT tags FROM rules WHERE source_board='TWO' AND source_rule_id=?",
+            [two["id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&imported_two).unwrap(),
+        ["ONLY:TWO"]
+    );
+    drop(registry);
+
+    for cwd in [&fixture.main, &second] {
+        let retired = fixture.ok_json(cwd, &["rule", "list", "--all", "--full", "--json"]);
+        assert_eq!(retired[0]["archived"], true);
+    }
+
+    let second_run = fixture.ok_json(
+        &fixture.root,
+        &["rule", "consolidate", "--as", "geo", "--json"],
+    );
+    assert_eq!(second_run["boardsAlreadyMigrated"], 2);
+    assert_eq!(second_run["rulesImported"], 0);
+    assert_eq!(second_run["sourceRulesRetired"], 0);
 }
 
 #[test]
