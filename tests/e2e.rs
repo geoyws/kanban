@@ -266,9 +266,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 8);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 8);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 16);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 16);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 16);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 17);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 17);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 17);
 }
 
 #[test]
@@ -584,7 +584,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         reopened
@@ -1731,7 +1731,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 16"),
+        version.contains("board schema 17"),
         "version output: {version}"
     );
     assert!(
@@ -5034,6 +5034,45 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert!(!unknown_tag.status.success());
     assert!(String::from_utf8_lossy(&unknown_tag.stderr).contains("master file"));
 
+    let self_settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            blocking["id"].as_str().unwrap(),
+            "--as",
+            "claude/driver-2",
+            "--note",
+            "The raiser withdrew its own item after verification.",
+            "--json",
+        ],
+    );
+    assert_eq!(self_settled["status"], "resolved");
+    let self_reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            blocking["id"].as_str().unwrap(),
+            "--as",
+            "claude/driver-2",
+            "--note",
+            "The underlying request still needs George.",
+            "--json",
+        ],
+    );
+    assert_eq!(self_reopened["status"], "open");
+    assert_eq!(self_reopened["resolvedBy"], "claude/driver-2");
+    assert_eq!(
+        self_reopened["resolution"],
+        "The raiser withdrew its own item after verification."
+    );
+    assert_eq!(self_reopened["reopenedBy"], "claude/driver-2");
+    assert_eq!(
+        self_reopened["reopenNote"],
+        "The underlying request still needs George."
+    );
+
     // A kind outside the closed set is refused: "what sort of thing is this"
     // is the part a reader needs first, and free text would not answer it.
     let invented = fixture.run(
@@ -5069,6 +5108,35 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         ]
     );
 
+    let unauthorized = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "claude/driver-3",
+            "--note",
+            "Probe",
+            "--json",
+        ],
+    );
+    assert!(!unauthorized.status.success());
+    assert!(String::from_utf8_lossy(&unauthorized.stderr).contains("only geo"));
+    let missing_note = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(!missing_note.status.success());
+    assert!(String::from_utf8_lossy(&missing_note.stderr).contains("--note is required"));
+
     // Settling one keeps it: the trail is the feature.
     let settled = fixture.ok_json(
         &fixture.main,
@@ -5087,6 +5155,55 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(settled["resolvedBy"], "geo");
     assert_eq!(settled["resolution"], "approved and pushed");
     assert!(!settled["resolvedAt"].is_null());
+
+    let wrong_reopener = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "claude/driver-3",
+            "--note",
+            "Trying to alter George's decision.",
+            "--json",
+        ],
+    );
+    assert!(!wrong_reopener.status.success());
+    assert!(String::from_utf8_lossy(&wrong_reopener.stderr).contains("only geo"));
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--note",
+            "The wrong item was resolved.",
+            "--json",
+        ],
+    );
+    assert_eq!(reopened["status"], "open");
+    assert_eq!(reopened["resolvedBy"], "geo");
+    assert_eq!(reopened["resolution"], "approved and pushed");
+    assert!(!reopened["reopenedAt"].is_null());
+    assert_eq!(reopened["reopenedBy"], "geo");
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--note",
+            "Approved after reopening the mistaken transition.",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert!(settled["reopenedAt"].is_null());
 
     let rewrite_history = fixture.run(
         &fixture.main,
@@ -5154,6 +5271,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert!(kinds.contains(&"attention_raised"), "{kinds:?}");
     assert!(kinds.contains(&"attention_updated"), "{kinds:?}");
     assert!(kinds.contains(&"attention_resolved"), "{kinds:?}");
+    assert!(kinds.contains(&"attention_reopened"), "{kinds:?}");
 
     // An item about a removed task keeps its text, like a handoff does.
     fixture.ok_json(
@@ -5171,6 +5289,42 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(
         survivor["status"], "open",
         "removing a task answered nothing"
+    );
+
+    // A v16 board already carrying tagged attention rows keeps both sides of
+    // that relationship through the v17 table rebuild.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            blocking["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--note",
+            "Settled before simulating the v16 migration boundary.",
+            "--json",
+        ],
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute_batch("PRAGMA user_version=16;")
+        .unwrap();
+    let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    let survivor = migrated
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == blocking["id"])
+        .unwrap();
+    assert_eq!(survivor["tags"], json!(["infra", "ui"]));
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
+        17
     );
 }
 
@@ -5575,7 +5729,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         connection

@@ -84,7 +84,8 @@ Usage:
              [--limit N] [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
-  kanban attention resolve ID --as ACTOR [--note TEXT] [--json]
+  kanban attention resolve ID --as ACTOR --note TEXT [--json]
+  kanban attention reopen ID --as ACTOR --note TEXT [--json]
   kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
   kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
   kanban events [--task ID] [--kind KIND] [--limit N] [--json]
@@ -493,6 +494,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id"],
         false,
     ),
+    ("attention", Some("reopen"), &["as", "note"], &["id"], false),
     (
         "sitrep",
         Some("post"),
@@ -2485,6 +2487,13 @@ fn run() -> Result<()> {
         let id = rest.first().context("attention id is required")?;
         return print(
             &store.resolve_attention(id, args.require("as")?, args.one("note"))?,
+            args.has("json"),
+        );
+    }
+    if command == "attention" && sub == Some("reopen") {
+        let id = rest.first().context("attention id is required")?;
+        return print(
+            &store.reopen_attention(id, args.require("as")?, args.require("note")?)?,
             args.has("json"),
         );
     }

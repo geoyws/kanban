@@ -208,6 +208,8 @@ kb att list --status open --tag queuer
 kb att update a-12345678 --body "Corrected request." --as codex@driver
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
+kb att resolve a-12345678 --as geo --note "Approved after review."
+kb att reopen a-12345678 --as geo --note "Resolved the wrong item."
 ```
 
 Several tags describe several touched subsystems. An agent may correct the body
@@ -215,6 +217,13 @@ or tags only while the item remains open; the prior body and tags stay on the
 event trail, and the update does not settle the request. Resolving it freezes
 the row with the rest of the historical receipt. Unknown tags are refused
 rather than producing an empty-looking filter result.
+
+Resolution is deliberately asymmetric: `geo` may settle any item, while an
+agent may settle only an item whose `raisedBy` is that exact actor, and every
+resolution requires a non-empty note. If a resolution was mistaken, only
+`geo` or the recorded resolver may reopen it. Reopening returns the item to the
+open queue without clearing `resolvedAt`, `resolvedBy` or `resolution`; it adds
+`reopenedAt`, `reopenedBy` and `reopenNote`, and the transition is audited.
 
 ## Working from anywhere
 

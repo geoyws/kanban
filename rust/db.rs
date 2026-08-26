@@ -732,6 +732,61 @@ CREATE TABLE attention_tags (
 CREATE INDEX idx_attention_tags_tag ON attention_tags(tag);
 "#;
 
+const BOARD_V17: &str = r#"
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE attention RENAME TO attention_v16;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk')),
+ body TEXT NOT NULL,
+ raised_by TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ NULL,NULL,NULL,archived,priority
+FROM attention_v16;
+DROP TABLE attention_v16;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -817,7 +872,7 @@ ALTER TABLE global_rules ADD COLUMN task_tags TEXT NOT NULL DEFAULT '[]'
  CHECK(json_valid(task_tags) AND json_type(task_tags) = 'array');
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 16;
+pub const BOARD_SCHEMA_VERSION: usize = 17;
 pub const REGISTRY_SCHEMA_VERSION: usize = 8;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1009,6 +1064,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
             BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16,
+            BOARD_V17,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;

@@ -512,6 +512,9 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         resolved_at: row.get("resolved_at")?,
         resolved_by: row.get("resolved_by")?,
         resolution: row.get("resolution")?,
+        reopened_at: row.get("reopened_at")?,
+        reopened_by: row.get("reopened_by")?,
+        reopen_note: row.get("reopen_note")?,
         archived: row.get::<_, i64>("archived")? != 0,
         tags: Vec::new(),
     })
@@ -2244,9 +2247,22 @@ impl Store {
                 existing.resolved_by.unwrap_or_else(|| "someone".into())
             );
         }
+        if actor != "geo" && actor != existing.raised_by {
+            bail!(
+                "attention {id} was raised by {}; only geo or that same raiser may resolve it — \
+                 use attention update to correct it without closing George's queue",
+                existing.raised_by
+            );
+        }
+        let resolution = nonempty(
+            resolution.context("--note is required so the resolution is auditable")?,
+            "resolution note",
+        )?
+        .to_owned();
         let now = now_ms();
         transaction.execute(
-            "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=? WHERE id=?",
+            "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=?,\
+             reopened_at=NULL,reopened_by=NULL,reopen_note=NULL WHERE id=?",
             params![now, actor, resolution, id],
         )?;
         event(
@@ -2254,7 +2270,63 @@ impl Store {
             existing.task_id.as_deref(),
             "attention_resolved",
             Some(&actor),
-            json!({"attentionID": id, "kind": existing.kind}),
+            json!({
+                "attentionID": id,
+                "kind": existing.kind,
+                "previousResolvedAt": existing.resolved_at,
+                "previousResolvedBy": existing.resolved_by,
+                "previousResolution": existing.resolution,
+                "reopenedAt": existing.reopened_at,
+                "reopenedBy": existing.reopened_by,
+                "reopenNote": existing.reopen_note,
+            }),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
+        transaction.commit()?;
+        let mut result = vec![result];
+        attach_attention_tags(&self.connection, &mut result)?;
+        Ok(result.remove(0))
+    }
+
+    /// Undo a mistaken resolution without erasing who made it or what they
+    /// wrote. Only the operator or that resolver can repair the transition.
+    pub fn reopen_attention(&mut self, id: &str, actor: &str, note: &str) -> Result<Attention> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let note = nonempty(note, "reopen note")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?
+            .with_context(|| format!("attention {id} not found"))?;
+        if existing.status != "resolved" {
+            bail!("attention {id} is already open; there is no resolution to reopen");
+        }
+        if actor != "geo" && existing.resolved_by.as_deref() != Some(actor.as_str()) {
+            bail!(
+                "attention {id} was resolved by {}; only geo or that resolver may reopen it",
+                existing.resolved_by.as_deref().unwrap_or("someone")
+            );
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE attention SET status='open',reopened_at=?,reopened_by=?,reopen_note=? WHERE id=?",
+            params![now, actor, note, id],
+        )?;
+        event(
+            &transaction,
+            existing.task_id.as_deref(),
+            "attention_reopened",
+            Some(&actor),
+            json!({
+                "attentionID": id,
+                "resolvedAt": existing.resolved_at,
+                "resolvedBy": existing.resolved_by,
+                "resolution": existing.resolution,
+                "note": note,
+            }),
         )?;
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;

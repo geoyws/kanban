@@ -443,6 +443,9 @@ pub struct Attention {
     pub resolved_at: Option<i64>,
     pub resolved_by: Option<String>,
     pub resolution: Option<String>,
+    pub reopened_at: Option<i64>,
+    pub reopened_by: Option<String>,
+    pub reopen_note: Option<String>,
     pub archived: bool,
     /// Registered subsystem tags carried directly by this attention row.
     pub tags: Vec<String>,
