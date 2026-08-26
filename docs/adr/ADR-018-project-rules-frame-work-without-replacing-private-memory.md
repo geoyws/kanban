@@ -1,8 +1,12 @@
 # ADR-018: Project rules frame work without replacing private memory
 
-**Status:** Accepted
+**Status:** Superseded in part by ADR-027
 **Date:** 2026-08-24
 **Deciders:** George
+
+ADR-027 retains this ADR's claim/resume injection boundary, compact summaries,
+audit trail, and separation from private memory. It supersedes board-local rule
+ownership and the project-rule public identity.
 
 ## Context
 
@@ -70,4 +74,3 @@ escaped served HTML. Unit tests remain a separate layer.
 - [ADR-007](ADR-007-global-project-addressing.md)
 - [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)
 - [ADR-016](ADR-016-kanban-serves-its-own-read-only-ui.md)
-

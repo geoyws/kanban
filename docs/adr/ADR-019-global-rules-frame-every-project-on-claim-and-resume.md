@@ -1,8 +1,11 @@
 # ADR-019: Global rules frame every project on claim and resume
 
-**Status:** Accepted
+**Status:** Superseded by ADR-027
 **Date:** 2026-08-24
 **Deciders:** George
+
+ADR-027 replaces the global/project split with one registry-owned, tag-scoped
+`/kb` rules document. The commands and JSON shapes below are historical.
 
 ## Context
 

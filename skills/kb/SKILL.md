@@ -80,61 +80,56 @@ kb ws det --root /retired/worktree --as "$AGENT" --json
 kb ws ls --all --json           # including detached aliases
 ```
 
-## Project rules — what frames every task
+## Tag-scoped rules — what frames work
 
-Put short, non-secret operating constraints that apply across this project in
-the board's ordered rules document:
+Put short, non-secret operating constraints in the one registry-owned rules
+document. A board owns work; it is a selector tag on a rule, not a rule scope:
 
 ```bash
-kb r new "Production runtime is Rust." --as "$AGENT" --json
+kb r new "Universal rule." --as "$AGENT" --json       # tags: ALL
 kb r new --body-file /tmp/non-secret-rule.md --as "$AGENT" --json
 kb r ls --json                         # active table of contents, oldest first
 kb r cat r-12345678 --json             # one full body, fetched lazily
 kb r up r-12345678 --body "Revised rule" --as "$AGENT" --json
 kb rule retire r-12345678 --as "$AGENT" --json
 kb r ls --all --full --json            # retired rows and full bodies
+kb ev --rule r-12345678 --json          # audited history
 
-# One rules document inherited by every project. No board selector belongs here.
-kb r new "Never store credentials in Kanban." --global --as "$AGENT" --json
-kb r ls --global --json
-kb r cat g-12345678 --global --json
-kb ev --global --rule g-12345678 --json  # audited global history
+# ALL is the default; includes/exclusions are repeatable selector tags.
+kb r new "Kanban only." --board kanban --as "$AGENT" --json
+kb r new "All except project-a." --except-board project-a --as "$AGENT" --json
+kb r up r-12345678 --board kanban --as "$AGENT" --json
 
-# Explicit board tags: ALL is the default; includes/exclusions are repeatable.
-kb r new "Kanban only." --global --board kanban --as "$AGENT" --json
-kb r new "All except project-a." --global --except-board project-a --as "$AGENT" --json
-kb r up g-12345678 --global --board kanban --as "$AGENT" --json
+# Lowercase subsystem tags intersect the board selector.
+kb r new "Queuer only." --tag queuer --as "$AGENT" --json
+kb r up r-12345678 --clear-tags --as "$AGENT" --json
 ```
 
 The first line is the headline. `kb ctx <task>`, every successful new claim and
-every accepted handoff carry the complete active table of contents: global rules
-first, then project rules, each with scope, id, headline, byte size and whether
-more body exists.
-Rendered context marks them `[g]` and `[p]`. Read a long body with `kb r cat ID`
-and add `--global` for a global id; do not load every detail speculatively. Other
-commands do not repeat rules—the injection boundary is claim/resume, which saves
-tokens and preserves existing JSON shapes. A claim receipt keeps its existing
-fields at the top level and adds `rules`; `kb t cat`'s stored claim deliberately
-does not pretend it re-read the board's current rules.
+every accepted handoff carry the applicable active table of contents. Each
+summary has one `tags` array plus id, headline, byte size and whether more body
+exists. Read a long body with `kb r cat ID`; do not load every detail
+speculatively. Other commands do not repeat rules—the injection boundary is
+claim/resume, which saves tokens. A stored claim deliberately does not pretend
+it re-read current rules.
 
-Global rules live once in `registry.db`; `--global` with an explicit board
-selector is refused because those name different scopes. Rules are **audited
-and retire-only**. Updates retain the previous body in the
-event trail; retirement removes a rule from active claims, contexts and the web
-board without deleting history. There is no `rm` alias.
+Rules live once in `registry.db` and are **audited and retire-only**. Updates
+retain the previous body; retirement removes a rule from active injection and
+the web view without deleting history. There is no `rm` alias. `--global` is
+retired and explicitly refused; `g-*` remains valid only as a historical ID.
 
 This is not the secret or long-form memory store. Keep credentials, secrets,
 long explanations and cross-machine knowledge in the versioned/git-crypt'd
 dotfiles, and let a short rule point there when needed. **Never put a secret
 value in the plaintext board database.**
 
-Every global rule carries `boardTags`. `ALL` is explicit and is the default,
-`ONLY:<name>` entries form a named include set, and `EXCEPT:<name>` entries
-subtract from `ALL`. Operators pass repeatable `--board NAME` and
-`--except-board NAME`; the CLI validates exact registered names and refuses
-ambiguous combinations. Injection and the web page include only rules whose
-board tags match the addressed project, saving irrelevant context tokens. See
-ADR-020.
+Every rule carries one `tags` array. `ALL` is explicit and default,
+`ONLY:<name>` is a named include, and `EXCEPT:<name>` subtracts from `ALL`.
+Repeatable `--board`/`--except-board` flags validate exact board names.
+Lowercase `--tag` selectors must exist on an active board; several are an OR
+set intersected with the board selector. Task claim/context/handoff injection
+requires a matching task tag. Taskless session handoffs and web board pages
+omit subsystem-scoped rules. See ADR-027.
 
 ## Attention — anything that needs George
 
@@ -182,10 +177,10 @@ reply makes George see it now. In one and not the other is a bug.
 
 ## Search and bounded RAG context
 
-Search before opening many cards speculatively. Results cover the board's
-tasks, notes, checkpoints, handoffs, attention, sitreps, rules, and selected
-audit events, with applicable global rules included. Each result has a stable
-`kanban://BOARD/KIND/ID` citation to the authoritative row.
+Search before opening many cards speculatively. Results cover board tasks,
+notes, checkpoints, handoffs, attention, sitreps and selected audit events,
+plus the one registry rules document. Each result has a stable
+`kanban://BOARD/KIND/ID` or `kanban://rules/rule/ID` citation.
 
 ```bash
 kb search "resume the release handoff" --project kanban --json
@@ -563,7 +558,8 @@ once a silent wrong answer.
 ADR-008 (fail closed), ADR-010 (adapters generated from the surface),
 ADR-011 (MCP server + in-place reload), ADR-012 (session handoffs and
 attention), ADR-013 (plans are epics), ADR-015 (tags are a master file),
-ADR-016 (the web view), ADR-017 (sitreps), ADR-018 (project rules).
-ADR-019 adds the single-copy global rules inherited at claim/resume boundaries.
-ADR-020 adds explicit `ALL`, named-only and all-except board targeting.
+ADR-016 (the web view), ADR-017 (sitreps), ADR-018 (the original board-local
+rules). ADR-027 supersedes the scoped rule decisions with one registry-owned,
+tag-scoped rules document using `ALL`, `ONLY:<board>`, `EXCEPT:<board>` and
+lowercase subsystem tags.
 ADR-021 keeps settled history while removing it from operational indexes.

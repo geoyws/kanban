@@ -45,9 +45,13 @@ longer imply global scope; newly created rules use `r-*`.
 
 Registry schema v9 creates canonical `rules` and `rule_events` tables and copies
 the existing registry rows into them, joining their selector and subsystem arrays
-without changing order. Board-local rows require an explicit, idempotent
-cross-database consolidation because a SQLite migration cannot transact across
-all board files. Consolidation:
+without changing order. A rolling upgrade may still receive writes from an old
+binary after that schema migration. Consolidation therefore first imports any
+later legacy `global_rules` rows and revisions, preserves their audit-event
+multiplicity, retires active legacy rows, and records an idempotent source marker.
+
+Board-local rows require the same explicit, idempotent cross-database operation
+because a SQLite migration cannot transact across all board files. Consolidation:
 
 1. copies each row with `ONLY:<canonical-board>` plus its task tags;
 2. preserves its active/retired state and records source board and source ID;

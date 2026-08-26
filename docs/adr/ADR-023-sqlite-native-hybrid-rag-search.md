@@ -22,8 +22,8 @@ ordinary read into a dependency on a hosted model or secret API key.
 ### One derived search corpus in each board
 
 Board schema V13 adds `search_documents`, one derived row per searchable task,
-note, checkpoint, handoff, attention item, sitrep, project rule, and selected
-audit event. Each row carries the source kind and identifier, linked task,
+note, checkpoint, handoff, attention item, sitrep, and selected audit event.
+Each row carries the source kind and identifier, linked task,
 status, lane, tags, timestamps, archived state, source hash, embedding model,
 and embedding bytes. No lease token, credential or session capability enters
 the corpus.
@@ -33,8 +33,9 @@ the authoritative tables keep the document and FTS rows current. Existing rows
 are backfilled by the migration. The FTS index is always disposable: the board
 rows remain authoritative and `search-rebuild` reconstructs all derived rows.
 
-Global rules continue to live once in the registry. Search composes matching
-global rules into the read result rather than copying them into every board.
+ADR-027's one rules document lives once in the registry. Search queries that
+canonical document alongside the addressed board rows rather than copying rules
+into every board, and cites them as `kanban://rules/rule/<id>`.
 
 ### Local semantic-lite vectors, measured before ANN
 

@@ -157,56 +157,45 @@ sixteen-agent fan-out, that took the failure rate from 3% to zero and the
 slowest write from 6.7s to 4.5s: an agent reads an exit status and moves on, so
 a dropped write is lost work nothing downstream will notice is missing.
 
-## Project rules
+## Tag-scoped `/kb` rules
 
-Short, non-secret constraints that must frame every task belong to the project
-board's ordered rules document:
+Short, non-secret constraints live in one registry-owned rules document. Boards
+still own work; they are selectors on rules, never a second rule species:
 
 ```bash
-kb r new "Production runtime is Rust." --as geo
+kb r new "Universal rule." --as geo                    # tags: ALL
 kb r new --body-file /tmp/non-secret-rule.md --as geo
 kb r ls                         # active table of contents, oldest first
 kb r cat r-12345678             # fetch one full body lazily
 kb r up r-12345678 --body "Production runtime is compiled Rust." --as geo
 kb rule retire r-12345678 --as geo
 kb r ls --all --full            # include retired rules and full bodies
-
-# One document inherited by every project; do not pass a board selector.
-kb r new "Never store credentials in Kanban." --global --as geo
-kb r ls --global
-kb r cat g-12345678 --global
-kb ev --global --rule g-12345678 # audited revision/retirement trail
+kb ev --rule r-12345678         # audited revision/retirement trail
 
 # Target one or more boards, or every board except named boards.
-kb r new "Kanban-only rule." --global --board kanban --as geo
-kb r new "Everywhere except project-a." --global --except-board project-a --as geo
+kb r new "Kanban-only rule." --board kanban --as geo
+kb r new "Everywhere except project-a." --except-board project-a --as geo
 
-# Narrow either kind to tasks carrying at least one named subsystem tag.
+# Intersect board selection with one or more subsystem tags.
 kb r new "Queuer-specific rule." --tag queuer --as geo
-kb r new "Aix rule across boards." --global --tag aix --as geo
+kb r new "Aix rule on two boards." --board crm-react --board pai-root --tag aix --as geo
 kb r up r-12345678 --clear-tags --as geo
 ```
 
 The first line is the headline. Every context packet, newly granted claim and
-accepted handoff carries the complete active table of contents: global rules
-first, then project rules. Each compact summary names its scope, id, headline,
-byte size and whether more exists; a long body is fetched only with `kb r cat ID` (plus `--global` for
-a `g-` id). Other commands do not repeat rules. The claim receipt stays flat,
-while a stored claim remains the same shape it had before rules existed.
+accepted handoff carries the applicable active table of contents. Each compact
+summary has one `tags` array plus id, headline, byte size and whether more body
+exists; `kb r cat ID` fetches long bodies lazily. Other commands do not repeat
+rules, and a stored claim does not pretend it re-read current rules.
 
-Every global rule has explicit `boardTags`. Omitted targeting defaults to
-`ALL`; named includes render as `ONLY:<board>`, and exclusions render as
-`ALL, EXCEPT:<board>`. `--board` and `--except-board` are repeatable and accept
-exact registered board names. See
-[ADR-020](docs/adr/ADR-020-global-rules-use-explicit-board-tags.md).
-
-Task-tag selectors are serialized as `taskTags`. Several are an OR set, while
-their result intersects the global rule's board scope. Project selectors must
-exist in that board's tag master; a global selector must be registered on at
-least one active board. Claims, task handoff acceptance and task context inject
-an active tagged rule only when the task carries at least one selector. A
-session handoff has no task context, so it receives only untagged rules.
-See [ADR-024](docs/adr/ADR-024-rules-target-task-tags-after-board-scope.md).
+`ALL` is the default selector. Named includes are `ONLY:<board>`; exclusions
+are `ALL, EXCEPT:<board>`. Operators use repeatable `--board` and
+`--except-board`, and the CLI validates exact registered board names. Lowercase
+`--tag` values are subsystem selectors registered on at least one active board.
+Several subsystem tags are an OR set, intersected with the board selector.
+Task claim, context and task-handoff injection require a matching task tag;
+taskless session handoffs and web board projections omit subsystem-scoped rules.
+See [ADR-027](docs/adr/ADR-027-rules-are-one-tag-scoped-kb-document.md).
 
 Rules are retire-only and audited: updating records the prior body, retirement
 removes a rule from active contexts without deleting it, and there is no `rm`
@@ -214,7 +203,7 @@ alias. They do not replace private memory. Long-form context, cross-machine
 knowledge and anything secret remain in versioned/git-crypt'd dotfiles. Never
 put credentials or secret values in the plaintext board database. See
 [ADR-018](docs/adr/ADR-018-project-rules-frame-work-without-replacing-private-memory.md)
-and [ADR-019](docs/adr/ADR-019-global-rules-frame-every-project-on-claim-and-resume.md).
+and its superseding [ADR-027](docs/adr/ADR-027-rules-are-one-tag-scoped-kb-document.md).
 
 Attention rows carry the same registered subsystem vocabulary as tasks:
 
@@ -311,10 +300,11 @@ supported schema versions.
 
 ## SQLite-native retrieval and RAG
 
-Kanban indexes its authoritative rows inside each board database. Search covers
-tasks, notes, checkpoints, handoffs, attention, sitreps, project rules, selected
-audit events, and applicable global rules. Every hit names the source with a
-stable `kanban://BOARD/KIND/ID` citation; it does not synthesize an answer.
+Kanban indexes authoritative work rows inside each board database and searches
+the registry-owned rules document alongside them. Search covers tasks, notes,
+checkpoints, handoffs, attention, sitreps, rules and selected audit events.
+Every hit names the source with a stable `kanban://BOARD/KIND/ID` or
+`kanban://rules/rule/ID` citation; it does not synthesize an answer.
 
 ```bash
 kb search "deploy the live build" --project kanban --json

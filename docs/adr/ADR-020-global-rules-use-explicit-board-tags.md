@@ -1,8 +1,12 @@
 # ADR-020: Global rules use explicit board tags
 
-**Status:** Accepted
+**Status:** Superseded in part by ADR-027
 **Date:** 2026-08-24
 **Deciders:** George
+
+ADR-027 retains `ALL`, `ONLY:<board>`, and `EXCEPT:<board>` as selector tags,
+but removes the global-rule species and the separate `boardTags` public field.
+The scoped commands below are historical.
 
 ## Context
 

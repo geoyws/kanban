@@ -3313,6 +3313,19 @@ fn compiled_binary_refuses_arguments_it_would_have_dropped() {
 fn compiled_binary_refuses_two_requests_dressed_as_one() {
     let fixture = Fixture::new("ambiguous");
     fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "tag",
+            "add",
+            "scheduler",
+            "--description",
+            "queue selection",
+            "--as",
+            "test",
+            "--json",
+        ],
+    );
     let other = fixture.root.join("other");
     fs::create_dir_all(&other).unwrap();
     fixture.ok_json(&other, &["init", "--name", "Beta", "--json"]);
@@ -3326,6 +3339,8 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
             "t-first",
             "--priority",
             "1",
+            "--tag",
+            "scheduler",
             "--json",
         ],
     );
@@ -3440,6 +3455,14 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
         .find(|task| task["id"] == "t-deps")
         .unwrap();
     assert_eq!(deps["dependencies"], json!(["t-first", "t-named"]));
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-deps", "--json"]);
+    let dependency = shown["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "t-first")
+        .unwrap();
+    assert_eq!(dependency["tags"], json!(["scheduler"]));
 }
 
 #[test]

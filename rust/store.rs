@@ -1132,7 +1132,9 @@ impl Store {
     }
 
     pub fn dependencies(&self, id: &str) -> Result<Vec<Task>> {
-        dependencies(&self.connection, id)
+        let mut rows = dependencies(&self.connection, id)?;
+        attach_tags(&self.connection, &mut rows)?;
+        Ok(rows)
     }
 
     pub fn ancestors(&self, id: &str) -> Result<Vec<Task>> {

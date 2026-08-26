@@ -1,8 +1,12 @@
 # ADR-024: Rules target task tags after board scope
 
-**Status:** Accepted
+**Status:** Superseded in part by ADR-027
 **Date:** 2026-08-26
 **Deciders:** George
+
+ADR-027 retains subsystem matching and its taskless-context behavior, but folds
+subsystem and board selectors into one `tags` array on one rule species. The
+separate scope and `taskTags` model below is historical.
 
 ## Context
 
