@@ -582,7 +582,7 @@ fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
 fn needs_you(replied: Option<&str>) -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     for (project, store) in projects()? {
-        for item in store.attention(Some("open"), None, None, 1000, false)? {
+        for item in store.attention(Some("open"), None, None, None, 1000, false)? {
             items.push((project.name.clone(), item));
         }
     }
@@ -625,13 +625,14 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
         html.push_str(&format!(
             "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
              <a href=\"/board/{project_url}\">{project}</a> \
-             · raised by {who} · waiting {age}</p>",
+             · raised by {who} · waiting {age}{tags}</p>",
             kind = escape(&item.kind),
             priority = priority_badge(item.priority, item.priority_level.as_deref()),
             project_url = escape(project),
             project = escape(project),
             who = escape(&item.raised_by),
             age = age(item.created_at),
+            tags = tag_list(&item.tags),
         ));
         html.push_str(&format!("<p class=body>{}</p>", escape(&item.body)));
         if let Some(task) = &item.task_id {
@@ -782,7 +783,7 @@ fn boards() -> Result<String> {
     for (project, store) in projects()? {
         let tasks = store.list_tasks(None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        let attention = store.attention(Some("open"), None, None, 1000, false)?;
+        let attention = store.attention(Some("open"), None, None, None, 1000, false)?;
         let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
         let queued = tasks
             .iter()

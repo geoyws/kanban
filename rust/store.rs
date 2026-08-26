@@ -194,7 +194,11 @@ pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
     Ok(name)
 }
 
-fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<String>> {
+fn validate_registered_tags(
+    connection: &Connection,
+    tags: &[String],
+    subject: &str,
+) -> Result<Vec<String>> {
     let known = connection
         .prepare("SELECT name FROM tags ORDER BY name")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -204,7 +208,7 @@ fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<St
     for tag in tags {
         let tag = validate_tag_name(tag)?;
         if !seen.insert(tag.clone()) {
-            bail!("rule task tag {tag:?} was given more than once");
+            bail!("{subject} tag {tag:?} was given more than once");
         }
         if !known.contains(&tag) {
             let borrowed = known.iter().map(String::as_str).collect::<Vec<_>>();
@@ -212,7 +216,7 @@ fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<St
                 .map(|near| format!(", did you mean {near}?"))
                 .unwrap_or_default();
             bail!(
-                "rule task tag {tag} is not in this board's master file{suggestion} — \
+                "{subject} tag {tag} is not in this board's master file{suggestion} — \
                  register it first with `tag add {tag}`"
             );
         }
@@ -220,6 +224,10 @@ fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<St
     }
     canonical.sort();
     Ok(canonical)
+}
+
+fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<String>> {
+    validate_registered_tags(connection, tags, "rule task")
 }
 
 /// Attach registered tags to rows that were already read.
@@ -244,6 +252,29 @@ fn attach_tags(connection: &Connection, tasks: &mut [Task]) -> Result<()> {
     for task in tasks.iter_mut() {
         if let Some(tags) = by_task.remove(&task.id) {
             task.tags = tags;
+        }
+    }
+    Ok(())
+}
+
+fn attach_attention_tags(connection: &Connection, items: &mut [Attention]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT attention_id,tag FROM attention_tags ORDER BY attention_id,tag")?;
+    let mut by_attention: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (attention_id, tag) = row?;
+        by_attention.entry(attention_id).or_default().push(tag);
+    }
+    for item in items.iter_mut() {
+        if let Some(tags) = by_attention.remove(&item.id) {
+            item.tags = tags;
         }
     }
     Ok(())
@@ -277,6 +308,18 @@ fn set_tags(connection: &Connection, id: &str, tags: &[String]) -> Result<()> {
                 params![id, tag],
             )?;
         }
+    }
+    Ok(())
+}
+
+fn set_attention_tags(connection: &Connection, id: &str, tags: &[String]) -> Result<()> {
+    let canonical = validate_registered_tags(connection, tags, "attention")?;
+    connection.execute("DELETE FROM attention_tags WHERE attention_id=?", [id])?;
+    for tag in canonical {
+        connection.execute(
+            "INSERT INTO attention_tags(attention_id,tag) VALUES(?,?)",
+            params![id, tag],
+        )?;
     }
     Ok(())
 }
@@ -470,6 +513,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         resolved_by: row.get("resolved_by")?,
         resolution: row.get("resolution")?,
         archived: row.get::<_, i64>("archived")? != 0,
+        tags: Vec::new(),
     })
 }
 
@@ -1640,7 +1684,8 @@ impl Store {
     pub fn tags(&self) -> Result<Vec<Tag>> {
         let mut statement = self.connection.prepare(
             "SELECT t.name,t.description,t.created_by,t.created_at,
-                    (SELECT count(*) FROM task_tags x WHERE x.tag=t.name) AS uses
+                    ((SELECT count(*) FROM task_tags x WHERE x.tag=t.name) +
+                     (SELECT count(*) FROM attention_tags x WHERE x.tag=t.name)) AS uses
              FROM tags t ORDER BY t.name",
         )?;
         statement
@@ -1676,8 +1721,9 @@ impl Store {
             );
         }
         let uses: i64 = transaction.query_row(
-            "SELECT count(*) FROM task_tags WHERE tag=?",
-            [name],
+            "SELECT (SELECT count(*) FROM task_tags WHERE tag=?) +
+                    (SELECT count(*) FROM attention_tags WHERE tag=?)",
+            params![name, name],
             |row| row.get(0),
         )?;
         if uses > 0 && !force {
@@ -1688,6 +1734,7 @@ impl Store {
             );
         }
         transaction.execute("DELETE FROM task_tags WHERE tag=?", [name])?;
+        transaction.execute("DELETE FROM attention_tags WHERE tag=?", [name])?;
         let removed = transaction.execute("DELETE FROM tags WHERE name=?", [name])?;
         if removed == 0 {
             bail!("tag {name} is not in the master file");
@@ -1993,6 +2040,7 @@ impl Store {
         raised_by: &str,
         task_id: Option<&str>,
         priority: i64,
+        tags: &[String],
     ) -> Result<Attention> {
         validate(kind, &ATTENTION_KINDS, "attention kind")?;
         validate_priority(Some(priority))?;
@@ -2010,17 +2058,20 @@ impl Store {
             "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?)",
             params![id, task_id, kind, body, raised_by, now, priority],
         )?;
+        set_attention_tags(&transaction, &id, tags)?;
         event(
             &transaction,
             task_id,
             "attention_raised",
             Some(&raised_by),
-            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority)}),
+            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority), "tags": tags}),
         )?;
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
         transaction.commit()?;
-        Ok(result)
+        let mut result = vec![result];
+        attach_attention_tags(&self.connection, &mut result)?;
+        Ok(result.remove(0))
     }
 
     /// Open items first, then priority and age within each state.
@@ -2033,6 +2084,7 @@ impl Store {
         status: Option<&str>,
         kind: Option<&str>,
         task: Option<&str>,
+        tag: Option<&str>,
         limit: i64,
         include_archived: bool,
     ) -> Result<Vec<Attention>> {
@@ -2062,6 +2114,32 @@ impl Store {
             clauses.push("task_id=?");
             values.push(Box::new(task.to_owned()));
         }
+        if let Some(tag) = tag {
+            let tag = validate_tag_name(tag)?;
+            let known: Option<String> = self
+                .connection
+                .query_row("SELECT name FROM tags WHERE name=?", [&tag], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if known.is_none() {
+                let names = self
+                    .tags()?
+                    .into_iter()
+                    .map(|item| item.name)
+                    .collect::<Vec<_>>();
+                let borrowed = names.iter().map(String::as_str).collect::<Vec<_>>();
+                let suggestion = crate::nearest(&tag, &borrowed)
+                    .map(|near| format!(", did you mean {near}?"))
+                    .unwrap_or_default();
+                bail!(
+                    "tag {tag} is not in this board's master file{suggestion} — \
+                     an unregistered tag would filter to nothing and read like an answer"
+                );
+            }
+            clauses.push("id IN (SELECT attention_id FROM attention_tags WHERE tag=?)");
+            values.push(Box::new(tag));
+        }
         let where_clause = if clauses.is_empty() {
             String::new()
         } else {
@@ -2073,10 +2151,49 @@ impl Store {
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let mut rows = statement
             .query_map(params_from_iter(refs), attention_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_attention_tags(&self.connection, &mut rows)?;
+        Ok(rows)
+    }
+
+    /// Replace an open attention row's subsystem tags without rewriting the
+    /// operator request itself. Resolved rows are immutable history.
+    pub fn update_attention_tags(
+        &mut self,
+        id: &str,
+        tags: &[String],
+        actor: &str,
+    ) -> Result<Attention> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?
+            .with_context(|| format!("attention {id} not found"))?;
+        if existing.status != "open" {
+            bail!("attention {id} is resolved history; its tags cannot be rewritten");
+        }
+        let mut previous = vec![existing.clone()];
+        attach_attention_tags(&transaction, &mut previous)?;
+        set_attention_tags(&transaction, id, tags)?;
+        event(
+            &transaction,
+            existing.task_id.as_deref(),
+            "attention_updated",
+            Some(&actor),
+            json!({"attentionID": id, "changed": ["tags"], "previousTags": previous[0].tags}),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
+        transaction.commit()?;
+        let mut result = vec![result];
+        attach_attention_tags(&self.connection, &mut result)?;
+        Ok(result.remove(0))
     }
 
     /// Settle an item. The row stays; only its state moves.
@@ -2117,7 +2234,9 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
-        Ok(result)
+        let mut result = vec![result];
+        attach_attention_tags(&self.connection, &mut result)?;
+        Ok(result.remove(0))
     }
 
     pub fn handoffs(

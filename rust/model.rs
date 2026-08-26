@@ -444,6 +444,8 @@ pub struct Attention {
     pub resolved_by: Option<String>,
     pub resolution: Option<String>,
     pub archived: bool,
+    /// Registered subsystem tags carried directly by this attention row.
+    pub tags: Vec<String>,
 }
 
 /// Receipt from one retention sweep.

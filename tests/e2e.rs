@@ -266,9 +266,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 8);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 8);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 15);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 15);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 15);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 16);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 16);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 16);
 }
 
 #[test]
@@ -564,6 +564,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
             ALTER TABLE attention DROP COLUMN priority;
             ALTER TABLE handoffs DROP COLUMN priority;
             ALTER TABLE rules DROP COLUMN task_tags;
+            DROP TABLE attention_tags;
             PRAGMA user_version=12;
             "#,
         )
@@ -583,7 +584,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     assert_eq!(
         reopened
@@ -1730,7 +1731,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 15"),
+        version.contains("board schema 16"),
         "version output: {version}"
     );
     assert!(
@@ -4930,6 +4931,9 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         &fixture.main,
         &["task", "add", "Work", "--id", "t-1", "--json"],
     );
+    for tag in ["infra", "ui"] {
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+    }
 
     let blocking = fixture.ok_json(
         &fixture.main,
@@ -4943,11 +4947,14 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "blocking",
             "--task",
             "t-1",
+            "--tag",
+            "infra",
             "--json",
         ],
     );
     assert_eq!(blocking["status"], "open");
     assert_eq!(blocking["taskID"], "t-1");
+    assert_eq!(blocking["tags"], json!(["infra"]));
     let approval = fixture.ok_json(
         &fixture.main,
         &[
@@ -4962,6 +4969,37 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         ],
     );
     assert!(approval["taskID"].is_null(), "an item may be about no task");
+    assert_eq!(approval["tags"], json!([]));
+
+    let retagged = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            blocking["id"].as_str().unwrap(),
+            "--as",
+            "claude/driver-2",
+            "--tag",
+            "ui",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    assert_eq!(retagged["tags"], json!(["infra", "ui"]));
+    let infra = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--tag", "infra", "--json"],
+    );
+    assert_eq!(infra.as_array().unwrap().len(), 1);
+    assert_eq!(infra[0]["id"], blocking["id"]);
+
+    let unknown_tag = fixture.run(
+        &fixture.main,
+        &["attention", "list", "--tag", "missing", "--json"],
+    );
+    assert!(!unknown_tag.status.success());
+    assert!(String::from_utf8_lossy(&unknown_tag.stderr).contains("master file"));
 
     // A kind outside the closed set is refused: "what sort of thing is this"
     // is the part a reader needs first, and free text would not answer it.
@@ -5017,6 +5055,21 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(settled["resolution"], "approved and pushed");
     assert!(!settled["resolvedAt"].is_null());
 
+    let rewrite_history = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            approval["id"].as_str().unwrap(),
+            "--as",
+            "someone-else",
+            "--clear-tags",
+            "--json",
+        ],
+    );
+    assert!(!rewrite_history.status.success());
+    assert!(String::from_utf8_lossy(&rewrite_history.stderr).contains("resolved history"));
+
     let still_there = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
     assert_eq!(
         still_there.as_array().unwrap().len(),
@@ -5066,6 +5119,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         .filter_map(|e| e["kind"].as_str())
         .collect::<Vec<_>>();
     assert!(kinds.contains(&"attention_raised"), "{kinds:?}");
+    assert!(kinds.contains(&"attention_updated"), "{kinds:?}");
     assert!(kinds.contains(&"attention_resolved"), "{kinds:?}");
 
     // An item about a removed task keeps its text, like a handoff does.
@@ -5411,6 +5465,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
             DROP INDEX idx_attention_task;
             DROP INDEX idx_attention_status_priority;
             DROP INDEX idx_task_tags_tag;
+            DROP TABLE attention_tags;
             ALTER TABLE tasks DROP COLUMN archived_at;
             ALTER TABLE tasks DROP COLUMN archived;
             ALTER TABLE task_notes DROP COLUMN archived;
@@ -5487,7 +5542,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     assert_eq!(
         connection

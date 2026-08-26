@@ -200,6 +200,20 @@ put credentials or secret values in the plaintext board database. See
 [ADR-018](docs/adr/ADR-018-project-rules-frame-work-without-replacing-private-memory.md)
 and [ADR-019](docs/adr/ADR-019-global-rules-frame-every-project-on-claim-and-resume.md).
 
+Attention rows carry the same registered subsystem vocabulary as tasks:
+
+```bash
+kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer
+kb att ls --status open --tag queuer
+kb att update a-12345678 --tag queuer --tag infra --as codex@driver
+kb att update a-12345678 --clear-tags --as codex@driver
+```
+
+Several tags describe several touched subsystems. Updating tags is allowed only
+while the item is open; resolving it freezes its classification with the rest
+of the historical receipt. Unknown tags are refused rather than producing an
+empty-looking filter result.
+
 ## Working from anywhere
 
 Boards are addressable from any directory, not only from inside the project

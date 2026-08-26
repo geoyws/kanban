@@ -723,6 +723,15 @@ ALTER TABLE rules ADD COLUMN task_tags TEXT NOT NULL DEFAULT '[]'
  CHECK(json_valid(task_tags) AND json_type(task_tags) = 'array');
 "#;
 
+const BOARD_V16: &str = r#"
+CREATE TABLE attention_tags (
+ attention_id TEXT NOT NULL REFERENCES attention(id) ON DELETE CASCADE,
+ tag TEXT NOT NULL REFERENCES tags(name) ON DELETE RESTRICT,
+ PRIMARY KEY(attention_id,tag)
+) STRICT;
+CREATE INDEX idx_attention_tags_tag ON attention_tags(tag);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -808,7 +817,7 @@ ALTER TABLE global_rules ADD COLUMN task_tags TEXT NOT NULL DEFAULT '[]'
  CHECK(json_valid(task_tags) AND json_type(task_tags) = 'array');
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 15;
+pub const BOARD_SCHEMA_VERSION: usize = 16;
 pub const REGISTRY_SCHEMA_VERSION: usize = 8;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -999,7 +1008,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15,
+            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;
