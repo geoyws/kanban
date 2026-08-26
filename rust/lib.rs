@@ -1361,13 +1361,24 @@ fn selected_board_name(args: &Args) -> Result<Option<String>> {
     Ok(registry.resolve(&workspace)?.map(|record| record.name))
 }
 
-fn effective_rule_summaries(args: &Args, store: &Store) -> Result<Vec<RuleSummary>> {
+fn effective_rule_summaries(
+    args: &Args,
+    store: &Store,
+    task_id: Option<&str>,
+) -> Result<Vec<RuleSummary>> {
     let board_name = selected_board_name(args)?;
     let mut rules = Registry::open()?.global_rule_summaries_for(board_name.as_deref(), false)?;
     rules.extend(store.rule_summaries(false)?);
-    // Storage lands before task-aware matching. Until the matching phase is
-    // deployed, omission is safe; broad injection of a scoped rule is not.
-    rules.retain(|rule| rule.task_tags.is_empty());
+    let task_tags = task_id
+        .map(|id| store.require_task(id).map(|task| task.tags))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    rules.retain(|rule| {
+        rule.task_tags.is_empty()
+            || (task_id.is_some() && rule.task_tags.iter().any(|tag| task_tags.contains(tag)))
+    });
     Ok(rules)
 }
 
@@ -2183,7 +2194,7 @@ fn run() -> Result<()> {
                 allow_reassign: args.has("allow-reassign"),
             },
         )?;
-        value.rules = effective_rule_summaries(&args, &store)?;
+        value.rules = effective_rule_summaries(&args, &store, Some(&value.claim.task_id))?;
         return print(&value, args.has("json"));
     }
     if command == "heartbeat" {
@@ -2297,7 +2308,11 @@ fn run() -> Result<()> {
             args.one("caller-scope"),
             git,
         )?;
-        let rules = effective_rule_summaries(&args, &store)?;
+        let rules = effective_rule_summaries(
+            &args,
+            &store,
+            claim.as_ref().map(|claim| claim.task_id.as_str()),
+        )?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),
             args.has("json"),
@@ -2481,7 +2496,7 @@ fn run() -> Result<()> {
     if command == "context" {
         let id = sub.context("task id is required")?;
         let mut packet = store.context_packet(id)?;
-        packet.rules = effective_rule_summaries(&args, &store)?;
+        packet.rules = effective_rule_summaries(&args, &store, Some(id))?;
         if args.has("json") {
             // --max-chars bounds the rendered text and has never had any
             // effect here, so accepting it silently handed back an unbounded

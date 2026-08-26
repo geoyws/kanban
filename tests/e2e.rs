@@ -7810,22 +7810,24 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
 }
 
 #[test]
-fn compiled_binary_stores_and_validates_task_scoped_rules_fail_closed() {
+fn compiled_binary_matches_task_scoped_rules_across_boards() {
     let fixture = Fixture::new("rule-task-tags");
     let second = fixture.root.join("second");
+    let third = fixture.root.join("third");
     fs::create_dir_all(&second).unwrap();
+    fs::create_dir_all(&third).unwrap();
     fixture.ok_json(
         &fixture.main,
         &["init", "--name", "RULE-TAGS-ONE", "--json"],
     );
     fixture.ok_json(&second, &["init", "--name", "RULE-TAGS-TWO", "--json"]);
+    fixture.ok_json(&third, &["init", "--name", "RULE-TAGS-THREE", "--json"]);
     for tag in ["infra", "queuer"] {
         fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
     }
-    fixture.ok_json(
-        &second,
-        &["tag", "add", "other-board-only", "--as", "geo", "--json"],
-    );
+    for cwd in [&fixture.main, &second, &third] {
+        fixture.ok_json(cwd, &["tag", "add", "shared", "--as", "geo", "--json"]);
+    }
 
     let scoped = fixture.ok_json(
         &fixture.main,
@@ -7854,13 +7856,20 @@ fn compiled_binary_stores_and_validates_task_scoped_rules_fail_closed() {
             "--global",
             "--as",
             "geo",
+            "--board",
+            "RULE-TAGS-ONE",
+            "--board",
+            "RULE-TAGS-TWO",
             "--tag",
-            "other-board-only",
+            "shared",
             "--json",
         ],
     );
-    assert_eq!(global["boardTags"], json!(["ALL"]));
-    assert_eq!(global["taskTags"], json!(["other-board-only"]));
+    assert_eq!(
+        global["boardTags"],
+        json!(["ONLY:RULE-TAGS-ONE", "ONLY:RULE-TAGS-TWO"])
+    );
+    assert_eq!(global["taskTags"], json!(["shared"]));
 
     for args in [
         vec![
@@ -7911,14 +7920,129 @@ fn compiled_binary_stores_and_validates_task_scoped_rules_fail_closed() {
         &fixture.main,
         &["claim", "t-tagged", "--as", "worker", "--json"],
     );
-    assert!(
+    assert_eq!(claim["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(claim["rules"][0]["id"], scoped["id"]);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["context", "t-tagged", "--json"])["rules"],
         claim["rules"]
+    );
+
+    for (cwd, id, should_match_global) in [
+        (&fixture.main, "t-shared-one", true),
+        (&second, "t-shared-two", true),
+        (&third, "t-shared-three", false),
+    ] {
+        fixture.ok_json(
+            cwd,
+            &["task", "add", id, "--id", id, "--tag", "shared", "--json"],
+        );
+        let tagged_claim = fixture.ok_json(cwd, &["claim", id, "--as", "worker", "--json"]);
+        let has_global = tagged_claim["rules"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|rule| rule["id"] != scoped["id"] && rule["id"] != global["id"]),
-        "storage-only release injected a task-scoped rule broadly: {claim}"
+            .any(|rule| rule["id"] == global["id"]);
+        assert_eq!(has_global, should_match_global, "claim: {tagged_claim}");
+        assert_eq!(
+            fixture.ok_json(cwd, &["context", id, "--json"])["rules"],
+            tagged_claim["rules"]
+        );
+    }
+
+    fixture.ok_json(
+        &second,
+        &["task", "add", "t-untagged", "--id", "t-untagged", "--json"],
     );
+    let untagged = fixture.ok_json(
+        &second,
+        &["claim", "t-untagged", "--as", "worker", "--json"],
+    );
+    assert!(untagged["rules"].as_array().unwrap().is_empty());
+
+    let session = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "outgoing",
+            "--to",
+            "incoming",
+            "--reason",
+            "session_end",
+            "--summary",
+            "Session boundary",
+            "--intent",
+            "Continue safely",
+            "--next-action",
+            "Read the board",
+            "--json",
+        ],
+    );
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            session["id"].as_str().unwrap(),
+            "--as",
+            "incoming",
+            "--json",
+        ],
+    );
+    assert!(accepted["rules"].as_array().unwrap().is_empty());
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Handoff-tagged work",
+            "--id",
+            "t-handoff-tagged",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    let outgoing = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-handoff-tagged", "--as", "outgoing", "--json"],
+    );
+    let task_handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-handoff-tagged",
+            "--lease",
+            outgoing["leaseToken"].as_str().unwrap(),
+            "--as",
+            "outgoing",
+            "--to",
+            "incoming",
+            "--summary",
+            "Transfer tagged work",
+            "--intent",
+            "Continue tagged work",
+            "--next-action",
+            "Accept the handoff",
+            "--json",
+        ],
+    );
+    let task_accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            task_handoff["id"].as_str().unwrap(),
+            "--as",
+            "incoming",
+            "--json",
+        ],
+    );
+    assert_eq!(task_accepted["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(task_accepted["rules"][0]["id"], scoped["id"]);
 
     let remove_in_use = fixture.run(
         &fixture.main,

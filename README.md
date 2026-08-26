@@ -187,9 +187,9 @@ exact registered board names. See
 Task-tag selectors are serialized as `taskTags`. Several are an OR set, while
 their result intersects the global rule's board scope. Project selectors must
 exist in that board's tag master; a global selector must be registered on at
-least one active board. Schema 15 stores and validates them but deliberately
-withholds tagged rules from injected context until task-aware matching lands:
-omitting a scoped rule is safer than accidentally applying it to every task.
+least one active board. Claims, task handoff acceptance and task context inject
+an active tagged rule only when the task carries at least one selector. A
+session handoff has no task context, so it receives only untagged rules.
 See [ADR-024](docs/adr/ADR-024-rules-target-task-tags-after-board-scope.md).
 
 Rules are retire-only and audited: updating records the prior body, retirement
