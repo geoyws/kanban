@@ -180,7 +180,7 @@ fn can_contain(parent_type: &str, child_type: &str) -> bool {
 /// Lowercase, digits and hyphens. The point of a registry is that one concept
 /// has one spelling, and `Infra` beside `infra` defeats it before anything else
 /// can — so the shape is fixed at the door rather than argued about later.
-fn validate_tag_name(name: &str) -> Result<String> {
+pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
     let name = nonempty(name, "tag name")?.to_owned();
     let shaped = name
         .chars()
@@ -192,6 +192,34 @@ fn validate_tag_name(name: &str) -> Result<String> {
         );
     }
     Ok(name)
+}
+
+fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<String>> {
+    let known = connection
+        .prepare("SELECT name FROM tags ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut canonical = Vec::new();
+    for tag in tags {
+        let tag = validate_tag_name(tag)?;
+        if !seen.insert(tag.clone()) {
+            bail!("rule task tag {tag:?} was given more than once");
+        }
+        if !known.contains(&tag) {
+            let borrowed = known.iter().map(String::as_str).collect::<Vec<_>>();
+            let suggestion = crate::nearest(&tag, &borrowed)
+                .map(|near| format!(", did you mean {near}?"))
+                .unwrap_or_default();
+            bail!(
+                "rule task tag {tag} is not in this board's master file{suggestion} — \
+                 register it first with `tag add {tag}`"
+            );
+        }
+        canonical.push(tag);
+    }
+    canonical.sort();
+    Ok(canonical)
 }
 
 /// Attach registered tags to rows that were already read.
@@ -423,6 +451,7 @@ fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         board_tags: None,
+        task_tags: parse_strings(row.get("task_tags")?),
     })
 }
 
@@ -1633,6 +1662,19 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rule_uses: i64 = transaction.query_row(
+            "SELECT count(*) FROM rules r, json_each(r.task_tags) j \
+             WHERE r.archived=0 AND j.value=?",
+            [name],
+            |row| row.get(0),
+        )?;
+        if rule_uses > 0 {
+            bail!(
+                "tag {name} scopes {rule_uses} active rule{}; update or retire those rules before \
+                 removing the master entry, because stripping it would silently widen their scope",
+                if rule_uses == 1 { "" } else { "s" }
+            );
+        }
         let uses: i64 = transaction.query_row(
             "SELECT count(*) FROM task_tags WHERE tag=?",
             [name],
@@ -1662,8 +1704,9 @@ impl Store {
     }
 
     /// Add an operator rule at the end of this board's rule document.
-    pub fn add_rule(&mut self, body: &str, actor: &str) -> Result<Rule> {
+    pub fn add_rule(&mut self, body: &str, actor: &str, task_tags: &[String]) -> Result<Rule> {
         validate_rule_body(body)?;
+        let task_tags = validate_rule_tags(&self.connection, task_tags)?;
         let body = body.to_owned();
         let actor = validate_rule_actor(actor)?.to_owned();
         let id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -1674,15 +1717,15 @@ impl Store {
             transaction.query_row("SELECT max(created_at) FROM rules", [], |row| row.get(0))?;
         let now = now_ms().max(previous_created.unwrap_or(0).saturating_add(1));
         transaction.execute(
-            "INSERT INTO rules(id,body,author,archived,created_at,updated_at) VALUES(?,?,?,0,?,?)",
-            params![id, body, actor, now, now],
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES(?,?,?,0,?,?,?)",
+            params![id, body, actor, now, now, serde_json::to_string(&task_tags)?],
         )?;
         event(
             &transaction,
             None,
             "rule_added",
             Some(&actor),
-            json!({"ruleID": id}),
+            json!({"ruleID": id, "taskTags": task_tags}),
         )?;
         let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [&id], rule_row)?;
         transaction.commit()?;
@@ -1727,6 +1770,7 @@ impl Store {
                     has_more,
                     bytes: rule.body.len(),
                     board_tags: None,
+                    task_tags: rule.task_tags,
                 })
             })
             .collect()
@@ -1740,27 +1784,58 @@ impl Store {
     }
 
     /// Revise a rule without destroying the text it replaced.
-    pub fn update_rule(&mut self, id: &str, body: &str, actor: &str) -> Result<Rule> {
-        validate_rule_body(body)?;
-        let body = body.to_owned();
+    pub fn update_rule(
+        &mut self,
+        id: &str,
+        body: Option<&str>,
+        task_tags: Option<&[String]>,
+        actor: &str,
+    ) -> Result<Rule> {
+        if body.is_none() && task_tags.is_none() {
+            bail!("rule update requires --body/--body-file, --tag, or --clear-tags");
+        }
+        if let Some(body) = body {
+            validate_rule_body(body)?;
+        }
+        let task_tags = task_tags
+            .map(|tags| validate_rule_tags(&self.connection, tags))
+            .transpose()?;
         let actor = validate_rule_actor(actor)?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<String> = transaction
-            .query_row("SELECT body FROM rules WHERE id=?", [id], |row| row.get(0))
+        let previous: Option<Rule> = transaction
+            .query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)
             .optional()?;
         let previous = previous.with_context(|| format!("rule {id} not found"))?;
         transaction.execute(
-            "UPDATE rules SET body=?,author=?,updated_at=? WHERE id=?",
-            params![body, actor, now_ms(), id],
+            "UPDATE rules SET body=?,task_tags=?,author=?,updated_at=? WHERE id=?",
+            params![
+                body.unwrap_or(&previous.body),
+                serde_json::to_string(task_tags.as_deref().unwrap_or(&previous.task_tags))?,
+                actor,
+                now_ms(),
+                id
+            ],
         )?;
+        let mut changed = Vec::new();
+        if body.is_some() {
+            changed.push("body");
+        }
+        if task_tags.is_some() {
+            changed.push("taskTags");
+        }
         event(
             &transaction,
             None,
             "rule_updated",
             Some(&actor),
-            json!({"ruleID": id, "previousBody": previous}),
+            json!({
+                "ruleID": id,
+                "previousBody": previous.body,
+                "previousTaskTags": previous.task_tags,
+                "changed": changed,
+            }),
         )?;
         let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
         transaction.commit()?;

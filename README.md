@@ -164,6 +164,11 @@ kb ev --global --rule g-12345678 # audited revision/retirement trail
 # Target one or more boards, or every board except named boards.
 kb r new "Kanban-only rule." --global --board kanban --as geo
 kb r new "Everywhere except project-a." --global --except-board project-a --as geo
+
+# Narrow either kind to tasks carrying at least one named subsystem tag.
+kb r new "Queuer-specific rule." --tag queuer --as geo
+kb r new "Aix rule across boards." --global --tag aix --as geo
+kb r up r-12345678 --clear-tags --as geo
 ```
 
 The first line is the headline. Every context packet, newly granted claim and
@@ -178,6 +183,14 @@ Every global rule has explicit `boardTags`. Omitted targeting defaults to
 `ALL, EXCEPT:<board>`. `--board` and `--except-board` are repeatable and accept
 exact registered board names. See
 [ADR-020](docs/adr/ADR-020-global-rules-use-explicit-board-tags.md).
+
+Task-tag selectors are serialized as `taskTags`. Several are an OR set, while
+their result intersects the global rule's board scope. Project selectors must
+exist in that board's tag master; a global selector must be registered on at
+least one active board. Schema 15 stores and validates them but deliberately
+withholds tagged rules from injected context until task-aware matching lands:
+omitting a scoped rule is safer than accidentally applying it to every task.
+See [ADR-024](docs/adr/ADR-024-rules-target-task-tags-after-board-scope.md).
 
 Rules are retire-only and audited: updating records the prior body, retirement
 removes a rule from active contexts without deleting it, and there is no `rm`

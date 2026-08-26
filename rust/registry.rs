@@ -1,5 +1,8 @@
-use crate::db::{checkpoint, create_backup_target, integrity, open_registry, own_private_dir};
+use crate::db::{
+    checkpoint, create_backup_target, integrity, open_board, open_registry, own_private_dir,
+};
 use crate::model::{Event, ProjectRecord, Rule, RuleSummary, UnreachableRoot, WorkspaceRecord};
+use crate::store::validate_tag_name;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::json;
@@ -39,6 +42,14 @@ fn global_rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
             Box::new(error),
         )
     })?;
+    let encoded_task_tags: String = record.get("task_tags")?;
+    let task_tags = serde_json::from_str(&encoded_task_tags).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            encoded_task_tags.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
     Ok(Rule {
         id: record.get("id")?,
         body: record.get("body")?,
@@ -47,6 +58,7 @@ fn global_rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
         created_at: record.get("created_at")?,
         updated_at: record.get("updated_at")?,
         board_tags: Some(board_tags),
+        task_tags,
     })
 }
 
@@ -452,13 +464,54 @@ impl Registry {
         Ok(tags)
     }
 
+    /// Validate global task-tag selectors against the union of active board
+    /// master files. The canonical name is the cross-board matching key; each
+    /// board still owns its description and decides whether it registers it.
+    pub fn canonical_rule_task_tags(&self, tags: &[String]) -> Result<Vec<String>> {
+        let mut known = HashSet::new();
+        for project in self.projects()? {
+            let path = Path::new(&project.board_path);
+            if !path.is_file() {
+                continue;
+            }
+            let connection = open_board(path)?;
+            let mut statement = connection.prepare("SELECT name FROM tags ORDER BY name")?;
+            for name in statement.query_map([], |row| row.get::<_, String>(0))? {
+                known.insert(name?);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut canonical = Vec::new();
+        for tag in tags {
+            let tag = validate_tag_name(tag)?;
+            if !seen.insert(tag.clone()) {
+                bail!("global rule task tag {tag:?} was given more than once");
+            }
+            if !known.contains(&tag) {
+                let mut borrowed = known.iter().map(String::as_str).collect::<Vec<_>>();
+                borrowed.sort_unstable();
+                let suggestion = crate::nearest(&tag, &borrowed)
+                    .map(|near| format!(", did you mean {near}?"))
+                    .unwrap_or_default();
+                bail!(
+                    "global rule task tag {tag} is not registered on any active board{suggestion}"
+                );
+            }
+            canonical.push(tag);
+        }
+        canonical.sort();
+        Ok(canonical)
+    }
+
     pub fn add_global_rule(
         &mut self,
         body: &str,
         actor: &str,
         board_tags: &[String],
+        task_tags: &[String],
     ) -> Result<Rule> {
         validate_rule_body(body)?;
+        let task_tags = self.canonical_rule_task_tags(task_tags)?;
         let actor = validate_rule_actor(actor)?.to_owned();
         let id = format!("g-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let transaction = self
@@ -470,12 +523,12 @@ impl Registry {
             })?;
         let now = now_ms().max(previous.unwrap_or(0).saturating_add(1));
         transaction.execute(
-            "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags) VALUES(?,?,?,0,?,?,?)",
-            params![id, body, actor, now, now, serde_json::to_string(board_tags)?],
+            "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags,task_tags) VALUES(?,?,?,0,?,?,?,?)",
+            params![id, body, actor, now, now, serde_json::to_string(board_tags)?, serde_json::to_string(&task_tags)?],
         )?;
         transaction.execute(
             "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-            params![id, "global_rule_added", actor, json!({"ruleID": id, "boardTags": board_tags}).to_string(), now],
+            params![id, "global_rule_added", actor, json!({"ruleID": id, "boardTags": board_tags, "taskTags": task_tags}).to_string(), now],
         )?;
         let rule = transaction.query_row(
             "SELECT * FROM global_rules WHERE id=?",
@@ -524,6 +577,7 @@ impl Registry {
                     has_more,
                     bytes: rule.body.len(),
                     board_tags: rule.board_tags,
+                    task_tags: rule.task_tags,
                 })
             })
             .collect()
@@ -569,14 +623,20 @@ impl Registry {
         id: &str,
         body: Option<&str>,
         board_tags: Option<&[String]>,
+        task_tags: Option<&[String]>,
         actor: &str,
     ) -> Result<Rule> {
-        if body.is_none() && board_tags.is_none() {
-            bail!("global rule update requires --body/--body-file, --board, or --except-board");
+        if body.is_none() && board_tags.is_none() && task_tags.is_none() {
+            bail!(
+                "global rule update requires --body/--body-file, --board/--except-board, --tag, or --clear-tags"
+            );
         }
         if let Some(body) = body {
             validate_rule_body(body)?;
         }
+        let task_tags = task_tags
+            .map(|tags| self.canonical_rule_task_tags(tags))
+            .transpose()?;
         let actor = validate_rule_actor(actor)?.to_owned();
         let transaction = self
             .connection
@@ -591,12 +651,13 @@ impl Registry {
         let previous = previous.with_context(|| format!("global rule {id} not found"))?;
         let now = now_ms();
         transaction.execute(
-            "UPDATE global_rules SET body=?,board_tags=?,author=?,updated_at=? WHERE id=?",
+            "UPDATE global_rules SET body=?,board_tags=?,task_tags=?,author=?,updated_at=? WHERE id=?",
             params![
                 body.unwrap_or(&previous.body),
                 serde_json::to_string(
                     board_tags.unwrap_or(previous.board_tags.as_deref().unwrap_or(&[]))
                 )?,
+                serde_json::to_string(task_tags.as_deref().unwrap_or(&previous.task_tags))?,
                 actor,
                 now,
                 id
@@ -609,12 +670,16 @@ impl Registry {
         if board_tags.is_some() {
             changed.push("boardTags");
         }
+        if task_tags.is_some() {
+            changed.push("taskTags");
+        }
         transaction.execute(
             "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
             params![id, "global_rule_updated", actor, json!({
                 "ruleID": id,
                 "previousBody": previous.body,
                 "previousBoardTags": previous.board_tags,
+                "previousTaskTags": previous.task_tags,
                 "changed": changed,
             }).to_string(), now],
         )?;

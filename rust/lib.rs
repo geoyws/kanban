@@ -71,10 +71,11 @@ Usage:
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
   kanban tag list [--json]
   kanban tag remove NAME [--force] [--as ACTOR] [--json]
-  kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR [--json]
+  kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR [--tag NAME ...] [--json]
   kanban rule list [--all] [--full] [--json]
   kanban rule show ID [--json]
-  kanban rule update ID [--body TEXT | --body-file PATH] --as ACTOR [--json]
+  kanban rule update ID [--body TEXT | --body-file PATH] [--tag NAME ... | --clear-tags]
+             --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--priority P0|P1|P2|0-9]
@@ -430,7 +431,15 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("add"),
-        &["as", "body", "body-file", "global", "board", "except-board"],
+        &[
+            "as",
+            "body",
+            "body-file",
+            "global",
+            "board",
+            "except-board",
+            "tag",
+        ],
         &["?body"],
         false,
     ),
@@ -439,7 +448,16 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("update"),
-        &["as", "body", "body-file", "global", "board", "except-board"],
+        &[
+            "as",
+            "body",
+            "body-file",
+            "global",
+            "board",
+            "except-board",
+            "tag",
+            "clear-tags",
+        ],
         &["id"],
         false,
     ),
@@ -1347,6 +1365,9 @@ fn effective_rule_summaries(args: &Args, store: &Store) -> Result<Vec<RuleSummar
     let board_name = selected_board_name(args)?;
     let mut rules = Registry::open()?.global_rule_summaries_for(board_name.as_deref(), false)?;
     rules.extend(store.rule_summaries(false)?);
+    // Storage lands before task-aware matching. Until the matching phase is
+    // deployed, omission is safe; broad injection of a scoped rule is not.
+    rules.retain(|rule| rule.task_tags.is_empty());
     Ok(rules)
 }
 
@@ -1869,8 +1890,9 @@ fn run() -> Result<()> {
             };
             let board_tags =
                 registry.canonical_board_tags(&args.many("board"), &args.many("except-board"))?;
+            let task_tags = registry.canonical_rule_task_tags(&args.many("tag"))?;
             return print(
-                &registry.add_global_rule(body, args.require("as")?, &board_tags)?,
+                &registry.add_global_rule(body, args.require("as")?, &board_tags, &task_tags)?,
                 args.has("json"),
             );
         }
@@ -1890,6 +1912,9 @@ fn run() -> Result<()> {
             );
         }
         if sub == Some("update") {
+            if args.has("tag") && args.has("clear-tags") {
+                bail!("--tag and --clear-tags are mutually exclusive");
+            }
             let id = rest.first().context("rule id is required")?;
             let body = args.body()?;
             let targets_changed = args.has("board") || args.has("except-board");
@@ -1898,11 +1923,19 @@ fn run() -> Result<()> {
                     registry.canonical_board_tags(&args.many("board"), &args.many("except-board"))
                 })
                 .transpose()?;
+            let task_tags = if args.has("clear-tags") {
+                Some(Vec::new())
+            } else if args.has("tag") {
+                Some(registry.canonical_rule_task_tags(&args.many("tag"))?)
+            } else {
+                None
+            };
             return print(
                 &registry.update_global_rule(
                     id,
                     body.as_deref(),
                     board_tags.as_deref(),
+                    task_tags.as_deref(),
                     args.require("as")?,
                 )?,
                 args.has("json"),
@@ -2334,7 +2367,7 @@ fn run() -> Result<()> {
             (None, None) => bail!("rule body is required"),
         };
         return print(
-            &store.add_rule(body, args.require("as")?)?,
+            &store.add_rule(body, args.require("as")?, &args.many("tag"))?,
             args.has("json"),
         );
     }
@@ -2349,10 +2382,25 @@ fn run() -> Result<()> {
         return print(&store.rule(id)?, args.has("json"));
     }
     if command == "rule" && sub == Some("update") {
+        if args.has("tag") && args.has("clear-tags") {
+            bail!("--tag and --clear-tags are mutually exclusive");
+        }
         let id = rest.first().context("rule id is required")?;
-        let body = args.body()?.context("--body or --body-file is required")?;
+        let body = args.body()?;
+        let task_tags = if args.has("clear-tags") {
+            Some(Vec::new())
+        } else if args.has("tag") {
+            Some(args.many("tag"))
+        } else {
+            None
+        };
         return print(
-            &store.update_rule(id, &body, args.require("as")?)?,
+            &store.update_rule(
+                id,
+                body.as_deref(),
+                task_tags.as_deref(),
+                args.require("as")?,
+            )?,
             args.has("json"),
         );
     }

@@ -718,6 +718,11 @@ CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_
 CREATE INDEX idx_handoffs_status_priority ON handoffs(status,priority,created_at,id) WHERE archived=0;
 "#;
 
+const BOARD_V15: &str = r#"
+ALTER TABLE rules ADD COLUMN task_tags TEXT NOT NULL DEFAULT '[]'
+ CHECK(json_valid(task_tags) AND json_type(task_tags) = 'array');
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -798,8 +803,13 @@ CREATE TABLE workspace_alias_history (
 CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 14;
-pub const REGISTRY_SCHEMA_VERSION: usize = 7;
+const REGISTRY_V8: &str = r#"
+ALTER TABLE global_rules ADD COLUMN task_tags TEXT NOT NULL DEFAULT '[]'
+ CHECK(json_valid(task_tags) AND json_type(task_tags) = 'array');
+"#;
+
+pub const BOARD_SCHEMA_VERSION: usize = 15;
+pub const REGISTRY_SCHEMA_VERSION: usize = 8;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -989,7 +999,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
         &mut connection,
         &[
             BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14,
+            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15,
         ],
     );
     connection.pragma_update(None, "foreign_keys", true)?;
@@ -1009,6 +1019,7 @@ pub fn open_registry(path: &Path) -> Result<Connection> {
             REGISTRY_V5,
             REGISTRY_V6,
             REGISTRY_V7,
+            REGISTRY_V8,
         ],
     )?;
     Ok(connection)

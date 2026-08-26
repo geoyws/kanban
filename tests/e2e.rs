@@ -264,11 +264,11 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 7);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 7);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 14);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 14);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 14);
+    assert_eq!(doctor["registrySchemaVersion"], 8);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 8);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 15);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 15);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 15);
 }
 
 #[test]
@@ -563,6 +563,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
             DROP INDEX idx_handoffs_status_priority;
             ALTER TABLE attention DROP COLUMN priority;
             ALTER TABLE handoffs DROP COLUMN priority;
+            ALTER TABLE rules DROP COLUMN task_tags;
             PRAGMA user_version=12;
             "#,
         )
@@ -582,7 +583,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
     assert_eq!(
         reopened
@@ -1729,11 +1730,11 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 14"),
+        version.contains("board schema 15"),
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 7"),
+        version.contains("registry schema 8"),
         "version output: {version}"
     );
 }
@@ -5486,7 +5487,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
     assert_eq!(
         connection
@@ -7809,6 +7810,155 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
 }
 
 #[test]
+fn compiled_binary_stores_and_validates_task_scoped_rules_fail_closed() {
+    let fixture = Fixture::new("rule-task-tags");
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&second).unwrap();
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "RULE-TAGS-ONE", "--json"],
+    );
+    fixture.ok_json(&second, &["init", "--name", "RULE-TAGS-TWO", "--json"]);
+    for tag in ["infra", "queuer"] {
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+    }
+    fixture.ok_json(
+        &second,
+        &["tag", "add", "other-board-only", "--as", "geo", "--json"],
+    );
+
+    let scoped = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Only tagged task context.",
+            "--as",
+            "geo",
+            "--tag",
+            "queuer",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    assert_eq!(scoped["taskTags"], json!(["infra", "queuer"]));
+    assert_eq!(scoped["boardTags"], Value::Null);
+
+    let global = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Cross-board selector.",
+            "--global",
+            "--as",
+            "geo",
+            "--tag",
+            "other-board-only",
+            "--json",
+        ],
+    );
+    assert_eq!(global["boardTags"], json!(["ALL"]));
+    assert_eq!(global["taskTags"], json!(["other-board-only"]));
+
+    for args in [
+        vec![
+            "rule",
+            "add",
+            "Unknown project tag.",
+            "--as",
+            "geo",
+            "--tag",
+            "missing",
+            "--json",
+        ],
+        vec![
+            "rule",
+            "add",
+            "Unknown global tag.",
+            "--global",
+            "--as",
+            "geo",
+            "--tag",
+            "missing",
+            "--json",
+        ],
+    ] {
+        let refused = fixture.run(&fixture.main, &args);
+        assert!(!refused.status.success(), "accepted {args:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("missing"),
+            "stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Tagged work",
+            "--id",
+            "t-tagged",
+            "--tag",
+            "queuer",
+            "--json",
+        ],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-tagged", "--as", "worker", "--json"],
+    );
+    assert!(
+        claim["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rule| rule["id"] != scoped["id"] && rule["id"] != global["id"]),
+        "storage-only release injected a task-scoped rule broadly: {claim}"
+    );
+
+    let remove_in_use = fixture.run(
+        &fixture.main,
+        &["tag", "remove", "infra", "--as", "geo", "--force", "--json"],
+    );
+    assert!(
+        !remove_in_use.status.success(),
+        "force removed a tag that still scopes an active rule"
+    );
+    assert!(
+        String::from_utf8_lossy(&remove_in_use.stderr).contains("silently widen"),
+        "stderr: {}",
+        String::from_utf8_lossy(&remove_in_use.stderr)
+    );
+
+    let updated = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            scoped["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--clear-tags",
+            "--json",
+        ],
+    );
+    assert_eq!(updated["body"], "Only tagged task context.");
+    assert_eq!(updated["taskTags"], json!([]));
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--rule", scoped["id"].as_str().unwrap(), "--json"],
+    );
+    assert_eq!(
+        events[0]["payload"]["previousTaskTags"],
+        json!(["infra", "queuer"])
+    );
+}
+
+#[test]
 fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
     let fixture = Fixture::new("global-rule-target-migration");
     fs::create_dir_all(&fixture.data).unwrap();
@@ -7853,7 +8003,7 @@ fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
 }
 
