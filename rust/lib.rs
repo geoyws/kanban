@@ -74,10 +74,12 @@ Usage:
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
   kanban tag list [--json]
   kanban tag remove NAME [--force] [--as ACTOR] [--json]
-  kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR [--tag NAME ...] [--json]
+  kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR
+             [--board NAME ... | --except-board NAME ...] [--tag NAME ...] [--json]
   kanban rule list [--all] [--full] [--json]
   kanban rule show ID [--json]
-  kanban rule update ID [--body TEXT | --body-file PATH] [--tag NAME ... | --clear-tags]
+  kanban rule update ID [--body TEXT | --body-file PATH]
+             [--board NAME ... | --except-board NAME ...] [--tag NAME ... | --clear-tags]
              --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
   kanban rule consolidate --as ACTOR [--json]
@@ -118,7 +120,7 @@ Aliases (the binary installs as both `kanban` and `kb`):
   story:     adv=advance
   handoff:   ls=list  new=create  acc=accept
   workspace: ls=list  att=attach  det=detach
-  rule:      ls=list  new=add  up=update  cat=show; --global manages inherited rules
+  rule:      ls=list  new=add  up=update  cat=show
              repeat --board NAME; --except-board NAME means ALL except that board
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
@@ -127,7 +129,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 25] = [
+pub(crate) const BOOLEAN: [&str; 24] = [
     "help",
     "json",
     "version",
@@ -151,9 +153,12 @@ pub(crate) const BOOLEAN: [&str; 25] = [
     "verify",
     "all",
     "full",
-    "global",
     "all-boards",
 ];
+
+/// Removed boolean flags that remain recognizable only to return an actionable
+/// migration diagnostic instead of consuming the next positional as a value.
+const DEPRECATED_BOOLEAN: [&str; 1] = ["global"];
 
 /// Flags that may be given more than once, because their value is a list.
 ///
@@ -443,20 +448,12 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("add"),
-        &[
-            "as",
-            "body",
-            "body-file",
-            "global",
-            "board",
-            "except-board",
-            "tag",
-        ],
+        &["as", "body", "body-file", "board", "except-board", "tag"],
         &["?body"],
         false,
     ),
-    ("rule", Some("list"), &["all", "full", "global"], &[], true),
-    ("rule", Some("show"), &["global"], &["id"], true),
+    ("rule", Some("list"), &["all", "full"], &[], true),
+    ("rule", Some("show"), &[], &["id"], true),
     (
         "rule",
         Some("update"),
@@ -464,7 +461,6 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "as",
             "body",
             "body-file",
-            "global",
             "board",
             "except-board",
             "tag",
@@ -473,7 +469,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id"],
         false,
     ),
-    ("rule", Some("retire"), &["as", "global"], &["id"], false),
+    ("rule", Some("retire"), &["as"], &["id"], false),
     ("rule", Some("consolidate"), &["as"], &[], false),
     (
         "attention",
@@ -521,7 +517,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "events",
         None,
-        &["task", "rule", "kind", "limit", "global", "all"],
+        &["task", "rule", "kind", "limit", "all"],
         &[],
         true,
     ),
@@ -648,7 +644,7 @@ impl Args {
                 .map_or((raw, None), |(a, b)| (a, Some(b)));
             let item = if let Some(value) = inline {
                 value.to_owned()
-            } else if BOOLEAN.contains(&name) {
+            } else if BOOLEAN.contains(&name) || DEPRECATED_BOOLEAN.contains(&name) {
                 "true".to_owned()
             } else {
                 index += 1;
@@ -1289,7 +1285,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
         bail!("--after must not be later than --before");
     }
     if let Some(source) = args.one("source") {
-        const SOURCES: [&str; 9] = [
+        const SOURCES: [&str; 8] = [
             "task",
             "note",
             "checkpoint",
@@ -1297,7 +1293,6 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
             "attention",
             "sitrep",
             "rule",
-            "global-rule",
             "event",
         ];
         if !SOURCES.contains(&source) {
@@ -1335,8 +1330,8 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
             results.extend(store.search(&project.name, &options)?);
             boards.push(project.name);
         }
-        results.extend(search::search_global_rules(
-            &registry.global_rules(options.include_archived)?,
+        results.extend(search::search_rules(
+            &registry.rules(options.include_archived)?,
             &options,
         ));
         let mut seen = HashSet::new();
@@ -1359,8 +1354,8 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
         .or(store.board_name()?)
         .unwrap_or_else(|| "unregistered".to_owned());
     let mut results = store.search(&board, &options)?;
-    results.extend(search::search_global_rules(
-        &registry.global_rules_for(board_name.as_deref(), options.include_archived)?,
+    results.extend(search::search_rules(
+        &registry.rules_targeting_board(board_name.as_deref(), options.include_archived)?,
         &options,
     ));
     Ok(search::bound_receipt(
@@ -1397,8 +1392,8 @@ fn rebuild_search_command(args: &Args) -> Result<Value> {
     Ok(serde_json::to_value(store.rebuild_search(&board, actor)?)?)
 }
 
-/// Global rules frame every board and always precede its local rules. Bodies
-/// remain lazy; this is only the complete table of contents.
+/// Rules are one registry-owned document. Bodies remain lazy; this is only the
+/// applicable table of contents for the addressed board and optional task.
 fn selected_board_name(args: &Args) -> Result<Option<String>> {
     let mut registry = Registry::open()?;
     if let Some(path) = direct_db(args) {
@@ -1435,34 +1430,17 @@ fn effective_rule_summaries(
     task_id: Option<&str>,
 ) -> Result<Vec<RuleSummary>> {
     let board_name = selected_board_name(args)?;
-    let mut rules = Registry::open()?.global_rule_summaries_for(board_name.as_deref(), false)?;
-    rules.extend(store.rule_summaries(false)?);
     let task_tags = task_id
         .map(|id| store.require_task(id).map(|task| task.tags))
         .transpose()?
         .unwrap_or_default()
         .into_iter()
         .collect::<HashSet<_>>();
-    rules.retain(|rule| {
-        rule.task_tags.is_empty()
-            || (task_id.is_some() && rule.task_tags.iter().any(|tag| task_tags.contains(tag)))
-    });
-    Ok(rules)
-}
-
-fn reject_global_board_selectors(args: &Args) -> Result<()> {
-    let selectors = BOARD_SELECTORS
-        .iter()
-        .filter(|name| args.flags.contains_key(**name))
-        .map(|name| format!("--{name}"))
-        .collect::<Vec<_>>();
-    if !selectors.is_empty() {
-        bail!(
-            "--global addresses registry-wide state; it cannot be combined with {}",
-            selectors.join(" or ")
-        );
-    }
-    Ok(())
+    Registry::open()?.applicable_rule_summaries(
+        board_name.as_deref(),
+        task_id.map(|_| &task_tags),
+        false,
+    )
 }
 
 fn option_string(args: &Args, name: &str) -> Option<String> {
@@ -1673,6 +1651,10 @@ fn run() -> Result<()> {
     // can print there, and it resolves each call's board per call instead.
     if command == "mcp" {
         return mcp::serve();
+    }
+
+    if args.has("global") && (command == "rule" || command == "events") {
+        bail!("--global is superseded; all /kb rules are one tag-scoped collection");
     }
 
     let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
@@ -1952,23 +1934,24 @@ fn run() -> Result<()> {
         );
     }
 
-    if command == "events" && args.has("global") {
-        reject_global_board_selectors(&args)?;
+    if command == "events" && args.one("rule").is_some() {
         if args.has("task") {
-            bail!("--task addresses a project event; use --rule ID with --global");
+            bail!("--task and --rule address different event trails; pass one");
         }
         return print(
-            &Registry::open()?.global_rule_events(
-                args.one("rule"),
-                args.one("kind"),
-                args.limit(50)?,
-            )?,
+            &Registry::open()?.rule_events(args.one("rule"), args.one("kind"), args.limit(50)?)?,
             args.has("json"),
         );
     }
 
-    if command == "rule" && args.has("global") {
-        reject_global_board_selectors(&args)?;
+    if command == "rule" {
+        for flag in ["project", "workspace", "db"] {
+            if args.has(flag) {
+                bail!(
+                    "rules are registry-owned and tag-scoped; --{flag} does not select a rule collection"
+                );
+            }
+        }
         let mut registry = Registry::open()?;
         if sub == Some("add") {
             let flagged = args.body()?;
@@ -1981,26 +1964,25 @@ fn run() -> Result<()> {
                 (None, Some(body)) => body,
                 (None, None) => bail!("rule body is required"),
             };
-            let board_tags =
-                registry.canonical_board_tags(&args.many("board"), &args.many("except-board"))?;
-            let task_tags = registry.canonical_rule_task_tags(&args.many("tag"))?;
+            let tags = registry.canonical_rule_tags(
+                &args.many("board"),
+                &args.many("except-board"),
+                &args.many("tag"),
+            )?;
             return print(
-                &registry.add_global_rule(body, args.require("as")?, &board_tags, &task_tags)?,
+                &registry.add_rule(body, args.require("as")?, &tags)?,
                 args.has("json"),
             );
         }
         if sub == Some("list") {
             if args.has("full") {
-                return print(&registry.global_rules(args.has("all"))?, args.has("json"));
+                return print(&registry.rules(args.has("all"))?, args.has("json"));
             }
-            return print(
-                &registry.global_rule_summaries(args.has("all"))?,
-                args.has("json"),
-            );
+            return print(&registry.rule_summaries(args.has("all"))?, args.has("json"));
         }
         if sub == Some("show") {
             return print(
-                &registry.global_rule(rest.first().context("rule id is required")?)?,
+                &registry.rule(rest.first().context("rule id is required")?)?,
                 args.has("json"),
             );
         }
@@ -2011,12 +1993,12 @@ fn run() -> Result<()> {
             let id = rest.first().context("rule id is required")?;
             let body = args.body()?;
             let targets_changed = args.has("board") || args.has("except-board");
-            let board_tags = targets_changed
+            let selector_tags = targets_changed
                 .then(|| {
                     registry.canonical_board_tags(&args.many("board"), &args.many("except-board"))
                 })
                 .transpose()?;
-            let task_tags = if args.has("clear-tags") {
+            let subsystem_tags = if args.has("clear-tags") {
                 Some(Vec::new())
             } else if args.has("tag") {
                 Some(registry.canonical_rule_task_tags(&args.many("tag"))?)
@@ -2024,11 +2006,11 @@ fn run() -> Result<()> {
                 None
             };
             return print(
-                &registry.update_global_rule(
+                &registry.update_rule(
                     id,
                     body.as_deref(),
-                    board_tags.as_deref(),
-                    task_tags.as_deref(),
+                    selector_tags.as_deref(),
+                    subsystem_tags.as_deref(),
                     args.require("as")?,
                 )?,
                 args.has("json"),
@@ -2036,17 +2018,13 @@ fn run() -> Result<()> {
         }
         if sub == Some("retire") {
             return print(
-                &registry.retire_global_rule(
+                &registry.retire_rule(
                     rest.first().context("rule id is required")?,
                     args.require("as")?,
                 )?,
                 args.has("json"),
             );
         }
-    }
-
-    if command == "rule" && (args.has("board") || args.has("except-board")) {
-        bail!("--board and --except-board target global rules; add --global");
     }
 
     if command == "search" {
@@ -2480,64 +2458,19 @@ fn run() -> Result<()> {
     }
     if command == "tag" && sub == Some("remove") {
         let name = rest.first().context("tag name is required")?;
+        let rule_uses = Registry::open()?
+            .rules(false)?
+            .iter()
+            .filter(|rule| rule.tags.iter().any(|tag| tag == name))
+            .count();
+        if rule_uses > 0 {
+            bail!(
+                "tag {name} scopes {rule_uses} active rule{}; update or retire those rules before removing the master entry, because stripping it would silently widen their scope",
+                if rule_uses == 1 { "" } else { "s" }
+            );
+        }
         store.remove_tag(name, args.one("as"), args.has("force"))?;
         return print(&json!({ "removed": name }), args.has("json"));
-    }
-    if command == "rule" && sub == Some("add") {
-        let flagged = args.body()?;
-        let positional = rest.first();
-        let body = match (positional, flagged.as_deref()) {
-            (Some(_), Some(_)) => {
-                bail!("rule body was given as both a positional and --body/--body-file; pass one")
-            }
-            (Some(body), None) => body.as_str(),
-            (None, Some(body)) => body,
-            (None, None) => bail!("rule body is required"),
-        };
-        return print(
-            &store.add_rule(body, args.require("as")?, &args.many("tag"))?,
-            args.has("json"),
-        );
-    }
-    if command == "rule" && sub == Some("list") {
-        if args.has("full") {
-            return print(&store.rules(args.has("all"))?, args.has("json"));
-        }
-        return print(&store.rule_summaries(args.has("all"))?, args.has("json"));
-    }
-    if command == "rule" && sub == Some("show") {
-        let id = rest.first().context("rule id is required")?;
-        return print(&store.rule(id)?, args.has("json"));
-    }
-    if command == "rule" && sub == Some("update") {
-        if args.has("tag") && args.has("clear-tags") {
-            bail!("--tag and --clear-tags are mutually exclusive");
-        }
-        let id = rest.first().context("rule id is required")?;
-        let body = args.body()?;
-        let task_tags = if args.has("clear-tags") {
-            Some(Vec::new())
-        } else if args.has("tag") {
-            Some(args.many("tag"))
-        } else {
-            None
-        };
-        return print(
-            &store.update_rule(
-                id,
-                body.as_deref(),
-                task_tags.as_deref(),
-                args.require("as")?,
-            )?,
-            args.has("json"),
-        );
-    }
-    if command == "rule" && sub == Some("retire") {
-        let id = rest.first().context("rule id is required")?;
-        return print(
-            &store.retire_rule(id, args.require("as")?)?,
-            args.has("json"),
-        );
     }
     if command == "attention" && sub == Some("raise") {
         let text = rest.first().context("attention text is required")?;

@@ -70,35 +70,30 @@ fn render_sitrep(sitrep: &Sitrep) -> String {
 }
 
 fn render_rules(rules: &[RuleSummary]) -> String {
-    let globals = rules.iter().filter(|rule| rule.scope == "global").count();
-    let projects = rules.len().saturating_sub(globals);
     let mut lines = vec![format!(
-        "## Rules ({globals} global · {projects} project; bodies lazy)"
+        "## Rules ({} applicable; bodies lazy)",
+        rules.len()
     )];
     if rules.is_empty() {
         lines.push("(none)".to_owned());
         return lines.join("\n");
     }
     for rule in rules {
-        let scope = if rule.scope == "global" { "g" } else { "p" };
         let detail = if rule.has_more {
-            let global = if rule.scope == "global" {
-                " --global"
-            } else {
-                ""
-            };
             format!(
-                "  (+{:.1} KB · kb r cat {}{global})",
+                "  (+{:.1} KB · kb r cat {})",
                 rule.bytes as f64 / 1024.0,
                 rule.id
             )
         } else {
             String::new()
         };
-        lines.push(format!(
-            "- [{scope}] {}  {}{detail}",
-            rule.id, rule.headline
-        ));
+        let tags = if rule.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", rule.tags.join(", "))
+        };
+        lines.push(format!("- {}{tags}  {}{detail}", rule.id, rule.headline));
     }
     lines.join("\n")
 }

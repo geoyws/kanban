@@ -107,8 +107,7 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
         &[
             "rule",
             "add",
-            "Global handoff rule.",
-            "--global",
+            "First handoff rule.",
             "--as",
             "geo",
             "--json",
@@ -119,7 +118,7 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
         &[
             "rule",
             "add",
-            "Project handoff rule.",
+            "Second handoff rule.",
             "--as",
             "geo",
             "--json",
@@ -221,8 +220,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     );
     let incoming_token = accepted["claim"]["leaseToken"].as_str().unwrap();
     assert_ne!(incoming_token, outgoing_token);
-    assert_eq!(accepted["rules"][0]["scope"], "global");
-    assert_eq!(accepted["rules"][1]["scope"], "project");
+    assert_eq!(accepted["rules"][0]["tags"], json!(["ALL"]));
+    assert_eq!(accepted["rules"][1]["tags"], json!(["ALL"]));
 
     let shown = fixture.run(&fixture.worktree, &["task", "show", "t-e2e", "--json"]);
     assert!(shown.status.success());
@@ -7043,7 +7042,6 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "rule",
             "add",
             "Global <em>rule</em> inherited everywhere.",
-            "--global",
             "--as",
             "geo",
             "--json",
@@ -7055,7 +7053,6 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "rule",
             "add",
             "OTHER ONLY MUST NOT RENDER",
-            "--global",
             "--board",
             "OTHER",
             "--as",
@@ -7069,7 +7066,6 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "rule",
             "add",
             "ALL EXCEPT SERVED MUST NOT RENDER",
-            "--global",
             "--except-board",
             "SERVED",
             "--as",
@@ -7226,8 +7222,9 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         !one.contains("<script>alert"),
         "a script tag reached the page: {one}"
     );
-    assert!(one.contains("Project rules"), "{one}");
-    assert!(one.contains("Global rules"), "{one}");
+    assert!(one.contains("<h2>Rules"), "{one}");
+    assert!(!one.contains("Project rules"), "{one}");
+    assert!(!one.contains("Global rules"), "{one}");
     assert!(one.contains(global_rule["id"].as_str().unwrap()), "{one}");
     assert!(
         one.contains("ALL"),
@@ -7961,7 +7958,7 @@ fn a_sitrep_costs_one_command_and_retires_what_it_supersedes() {
 }
 
 #[test]
-fn project_rules_have_an_ordered_audited_retire_only_lifecycle() {
+fn rules_have_an_ordered_audited_retire_only_lifecycle() {
     let fixture = Fixture::new("rules");
     fixture.ok_json(&fixture.main, &["init", "--name", "RULES", "--json"]);
 
@@ -8024,7 +8021,10 @@ fn project_rules_have_an_ordered_audited_retire_only_lifecycle() {
         fixture.ok_json(&fixture.main, &["r", "cat", first_id, "--json"])["body"],
         revised["body"]
     );
-    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--rule", first_id, "--limit", "100", "--json"],
+    );
     let revision = events
         .as_array()
         .unwrap()
@@ -8129,7 +8129,7 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
     assert_eq!(claim["rules"].as_array().unwrap().len(), 2);
     assert_eq!(claim["rules"][0]["id"], short["id"]);
     assert_eq!(claim["rules"][1]["id"], long["id"]);
-    assert_eq!(claim["rules"][0]["scope"], "project");
+    assert_eq!(claim["rules"][0]["tags"], json!(["ALL"]));
     assert_eq!(claim["rules"][0]["hasMore"], false);
     assert_eq!(claim["rules"][1]["hasMore"], true);
     assert!(claim["rules"][1]["bytes"].as_u64().unwrap() > 2_000);
@@ -8153,7 +8153,7 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
     assert!(rendered.status.success());
     let rendered = String::from_utf8(rendered.stdout).unwrap();
     assert!(
-        rendered.contains("## Rules (0 global · 2 project; bodies lazy)"),
+        rendered.contains("## Rules (2 applicable; bodies lazy)"),
         "{rendered}"
     );
     assert!(
@@ -8210,8 +8210,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "--json",
         ],
     );
-    assert_eq!(scoped["taskTags"], json!(["infra", "queuer"]));
-    assert_eq!(scoped["boardTags"], Value::Null);
+    assert_eq!(scoped["tags"], json!(["ALL", "infra", "queuer"]));
 
     let global = fixture.ok_json(
         &fixture.main,
@@ -8219,7 +8218,6 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "rule",
             "add",
             "Cross-board selector.",
-            "--global",
             "--as",
             "geo",
             "--board",
@@ -8232,42 +8230,27 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
         ],
     );
     assert_eq!(
-        global["boardTags"],
-        json!(["ONLY:RULE-TAGS-ONE", "ONLY:RULE-TAGS-TWO"])
+        global["tags"],
+        json!(["ONLY:RULE-TAGS-ONE", "ONLY:RULE-TAGS-TWO", "shared"])
     );
-    assert_eq!(global["taskTags"], json!(["shared"]));
 
-    for args in [
-        vec![
-            "rule",
-            "add",
-            "Unknown project tag.",
-            "--as",
-            "geo",
-            "--tag",
-            "missing",
-            "--json",
-        ],
-        vec![
-            "rule",
-            "add",
-            "Unknown global tag.",
-            "--global",
-            "--as",
-            "geo",
-            "--tag",
-            "missing",
-            "--json",
-        ],
-    ] {
-        let refused = fixture.run(&fixture.main, &args);
-        assert!(!refused.status.success(), "accepted {args:?}");
-        assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("missing"),
-            "stderr: {}",
-            String::from_utf8_lossy(&refused.stderr)
-        );
-    }
+    let args = vec![
+        "rule",
+        "add",
+        "Unknown project tag.",
+        "--as",
+        "geo",
+        "--tag",
+        "missing",
+        "--json",
+    ];
+    let refused = fixture.run(&fixture.main, &args);
+    assert!(!refused.status.success(), "accepted {args:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("missing"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
 
     fixture.ok_json(
         &fixture.main,
@@ -8437,19 +8420,19 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
         ],
     );
     assert_eq!(updated["body"], "Only tagged task context.");
-    assert_eq!(updated["taskTags"], json!([]));
+    assert_eq!(updated["tags"], json!(["ALL"]));
     let events = fixture.ok_json(
         &fixture.main,
         &["events", "--rule", scoped["id"].as_str().unwrap(), "--json"],
     );
     assert_eq!(
-        events[0]["payload"]["previousTaskTags"],
-        json!(["infra", "queuer"])
+        events[0]["payload"]["previousTags"],
+        json!(["ALL", "infra", "queuer"])
     );
 }
 
 #[test]
-fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
+fn registry_v3_rules_migrate_to_the_unified_all_tag() {
     let fixture = Fixture::new("global-rule-target-migration");
     fs::create_dir_all(&fixture.data).unwrap();
     let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
@@ -8483,11 +8466,8 @@ fn registry_v3_global_rules_migrate_to_explicit_all_tag() {
         .unwrap();
     drop(registry);
 
-    let rules = fixture.ok_json(
-        &fixture.main,
-        &["rule", "list", "--global", "--full", "--json"],
-    );
-    assert_eq!(rules[0]["boardTags"], json!(["ALL"]));
+    let rules = fixture.ok_json(&fixture.main, &["rule", "list", "--full", "--json"]);
+    assert_eq!(rules[0]["tags"], json!(["ALL"]));
     let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
     assert_eq!(
         registry
@@ -8508,23 +8488,35 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
         &fixture.main,
         &["tag", "add", "infra", "--as", "geo", "--json"],
     );
-    let one = fixture.ok_json(
-        &fixture.main,
-        &[
-            "rule",
-            "add",
-            "ONE infrastructure rule.",
-            "--tag",
-            "infra",
-            "--as",
-            "geo",
-            "--json",
-        ],
-    );
-    let two = fixture.ok_json(
-        &second,
-        &["rule", "add", "TWO board rule.", "--as", "geo", "--json"],
-    );
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    let board_path = |name: &str| {
+        registry
+            .query_row(
+                "SELECT board_path FROM workspaces WHERE name=?",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let one_path = board_path("ONE");
+    let two_path = board_path("TWO");
+    drop(registry);
+    Connection::open(&one_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-one','ONE infrastructure rule.','geo',0,1,1,'[\"infra\"]')",
+            [],
+        )
+        .unwrap();
+    Connection::open(&two_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-two','TWO board rule.','geo',0,2,2,'[]')",
+            [],
+        )
+        .unwrap();
+    let one = json!({"id":"r-legacy-one"});
+    let two = json!({"id":"r-legacy-two"});
 
     let first = fixture.ok_json(
         &fixture.root,
@@ -8561,9 +8553,14 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     );
     drop(registry);
 
-    for cwd in [&fixture.main, &second] {
-        let retired = fixture.ok_json(cwd, &["rule", "list", "--all", "--full", "--json"]);
-        assert_eq!(retired[0]["archived"], true);
+    for path in [&one_path, &two_path] {
+        let board = Connection::open(path).unwrap();
+        let active: i64 = board
+            .query_row("SELECT count(*) FROM rules WHERE archived=0", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active, 0, "legacy source remained active in {path}");
     }
 
     let second_run = fixture.ok_json(
@@ -8576,7 +8573,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
 }
 
 #[test]
-fn global_rules_are_stored_once_and_frame_every_projects_claim_and_context() {
+fn unified_rules_are_stored_once_and_frame_every_board_claim_and_context() {
     let fixture = Fixture::new("global-rules");
     let second = fixture.root.join("second");
     fs::create_dir_all(&second).unwrap();
@@ -8589,28 +8586,32 @@ fn global_rules_are_stored_once_and_frame_every_projects_claim_and_context() {
             "rule",
             "add",
             "Never store credentials in Kanban.\n\nKeep secrets in git-crypt.",
-            "--global",
             "--as",
             "geo",
             "--json",
         ],
     );
-    assert!(global["id"].as_str().unwrap().starts_with("g-"));
-    assert_eq!(global["boardTags"], json!(["ALL"]));
+    assert!(global["id"].as_str().unwrap().starts_with("r-"));
+    assert_eq!(global["tags"], json!(["ALL"]));
     let global_id = global["id"].as_str().unwrap();
 
-    for (cwd, task, local) in [
-        (&fixture.main, "t-one", "ONE uses Rust."),
-        (&second, "t-two", "TWO uses SQLite."),
+    for (cwd, board, task, local) in [
+        (&fixture.main, "ONE", "t-one", "ONE uses Rust."),
+        (&second, "TWO", "t-two", "TWO uses SQLite."),
     ] {
         fixture.ok_json(cwd, &["task", "add", task, "--id", task, "--json"]);
-        fixture.ok_json(cwd, &["rule", "add", local, "--as", "geo", "--json"]);
+        fixture.ok_json(
+            cwd,
+            &[
+                "rule", "add", local, "--board", board, "--as", "geo", "--json",
+            ],
+        );
         let claim = fixture.ok_json(cwd, &["claim", task, "--as", "worker", "--json"]);
         let rules = claim["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0]["id"], global["id"]);
-        assert_eq!(rules[0]["scope"], "global");
-        assert_eq!(rules[1]["scope"], "project");
+        assert_eq!(rules[0]["tags"], json!(["ALL"]));
+        assert_eq!(rules[1]["tags"], json!([format!("ONLY:{board}")]));
         let context = fixture.ok_json(cwd, &["context", task, "--json"]);
         assert_eq!(context["rules"], claim["rules"]);
     }
@@ -8642,7 +8643,6 @@ fn global_rules_are_stored_once_and_frame_every_projects_claim_and_context() {
             "rule",
             "update",
             global_id,
-            "--global",
             "--body",
             "Never store secrets in Kanban.",
             "--as",
@@ -8650,10 +8650,7 @@ fn global_rules_are_stored_once_and_frame_every_projects_claim_and_context() {
             "--json",
         ],
     );
-    let events = fixture.ok_json(
-        &fixture.main,
-        &["events", "--global", "--rule", global_id, "--json"],
-    );
+    let events = fixture.ok_json(&fixture.main, &["events", "--rule", global_id, "--json"]);
     assert!(
         events[0]["payload"]["previousBody"]
             .as_str()
@@ -8663,28 +8660,32 @@ fn global_rules_are_stored_once_and_frame_every_projects_claim_and_context() {
 
     fixture.ok_json(
         &fixture.main,
-        &[
-            "rule", "retire", global_id, "--global", "--as", "geo", "--json",
-        ],
+        &["rule", "retire", global_id, "--as", "geo", "--json"],
     );
-    let active = fixture.ok_json(&fixture.main, &["rule", "list", "--global", "--json"]);
-    assert_eq!(active, json!([]));
+    let active = fixture.ok_json(&fixture.main, &["rule", "list", "--json"]);
+    assert_eq!(active.as_array().unwrap().len(), 2);
     let retained = fixture.ok_json(
         &fixture.main,
-        &["rule", "list", "--global", "--all", "--full", "--json"],
+        &["rule", "list", "--all", "--full", "--json"],
     );
-    assert_eq!(retained[0]["archived"], true);
+    assert!(
+        retained
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == global["id"] && rule["archived"] == true)
+    );
 
     let conflicting = fixture.run(
         &fixture.main,
         &["rule", "list", "--global", "--project", "ONE", "--json"],
     );
     assert!(!conflicting.status.success());
-    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("cannot be combined"));
+    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("superseded"));
 }
 
 #[test]
-fn global_rules_target_named_boards_or_all_except_named_boards() {
+fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
     let fixture = Fixture::new("targeted-global-rules");
     let second = fixture.root.join("second");
     let third = fixture.root.join("third");
@@ -8696,15 +8697,7 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
 
     let all = fixture.ok_json(
         &fixture.main,
-        &[
-            "rule",
-            "add",
-            "Every board.",
-            "--global",
-            "--as",
-            "geo",
-            "--json",
-        ],
+        &["rule", "add", "Every board.", "--as", "geo", "--json"],
     );
     let only = fixture.ok_json(
         &fixture.main,
@@ -8712,7 +8705,6 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
             "rule",
             "add",
             "Only one and two.",
-            "--global",
             "--board",
             "ONE",
             "--board",
@@ -8728,7 +8720,6 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
             "rule",
             "add",
             "Everything except one.",
-            "--global",
             "--except-board",
             "ONE",
             "--as",
@@ -8736,8 +8727,8 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
             "--json",
         ],
     );
-    assert_eq!(only["boardTags"], json!(["ONLY:ONE", "ONLY:TWO"]));
-    assert_eq!(except["boardTags"], json!(["ALL", "EXCEPT:ONE"]));
+    assert_eq!(only["tags"], json!(["ONLY:ONE", "ONLY:TWO"]));
+    assert_eq!(except["tags"], json!(["ALL", "EXCEPT:ONE"]));
 
     for (cwd, id, expected) in [
         (
@@ -8775,31 +8766,26 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
     let retargeted = fixture.ok_json(
         &fixture.main,
         &[
-            "rule", "update", only_id, "--global", "--board", "THREE", "--as", "geo", "--json",
+            "rule", "update", only_id, "--board", "THREE", "--as", "geo", "--json",
         ],
     );
     assert_eq!(retargeted["body"], "Only one and two.");
-    assert_eq!(retargeted["boardTags"], json!(["ONLY:THREE"]));
-    let events = fixture.ok_json(
-        &fixture.main,
-        &["events", "--global", "--rule", only_id, "--json"],
-    );
+    assert_eq!(retargeted["tags"], json!(["ONLY:THREE"]));
+    let events = fixture.ok_json(&fixture.main, &["events", "--rule", only_id, "--json"]);
     assert_eq!(
-        events[0]["payload"]["previousBoardTags"],
+        events[0]["payload"]["previousTags"],
         json!(["ONLY:ONE", "ONLY:TWO"])
     );
-    assert_eq!(events[0]["payload"]["changed"], json!(["boardTags"]));
+    assert_eq!(events[0]["payload"]["changed"], json!(["selectorTags"]));
 
     for args in [
         vec![
-            "rule", "add", "Bad mix.", "--global", "--board", "ALL", "--board", "ONE", "--as",
-            "geo", "--json",
+            "rule", "add", "Bad mix.", "--board", "ALL", "--board", "ONE", "--as", "geo", "--json",
         ],
         vec![
             "rule",
             "add",
             "Bad subtraction.",
-            "--global",
             "--board",
             "ONE",
             "--except-board",
@@ -8812,7 +8798,6 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
             "rule",
             "add",
             "Unknown board.",
-            "--global",
             "--board",
             "MISSING",
             "--as",
@@ -8822,9 +8807,8 @@ fn global_rules_target_named_boards_or_all_except_named_boards() {
         vec![
             "rule",
             "add",
-            "Not global.",
-            "--board",
-            "ONE",
+            "Legacy scope.",
+            "--global",
             "--as",
             "geo",
             "--json",

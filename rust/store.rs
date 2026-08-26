@@ -17,6 +17,11 @@ fn nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+fn validate_rule_actor(value: &str) -> Result<&str> {
+    nonempty(value, "author")
+}
+
+#[cfg(test)]
 fn validate_rule_body(value: &str) -> Result<()> {
     nonempty(value, "rule body")?;
     if value
@@ -27,10 +32,6 @@ fn validate_rule_body(value: &str) -> Result<()> {
         bail!("rule headline is required on the first line");
     }
     Ok(())
-}
-
-fn validate_rule_actor(value: &str) -> Result<&str> {
-    nonempty(value, "author")
 }
 
 fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
@@ -226,10 +227,6 @@ fn validate_registered_tags(
     }
     canonical.sort();
     Ok(canonical)
-}
-
-fn validate_rule_tags(connection: &Connection, tags: &[String]) -> Result<Vec<String>> {
-    validate_registered_tags(connection, tags, "rule task")
 }
 
 /// Attach registered tags to rows that were already read.
@@ -495,8 +492,9 @@ fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
         archived: row.get::<_, i64>("archived")? != 0,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
-        board_tags: None,
-        task_tags: parse_strings(row.get("task_tags")?),
+        tags: parse_strings(row.get("task_tags")?),
+        source_board: None,
+        source_rule_id: None,
     })
 }
 
@@ -1802,35 +1800,6 @@ impl Store {
         Ok(())
     }
 
-    /// Add an operator rule at the end of this board's rule document.
-    pub fn add_rule(&mut self, body: &str, actor: &str, task_tags: &[String]) -> Result<Rule> {
-        validate_rule_body(body)?;
-        let task_tags = validate_rule_tags(&self.connection, task_tags)?;
-        let body = body.to_owned();
-        let actor = validate_rule_actor(actor)?.to_owned();
-        let id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous_created: Option<i64> =
-            transaction.query_row("SELECT max(created_at) FROM rules", [], |row| row.get(0))?;
-        let now = now_ms().max(previous_created.unwrap_or(0).saturating_add(1));
-        transaction.execute(
-            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES(?,?,?,0,?,?,?)",
-            params![id, body, actor, now, now, serde_json::to_string(&task_tags)?],
-        )?;
-        event(
-            &transaction,
-            None,
-            "rule_added",
-            Some(&actor),
-            json!({"ruleID": id, "taskTags": task_tags}),
-        )?;
-        let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [&id], rule_row)?;
-        transaction.commit()?;
-        Ok(result)
-    }
-
     /// Active rules are a document, so their order is oldest first.
     pub fn rules(&self, include_archived: bool) -> Result<Vec<Rule>> {
         let clause = if include_archived {
@@ -1863,82 +1832,14 @@ impl Store {
                     .skip(1)
                     .any(|line| !line.trim().is_empty());
                 Ok(RuleSummary {
-                    scope: "project".into(),
                     id: rule.id,
                     headline,
                     has_more,
                     bytes: rule.body.len(),
-                    board_tags: None,
-                    task_tags: rule.task_tags,
+                    tags: rule.tags,
                 })
             })
             .collect()
-    }
-
-    pub fn rule(&self, id: &str) -> Result<Rule> {
-        self.connection
-            .query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)
-            .optional()?
-            .with_context(|| format!("rule {id} not found"))
-    }
-
-    /// Revise a rule without destroying the text it replaced.
-    pub fn update_rule(
-        &mut self,
-        id: &str,
-        body: Option<&str>,
-        task_tags: Option<&[String]>,
-        actor: &str,
-    ) -> Result<Rule> {
-        if body.is_none() && task_tags.is_none() {
-            bail!("rule update requires --body/--body-file, --tag, or --clear-tags");
-        }
-        if let Some(body) = body {
-            validate_rule_body(body)?;
-        }
-        let task_tags = task_tags
-            .map(|tags| validate_rule_tags(&self.connection, tags))
-            .transpose()?;
-        let actor = validate_rule_actor(actor)?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<Rule> = transaction
-            .query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)
-            .optional()?;
-        let previous = previous.with_context(|| format!("rule {id} not found"))?;
-        transaction.execute(
-            "UPDATE rules SET body=?,task_tags=?,author=?,updated_at=? WHERE id=?",
-            params![
-                body.unwrap_or(&previous.body),
-                serde_json::to_string(task_tags.as_deref().unwrap_or(&previous.task_tags))?,
-                actor,
-                now_ms(),
-                id
-            ],
-        )?;
-        let mut changed = Vec::new();
-        if body.is_some() {
-            changed.push("body");
-        }
-        if task_tags.is_some() {
-            changed.push("taskTags");
-        }
-        event(
-            &transaction,
-            None,
-            "rule_updated",
-            Some(&actor),
-            json!({
-                "ruleID": id,
-                "previousBody": previous.body,
-                "previousTaskTags": previous.task_tags,
-                "changed": changed,
-            }),
-        )?;
-        let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
-        transaction.commit()?;
-        Ok(result)
     }
 
     /// Retire a rule from the active set without erasing it.

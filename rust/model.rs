@@ -30,7 +30,7 @@ pub struct Tag {
     pub uses: i64,
 }
 
-/// One project-level operator rule, ordered as part of a document.
+/// One operator rule in the registry-owned, tag-scoped document.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -40,27 +40,24 @@ pub struct Rule {
     pub archived: bool,
     pub created_at: i64,
     pub updated_at: i64,
-    /// Present only for registry-wide rules. `ALL` and `EXCEPT:<name>` form an
-    /// all-minus set; `ONLY:<name>` rows form an explicit include set.
+    /// Selector tags (`ALL`, `ONLY:<board>`, `EXCEPT:<board>`) and lowercase
+    /// subsystem tags share one ordered, fail-closed vocabulary.
+    pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub board_tags: Option<Vec<String>>,
-    /// Task subsystem selectors. Empty means every task in board scope.
-    pub task_tags: Vec<String>,
+    pub source_board: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rule_id: Option<String>,
 }
 
-/// The always-carried table-of-contents entry for a project rule.
+/// The always-carried table-of-contents entry for a rule.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSummary {
-    /// `global` rules precede `project` rules in effective work context.
-    pub scope: String,
     pub id: String,
     pub headline: String,
     pub has_more: bool,
     pub bytes: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub board_tags: Option<Vec<String>>,
-    pub task_tags: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 /// Receipt for the one-time, idempotent consolidation of board-local rules
@@ -377,7 +374,7 @@ pub struct ContextPacket {
     pub notes: Vec<TaskNote>,
     pub checkpoints: Vec<Checkpoint>,
     pub handoffs: Vec<Handoff>,
-    /// Active project rules, as an untruncated table of contents.
+    /// Applicable rules, as an untruncated table of contents.
     pub rules: Vec<RuleSummary>,
     /// Sitreps mentioning this task, newest first.
     ///

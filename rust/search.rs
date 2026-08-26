@@ -422,15 +422,14 @@ pub fn search(
     Ok(results)
 }
 
-/// Rank registry-wide rules with the same semantic model. They do not live in
-/// a board database, so they cannot participate in that board's FTS table; the
-/// exact and semantic legs still make inherited operating knowledge visible.
-pub fn search_global_rules(rules: &[Rule], options: &SearchOptions) -> Vec<SearchResult> {
+/// Rank the registry-owned rules document with the same semantic model. It does
+/// not live in a board database, so exact and semantic ranking supplement the
+/// board-local FTS indexes.
+pub fn search_rules(rules: &[Rule], options: &SearchOptions) -> Vec<SearchResult> {
     if options
         .source
         .as_deref()
-        .is_some_and(|source| source != "rule" && source != "global-rule")
-        || !options.tags.is_empty()
+        .is_some_and(|source| source != "rule")
         || options.lane.is_some()
     {
         return Vec::new();
@@ -441,6 +440,12 @@ pub fn search_global_rules(rules: &[Rule], options: &SearchOptions) -> Vec<Searc
     let mut results = rules
         .iter()
         .filter(|rule| options.include_archived || !rule.archived)
+        .filter(|rule| {
+            options
+                .tags
+                .iter()
+                .all(|tag| rule.tags.iter().any(|candidate| candidate == tag))
+        })
         .filter(|rule| options.after.is_none_or(|after| rule.updated_at >= after))
         .filter(|rule| {
             options
@@ -471,11 +476,11 @@ pub fn search_global_rules(rules: &[Rule], options: &SearchOptions) -> Vec<Searc
             };
             let semantic = cosine(&query_vector, &embed(&rule.body));
             (exact > 0.0 || semantic >= 0.18).then(|| SearchResult {
-                board: "global".to_owned(),
-                source_kind: "global-rule".to_owned(),
+                board: "rules".to_owned(),
+                source_kind: "rule".to_owned(),
                 source_id: rule.id.clone(),
                 task_id: None,
-                title: rule.body.lines().next().unwrap_or("global rule").to_owned(),
+                title: rule.body.lines().next().unwrap_or("rule").to_owned(),
                 snippet: rule
                     .body
                     .chars()
@@ -486,7 +491,7 @@ pub fn search_global_rules(rules: &[Rule], options: &SearchOptions) -> Vec<Searc
                     .join(" "),
                 status: Some(if rule.archived { "retired" } else { "active" }.to_owned()),
                 lane: None,
-                tags: Vec::new(),
+                tags: rule.tags.clone(),
                 created_at: rule.created_at,
                 updated_at: rule.updated_at,
                 archived: rule.archived,
@@ -500,7 +505,7 @@ pub fn search_global_rules(rules: &[Rule], options: &SearchOptions) -> Vec<Searc
                 } else {
                     exact * 0.4 + semantic * 0.6
                 },
-                citation: format!("kanban://global/rule/{}", rule.id),
+                citation: format!("kanban://rules/rule/{}", rule.id),
             })
         })
         .collect::<Vec<_>>();

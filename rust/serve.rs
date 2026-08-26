@@ -704,10 +704,7 @@ fn search_page(query: &str) -> Result<String> {
         results.extend(store.search(&project.name, &options)?);
         boards.push(project.name);
     }
-    results.extend(search::search_global_rules(
-        &registry.global_rules(false)?,
-        &options,
-    ));
+    results.extend(search::search_rules(&registry.rules(false)?, &options));
     let receipt = search::bound_receipt(
         query,
         boards,
@@ -993,32 +990,21 @@ fn lanes() -> Result<String> {
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None, false)?;
-    let global_rules = Registry::open()?.global_rules_for(Some(&project.name), false)?;
-    let project_rules = store.rules(false)?;
+    let rules = Registry::open()?.applicable_rules(Some(&project.name), None, false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
     html.push_str(&format!(
         "<p class=meta>{} · {} rows</p>",
         escape(&project.canonical_root),
         tasks.len()
     ));
-    for (heading, rules) in [
-        ("Global rules", global_rules),
-        ("Project rules", project_rules),
-    ] {
-        if rules.is_empty() {
-            continue;
-        }
+    if !rules.is_empty() {
         html.push_str(&format!(
-            "<h2>{heading} <span class=count>{}</span></h2>",
+            "<h2>Rules <span class=count>{}</span></h2>",
             rules.len()
         ));
         for rule in rules {
             let headline = rule.body.lines().next().unwrap_or_default();
-            let targets = rule
-                .board_tags
-                .as_ref()
-                .map(|tags| format!(" <span class=lane>{}</span>", escape(&tags.join(", "))))
-                .unwrap_or_default();
+            let targets = format!(" <span class=lane>{}</span>", escape(&rule.tags.join(", ")));
             html.push_str(&format!(
                 "<details class=rule><summary><code>{id}</code> {headline}{targets}</summary>\
                  <pre>{body}</pre></details>",
