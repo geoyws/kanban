@@ -65,6 +65,12 @@ pub struct RuleSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleMigrationReport {
+    pub legacy_registry_migrated: bool,
+    pub legacy_registry_already_migrated: bool,
+    pub legacy_rules_imported: usize,
+    pub legacy_rules_updated: usize,
+    pub legacy_events_imported: usize,
+    pub legacy_rules_retired: usize,
     pub boards_migrated: usize,
     pub boards_already_migrated: usize,
     pub rules_imported: usize,

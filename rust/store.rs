@@ -1478,7 +1478,7 @@ impl Store {
         transaction.commit()?;
         Ok(ClaimReceipt {
             claim: result,
-            rules: self.rule_summaries(false)?,
+            rules: Vec::new(),
         })
     }
 
@@ -1813,33 +1813,6 @@ impl Store {
             .query_map([], rule_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
-    }
-
-    pub fn rule_summaries(&self, include_archived: bool) -> Result<Vec<RuleSummary>> {
-        self.rules(include_archived)?
-            .into_iter()
-            .map(|rule| {
-                let headline = rule
-                    .body
-                    .lines()
-                    .next()
-                    .context("stored rule has no headline")?
-                    .trim()
-                    .to_owned();
-                let has_more = rule
-                    .body
-                    .lines()
-                    .skip(1)
-                    .any(|line| !line.trim().is_empty());
-                Ok(RuleSummary {
-                    id: rule.id,
-                    headline,
-                    has_more,
-                    bytes: rule.body.len(),
-                    tags: rule.tags,
-                })
-            })
-            .collect()
     }
 
     /// Retire a rule from the active set without erasing it.
@@ -2851,7 +2824,7 @@ impl Store {
             notes,
             checkpoints,
             handoffs,
-            rules: self.rule_summaries(false)?,
+            rules: Vec::new(),
             sitreps,
             generated_at: now_ms(),
             truncated,

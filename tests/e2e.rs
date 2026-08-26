@@ -363,6 +363,39 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     assert!(paraphrase["resultChars"].as_u64().unwrap() <= 1000);
     assert_eq!(paraphrase["embeddingModel"], "kanban-semantic-lite-v1");
 
+    let rule = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Canary feedback tier rule.",
+            "--tag",
+            "release",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let rule_search = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "Canary feedback tier",
+            "--source",
+            "rule",
+            "--tag",
+            "release",
+            "--json",
+        ],
+    );
+    assert_eq!(rule_search["results"][0]["sourceKind"], "rule");
+    assert_eq!(rule_search["results"][0]["sourceId"], rule["id"]);
+    assert_eq!(
+        rule_search["results"][0]["citation"],
+        format!("kanban://rules/rule/{}", rule["id"].as_str().unwrap())
+    );
+    assert_eq!(rule_search["results"][0]["tags"], json!(["ALL", "release"]));
+
     let rebuilt = fixture.ok_json(
         &fixture.main,
         &["search-rebuild", "--as", "tester", "--json"],
@@ -4577,6 +4610,17 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     assert_eq!(read_only["annotations"]["readOnlyHint"], true);
     let writes = tools.iter().find(|t| t["name"] == "claim").unwrap();
     assert_eq!(writes["annotations"]["readOnlyHint"], false);
+    let rule_add = tools.iter().find(|t| t["name"] == "rule_add").unwrap();
+    assert!(
+        rule_add["inputSchema"]["properties"]
+            .get("global")
+            .is_none(),
+        "MCP still advertised the retired rule scope flag"
+    );
+    assert_eq!(
+        rule_add["inputSchema"]["properties"]["board"]["type"],
+        "array"
+    );
     // A list-valued flag must be typed as an array, or an agent can only ever
     // pass one dependency and the rest are dropped without a word.
     let add = tools.iter().find(|t| t["name"] == "task_add").unwrap();
@@ -4596,6 +4640,19 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
         fixture.ok_json(&fixture.main, &["task", "show", "t-wire", "--json"])["title"],
         "Over the wire"
     );
+    let rule = session.ask(json!({
+        "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+        "params": { "name": "rule_add", "arguments": {
+            "body": "MCP-created rule.", "board": ["MCP"], "as": "geo"
+        } }
+    }));
+    assert_eq!(rule["result"]["isError"], false, "{rule}");
+    let rule_text = rule["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(rule_text.contains("ONLY:MCP"), "{rule_text}");
+    let context = fixture.ok_json(&fixture.main, &["context", "t-wire", "--json"]);
+    assert!(context["rules"].as_array().unwrap().iter().any(|item| {
+        item["headline"] == "MCP-created rule." && item["tags"] == json!(["ONLY:MCP"])
+    }));
     let found = session.ask(json!({
         "jsonrpc": "2.0", "id": 31, "method": "tools/call",
         "params": { "name": "search", "arguments": { "query": "Over the wire" } }
@@ -7036,6 +7093,19 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--json",
         ],
     );
+    let task_only_rule = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "TASK TAG RULE MUST NOT RENDER WITHOUT A TASK",
+            "--tag",
+            "infra",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
     let global_rule = fixture.ok_json(
         &fixture.main,
         &[
@@ -7240,6 +7310,10 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "a global rule was not escaped: {one}"
     );
     assert!(one.contains(live_rule["id"].as_str().unwrap()), "{one}");
+    assert!(
+        !one.contains(task_only_rule["id"].as_str().unwrap()),
+        "task-scoped rule leaked into a taskless board projection: {one}"
+    );
     assert!(
         one.contains("Never render &lt;b&gt;rules&lt;/b&gt; without escaping."),
         "a rule headline was not escaped: {one}"
@@ -8500,6 +8574,20 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     };
     let one_path = board_path("ONE");
     let two_path = board_path("TWO");
+    registry
+        .execute(
+            "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags,task_tags) \
+             VALUES('g-late','Late rolling-upgrade rule.','geo',0,3,3,'[\"ALL\"]','[\"infra\"]')",
+            [],
+        )
+        .unwrap();
+    registry
+        .execute(
+            "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) \
+             VALUES('g-late','global_rule_added','geo','{\"ruleID\":\"g-late\"}',3)",
+            [],
+        )
+        .unwrap();
     drop(registry);
     Connection::open(&one_path)
         .unwrap()
@@ -8525,6 +8613,10 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     assert_eq!(first["boardsMigrated"], 2);
     assert_eq!(first["rulesImported"], 2);
     assert_eq!(first["sourceRulesRetired"], 2);
+    assert_eq!(first["legacyRegistryMigrated"], true);
+    assert_eq!(first["legacyRulesImported"], 1);
+    assert_eq!(first["legacyEventsImported"], 1);
+    assert_eq!(first["legacyRulesRetired"], 1);
 
     let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
     let imported_one: (String, String, String) = registry
@@ -8551,6 +8643,15 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
         serde_json::from_str::<Vec<String>>(&imported_two).unwrap(),
         ["ONLY:TWO"]
     );
+    let late_tags: String = registry
+        .query_row("SELECT tags FROM rules WHERE id='g-late'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&late_tags).unwrap(),
+        ["ALL", "infra"]
+    );
     drop(registry);
 
     for path in [&one_path, &two_path] {
@@ -8568,6 +8669,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
         &["rule", "consolidate", "--as", "geo", "--json"],
     );
     assert_eq!(second_run["boardsAlreadyMigrated"], 2);
+    assert_eq!(second_run["legacyRegistryAlreadyMigrated"], true);
     assert_eq!(second_run["rulesImported"], 0);
     assert_eq!(second_run["sourceRulesRetired"], 0);
 }

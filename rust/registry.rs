@@ -9,7 +9,7 @@ use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -558,12 +558,20 @@ impl Registry {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut report = RuleMigrationReport {
+            legacy_registry_migrated: false,
+            legacy_registry_already_migrated: false,
+            legacy_rules_imported: 0,
+            legacy_rules_updated: 0,
+            legacy_events_imported: 0,
+            legacy_rules_retired: 0,
             boards_migrated: 0,
             boards_already_migrated: 0,
             rules_imported: 0,
             rules_already_imported: 0,
             source_rules_retired: 0,
         };
+
+        self.consolidate_legacy_registry_rules(&actor, &mut report)?;
 
         for (board_name, board_path) in projects {
             let duplicate_names: i64 = self.connection.query_row(
@@ -685,6 +693,145 @@ impl Registry {
             report.boards_migrated += 1;
         }
         Ok(report)
+    }
+
+    /// Synchronize writes made by a rolling-upgrade client after registry v9
+    /// initially copied `global_rules`. The marker makes the operation
+    /// idempotent; current state and the exact multiplicity of audit events are
+    /// copied before active legacy rows are retired.
+    fn consolidate_legacy_registry_rules(
+        &mut self,
+        actor: &str,
+        report: &mut RuleMigrationReport,
+    ) -> Result<()> {
+        const SOURCE: &str = "registry:global_rules";
+        if self
+            .connection
+            .query_row(
+                "SELECT 1 FROM rule_board_migrations WHERE board_path=?",
+                [SOURCE],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            report.legacy_registry_already_migrated = true;
+            return Ok(());
+        }
+
+        type LegacyRule = (String, String, String, bool, i64, i64, String, String);
+        let legacy_rules = {
+            let mut statement = self.connection.prepare(
+                "SELECT id,body,author,archived,created_at,updated_at,board_tags,task_tags \
+                 FROM global_rules ORDER BY created_at,id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<LegacyRule>>>()?
+        };
+        for (id, body, author, archived, created_at, updated_at, board_tags, task_tags) in
+            &legacy_rules
+        {
+            let mut tags = serde_json::from_str::<Vec<String>>(board_tags)?;
+            tags.extend(serde_json::from_str::<Vec<String>>(task_tags)?);
+            let previous = self
+                .connection
+                .query_row("SELECT updated_at FROM rules WHERE id=?", [id], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?;
+            match previous {
+                None => {
+                    self.connection.execute(
+                        "INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags) \
+                         VALUES(?,?,?,?,?,?,?)",
+                        params![
+                            id,
+                            body,
+                            author,
+                            archived,
+                            created_at,
+                            updated_at,
+                            serde_json::to_string(&tags)?,
+                        ],
+                    )?;
+                    report.legacy_rules_imported += 1;
+                }
+                Some(previous_updated) if *updated_at > previous_updated => {
+                    self.connection.execute(
+                        "UPDATE rules SET body=?,author=?,archived=?,updated_at=?,tags=? WHERE id=?",
+                        params![
+                            body,
+                            author,
+                            archived,
+                            updated_at,
+                            serde_json::to_string(&tags)?,
+                            id,
+                        ],
+                    )?;
+                    report.legacy_rules_updated += 1;
+                }
+                Some(_) => {}
+            }
+        }
+
+        type LegacyEvent = (String, String, String, String, i64);
+        let legacy_events = {
+            let mut statement = self.connection.prepare(
+                "SELECT rule_id,kind,actor,payload,created_at FROM global_rule_events ORDER BY seq",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<LegacyEvent>>>()?
+        };
+        let mut occurrences: HashMap<LegacyEvent, i64> = HashMap::new();
+        for event in legacy_events {
+            let (rule_id, kind, event_actor, payload, created_at) = &event;
+            let occurrence = occurrences.entry(event.clone()).or_default();
+            *occurrence += 1;
+            let copied: i64 = self.connection.query_row(
+                "SELECT count(*) FROM rule_events WHERE rule_id=? AND kind=? AND actor=? AND payload=? AND created_at=?",
+                params![rule_id, kind, event_actor, payload, created_at],
+                |row| row.get(0),
+            )?;
+            if copied < *occurrence {
+                self.connection.execute(
+                    "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+                    params![rule_id, kind, event_actor, payload, created_at],
+                )?;
+                report.legacy_events_imported += 1;
+            }
+        }
+
+        report.legacy_rules_retired = self
+            .connection
+            .execute("UPDATE global_rules SET archived=1 WHERE archived=0", [])?;
+        self.connection.execute(
+            "INSERT INTO rule_board_migrations(board_path,board_name,source_count,actor,migrated_at) \
+             VALUES(?,?,?,?,?)",
+            params![SOURCE, "legacy-registry", legacy_rules.len(), actor, now_ms()],
+        )?;
+        report.legacy_registry_migrated = true;
+        Ok(())
     }
 
     pub fn canonical_rule_tags(
