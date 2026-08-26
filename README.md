@@ -65,6 +65,22 @@ cannot claim the same task while its lease is live. If a worker disappears,
 the lease expires and the task becomes claimable again; the last durable
 checkpoint remains available.
 
+Schedulers that need to inspect before dispatching use the same predicate
+without taking a lease:
+
+```bash
+kanban claim --candidates --project my-project --as atmux@_superbot \
+  --lane be --tag queuer --limit 20 --json
+```
+
+The result is priority ordered and contains task fields, including tags, lane,
+assignee and `driverOnly`, but never a lease token. It excludes containers,
+dependency-blocked work, work under draft plans, active leases, incompatible
+assignees and driver-only work unless `--caller-scope driver` is supplied.
+Inspection is read-only: it does not migrate or touch registry recency, expire
+leases, update task state, append events, or cache a result. A returned row is
+still only a candidate; take it with atomic `claim ID` or `claim --next`.
+
 ## Roadmap todo lists
 
 Use the board tree for every durable multi-item todo list. The roadmap is an

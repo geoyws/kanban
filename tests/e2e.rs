@@ -1147,6 +1147,130 @@ fn compiled_binary_enforces_pull_routing_task_graph_and_story_gates() {
 }
 
 #[test]
+fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
+    let fixture = Fixture::new("claim-candidates");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CANDIDATES", "--json"]);
+    for tag in ["claims", "other"] {
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+    }
+    let add = |id: &str, extra: &[&str]| {
+        let mut args = vec!["task", "add", id, "--id", id, "--tag", "claims"];
+        args.extend_from_slice(extra);
+        args.push("--json");
+        fixture.ok_json(&fixture.main, &args)
+    };
+
+    add("t-base", &["--priority", "9"]);
+    add(
+        "t-dependency-blocked",
+        &["--priority", "0", "--depends-on", "t-base"],
+    );
+    add("e-container", &["--type", "epic", "--priority", "0"]);
+    add(
+        "e-draft",
+        &["--type", "epic", "--status", "draft", "--priority", "0"],
+    );
+    add("t-under-draft", &["--parent", "e-draft", "--priority", "0"]);
+    add("t-leased", &["--priority", "0"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-leased", "--as", "other-agent", "--json"],
+    );
+    add(
+        "t-assigned-away",
+        &["--assignee", "other-agent", "--priority", "0"],
+    );
+    add("t-driver-only", &["--driver-only", "--priority", "0"]);
+    add("t-ready-first", &["--priority", "1"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "t-ready-other-tag",
+            "--id",
+            "t-ready-other-tag",
+            "--tag",
+            "other",
+            "--priority",
+            "2",
+            "--json",
+        ],
+    );
+
+    let board_path =
+        fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let before_bytes = fs::read(&board_path).unwrap();
+    let before_metadata = fs::metadata(&board_path).unwrap().modified().unwrap();
+    let registry_path = fixture.data.join("registry.db");
+    let before_registry_bytes = fs::read(&registry_path).unwrap();
+    let before_registry_metadata = fs::metadata(&registry_path).unwrap().modified().unwrap();
+    let before_counts = Connection::open(&board_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM events),(SELECT count(*) FROM task_claims)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+
+    let candidates = fixture.ok_json(
+        &fixture.worktree,
+        &[
+            "claim",
+            "--candidates",
+            "--project",
+            "CANDIDATES",
+            "--as",
+            "worker",
+            "--tag",
+            "claims",
+            "--limit",
+            "10",
+            "--json",
+        ],
+    );
+    assert_eq!(candidates.as_array().unwrap().len(), 2);
+    assert_eq!(candidates[0]["id"], "t-ready-first");
+    assert_eq!(candidates[1]["id"], "t-base");
+    assert_eq!(candidates[0]["tags"], json!(["claims"]));
+    assert_eq!(candidates[0]["priority"], 1);
+    assert_eq!(candidates[0]["driverOnly"], false);
+    assert!(candidates[0].get("leaseToken").is_none());
+
+    let after_counts = Connection::open(&board_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM events),(SELECT count(*) FROM task_claims)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(before_counts, after_counts, "inspection wrote ledger state");
+    assert_eq!(before_bytes, fs::read(&board_path).unwrap());
+    assert_eq!(
+        before_metadata,
+        fs::metadata(&board_path).unwrap().modified().unwrap()
+    );
+    assert_eq!(before_registry_bytes, fs::read(&registry_path).unwrap());
+    assert_eq!(
+        before_registry_metadata,
+        fs::metadata(&registry_path).unwrap().modified().unwrap()
+    );
+
+    // Each returned row is accepted by the real atomic claim path immediately
+    // afterwards. This would fail if inspection's predicate were only a loose
+    // approximation of scheduler eligibility.
+    for id in ["t-ready-first", "t-base"] {
+        let claimed = fixture.ok_json(&fixture.main, &["claim", id, "--as", "worker", "--json"]);
+        assert_eq!(claimed["taskID"], id);
+    }
+}
+
+#[test]
 fn compiled_binary_bounds_context_and_generates_non_authoritative_todo() {
     let fixture = Fixture::new("projections");
     fixture.ok_json(&fixture.main, &["init", "--name", "Projection", "--json"]);

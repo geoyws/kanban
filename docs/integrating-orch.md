@@ -73,3 +73,11 @@ stores progress; it does not grant execution.
 Planner output should create real Kanban tasks with dependencies. Workers use
 atomic `claim --next` semantics and receive only their task context. Aggregate
 steps read completed child checkpoints/evidence rather than raw conversations.
+
+An orchestrator that needs to plan a dispatch batch may first call
+`claim --candidates --as <worker> --project <board> --json`. Optional `--lane`,
+`--role`, `--caller-scope`, `--no-cross-lane`, `--allow-reassign`, `--tag` and
+`--limit` filters use the same scheduler eligibility and ordering as
+`claim --next`. This is observation only: no lease is created and no board or
+registry state is updated. The orchestrator must still use atomic `claim` at
+dispatch time and handle another worker winning the race.

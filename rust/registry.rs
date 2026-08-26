@@ -1,5 +1,6 @@
 use crate::db::{
-    checkpoint, create_backup_target, integrity, open_board, open_registry, own_private_dir,
+    checkpoint, create_backup_target, integrity, open_board, open_registry, open_registry_readonly,
+    own_private_dir,
 };
 use crate::model::{Event, ProjectRecord, Rule, RuleSummary, UnreachableRoot, WorkspaceRecord};
 use crate::store::validate_tag_name;
@@ -171,6 +172,12 @@ impl Registry {
         Ok(Self { connection, root })
     }
 
+    pub fn open_readonly() -> Result<Self> {
+        let root = data_root()?;
+        let connection = open_registry_readonly(&root.join("registry.db"))?;
+        Ok(Self { connection, root })
+    }
+
     pub fn register(
         &mut self,
         workspace: &Path,
@@ -277,6 +284,20 @@ impl Registry {
                     params![now_ms(), found.root_path],
                 )?;
                 return self.exact(&cursor);
+            }
+            if !cursor.pop() {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub fn resolve_readonly(&self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
+        let mut cursor = workspace
+            .canonicalize()
+            .with_context(|| format!("resolve workspace {}", workspace.display()))?;
+        loop {
+            if let Some(found) = self.exact(&cursor)? {
+                return Ok(Some(found));
             }
             if !cursor.pop() {
                 return Ok(None);

@@ -304,6 +304,18 @@ kb cp <id> --lease "$TOKEN" --as "$AGENT" --state continue \
 kb rel <id> --lease "$TOKEN"
 ```
 
+To inspect the same scheduler queue without taking a lease:
+
+```bash
+kb claim --candidates --as "$AGENT" --project NAME \
+  [--lane LANE] [--role ROLE] [--caller-scope driver] \
+  [--no-cross-lane] [--allow-reassign] [--tag NAME] [--limit N] --json
+```
+
+Candidate inspection is strictly read-only and never returns lease tokens.
+It shares eligibility and ordering with `claim --next`; claim the selected ID
+atomically before starting work because inspection does not reserve it.
+
 `--state done` or `blocked` on a checkpoint **releases the lease in the same
 transaction** that records it — there is no window where the work reads finished
 but the lease is still held.

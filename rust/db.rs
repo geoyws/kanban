@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::cell::Cell;
 use std::fs::{self, Permissions};
 use std::io::ErrorKind;
@@ -1059,34 +1059,74 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     // `doctor` runs to prove it afterwards, and enforcement is restored before
     // the connection does any work.
     connection.pragma_update(None, "foreign_keys", false)?;
-    let outcome = migrate(
-        &mut connection,
-        &[
-            BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8,
-            BOARD_V9, BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16,
-            BOARD_V17,
-        ],
-    );
+    let outcome = migrate(&mut connection, BOARD_MIGRATIONS);
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
     Ok(connection)
 }
 
+const BOARD_MIGRATIONS: &[&str] = &[
+    BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
+    BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
+];
+
+/// Open a current board without creating, migrating, sweeping, or checkpointing it.
+///
+/// Scheduler inspection must be observational: an agent asking what it could
+/// claim must not expire another agent's lease or leave a ledger event behind.
+/// An old schema is refused because making it readable would itself be a write;
+/// the next ordinary command will migrate it before inspection is retried.
+pub fn open_board_readonly(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open SQLite board read-only {}", path.display()))?;
+    connection.busy_handler(Some(busy_backoff))?;
+    connection.pragma_update(None, "query_only", true)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    let version = schema_version(&connection)?;
+    if version != BOARD_MIGRATIONS.len() {
+        bail!(
+            "board schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
+            BOARD_MIGRATIONS.len()
+        );
+    }
+    Ok(connection)
+}
+
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
-    migrate(
-        &mut connection,
-        &[
-            REGISTRY_V1,
-            REGISTRY_V2,
-            REGISTRY_V3,
-            REGISTRY_V4,
-            REGISTRY_V5,
-            REGISTRY_V6,
-            REGISTRY_V7,
-            REGISTRY_V8,
-        ],
-    )?;
+    migrate(&mut connection, REGISTRY_MIGRATIONS)?;
+    Ok(connection)
+}
+
+const REGISTRY_MIGRATIONS: &[&str] = &[
+    REGISTRY_V1,
+    REGISTRY_V2,
+    REGISTRY_V3,
+    REGISTRY_V4,
+    REGISTRY_V5,
+    REGISTRY_V6,
+    REGISTRY_V7,
+    REGISTRY_V8,
+];
+
+pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open SQLite registry read-only {}", path.display()))?;
+    connection.busy_handler(Some(busy_backoff))?;
+    connection.pragma_update(None, "query_only", true)?;
+    let version = schema_version(&connection)?;
+    if version != REGISTRY_MIGRATIONS.len() {
+        bail!(
+            "registry schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
+            REGISTRY_MIGRATIONS.len()
+        );
+    }
     Ok(connection)
 }
 

@@ -57,6 +57,9 @@ Usage:
   kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
   kanban claim [ID | --next] --as AGENT [claim options] [--json]
+  kanban claim --candidates --as AGENT [--tag NAME] [--lane LANE] [--role ROLE]
+             [--caller-scope driver] [--no-cross-lane] [--allow-reassign]
+             [--limit N] [--json]
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
   kanban note ID TEXT --as AGENT [--kind KIND]
@@ -123,12 +126,13 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 24] = [
+pub(crate) const BOOLEAN: [&str; 25] = [
     "help",
     "json",
     "version",
     "force",
     "next",
+    "candidates",
     "keep-status",
     "driver-only",
     "no-driver-only",
@@ -340,6 +344,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "no-cross-lane",
             "allow-reassign",
             "next",
+            "candidates",
+            "tag",
+            "limit",
         ],
         &["?id"],
         false,
@@ -1161,6 +1168,53 @@ fn store_path(args: &Args) -> Result<PathBuf> {
         workspace.display(),
         known_projects(&registry)?
     )
+}
+
+/// Resolve a board without updating registry recency or migrating either DB.
+fn store_path_readonly(args: &Args) -> Result<PathBuf> {
+    if let Some(path) = direct_db(args) {
+        return Ok(path);
+    }
+    let registry = Registry::open_readonly()?;
+    let named = args.one("project").map(str::to_owned).or_else(|| {
+        env::var("KANBAN_PROJECT")
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
+    let path = if let Some(name) = named {
+        let matches = registry.by_name(&name)?;
+        match matches.as_slice() {
+            [project] => PathBuf::from(&project.board_path),
+            [] => bail!(
+                "no Kanban project named {name}{}",
+                known_projects(&registry)?
+            ),
+            many => bail!(
+                "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
+                many.len(),
+                many.iter()
+                    .map(|project| project.canonical_root.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    } else {
+        let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
+        registry
+            .resolve_readonly(&workspace)?
+            .map(|record| PathBuf::from(record.board_path))
+            .with_context(|| {
+                format!(
+                    "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT{}",
+                    workspace.display(),
+                    known_projects(&registry).unwrap_or_default()
+                )
+            })?
+    };
+    if !board_is_present(&path.to_string_lossy()) {
+        return Err(missing_board_error(&path.to_string_lossy()));
+    }
+    Ok(path)
 }
 
 /// Whether a registered board's file is still on disk.
@@ -1988,6 +2042,37 @@ fn run() -> Result<()> {
     }
     if command == "search-rebuild" {
         return print(&rebuild_search_command(&args)?, args.has("json"));
+    }
+
+    if command == "claim" && args.has("candidates") {
+        if sub.is_some() || args.has("next") {
+            bail!(
+                "claim --candidates is read-only and cannot be combined with a task id or --next"
+            );
+        }
+        if args.has("session") || args.has("lease-minutes") {
+            bail!(
+                "claim --candidates creates no lease; --session and --lease-minutes do not apply"
+            );
+        }
+        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let options = ClaimOptions {
+            git: None,
+            agent_id: args.require("as")?.into(),
+            session_id: None,
+            lease_ms: 1000,
+            caller_lane: option_string(&args, "lane"),
+            role_filter: option_string(&args, "role"),
+            caller_scope: option_string(&args, "caller-scope"),
+            cross_lane: !args.has("no-cross-lane"),
+            allow_reassign: args.has("allow-reassign"),
+        };
+        let limit =
+            usize::try_from(args.limit(100)?).context("--limit is too large for this platform")?;
+        return print(
+            &store.claim_candidates(&options, args.one("tag"), limit)?,
+            args.has("json"),
+        );
     }
 
     let mut store = open_store(&args)?;

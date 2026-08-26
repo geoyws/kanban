@@ -1,4 +1,6 @@
-use crate::db::{checkpoint as wal_checkpoint, create_backup_target, integrity, open_board};
+use crate::db::{
+    checkpoint as wal_checkpoint, create_backup_target, integrity, open_board, open_board_readonly,
+};
 use crate::model::*;
 use crate::registry::now_ms;
 use anyhow::{Context, Result, bail};
@@ -809,6 +811,77 @@ pub struct Store {
     pub connection: Connection,
 }
 
+/// The scheduler's single definition of an eligible next task.
+///
+/// Both read-only inspection and the atomic writer call this function. Keep
+/// routing here: duplicating it would let the superbot see work that a claim
+/// immediately refuses, or hide work that the scheduler would actually hand
+/// out.
+fn eligible_claim_candidates(
+    connection: &Connection,
+    agent: &str,
+    options: &ClaimOptions,
+) -> Result<Vec<Task>> {
+    let mut statement = connection.prepare(
+        "SELECT t.* FROM tasks t
+         LEFT JOIN task_claims c ON c.task_id=t.id
+         WHERE t.status='todo'
+           AND t.archived=0
+           AND t.type=?
+           AND c.task_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM task_dependencies d
+             JOIN tasks dep ON dep.id=d.depends_on
+             WHERE d.task_id=t.id AND dep.status<>'done'
+           )
+         ORDER BY t.priority,t.created_at,t.id",
+    )?;
+    let candidates = statement
+        .query_map([CLAIMABLE_TYPE], task_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    let mut eligible = Vec::new();
+    for candidate in candidates {
+        let routable = (!candidate.driver_only
+            || options.caller_scope.as_deref() == Some("driver"))
+            && (candidate
+                .assignee
+                .as_ref()
+                .is_none_or(|value| value == agent)
+                || options.allow_reassign);
+        if routable && draft_ancestor(connection, &candidate.id)?.is_none() {
+            eligible.push(candidate);
+        }
+    }
+
+    Ok(if let Some(role) = options.role_filter.as_deref() {
+        eligible
+            .into_iter()
+            .filter(|candidate| candidate.lane.as_deref() == Some(role))
+            .collect()
+    } else if let Some(lane) = options.caller_lane.as_deref() {
+        let own_lane = eligible
+            .iter()
+            .filter(|candidate| candidate.lane.as_deref() == Some(lane))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !own_lane.is_empty() || !options.cross_lane {
+            own_lane
+        } else {
+            eligible
+                .into_iter()
+                .filter(|candidate| candidate.lane.is_none())
+                .collect()
+        }
+    } else {
+        eligible
+            .into_iter()
+            .filter(|candidate| candidate.lane.is_none())
+            .collect()
+    })
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut store = Self {
@@ -816,6 +889,12 @@ impl Store {
         };
         store.sweep_expired_claims()?;
         Ok(store)
+    }
+
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        Ok(Self {
+            connection: open_board_readonly(path)?,
+        })
     }
 
     pub fn search(&self, board: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
@@ -1343,63 +1422,10 @@ impl Store {
         let task = if let Some(id) = id {
             require_active_task(&transaction, id)?
         } else {
-            let mut statement = transaction.prepare(
-                "SELECT t.* FROM tasks t
-                 LEFT JOIN task_claims c ON c.task_id=t.id
-                 WHERE t.status='todo'
-                   AND t.archived=0
-                   AND t.type=?
-                   AND c.task_id IS NULL
-                   AND NOT EXISTS (
-                     SELECT 1 FROM task_dependencies d
-                     JOIN tasks dep ON dep.id=d.depends_on
-                     WHERE d.task_id=t.id AND dep.status<>'done'
-                   )
-                 ORDER BY t.priority,t.created_at,t.id",
-            )?;
-            let candidates = statement
-                .query_map([CLAIMABLE_TYPE], task_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(statement);
-            // Work under an unopened plan is not offered. Filtered here rather
-            // than in the query so that `--next` and an explicit claim refuse
-            // for the same reason, computed once.
-            let mut eligible = Vec::new();
-            for candidate in candidates {
-                let routable = (!candidate.driver_only
-                    || options.caller_scope.as_deref() == Some("driver"))
-                    && (candidate
-                        .assignee
-                        .as_ref()
-                        .is_none_or(|value| value == &agent)
-                        || options.allow_reassign);
-                if routable && draft_ancestor(&transaction, &candidate.id)?.is_none() {
-                    eligible.push(candidate);
-                }
-            }
-            let candidates = eligible;
-            let selected = if let Some(role) = options.role_filter.as_deref() {
-                candidates
-                    .into_iter()
-                    .find(|candidate| candidate.lane.as_deref() == Some(role))
-            } else if let Some(lane) = options.caller_lane.as_deref() {
-                let own_lane = candidates
-                    .iter()
-                    .find(|candidate| candidate.lane.as_deref() == Some(lane))
-                    .cloned();
-                if own_lane.is_some() || !options.cross_lane {
-                    own_lane
-                } else {
-                    candidates
-                        .into_iter()
-                        .find(|candidate| candidate.lane.is_none())
-                }
-            } else {
-                candidates
-                    .into_iter()
-                    .find(|candidate| candidate.lane.is_none())
-            };
-            selected.context("no claimable task")?
+            eligible_claim_candidates(&transaction, &agent, &options)?
+                .into_iter()
+                .next()
+                .context("no claimable task")?
         };
         require_claimable_type(&task.id, &task.task_type)?;
         require_no_draft_ancestor(&transaction, &task.id)?;
@@ -1456,6 +1482,29 @@ impl Store {
             claim: result,
             rules: self.rule_summaries(false)?,
         })
+    }
+
+    /// Inspect the tasks the atomic `claim --next` scheduler could choose.
+    /// This method accepts `&self` and is reached through `open_readonly`, so
+    /// it cannot expire leases, append events, or change task state.
+    pub fn claim_candidates(
+        &self,
+        options: &ClaimOptions,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Task>> {
+        let agent = nonempty(&options.agent_id, "agent id")?;
+        let tag = tag
+            .map(|value| validate_registered_tags(&self.connection, &[value.to_owned()], "claim"))
+            .transpose()?
+            .and_then(|mut values| values.pop());
+        let mut candidates = eligible_claim_candidates(&self.connection, agent, options)?;
+        attach_tags(&self.connection, &mut candidates)?;
+        if let Some(tag) = tag {
+            candidates.retain(|candidate| candidate.tags.contains(&tag));
+        }
+        candidates.truncate(limit);
+        Ok(candidates)
     }
 
     pub fn get_claim(&self, id: &str) -> Result<Option<Claim>> {
