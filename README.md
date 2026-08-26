@@ -204,7 +204,7 @@ Attention rows carry the same registered subsystem vocabulary as tasks:
 
 ```bash
 kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer
-kb att ls --status open --tag queuer
+kb att list --status open --tag queuer
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
 ```
