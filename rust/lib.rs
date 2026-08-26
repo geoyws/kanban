@@ -2099,7 +2099,12 @@ fn run() -> Result<()> {
     if command == "heartbeat" {
         let id = sub.context("task id is required")?;
         return print(
-            &store.heartbeat(id, args.require("lease")?, lease_ms(&args)?)?,
+            &store.heartbeat(
+                id,
+                args.require("lease")?,
+                lease_ms(&args)?,
+                here().as_ref(),
+            )?,
             args.has("json"),
         );
     }

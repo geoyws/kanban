@@ -5606,6 +5606,23 @@ fn make_repo(dir: &Path) -> bool {
     run(&["add", "-A"]) && run(&["commit", "-qm", "seed"])
 }
 
+fn commit_all(dir: &Path, message: &str) -> bool {
+    let run = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    };
+    run(&["add", "-A"]) && run(&["commit", "-qm", message])
+}
+
 #[test]
 fn where_work_happened_is_captured_rather_than_asked_for() {
     // The columns for this existed and were empty: measured across the live
@@ -5642,10 +5659,40 @@ fn where_work_happened_is_captured_rather_than_asked_for() {
     );
     assert_eq!(claim["branch"], "work");
     assert_eq!(claim["worktreeKind"], "main");
+    let claimed_head = claim["headSha"].as_str().unwrap().to_owned();
     assert_eq!(
-        claim["headSha"].as_str().unwrap().len(),
+        claimed_head.len(),
         40,
         "a HEAD sha should be a full object id"
+    );
+
+    // A heartbeat is a fresh receipt, not merely a longer expiry stamped onto
+    // the checkout where the claim was first taken.
+    fs::write(fixture.main.join("after-claim.txt"), "new head").unwrap();
+    assert!(commit_all(&fixture.main, "advance after claim"));
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+    let heartbeat = fixture.ok_json(
+        &fixture.main,
+        &[
+            "heartbeat",
+            "t-1",
+            "--lease",
+            &token,
+            "--lease-minutes",
+            "30",
+            "--json",
+        ],
+    );
+    assert_ne!(heartbeat["headSha"], claimed_head);
+    let current_head = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.main)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        heartbeat["headSha"],
+        String::from_utf8(current_head.stdout).unwrap().trim()
     );
 
     // Creating a task is attributable. Every other event kind recorded who did
@@ -5664,7 +5711,6 @@ fn where_work_happened_is_captured_rather_than_asked_for() {
     assert_eq!(added["payload"]["type"], "task");
 
     // A checkpoint fills the columns that used to be null.
-    let token = claim["leaseToken"].as_str().unwrap().to_owned();
     let checkpoint = fixture.ok_json(
         &fixture.main,
         &[

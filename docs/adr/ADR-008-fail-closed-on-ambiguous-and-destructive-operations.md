@@ -378,6 +378,13 @@ outermost superproject's commit: a submodule's own sha says nothing about which
 revision of the whole tree it belonged to, and the chain is followed to its end
 rather than one level, because nesting is not limited to one level.
 
+A heartbeat refreshes that claim provenance from the directory where it runs.
+Extending an expiry while retaining the claim's original HEAD produced a fresh
+receipt carrying stale recovery data after the lane committed or changed
+branches. When Git context is unavailable the heartbeat preserves the last
+known fields rather than inventing or erasing them; its lease renewal still
+succeeds.
+
 It asks git rather than reading `.git`. The layouts on a real machine disagree
 with the tutorial — here a submodule has a real `.git` directory while its
 superproject's is a file, lanes redirect through `gitdir:`, refs may be packed

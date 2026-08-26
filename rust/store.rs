@@ -1381,7 +1381,13 @@ impl Store {
         active_claim(&self.connection, id, now_ms())
     }
 
-    pub fn heartbeat(&mut self, id: &str, token: &str, lease_ms: i64) -> Result<Claim> {
+    pub fn heartbeat(
+        &mut self,
+        id: &str,
+        token: &str,
+        lease_ms: i64,
+        git: Option<&crate::gitctx::GitContext>,
+    ) -> Result<Claim> {
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
@@ -1390,10 +1396,26 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
-        transaction.execute(
-            "UPDATE task_claims SET heartbeat_at=?,expires_at=? WHERE task_id=? AND lease_token=?",
-            params![now, now + lease_ms, id, token],
-        )?;
+        match git {
+            Some(git) => transaction.execute(
+                "UPDATE task_claims SET heartbeat_at=?,expires_at=?,worktree=?,worktree_kind=?,branch=?,head_sha=?,root_head=? WHERE task_id=? AND lease_token=?",
+                params![
+                    now,
+                    now + lease_ms,
+                    git.worktree,
+                    git.worktree_kind,
+                    git.branch,
+                    git.head,
+                    git.root_head,
+                    id,
+                    token
+                ],
+            )?,
+            None => transaction.execute(
+                "UPDATE task_claims SET heartbeat_at=?,expires_at=? WHERE task_id=? AND lease_token=?",
+                params![now, now + lease_ms, id, token],
+            )?,
+        };
         event(
             &transaction,
             Some(id),
