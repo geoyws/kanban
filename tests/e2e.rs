@@ -262,7 +262,13 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
     assert_eq!(dashboard[0]["workspaceRoots"].as_array().unwrap().len(), 2);
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
-    assert!(fixture.ok_json(&fixture.main, &["doctor", "--json"])["healthy"] == true);
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(doctor["healthy"], true);
+    assert_eq!(doctor["registrySchemaVersion"], 7);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 7);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 13);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 13);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 13);
 }
 
 #[test]
@@ -1709,9 +1715,16 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         &fixture.main,
         &["task", "list", "--status", "todo", "--json"],
     );
+    let version = fixture.run(&fixture.main, &["version"]);
+    let version = String::from_utf8_lossy(&version.stdout);
+    assert!(version.contains("kanban"));
     assert!(
-        String::from_utf8_lossy(&fixture.run(&fixture.main, &["version"]).stdout)
-            .contains("kanban"),
+        version.contains("board schema 13"),
+        "version output: {version}"
+    );
+    assert!(
+        version.contains("registry schema 7"),
+        "version output: {version}"
     );
 }
 

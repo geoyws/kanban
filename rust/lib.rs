@@ -1518,7 +1518,7 @@ pub fn entrypoint() -> ! {
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
     if args.has("version") {
-        emit(&format!("kanban {}", env!("CARGO_PKG_VERSION")))?;
+        emit(&version_string())?;
         return Ok(());
     }
     if args.positionals.is_empty() || args.has("help") {
@@ -1534,7 +1534,7 @@ fn run() -> Result<()> {
     let rest = args.positionals.get(2..).unwrap_or(&[]);
 
     if command == "version" {
-        emit(&format!("kanban {}", env!("CARGO_PKG_VERSION")))?;
+        emit(&version_string())?;
         return Ok(());
     }
 
@@ -1678,6 +1678,7 @@ fn run() -> Result<()> {
     if command == "doctor" {
         let registry = Registry::open()?;
         let registry_check = registry.integrity()?;
+        let registry_schema = db::schema_version(&registry.connection)?;
         let mut projects = Vec::new();
         // A stored root is canonical when written and can only become wrong
         // afterwards -- the tree moves and a symlink takes its place, which is
@@ -1699,6 +1700,7 @@ fn run() -> Result<()> {
                 continue;
             }
             let store = Store::open(Path::new(&project.board_path))?;
+            let board_schema = db::schema_version(&store.connection)?;
             let check = store.integrity()?;
             // `integrity_check` validates the b-tree and nothing about what
             // the rows mean, so a structurally perfect board can still hold a
@@ -1715,6 +1717,8 @@ fn run() -> Result<()> {
                 "name": project.name,
                 "boardPath": project.board_path,
                 "present": true,
+                "schemaVersion": board_schema,
+                "supportedSchemaVersion": db::BOARD_SCHEMA_VERSION,
                 "integrity": check,
                 "orphanedRows": orphans,
                 "futureDatedTasks": future,
@@ -1724,6 +1728,9 @@ fn run() -> Result<()> {
         let result = json!({
             "healthy": healthy,
             "registry": registry_check,
+            "registrySchemaVersion": registry_schema,
+            "supportedRegistrySchemaVersion": db::REGISTRY_SCHEMA_VERSION,
+            "supportedBoardSchemaVersion": db::BOARD_SCHEMA_VERSION,
             "unreachableRoots": unreachable,
             "projects": projects,
         });
@@ -2393,6 +2400,15 @@ fn run() -> Result<()> {
         return Ok(());
     }
     bail!("unknown command; run kanban --help")
+}
+
+fn version_string() -> String {
+    format!(
+        "kanban {} (board schema {}; registry schema {})",
+        env!("CARGO_PKG_VERSION"),
+        db::BOARD_SCHEMA_VERSION,
+        db::REGISTRY_SCHEMA_VERSION
+    )
 }
 
 #[cfg(test)]

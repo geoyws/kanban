@@ -785,6 +785,9 @@ CREATE TABLE workspace_alias_history (
 CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
 "#;
 
+pub const BOARD_SCHEMA_VERSION: usize = 13;
+pub const REGISTRY_SCHEMA_VERSION: usize = 7;
+
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
 /// Directories that already exist are left exactly as the operator set them.
@@ -1005,6 +1008,12 @@ pub fn integrity(connection: &Connection) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+pub fn schema_version(connection: &Connection) -> Result<usize> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
 /// Rows whose foreign key points at something that is not there.
 ///
 /// `integrity_check` validates the b-tree and says nothing about referential
@@ -1102,6 +1111,12 @@ mod tests {
             declared, ladder,
             "{declared} board migrations are declared but {ladder} are applied; \
              a migration that is never run is invisible until a column is missing"
+        );
+        assert_eq!(BOARD_SCHEMA_VERSION, declared);
+        let registry_declaration = format!("{} REGISTRY_V", "const");
+        assert_eq!(
+            REGISTRY_SCHEMA_VERSION,
+            SOURCE.matches(registry_declaration.as_str()).count()
         );
     }
 

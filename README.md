@@ -243,9 +243,17 @@ path alone ([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-
 Check and back up all registered boards with:
 
 ```bash
+kanban version
 kanban doctor
 kanban backup --json
 ```
+
+`version` prints the package version plus the newest board and registry schema
+versions the binary supports. This makes two builds with the same package
+version but different migration ladders visibly different before either one
+opens a shared board. `doctor --json` also reports the registry's actual and
+supported schema versions and, for every present board, its actual and
+supported schema versions.
 
 ## SQLite-native retrieval and RAG
 
