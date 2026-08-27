@@ -1,8 +1,6 @@
 ---
 name: kb
 description: Use the authoritative Kanban work ledger on HAX over SSH — tasks, claims and leases, checkpoints, handoffs, sitreps, and attention items that need George. Use whenever recording, reading, resuming, or handing over durable work state.
-metadata:
-  argument-hint: "[subcommand …]"
 ---
 
 # /kb — the kanban work ledger
