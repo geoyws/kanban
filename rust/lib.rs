@@ -1,3 +1,4 @@
+mod audit;
 mod context;
 mod db;
 mod gitctx;
@@ -16,25 +17,27 @@ use crate::model::*;
 use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
 use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write as _};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const HELP: &str = r#"kanban — durable work ledger for agents (Rust)
 
 Usage:
   kanban version
-  kanban init [--name NAME] [--workspace PATH] [--force]
+  kanban init [--name NAME] [--workspace PATH] [--force] [--as ACTOR]
   kanban workspace list [--all] [--json]
-  kanban workspace attach --to REGISTERED_PATH [--workspace PATH]
+  kanban workspace attach --to REGISTERED_PATH [--workspace PATH] [--as ACTOR]
   kanban workspace detach --root REGISTERED_PATH --as ACTOR
-  kanban workspace repoint [--root PATH] [--json]
+  kanban workspace repoint [--root PATH] [--as ACTOR] [--json]
   kanban dashboard [--json]
   kanban doctor [--json]
+  kanban audit verify [--against MANIFEST] [--json]
   kanban search QUERY [--source KIND] [--status STATUS] [--tag NAME] [--lane LANE]
              [--after MS] [--before MS] [--all] [--all-boards]
              [--limit N] [--max-chars N] [--json]
@@ -42,7 +45,7 @@ Usage:
   kanban serve [--port N]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
-  kanban restore --from DIRECTORY --force [--json]
+  kanban restore --from DIRECTORY --force [--as ACTOR] [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
              [--priority P0|P1|P2|0-9] [--depends-on ID ...]
@@ -94,7 +97,7 @@ Usage:
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
   kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
   kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
-  kanban events [--task ID] [--kind KIND] [--limit N] [--json]
+  kanban events [--task ID | --rule ID | --registry] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
@@ -129,7 +132,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 24] = [
+pub(crate) const BOOLEAN: [&str; 25] = [
     "help",
     "json",
     "version",
@@ -154,6 +157,7 @@ pub(crate) const BOOLEAN: [&str; 24] = [
     "all",
     "full",
     "all-boards",
+    "registry",
 ];
 
 /// Removed boolean flags that remain recognizable only to return an actionable
@@ -218,13 +222,14 @@ pub(crate) type CommandRow = (
 );
 
 pub(crate) const COMMANDS: &[CommandRow] = &[
-    ("init", None, &["name", "force"], &[], false),
+    ("init", None, &["name", "force", "as"], &[], false),
     ("workspace", Some("list"), &["all"], &[], true),
-    ("workspace", Some("attach"), &["to"], &[], false),
+    ("workspace", Some("attach"), &["to", "as"], &[], false),
     ("workspace", Some("detach"), &["root", "as"], &[], false),
-    ("workspace", Some("repoint"), &["root"], &[], false),
+    ("workspace", Some("repoint"), &["root", "as"], &[], false),
     ("dashboard", None, &[], &[], true),
     ("doctor", None, &[], &[], true),
+    ("audit", Some("verify"), &["against"], &[], true),
     (
         "search",
         None,
@@ -253,7 +258,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[],
         false,
     ),
-    ("restore", None, &["from", "force"], &[], false),
+    ("restore", None, &["from", "force", "as"], &[], false),
     (
         "task",
         Some("add"),
@@ -517,7 +522,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "events",
         None,
-        &["task", "rule", "kind", "limit", "all"],
+        &["task", "rule", "registry", "kind", "limit", "all"],
         &[],
         true,
     ),
@@ -548,7 +553,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 9] = [
+const SUBCOMMAND_GROUPS: [&str; 10] = [
     "task",
     "story",
     "handoff",
@@ -558,6 +563,7 @@ const SUBCOMMAND_GROUPS: [&str; 9] = [
     "tag",
     "rule",
     "sitrep",
+    "audit",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -1317,7 +1323,7 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
     let options = search_options(args, query)?;
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
-        let registry = Registry::open()?;
+        let registry = Registry::open_readonly()?;
         let mut results = Vec::new();
         let mut boards = Vec::new();
         let mut missing = Vec::new();
@@ -1519,6 +1525,241 @@ fn prune_backups(keep: i64, just_written: &Path) -> Result<Vec<String>> {
     Ok(pruned)
 }
 
+const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotFile {
+    path: String,
+    kind: String,
+    project: Option<String>,
+    bytes: u64,
+    sha256: String,
+    schema_version: usize,
+    audit: crate::audit::AuditReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotManifest {
+    format_version: u32,
+    created_at: i64,
+    files: Vec<SnapshotFile>,
+    missing_boards: Vec<String>,
+}
+
+fn load_snapshot_manifest(path: &Path) -> Result<SnapshotManifest> {
+    let path = if path.is_dir() {
+        path.join("manifest.json")
+    } else {
+        path.to_owned()
+    };
+    let bytes = fs::read(&path).with_context(|| format!("read audit anchor {}", path.display()))?;
+    let manifest: SnapshotManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse audit anchor {}", path.display()))?;
+    if manifest.format_version != SNAPSHOT_MANIFEST_VERSION {
+        bail!(
+            "snapshot manifest version {} is not supported (expected {})",
+            manifest.format_version,
+            SNAPSHOT_MANIFEST_VERSION
+        );
+    }
+    Ok(manifest)
+}
+
+fn apply_snapshot_anchor(
+    connection: &rusqlite::Connection,
+    table: &str,
+    report: &mut audit::AuditReport,
+    anchor: &audit::AuditReport,
+) -> Result<()> {
+    let anchored_hash = if anchor.last_seq == 0 {
+        Some(anchor.head.clone())
+    } else {
+        audit::hash_at(connection, table, anchor.last_seq)?
+    };
+    if report.last_seq < anchor.last_seq {
+        report.errors.push(format!(
+            "journal ends at sequence {}, before anchored sequence {}",
+            report.last_seq, anchor.last_seq
+        ));
+    } else if anchored_hash.as_deref() != Some(anchor.head.as_str()) {
+        report.errors.push(format!(
+            "sequence {} does not match the retained anchor",
+            anchor.last_seq
+        ));
+    }
+    report.healthy = report.errors.is_empty();
+    Ok(())
+}
+
+fn snapshot_file(
+    directory: &Path,
+    path: &Path,
+    kind: &str,
+    project: Option<String>,
+) -> Result<SnapshotFile> {
+    let relative = path
+        .strip_prefix(directory)
+        .with_context(|| {
+            format!(
+                "{} is outside snapshot {}",
+                path.display(),
+                directory.display()
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let (schema_version, audit) = match kind {
+        "registry" => {
+            let connection = db::open_registry_readonly(path)?;
+            (
+                db::schema_version(&connection)?,
+                audit::verify_registry(&connection)?,
+            )
+        }
+        "board" => {
+            let connection = db::open_board_readonly(path)?;
+            (
+                db::schema_version(&connection)?,
+                audit::verify_board(&connection)?,
+            )
+        }
+        _ => bail!("unknown snapshot file kind {kind}"),
+    };
+    if !audit.healthy {
+        bail!(
+            "{} has an invalid audit chain: {:?}",
+            path.display(),
+            audit.errors
+        );
+    }
+    Ok(SnapshotFile {
+        path: relative,
+        kind: kind.to_owned(),
+        project,
+        bytes: fs::metadata(path)?.len(),
+        sha256: audit::file_sha256(path)?,
+        schema_version,
+        audit,
+    })
+}
+
+fn write_snapshot_manifest(
+    directory: &Path,
+    registry_path: &Path,
+    boards: &[(String, PathBuf)],
+    missing_boards: &[String],
+) -> Result<(PathBuf, String)> {
+    let mut files = vec![snapshot_file(directory, registry_path, "registry", None)?];
+    for (project, path) in boards {
+        files.push(snapshot_file(
+            directory,
+            path,
+            "board",
+            Some(project.clone()),
+        )?);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let manifest = SnapshotManifest {
+        format_version: SNAPSHOT_MANIFEST_VERSION,
+        created_at: now_ms(),
+        files,
+        missing_boards: missing_boards.to_vec(),
+    };
+    let path = directory.join("manifest.json");
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut output, &manifest)?;
+    output.write_all(b"\n")?;
+    output.sync_all()?;
+    let digest = audit::file_sha256(&path)?;
+    Ok((path, digest))
+}
+
+fn verify_snapshot_manifest(directory: &Path) -> Result<(SnapshotManifest, String)> {
+    let path = directory.join("manifest.json");
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "snapshot {} has no readable manifest.json; legacy unmanifested snapshots cannot be verified",
+            directory.display()
+        )
+    })?;
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    if manifest.format_version != SNAPSHOT_MANIFEST_VERSION {
+        bail!(
+            "snapshot manifest version {} is not supported (expected {})",
+            manifest.format_version,
+            SNAPSHOT_MANIFEST_VERSION
+        );
+    }
+    let mut expected = manifest
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    expected.sort();
+    expected.dedup();
+    if expected.len() != manifest.files.len() {
+        bail!("snapshot manifest contains duplicate file paths");
+    }
+    let mut actual = vec!["registry.db".to_owned()];
+    for entry in fs::read_dir(directory.join("boards"))
+        .with_context(|| format!("read {}/boards", directory.display()))?
+    {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("db") {
+            actual.push(format!("boards/{}", entry.file_name().to_string_lossy()));
+        }
+    }
+    actual.sort();
+    if expected != actual {
+        bail!(
+            "snapshot database set differs from manifest: expected {expected:?}, found {actual:?}"
+        );
+    }
+    for record in &manifest.files {
+        let relative = Path::new(&record.path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            bail!("unsafe path in snapshot manifest: {}", record.path);
+        }
+        let file = directory.join(relative);
+        let bytes = fs::metadata(&file)
+            .with_context(|| format!("stat manifested file {}", file.display()))?
+            .len();
+        if bytes != record.bytes {
+            bail!("snapshot file {} size differs from manifest", record.path);
+        }
+        let digest = audit::file_sha256(&file)?;
+        if digest != record.sha256 {
+            bail!(
+                "snapshot file {} SHA-256 differs from manifest",
+                record.path
+            );
+        }
+        let observed = snapshot_file(directory, &file, &record.kind, record.project.clone())?;
+        if observed.schema_version != record.schema_version
+            || observed.audit.head != record.audit.head
+            || observed.audit.entries != record.audit.entries
+        {
+            bail!(
+                "snapshot file {} audit anchor differs from manifest",
+                record.path
+            );
+        }
+    }
+    Ok((manifest, audit::file_sha256(&path)?))
+}
+
 /// Replace the live registry and boards with a snapshot.
 ///
 /// A backup nobody can restore is not a recovery path, but this overwrites
@@ -1533,6 +1774,7 @@ fn restore(args: &Args) -> Result<()> {
             source.display()
         );
     }
+    let (manifest, manifest_sha256) = verify_snapshot_manifest(&source)?;
     // Verify before destroying: restoring a corrupt snapshot over good state
     // would turn a recovery into the incident.
     let mut boards = Vec::new();
@@ -1569,19 +1811,26 @@ fn restore(args: &Args) -> Result<()> {
         .join("backups")
         .join(format!("pre-restore-{}", now_ms()));
     let registry = Registry::open()?;
-    registry.backup(&rescue.join("registry.db"))?;
+    let rescue_registry = rescue.join("registry.db");
+    registry.backup(&rescue_registry)?;
+    let mut rescue_boards = Vec::new();
+    let mut rescue_missing = Vec::new();
     for project in registry.projects()? {
         // A board that is already gone is what a restore is often for; it
         // cannot be a precondition of running one.
         if !board_is_present(&project.board_path) {
+            rescue_missing.push(project.name);
             continue;
         }
         let file_name = Path::new(&project.board_path)
             .file_name()
             .with_context(|| format!("board path has no file name: {}", project.board_path))?;
-        Store::open(Path::new(&project.board_path))?
-            .backup(&rescue.join("boards").join(file_name))?;
+        let destination = rescue.join("boards").join(file_name);
+        Store::open(Path::new(&project.board_path))?.backup(&destination)?;
+        rescue_boards.push((project.name, destination));
     }
+    let (rescue_manifest, rescue_manifest_sha256) =
+        write_snapshot_manifest(&rescue, &rescue_registry, &rescue_boards, &rescue_missing)?;
     drop(registry);
 
     let mut restored = Vec::new();
@@ -1597,8 +1846,48 @@ fn restore(args: &Args) -> Result<()> {
         db::replace_database(&from, &to)?;
         restored.push(to.to_string_lossy().into_owned());
     }
+    let restore_id = format!("restore-{}", now_ms());
+    let actor = args.one("as").unwrap_or("system@cli");
+    Registry::open()?.record_system_event(
+        "snapshot_restored",
+        actor,
+        json!({
+            "restoreID":restore_id,
+            "from":source,
+            "manifestSha256":manifest_sha256,
+            "rescueSnapshot":rescue,
+            "rescueManifestSha256":rescue_manifest_sha256,
+        }),
+    )?;
+    for path in &boards {
+        let destination = root
+            .join("boards")
+            .join(path.file_name().unwrap_or_default());
+        Store::open(&destination)?.record_system_event(
+            "snapshot_restored",
+            actor,
+            json!({
+                "restoreID":restore_id,
+                "from":source,
+                "manifestSha256":manifest_sha256,
+            }),
+        )?;
+    }
+    let restored_heads = manifest
+        .files
+        .iter()
+        .map(|file| json!({"path":file.path,"kind":file.kind,"project":file.project,"entries":file.audit.entries,"head":file.audit.head}))
+        .collect::<Vec<_>>();
     print(
-        &json!({"restored":restored,"from":source,"rescueSnapshot":rescue}),
+        &json!({
+            "restored":restored,
+            "from":source,
+            "manifestSha256":manifest_sha256,
+            "restoredHeads":restored_heads,
+            "rescueSnapshot":rescue,
+            "rescueManifest":rescue_manifest,
+            "rescueManifestSha256":rescue_manifest_sha256,
+        }),
         args.has("json"),
     )
 }
@@ -1698,9 +1987,10 @@ fn run() -> Result<()> {
             &workspace,
             args.one("name").unwrap_or(fallback),
             args.has("force"),
+            args.one("as").unwrap_or("system@cli"),
         )?;
-        let store = Store::open(Path::new(&record.board_path))?;
-        store.initialize(&record.name)?;
+        let mut store = Store::open(Path::new(&record.board_path))?;
+        store.initialize(&record.name, args.one("as").unwrap_or("system@cli"))?;
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("list") {
@@ -1709,7 +1999,11 @@ fn run() -> Result<()> {
     if command == "workspace" && sub == Some("attach") {
         let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
         let mut registry = Registry::open()?;
-        let record = registry.attach(&workspace, Path::new(args.require("to")?))?;
+        let record = registry.attach(
+            &workspace,
+            Path::new(args.require("to")?),
+            args.one("as").unwrap_or("system@cli"),
+        )?;
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("detach") {
@@ -1735,7 +2029,7 @@ fn run() -> Result<()> {
         };
         let mut repointed = Vec::new();
         for root in targets {
-            repointed.push(registry.repoint(&root)?);
+            repointed.push(registry.repoint(&root, args.one("as").unwrap_or("system@cli"))?);
         }
         return print(&repointed, args.has("json"));
     }
@@ -1814,9 +2108,62 @@ fn run() -> Result<()> {
             args.has("json"),
         );
     }
+    if command == "audit" && sub == Some("verify") {
+        let anchor = args
+            .one("against")
+            .map(|path| load_snapshot_manifest(Path::new(path)))
+            .transpose()?;
+        let registry = Registry::open_readonly()?;
+        let mut registry_audit = registry.audit()?;
+        if let Some(record) = anchor
+            .as_ref()
+            .and_then(|manifest| manifest.files.iter().find(|file| file.kind == "registry"))
+        {
+            apply_snapshot_anchor(
+                &registry.connection,
+                "rule_events",
+                &mut registry_audit,
+                &record.audit,
+            )?;
+        }
+        let mut healthy = registry_audit.healthy;
+        let mut boards = Vec::new();
+        let mut missing = Vec::new();
+        for project in registry.projects()? {
+            if !board_is_present(&project.board_path) {
+                healthy = false;
+                missing.push(project.name);
+                continue;
+            }
+            let store = Store::open_readonly(Path::new(&project.board_path))?;
+            let mut audit = store.audit()?;
+            if let Some(record) = anchor.as_ref().and_then(|manifest| {
+                let current_name = Path::new(&project.board_path).file_name()?;
+                manifest.files.iter().find(|file| {
+                    file.kind == "board" && Path::new(&file.path).file_name() == Some(current_name)
+                })
+            }) {
+                apply_snapshot_anchor(&store.connection, "events", &mut audit, &record.audit)?;
+            }
+            healthy &= audit.healthy;
+            boards.push(json!({"name":project.name,"boardPath":project.board_path,"audit":audit}));
+        }
+        let receipt = json!({
+            "healthy": healthy,
+            "registry": registry_audit,
+            "boards": boards,
+            "missingBoards": missing,
+        });
+        print(&receipt, args.has("json"))?;
+        if !healthy {
+            bail!("Kanban audit verification failed");
+        }
+        return Ok(());
+    }
     if command == "doctor" {
         let registry = Registry::open()?;
         let registry_check = registry.integrity()?;
+        let registry_audit = registry.audit()?;
         let registry_schema = db::schema_version(&registry.connection)?;
         let mut projects = Vec::new();
         // A stored root is canonical when written and can only become wrong
@@ -1826,7 +2173,8 @@ fn run() -> Result<()> {
         // resolves to the board and the project is reachable only by name.
         // `integrity_check` sees a perfect database throughout.
         let unreachable = registry.unreachable_roots()?;
-        let mut healthy = registry_check == vec!["ok"] && unreachable.is_empty();
+        let mut healthy =
+            registry_check == vec!["ok"] && registry_audit.healthy && unreachable.is_empty();
         for project in registry.projects()? {
             // Checked before opening, because opening would create it.
             if !board_is_present(&project.board_path) {
@@ -1848,10 +2196,12 @@ fn run() -> Result<()> {
             let orphans = store.foreign_key_violations()?;
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
+            let audit = store.audit()?;
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
                 && future.is_empty()
-                && search_index.healthy;
+                && search_index.healthy
+                && audit.healthy;
             projects.push(json!({
                 "name": project.name,
                 "boardPath": project.board_path,
@@ -1862,11 +2212,13 @@ fn run() -> Result<()> {
                 "orphanedRows": orphans,
                 "futureDatedTasks": future,
                 "searchIndex": search_index,
+                "audit": audit,
             }));
         }
         let result = json!({
             "healthy": healthy,
             "registry": registry_check,
+            "registryAudit": registry_audit,
             "registrySchemaVersion": registry_schema,
             "supportedRegistrySchemaVersion": db::REGISTRY_SCHEMA_VERSION,
             "supportedBoardSchemaVersion": db::BOARD_SCHEMA_VERSION,
@@ -1890,7 +2242,7 @@ fn run() -> Result<()> {
             .unwrap_or(data_root()?.join("backups").join(now_ms().to_string()));
         let registry_path = directory.join("registry.db");
         registry.backup(&registry_path)?;
-        let mut boards = Vec::new();
+        let mut board_files = Vec::new();
         let mut missing = Vec::new();
         for project in registry.projects()? {
             // A snapshot of what is still here beats refusing to snapshot
@@ -1905,14 +2257,28 @@ fn run() -> Result<()> {
                 .with_context(|| format!("board path has no file name: {}", project.board_path))?;
             let destination = directory.join("boards").join(file_name);
             store.backup(&destination)?;
-            boards.push(destination.to_string_lossy().into_owned());
+            board_files.push((project.name, destination));
         }
+        let (manifest, manifest_sha256) =
+            write_snapshot_manifest(&directory, &registry_path, &board_files, &missing)?;
+        let boards = board_files
+            .iter()
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         let pruned = match args.one("keep") {
             Some(_) => prune_backups(args.integer("keep", 0)?, &directory)?,
             None => Vec::new(),
         };
         return print(
-            &json!({"directory":directory,"registry":registry_path,"boards":boards,"missingBoards":missing,"pruned":pruned}),
+            &json!({
+                "directory":directory,
+                "registry":registry_path,
+                "boards":boards,
+                "missingBoards":missing,
+                "manifest":manifest,
+                "manifestSha256":manifest_sha256,
+                "pruned":pruned,
+            }),
             args.has("json"),
         );
     }
@@ -1934,12 +2300,16 @@ fn run() -> Result<()> {
         );
     }
 
-    if command == "events" && args.one("rule").is_some() {
-        if args.has("task") {
-            bail!("--task and --rule address different event trails; pass one");
+    if command == "events" && (args.one("rule").is_some() || args.has("registry")) {
+        if args.has("task") || (args.one("rule").is_some() && args.has("registry")) {
+            bail!("--task, --rule and --registry address different event trails; pass one");
         }
         return print(
-            &Registry::open()?.rule_events(args.one("rule"), args.one("kind"), args.limit(50)?)?,
+            &Registry::open_readonly()?.rule_events(
+                args.one("rule"),
+                args.one("kind"),
+                args.limit(50)?,
+            )?,
             args.has("json"),
         );
     }
@@ -2091,7 +2461,7 @@ fn run() -> Result<()> {
             task_type: args.one("type").unwrap_or("task").into(),
             parent_id: option_string(&args, "parent"),
             title,
-            actor: option_string(&args, "as"),
+            actor: Some(args.one("as").unwrap_or("system@cli").to_owned()),
             body: args.body()?,
             assignee: option_string(&args, "assignee"),
             lane: option_string(&args, "lane"),
@@ -2452,7 +2822,11 @@ fn run() -> Result<()> {
     if command == "tag" && sub == Some("add") {
         let name = rest.first().context("tag name is required")?;
         return print(
-            &store.add_tag(name, args.one("description"), args.one("as"))?,
+            &store.add_tag(
+                name,
+                args.one("description"),
+                Some(args.one("as").unwrap_or("system@cli")),
+            )?,
             args.has("json"),
         );
     }
@@ -2472,7 +2846,11 @@ fn run() -> Result<()> {
                 if rule_uses == 1 { "" } else { "s" }
             );
         }
-        store.remove_tag(name, args.one("as"), args.has("force"))?;
+        store.remove_tag(
+            name,
+            Some(args.one("as").unwrap_or("system@cli")),
+            args.has("force"),
+        )?;
         return print(&json!({ "removed": name }), args.has("json"));
     }
     if command == "attention" && sub == Some("raise") {

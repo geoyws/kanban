@@ -98,6 +98,16 @@ fn remove_v13_search_schema(connection: &Connection) {
         .unwrap();
 }
 
+fn remove_v18_board_audit_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DELETE FROM board_meta WHERE key LIKE 'audit_chain_%';\
+             ALTER TABLE events DROP COLUMN event_hash;\
+             ALTER TABLE events DROP COLUMN prev_hash;",
+        )
+        .unwrap();
+}
+
 #[test]
 fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     let fixture = Fixture::new("handoff");
@@ -263,11 +273,11 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 9);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 9);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 17);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 17);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 17);
+    assert_eq!(doctor["registrySchemaVersion"], 10);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 10);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 18);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 18);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 18);
 }
 
 #[test]
@@ -708,6 +718,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         .unwrap()
         .to_owned();
     let connection = Connection::open(&board).unwrap();
+    remove_v18_board_audit_schema(&connection);
     remove_v13_search_schema(&connection);
     connection
         .execute_batch(
@@ -737,7 +748,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        17
+        18
     );
     assert_eq!(
         reopened
@@ -2008,11 +2019,11 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 17"),
+        version.contains("board schema 18"),
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 9"),
+        version.contains("registry schema 10"),
         "version output: {version}"
     );
 }
@@ -2559,6 +2570,148 @@ fn compiled_binary_exposes_the_audit_trail_it_writes() {
 }
 
 #[test]
+fn compiled_binary_detects_a_structurally_valid_board_event_edit() {
+    let fixture = Fixture::new("audit-board-tamper");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Audit", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "audited", "--id", "t-audit", "--json"],
+    );
+    let clean = fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
+    assert_eq!(clean["healthy"], true);
+    assert_eq!(clean["boards"][0]["audit"]["healthy"], true);
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(board)
+        .unwrap()
+        .execute("UPDATE events SET payload='{}' WHERE kind='task_added'", [])
+        .unwrap();
+
+    let audit = fixture.run(&fixture.main, &["audit", "verify", "--json"]);
+    assert!(
+        !audit.status.success(),
+        "edited history passed audit verification"
+    );
+    let receipt: Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(receipt["healthy"], false);
+    assert!(
+        receipt["boards"][0]["audit"]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("event hash")),
+        "receipt did not identify the broken digest: {receipt}"
+    );
+    assert!(
+        !fixture
+            .run(&fixture.main, &["doctor", "--json"])
+            .status
+            .success(),
+        "doctor ignored a broken audit chain"
+    );
+}
+
+#[test]
+fn compiled_binary_detects_registry_rule_history_edit() {
+    let fixture = Fixture::new("audit-registry-tamper");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Audit", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["rule", "add", "Keep evidence.", "--as", "geo", "--json"],
+    );
+    fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
+
+    Connection::open(fixture.data.join("registry.db"))
+        .unwrap()
+        .execute("UPDATE rule_events SET actor='intruder'", [])
+        .unwrap();
+    let audit = fixture.run(&fixture.main, &["audit", "verify", "--json"]);
+    assert!(
+        !audit.status.success(),
+        "edited registry history passed verification"
+    );
+    let receipt: Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(receipt["registry"]["healthy"], false);
+    assert!(
+        receipt["registry"]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("event hash")),
+        "receipt did not identify the registry digest mismatch: {receipt}"
+    );
+}
+
+#[test]
+fn compiled_binary_detects_deleted_and_reordered_board_history() {
+    for mutation in ["delete", "reorder"] {
+        let fixture = Fixture::new(&format!("audit-{mutation}"));
+        fixture.ok_json(&fixture.main, &["init", "--name", "Audit", "--json"]);
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", "audited", "--id", "t-audit", "--json"],
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "t-audit", "--as", "worker", "--json"],
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &["note", "t-audit", "evidence", "--as", "worker", "--json"],
+        );
+        let board =
+            fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let connection = Connection::open(board).unwrap();
+        let sequences = {
+            let mut statement = connection
+                .prepare("SELECT seq FROM events ORDER BY seq LIMIT 3")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(sequences.len(), 3);
+        if mutation == "delete" {
+            connection
+                .execute("DELETE FROM events WHERE seq=?", [sequences[1]])
+                .unwrap();
+        } else {
+            connection
+                .execute_batch(&format!(
+                    "UPDATE events SET seq=-1 WHERE seq={};\
+                     UPDATE events SET seq={} WHERE seq={};\
+                     UPDATE events SET seq={} WHERE seq=-1;",
+                    sequences[0], sequences[0], sequences[1], sequences[1]
+                ))
+                .unwrap();
+        }
+        drop(connection);
+
+        let audit = fixture.run(&fixture.main, &["audit", "verify", "--json"]);
+        assert!(
+            !audit.status.success(),
+            "{mutation} passed audit verification"
+        );
+        let receipt: Value = serde_json::from_slice(&audit.stdout).unwrap();
+        assert!(
+            !receipt["boards"][0]["audit"]["errors"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{mutation} produced no forensic diagnostic: {receipt}"
+        );
+    }
+}
+
+#[test]
 fn compiled_binary_reports_tasks_that_overran_their_stale_budget() {
     let fixture = Fixture::new("stale");
     fixture.ok_json(&fixture.main, &["init", "--name", "Stale", "--json"]);
@@ -2701,6 +2854,109 @@ fn compiled_binary_restores_a_snapshot_over_destroyed_work_state() {
         fixture.ok_json(&fixture.main, &["task", "show", "t-keep", "--json"])["title"],
         "real work",
         "a refused restore must leave live state untouched"
+    );
+}
+
+#[test]
+fn compiled_binary_refuses_a_snapshot_changed_after_its_manifest() {
+    let fixture = Fixture::new("manifest-tamper");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Manifest", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "live work", "--id", "t-live", "--json"],
+    );
+    let backup = fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    let manifest = Path::new(backup["manifest"].as_str().unwrap());
+    assert!(manifest.is_file());
+    assert_eq!(backup["manifestSha256"].as_str().unwrap().len(), 64);
+    let manifested: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+    assert!(
+        manifested["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["audit"]["head"].as_str().unwrap().len() == 64)
+    );
+
+    let copied_board = backup["boards"][0].as_str().unwrap();
+    Connection::open(copied_board)
+        .unwrap()
+        .execute("UPDATE tasks SET title='substituted' WHERE id='t-live'", [])
+        .unwrap();
+    let restore = fixture.run(
+        &fixture.main,
+        &[
+            "restore",
+            "--from",
+            backup["directory"].as_str().unwrap(),
+            "--force",
+            "--json",
+        ],
+    );
+    assert!(
+        !restore.status.success(),
+        "a substituted snapshot was restored"
+    );
+    assert!(
+        String::from_utf8_lossy(&restore.stderr).contains("SHA-256 differs"),
+        "restore did not name the failed manifest check: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-live", "--json"])["title"],
+        "live work",
+        "a refused restore changed live state"
+    );
+}
+
+#[test]
+fn compiled_binary_detects_rollback_past_a_retained_manifest_anchor() {
+    let fixture = Fixture::new("manifest-rollback");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Rollback", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "first", "--id", "t-first", "--json"],
+    );
+    let old = fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "anchored", "--id", "t-anchor", "--json"],
+    );
+    let anchor = fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    let live_board =
+        fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    fs::copy(old["boards"][0].as_str().unwrap(), &live_board).unwrap();
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
+        true,
+        "an intact older chain should be internally valid"
+    );
+    let anchored = fixture.run(
+        &fixture.main,
+        &[
+            "audit",
+            "verify",
+            "--against",
+            anchor["manifest"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        !anchored.status.success(),
+        "rollback passed the retained anchor"
+    );
+    let receipt: Value = serde_json::from_slice(&anchored.stdout).unwrap();
+    assert!(
+        receipt["boards"][0]["audit"]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("before anchored sequence")),
+        "rollback receipt did not name the missing anchored history: {receipt}"
     );
 }
 
@@ -4536,6 +4792,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "workspace list" => vec!["workspace", "list"],
             "dashboard" => vec!["dashboard"],
             "doctor" => vec!["doctor"],
+            "audit verify" => vec!["audit", "verify"],
             "search" => vec!["search", "Some work"],
             "task list" => vec!["task", "list"],
             "task show" => vec!["task", "show", "t-1"],
@@ -5634,10 +5891,9 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         .as_str()
         .unwrap()
         .to_owned();
-    Connection::open(&board)
-        .unwrap()
-        .execute_batch("PRAGMA user_version=16;")
-        .unwrap();
+    let connection = Connection::open(&board).unwrap();
+    remove_v18_board_audit_schema(&connection);
+    connection.execute_batch("PRAGMA user_version=16;").unwrap();
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
     let survivor = migrated
         .as_array()
@@ -5648,7 +5904,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        17
+        18
     );
 }
 
@@ -5953,6 +6209,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
     // it through the compiled binary below must run V10, not merely exercise
     // fresh-board behaviour.
     let connection = Connection::open(&board).unwrap();
+    remove_v18_board_audit_schema(&connection);
     remove_v13_search_schema(&connection);
     connection
         .execute_batch(
@@ -6053,7 +6310,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        17
+        18
     );
     assert_eq!(
         connection
@@ -6980,6 +7237,21 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     assert_eq!(detached["archived"], true);
     assert_eq!(detached["archivedBy"], "geo");
     assert!(detached["archivedAt"].as_i64().is_some());
+    let lifecycle = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_detached",
+            "--json",
+        ],
+    );
+    assert_eq!(lifecycle[0]["actor"], "geo");
+    assert_eq!(
+        lifecycle[0]["payload"]["rootPath"],
+        retired.to_string_lossy().as_ref()
+    );
 
     let active = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
     assert!(
@@ -8691,7 +8963,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
 }
 
@@ -9256,6 +9528,11 @@ fn compiled_binary_archives_settled_history_without_deleting_it() {
     assert!(
         String::from_utf8_lossy(&rewrite.stderr).contains("archived history"),
         "the refusal did not explain the archival boundary"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
+        true,
+        "archival changed immutable audit history"
     );
 
     let database = Connection::open(&board).unwrap();

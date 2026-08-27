@@ -787,6 +787,12 @@ CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
 END;
 "#;
 
+const BOARD_V18: &str = r#"
+CREATE TABLE IF NOT EXISTS board_meta (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL) STRICT;
+ALTER TABLE events ADD COLUMN prev_hash TEXT;
+ALTER TABLE events ADD COLUMN event_hash TEXT;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -921,8 +927,14 @@ INSERT INTO rule_events(rule_id,kind,actor,payload,created_at)
 SELECT rule_id,kind,actor,payload,created_at FROM global_rule_events ORDER BY seq;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 17;
-pub const REGISTRY_SCHEMA_VERSION: usize = 9;
+const REGISTRY_V10: &str = r#"
+CREATE TABLE registry_meta (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL) STRICT;
+ALTER TABLE rule_events ADD COLUMN prev_hash TEXT;
+ALTER TABLE rule_events ADD COLUMN event_hash TEXT;
+"#;
+
+pub const BOARD_SCHEMA_VERSION: usize = 18;
+pub const REGISTRY_SCHEMA_VERSION: usize = 10;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -1111,12 +1123,14 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     let outcome = migrate(&mut connection, BOARD_MIGRATIONS);
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
+    crate::audit::initialize_board_chain(&mut connection)?;
     Ok(connection)
 }
 
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
+    BOARD_V18,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.
@@ -1147,6 +1161,7 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
     migrate(&mut connection, REGISTRY_MIGRATIONS)?;
+    crate::audit::initialize_registry_chain(&mut connection)?;
     Ok(connection)
 }
 
@@ -1160,6 +1175,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V7,
     REGISTRY_V8,
     REGISTRY_V9,
+    REGISTRY_V10,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {

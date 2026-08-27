@@ -328,6 +328,8 @@ pub struct Event {
     pub payload: Value,
     pub created_at: i64,
     pub archived: bool,
+    pub prev_hash: Option<String>,
+    pub event_hash: Option<String>,
 }
 
 /// A task that has been in progress longer than its own `stale_minutes`
@@ -408,8 +410,8 @@ pub struct AddTask {
     pub priority: i64,
     pub dependencies: Vec<String>,
     pub metadata: Value,
-    /// Who created the row. Optional, so existing callers keep working; an
-    /// absent actor is recorded as absent rather than invented.
+    /// Who created the row. Compatibility callers may omit it; the CLI then
+    /// supplies the explicit `system@cli` actor before the store writes.
     pub actor: Option<String>,
     /// Registered tags to apply. Unregistered ones are refused.
     pub tags: Vec<String>,

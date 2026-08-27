@@ -288,6 +288,7 @@ Check and back up all registered boards with:
 ```bash
 kanban version
 kanban doctor
+kanban audit verify --json
 kanban backup --json
 ```
 
@@ -297,6 +298,14 @@ version but different migration ladders visibly different before either one
 opens a shared board. `doctor --json` also reports the registry's actual and
 supported schema versions and, for every present board, its actual and
 supported schema versions.
+
+Board events and registry rule events are SHA-256 hash-chained. `audit verify`
+walks every complete journal, including cold history, and exits non-zero on an
+edited, deleted or reordered row. `doctor` includes the same check. Schema v18
+for boards and v10 for the registry establish an explicit legacy boundary:
+pre-migration rows are preserved and hashed, but are not represented as having
+been protected before that boundary. See
+[ADR-029](docs/adr/ADR-029-audit-journals-are-hash-chained-and-externally-anchored.md).
 
 ## SQLite-native retrieval and RAG
 
@@ -442,6 +451,10 @@ touches the live data root.
 
 The verify step is not optional: every run re-downloads what it just uploaded,
 decrypts it, and asserts the registry and every board came back as valid SQLite.
+Each local snapshot also carries `manifest.json`, with the exact database set,
+byte sizes, SHA-256 digests, schema versions, and audit heads. Retain that file
+independently when an adversarial rollback matters; it becomes an external
+anchor that can be checked with `kb audit verify --against manifest.json`.
 An unverified backup is a hope, not a backup.
 
 The decryption key is the **only** copy — `keys/kanban-backup-age.key` in the
@@ -536,11 +549,14 @@ Snapshots are restorable, not just writable:
 ```bash
 kb backup --keep 7                 # snapshot, then keep the newest 7
 kb restore --from <SNAPSHOT> --force
+kb audit verify --against <SNAPSHOT>/manifest.json --json
 ```
 
-`restore` verifies every file in the snapshot before it touches live state,
-refuses without `--force`, and writes a `pre-restore-<stamp>` rescue snapshot of
-what it replaced, so a mistaken restore is recoverable in turn. It also takes
+`restore` verifies the manifested file set, byte digests and audit chains
+before it touches live state, refuses without `--force`, and writes a
+`pre-restore-<stamp>` rescue snapshot of
+what it replaced, including its own manifest. The receipt names the restored
+and rescue journal heads, so a deliberate rollback remains visible. It also takes
 the data root exclusively and refuses outright while any other kanban process
 holds it — you do not have to remember to stop them. `--keep` prunes only the
 managed backups directory and only the stamped snapshots Kanban itself wrote —
@@ -609,6 +625,7 @@ Overrides are reviewable, because forcing one writes durable history:
 ```bash
 kb events --kind lease_seized        # who overrode whose lease, and when
 kb events --task t-resume --limit 20
+kb events --registry --limit 20      # rules and workspace lifecycle
 ```
 
 Every command still prints JSON whether or not `--json` is passed.

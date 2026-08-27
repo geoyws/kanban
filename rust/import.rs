@@ -538,7 +538,14 @@ fn normalize_and_insert(
             )?;
         }
     }
-    transaction.execute("INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(NULL,'tasks_imported',?,?,?)",params![actor,json!({"taskIDs":inputs.iter().map(|i|&i.id).collect::<Vec<_>>()}).to_string(),now_ms()])?;
+    crate::audit::append_board_event(
+        &transaction,
+        None,
+        "tasks_imported",
+        actor,
+        &json!({"taskIDs":inputs.iter().map(|i|&i.id).collect::<Vec<_>>()}).to_string(),
+        now_ms(),
+    )?;
     // A preview that runs the real path and rolls back cannot disagree with
     // the import it is previewing. Computing the same numbers a second way
     // would be a second implementation, free to drift from this one.

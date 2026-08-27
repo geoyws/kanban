@@ -611,13 +611,13 @@ pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<
         )?;
         embedded += 1;
     }
-    transaction.execute(
-        "INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(NULL,'search_rebuilt',?,?,?)",
-        params![
-            actor,
-            json!({"documents":documents.len(),"embeddingModel":EMBEDDING_MODEL}).to_string(),
-            now_ms()
-        ],
+    crate::audit::append_board_event(
+        &transaction,
+        None,
+        "search_rebuilt",
+        actor,
+        &json!({"documents":documents.len(),"embeddingModel":EMBEDDING_MODEL}).to_string(),
+        now_ms(),
     )?;
     transaction.commit()?;
     Ok(SearchIndexReport {

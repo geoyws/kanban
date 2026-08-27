@@ -588,11 +588,15 @@ pub(crate) fn event(
     actor: Option<&str>,
     payload: Value,
 ) -> Result<()> {
-    connection.execute(
-        "INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-        params![task_id, kind, actor, payload.to_string(), now_ms()],
-    )?;
-    Ok(())
+    let actor = actor.context("actor is required for audited mutation")?;
+    crate::audit::append_board_event(
+        connection,
+        task_id,
+        kind,
+        actor,
+        &payload.to_string(),
+        now_ms(),
+    )
 }
 
 /// A board written by the released TypeScript implementation can sit at
@@ -978,6 +982,8 @@ impl Store {
                         payload: parse_value(row.get("payload")?),
                         created_at: row.get("created_at")?,
                         archived: row.get::<_, i64>("archived")? != 0,
+                        prev_hash: row.get("prev_hash")?,
+                        event_hash: row.get("event_hash")?,
                     })
                 },
             )?
@@ -985,11 +991,24 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn initialize(&self, name: &str) -> Result<()> {
-        self.connection.execute(
+    pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
+        let name = nonempty(name, "name")?;
+        let actor = nonempty(actor, "actor")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO board_meta(key,value) VALUES('name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [nonempty(name, "name")?],
+            [name],
         )?;
+        event(
+            &transaction,
+            None,
+            "board_initialized",
+            Some(actor),
+            json!({"name":name}),
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2854,6 +2873,21 @@ impl Store {
 
     pub fn integrity(&self) -> Result<Vec<String>> {
         integrity(&self.connection)
+    }
+
+    pub fn audit(&self) -> Result<crate::audit::AuditReport> {
+        crate::audit::verify_board(&self.connection)
+    }
+
+    pub fn record_system_event(&self, kind: &str, actor: &str, payload: Value) -> Result<()> {
+        crate::audit::append_board_event(
+            &self.connection,
+            None,
+            kind,
+            nonempty(actor, "actor")?,
+            &payload.to_string(),
+            now_ms(),
+        )
     }
 
     pub fn foreign_key_violations(&self) -> Result<Vec<String>> {

@@ -472,8 +472,12 @@ Recorded automatically. You do not pass it, and you should not have to:
   `completedAt`, `claimedAt`, `heartbeatAt`, `expiresAt`, `acceptedAt`,
   `resolvedAt`.
 - **`kb ev`** is the audit trail: every mutation, its actor, and what changed.
-  Pass `--as` to `kb t new` so the row's creation is attributable — without it
-  the trail records the creation with no actor, which is honest but useless.
+  Pass `--as` to `kb t new`; compatibility calls that omit it are explicitly
+  attributed to `system@cli`, never stored with a blank post-migration actor.
+- **`kb audit verify --json`** verifies every board and registry hash chain.
+  Keep a snapshot `manifest.json` outside the HAX data root when rollback
+  evidence matters, then run `kb audit verify --against manifest.json --json`.
+  A chain proves continuity; the retained manifest is what proves freshness.
 
 Run outside a git repository and provenance is recorded as absent rather than
 invented, and the command works exactly the same.
@@ -484,8 +488,10 @@ invented, and the command works exactly the same.
 kb ctx <id> --json              # the bounded cold-start packet for a resuming agent
 kb dash --json                  # per-board counts, incl. openAttention + pendingHandoffs
 kb ev --task <id> --json        # the durable audit trail
+kb ev --registry --json         # registry rules and workspace lifecycle
 kb stale --json                 # work that overran its stale budget
 kb doctor --json                # integrity, orphaned rows, unreachable roots
+kb audit verify --json          # all hash chains, including archived history
 kb archive --older-than-days 90 --as system@archive --json
 kb w repoint --json             # after moving a repo: point its registered roots at it
 ```

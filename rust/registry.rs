@@ -8,7 +8,7 @@ use crate::model::{
 use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -200,7 +200,9 @@ impl Registry {
         workspace: &Path,
         name: &str,
         force: bool,
+        actor: &str,
     ) -> Result<WorkspaceRecord> {
+        let actor = validate_rule_actor(actor)?;
         let root_path = workspace
             .canonicalize()
             .with_context(|| format!("resolve workspace {}", workspace.display()))?;
@@ -230,10 +232,22 @@ impl Registry {
             } else {
                 "workspace_aliases"
             };
-            self.connection.execute(
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
                 &format!("UPDATE {table} SET name=?,last_used_at=? WHERE root_path=?"),
                 params![name, now, root_text],
             )?;
+            crate::audit::append_registry_event(
+                &transaction,
+                &format!("workspace:{root_text}"),
+                "workspace_registered",
+                actor,
+                &json!({"rootPath":root_text,"name":name,"existing":true}).to_string(),
+                now,
+            )?;
+            transaction.commit()?;
             return self
                 .exact(&root_path)?
                 .context("registered workspace disappeared");
@@ -242,10 +256,22 @@ impl Registry {
             .root
             .join("boards")
             .join(format!("{}.db", Uuid::new_v4()));
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO workspaces(root_path,name,board_path,created_at,last_used_at) VALUES(?,?,?,?,?)",
             params![root_text, name, board_path.to_string_lossy(), now, now],
         )?;
+        crate::audit::append_registry_event(
+            &transaction,
+            &format!("workspace:{root_text}"),
+            "workspace_registered",
+            actor,
+            &json!({"rootPath":root_text,"name":name,"boardPath":board_path}).to_string(),
+            now,
+        )?;
+        transaction.commit()?;
         self.exact(&root_path)?
             .context("registered workspace not found")
     }
@@ -326,7 +352,9 @@ impl Registry {
         &mut self,
         workspace: &Path,
         project_workspace: &Path,
+        actor: &str,
     ) -> Result<WorkspaceRecord> {
+        let actor = validate_rule_actor(actor)?;
         let root = workspace.canonicalize()?;
         let project = self.resolve(project_workspace)?.with_context(|| {
             format!("no Kanban project contains {}", project_workspace.display())
@@ -346,10 +374,22 @@ impl Registry {
             |row| row.get(0),
         )?;
         let now = now_ms();
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO workspace_aliases(root_path,name,board_path,created_at,last_used_at) VALUES(?,?,?,?,?)",
             params![root.to_string_lossy(), canonical_name, project.board_path, now, now],
         )?;
+        crate::audit::append_registry_event(
+            &transaction,
+            &format!("workspace:{}", root.to_string_lossy()),
+            "workspace_attached",
+            actor,
+            &json!({"rootPath":root,"boardPath":project.board_path}).to_string(),
+            now,
+        )?;
+        transaction.commit()?;
         self.exact(&root)?.context("attached workspace not found")
     }
 
@@ -438,6 +478,14 @@ impl Registry {
         transaction.execute(
             "DELETE FROM workspace_aliases WHERE root_path=?",
             [root_path],
+        )?;
+        crate::audit::append_registry_event(
+            &transaction,
+            &format!("workspace:{root_path}"),
+            "workspace_detached",
+            actor,
+            &json!({"rootPath":root_path,"boardPath":alias.board_path}).to_string(),
+            now,
         )?;
         let retired = WorkspaceRecord {
             archived: true,
@@ -649,21 +697,19 @@ impl Registry {
                             source.id,
                         ],
                     )?;
-                    transaction.execute(
-                        "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-                        params![
-                            id,
-                            "rule_consolidated",
-                            actor,
-                            json!({
-                                "ruleID": id,
-                                "sourceBoard": board_name,
-                                "sourceRuleID": source.id,
-                                "tags": tags,
-                            })
-                            .to_string(),
-                            now,
-                        ],
+                    crate::audit::append_registry_event(
+                        &transaction,
+                        &id,
+                        "rule_consolidated",
+                        &actor,
+                        &json!({
+                            "ruleID": id,
+                            "sourceBoard": board_name,
+                            "sourceRuleID": source.id,
+                            "tags": tags,
+                        })
+                        .to_string(),
+                        now,
                     )?;
                     transaction.commit()?;
                     report.rules_imported += 1;
@@ -814,9 +860,13 @@ impl Registry {
                 |row| row.get(0),
             )?;
             if copied < *occurrence {
-                self.connection.execute(
-                    "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-                    params![rule_id, kind, event_actor, payload, created_at],
+                crate::audit::append_registry_event(
+                    &self.connection,
+                    rule_id,
+                    kind,
+                    event_actor,
+                    payload,
+                    *created_at,
                 )?;
                 report.legacy_events_imported += 1;
             }
@@ -859,15 +909,13 @@ impl Registry {
             "INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags) VALUES(?,?,?,0,?,?,?)",
             params![id, body, actor, now, now, serde_json::to_string(tags)?],
         )?;
-        transaction.execute(
-            "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-            params![
-                id,
-                "rule_added",
-                actor,
-                json!({"ruleID": id, "tags": tags}).to_string(),
-                now
-            ],
+        crate::audit::append_registry_event(
+            &transaction,
+            &id,
+            "rule_added",
+            &actor,
+            &json!({"ruleID": id, "tags": tags}).to_string(),
+            now,
         )?;
         let rule = transaction.query_row("SELECT * FROM rules WHERE id=?", [&id], rule_row)?;
         transaction.commit()?;
@@ -1029,21 +1077,19 @@ impl Registry {
         if subsystem_tags.is_some() {
             changed.push("subsystemTags");
         }
-        transaction.execute(
-            "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-            params![
-                id,
-                "rule_updated",
-                actor,
-                json!({
-                    "ruleID": id,
-                    "previousBody": previous.body,
-                    "previousTags": previous.tags,
-                    "changed": changed,
-                })
-                .to_string(),
-                now
-            ],
+        crate::audit::append_registry_event(
+            &transaction,
+            id,
+            "rule_updated",
+            &actor,
+            &json!({
+                "ruleID": id,
+                "previousBody": previous.body,
+                "previousTags": previous.tags,
+                "changed": changed,
+            })
+            .to_string(),
+            now,
         )?;
         let rule = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
         transaction.commit()?;
@@ -1071,15 +1117,13 @@ impl Registry {
                 Some(_) => bail!("rule {id} is already retired"),
             }
         }
-        transaction.execute(
-            "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-            params![
-                id,
-                "rule_retired",
-                actor,
-                json!({"ruleID": id}).to_string(),
-                now
-            ],
+        crate::audit::append_registry_event(
+            &transaction,
+            id,
+            "rule_retired",
+            &actor,
+            &json!({"ruleID": id}).to_string(),
+            now,
         )?;
         let rule = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
         transaction.commit()?;
@@ -1122,6 +1166,8 @@ impl Registry {
                             .unwrap_or(json!({})),
                         created_at: row.get("created_at")?,
                         archived: false,
+                        prev_hash: row.get("prev_hash")?,
+                        event_hash: row.get("event_hash")?,
                     })
                 },
             )?
@@ -1191,6 +1237,21 @@ impl Registry {
         integrity(&self.connection)
     }
 
+    pub fn audit(&self) -> Result<crate::audit::AuditReport> {
+        crate::audit::verify_registry(&self.connection)
+    }
+
+    pub fn record_system_event(&self, kind: &str, actor: &str, payload: Value) -> Result<()> {
+        crate::audit::append_registry_event(
+            &self.connection,
+            "registry",
+            kind,
+            validate_rule_actor(actor)?,
+            &payload.to_string(),
+            now_ms(),
+        )
+    }
+
     pub fn backup(&self, destination: &Path) -> Result<()> {
         let mut target = create_backup_target(destination)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut target)?;
@@ -1235,7 +1296,8 @@ impl Registry {
     /// spelling of one path changes, which is the whole defect. A root that is
     /// simply gone is refused rather than guessed at — there is nothing to
     /// repoint it to, and inventing a path would be worse than the gap.
-    pub fn repoint(&mut self, root_path: &str) -> Result<UnreachableRoot> {
+    pub fn repoint(&mut self, root_path: &str, actor: &str) -> Result<UnreachableRoot> {
+        let actor = validate_rule_actor(actor)?;
         let broken = self
             .unreachable_roots()?
             .into_iter()
@@ -1263,10 +1325,24 @@ impl Registry {
         } else {
             "workspace_aliases"
         };
-        self.connection.execute(
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             &format!("UPDATE {table} SET root_path=?, last_used_at=? WHERE root_path=?"),
-            params![target, now_ms(), root_path],
+            params![target, now, root_path],
         )?;
+        crate::audit::append_registry_event(
+            &transaction,
+            &format!("workspace:{target}"),
+            "workspace_repointed",
+            actor,
+            &json!({"previousRootPath":root_path,"rootPath":target,"boardPath":broken.board_path})
+                .to_string(),
+            now,
+        )?;
+        transaction.commit()?;
         Ok(UnreachableRoot {
             root_path: target.clone(),
             resolves_to: Some(target),
