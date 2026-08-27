@@ -1,7 +1,8 @@
 ---
 name: kb
-description: The kanban work-ledger CLI — tasks, claims and leases, checkpoints, handoffs (task and session), and attention items that need George. Use whenever recording, reading or handing over work state, raising something only George can settle, or resuming a lane from the board rather than a directory.
-argument-hint: "[subcommand …]"
+description: Use the authoritative Kanban work ledger on HAX over SSH — tasks, claims and leases, checkpoints, handoffs, sitreps, and attention items that need George. Use whenever recording, reading, resuming, or handing over durable work state.
+metadata:
+  argument-hint: "[subcommand …]"
 ---
 
 # /kb — the kanban work ledger
@@ -16,6 +17,37 @@ refusal you meet here names the fix — pass the message on rather than
 paraphrasing it.
 
 Output is **always JSON**, with or without `--json`.
+
+## HAX is the execution boundary
+
+The authoritative Kanban registry and boards live on **HAX**. Before any `/kb`
+read or write, enter HAX over SSH and run the whole ledger workflow in that
+remote shell:
+
+```bash
+ssh hax
+hostname                   # must print exactly: hax
+command -v kb              # must resolve the installed HAX binary
+kb v
+```
+
+Every `kb …` example below is a command to run **inside that HAX shell**. Keep
+one SSH session open for related operations to save connection overhead and
+tokens. If the agent is already executing on a host whose exact `hostname` is
+`hax`, the current shell is already at the required boundary; verify it once
+and do not nest an SSH connection back into the same host.
+
+From another machine, never invoke a local `kb` or read a local Kanban SQLite
+file as a fallback. If HAX SSH or the installed HAX binary is unavailable, stop
+and report that boundary as blocked; do not run `kb init`, create a replacement
+board, or let local state diverge.
+
+Prefer `--project NAME` for remote commands because the caller's local checkout
+path may not exist on HAX. Use `--workspace PATH` only with a path verified to
+exist and be registered on HAX. For one-shot automation, shell-quote the entire
+remote command and every dynamic value safely; an interactive SSH session is
+preferred for prose mutations so titles and bodies cannot be split or expanded
+by an intermediate shell.
 
 ## Aliases
 
