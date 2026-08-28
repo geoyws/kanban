@@ -1,7 +1,9 @@
+use headless_chrome::{Browser, LaunchOptionsBuilder};
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -69,6 +71,201 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+struct ServerGuard {
+    child: Option<std::process::Child>,
+    port: u16,
+}
+
+impl ServerGuard {
+    fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}/", self.port)
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn chrome_binary() -> PathBuf {
+    let explicit = env::var_os("KANBAN_CHROME").map(PathBuf::from);
+    let candidates = chrome_binary_candidates(
+        explicit.as_deref().and_then(Path::to_str),
+        env::var_os("PATH")
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str),
+        cfg!(target_os = "macos"),
+    );
+    if let Some(path) = chrome_binary_from_candidates(candidates.clone(), Path::exists) {
+        return path;
+    }
+    panic!(
+        "could not find Chrome; tried: {}",
+        candidates
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+fn chrome_binary_candidates(
+    explicit: Option<&str>,
+    path_env: Option<&str>,
+    is_macos: bool,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = explicit {
+        candidates.push(PathBuf::from(path));
+    }
+    if is_macos {
+        candidates.push(PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ));
+    }
+    if let Some(path_env) = path_env {
+        for dir in std::env::split_paths(path_env) {
+            for name in [
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+            ] {
+                candidates.push(dir.join(name));
+            }
+        }
+    }
+    for path in [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/local/bin/google-chrome",
+        "/opt/google/chrome/google-chrome",
+        "/snap/bin/chromium",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ] {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates
+}
+
+fn chrome_binary_from_candidates<F>(candidates: Vec<PathBuf>, exists: F) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    candidates.into_iter().find(|path| exists(path))
+}
+
+#[test]
+fn chrome_discovery_prefers_explicit_then_platform_then_path_then_defaults() {
+    let candidates = chrome_binary_candidates(Some("/explicit/chrome"), Some("/a:/b"), true);
+    assert_eq!(candidates[0], PathBuf::from("/explicit/chrome"));
+    assert_eq!(
+        candidates[1],
+        PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    );
+    assert_eq!(candidates[2], PathBuf::from("/a/google-chrome"));
+    assert_eq!(candidates[3], PathBuf::from("/a/google-chrome-stable"));
+    assert_eq!(candidates[4], PathBuf::from("/a/chromium"));
+    assert_eq!(candidates[5], PathBuf::from("/a/chromium-browser"));
+    assert_eq!(candidates[6], PathBuf::from("/b/google-chrome"));
+    assert_eq!(candidates[10], PathBuf::from("/usr/bin/google-chrome"));
+    let picked = chrome_binary_from_candidates(
+        vec![
+            PathBuf::from("/missing"),
+            PathBuf::from("/still-missing"),
+            PathBuf::from("/found"),
+        ],
+        |path| path == Path::new("/found"),
+    )
+    .unwrap();
+    assert_eq!(picked, PathBuf::from("/found"));
+}
+
+fn launch_browser(chrome_path: PathBuf) -> Browser {
+    let options = LaunchOptionsBuilder::default()
+        .path(Some(chrome_path))
+        .headless(true)
+        .build()
+        .expect("build Chrome launch options");
+    Browser::new(options).expect("launch Chrome")
+}
+
+fn spawn_browser_server(fixture: &Fixture) -> ServerGuard {
+    let mut failures = Vec::new();
+    for attempt in 0..16_u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|error| {
+            panic!("reserve loopback port for browser attempt {attempt}: {error}")
+        });
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|error| {
+                panic!("read reserved loopback port for browser attempt {attempt}: {error}")
+            })
+            .port();
+        drop(listener);
+        let mut child = fixture
+            .command(&fixture.main)
+            .args(["serve", "--port", &port.to_string()])
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn kanban serve on {port}: {error}"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut stderr = String::new();
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("wait on kanban serve candidate {port}: {error}"))
+            {
+                if let Some(mut reader) = child.stderr.take() {
+                    let _ = reader.read_to_string(&mut stderr);
+                }
+                failures.push(format!(
+                    "port {port} exited before readiness on attempt {attempt}: {status}: {stderr}"
+                ));
+                break;
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                if let Some(status) = child.try_wait().unwrap_or_else(|error| {
+                    panic!("post-connect wait on kanban serve candidate {port}: {error}")
+                }) {
+                    if let Some(mut reader) = child.stderr.take() {
+                        let _ = reader.read_to_string(&mut stderr);
+                    }
+                    failures.push(format!(
+                        "port {port} connected but exited before usable readiness on attempt {attempt}: {status}: {stderr}"
+                    ));
+                    break;
+                }
+                return ServerGuard {
+                    child: Some(child),
+                    port,
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(mut reader) = child.stderr.take() {
+                    let _ = reader.read_to_string(&mut stderr);
+                }
+                failures.push(format!(
+                    "port {port} timed out on attempt {attempt}: {stderr}"
+                ));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!(
+        "kanban serve never bound after {} attempts:\n{}",
+        failures.len(),
+        failures.join("\n---\n")
+    );
 }
 
 /// Return a current fixture to the exact pre-search schema shape before a
@@ -8202,20 +8399,6 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
 
     let fixture = Fixture::new("serve-reply-live");
     fixture.ok_json(&fixture.main, &["init", "--name", "SERVEWRITE", "--json"]);
-    let attention = fixture.ok_json(
-        &fixture.main,
-        &[
-            "attention",
-            "raise",
-            "Choose the rollout window",
-            "--as",
-            "codex@driver",
-            "--kind",
-            "decision",
-            "--json",
-        ],
-    );
-    let attention_id = attention["id"].as_str().unwrap();
     fixture.ok_json(
         &fixture.main,
         &[
@@ -8231,6 +8414,84 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "--json",
         ],
     );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ship the rollout task",
+            "--type",
+            "story",
+            "--parent",
+            "e-web-open",
+            "--id",
+            "s-web-open",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Comment and resolve this",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--id",
+            "e-browser-reply",
+            "--json",
+        ],
+    );
+    let approve = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Choose the rollout window",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "e-web-open",
+            "--json",
+        ],
+    );
+    let reply = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Use the free-form note",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "e-browser-reply",
+            "--json",
+        ],
+    );
+    let reject = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Need a second reviewer before this ships",
+            "--as",
+            "codex@driver-2",
+            "--kind",
+            "review",
+            "--task",
+            "s-web-open",
+            "--json",
+        ],
+    );
+    let approve_id = approve["id"].as_str().unwrap();
+    let reply_id = reply["id"].as_str().unwrap();
+    let reject_id = reject["id"].as_str().unwrap();
     let port = 25000 + (std::process::id() % 4000) as u16;
     let mut server = fixture
         .command(&fixture.main)
@@ -8246,21 +8507,48 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     let (status, home) = http_get(port, "/");
     assert_eq!(status, 200, "{home}");
     assert!(home.contains("Your reply"), "{home}");
-    assert!(home.contains("Approved. Proceed."), "{home}");
+    assert!(home.contains("Approve"), "{home}");
+    assert!(home.contains("Reject"), "{home}");
+    assert!(
+        home.contains("data-comment-label=\"Comment and Approve\""),
+        "{home}"
+    );
+    assert!(
+        home.contains("data-comment-label=\"Comment and Reject\""),
+        "{home}"
+    );
+    assert!(home.contains("Comment and Resolve"), "{home}");
     assert!(home.contains("new WebSocket"), "{home}");
     assert!(
-        home.contains(&format!("/attention/SERVEWRITE/{attention_id}/reply")),
+        home.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
+        "{home}"
+    );
+    assert!(
+        home.contains("about <a href=\"/task/SERVEWRITE/e-web-open\">Approve this roadmap</a>"),
+        "{home}"
+    );
+    assert!(
+        home.contains("span class=\"type type-epic\">epic</span>"),
+        "{home}"
+    );
+    assert!(
+        home.contains("about <a href=\"/task/SERVEWRITE/s-web-open\">Ship the rollout task</a>"),
         "{home}"
     );
 
-    let path = format!("/attention/SERVEWRITE/{attention_id}/reply");
-    let (status, _) = http_post(port, &path, "https://hostile.example", b"reply=Approved");
+    let path = format!("/attention/SERVEWRITE/{approve_id}/reply");
+    let (status, _) = http_post(
+        port,
+        &path,
+        "https://hostile.example",
+        b"decision=approve&reply=Approved%2E+Proceed+after+the+backup%2E",
+    );
     assert_eq!(status, 403, "a cross-origin form was accepted");
     let still_open = fixture.ok_json(
         &fixture.main,
         &["attention", "list", "--status", "open", "--json"],
     );
-    assert_eq!(still_open.as_array().unwrap().len(), 1);
+    assert_eq!(still_open.as_array().unwrap().len(), 3);
 
     let origin = format!("http://127.0.0.1:{port}");
     let (status, plans) = http_get(port, "/plans");
@@ -8269,6 +8557,9 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         plans.contains("/plan/SERVEWRITE/e-web-open/open"),
         "the draft epic had no approval action: {plans}"
     );
+    assert!(plans.contains("1 open attention"), "{plans}");
+    assert!(plans.contains("Ship the rollout task"), "{plans}");
+    assert!(plans.contains("s-web-open"), "{plans}");
     let (status, _) = http_post(
         port,
         "/plan/SERVEWRITE/e-web-open/open",
@@ -8280,6 +8571,26 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         fixture.ok_json(&fixture.main, &["task", "show", "e-web-open", "--json"])["status"],
         "draft"
     );
+    let (status, _) = http_post(
+        port,
+        &format!("/attention/NOBOARD/{approve_id}/reply"),
+        &origin,
+        b"decision=approve&reply=No+board",
+    );
+    assert_eq!(status, 404, "an unknown board write was accepted");
+    let unresolved = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(unresolved.as_array().unwrap().len(), 3);
+    let (status, task_page) = http_get(port, "/task/SERVEWRITE/e-web-open");
+    assert_eq!(status, 200, "{task_page}");
+    assert!(task_page.contains("Open attention"), "{task_page}");
+    assert!(
+        task_page.contains("Choose the rollout window"),
+        "{task_page}"
+    );
+    let (status, board) = http_get(port, "/board/SERVEWRITE");
+    assert_eq!(status, 200, "{board}");
+    assert!(board.contains("1 open attention"), "{board}");
+    assert!(board.contains("Ship the rollout task"), "{board}");
     let (status, opened) = http_post(port, "/plan/SERVEWRITE/e-web-open/open", &origin, b"");
     assert_eq!(status, 303, "{opened}");
     assert_eq!(
@@ -8295,7 +8606,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         port,
         &path,
         &origin,
-        b"reply=Approved%2E+Proceed+after+the+backup%2E",
+        b"decision=approve&reply=Approved%2E+Proceed+after+the+backup%2E",
     );
     assert_eq!(status, 303, "{response}");
     assert!(response.contains("Location: /?replied="), "{response}");
@@ -8306,9 +8617,53 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(resolved[0]["resolvedBy"], "geo");
     assert_eq!(
         resolved[0]["resolution"],
-        "Approved. Proceed after the backup."
+        "Decision: Approved. Proceed.\nComment: Approved. Proceed after the backup."
     );
-    let (status, _) = http_post(port, &path, &origin, b"reply=Resolve+twice");
+    let reject_path = format!("/attention/SERVEWRITE/{reject_id}/reply");
+    let (status, response) = http_post(
+        port,
+        &reject_path,
+        &origin,
+        b"decision=reject&reply=Needs+another+reviewer",
+    );
+    assert_eq!(status, 303, "{response}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(resolved.as_array().unwrap().len(), 2);
+    assert_eq!(
+        resolved[1]["resolution"],
+        "Decision: Declined. Do not proceed.\nComment: Needs another reviewer"
+    );
+    let reply_path = format!("/attention/SERVEWRITE/{reply_id}/reply");
+    let (status, response) = http_post(
+        port,
+        &reply_path,
+        &origin,
+        b"decision=reply&reply=This+is+the+durable+note",
+    );
+    assert_eq!(status, 303, "{response}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(resolved.as_array().unwrap().len(), 3);
+    assert_eq!(
+        resolved
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == reply_id)
+            .expect("reply resolution")["resolution"],
+        "Comment: This is the durable note"
+    );
+    let (status, _) = http_post(
+        port,
+        &path,
+        &origin,
+        b"decision=approve&reply=Resolve+twice",
+    );
     assert_eq!(status, 409, "an already-resolved item changed twice");
 
     let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -8348,6 +8703,246 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
 
     let _ = server.kill();
     let _ = server.wait();
+}
+
+#[test]
+fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
+    let fixture = Fixture::new("serve-browser");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SERVE-BROWSER", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Approve this release",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--id",
+            "e-browser-approve",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Reject this release",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--id",
+            "e-browser-reject",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Comment and resolve this",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--id",
+            "e-browser-reply",
+            "--json",
+        ],
+    );
+    let approve = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Approve from the browser",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "e-browser-approve",
+            "--json",
+        ],
+    );
+    let reply = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Use the free-form note",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "e-browser-reply",
+            "--json",
+        ],
+    );
+    let reject = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Reject from the browser",
+            "--as",
+            "codex@driver-2",
+            "--kind",
+            "review",
+            "--task",
+            "e-browser-reject",
+            "--json",
+        ],
+    );
+    let approve_id = approve["id"].as_str().unwrap();
+    let reply_id = reply["id"].as_str().unwrap();
+    let reject_id = reject["id"].as_str().unwrap();
+
+    let server = spawn_browser_server(&fixture);
+    let origin = server.origin();
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("initial tab");
+    tab.navigate_to(&origin).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+
+    let approve_textarea = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{approve_id}/reply\"] textarea[name=reply]"
+        ))
+        .expect("approve textarea");
+    approve_textarea.click().expect("focus approve textarea");
+    approve_textarea
+        .type_into(" Approved. Proceed after the review. ")
+        .expect("type approve comment");
+    let approve_button = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{approve_id}/reply\"] button.quick.approve"
+        ))
+        .expect("approve button");
+    assert_eq!(
+        approve_button.get_inner_text().expect("approve label"),
+        "Comment and Approve"
+    );
+    let reject_button = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{approve_id}/reply\"] button.quick.decline"
+        ))
+        .expect("reject button");
+    assert_eq!(
+        reject_button.get_inner_text().expect("reject label"),
+        "Comment and Reject"
+    );
+    approve_button.click().expect("submit approve");
+    tab.wait_until_navigated().expect("approve navigation");
+    let approve_page = tab.get_content().expect("approve page");
+    assert!(approve_page.contains("Reply recorded"), "{approve_page}");
+    assert!(tab.get_url().contains("/?replied="), "{}", tab.get_url());
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(resolved.as_array().unwrap().len(), 1);
+    assert_eq!(resolved[0]["resolvedBy"], "geo");
+    assert_eq!(
+        resolved[0]["resolution"],
+        "Decision: Approved. Proceed.\nComment: Approved. Proceed after the review."
+    );
+
+    tab.navigate_to(&origin).expect("reload Needs you");
+    tab.wait_until_navigated().expect("reload navigation");
+    let reject_textarea = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{reject_id}/reply\"] textarea[name=reply]"
+        ))
+        .expect("reject textarea");
+    reject_textarea.click().expect("focus reject textarea");
+    reject_textarea
+        .type_into(" Needs a second reviewer ")
+        .expect("type reject comment");
+    let reject_approve = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{reject_id}/reply\"] button.quick.approve"
+        ))
+        .expect("reject approve button");
+    assert_eq!(
+        reject_approve
+            .get_inner_text()
+            .expect("reject approve label"),
+        "Comment and Approve"
+    );
+    let reject_quick = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{reject_id}/reply\"] button.quick.decline"
+        ))
+        .expect("reject quick button");
+    assert_eq!(
+        reject_quick.get_inner_text().expect("reject quick label"),
+        "Comment and Reject"
+    );
+    reject_quick.click().expect("submit reject");
+    tab.wait_until_navigated().expect("reject navigation");
+    let reject_page = tab.get_content().expect("reject page");
+    assert!(reject_page.contains("Reply recorded"), "{reject_page}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(resolved.as_array().unwrap().len(), 2);
+    assert_eq!(
+        resolved[1]["resolution"],
+        "Decision: Declined. Do not proceed.\nComment: Needs a second reviewer"
+    );
+
+    tab.navigate_to(&origin)
+        .expect("reload Needs you for reply");
+    tab.wait_until_navigated().expect("reply reload navigation");
+    let reply_textarea = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{reply_id}/reply\"] textarea[name=reply]"
+        ))
+        .expect("reply textarea");
+    reply_textarea.click().expect("focus reply textarea");
+    reply_textarea
+        .type_into("  This is the durable note  ")
+        .expect("type reply comment");
+    let reply_button = tab
+        .wait_for_element(&format!(
+            "form.reply[action=\"/attention/SERVE-BROWSER/{reply_id}/reply\"] button.send"
+        ))
+        .expect("reply button");
+    assert_eq!(
+        reply_button.get_inner_text().expect("reply label"),
+        "Comment and Resolve"
+    );
+    reply_button.click().expect("submit reply");
+    tab.wait_until_navigated().expect("reply navigation");
+    let reply_page = tab.get_content().expect("reply page");
+    assert!(reply_page.contains("Reply recorded"), "{reply_page}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    let reply_resolved = resolved
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == reply_id)
+        .expect("reply resolution")
+        .clone();
+    assert_eq!(resolved.as_array().unwrap().len(), 3);
+    assert_eq!(
+        reply_resolved["resolution"],
+        "Comment: This is the durable note"
+    );
 }
 
 #[test]

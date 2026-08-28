@@ -252,22 +252,26 @@ fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
             page("Invalid reply", "<h1>Invalid reply</h1>"),
         ));
     };
-    let Ok(value) = strict_form_value(body, "reply") else {
+    let Ok(decision) = strict_form_value(body, "decision") else {
         return Ok(WebResponse::Html(
             400,
             page("Invalid reply", "<h1>Invalid reply</h1>"),
         ));
     };
-    let reply = value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    let Some(reply) = reply else {
+    let decision = decision.unwrap_or_else(|| "reply".to_owned());
+    let Ok(reply) = strict_form_value(body, "reply") else {
         return Ok(WebResponse::Html(
             400,
-            page(
-                "Reply required",
-                "<h1>Reply required</h1><p class=error>Write a short reply before resolving this item.</p>",
-            ),
+            page("Invalid reply", "<h1>Invalid reply</h1>"),
+        ));
+    };
+    let reply = reply
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Ok(reply) = compose_resolution_note(&decision, reply.as_deref()) else {
+        return Ok(WebResponse::Html(
+            400,
+            page("Invalid reply", "<h1>Invalid reply</h1>"),
         ));
     };
     let [_, project, id, _] = parts.as_slice() else {
@@ -576,6 +580,102 @@ fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
     }
 }
 
+fn reply_button_labels(has_comment: bool) -> (&'static str, &'static str) {
+    if has_comment {
+        ("Comment and Approve", "Comment and Reject")
+    } else {
+        ("Approve", "Reject")
+    }
+}
+
+fn compose_resolution_note(decision: &str, reply: Option<&str>) -> Result<String> {
+    let reply = reply.map(str::trim).filter(|value| !value.is_empty());
+    match decision {
+        "approve" => Ok(match reply {
+            Some(comment) => format!("Decision: Approved. Proceed.\nComment: {comment}"),
+            None => "Decision: Approved. Proceed.".to_owned(),
+        }),
+        "reject" => Ok(match reply {
+            Some(comment) => format!("Decision: Declined. Do not proceed.\nComment: {comment}"),
+            None => "Decision: Declined. Do not proceed.".to_owned(),
+        }),
+        "reply" => {
+            let Some(reply) = reply else {
+                anyhow::bail!("reply text is required when sending a reply");
+            };
+            Ok(format!("Comment: {reply}"))
+        }
+        other => anyhow::bail!("invalid decision {other}"),
+    }
+}
+
+fn task_open_attention(store: &Store, task_id: &str) -> Result<Vec<Attention>> {
+    store.attention(Some("open"), None, Some(task_id), None, 1000, false)
+}
+
+fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
+    Ok(task_open_attention(store, task_id)?.len())
+}
+
+fn task_reference(project: &str, store: &Store, task_id: &str) -> String {
+    match store.require_task(task_id) {
+        Ok(task) => format!(
+            "<a href=\"/task/{project}/{task_id}\">{title}</a> \
+             <span class=\"type type-{ty}\">{ty}</span>",
+            project = escape(&url_encode(project)),
+            task_id = escape(&url_encode(&task.id)),
+            title = escape(&task.title),
+            ty = escape(&task.task_type),
+        ),
+        Err(_) => format!(
+            "<a href=\"/task/{project}/{task_id}\">{task_id}</a>",
+            project = escape(&url_encode(project)),
+            task_id = escape(&url_encode(task_id)),
+        ),
+    }
+}
+
+fn attention_count_badge(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(" <span class=attention-count>{count} open attention</span>")
+    }
+}
+
+fn attention_section(project: &str, title: &str, items: &[Attention]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut html = format!(
+        "<h2>{title} <span class=count>{}</span></h2><ul class=rows>",
+        items.len()
+    );
+    for item in items {
+        html.push_str("<li>");
+        html.push_str(&format!(
+            "{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
+             · raised by {who} · waiting {age}{tags}",
+            kind = escape(&item.kind),
+            priority = priority_badge(item.priority, item.priority_level.as_deref()),
+            who = escape(&item.raised_by),
+            age = age(item.created_at),
+            tags = tag_list(&item.tags),
+        ));
+        html.push_str(&format!("<p class=body>{}</p>", escape(&item.body)));
+        if let Some(task_id) = &item.task_id {
+            html.push_str(&format!(
+                "<p class=meta>about <a href=\"/task/{project}/{task_id}\">{task_id}</a></p>",
+                project = escape(&url_encode(project)),
+                task_id = escape(&url_encode(task_id)),
+            ));
+        }
+        html.push_str("</li>");
+    }
+    html.push_str("</ul>");
+    html
+}
+
 // ---------------------------------------------------------------- the screens
 
 /// The landing page, and the reason the server exists: everything open across
@@ -583,10 +683,13 @@ fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
 /// remains the tie-breaker that prevents starvation within a level.
 fn needs_you(replied: Option<&str>) -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
+    let mut stores = std::collections::BTreeMap::new();
     for (project, store) in projects()? {
+        let name = project.name.clone();
         for item in store.attention(Some("open"), None, None, None, 1000, false)? {
-            items.push((project.name.clone(), item));
+            items.push((name.clone(), item));
         }
+        stores.insert(name, store);
     }
     items.sort_by(|(project_a, item_a), (project_b, item_b)| {
         (item_a.priority, item_a.created_at, &item_a.id, project_a).cmp(&(
@@ -623,6 +726,10 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
             .len()
     ));
     for (project, item) in &items {
+        let store = stores
+            .get(project)
+            .expect("project store map built from same iterator");
+        let (approve_label, reject_label) = reply_button_labels(false);
         html.push_str("<article class=item>");
         html.push_str(&format!(
             "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
@@ -639,9 +746,8 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
         html.push_str(&format!("<p class=body>{}</p>", escape(&item.body)));
         if let Some(task) = &item.task_id {
             html.push_str(&format!(
-                "<p class=meta>about <a href=\"/task/{project}/{task}\">{task}</a></p>",
-                project = escape(project),
-                task = escape(task),
+                "<p class=meta>about {}</p>",
+                task_reference(project, store, task)
             ));
         }
         html.push_str(&format!(
@@ -649,14 +755,17 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
              <label for=\"reply-{id}\">Your reply</label>\
              <textarea id=\"reply-{id}\" name=reply maxlength={max} \
              placeholder=\"Answer this item…\"></textarea>\
-             <div class=actions><button type=submit class=send>Send reply</button>\
-             <button type=button class=\"quick approve\" data-reply=\"Approved. Proceed.\">Approve</button>\
-             <button type=button class=\"quick decline\" data-reply=\"Declined. Do not proceed.\">Decline</button>\
-             <button type=button class=quick data-reply=\"Proceed with the recommended option.\">Proceed</button>\
+             <div class=actions><button type=submit class=send name=decision value=reply>Comment and Resolve</button>\
+             <button type=submit class=\"quick approve\" name=decision value=approve \
+             data-empty-label=\"{approve_label}\" data-comment-label=\"Comment and Approve\">{approve_label}</button>\
+             <button type=submit class=\"quick decline\" name=decision value=reject \
+             data-empty-label=\"{reject_label}\" data-comment-label=\"Comment and Reject\">{reject_label}</button>\
              </div></form>",
             project = escape(&url_encode(project)),
             id = escape(&url_encode(&item.id)),
             max = MAX_REPLY_BYTES,
+            approve_label = approve_label,
+            reject_label = reject_label,
         ));
         html.push_str("</article>");
     }
@@ -1028,9 +1137,10 @@ fn plans(opened: Option<&str>) -> Result<String> {
             .collect::<Vec<_>>();
         for plan in drafts {
             found += 1;
+            let plan_attention = task_attention_count(&store, &plan.id)?;
             html.push_str("<article class=plan>");
             html.push_str(&format!(
-                "<h2><a href=\"/task/{project}/{id}\">{title}</a></h2>\
+                "<h2><a href=\"/task/{project}/{id}\">{title}</a>{attention}</h2>\
                  <p class=meta><a href=\"/board/{project}\">{project}</a> · \
                  {id} · {priority} · drafted {age}{tags}</p>",
                 project = escape(&project.name),
@@ -1039,6 +1149,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
                 priority = priority_badge(plan.priority, plan.priority_level.as_deref()),
                 age = ago(plan.created_at),
                 tags = tag_list(&plan.tags),
+                attention = attention_count_badge(plan_attention),
             ));
             let children = tasks
                 .iter()
@@ -1052,14 +1163,16 @@ fn plans(opened: Option<&str>) -> Result<String> {
                     if children.len() == 1 { "" } else { "s" }
                 ));
                 for child in children {
+                    let child_attention = task_attention_count(&store, &child.id)?;
                     html.push_str(&format!(
                         "<li>{priority} <a href=\"/task/{project}/{id}\">{id}</a> \
-                         <span class=status>{status}</span> {title}</li>",
+                         <span class=status>{status}</span> {title}{attention}</li>",
                         project = escape(&project.name),
                         id = escape(&child.id),
                         status = escape(&child.status),
                         title = escape(&child.title),
                         priority = priority_badge(child.priority, child.priority_level.as_deref()),
+                        attention = attention_count_badge(child_attention),
                     ));
                 }
                 html.push_str("</ul>");
@@ -1201,9 +1314,10 @@ fn board(name: &str) -> Result<String> {
             rows.len()
         ));
         for task in rows {
+            let attention = task_attention_count(&store, &task.id)?;
             html.push_str(&format!(
                 "<li>{priority} <a href=\"/task/{project}/{id}\">{id}</a> \
-                 <span class=\"type type-{ty}\">{ty}</span> {title}{lane}{tags}</li>",
+                 <span class=\"type type-{ty}\">{ty}</span> {title}{lane}{tags}{attention}</li>",
                 project = escape(&project.name),
                 id = escape(&task.id),
                 ty = escape(&task.task_type),
@@ -1215,6 +1329,7 @@ fn board(name: &str) -> Result<String> {
                     .map(|lane| format!(" <span class=lane>{}</span>", escape(lane)))
                     .unwrap_or_default(),
                 tags = tag_list(&task.tags),
+                attention = attention_count_badge(attention),
             ));
         }
         html.push_str("</ul>");
@@ -1266,6 +1381,13 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         // Never the lease token: it is a capability, and a read surface that
         // renders one hands whoever loads the page the ability to write.
     }
+
+    let open_attention = task_open_attention(&store, &task.id)?;
+    html.push_str(&attention_section(
+        &project.name,
+        "Open attention",
+        &open_attention,
+    ));
 
     let notes = store.notes(&task.id, DETAIL_ROWS)?;
     if !notes.is_empty() {
@@ -1518,12 +1640,20 @@ const JS: &str = r#"
 const setLive = text => { const el = document.querySelector('[data-live]'); if (el) el.textContent = text; };
 const hasDraftReply = () => [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim());
 function bindQuickReplies() {
-  document.querySelectorAll('button.quick').forEach(button => {
-    button.onclick = () => {
-      const form = button.closest('form');
-      form.querySelector('textarea[name=reply]').value = button.dataset.reply;
-      form.requestSubmit();
+  document.querySelectorAll('form.reply').forEach(form => {
+    const textarea = form.querySelector('textarea[name=reply]');
+    if (!textarea || form.dataset.quickRepliesBound) {
+      return;
+    }
+    form.dataset.quickRepliesBound = '1';
+    const sync = () => {
+      const hasReply = textarea.value.trim().length > 0;
+      form.querySelectorAll('button.quick').forEach(button => {
+        button.textContent = hasReply ? button.dataset.commentLabel : button.dataset.emptyLabel;
+      });
     };
+    textarea.addEventListener('input', sync);
+    sync();
   });
 }
 async function refreshProjection() {
@@ -1605,6 +1735,8 @@ margin:1rem 0;background:linear-gradient(145deg,var(--raised),var(--surface));bo
 .cmd{margin:.5rem 0 0;font-size:.85rem}\
 .empty{color:#8b949e}\
 .count{color:#8b949e;font-weight:400;font-size:.85rem}\
+.attention-count{display:inline-block;margin-left:.4rem;padding:.1rem .45rem;border-radius:999px;\
+background:#12351f;border:1px solid #2c7a44;color:#9fe6b5;font-size:.75rem;font-weight:700}\
 .kind,.type,.status,.lane,.tag,.priority{display:inline-block;padding:.05em .5em;\
 border-radius:999px;font-size:.75rem;font-weight:600;border:1px solid #30363d}\
 .kind-blocking{background:#4a1d1d;border-color:#8b3232}\
@@ -1645,8 +1777,40 @@ mod tests {
         assert!(rendered.contains("role=status aria-live=polite"));
         assert!(CSS.contains("min-height:2.75rem"));
         assert!(CSS.contains("env(safe-area-inset-bottom)"));
+        assert!(CSS.contains(".attention-count"));
         assert!(CSS.contains("@media(max-width:700px)"));
         assert!(CSS.contains(":focus-visible"));
+        assert!(rendered.contains("Comment and Resolve"));
+        assert!(JS.contains("Comment and Approve"));
+        assert!(JS.contains("Comment and Reject"));
+        assert!(JS.contains("dataset.quickRepliesBound"));
+    }
+
+    #[test]
+    fn reply_labels_and_resolution_notes_preserve_both_facts() {
+        assert_eq!(reply_button_labels(false), ("Approve", "Reject"));
+        assert_eq!(
+            reply_button_labels(true),
+            ("Comment and Approve", "Comment and Reject")
+        );
+        assert_eq!(
+            compose_resolution_note("approve", None).unwrap(),
+            "Decision: Approved. Proceed."
+        );
+        assert_eq!(
+            compose_resolution_note("approve", Some("  Ship it  ")).unwrap(),
+            "Decision: Approved. Proceed.\nComment: Ship it"
+        );
+        assert_eq!(
+            compose_resolution_note("reject", Some("Needs another pass")).unwrap(),
+            "Decision: Declined. Do not proceed.\nComment: Needs another pass"
+        );
+        assert_eq!(
+            compose_resolution_note("reply", Some("  Keep the note exactly  ")).unwrap(),
+            "Comment: Keep the note exactly"
+        );
+        assert!(compose_resolution_note("reply", Some("   ")).is_err());
+        assert!(compose_resolution_note("banana", Some("nope")).is_err());
     }
 
     #[test]

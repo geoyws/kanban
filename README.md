@@ -702,7 +702,8 @@ shims over it, so the crate is compiled once rather than twice. The E2E suite
 invokes `CARGO_BIN_EXE_kanban` and `CARGO_BIN_EXE_kb` as separate
 operating-system processes. It covers persistence and restart, concurrent claims, worktree
 aliases, token-pressure handoffs, story gates, imports, backup/reopen, bounded
-context, TODO projection, and the released SQLite v3 format.
+context, TODO projection, the released SQLite v3 format, and one real-browser
+approval flow against the compiled server.
 
 The database migration ladder is append-only. Never edit a released migration;
 add the next rung.

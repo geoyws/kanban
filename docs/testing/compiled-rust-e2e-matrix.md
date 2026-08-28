@@ -26,10 +26,12 @@ The release gate runs `cargo test --test e2e` after Cargo builds the production
 | Served search | A real loopback HTTP conversation retrieves a cited cross-board result; byte comparison and source guards prove the pages expose no board mutation. |
 | Deployment ledger | Separate compiled processes prove capability ownership, idempotent start, exact served-commit success, derived current release, CLI/MCP parity, and real HTTP rendering of the cross-board matrix and attempt detail. |
 | Deployment self-archive | A real archive process moves only old terminal non-current attempts out of default lists and hot partial indexes, keeps started and current successes hot, retains cold search and `--all` access, and proves a repeated sweep is idempotent. |
+| Browser-backed operator approval | A real Chrome session loads the compiled `kanban serve` page, types into the live comment box, watches the quick labels switch to `Comment and Approve` / `Comment and Reject`, clicks a real submit button, and verifies the persisted decision/comment through the compiled CLI/store boundary. |
 
 Passing library/unit tests or invoking `rust/main.rs` through an interpreter is
 not E2E evidence. The gate is incomplete until the compiled executable passes
-this matrix on a clean test data directory.
+this matrix on a clean test data directory, including the real-browser path
+above.
 
 ## 2026-08-16 release receipt
 

@@ -32,6 +32,9 @@ sha2 = "0.10.9"
 tiny_http = { version = "0.12.0", default-features = false }
 uuid = { version = "1.18.1", features = ["v4"] }
 
+[dev-dependencies]
+headless_chrome = "1"
+
 [profile.release]
 lto = "thin"
 strip = true
