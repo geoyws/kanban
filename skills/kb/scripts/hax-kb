@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote_host="${HAX_SSH_HOST:-hax}"
+remote_kb="/root/.local/bin/kb"
+
+printf -v remote_command '%q ' "$remote_kb" "$@"
+remote_command="test \"\$(hostname)\" = hax; exec ${remote_command}"
+exec ssh "$remote_host" "$remote_command"

@@ -37,6 +37,24 @@ command -v kb              # must resolve the installed HAX binary
 kb v
 ```
 
+A non-interactive `ssh hax 'kb ...'` does **not** load HAX's interactive
+`PATH`, so it can report `kb: command not found` even though the binary is
+installed. Do not rediscover or re-quote this on every call. From outside HAX,
+use the bundled argv-preserving wrapper for one-shot commands:
+
+```bash
+<skill-dir>/scripts/hax-kb v
+<skill-dir>/scripts/hax-kb tag ls --project kanban --json
+<skill-dir>/scripts/hax-kb search "status change" --project kanban --json
+```
+
+The wrapper verifies that the remote host is exactly `hax`, invokes the fixed
+installed path `/root/.local/bin/kb`, and preserves spaces and shell
+metacharacters as literal arguments. Use an interactive `ssh hax` session for a
+related series of commands or prose-heavy mutations; use the wrapper for
+deterministic one-shots. Never fall back to a local `kb` after either path
+fails.
+
 Every `kb …` example below is a command to run **inside the verified HAX
 shell**. Keep one SSH session open for related operations to save connection
 overhead and tokens. Never run `ssh hax` from a shell whose exact `hostname` is
@@ -53,6 +71,13 @@ exist and be registered on HAX. For one-shot automation, shell-quote the entire
 remote command and every dynamic value safely; an interactive SSH session is
 preferred for prose mutations so titles and bodies cannot be split or expanded
 by an intermediate shell.
+
+Selector rule: board-owned commands such as `task`, `tag`, `search`, `claim`,
+and `attention` should normally use `--project NAME` remotely. Registry-owned
+`rule` commands must not receive `--project`, `--workspace`, or `--db`; rules
+live once in the registry and select boards through `ALL`, `ONLY:<board>`, and
+`EXCEPT:<board>` tags. In particular, use `hax-kb r ls --json`, never
+`hax-kb r ls --project kanban`.
 
 ## Aliases
 
