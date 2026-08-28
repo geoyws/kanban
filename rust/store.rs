@@ -2144,7 +2144,7 @@ impl Store {
     }
 
     pub fn open_attentions(&self, task: &str) -> Result<Vec<Attention>> {
-        Ok(self.attention(Some("open"), None, Some(task), None, 1000, false)?)
+        self.attention(Some("open"), None, Some(task), None, 1000, false)
     }
 
     /// Correct an open attention row without settling it. The event retains

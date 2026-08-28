@@ -52,6 +52,7 @@ const DETAIL_ROWS: i64 = 50;
 
 /// A browser reply is a decision note, not a document upload.
 const MAX_REPLY_BYTES: usize = 4_096;
+const COMMENT_RESOLVE_LABEL: &str = "Comment and Resolve";
 
 enum WebResponse {
     Html(u16, String),
@@ -755,7 +756,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
              <label for=\"reply-{id}\">Your reply</label>\
              <textarea id=\"reply-{id}\" name=reply maxlength={max} \
              placeholder=\"Answer this item…\"></textarea>\
-             <div class=actions><button type=submit class=send name=decision value=reply>Comment and Resolve</button>\
+             <div class=actions><button type=submit class=send name=decision value=reply>{resolve_label}</button>\
              <button type=submit class=\"quick approve\" name=decision value=approve \
              data-empty-label=\"{approve_label}\" data-comment-label=\"Comment and Approve\">{approve_label}</button>\
              <button type=submit class=\"quick decline\" name=decision value=reject \
@@ -764,6 +765,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
             project = escape(&url_encode(project)),
             id = escape(&url_encode(&item.id)),
             max = MAX_REPLY_BYTES,
+            resolve_label = COMMENT_RESOLVE_LABEL,
             approve_label = approve_label,
             reject_label = reject_label,
         ));
@@ -1780,9 +1782,9 @@ mod tests {
         assert!(CSS.contains(".attention-count"));
         assert!(CSS.contains("@media(max-width:700px)"));
         assert!(CSS.contains(":focus-visible"));
-        assert!(rendered.contains("Comment and Resolve"));
-        assert!(JS.contains("Comment and Approve"));
-        assert!(JS.contains("Comment and Reject"));
+        assert_eq!(COMMENT_RESOLVE_LABEL, "Comment and Resolve");
+        assert!(JS.contains("button.dataset.commentLabel"));
+        assert!(JS.contains("button.dataset.emptyLabel"));
         assert!(JS.contains("dataset.quickRepliesBound"));
     }
 
