@@ -19,21 +19,28 @@ Output is **always JSON**, with or without `--json`.
 ## HAX is the execution boundary
 
 The authoritative Kanban registry and boards live on **HAX**. Before any `/kb`
-read or write, enter HAX over SSH and run the whole ledger workflow in that
-remote shell:
+read or write, check the current host **before attempting SSH**:
+
+```bash
+hostname                   # if this prints exactly "hax", stay in this shell
+command -v kb              # on hax, must resolve the installed HAX binary
+kb v                       # on hax, verify the installed binary
+```
+
+If `hostname` prints anything other than exactly `hax`, enter HAX and verify the
+remote boundary there:
 
 ```bash
 ssh hax
-hostname                   # must print exactly: hax
+hostname                   # must now print exactly "hax"
 command -v kb              # must resolve the installed HAX binary
 kb v
 ```
 
-Every `kb …` example below is a command to run **inside that HAX shell**. Keep
-one SSH session open for related operations to save connection overhead and
-tokens. If the agent is already executing on a host whose exact `hostname` is
-`hax`, the current shell is already at the required boundary; verify it once
-and do not nest an SSH connection back into the same host.
+Every `kb …` example below is a command to run **inside the verified HAX
+shell**. Keep one SSH session open for related operations to save connection
+overhead and tokens. Never run `ssh hax` from a shell whose exact `hostname` is
+already `hax`; that shell is already at the required boundary.
 
 From another machine, never invoke a local `kb` or read a local Kanban SQLite
 file as a fallback. If HAX SSH or the installed HAX binary is unavailable, stop
