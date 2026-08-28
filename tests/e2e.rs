@@ -197,7 +197,7 @@ fn launch_browser(chrome_path: PathBuf) -> Browser {
     Browser::new(options).expect("launch Chrome")
 }
 
-fn spawn_browser_server(fixture: &Fixture) -> ServerGuard {
+fn spawn_server(fixture: &Fixture) -> ServerGuard {
     let mut failures = Vec::new();
     for attempt in 0..16_u16 {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|error| {
@@ -8127,25 +8127,8 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         ],
     );
 
-    // A port nobody else on the box is using, derived from this process so a
-    // concurrent test run cannot collide with it.
-    let port = 21000 + (std::process::id() % 4000) as u16;
-    let mut server = fixture
-        .command(&fixture.main)
-        .args(["serve", "--port", &port.to_string()])
-        .spawn()
-        .expect("start kanban serve");
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut ready = false;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(ready, "kanban serve never bound {port}");
+    let server = spawn_server(&fixture);
+    let port = server.port;
 
     let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
         .as_str()
@@ -8359,15 +8342,10 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         settled,
         "serving a page modified the board"
     );
-
-    let _ = server.kill();
-    let _ = server.wait();
 }
 
 #[test]
 fn priority_orders_cli_dashboard_and_web_queues_before_age() {
-    use std::net::TcpStream;
-
     let fixture = Fixture::new("priority-queues");
     fixture.ok_json(
         &fixture.main,
@@ -8481,17 +8459,8 @@ fn priority_orders_cli_dashboard_and_web_queues_before_age() {
     assert_eq!(dashboard[1]["name"], "PRIORITY-MAIN");
     assert_eq!(dashboard[1]["highestPriorityLevel"], "P1");
 
-    let port = 28000 + (std::process::id() % 3000) as u16;
-    let mut server = fixture
-        .command(&fixture.main)
-        .args(["serve", "--port", &port.to_string()])
-        .spawn()
-        .expect("start kanban serve");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "kanban serve never bound {port}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let server = spawn_server(&fixture);
+    let port = server.port;
 
     let (status, home) = http_get(port, "/");
     assert_eq!(status, 200, "{home}");
@@ -8508,14 +8477,10 @@ fn priority_orders_cli_dashboard_and_web_queues_before_age() {
     let (status, boards) = http_get(port, "/boards");
     assert_eq!(status, 200, "{boards}");
     assert!(boards.find("PRIORITY-URGENT").unwrap() < boards.find("PRIORITY-MAIN").unwrap());
-
-    let _ = server.kill();
-    let _ = server.wait();
 }
 
 #[test]
 fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
-    use std::io::Write as _;
     use std::net::TcpStream;
 
     let fixture = Fixture::new("serve-reply-live");
@@ -8613,17 +8578,8 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     let approve_id = approve["id"].as_str().unwrap();
     let reply_id = reply["id"].as_str().unwrap();
     let reject_id = reject["id"].as_str().unwrap();
-    let port = 25000 + (std::process::id() % 4000) as u16;
-    let mut server = fixture
-        .command(&fixture.main)
-        .args(["serve", "--port", &port.to_string()])
-        .spawn()
-        .expect("start kanban serve");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "kanban serve never bound {port}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let server = spawn_server(&fixture);
+    let port = server.port;
 
     let (status, home) = http_get(port, "/");
     assert_eq!(status, 200, "{home}");
@@ -8821,9 +8777,6 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     let changed: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket)).unwrap();
     assert_eq!(changed["type"], "refresh", "{changed}");
     assert_ne!(changed["revision"], ready["revision"]);
-
-    let _ = server.kill();
-    let _ = server.wait();
 }
 
 #[test]
@@ -8927,7 +8880,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
     let reply_id = reply["id"].as_str().unwrap();
     let reject_id = reject["id"].as_str().unwrap();
 
-    let server = spawn_browser_server(&fixture);
+    let server = spawn_server(&fixture);
     let origin = server.origin();
 
     let chrome = launch_browser(chrome_binary());
