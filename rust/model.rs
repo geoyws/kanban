@@ -379,6 +379,8 @@ pub struct ContextPacket {
     pub ancestors: Vec<Task>,
     pub dependencies: Vec<Task>,
     pub claim: Option<ClaimSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_attention: Vec<Attention>,
     pub notes: Vec<TaskNote>,
     pub checkpoints: Vec<Checkpoint>,
     pub handoffs: Vec<Handoff>,

@@ -2143,6 +2143,10 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn open_attentions(&self, task: &str) -> Result<Vec<Attention>> {
+        Ok(self.attention(Some("open"), None, Some(task), None, 1000, false)?)
+    }
+
     /// Correct an open attention row without settling it. The event retains
     /// the text and tags that were superseded; resolved rows are immutable.
     pub fn update_attention(
@@ -2877,6 +2881,7 @@ impl Store {
         const HANDOFFS: usize = 20;
         const SITREPS: usize = 20;
         let task = self.require_task(id)?;
+        let open_attention = self.open_attentions(id)?;
         // Over-fetch by one so "there is older history" is measured, not
         // assumed. `truncated` was hardcoded false, so a resuming agent was
         // told it held the whole record while notes were being dropped.
@@ -2898,6 +2903,7 @@ impl Store {
             ancestors: self.ancestors(id)?,
             dependencies: self.dependencies(id)?,
             claim: self.get_claim(id)?.as_ref().map(ClaimSummary::from),
+            open_attention,
             notes,
             checkpoints,
             handoffs,

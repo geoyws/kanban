@@ -1,4 +1,6 @@
-use crate::model::{Checkpoint, ContextPacket, Handoff, RuleSummary, Sitrep, Task, TaskNote};
+use crate::model::{
+    Attention, Checkpoint, ContextPacket, Handoff, RuleSummary, Sitrep, Task, TaskNote,
+};
 use crate::store::Store;
 use anyhow::{Result, bail};
 
@@ -66,6 +68,66 @@ fn render_sitrep(sitrep: &Sitrep) -> String {
                 .unwrap_or_default()
         ));
     }
+    lines.join("\n")
+}
+
+fn render_attention(attention: &Attention) -> String {
+    let mut lines = vec![
+        format!(
+            "- {} · {} · {} · {}",
+            attention.id, attention.kind, attention.raised_by, attention.status
+        ),
+        format!("  Body: {}", attention.body),
+        format!(
+            "  Priority: {}",
+            attention.priority_level.as_deref().unwrap_or("P?")
+        ),
+    ];
+    if !attention.tags.is_empty() {
+        lines.push(format!("  Tags: {}", attention.tags.join("; ")));
+    }
+    lines.join("\n")
+}
+
+fn render_attention_summary(attention: &Attention) -> String {
+    let tags = if attention.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", attention.tags.join(", "))
+    };
+    format!(
+        "- {} [{}] {} · {}{}",
+        attention.id,
+        attention.kind,
+        attention.priority_level.as_deref().unwrap_or("P?"),
+        clip(&attention.body, 160),
+        tags
+    )
+}
+
+fn render_attention_block(attentions: &[Attention]) -> String {
+    if attentions.is_empty() {
+        return "(none)".to_owned();
+    }
+    let mut lines = vec![format!(
+        "{} open item{}",
+        attentions.len(),
+        if attentions.len() == 1 { "" } else { "s" }
+    )];
+    lines.extend(attentions.iter().map(render_attention));
+    lines.join("\n")
+}
+
+fn render_attention_compact(attentions: &[Attention]) -> String {
+    if attentions.is_empty() {
+        return "(none)".to_owned();
+    }
+    let mut lines = vec![format!(
+        "{} open item{}",
+        attentions.len(),
+        if attentions.len() == 1 { "" } else { "s" }
+    )];
+    lines.extend(attentions.iter().map(render_attention_summary));
     lines.join("\n")
 }
 
@@ -182,6 +244,9 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
             },
         ),
         String::new(),
+        "## Open attention".to_owned(),
+        render_attention_block(&packet.open_attention),
+        String::new(),
         "## Ancestry".to_owned(),
         if packet.ancestors.is_empty() {
             "(none)".to_owned()
@@ -233,6 +298,10 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .claim
                     .as_ref()
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
+            ),
+            format!(
+                "Open attention: {}",
+                render_attention_compact(&packet.open_attention)
             ),
             rules,
             format!(
@@ -402,4 +471,142 @@ pub fn render_todo(store: &Store) -> Result<String> {
         lines.extend(done.into_iter().rev().take(20).map(task_line));
     }
     Ok(format!("{}\n", lines.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Attention, ContextPacket, Task};
+    use serde_json::json;
+
+    fn sample_task() -> Task {
+        Task {
+            id: "t-ctx".to_owned(),
+            task_type: "epic".to_owned(),
+            parent_id: None,
+            title: "Context surface".to_owned(),
+            body: Some("x".repeat(1_200)),
+            assignee: None,
+            lane: None,
+            deliverable: None,
+            stale_minutes: None,
+            driver_only: false,
+            status: "todo".to_owned(),
+            priority: 3,
+            priority_level: Some("P1".to_owned()),
+            created_at: 1,
+            updated_at: 2,
+            completed_at: None,
+            archived: false,
+            archived_at: None,
+            metadata: json!({}),
+            tags: vec!["attention".to_owned()],
+        }
+    }
+
+    fn sample_attention(id: &str, kind: &str, priority: i64, body: &str) -> Attention {
+        Attention {
+            id: id.to_owned(),
+            task_id: Some("t-ctx".to_owned()),
+            kind: kind.to_owned(),
+            body: body.to_owned(),
+            raised_by: "codex@driver".to_owned(),
+            created_at: 3,
+            status: "open".to_owned(),
+            priority,
+            priority_level: Some(
+                match priority {
+                    0..=2 => "P0",
+                    3..=5 => "P1",
+                    _ => "P2",
+                }
+                .to_owned(),
+            ),
+            resolved_at: None,
+            resolved_by: None,
+            resolution: None,
+            reopened_at: None,
+            reopened_by: None,
+            reopen_note: None,
+            archived: false,
+            tags: vec!["infra".to_owned()],
+        }
+    }
+
+    fn sample_packet() -> ContextPacket {
+        ContextPacket {
+            task: sample_task(),
+            ancestors: vec![],
+            dependencies: vec![],
+            claim: None,
+            open_attention: vec![
+                sample_attention(
+                    "a-1",
+                    "blocking",
+                    0,
+                    "George needs to review this epic before it can move.",
+                ),
+                sample_attention(
+                    "a-2",
+                    "approval",
+                    3,
+                    "A second operator decision is waiting on this same row.",
+                ),
+            ],
+            notes: vec![],
+            checkpoints: vec![],
+            handoffs: vec![],
+            rules: vec![],
+            sitreps: vec![],
+            generated_at: 4,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn open_attention_is_rendered_in_full_and_compact_contexts() {
+        let packet = sample_packet();
+        let full = render_context(&packet, 5_000).unwrap();
+        assert!(full.contains("## Open attention"), "{full}");
+        assert!(full.contains("2 open items"), "{full}");
+        assert!(
+            full.contains("- a-1 · blocking · codex@driver · open"),
+            "{full}"
+        );
+        assert!(
+            full.contains("- a-2 · approval · codex@driver · open"),
+            "{full}"
+        );
+        assert!(
+            full.contains("Body: George needs to review this epic before it can move."),
+            "{full}"
+        );
+
+        let compact = render_context(&packet, 1_000).unwrap();
+        assert!(
+            compact.contains("# Kanban cold-start context (compact)"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("Open attention: 2 open items"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("- a-1 [blocking] P0 · George needs to review this epic"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("- a-2 [approval] P1 · A second operator decision is waiting"),
+            "{compact}"
+        );
+    }
+
+    #[test]
+    fn open_attention_is_serialized_on_the_packet() {
+        let packet = sample_packet();
+        let json = serde_json::to_value(&packet).unwrap();
+        assert_eq!(json["openAttention"].as_array().unwrap().len(), 2);
+        assert_eq!(json["openAttention"][0]["id"], "a-1");
+        assert_eq!(json["openAttention"][1]["taskID"], "t-ctx");
+    }
 }

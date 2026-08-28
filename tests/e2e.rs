@@ -1510,6 +1510,162 @@ fn compiled_binary_bounds_context_and_generates_non_authoritative_todo() {
 }
 
 #[test]
+fn compiled_binary_surfaces_open_attention_on_task_story_and_epic_contexts() {
+    let fixture = Fixture::new("attention-context");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ATTNCTX", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Review the linked attention",
+            "--type",
+            "epic",
+            "--status",
+            "todo",
+            "--id",
+            "e-attn",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Linked story",
+            "--type",
+            "story",
+            "--status",
+            "todo",
+            "--id",
+            "s-attn",
+            "--parent",
+            "e-attn",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Linked task",
+            "--id",
+            "t-attn",
+            "--body",
+            &"t".repeat(1_600),
+            "--json",
+        ],
+    );
+    let epic_attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Epic review is waiting on George.",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "blocking",
+            "--task",
+            "e-attn",
+            "--json",
+        ],
+    );
+    let story_attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Story waiting on the operator.",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "s-attn",
+            "--json",
+        ],
+    );
+    let task_attention_one = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Task needs a blocking review.",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "blocking",
+            "--task",
+            "t-attn",
+            "--json",
+        ],
+    );
+    let task_attention_two = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Task also needs approval.",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "approval",
+            "--task",
+            "t-attn",
+            "--json",
+        ],
+    );
+
+    let epic_ctx = fixture.ok_json(&fixture.main, &["context", "e-attn", "--json"]);
+    assert_eq!(epic_ctx["openAttention"].as_array().unwrap().len(), 1);
+    assert_eq!(epic_ctx["openAttention"][0]["id"], epic_attention["id"]);
+    assert_eq!(epic_ctx["openAttention"][0]["taskID"], "e-attn");
+
+    let story_ctx = fixture.ok_json(&fixture.main, &["context", "s-attn", "--json"]);
+    assert_eq!(story_ctx["openAttention"].as_array().unwrap().len(), 1);
+    assert_eq!(story_ctx["openAttention"][0]["id"], story_attention["id"]);
+    assert_eq!(story_ctx["openAttention"][0]["taskID"], "s-attn");
+
+    let task_ctx = fixture.ok_json(&fixture.main, &["context", "t-attn", "--json"]);
+    assert_eq!(task_ctx["openAttention"].as_array().unwrap().len(), 2);
+    assert_eq!(task_ctx["openAttention"][0]["id"], task_attention_one["id"]);
+    assert_eq!(task_ctx["openAttention"][1]["id"], task_attention_two["id"]);
+    assert_eq!(task_ctx["openAttention"][0]["taskID"], "t-attn");
+    assert_eq!(task_ctx["openAttention"][1]["taskID"], "t-attn");
+
+    let rendered = fixture.run(&fixture.main, &["context", "t-attn"]);
+    assert!(rendered.status.success());
+    let rendered = String::from_utf8(rendered.stdout).unwrap();
+    assert!(rendered.contains("## Open attention"), "{rendered}");
+    assert!(rendered.contains("2 open items"), "{rendered}");
+    assert!(
+        rendered.contains("Task needs a blocking review."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Task also needs approval."), "{rendered}");
+
+    let compact = fixture.run(&fixture.main, &["context", "t-attn", "--max-chars", "1200"]);
+    assert!(compact.status.success());
+    let compact = String::from_utf8(compact.stdout).unwrap();
+    assert!(
+        compact.contains("# Kanban cold-start context (compact)"),
+        "{compact}"
+    );
+    assert!(
+        compact.contains("Open attention: 2 open items"),
+        "{compact}"
+    );
+    assert!(
+        compact.contains("Task needs a blocking review."),
+        "{compact}"
+    );
+    assert!(compact.contains("Task also needs approval."), "{compact}");
+}
+
+#[test]
 fn compiled_binary_imports_both_atmux_formats_backs_up_and_opens_v3_databases() {
     let fixture = Fixture::new("migration");
     fixture.ok_json(&fixture.main, &["init", "--name", "Import", "--json"]);
