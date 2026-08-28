@@ -111,9 +111,11 @@ fi
 
 # A decrypt-and-list proves the bytes survived. Only an actual restore proves
 # the thing is usable, so this drives `kanban restore` into a scratch data root
-# and then makes the restored copy answer `doctor`. It never touches the live
-# data root: KANBAN_DATA_DIR points elsewhere, and restore takes its exclusive
-# lock on that scratch root instead.
+# and then makes the restored copy answer `doctor` and `audit verify`. It never
+# touches the live data root: KANBAN_DATA_DIR points elsewhere, and restore
+# takes its exclusive lock on that scratch root instead. Workspace roots are
+# routing metadata, not backup payloads, so an absent/retired checkout is
+# reported separately rather than mislabelled as a corrupt restore.
 if [[ "${1:-}" == "--rehearse" ]]; then
   say "Restore rehearsal (into a scratch data root — the live one is untouched)"
   latest="$(rclone lsf "SB:$REMOTE_DIR/" | grep -E '^kanban-.*\.tar\.gz\.age$' | sort | tail -1)"
@@ -124,10 +126,32 @@ if [[ "${1:-}" == "--rehearse" ]]; then
   tar xzf "$WORK/r.tar.gz" -C "$WORK/snap"
   KANBAN_DATA_DIR="$WORK/root" "$KB" restore --from "$WORK/snap" --force --json >/dev/null \
     || die "restore of $latest FAILED — the backup is not usable"
-  KANBAN_DATA_DIR="$WORK/root" "$KB" doctor --json > "$WORK/doctor.json" \
-    || die "restored copy fails doctor — it is not a working ledger"
-  n="$(grep -o '"name"' "$WORK/doctor.json" | wc -l)"
-  ok "restored $latest into a scratch root; doctor healthy across $n project(s)"
+  KANBAN_DATA_DIR="$WORK/root" "$KB" doctor --json > "$WORK/doctor.json" 2>/dev/null || true
+  jq -e '
+    .registry == ["ok"] and
+    .registryAudit.healthy == true and
+    .registrySchemaVersion == .supportedRegistrySchemaVersion and
+    ([.projects[] | select(
+      .present != true or
+      .integrity != ["ok"] or
+      .schemaVersion != .supportedSchemaVersion or
+      .audit.healthy != true or
+      (.orphanedRows | length) != 0 or
+      (.futureDatedTasks | length) != 0 or
+      .searchIndex.healthy != true
+    )] | length) == 0
+  ' "$WORK/doctor.json" >/dev/null \
+    || die "restored copy has a registry, board, schema, audit, or search integrity defect"
+  KANBAN_DATA_DIR="$WORK/root" "$KB" audit verify --json > "$WORK/audit.json" \
+    || die "restored copy fails audit-chain verification"
+  jq -e '.healthy == true and (.missingBoards | length) == 0' "$WORK/audit.json" >/dev/null \
+    || die "restored copy has an unhealthy or missing audit journal"
+  n="$(jq '.projects | length' "$WORK/doctor.json")"
+  unreachable="$(jq '.unreachableRoots | length' "$WORK/doctor.json")"
+  ok "restored $latest into a scratch root; $n project(s) pass storage + audit checks"
+  if (( unreachable > 0 )); then
+    printf '    ! %s workspace root(s) are absent on this host (routing only; ledger files verified)\n' "$unreachable"
+  fi
   exit 0
 fi
 
