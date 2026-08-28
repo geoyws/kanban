@@ -7503,15 +7503,16 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
         String::from_utf8_lossy(&lost.stderr)
     );
 
-    // doctor is the thing that has to notice, because nothing else can: the
-    // database passes every structural check ever written.
+    // Doctor reports the stale discovery hints, but a root is not board
+    // identity: the healthy board remains reachable by its global name.
     let sick = fixture.run(&original, &["doctor", "--json"]);
     assert!(
-        !sick.status.success(),
-        "doctor called a lost project healthy"
+        sick.status.success(),
+        "an unreachable discovery hint failed board integrity: {}",
+        String::from_utf8_lossy(&sick.stderr)
     );
     let report: Value = serde_json::from_slice(&sick.stdout).unwrap();
-    assert_eq!(report["healthy"], false);
+    assert_eq!(report["healthy"], true);
     let roots = report["unreachableRoots"].as_array().unwrap();
     assert_eq!(
         roots.len(),
@@ -7525,7 +7526,7 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
     assert_eq!(project_root["name"], "MOVED");
     assert_eq!(
         project_root["resolvesTo"],
-        moved.to_string_lossy().into_owned(),
+        moved.canonicalize().unwrap().to_string_lossy().into_owned(),
         "the report must say where the path leads now, not merely that it is wrong"
     );
 
@@ -7582,17 +7583,19 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&retired).unwrap();
 
-    fixture.ok_json(&project, &["init", "--name", "DETACH", "--json"]);
-    fixture.ok_json(
+    let registered = fixture.ok_json(&project, &["init", "--name", "DETACH", "--json"]);
+    let project_root = registered["rootPath"]
+        .as_str()
+        .expect("registered project root")
+        .to_owned();
+    let attached = fixture.ok_json(
         &retired,
-        &[
-            "workspace",
-            "attach",
-            "--to",
-            project.to_str().unwrap(),
-            "--json",
-        ],
+        &["workspace", "attach", "--to", &project_root, "--json"],
     );
+    let retired_root = attached["rootPath"]
+        .as_str()
+        .expect("attached root path")
+        .to_owned();
     fixture.ok_json(
         &project,
         &["task", "add", "Kept work", "--id", "t-kept", "--json"],
@@ -7605,13 +7608,13 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "workspace",
             "detach",
             "--root",
-            retired.to_str().unwrap(),
+            &retired_root,
             "--as",
             "geo",
             "--json",
         ],
     );
-    assert_eq!(detached["rootPath"], retired.to_string_lossy().as_ref());
+    assert_eq!(detached["rootPath"], retired_root);
     assert_eq!(detached["canonical"], false);
     assert_eq!(detached["archived"], true);
     assert_eq!(detached["archivedBy"], "geo");
@@ -7627,10 +7630,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
         ],
     );
     assert_eq!(lifecycle[0]["actor"], "geo");
-    assert_eq!(
-        lifecycle[0]["payload"]["rootPath"],
-        retired.to_string_lossy().as_ref()
-    );
+    assert_eq!(lifecycle[0]["payload"]["rootPath"], retired_root);
 
     let active = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
     assert!(
@@ -7638,12 +7638,15 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|row| row["rootPath"] != retired.to_string_lossy().as_ref())
+            .all(|row| row["rootPath"] != retired_root)
     );
     let all = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
-    assert!(all.as_array().unwrap().iter().any(|row| {
-        row["rootPath"] == retired.to_string_lossy().as_ref() && row["archived"] == true
-    }));
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["rootPath"] == retired_root && row["archived"] == true })
+    );
     assert_eq!(
         fixture.ok_json(&project, &["task", "show", "t-kept", "--json"])["id"],
         "t-kept",
@@ -7662,7 +7665,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "workspace",
             "detach",
             "--root",
-            project.to_str().unwrap(),
+            &project_root,
             "--as",
             "geo",
             "--json",
@@ -7677,7 +7680,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "workspace",
             "detach",
             "--root",
-            retired.to_str().unwrap(),
+            &retired_root,
             "--as",
             "geo",
             "--json",
@@ -7691,15 +7694,9 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     fs::create_dir_all(&retired).unwrap();
     let reattached = fixture.ok_json(
         &retired,
-        &[
-            "workspace",
-            "attach",
-            "--to",
-            project.to_str().unwrap(),
-            "--json",
-        ],
+        &["workspace", "attach", "--to", &project_root, "--json"],
     );
-    assert_eq!(reattached["rootPath"], retired.to_string_lossy().as_ref());
+    assert_eq!(reattached["rootPath"], retired_root);
     assert_eq!(reattached["archived"], false);
     let history = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
     assert_eq!(
@@ -7707,7 +7704,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|row| row["rootPath"] == retired.to_string_lossy().as_ref())
+            .filter(|row| row["rootPath"] == retired_root)
             .count(),
         2,
         "reattaching a reused path erased or replaced its retired history"

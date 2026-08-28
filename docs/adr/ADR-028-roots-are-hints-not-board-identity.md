@@ -114,9 +114,12 @@ the meantime.
 
 ## Implementation status
 
-**No shipped code behaves this way yet.** This ADR records the decision and its
-rationale; the current binary still keys board identity to a canonical path
-everywhere below. An implementation would have to change at least:
+**Partial, 2026-08-28:** `kb doctor` now reports unreachable roots as advisory
+discovery hints without making an otherwise healthy registry fail. The board
+entity/schema migration and zero-root lifecycle below remain unimplemented.
+
+The current binary still keys board identity to a canonical path everywhere
+else below. Completing this decision still requires changes to at least:
 
 - `rust/db.rs:791-802` — `REGISTRY_V1`/`V2`: `workspaces.root_path` as PRIMARY
   KEY with `board_path` UNIQUE, and `workspace_aliases` as the second-class

@@ -135,6 +135,13 @@ the receipt would say which was used.
 not a second request. With none of them, the board is the one containing the
 working directory.
 
+Roots are optional discovery hints, not board identity. The same repository may
+appear at several paths (including as submodules in several projects), and a
+board remains authoritative and fully usable through `--project NAME` when any
+or every registered root is absent. Do not infer board identity from `TODO.md`,
+`HANDOFF.md`, a checkout basename, or a privileged "canonical" root. Prefer an
+explicit project selector whenever the directory is ambiguous.
+
 ```bash
 kb ws ls --json                 # every registered project and its board path
 kb init --name NAME             # register the current directory
@@ -522,7 +529,7 @@ kb dash --json                  # per-board counts, incl. openAttention + pendin
 kb ev --task <id> --json        # the durable audit trail
 kb ev --registry --json         # registry rules and workspace lifecycle
 kb stale --json                 # work that overran its stale budget
-kb doctor --json                # integrity, orphaned rows, unreachable roots
+kb doctor --json                # integrity plus advisory unreachable-root hints
 kb audit verify --json          # all hash chains, including archived history
 kb archive --older-than-days 90 --as system@archive --json
 kb w repoint --json             # after moving a repo: point its registered roots at it
@@ -535,6 +542,12 @@ so on. It records **what happened**; `att` records **what needs George**. Use
 
 `ctx` is bounded and says so: `truncated` is computed, never assumed, and the
 marker survives the truncation it describes.
+
+`doctor.unreachableRoots` is advisory discovery maintenance. Non-empty root
+hints do not make `healthy` false; missing board files, failed integrity/audit,
+schema defects, orphaned rows, future-dated tasks, and search-index drift still
+do. Repoint or retire a hint when useful, but never treat a disposable checkout
+as the board's identity.
 
 `--limit` must be zero or more. A negative one reads as *no limit* in SQL, so it
 is refused rather than silently handing back everything you asked to bound.

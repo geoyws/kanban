@@ -2230,15 +2230,11 @@ fn run() -> Result<()> {
         let registry_audit = registry.audit()?;
         let registry_schema = db::schema_version(&registry.connection)?;
         let mut projects = Vec::new();
-        // A stored root is canonical when written and can only become wrong
-        // afterwards -- the tree moves and a symlink takes its place, which is
-        // exactly what happened to this repository. Resolution canonicalises
-        // the caller's cwd, so from that moment no directory inside the tree
-        // resolves to the board and the project is reachable only by name.
-        // `integrity_check` sees a perfect database throughout.
+        // Roots are discovery hints, not board identity (ADR-028). Keep stale
+        // hints visible so an operator can repoint or retire them, but do not
+        // fail an otherwise healthy board that remains reachable by name.
         let unreachable = registry.unreachable_roots()?;
-        let mut healthy =
-            registry_check == vec!["ok"] && registry_audit.healthy && unreachable.is_empty();
+        let mut healthy = registry_check == vec!["ok"] && registry_audit.healthy;
         for project in registry.projects()? {
             // Checked before opening, because opening would create it.
             if !board_is_present(&project.board_path) {
