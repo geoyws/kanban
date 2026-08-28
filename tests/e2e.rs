@@ -472,9 +472,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 10);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 10);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 19);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 19);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 19);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 20);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 20);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 20);
 }
 
 #[test]
@@ -889,6 +889,130 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
 }
 
 #[test]
+fn compiled_binary_keeps_linked_deployment_search_documents_after_task_mutations() {
+    let fixture = Fixture::new("deployment-search-refresh");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SEARCH-DEPLOY", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "release", "--as", "tester", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Deploy indexed release",
+            "--id",
+            "t-deploy-search",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban",
+            "--commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tier",
+            "@_bs",
+            "--environment",
+            "driver-feedback",
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--task",
+            "t-deploy-search",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            deployment["id"].as_str().unwrap(),
+            "--token",
+            deployment["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--receipt",
+            "served linked deployment",
+            "--served-commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+
+    let assert_healthy = || {
+        let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+        let search = &doctor["projects"][0]["searchIndex"];
+        assert_eq!(search["healthy"], true, "{doctor}");
+        assert_eq!(search["sourceRows"], search["documents"], "{doctor}");
+        assert_eq!(search["documents"], search["ftsRows"], "{doctor}");
+    };
+    assert_healthy();
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-deploy-search",
+            "--body",
+            "The linked deployment must remain searchable after this refresh.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    assert_healthy();
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-deploy-search",
+            "--tag",
+            "release",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    assert_healthy();
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-deploy-search",
+            "done",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    assert_healthy();
+}
+
+#[test]
 fn the_v13_search_migration_preserves_v12_knowledge() {
     let fixture = Fixture::new("search-migration");
     fixture.ok_json(
@@ -945,7 +1069,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        19
+        20
     );
     assert_eq!(
         reopened
@@ -2372,7 +2496,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 19"),
+        version.contains("board schema 20"),
         "version output: {version}"
     );
     assert!(
@@ -6283,7 +6407,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        19
+        20
     );
 }
 
@@ -6689,7 +6813,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        19
+        20
     );
     assert_eq!(
         connection

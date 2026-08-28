@@ -852,6 +852,105 @@ CREATE TRIGGER IF NOT EXISTS search_deployments_au AFTER UPDATE ON deployments B
 END;
 "#;
 
+/// Keep the V19 deployment-event projection inside every task-scoped refresh.
+///
+/// V13's task and tag triggers rebuild all documents for a task from
+/// `search_source_rows`. Deployment events were added later and deliberately
+/// live outside that view, so those refreshes silently deleted the V19 rows.
+/// One canonical projection lets task, tag, event, deployment, rebuild, and
+/// health paths agree on exactly which deployment documents exist.
+const BOARD_V20: &str = r#"
+DROP VIEW IF EXISTS search_deployment_event_rows;
+CREATE VIEW search_deployment_event_rows(
+ source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived
+) AS
+SELECT
+ 'event', CAST(e.seq AS TEXT), d.task_id,
+ 'deployment: ' || d.id,
+ e.kind || char(10) || COALESCE(e.actor,'') || char(10) || e.payload,
+ d.status, d.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=d.task_id AND archived=0 ORDER BY tag)), ''),
+ e.created_at, d.updated_at, d.archived
+FROM events e
+JOIN deployments d ON d.id=json_extract(e.payload,'$.deploymentID')
+WHERE e.kind IN ('deployment_started','deployment_finished','deployment_abandoned');
+
+DROP TRIGGER search_tasks_au;
+CREATE TRIGGER search_tasks_au AFTER UPDATE ON tasks BEGIN
+ DELETE FROM search_documents WHERE task_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=new.id;
+END;
+
+DROP TRIGGER search_task_tags_ai;
+CREATE TRIGGER search_task_tags_ai AFTER INSERT ON task_tags BEGIN
+ DELETE FROM search_documents WHERE task_id=new.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=new.task_id;
+END;
+
+DROP TRIGGER search_task_tags_au;
+CREATE TRIGGER search_task_tags_au AFTER UPDATE ON task_tags BEGIN
+ DELETE FROM search_documents WHERE task_id=old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=old.task_id;
+ DELETE FROM search_documents WHERE task_id=new.task_id AND new.task_id<>old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=new.task_id AND new.task_id<>old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=new.task_id AND new.task_id<>old.task_id;
+END;
+
+DROP TRIGGER search_task_tags_ad;
+CREATE TRIGGER search_task_tags_ad AFTER DELETE ON task_tags BEGIN
+ DELETE FROM search_documents WHERE task_id=old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE task_id=old.task_id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE task_id=old.task_id;
+END;
+
+DROP TRIGGER search_events_au;
+CREATE TRIGGER search_events_au AFTER UPDATE ON events BEGIN
+ DELETE FROM search_documents WHERE source_kind='event' AND source_id=CAST(old.seq AS TEXT);
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='event' AND source_id=CAST(new.seq AS TEXT);
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE source_id=CAST(new.seq AS TEXT);
+END;
+
+DROP TRIGGER search_deployment_events_ai;
+CREATE TRIGGER search_deployment_events_ai AFTER INSERT ON events
+WHEN new.kind IN ('deployment_started','deployment_finished','deployment_abandoned') BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows WHERE source_id=CAST(new.seq AS TEXT);
+END;
+
+DROP TRIGGER search_deployments_au;
+CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
+ DELETE FROM search_documents
+ WHERE source_kind='event' AND source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID') IN (old.id,new.id)
+ );
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows
+ WHERE source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID')=new.id
+ );
+END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -992,7 +1091,7 @@ ALTER TABLE rule_events ADD COLUMN prev_hash TEXT;
 ALTER TABLE rule_events ADD COLUMN event_hash TEXT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 19;
+pub const BOARD_SCHEMA_VERSION: usize = 20;
 pub const REGISTRY_SCHEMA_VERSION: usize = 10;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1189,7 +1288,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19,
+    BOARD_V18, BOARD_V19, BOARD_V20,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.

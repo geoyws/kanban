@@ -577,14 +577,7 @@ pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<
     )?;
     transaction.execute(
         "INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived) \
-         SELECT 'event',CAST(e.seq AS TEXT),d.task_id,'deployment: ' || d.id, \
-                e.kind || char(10) || COALESCE(e.actor,'') || char(10) || e.payload, \
-                d.status,d.lane, \
-                COALESCE((SELECT group_concat(tag,' ') FROM \
-                  (SELECT tag FROM task_tags WHERE task_id=d.task_id AND archived=0 ORDER BY tag)),''), \
-                e.created_at,d.updated_at,d.archived \
-         FROM events e JOIN deployments d ON d.id=json_extract(e.payload,'$.deploymentID') \
-         WHERE e.kind IN ('deployment_started','deployment_finished','deployment_abandoned')",
+         SELECT * FROM search_deployment_event_rows",
         [],
     )?;
     let documents = load_documents(
@@ -644,7 +637,7 @@ pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<
 pub fn health(connection: &Connection) -> Result<SearchIndexHealth> {
     let source_rows = connection.query_row(
         "SELECT (SELECT count(*) FROM search_source_rows) + \
-                (SELECT count(*) FROM events WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned'))",
+                (SELECT count(*) FROM search_deployment_event_rows)",
         [],
         |row| row.get::<_, i64>(0),
     )?;
