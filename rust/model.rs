@@ -482,6 +482,82 @@ pub struct ArchiveReport {
     pub attention: i64,
     pub sitreps: i64,
     pub task_tags: i64,
+    pub deployments: i64,
+}
+
+pub const DEPLOYMENT_TIERS: [&str; 7] = ["@_bdt", "@_bd", "@_bst", "@_bs", "@_s", "@_uat", "@_p"];
+pub const DEPLOYMENT_STATUSES: [&str; 5] =
+    ["started", "succeeded", "failed", "cancelled", "abandoned"];
+pub const DEPLOYMENT_PHASES: [&str; 4] = ["build", "publish", "start", "verification"];
+
+/// One immutable deployment attempt. Terminal completion only fills the
+/// result columns; a retry is always a new row linked through `retry_of`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentAttempt {
+    pub id: String,
+    #[serde(rename = "taskID")]
+    pub task_id: Option<String>,
+    pub repo: String,
+    pub commit_sha: String,
+    pub branch: Option<String>,
+    pub tier: String,
+    pub environment: String,
+    pub host: String,
+    pub url: String,
+    pub mechanism: Option<String>,
+    pub operation_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub status: String,
+    pub phase: Option<String>,
+    pub actor: String,
+    pub lane: Option<String>,
+    pub receipt: Option<String>,
+    pub artifact_uri: Option<String>,
+    pub served_commit: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+    pub archived: bool,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentStartReceipt {
+    #[serde(flatten)]
+    pub deployment: DeploymentAttempt,
+    pub capability_token: String,
+    pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartDeployment {
+    pub task_id: Option<String>,
+    pub repo: String,
+    pub commit_sha: String,
+    pub branch: Option<String>,
+    pub tier: String,
+    pub environment: String,
+    pub host: String,
+    pub url: String,
+    pub mechanism: Option<String>,
+    pub operation_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub actor: String,
+    pub lane: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinishDeployment {
+    pub id: String,
+    pub capability_token: String,
+    pub result: String,
+    pub phase: Option<String>,
+    pub receipt: Option<String>,
+    pub artifact_uri: Option<String>,
+    pub served_commit: Option<String>,
+    pub actor: String,
 }
 
 /// One bounded retrieval request over Kanban's derived search corpus.

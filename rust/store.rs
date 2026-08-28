@@ -41,6 +41,14 @@ fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     Ok(())
 }
 
+fn full_commit(value: &str, label: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must be a full 40-character hexadecimal commit");
+    }
+    Ok(value)
+}
+
 /// Queue position: 0 is the most urgent, 9 the least, 3 the default.
 ///
 /// The band follows what the ledger already means by the field rather than
@@ -414,6 +422,35 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         // Attached after the row is read: a join per task would be a query per
         // task, and the readers below fill these in one pass.
         tags: Vec::new(),
+    })
+}
+
+fn deployment_row(row: &Row<'_>) -> rusqlite::Result<DeploymentAttempt> {
+    Ok(DeploymentAttempt {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        repo: row.get("repo")?,
+        commit_sha: row.get("commit_sha")?,
+        branch: row.get("branch")?,
+        tier: row.get("tier")?,
+        environment: row.get("environment")?,
+        host: row.get("host")?,
+        url: row.get("url")?,
+        mechanism: row.get("mechanism")?,
+        operation_id: row.get("operation_id")?,
+        retry_of: row.get("retry_of")?,
+        status: row.get("status")?,
+        phase: row.get("phase")?,
+        actor: row.get("actor")?,
+        lane: row.get("lane")?,
+        receipt: row.get("receipt")?,
+        artifact_uri: row.get("artifact_uri")?,
+        served_commit: row.get("served_commit")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        completed_at: row.get("completed_at")?,
+        archived: row.get::<_, i64>("archived")? != 0,
+        archived_at: row.get("archived_at")?,
     })
 }
 
@@ -2918,6 +2955,269 @@ impl Store {
         Ok(())
     }
 
+    pub fn start_deployment(&mut self, input: StartDeployment) -> Result<DeploymentStartReceipt> {
+        validate(&input.tier, &DEPLOYMENT_TIERS, "deployment tier")?;
+        let repo = nonempty(&input.repo, "repo")?.to_owned();
+        let commit_sha = full_commit(&input.commit_sha, "commit")?;
+        let environment = nonempty(&input.environment, "environment")?.to_owned();
+        let host = nonempty(&input.host, "host")?.to_owned();
+        let url = nonempty(&input.url, "url")?.to_owned();
+        let actor = nonempty(&input.actor, "actor")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(task_id) = input.task_id.as_deref() {
+            require_task(&transaction, task_id)?;
+        }
+        if let Some(retry_of) = input.retry_of.as_deref() {
+            let status: Option<String> = transaction
+                .query_row(
+                    "SELECT status FROM deployments WHERE id=?",
+                    [retry_of],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let status = status.with_context(|| format!("deployment {retry_of} not found"))?;
+            if status == "started" {
+                bail!("deployment {retry_of} is still started and cannot be retried");
+            }
+        }
+        if let Some(operation_id) = input.operation_id.as_deref() {
+            let replay: Option<(DeploymentAttempt, String)> = transaction
+                .query_row(
+                    "SELECT *,capability_token FROM deployments WHERE operation_id=?",
+                    [operation_id],
+                    |row| Ok((deployment_row(row)?, row.get("capability_token")?)),
+                )
+                .optional()?;
+            if let Some((deployment, capability_token)) = replay {
+                let same = deployment.task_id == input.task_id
+                    && deployment.repo == repo
+                    && deployment.commit_sha == commit_sha
+                    && deployment.branch == input.branch
+                    && deployment.tier == input.tier
+                    && deployment.environment == environment
+                    && deployment.host == host
+                    && deployment.url == url
+                    && deployment.mechanism == input.mechanism
+                    && deployment.retry_of == input.retry_of
+                    && deployment.actor == actor
+                    && deployment.lane == input.lane;
+                if !same {
+                    bail!(
+                        "operation id {operation_id} already names a different deployment attempt"
+                    );
+                }
+                transaction.rollback()?;
+                return Ok(DeploymentStartReceipt {
+                    deployment,
+                    capability_token,
+                    idempotent_replay: true,
+                });
+            }
+        }
+        let id = format!("d-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let capability_token = Uuid::new_v4().to_string();
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO deployments(id,task_id,repo,commit_sha,branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,actor,lane,capability_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'started',?,?,?,?,?)",
+            params![id,input.task_id,repo,commit_sha,input.branch,input.tier,environment,host,url,input.mechanism,input.operation_id,input.retry_of,actor,input.lane,capability_token,now,now],
+        )?;
+        event(
+            &transaction,
+            input.task_id.as_deref(),
+            "deployment_started",
+            Some(&actor),
+            json!({"deploymentID":id,"repo":repo,"commit":commit_sha,"tier":input.tier,"environment":environment,"host":host,"url":url,"retryOf":input.retry_of}),
+        )?;
+        let deployment = transaction.query_row(
+            "SELECT * FROM deployments WHERE id=?",
+            [&id],
+            deployment_row,
+        )?;
+        transaction.commit()?;
+        Ok(DeploymentStartReceipt {
+            deployment,
+            capability_token,
+            idempotent_replay: false,
+        })
+    }
+
+    pub fn require_deployment(&self, id: &str) -> Result<DeploymentAttempt> {
+        self.connection
+            .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
+            .optional()?
+            .with_context(|| format!("deployment {id} not found"))
+    }
+
+    pub fn deployments(
+        &self,
+        status: Option<&str>,
+        tier: Option<&str>,
+        include_archived: bool,
+        limit: i64,
+    ) -> Result<Vec<DeploymentAttempt>> {
+        if let Some(value) = status {
+            validate(value, &DEPLOYMENT_STATUSES, "deployment status")?;
+        }
+        if let Some(value) = tier {
+            validate(value, &DEPLOYMENT_TIERS, "deployment tier")?;
+        }
+        let mut sql = String::from("SELECT * FROM deployments WHERE 1=1");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !include_archived {
+            sql.push_str(" AND archived=0");
+        }
+        if let Some(value) = status {
+            sql.push_str(" AND status=?");
+            values.push(Box::new(value.to_owned()));
+        }
+        if let Some(value) = tier {
+            sql.push_str(" AND tier=?");
+            values.push(Box::new(value.to_owned()));
+        }
+        sql.push_str(" ORDER BY created_at DESC,id DESC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                deployment_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn current_deployments(&self) -> Result<Vec<DeploymentAttempt>> {
+        let mut statement = self.connection.prepare(
+            "SELECT d.* FROM deployments d WHERE d.status='succeeded' AND d.archived=0 AND NOT EXISTS (SELECT 1 FROM deployments newer WHERE newer.status='succeeded' AND newer.repo=d.repo AND newer.tier=d.tier AND newer.environment=d.environment AND (newer.created_at>d.created_at OR (newer.created_at=d.created_at AND newer.id>d.id))) ORDER BY d.repo,d.tier,d.environment",
+        )?;
+        statement
+            .query_map([], deployment_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn finish_deployment(&mut self, input: FinishDeployment) -> Result<DeploymentAttempt> {
+        validate(
+            &input.result,
+            &DEPLOYMENT_STATUSES[1..],
+            "deployment result",
+        )?;
+        if input.result == "abandoned" {
+            bail!("use deploy abandon for an abandoned attempt");
+        }
+        let phase = input
+            .phase
+            .as_deref()
+            .context("deployment phase is required")?;
+        validate(phase, &DEPLOYMENT_PHASES, "deployment phase")?;
+        let actor = nonempty(&input.actor, "actor")?.to_owned();
+        nonempty(input.receipt.as_deref().unwrap_or(""), "deployment receipt")?;
+        let served_commit = input
+            .served_commit
+            .as_deref()
+            .map(|value| full_commit(value, "served commit"))
+            .transpose()?;
+        if input.result == "succeeded" && phase != "verification" {
+            bail!("a succeeded deployment requires --phase verification");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: (String, String, Option<String>) = transaction
+            .query_row(
+                "SELECT status,capability_token,commit_sha FROM deployments WHERE id=?",
+                [&input.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .with_context(|| format!("deployment {} not found", input.id))?;
+        if current.0 != "started" {
+            bail!("deployment {} is already {}", input.id, current.0);
+        }
+        if current.1 != input.capability_token {
+            bail!("capability token does not own deployment {}", input.id);
+        }
+        if input.result == "succeeded" && served_commit.as_deref() != current.2.as_deref() {
+            bail!("served commit must exactly match the requested deployment commit");
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE deployments SET status=?,phase=?,receipt=?,artifact_uri=?,served_commit=?,updated_at=?,completed_at=? WHERE id=?",
+            params![input.result,input.phase,input.receipt,input.artifact_uri,served_commit,now,now,input.id],
+        )?;
+        let task_id: Option<String> = transaction.query_row(
+            "SELECT task_id FROM deployments WHERE id=?",
+            [&input.id],
+            |row| row.get(0),
+        )?;
+        event(
+            &transaction,
+            task_id.as_deref(),
+            "deployment_finished",
+            Some(&actor),
+            json!({"deploymentID":input.id,"result":input.result,"phase":input.phase,"servedCommit":served_commit,"receipt":input.receipt,"artifactURI":input.artifact_uri}),
+        )?;
+        let deployment = transaction.query_row(
+            "SELECT * FROM deployments WHERE id=?",
+            [&input.id],
+            deployment_row,
+        )?;
+        transaction.commit()?;
+        Ok(deployment)
+    }
+
+    pub fn abandon_deployment(
+        &mut self,
+        id: &str,
+        token: Option<&str>,
+        force: bool,
+        note: &str,
+        actor: &str,
+    ) -> Result<DeploymentAttempt> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let note = nonempty(note, "abandon note")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, capability, task_id, updated_at): (String, String, Option<String>, i64) =
+            transaction
+                .query_row(
+                    "SELECT status,capability_token,task_id,updated_at FROM deployments WHERE id=?",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?
+                .with_context(|| format!("deployment {id} not found"))?;
+        if status != "started" {
+            bail!("deployment {id} is already {status}");
+        }
+        if !force && token != Some(capability.as_str()) {
+            bail!(
+                "capability token does not own deployment {id}; use --force only for explicit recovery"
+            );
+        }
+        let now = now_ms();
+        if force && now.saturating_sub(updated_at) < 60 * 60 * 1000 {
+            bail!(
+                "deployment {id} is not stale; wait 60 minutes or finish it with its capability token"
+            );
+        }
+        transaction.execute("UPDATE deployments SET status='abandoned',receipt=?,updated_at=?,completed_at=? WHERE id=?", params![note,now,now,id])?;
+        event(
+            &transaction,
+            task_id.as_deref(),
+            "deployment_abandoned",
+            Some(&actor),
+            json!({"deploymentID":id,"note":note,"forced":force}),
+        )?;
+        let deployment =
+            transaction.query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)?;
+        transaction.commit()?;
+        Ok(deployment)
+    }
+
     /// Move settled history out of operational views and secondary indexes.
     ///
     /// Rows stay in the same SQLite file and remain readable through `--all`.
@@ -2976,6 +3276,19 @@ impl Store {
              )",
             [cutoff_at],
         )? as i64;
+        let deployments = transaction.execute(
+            "UPDATE deployments SET archived=1,archived_at=? \
+             WHERE archived=0 AND status IN ('succeeded','failed','cancelled','abandoned') \
+             AND completed_at IS NOT NULL AND completed_at<=? \
+             AND id NOT IN ( \
+               SELECT d.id FROM deployments d WHERE d.status='succeeded' AND NOT EXISTS ( \
+                 SELECT 1 FROM deployments newer WHERE newer.status='succeeded' \
+                 AND newer.repo=d.repo AND newer.tier=d.tier AND newer.environment=d.environment \
+                 AND (newer.created_at>d.created_at OR (newer.created_at=d.created_at AND newer.id>d.id)) \
+               ) \
+             )",
+            params![archived_at, cutoff_at],
+        )? as i64;
         let events = transaction.execute(
             "UPDATE events SET archived=1 WHERE archived=0 AND ( \
                task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
@@ -2995,12 +3308,23 @@ impl Store {
             attention,
             sitreps,
             task_tags,
+            deployments,
         };
         if dry_run {
             transaction.rollback()?;
             return Ok(report);
         }
-        if tasks + notes + checkpoints + events + handoffs + attention + sitreps + task_tags > 0 {
+        if tasks
+            + notes
+            + checkpoints
+            + events
+            + handoffs
+            + attention
+            + sitreps
+            + task_tags
+            + deployments
+            > 0
+        {
             event(
                 &transaction,
                 None,

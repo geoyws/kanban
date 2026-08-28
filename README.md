@@ -435,6 +435,34 @@ The nightly backup job runs the sweep across every present registered board
 before snapshotting. Nothing is deleted; `--all` is the explicit cold-history
 read. See ADR-021.
 
+Deployment attempts use the same retention path. The latest verified success
+for each `(repo, tier, environment)` and every still-started attempt remain hot;
+older terminal, non-current attempts self-archive during the nightly 90-day
+sweep. They remain in SQLite, backups, audit history, `deploy list --all`, and
+search with `--all`.
+
+## Deployment ledger
+
+```bash
+kb deploy start --repo geoyws/kanban --commit "$FULL_SHA" \
+  --tier @_p --environment production --host hax --url https://kb.geoy.ws \
+  --task "$TASK_ID" --operation-id "$OPERATION_ID" --as codex@driver --json
+
+kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
+  --result succeeded --phase verification --served-commit "$FULL_SHA" \
+  --receipt "live release endpoint and served bundle matched" --as codex@driver --json
+
+kb deploy current --json
+kb deploy list --status failed --json
+kb deploy show "$DEPLOYMENT_ID" --json
+```
+
+Success is deliberately strict: it requires a live verification receipt and a
+served commit exactly equal to the requested full 40-character commit. A retry
+is a new attempt linked with `--retry-of`; an idempotent caller supplies
+`--operation-id`. See ADR-030. The cross-board live matrix is at
+`https://kb.geoy.ws/deployments`.
+
 ## Off-site backup
 
 ```bash
@@ -467,10 +495,11 @@ loss of the machine the backups are taken from.
 kanban serve --port 14200      # loopback only; no --bind flag exists
 ```
 
-Six server-rendered pages over every registered board: open attention items
+Eight server-rendered views over every registered board: open attention items
 across all of them by priority then age, the dashboard projection, draft plans
-with the work each holds back, cross-board cited search, one board's rows, and
-one task in full. Priority badges use P0/P1/P2 everywhere a queued row appears.
+with the work each holds back, the verified deployment matrix and attempt
+detail, cross-board cited search, one board's rows, and one task in full.
+Priority badges use P0/P1/P2 everywhere a queued row appears.
 Every read goes through the same `Store` methods the CLI calls, so there is no
 second implementation to keep in step.
 

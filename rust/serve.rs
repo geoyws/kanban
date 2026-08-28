@@ -22,7 +22,7 @@
 //! carry revision notices, never ledger content or capabilities; the browser
 //! fetches the canonical server-rendered projection after a notice.
 
-use crate::model::{Attention, ProjectRecord, SearchOptions, Sitrep, Task};
+use crate::model::{Attention, DeploymentAttempt, ProjectRecord, SearchOptions, Sitrep, Task};
 use crate::registry::{Registry, now_ms};
 use crate::search;
 use crate::store::Store;
@@ -148,10 +148,12 @@ fn render(url: &str) -> Result<String> {
         [] => needs_you(query_value(query, "replied").as_deref()),
         ["boards"] => boards(),
         ["plans"] => plans(query_value(query, "opened").as_deref()),
+        ["deployments"] => deployments(),
         ["lanes"] => lanes(),
         ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
         ["board", project] => board(project),
         ["task", project, id] => task_detail(project, id),
+        ["deployment", project, id] => deployment_detail(project, id),
         _ => Ok(page(
             "Not found",
             "<h1>Not found</h1><p>No page at that address. \
@@ -768,6 +770,176 @@ fn search_page(query: &str) -> Result<String> {
     Ok(page(&format!("Search: {query}"), &html))
 }
 
+fn deployment_link(project: &str, deployment: &DeploymentAttempt) -> String {
+    format!(
+        "<a href=\"/deployment/{}/{}\"><code>{}</code></a>",
+        escape(&url_encode(project)),
+        escape(&url_encode(&deployment.id)),
+        escape(&deployment.id),
+    )
+}
+
+/// Current releases and the attempts that still need operational attention.
+fn deployments() -> Result<String> {
+    let mut current = Vec::new();
+    let mut active = Vec::new();
+    let mut failures = Vec::new();
+    for (project, store) in projects()? {
+        current.extend(
+            store
+                .current_deployments()?
+                .into_iter()
+                .map(|row| (project.name.clone(), row)),
+        );
+        active.extend(
+            store
+                .deployments(Some("started"), None, false, 100)?
+                .into_iter()
+                .map(|row| (project.name.clone(), row)),
+        );
+        for status in ["failed", "abandoned"] {
+            failures.extend(
+                store
+                    .deployments(Some(status), None, false, 30)?
+                    .into_iter()
+                    .map(|row| (project.name.clone(), row)),
+            );
+        }
+    }
+    current.sort_by(|a, b| {
+        (&a.1.repo, &a.1.tier, &a.1.environment, &a.0).cmp(&(
+            &b.1.repo,
+            &b.1.tier,
+            &b.1.environment,
+            &b.0,
+        ))
+    });
+    active.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
+    failures.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
+
+    let mut html = String::from(
+        "<div class=heading><h1>Deployments</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>\
+         <p class=meta>Verified current releases, derived from immutable attempts. Old non-current terminal attempts self-archive from hot views and remain available with <code>kb deploy list --all</code>.</p>",
+    );
+    html.push_str("<h2>Current releases</h2>");
+    if current.is_empty() {
+        html.push_str("<p class=empty>No verified release has been recorded yet.</p>");
+    } else {
+        html.push_str("<table><thead><tr><th>Repository</th><th>Tier</th><th>Environment</th><th>Commit</th><th>Host</th><th>Attempt</th><th>Verified</th></tr></thead><tbody>");
+        for (project, row) in &current {
+            html.push_str(&format!(
+                "<tr><td>{repo}<div class=meta>{project}</div></td><td><span class=tag>{tier}</span></td><td>{environment}</td><td><code>{commit}</code></td><td>{host}</td><td>{attempt}</td><td class=when>{when}</td></tr>",
+                repo = escape(&row.repo), project = escape(project), tier = escape(&row.tier),
+                environment = escape(&row.environment), commit = escape(&row.commit_sha[..12]),
+                host = escape(&row.host), attempt = deployment_link(project, row),
+                when = escape(&ago(row.completed_at.unwrap_or(row.updated_at))),
+            ));
+        }
+        html.push_str("</tbody></table>");
+    }
+    html.push_str("<h2>In progress</h2>");
+    if active.is_empty() {
+        html.push_str("<p class=empty>No deployment is currently in progress.</p>");
+    }
+    for (project, row) in &active {
+        html.push_str(&format!(
+            "<article class=item><p>{attempt} <strong>{repo}</strong> → <span class=tag>{tier}</span> {environment}</p><p class=meta>{commit} · {host} · started {when} by {actor}</p></article>",
+            attempt = deployment_link(project, row), repo = escape(&row.repo), tier = escape(&row.tier),
+            environment = escape(&row.environment), commit = escape(&row.commit_sha[..12]),
+            host = escape(&row.host), when = escape(&ago(row.created_at)), actor = escape(&row.actor),
+        ));
+    }
+    html.push_str("<h2>Recent failures</h2>");
+    if failures.is_empty() {
+        html.push_str("<p class=empty>No failed or abandoned attempt is in the hot window.</p>");
+    }
+    for (project, row) in failures.iter().take(30) {
+        html.push_str(&format!(
+            "<article class=item><p>{attempt} <strong>{repo}</strong> <span class=\"status status-{status}\">{status}</span></p><p class=meta>{tier} · {environment} · phase {phase} · {when}</p><p class=body>{receipt}</p></article>",
+            attempt = deployment_link(project, row), repo = escape(&row.repo), status = escape(&row.status),
+            tier = escape(&row.tier), environment = escape(&row.environment),
+            phase = escape(row.phase.as_deref().unwrap_or("unknown")), when = escape(&ago(row.updated_at)),
+            receipt = escape(row.receipt.as_deref().unwrap_or("No receipt recorded.")),
+        ));
+    }
+    Ok(page("Deployments", &html))
+}
+
+fn deployment_detail(project: &str, id: &str) -> Result<String> {
+    let (_, store) = project_named(project)?;
+    let row = store.require_deployment(id)?;
+    let task = row
+        .task_id
+        .as_ref()
+        .map(|task| {
+            format!(
+                "<a href=\"/task/{}/{}\">{}</a>",
+                escape(&url_encode(project)),
+                escape(&url_encode(task)),
+                escape(task)
+            )
+        })
+        .unwrap_or_else(|| "—".to_owned());
+    let fields = [
+        ("Board", escape(project)),
+        ("Status", escape(&row.status)),
+        ("Repository", escape(&row.repo)),
+        (
+            "Commit",
+            format!("<code>{}</code>", escape(&row.commit_sha)),
+        ),
+        ("Branch", escape(row.branch.as_deref().unwrap_or("—"))),
+        ("Tier", escape(&row.tier)),
+        ("Environment", escape(&row.environment)),
+        ("Host", escape(&row.host)),
+        ("URL", escape(&row.url)),
+        ("Task", task),
+        ("Actor", escape(&row.actor)),
+        ("Lane", escape(row.lane.as_deref().unwrap_or("—"))),
+        ("Mechanism", escape(row.mechanism.as_deref().unwrap_or("—"))),
+        ("Retry of", escape(row.retry_of.as_deref().unwrap_or("—"))),
+        ("Phase", escape(row.phase.as_deref().unwrap_or("—"))),
+        (
+            "Served commit",
+            row.served_commit
+                .as_ref()
+                .map(|value| format!("<code>{}</code>", escape(value)))
+                .unwrap_or_else(|| "—".to_owned()),
+        ),
+        ("Started", escape(&stamp(row.created_at))),
+        (
+            "Completed",
+            row.completed_at
+                .map(|value| escape(&stamp(value)))
+                .unwrap_or_else(|| "—".to_owned()),
+        ),
+        (
+            "Archived",
+            if row.archived {
+                "yes".to_owned()
+            } else {
+                "no".to_owned()
+            },
+        ),
+    ];
+    let mut html = format!("<h1>Deployment <code>{}</code></h1><dl>", escape(&row.id));
+    for (label, value) in fields {
+        html.push_str(&format!("<dt>{}</dt><dd>{}</dd>", escape(label), value));
+    }
+    html.push_str("</dl><h2>Receipt</h2>");
+    html.push_str(&format!(
+        "<pre>{}</pre>",
+        escape(row.receipt.as_deref().unwrap_or("No terminal receipt yet."))
+    ));
+    if let Some(uri) = row.artifact_uri {
+        html.push_str(&format!(
+            "<p class=meta>Artifact: <code>{}</code></p>",
+            escape(&uri)
+        ));
+    }
+    Ok(page(&format!("Deployment {id}"), &html))
+}
+
 /// Every board at a glance — the `dashboard` projection, rendered.
 fn boards() -> Result<String> {
     let mut html = String::from(
@@ -1333,7 +1505,7 @@ fn page(title: &str, body: &str) -> String {
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
          <nav aria-label=Primary><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
          <div class=nav-links><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
-         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a></div>\
+         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a><a href=\"/deployments\">Deployments</a></div>\
          <form action=/search method=get><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
          </nav><main id=main>{body}</main>\
          <footer>live operator view · <code>kanban serve</code></footer>\
@@ -1500,7 +1672,7 @@ mod tests {
             .unwrap_or(SOURCE);
         // Every `&mut self` method on Store, which is the complete set of ways
         // this module could change a board.
-        const MUTATORS: [&str; 20] = [
+        const MUTATORS: [&str; 23] = [
             "add_task",
             "move_task",
             "remove_task",
@@ -1521,6 +1693,9 @@ mod tests {
             "advance_story",
             "sweep_expired_claims",
             "initialize",
+            "start_deployment",
+            "finish_deployment",
+            "abandon_deployment",
         ];
         for name in MUTATORS {
             if ALLOWED.contains(&name) {

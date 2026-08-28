@@ -526,6 +526,9 @@ kb ev --task <id> --all --json   # cold audit history for one task
 The sweep archives only settled rows older than the cutoff: `done`/`cancelled`
 tasks without a lease, their notes/checkpoints/tags/events, settled handoffs,
 resolved attention and linked sitreps. Old taskless settled records are included.
+It also archives terminal deployment attempts that are no longer the current
+verified success for their `(repo, tier, environment)`. Started attempts and
+each target's latest verified success always remain hot.
 Rows remain in the same backed-up SQLite board and `--all` reads them; nothing is
 deleted. Operational secondary indexes contain only `archived=0` rows, so their
 size follows current work rather than the board's lifetime.
@@ -533,6 +536,30 @@ size follows current work rather than the board's lifetime.
 Reads never run retention implicitly. The nightly backup timer explicitly sweeps
 every present registered board at 90 days before snapshotting it. `--dry-run`
 executes the real transaction, reports its counts, and rolls it back. See ADR-021.
+
+## Deployment attempts — exact release receipts
+
+```bash
+kb deploy start --repo OWNER/REPO --commit FULL_40_CHAR_SHA --tier @_p \
+  --environment production --host hax --url https://service.example \
+  --task TASK_ID --operation-id OPERATION_ID --as "$AGENT" --json
+
+kb deploy finish DEPLOYMENT_ID --token CAPABILITY_TOKEN --result succeeded \
+  --phase verification --served-commit FULL_40_CHAR_SHA \
+  --receipt "what was checked live" --as "$AGENT" --json
+
+kb deploy current --json
+kb deploy list --status failed --json
+kb deploy list --all --json
+```
+
+Canonical tiers are `@_bdt`, `@_bd`, `@_bst`, `@_bs`, `@_s`, `@_uat`, and
+`@_p`. Record the full pushed commit. `succeeded` is refused unless the served
+commit matches it exactly and the phase is `verification` with a non-empty live
+receipt. A retry starts a new row with `--retry-of`; never rewrite the old
+attempt. Keep the start receipt's capability token until finishing. Use
+`deploy abandon --token … --note …` when no failure was observed; `--force` is
+an explicit audited recovery override. See ADR-030.
 
 ## The web view
 
@@ -547,6 +574,8 @@ write is the Needs-you reply/resolve action, attributed to `geo`.
 - **Lanes** — the counterpart: what every lane last reported, newest first.
 - **Boards** — the `kb dash` projection as a table.
 - **Plans** — draft epics with their bodies, each naming the work it holds back.
+- **Deployments** — verified current releases, active attempts, recent failures,
+  and immutable per-attempt receipts; the existing WebSocket refresh keeps it live.
 - **Search** — cited exact, lexical, and semantic retrieval across every board.
 - **Task detail** — notes, checkpoints, the event trail, and the provenance of
   whoever holds it. Never the lease token: that is a capability, and a page that

@@ -793,6 +793,65 @@ ALTER TABLE events ADD COLUMN prev_hash TEXT;
 ALTER TABLE events ADD COLUMN event_hash TEXT;
 "#;
 
+/// Append-only deployment attempts and bounded hot projections (ADR-030).
+const BOARD_V19: &str = r#"
+CREATE TABLE IF NOT EXISTS deployments (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ repo TEXT NOT NULL,
+ commit_sha TEXT NOT NULL CHECK(length(commit_sha)=40 AND commit_sha NOT GLOB '*[^0-9a-f]*'),
+ branch TEXT,
+ tier TEXT NOT NULL CHECK(tier IN ('@_bdt','@_bd','@_bst','@_bs','@_s','@_uat','@_p')),
+ environment TEXT NOT NULL,
+ host TEXT NOT NULL,
+ url TEXT NOT NULL,
+ mechanism TEXT,
+ operation_id TEXT UNIQUE,
+ retry_of TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+ status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','cancelled','abandoned')),
+ phase TEXT CHECK(phase IS NULL OR phase IN ('build','publish','start','verification')),
+ actor TEXT NOT NULL,
+ lane TEXT,
+ capability_token TEXT NOT NULL UNIQUE,
+ receipt TEXT,
+ artifact_uri TEXT,
+ served_commit TEXT CHECK(served_commit IS NULL OR (length(served_commit)=40 AND served_commit NOT GLOB '*[^0-9a-f]*')),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ completed_at INTEGER,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ archived_at INTEGER,
+ CHECK(
+   (status='started' AND completed_at IS NULL)
+   OR
+   (status<>'started' AND completed_at IS NOT NULL)
+ ),
+ CHECK(status<>'succeeded' OR (phase='verification' AND receipt IS NOT NULL AND length(trim(receipt))>0 AND served_commit=commit_sha))
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_deployments_hot_target ON deployments(repo,tier,environment,created_at DESC,id) WHERE archived=0;
+CREATE INDEX IF NOT EXISTS idx_deployments_hot_status ON deployments(status,created_at DESC,id) WHERE archived=0;
+CREATE INDEX IF NOT EXISTS idx_deployments_task ON deployments(task_id,created_at DESC) WHERE archived=0;
+CREATE TRIGGER IF NOT EXISTS search_deployment_events_ai AFTER INSERT ON events
+WHEN new.kind IN ('deployment_started','deployment_finished','deployment_abandoned') BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT 'event',CAST(new.seq AS TEXT),d.task_id,'deployment: ' || d.id,
+        new.kind || char(10) || COALESCE(new.actor,'') || char(10) || new.payload,
+        d.status,d.lane,
+        COALESCE((SELECT group_concat(tag,' ') FROM
+          (SELECT tag FROM task_tags WHERE task_id=d.task_id AND archived=0 ORDER BY tag)),''),
+        new.created_at,d.updated_at,d.archived
+ FROM deployments d WHERE d.id=json_extract(new.payload,'$.deploymentID');
+END;
+CREATE TRIGGER IF NOT EXISTS search_deployments_au AFTER UPDATE ON deployments BEGIN
+ UPDATE search_documents SET status=new.status,lane=new.lane,updated_at=new.updated_at,archived=new.archived
+ WHERE source_kind='event' AND source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID')=new.id
+ );
+END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -933,7 +992,7 @@ ALTER TABLE rule_events ADD COLUMN prev_hash TEXT;
 ALTER TABLE rule_events ADD COLUMN event_hash TEXT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 18;
+pub const BOARD_SCHEMA_VERSION: usize = 19;
 pub const REGISTRY_SCHEMA_VERSION: usize = 10;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1130,7 +1189,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18,
+    BOARD_V18, BOARD_V19,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.

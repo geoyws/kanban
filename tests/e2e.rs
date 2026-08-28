@@ -275,9 +275,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 10);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 10);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 18);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 18);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 18);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 19);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 19);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 19);
 }
 
 #[test]
@@ -748,7 +748,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        18
+        19
     );
     assert_eq!(
         reopened
@@ -2019,7 +2019,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 18"),
+        version.contains("board schema 19"),
         "version output: {version}"
     );
     assert!(
@@ -4782,6 +4782,29 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         ],
     );
     let rule_id = rule["id"].as_str().unwrap().to_owned();
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban",
+            "--commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"].as_str().unwrap().to_owned();
     let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
         .as_str()
         .unwrap()
@@ -4802,6 +4825,9 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "rule list" => vec!["rule", "list"],
             "rule show" => vec!["rule", "show", &rule_id],
             "sitrep list" => vec!["sitrep", "list"],
+            "deploy show" => vec!["deploy", "show", &deployment_id],
+            "deploy list" => vec!["deploy", "list"],
+            "deploy current" => vec!["deploy", "current"],
             "schema" => vec!["schema"],
             "events" => vec!["events"],
             "stale" => vec!["stale"],
@@ -5904,7 +5930,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        18
+        19
     );
 }
 
@@ -6310,7 +6336,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        18
+        19
     );
     assert_eq!(
         connection
@@ -7582,6 +7608,51 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         ],
     );
 
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban",
+            "--commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--as",
+            "codex@driver",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &deployment_id,
+            "--token",
+            deployment["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--receipt",
+            "served bundle carried exact release",
+            "--as",
+            "codex@driver",
+            "--json",
+        ],
+    );
+
     // A port nobody else on the box is using, derived from this process so a
     // concurrent test run cannot collide with it.
     let port = 21000 + (std::process::id() % 4000) as u16;
@@ -7630,6 +7701,16 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     let (status, boards) = http_get(port, "/boards");
     assert_eq!(status, 200);
     assert!(boards.contains("SERVED"), "{boards}");
+
+    let (status, deployments) = http_get(port, "/deployments");
+    assert_eq!(status, 200, "{deployments}");
+    assert!(deployments.contains("Current releases"), "{deployments}");
+    assert!(deployments.contains("geoyws/kanban"), "{deployments}");
+    assert!(deployments.contains("aaaaaaaaaaaa"), "{deployments}");
+    let (status, deployment_detail) =
+        http_get(port, &format!("/deployment/SERVED/{deployment_id}"));
+    assert_eq!(status, 200, "{deployment_detail}");
+    assert!(deployment_detail.contains("served bundle carried exact release"));
 
     let (status, search) = http_get(port, "/search?q=migration");
     assert_eq!(status, 200, "{search}");
@@ -7791,6 +7872,8 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "/",
         "/boards",
         "/plans",
+        "/deployments",
+        &format!("/deployment/SERVED/{deployment_id}"),
         "/board/SERVED",
         "/task/SERVED/t-gated",
     ] {
@@ -9543,5 +9626,245 @@ fn compiled_binary_archives_settled_history_without_deleting_it() {
             |row| row.get(0),
         )
         .unwrap();
+    assert!(index_sql.contains("WHERE archived=0"));
+}
+
+#[test]
+fn compiled_binary_tracks_verified_deployments_and_self_archives_only_non_current_history() {
+    let fixture = Fixture::new("deployment-archive");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Deployments", "--json"]);
+
+    let start = |operation: &str, commit: &str| {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "deploy",
+                "start",
+                "--repo",
+                "geoyws/kanban",
+                "--commit",
+                commit,
+                "--tier",
+                "@_p",
+                "--environment",
+                "production",
+                "--host",
+                "hax",
+                "--url",
+                "https://kb.geoy.ws",
+                "--operation-id",
+                operation,
+                "--as",
+                "codex@e2e",
+                "--json",
+            ],
+        )
+    };
+    let first = start("deploy-e2e-1", "1111111111111111111111111111111111111111");
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &first_id,
+            "--token",
+            first["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            "1111111111111111111111111111111111111111",
+            "--receipt",
+            "served first",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+
+    let current = start("deploy-e2e-2", "2222222222222222222222222222222222222222");
+    let current_id = current["id"].as_str().unwrap().to_owned();
+    let mismatch = fixture.run(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &current_id,
+            "--token",
+            current["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            "3333333333333333333333333333333333333333",
+            "--receipt",
+            "mismatch",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    assert!(
+        !mismatch.status.success(),
+        "a mismatching served commit was accepted"
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &current_id,
+            "--token",
+            current["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            "2222222222222222222222222222222222222222",
+            "--receipt",
+            "served current",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    let replay = start("deploy-e2e-2", "2222222222222222222222222222222222222222");
+    assert_eq!(replay["id"], current_id);
+    assert_eq!(replay["idempotentReplay"], true);
+    assert_eq!(replay["capabilityToken"], current["capabilityToken"]);
+
+    let active = start(
+        "deploy-e2e-active",
+        "4444444444444444444444444444444444444444",
+    );
+    let active_id = active["id"].as_str().unwrap().to_owned();
+    let failed = start(
+        "deploy-e2e-failed",
+        "5555555555555555555555555555555555555555",
+    );
+    let failed_id = failed["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &failed_id,
+            "--token",
+            failed["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "failed",
+            "--phase",
+            "publish",
+            "--receipt",
+            "registry refused",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let database = Connection::open(&board).unwrap();
+    database.execute("UPDATE deployments SET created_at=1,updated_at=1,completed_at=CASE WHEN status='started' THEN NULL ELSE 1 END", []).unwrap();
+    database
+        .execute(
+            "UPDATE deployments SET created_at=2,updated_at=2,completed_at=2 WHERE id=?",
+            [&current_id],
+        )
+        .unwrap();
+
+    let projected = fixture.ok_json(&fixture.main, &["deploy", "current", "--json"]);
+    assert_eq!(projected.as_array().unwrap().len(), 1);
+    assert_eq!(projected[0]["id"], current_id);
+
+    let archived = fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "system@archive",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        archived["deployments"], 2,
+        "only superseded success and old failure should leave hot storage"
+    );
+    let hot = fixture.ok_json(&fixture.main, &["deploy", "list", "--json"]);
+    assert_eq!(hot.as_array().unwrap().len(), 2);
+    assert!(
+        hot.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == current_id && row["archived"] == false)
+    );
+    assert!(
+        hot.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == active_id && row["status"] == "started")
+    );
+    let all = fixture.ok_json(&fixture.main, &["deploy", "list", "--all", "--json"]);
+    assert_eq!(all.as_array().unwrap().len(), 4);
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == first_id && row["archived"] == true)
+    );
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == failed_id && row["archived"] == true)
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["search", &first_id, "--json"])["results"],
+        json!([]),
+        "archived deployment documents leaked into the hot search corpus"
+    );
+    let cold_search = fixture.ok_json(&fixture.main, &["search", &first_id, "--all", "--json"]);
+    assert!(
+        cold_search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["title"] == format!("deployment: {first_id}") && row["archived"] == true
+            })
+    );
+    let hot_search = fixture.ok_json(&fixture.main, &["search", &current_id, "--json"]);
+    assert!(hot_search["results"].as_array().unwrap().iter().any(|row| {
+        row["title"] == format!("deployment: {current_id}") && row["archived"] == false
+    }));
+
+    let repeated = fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "system@archive",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        repeated["deployments"], 0,
+        "the self-archive sweep must be idempotent"
+    );
+    let index_sql: String = database.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_deployments_hot_target'",
+        [], |row| row.get(0),
+    ).unwrap();
     assert!(index_sql.contains("WHERE archived=0"));
 }
