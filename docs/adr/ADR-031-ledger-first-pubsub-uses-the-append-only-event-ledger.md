@@ -43,11 +43,11 @@ For board scope, the bus is the board database's `events` table. For registry
 scope, the bus is the registry database's `rule_events` table. A subscriber is
 bound to exactly one scope at a time; there is no cross-board fan-in.
 
-The watch cursor is opaque. It binds the exact source, selector, kind, archive
-state, and last delivered `seq` together. Consumers persist that cursor and
-resume from the next ledger row after the last delivered one. Literal `0` is
-the only bootstrap cursor. Wall clock time, file mtime, WAL fingerprints, and
-payload hashes are not cursors.
+The watch cursor is opaque. It binds the exact source, selector, predicate set,
+archive state, and last consumed ledger `seq` together. Consumers persist the
+cursor from every event or advancing-heartbeat envelope and resume from the
+next ledger row. Literal `0` is the only bootstrap cursor. Wall clock time,
+file mtime, WAL fingerprints, and payload hashes are not cursors.
 
 Reusing a cursor against a different scope, selector, kind, archive state, or
 future sequence must fail closed rather than silently replaying the wrong
@@ -66,7 +66,11 @@ The contract is:
 
 ```text
 kb watch [--project NAME] [--task ID | --rule ID | --registry]
-         [--kind KIND]
+         [--kind KIND ...]
+         [--relation parent:ID|ancestor:ID|depends-on:ID ...]
+         [--prior-status STATUS ...]
+         [--current-status STATUS ...]
+         [--tag TAG ...]
          [--cursor CURSOR]
          [--follow]
          [--all]
@@ -77,44 +81,73 @@ kb watch [--project NAME] [--task ID | --rule ID | --registry]
 
 Semantics:
 
-- `--project` selects the addressed board. `--task` narrows the addressed
-  board's `events` trail to that task ID. `--rule` narrows the registry
+- Exactly one scope is active at a time. `--project` selects the addressed
+  board. `--task` is the subject selector. `--rule` narrows the registry
   `rule_events` trail to the selected rule ID. `--registry` selects the
-  registry trail directly. Exactly one of those scopes is active at a time.
-- Registry scope rejects board selectors and `--all`; board scope may include
-  archived history only where the underlying trail already supports it.
+  registry trail directly. There is no cross-board fan-in.
+- `--kind`, `--relation`, `--prior-status`, `--current-status`, and `--tag`
+  are repeatable predicates. `--relation` accepts typed forms `parent:ID`,
+  `ancestor:ID`, and `depends-on:ID`.
+- Values within one predicate family are ORed. Families are ANDed together.
+- The command normalizes the full predicate set before binding it to the
+  cursor. Reusing a cursor with any different normalized predicate set fails
+  closed.
+- Unknown task IDs, relation targets, kinds, statuses, or tags fail closed.
+- Removed subjects and historical relation targets remain replayable because
+  replay uses stored rows, not live lookups.
+- Registry scope supports `--kind` only and rejects board semantic predicates.
 - `--cursor` is the opaque resume point. Literal `0` is the only bootstrap
   cursor. The watcher replays rows with sequence numbers greater than the last
   delivered one and never writes the cursor itself.
-- The cursor is bound to the exact source, selector, kind, archive state, and
-  last delivered `seq`. Reusing a persisted cursor with a different source,
-  selector, kind, archive state, or future `seq` fails closed.
+- The cursor is bound to the exact source, selector, normalized predicate set,
+  archive state, and last consumed ledger `seq`. Reusing a persisted cursor with a
+  different source, selector, normalized predicate set, archive state, or
+  future `seq` fails closed.
 - `--follow` keeps the process open after replaying the backlog. Each poll
   reopens a read-only database transaction, reads the committed rows
   synchronously with no intermediate queue, and then closes before the next
   poll. The runtime requires `--limit` to be at least `1` whenever `--follow`
   is set, so `--follow --limit 0` fails.
 - `--limit` bounds replay work and must be within `0..1000` in every mode;
-  follow mode additionally rejects `0`.
+  follow mode additionally rejects `0`. Sparse filtering happens before
+  `--limit`, so the limit slices the filtered result set rather than the raw
+  rows.
 - `--db PATH` opens that exact database file rather than re-resolving a board.
 - `--json` is the machine contract. The stream stays NDJSON on stdout; errors
   and diagnostics belong on stderr.
+- Idle heartbeats do not advance the durable cursor. When predicates skip a
+  committed tail with no matching event, an `advanced` heartbeat moves the
+  opaque cursor to the last scanned row so follow mode does not rescan the same
+  unmatched rows forever.
 - Secrets are redacted recursively before payloads are emitted.
 
 Each delivery is an NDJSON envelope containing:
 
 - `version`, the stable pubsub protocol version, starting at integer `1`;
 - `scope`, naming the addressed board or registry trail;
-- `cursor`, the last delivered monotonic sequence number;
-- `type`, a stable tag such as `event`, `snapshot`, or `heartbeat`;
+- `cursor`, the last consumed monotonic ledger sequence number;
+- `type`, either `event` or `heartbeat`;
 - and `payload`, the underlying event JSON shape the current CLI already uses.
 
 Envelope readers must reject incompatible protocol versions and fail closed.
 The wire version does not track the changing binary release string.
 
-The event payload itself stays compatible with the existing JSON representation:
-`seq`, `taskID` where applicable, `kind`, `actor`, `payload`, `createdAt`,
-`archived`, `prevHash`, and `eventHash` remain the fields downstream code sees.
+The event payload is additive protocol-v1. The stored board event shape is
+stable, and the emitted payload carries:
+
+- `board`, a stable `{id, name?}` object for board scope and `null` for registry
+  scope;
+- `eventID` and `eventHash`;
+- `seq`, `timestamp`, `actor`, and `kind`;
+- `subject`;
+- typed `parent`, `ancestor`, and `depends-on` relations;
+- `priorStatus` and `currentStatus`;
+- sorted registered tags;
+- bounded recursively redacted metadata; and
+- explicit `null` semantic fields on legacy events.
+
+Stored board event payloads also carry private `_semanticV1`. It is
+hash-covered in the board ledger, but it is never emitted on the watch stream.
 
 ### 3. Replay, ordering, and liveness are ledger properties
 
@@ -148,6 +181,9 @@ implied later. The socket stays a notification channel and never becomes a
 second source of truth. Any cursor-driven replacement must preserve the current
 draft-reply suppression and the other interaction guards that prevent typing
 from being erased or replaced unexpectedly.
+
+The phase-1 compatibility wording above is historical. The canonical stream is
+protocol-v1, and `/live` stays compatibility invalidation only.
 
 ### 4. Slow consumers get bounded buffering, not hidden data loss
 
@@ -256,19 +292,22 @@ The implementation rollout should be staged:
 
 Release evidence should come from separate compiled processes, per
 [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md), and should prove
-all of the following. Exactly five compiled-process tests cover the watch
-contract:
+all of the following. The watch acceptance slice is coverage-driven, not
+count-driven:
 
 - replay from cursor `0` returns the full trail in ascending `seq` order;
 - resuming from a saved cursor returns only newer rows;
 - the board and registry scopes never cross;
-- a resumed cursor that presents the wrong scope or selector is rejected
-  rather than replayed under the wrong identity;
+- a resumed cursor that presents the wrong scope, selector, or normalized
+  predicate set is rejected rather than replayed under the wrong identity;
 - the follow loop reads one committed snapshot at a time and only observes
   rows after the read transaction that can see them has started;
 - archived rows appear only when explicitly requested;
 - the NDJSON stream is parseable as stdout output and each envelope carries the
   stable protocol `version`, `scope`, `cursor`, `type`, and `payload`;
+- the payload is additive protocol-v1, legacy rows emit explicit null semantic
+  fields, and `_semanticV1` never appears on stdout;
+- removed subjects and historical relation targets remain replayable;
 - incompatible envelope versions fail closed;
 - idle periods produce heartbeats;
 - and a slow consumer does not force writers to block or share a mutable queue

@@ -182,6 +182,9 @@ kb r new "Aix rule on two boards." --board crm-react --board pai-root --tag aix 
 kb r up r-12345678 --clear-tags --as geo
 ```
 
+Examples below use bare tag names in storage and CLI. Prose may render them as
+`:slug`. `@:team` stays atmux routing identity, not a tag.
+
 The first line is the headline. Every context packet, newly granted claim and
 accepted handoff carries the applicable active table of contents. Each compact
 summary has one `tags` array plus id, headline, byte size and whether more body
@@ -530,7 +533,8 @@ changes. It never sends board content, cookies, credentials or lease tokens, and
 it defers a refresh while a reply is being typed. The compatibility socket
 stays on `/live`; the canonical long-running subscription is `kb watch`, which
 reads the append-only ledgers directly and leaves `kb events` as the newest-
-first snapshot view.
+first snapshot view. `kb watch` uses the additive protocol-v1 envelope and the
+same fail-closed cursor rules described in ADR-031.
 
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google
