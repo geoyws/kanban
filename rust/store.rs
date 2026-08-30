@@ -1230,23 +1230,34 @@ impl Store {
         if !include_archived {
             sql.push_str(" AND archived=0");
         }
+        let semantic_payload = "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END";
         let semantic = !relations.is_empty()
             || !prior_statuses.is_empty()
             || !current_statuses.is_empty()
             || !tags.is_empty();
         if semantic {
-            sql.push_str(
-                " AND json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1')='object'",
-            );
+            sql.push_str(&format!(
+                " AND json_type({semantic_payload},'$._semanticV1')='object'"
+            ));
         }
         if !relations.is_empty() {
+            let semantic_relations = format!(
+                "CASE WHEN json_type({semantic_payload},'$._semanticV1.relations')='array' \
+                 THEN json_extract({semantic_payload},'$._semanticV1.relations') \
+                 ELSE '[]' END"
+            );
             let mut clauses = Vec::new();
             for relation in relations {
                 let Some((kind, id)) = relation.split_once(':') else {
                     sql.push_str(" AND 0");
                     continue;
                 };
-                clauses.push("EXISTS (SELECT 1 FROM json_each(json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.relations')) r WHERE json_extract(r.value,'$.kind')=? AND json_extract(r.value,'$.id')=?)");
+                clauses.push(format!(
+                    "EXISTS (SELECT 1 FROM json_each({semantic_relations}) r \
+                     WHERE r.type='object' \
+                       AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.kind')=? \
+                       AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.id')=?)"
+                ));
                 values.push(Box::new(kind.to_owned()));
                 values.push(Box::new(id.to_owned()));
             }
@@ -1272,7 +1283,9 @@ impl Store {
             );
         }
         if !current_statuses.is_empty() {
-            sql.push_str(" AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.currentStatus') IN (");
+            sql.push_str(&format!(
+                " AND json_extract({semantic_payload},'$._semanticV1.currentStatus') IN ("
+            ));
             sql.push_str(
                 &std::iter::repeat_n("?", current_statuses.len())
                     .collect::<Vec<_>>()
@@ -1287,7 +1300,14 @@ impl Store {
             );
         }
         if !tags.is_empty() {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.tags')) t WHERE t.value IN (");
+            let semantic_tags = format!(
+                "CASE WHEN json_type({semantic_payload},'$._semanticV1.tags')='array' \
+                 THEN json_extract({semantic_payload},'$._semanticV1.tags') \
+                 ELSE '[]' END"
+            );
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM json_each({semantic_tags}) t WHERE t.value IN ("
+            ));
             sql.push_str(
                 &std::iter::repeat_n("?", tags.len())
                     .collect::<Vec<_>>()
@@ -1358,8 +1378,9 @@ impl Store {
                                          ELSE '[]' END \
                                ELSE '[]' END\
                       ) relation \
-                 WHERE json_extract(relation.value,'$.kind')=?1 \
-                   AND json_extract(relation.value,'$.id')=?2\
+                 WHERE relation.type='object' \
+                   AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.kind')=?1 \
+                   AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.id')=?2\
              )",
             params![kind, id],
             |row| row.get::<_, i64>(0),
@@ -3949,16 +3970,26 @@ mod tests {
         );
         crate::audit::append_board_event(
             &store.connection,
-            Some("t-historical"),
+            Some("t-invalid-relations"),
             "task_removed",
             "test",
-            r#"{"_semanticV1":{"relations":[{"kind":"parent","type":"story","id":"s-historical"}]}}"#,
+            r#"{"_semanticV1":{"relations":["oops",42,null]}}"#,
             1,
         )
         .unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-historical"),
+            "task_removed",
+            "test",
+            r#"{"_semanticV1":{"relations":[{"kind":"parent","type":"story","id":"s-1"}]}}"#,
+            1,
+        )
+        .unwrap();
+        assert!(store.watch_relation_target_exists("parent", "s-1").unwrap());
         assert!(
-            store
-                .watch_relation_target_exists("parent", "s-historical")
+            !store
+                .watch_relation_target_exists("parent", "not-history")
                 .unwrap()
         );
         assert!(
@@ -3993,6 +4024,18 @@ mod tests {
             .execute_batch("PRAGMA ignore_check_constraints=OFF")
             .unwrap();
         append(
+            "wrong-relations",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":{"kind":"parent","type":"story","id":"s-1"},"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
+        );
+        append(
+            "wrong-tags",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[{"kind":"parent","type":"story","id":"s-1"}],"priorStatus":"todo","currentStatus":"done","tags":{"name":"infra"}}}"#,
+        );
+        append(
+            "wrong-relation-elements",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":["oops",42,null],"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
+        );
+        append(
             "wanted",
             r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[{"kind":"parent","type":"story","id":"s-1"}],"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
         );
@@ -4000,7 +4043,6 @@ mod tests {
             "other",
             r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[],"priorStatus":"todo","currentStatus":"review","tags":["docs"]}}"#,
         );
-        let kinds = vec!["malformed".to_owned(), "wanted".to_owned()];
         let relations = vec!["parent:s-1".to_owned()];
         let prior = vec!["todo".to_owned()];
         let current = vec!["done".to_owned()];
@@ -4008,7 +4050,13 @@ mod tests {
         let rows = store
             .events_since_filtered(
                 Some("gone-task"),
-                &kinds,
+                &[
+                    "malformed".to_owned(),
+                    "wrong-relations".to_owned(),
+                    "wrong-tags".to_owned(),
+                    "wrong-relation-elements".to_owned(),
+                    "wanted".to_owned(),
+                ],
                 &relations,
                 &prior,
                 &current,
@@ -4020,11 +4068,53 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "wanted");
+        assert_eq!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &[
+                        "wrong-relations".to_owned(),
+                        "wrong-relation-elements".to_owned(),
+                        "wanted".to_owned(),
+                    ],
+                    &relations,
+                    &prior,
+                    &current,
+                    &[],
+                    0,
+                    1,
+                    true,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec!["wanted".to_owned()]
+        );
+        assert_eq!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &["wrong-tags".to_owned(), "wanted".to_owned()],
+                    &[],
+                    &prior,
+                    &current,
+                    &tags,
+                    0,
+                    1,
+                    true,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec!["wanted".to_owned()]
+        );
         assert!(
             store
                 .events_since_filtered(
                     Some("gone-task"),
-                    &[],
+                    &["wrong-relations".to_owned(), "wanted".to_owned()],
                     &relations,
                     &[],
                     &[],
