@@ -103,9 +103,11 @@ error naming its candidates rather than a pick — per
 [ADR-008](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md).
 Because a candidate may now have no root to name, that error lists every root
 each candidate has, says plainly when a candidate has none, and keeps
-`--workspace` as the disambiguator for those that do. A rootless duplicate name
-is addressable only after a rename, which is the second reason renaming has to
-exist rather than being a convenience.
+`--workspace` as the disambiguator for those that do. The registry refuses to
+create a second active board with the same name; if a legacy duplicate still
+reaches `workspace attach --to NAME`, the attach path chooses the unique
+rootless candidate when exactly one exists and otherwise fails closed with the
+full candidate list.
 
 Explicitly not decided here: making board names unique. That would resolve
 duplicates by construction, but it is a separate change with its own migration
@@ -114,46 +116,38 @@ the meantime.
 
 ## Implementation status
 
-**Partial, 2026-08-28:** `kb doctor` now reports unreachable roots as advisory
-discovery hints without making an otherwise healthy registry fail. The board
-entity/schema migration and zero-root lifecycle below remain unimplemented.
+**Complete, 2026-08-30:** the registry now has explicit board identity
+separate from optional roots. `boards(board_path,name,created_at,last_used_at)`
+holds the board name once; `workspace_roots(root_path,board_path,...)` holds
+zero or more unordered discovery hints; `workspace_alias_history` continues to
+retain retired roots. Registry schema v11 migrates the legacy tables
+losslessly, including rootless boards, and records discarded alias-name drift
+in the registry audit chain as `workspace_alias_name_discarded`.
 
-The current binary still keys board identity to a canonical path everywhere
-else below. Completing this decision still requires changes to at least:
+Public projections no longer expose canonical privilege. `WorkspaceRecord`
+and `ProjectRecord` carry roots only as an unordered list, `doctor` reports
+rootless boards as healthy when their board files are healthy, the serve UI
+renders roots rather than a canonical root, and `init` requires an explicit
+name with `--rootless` for boards that start without a root.
 
-- `rust/db.rs:791-802` — `REGISTRY_V1`/`V2`: `workspaces.root_path` as PRIMARY
-  KEY with `board_path` UNIQUE, and `workspace_aliases` as the second-class
-  table. This is where a board with no root becomes unrepresentable.
-- `rust/registry.rs:198-249` — `Registry::register`: creates the board and its
-  privileged root in one insert, and renames whichever table the root sits in.
-- `rust/registry.rs:265-323` — `Registry::exact` / `resolve` /
-  `resolve_readonly`: two-table lookup that prefers `workspaces`, and the
-  upward walk that makes an enclosing board absorb a nested checkout.
-- `rust/registry.rs:325-354` — `Registry::attach`: copies the canonical name
-  into the alias row, which is the drift described above.
-- `rust/registry.rs:388-450` — `Registry::detach`: refuses a canonical root.
-- `rust/registry.rs:1132-1173` — `Registry::projects` / `by_name`: builds every
-  `ProjectRecord` from the `workspaces` table, so a board without a canonical
-  row would be invisible to `--project`.
-- `rust/registry.rs:1210-1275` — `unreachable_roots` / `repoint`: reports a
-  deleted root forever and refuses to repoint one that resolves nowhere.
-- `rust/lib.rs:1024-1043` and `rust/lib.rs:1140-1230` — `board_by_name`,
-  `store_path`, `store_path_readonly`: the ADR-007 chain, plus the duplicate-name
-  error that names `canonical_root`.
-- `rust/lib.rs:1397-1423` — `selected_board_name`: returns the per-root name
-  copy, so rule scoping follows the drifted alias.
-- `rust/lib.rs:1690-1705` — the `init` handler: the basename fallback that
-  named a board `root`.
-- `rust/lib.rs:1828-1829` — `doctor`: a single unreachable root makes the whole
-  registry report unhealthy, with no way to clear a deliberately deleted one.
-- `rust/model.rs:351-371` — `WorkspaceRecord.canonical` and
-  `ProjectRecord.canonical_root`: the public JSON that encodes the privilege.
-- `rust/serve.rs:990-998` — the web board header renders `canonical_root`.
-- `docs/PRD.md:39`, `README.md:255-275`, and
-  `docs/testing/compiled-rust-e2e-matrix.md:10` document the canonical-root
-  model and must move with it.
-- `tests/e2e.rs` around lines 6820-7025 assert the current semantics,
-  including that a canonical root cannot be detached.
+Implemented and covered in this batch:
+
+- `rust/db.rs` — schema v11 migration, alias-name-drift audit, and registry
+  schema version bump.
+- `rust/registry.rs` — board-name registration, rootless init, attach/detach,
+  name-based lookup, repoint, and project listing against `boards` plus
+  `workspace_roots`.
+- `rust/model.rs` — public record shapes without canonical fields.
+- `rust/lib.rs` — explicit-name init, rootless boards, ambiguity reporting,
+  doctor/dashboard projections, and the attach CLI accepting a registered
+  board name or path.
+- `rust/serve.rs` — board pages render roots, not canonical ownership.
+- `tests/e2e.rs` — schema migration, alias-name drift audit, rootless board
+  lifecycle, final-root retirement, attach/reuse, ambiguous naming with a
+  rootless candidate, doctor/dashboard public JSON, and rootless backup/restore
+  coverage.
+- `README.md`, `docs/PRD.md`, `docs/testing/compiled-rust-e2e-matrix.md`, and
+  `skills/kb/SKILL.md` — operator-facing workflow updates.
 
 ## Migration and compatibility
 

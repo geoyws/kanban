@@ -1,5 +1,5 @@
 use headless_chrome::{Browser, LaunchOptionsBuilder};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
@@ -71,6 +72,24 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn seed_legacy_rootless_duplicate(fixture: &Fixture, slug: &str, name: &str) {
+    let board_path = fixture.data.join("boards").join(format!("{slug}.db"));
+    fs::create_dir_all(board_path.parent().unwrap()).unwrap();
+    let _board = Connection::open(&board_path).unwrap();
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    registry
+        .execute(
+            "INSERT INTO boards(board_path,name,created_at,last_used_at) VALUES(?,?,?,?)",
+            params![
+                board_path.to_string_lossy().into_owned(),
+                name,
+                2_i64,
+                2_i64
+            ],
+        )
+        .unwrap();
 }
 
 struct ServerGuard {
@@ -195,6 +214,12 @@ fn launch_browser(chrome_path: PathBuf) -> Browser {
         .build()
         .expect("build Chrome launch options");
     Browser::new(options).expect("launch Chrome")
+}
+
+fn browser_loopback_reservation_supported() -> Result<(), String> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map(drop)
+        .map_err(|error| format!("reserve loopback port for browser tests: {error}"))
 }
 
 fn spawn_server(fixture: &Fixture) -> ServerGuard {
@@ -466,15 +491,65 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
         ],
     );
     let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    assert!(
+        !dashboard[0]
+            .as_object()
+            .unwrap()
+            .contains_key("canonicalRoot")
+    );
+    assert!(!dashboard[0].as_object().unwrap().contains_key("canonical"));
     assert_eq!(dashboard[0]["workspaceRoots"].as_array().unwrap().len(), 2);
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 10);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 10);
+    assert_eq!(doctor["registrySchemaVersion"], 11);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 11);
     assert_eq!(doctor["supportedBoardSchemaVersion"], 20);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 20);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 20);
+    assert_eq!(
+        doctor["projects"][0]["workspaceRoots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        !doctor["projects"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("canonicalRoot")
+    );
+    assert!(
+        !doctor["projects"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("canonical")
+    );
+    assert_eq!(doctor["projects"][0]["rootless"], false);
+}
+
+#[test]
+fn init_requires_an_explicit_board_name() {
+    let fixture = Fixture::new("init-name-required");
+    let failed = fixture.run(&fixture.main, &["init", "--json"]);
+    assert!(
+        !failed.status.success(),
+        "init without --name unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("--name"),
+        "stderr did not name the missing explicit board-name flag: {stderr}"
+    );
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["workspace", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a failed init without --name must not register a board"
+    );
 }
 
 #[test]
@@ -1188,6 +1263,63 @@ fn compiled_binary_allows_exactly_one_concurrent_claimer() {
         usize::from(first.status.success()) + usize::from(second.status.success()),
         1,
         "exactly one separate process must win the SQLite immediate transaction"
+    );
+}
+
+#[test]
+fn compiled_binary_rejects_two_simultaneous_init_attempts_with_the_same_name() {
+    let fixture = Fixture::new("atomic-init");
+    let first_cwd = fixture.root.join("same-first");
+    let second_cwd = fixture.root.join("same-second");
+    fs::create_dir_all(&first_cwd).unwrap();
+    fs::create_dir_all(&second_cwd).unwrap();
+
+    let outputs = std::thread::scope(|scope| {
+        let start = Arc::new(Barrier::new(3));
+        let first_start = Arc::clone(&start);
+        let fixture = &fixture;
+        let first_cwd = &first_cwd;
+        let second_cwd = &second_cwd;
+        let first = scope.spawn(move || {
+            first_start.wait();
+            fixture.run(first_cwd, &["init", "--name", "SAME", "--json"])
+        });
+        let second_start = Arc::clone(&start);
+        let second = scope.spawn(move || {
+            second_start.wait();
+            fixture.run(second_cwd, &["init", "--name", "SAME", "--json"])
+        });
+        start.wait();
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1,
+        "exactly one separate process must win the SQLite immediate transaction"
+    );
+    let refused = outputs
+        .iter()
+        .find(|output| !output.status.success())
+        .expect("one init attempt must refuse");
+    let refused_message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        refused_message.contains("a Kanban board is already named SAME"),
+        "{refused_message}"
+    );
+
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    let active_count = registry
+        .query_row("SELECT count(*) FROM boards WHERE name='SAME'", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(
+        active_count, 1,
+        "simultaneous init attempts must leave exactly one active board named SAME"
     );
 }
 
@@ -2172,7 +2304,6 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
         &beta,
         &["task", "add", "beta work", "--id", "t-beta", "--json"],
     );
-
     let ids = |value: &Value| -> Vec<String> {
         value
             .as_array()
@@ -2375,7 +2506,16 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
 
     // (8) Registry names are not unique. A duplicate must refuse and name the
     // candidate roots — picking one would corrupt the loser's work state.
-    fixture.ok_json(&alpha_twin, &["init", "--name", "Alpha", "--json"]);
+    seed_legacy_rootless_duplicate(&fixture, "alpha-twin", "Alpha");
+    let listed = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "Alpha" && row["rootless"] == true),
+        "workspace list omitted the rootless Alpha board: {listed}"
+    );
     let ambiguous = fixture.run(&outside, &["task", "list", "--project", "Alpha", "--json"]);
     assert!(
         !ambiguous.status.success(),
@@ -2388,9 +2528,113 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
     );
     assert!(
         ambiguous_message.contains(fixture.main.canonicalize().unwrap().to_str().unwrap())
-            && ambiguous_message.contains(alpha_twin.canonicalize().unwrap().to_str().unwrap()),
+            && ambiguous_message.contains("Alpha (rootless)"),
         "{ambiguous_message}"
     );
+
+    let second_rootless = fixture.root.join("alpha-rootless-two");
+    fs::create_dir_all(&second_rootless).unwrap();
+    let refused = fixture.run(
+        &second_rootless,
+        &["init", "--name", "Alpha", "--rootless", "--json"],
+    );
+    assert!(
+        !refused.status.success(),
+        "a second active rootless Alpha board was accepted"
+    );
+    let refused_message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        refused_message.contains("a Kanban board is already named Alpha"),
+        "{refused_message}"
+    );
+
+    let attach = fixture.root.join("alpha-attach");
+    fs::create_dir_all(&attach).unwrap();
+    let attached = fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "attach",
+            "--workspace",
+            "../alpha-attach",
+            "--to",
+            "Alpha",
+            "--json",
+        ],
+    );
+    let attached_root = attach
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let rootless_board_path = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Alpha" && row["rootless"] == true)
+        .expect("rootless Alpha row")["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        attached["boardPath"], rootless_board_path,
+        "name-based attach should choose the unique rootless board"
+    );
+    let attached_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    let attached_row = attached_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rootPath"] == attached_root)
+        .expect("attached root missing from workspace list");
+    assert_eq!(attached_row["boardPath"], rootless_board_path);
+    assert_eq!(attached_row["rootless"], false);
+
+    // (9) Path-like attach targets stay path-like, even when they look short.
+    let dot_attach = fixture.root.join("alpha-dot-attach");
+    fs::create_dir_all(&dot_attach).unwrap();
+    let rooted_root = fixture
+        .main
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let rooted_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    let rooted_board_path = rooted_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rootPath"] == rooted_root)
+        .expect("rooted board missing from workspace list")["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dot = fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "attach",
+            "--workspace",
+            "../alpha-dot-attach",
+            "--to",
+            ".",
+            "--json",
+        ],
+    );
+    assert_eq!(dot["boardPath"], rooted_board_path);
+    let dot_root = dot_attach
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let dot_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    let dot_row = dot_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rootPath"] == dot_root)
+        .expect("dot-attached root missing from workspace list");
+    assert_eq!(dot_row["boardPath"], rooted_board_path);
 
     // (9) --workspace still disambiguates what the name cannot.
     assert_eq!(
@@ -2405,6 +2649,83 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
             ]
         )),
         vec!["t-alpha".to_owned()]
+    );
+}
+
+#[test]
+fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
+    let fixture = Fixture::new("rootless-doctor-repoint");
+    let rootless = fixture.root.join("rootless");
+    fs::create_dir_all(&rootless).unwrap();
+
+    fixture.ok_json(
+        &rootless,
+        &["init", "--name", "ROOTLESS", "--rootless", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "task",
+            "add",
+            "Rootless work",
+            "--id",
+            "t-rootless",
+            "--project",
+            "ROOTLESS",
+            "--json",
+        ],
+    );
+
+    let listed = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "ROOTLESS" && row["rootless"] == true),
+        "workspace list omitted the healthy rootless board: {listed}"
+    );
+
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        doctor["unreachableRoots"].as_array().unwrap().is_empty(),
+        "doctor should not report a healthy rootless board as an unreachable root: {doctor}"
+    );
+    let project = doctor["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ROOTLESS")
+        .expect("rootless project missing from doctor");
+    assert_eq!(project["rootless"], true);
+    assert!(
+        project["workspaceRoots"].as_array().unwrap().is_empty(),
+        "the rootless board should remain rootless in doctor output"
+    );
+
+    let tasks = fixture.ok_json(
+        &fixture.root,
+        &["task", "list", "--project", "ROOTLESS", "--json"],
+    );
+    assert_eq!(
+        tasks.as_array().unwrap().len(),
+        1,
+        "the healthy rootless board should remain addressable by name"
+    );
+    assert_eq!(tasks[0]["id"], "t-rootless");
+
+    let repoint = fixture.run(
+        &fixture.main,
+        &["workspace", "repoint", "--root", "", "--json"],
+    );
+    assert!(
+        !repoint.status.success(),
+        "an empty root was accepted as a repoint candidate"
+    );
+    let repoint_message = String::from_utf8_lossy(&repoint.stderr);
+    assert!(
+        repoint_message.contains("not a registered root that needs repointing"),
+        "{repoint_message}"
     );
 }
 
@@ -2500,7 +2821,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 10"),
+        version.contains("registry schema 11"),
         "version output: {version}"
     );
 }
@@ -3331,6 +3652,85 @@ fn compiled_binary_restores_a_snapshot_over_destroyed_work_state() {
         fixture.ok_json(&fixture.main, &["task", "show", "t-keep", "--json"])["title"],
         "real work",
         "a refused restore must leave live state untouched"
+    );
+}
+
+#[test]
+fn compiled_binary_restores_a_rootless_board_snapshot_and_keeps_name_addressing() {
+    let fixture = Fixture::new("restore-rootless");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "ROOTLESS", "--rootless", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "rootless work",
+            "--id",
+            "t-rootless",
+            "--project",
+            "ROOTLESS",
+            "--json",
+        ],
+    );
+
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let attach = fixture.root.join("attach-rootless");
+    fs::create_dir_all(&attach).unwrap();
+    fixture.ok_json(
+        &attach,
+        &["workspace", "attach", "--to", "ROOTLESS", "--json"],
+    );
+
+    let attached = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    let attached_board = attached
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|board| board["name"] == "ROOTLESS")
+        .expect("the attached board must be listed");
+    assert_eq!(
+        attached_board["workspaceRoots"].as_array().unwrap().len(),
+        1
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+
+    let restored = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    let restored_board = restored
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|board| board["name"] == "ROOTLESS")
+        .expect("the restored board must be listed");
+    assert!(
+        restored_board["workspaceRoots"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "show",
+                "t-rootless",
+                "--project",
+                "ROOTLESS",
+                "--json"
+            ]
+        )["id"],
+        "t-rootless"
     );
 }
 
@@ -7593,6 +7993,11 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
     fs::create_dir_all(&lane).unwrap();
 
     fixture.ok_json(&original, &["init", "--name", "MOVED", "--json"]);
+    let board_path =
+        fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+            .as_str()
+            .unwrap()
+            .to_owned();
     fixture.ok_json(
         &lane,
         &[
@@ -7645,8 +8050,8 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
     );
     let project_root = roots
         .iter()
-        .find(|item| item["canonical"] == true)
-        .expect("the canonical root must be named");
+        .find(|item| item["boardPath"] == board_path)
+        .expect("the project root must be named");
     assert_eq!(project_root["name"], "MOVED");
     assert_eq!(
         project_root["resolvesTo"],
@@ -7708,7 +8113,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     fs::create_dir_all(&retired).unwrap();
 
     let registered = fixture.ok_json(&project, &["init", "--name", "DETACH", "--json"]);
-    let project_root = registered["rootPath"]
+    let project_root = registered["workspaceRoots"][0]
         .as_str()
         .expect("registered project root")
         .to_owned();
@@ -7739,7 +8144,6 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
         ],
     );
     assert_eq!(detached["rootPath"], retired_root);
-    assert_eq!(detached["canonical"], false);
     assert_eq!(detached["archived"], true);
     assert_eq!(detached["archivedBy"], "geo");
     assert!(detached["archivedAt"].as_i64().is_some());
@@ -7783,7 +8187,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             .is_empty()
     );
 
-    let canonical = fixture.run(
+    let detached_root = fixture.ok_json(
         &fixture.root,
         &[
             "workspace",
@@ -7795,8 +8199,31 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "--json",
         ],
     );
-    assert!(!canonical.status.success());
-    assert!(String::from_utf8_lossy(&canonical.stderr).contains("canonical project root"));
+    assert_eq!(detached_root["rootPath"], project_root);
+    assert_eq!(detached_root["archived"], true);
+    assert_eq!(detached_root["archivedBy"], "geo");
+    let doctor = fixture.ok_json(&fixture.root, &["doctor", "--json"]);
+    let detached_project = doctor["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "DETACH")
+        .expect("the detached board must still be listed");
+    assert_eq!(detached_project["rootless"], true);
+    assert!(
+        detached_project["workspaceRoots"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.root,
+            &["task", "show", "t-kept", "--project", "DETACH", "--json"]
+        )["id"],
+        "t-kept",
+        "a board with no roots must remain reachable by name"
+    );
 
     let twice = fixture.run(
         &fixture.root,
@@ -7818,7 +8245,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     fs::create_dir_all(&retired).unwrap();
     let reattached = fixture.ok_json(
         &retired,
-        &["workspace", "attach", "--to", &project_root, "--json"],
+        &["workspace", "attach", "--to", "DETACH", "--json"],
     );
     assert_eq!(reattached["rootPath"], retired_root);
     assert_eq!(reattached["archived"], false);
@@ -7927,6 +8354,8 @@ fn read_ws_text(stream: &mut std::net::TcpStream) -> String {
 
 #[test]
 fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
     // Approvals are the bottleneck, and settling one meant being at a terminal
     // with the right board addressed. This is the page that answers "what is
     // waiting on me" across every board at once. Phase 1 is read-only, and the
@@ -8346,6 +8775,8 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
 
 #[test]
 fn priority_orders_cli_dashboard_and_web_queues_before_age() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
     let fixture = Fixture::new("priority-queues");
     fixture.ok_json(
         &fixture.main,
@@ -8480,8 +8911,25 @@ fn priority_orders_cli_dashboard_and_web_queues_before_age() {
 }
 
 #[test]
+fn served_board_pages_fail_closed_on_duplicate_names() {
+    let fixture = Fixture::new("serve-board-duplicate");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    seed_legacy_rootless_duplicate(&fixture, "alpha-rootless", "Alpha");
+
+    let server = spawn_server(&fixture);
+    let port = server.port;
+    let (status, page) = http_get(port, "/board/Alpha");
+    assert_eq!(status, 500, "{page}");
+    assert!(page.contains("2 Kanban projects are named Alpha"), "{page}");
+    assert!(page.contains("Alpha (rootless)"), "{page}");
+}
+
+#[test]
 fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     use std::net::TcpStream;
+
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
 
     let fixture = Fixture::new("serve-reply-live");
     fixture.ok_json(&fixture.main, &["init", "--name", "SERVEWRITE", "--json"]);
@@ -8781,6 +9229,8 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
 
 #[test]
 fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
     let fixture = Fixture::new("serve-browser");
     fixture.ok_json(
         &fixture.main,
@@ -9830,6 +10280,80 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
 }
 
 #[test]
+fn registry_rejects_duplicate_names_before_creating_a_new_board() {
+    let fixture = Fixture::new("board-name-uniqueness");
+
+    let omega_root = fixture.root.join("omega-rooted");
+    fs::create_dir_all(&omega_root).unwrap();
+    fixture.ok_json(&omega_root, &["init", "--name", "OMEGA", "--json"]);
+    let omega_root_str = omega_root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let omega_rootless = fixture.root.join("omega-rootless");
+    fs::create_dir_all(&omega_rootless).unwrap();
+    let rooted_then_rootless = fixture.run(
+        &omega_rootless,
+        &["init", "--name", "OMEGA", "--rootless", "--json"],
+    );
+    assert!(
+        !rooted_then_rootless.status.success(),
+        "a rootless OMEGA board was created beside the rooted one"
+    );
+    let rooted_then_rootless_message =
+        String::from_utf8_lossy(&rooted_then_rootless.stderr).into_owned();
+    assert!(
+        rooted_then_rootless_message.contains("a Kanban board is already named OMEGA"),
+        "{rooted_then_rootless_message}"
+    );
+
+    let detached = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            omega_root_str.as_str(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(detached["rootPath"], omega_root_str);
+    let omega_rows = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        omega_rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "OMEGA" && row["rootless"] == true),
+        "detaching the last root should keep the unique board reachable by name: {omega_rows}"
+    );
+
+    let sigma_rootless = fixture.root.join("sigma-rootless");
+    fs::create_dir_all(&sigma_rootless).unwrap();
+    fixture.ok_json(
+        &sigma_rootless,
+        &["init", "--name", "SIGMA", "--rootless", "--json"],
+    );
+    let sigma_rooted = fixture.root.join("sigma-rooted");
+    fs::create_dir_all(&sigma_rooted).unwrap();
+    let rootless_then_rooted = fixture.run(&sigma_rooted, &["init", "--name", "SIGMA", "--json"]);
+    assert!(
+        !rootless_then_rooted.status.success(),
+        "a rooted SIGMA board was created beside the rootless one"
+    );
+    let rootless_then_rooted_message =
+        String::from_utf8_lossy(&rootless_then_rooted.stderr).into_owned();
+    assert!(
+        rootless_then_rooted_message.contains("a Kanban board is already named SIGMA"),
+        "{rootless_then_rooted_message}"
+    );
+}
+
+#[test]
 fn registry_v3_rules_migrate_to_the_unified_all_tag() {
     let fixture = Fixture::new("global-rule-target-migration");
     fs::create_dir_all(&fixture.data).unwrap();
@@ -9871,7 +10395,362 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
+    );
+}
+
+#[test]
+fn registry_v10_migration_records_discarded_alias_names() {
+    let fixture = Fixture::new("rootless-name-drift");
+    fs::create_dir_all(&fixture.data).unwrap();
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    registry
+        .execute_batch(
+            r#"
+            CREATE TABLE registry_meta (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL) STRICT;
+            CREATE TABLE workspaces (
+             root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
+             created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE TABLE workspace_aliases (
+             root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_workspace_aliases_board ON workspace_aliases(board_path);
+            CREATE TABLE workspace_alias_history (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             root_path TEXT NOT NULL,
+             name TEXT NOT NULL,
+             board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL,
+             archived_at INTEGER NOT NULL,
+             archived_by TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
+            CREATE TABLE rule_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             actor TEXT NOT NULL,
+             payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+             created_at INTEGER NOT NULL,
+             prev_hash TEXT,
+             event_hash TEXT
+            ) STRICT;
+            CREATE INDEX idx_registry_rule_events_rule_seq ON rule_events(rule_id,seq);
+            INSERT INTO workspaces VALUES('/workspace/alpha','Alpha','/boards/alpha.db',10,20);
+            INSERT INTO workspace_aliases VALUES('/workspace/alpha/alias','Beta','/boards/alpha.db',30,40);
+            PRAGMA user_version=10;
+            "#,
+        )
+        .unwrap();
+    drop(registry);
+
+    fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    assert_eq!(
+        registry
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        11
+    );
+    let (kind, actor, payload): (String, String, String) = registry
+        .query_row(
+            "SELECT kind,actor,payload FROM rule_events WHERE kind='workspace_alias_name_discarded'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, "workspace_alias_name_discarded");
+    assert_eq!(actor, "system@migration");
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["discardedName"], "Beta");
+    assert_eq!(payload["boardName"], "Alpha");
+    assert_eq!(payload["rootPath"], "/workspace/alpha/alias");
+    assert_eq!(payload["boardPath"], "/boards/alpha.db");
+}
+
+#[test]
+fn registry_v10_migration_records_discarded_alias_names_once_across_competing_processes() {
+    let fixture = Fixture::new("rootless-name-drift-race");
+    fs::create_dir_all(&fixture.data).unwrap();
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    registry
+        .execute_batch(
+            r#"
+            CREATE TABLE registry_meta (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL) STRICT;
+            CREATE TABLE workspaces (
+             root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
+             created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE TABLE workspace_aliases (
+             root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_workspace_aliases_board ON workspace_aliases(board_path);
+            CREATE TABLE workspace_alias_history (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             root_path TEXT NOT NULL,
+             name TEXT NOT NULL,
+             board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL,
+             archived_at INTEGER NOT NULL,
+             archived_by TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
+            CREATE TABLE rule_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             actor TEXT NOT NULL,
+             payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+             created_at INTEGER NOT NULL,
+             prev_hash TEXT,
+             event_hash TEXT
+            ) STRICT;
+            CREATE INDEX idx_registry_rule_events_rule_seq ON rule_events(rule_id,seq);
+            INSERT INTO workspaces VALUES('/workspace/alpha','Alpha','/boards/alpha.db',10,20);
+            INSERT INTO workspace_aliases VALUES('/workspace/alpha/alias','Beta','/boards/alpha.db',30,40);
+            PRAGMA user_version=10;
+            "#,
+        )
+        .unwrap();
+    drop(registry);
+
+    fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    registry
+        .execute_batch(
+            r#"
+            DELETE FROM registry_meta
+            WHERE key='workspace_root_model_v11_name_drift_audited';
+            DELETE FROM rule_events
+            WHERE kind='workspace_alias_name_discarded';
+            "#,
+        )
+        .unwrap();
+    drop(registry);
+
+    let outputs = std::thread::scope(|scope| {
+        let start = Arc::new(Barrier::new(3));
+        let fixture = &fixture;
+
+        let first_start = Arc::clone(&start);
+        let first = scope.spawn(move || {
+            first_start.wait();
+            fixture.run(&fixture.main, &["workspace", "list", "--json"])
+        });
+
+        let second_start = Arc::clone(&start);
+        let second = scope.spawn(move || {
+            second_start.wait();
+            fixture.run(&fixture.main, &["workspace", "list", "--json"])
+        });
+
+        start.wait();
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+
+    assert!(
+        outputs.iter().all(|output| output.status.success()),
+        "both concurrent opens must succeed: first={:?}\nsecond={:?}",
+        outputs[0],
+        outputs[1]
+    );
+
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    let marker_count = registry
+        .query_row(
+            "SELECT count(*) FROM registry_meta WHERE key='workspace_root_model_v11_name_drift_audited'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(marker_count, 1, "the drift marker must be written once");
+    let event_count = registry
+        .query_row(
+            "SELECT count(*) FROM rule_events WHERE kind='workspace_alias_name_discarded'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1, "the drift event must be written once");
+}
+
+#[test]
+fn registry_rejects_last_root_detach_for_legacy_duplicate_names() {
+    let fixture = Fixture::new("rootless-duplicate-name-detach");
+    fs::create_dir_all(&fixture.data).unwrap();
+
+    let omega_left = fixture.root.join("omega-left");
+    let omega_right = fixture.root.join("omega-right");
+    let sigma_root = fixture.root.join("sigma-root");
+    for dir in [&omega_left, &omega_right, &sigma_root] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let omega_left_root = omega_left
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let omega_right_root = omega_right
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let sigma_root_path = sigma_root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    registry
+        .execute_batch(
+            format!(
+                r#"
+            CREATE TABLE registry_meta (key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL) STRICT;
+            CREATE TABLE workspaces (
+             root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
+             created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE TABLE workspace_aliases (
+             root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_workspace_aliases_board ON workspace_aliases(board_path);
+            CREATE TABLE workspace_alias_history (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             root_path TEXT NOT NULL,
+             name TEXT NOT NULL,
+             board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL,
+             archived_at INTEGER NOT NULL,
+             archived_by TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_workspace_alias_history_root ON workspace_alias_history(root_path,seq);
+            CREATE TABLE boards (
+             board_path TEXT PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL
+            ) STRICT;
+            CREATE INDEX idx_boards_name ON boards(name,board_path);
+            CREATE TABLE workspace_roots (
+             root_path TEXT PRIMARY KEY NOT NULL,
+             board_path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL,
+             FOREIGN KEY(board_path) REFERENCES boards(board_path)
+            ) STRICT;
+            CREATE INDEX idx_workspace_roots_board ON workspace_roots(board_path,last_used_at DESC);
+            CREATE TABLE rule_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             actor TEXT NOT NULL,
+             payload TEXT NOT NULL DEFAULT '{{}}' CHECK(json_valid(payload)),
+             created_at INTEGER NOT NULL,
+             prev_hash TEXT,
+             event_hash TEXT
+            ) STRICT;
+            CREATE INDEX idx_registry_rule_events_rule_seq ON rule_events(rule_id,seq);
+            INSERT INTO workspaces VALUES('{omega_left_root}','OMEGA','/boards/omega-left.db',10,20);
+            INSERT INTO workspaces VALUES('{omega_right_root}','OMEGA','/boards/omega-right.db',30,40);
+            INSERT INTO workspaces VALUES('{sigma_root_path}','SIGMA','/boards/sigma.db',50,60);
+            INSERT INTO boards VALUES('/boards/omega-left.db','OMEGA',10,20);
+            INSERT INTO boards VALUES('/boards/omega-right.db','OMEGA',30,40);
+            INSERT INTO boards VALUES('/boards/sigma.db','SIGMA',50,60);
+            INSERT INTO workspace_roots VALUES('{omega_left_root}','/boards/omega-left.db',10,20);
+            INSERT INTO workspace_roots VALUES('{omega_right_root}','/boards/omega-right.db',30,40);
+            INSERT INTO workspace_roots VALUES('{sigma_root_path}','/boards/sigma.db',50,60);
+            PRAGMA user_version=11;
+            "#
+            )
+            .as_str(),
+        )
+        .unwrap();
+    drop(registry);
+
+    let before = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert_eq!(before.as_array().unwrap().len(), 3);
+
+    let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+    assert_eq!(
+        registry
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='workspace_alias_history'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the archive table is missing from the hybrid fixture"
+    );
+    assert_eq!(
+        registry
+            .query_row(
+                "SELECT count(*) FROM workspace_roots WHERE root_path=?",
+                [sigma_root_path.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the migrated unique root was not registered"
+    );
+
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            &omega_left_root,
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "detaching a legacy duplicate-name root was accepted"
+    );
+    let refused_message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        refused_message.contains("would create a second active board named OMEGA"),
+        "{refused_message}"
+    );
+
+    let after = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert_eq!(after, before, "the rejected detach changed registry state");
+
+    let detached = fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            &sigma_root_path,
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(detached["rootPath"], sigma_root_path);
+    assert_eq!(detached["archived"], true);
+
+    let sigma_rows = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        sigma_rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "SIGMA" && row["rootless"] == true),
+        "detaching the unique board's last root should leave it rootless: {sigma_rows}"
     );
 }
 
@@ -9890,7 +10769,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     let board_path = |name: &str| {
         registry
             .query_row(
-                "SELECT board_path FROM workspaces WHERE name=?",
+                "SELECT board_path FROM boards WHERE name=?",
                 [name],
                 |row| row.get::<_, String>(0),
             )
@@ -10045,7 +10924,7 @@ fn unified_rules_are_stored_once_and_frame_every_board_claim_and_context() {
     let registry_path = fixture.data.join("registry.db");
     let registry = Connection::open(&registry_path).unwrap();
     let board_paths = registry
-        .prepare("SELECT board_path FROM workspaces ORDER BY name")
+        .prepare("SELECT board_path FROM boards ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()

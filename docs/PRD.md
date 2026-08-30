@@ -36,9 +36,9 @@ and transfer work to a replacement agent when context or tokens run low.
 
 ### Register a project and its worktrees
 
-The operator initializes one canonical project root. Additional worktree roots
-attach to that project and resolve to the same board. Registration is explicit
-and reversible; no filesystem crawl is required.
+The operator initializes a board with an explicit name. A root is optional and
+attached as a discovery hint, and additional worktree roots can join later.
+Registration is explicit and reversible; no filesystem crawl is required.
 
 ### Plan and execute work
 

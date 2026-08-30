@@ -153,16 +153,17 @@ the receipt would say which was used.
 not a second request. With none of them, the board is the one containing the
 working directory.
 
-Roots are optional discovery hints, not board identity. The same repository may
-appear at several paths (including as submodules in several projects), and a
-board remains authoritative and fully usable through `--project NAME` when any
-or every registered root is absent. Do not infer board identity from `TODO.md`,
-`HANDOFF.md`, a checkout basename, or a privileged "canonical" root. Prefer an
-explicit project selector whenever the directory is ambiguous.
+The board name is identity; roots are optional discovery hints. The same
+repository may appear at several paths (including as submodules in several
+projects), and a board remains authoritative and fully usable through
+`--project NAME` when any or every registered root is absent. Rootless boards
+are valid. Do not infer board identity from `TODO.md`, `HANDOFF.md`, a checkout
+basename, or a privileged "canonical" root. Prefer an explicit project
+selector whenever the directory is ambiguous.
 
 ```bash
 kb ws ls --json                 # every registered project and its board path
-kb init --name NAME             # register the current directory
+kb init --name NAME [--workspace PATH] [--rootless]   # register a board by name
 kb ws det --root /retired/worktree --as "$AGENT" --json
 kb ws ls --all --json           # including detached aliases
 ```

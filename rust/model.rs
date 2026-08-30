@@ -94,7 +94,6 @@ pub struct UnreachableRoot {
     pub board_path: String,
     /// Where the stored path leads today, or `None` when nothing is there.
     pub resolves_to: Option<String>,
-    pub canonical: bool,
 }
 
 /// Where a lane stands, written by whoever is working it.
@@ -354,12 +353,12 @@ pub struct WorkspaceRecord {
     pub root_path: String,
     pub name: String,
     pub board_path: String,
-    pub canonical: bool,
     pub created_at: i64,
     pub last_used_at: i64,
     pub archived: bool,
     pub archived_at: Option<i64>,
     pub archived_by: Option<String>,
+    pub rootless: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,7 +366,6 @@ pub struct WorkspaceRecord {
 pub struct ProjectRecord {
     pub name: String,
     pub board_path: String,
-    pub canonical_root: String,
     pub workspace_roots: Vec<String>,
     pub last_used_at: i64,
 }

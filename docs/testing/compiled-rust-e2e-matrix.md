@@ -7,14 +7,14 @@ The release gate runs `cargo test --test e2e` after Cargo builds the production
 | Requirement | Process-boundary evidence |
 | --- | --- |
 | SQLite persistence and restart | Separate `init`, `task add`, `note`, `claim`, `handoff`, `context`, and `checkpoint` processes reopen the same board. |
-| Multiple worktrees | A second directory attaches to the canonical project and reads/writes the same board; dashboard reports both roots. |
+| Multiple worktrees | A second directory attaches to a named board and reads/writes the same board; `workspace list` includes rootless boards and dashboard reports the roots as hints. |
 | Atomic ownership | Two compiled processes race to claim one task; exactly one exit status may succeed. |
 | Token-pressure handoff | The outgoing process creates the structured handoff, releases its lease, and an incoming process accepts with a different token. |
 | Stale-token exclusion | The outgoing token is used for a post-handoff heartbeat and must fail. |
 | Secret-safe read models | `task show` and rendered context are checked for both the literal token and the `leaseToken` field name. |
 | atmux JSON import | A real source file containing epic, story, and task hierarchy is imported through the compiled CLI and the parent link is read back. |
 | atmux SQLite import | A real legacy SQLite database is created and imported by a separate CLI process; duplicate insert-only import is rejected, then explicit reconciliation refreshes the existing rows and reports created/updated counts. |
-| Operations | Dashboard counts, `doctor` integrity, multi-board backup, and reopening a copied board through `--db` are exercised. |
+| Operations | Dashboard counts, `doctor` integrity and rootless advisory reporting, multi-board backup, rootless restore, and reopening a copied board through `--db` are exercised. |
 | Audit safety | Separate compiled processes create board and registry history, verify clean chains, and then reject edited, deleted and reordered event rows. Manifested backup/restore tests reject a substituted database, preserve a manifested rescue snapshot, keep archive continuity, and detect an intact older database against a retained newer anchor. |
 | Existing-format compatibility | The binary opens a separately created `user_version=3` database matching the released TypeScript task schema without migration/export. |
 | Pull routing and task graph | Separate CLI processes exercise `claim --next`, priority/dependency readiness, lane preference, role filtering, driver scope, assignee gates, and cycle rejection. |

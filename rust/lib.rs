@@ -30,9 +30,9 @@ const HELP: &str = r#"kanban — durable work ledger for agents (Rust)
 
 Usage:
   kanban version
-  kanban init [--name NAME] [--workspace PATH] [--force] [--as ACTOR]
+  kanban init --name NAME [--workspace PATH] [--rootless] [--force] [--as ACTOR]
   kanban workspace list [--all] [--json]
-  kanban workspace attach --to REGISTERED_PATH [--workspace PATH] [--as ACTOR]
+  kanban workspace attach --to NAME|REGISTERED_PATH [--workspace PATH] [--as ACTOR]
   kanban workspace detach --root REGISTERED_PATH --as ACTOR
   kanban workspace repoint [--root PATH] [--as ACTOR] [--json]
   kanban dashboard [--json]
@@ -231,7 +231,13 @@ pub(crate) type CommandRow = (
 );
 
 pub(crate) const COMMANDS: &[CommandRow] = &[
-    ("init", None, &["name", "force", "as"], &[], false),
+    (
+        "init",
+        None,
+        &["name", "force", "rootless", "as"],
+        &[],
+        false,
+    ),
     ("workspace", Some("list"), &["all"], &[], true),
     ("workspace", Some("attach"), &["to", "as"], &[], false),
     ("workspace", Some("detach"), &["root", "as"], &[], false),
@@ -1088,6 +1094,20 @@ fn known_projects(registry: &Registry) -> Result<String> {
     })
 }
 
+fn project_candidates(projects: &[ProjectRecord]) -> String {
+    projects
+        .iter()
+        .map(|project| {
+            if project.workspace_roots.is_empty() {
+                format!("{} (rootless)", project.name)
+            } else {
+                format!("{} [{}]", project.name, project.workspace_roots.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolve a project by registry name. Names are NOT unique — two projects may
 /// share one — so an ambiguous name is an error naming the candidates, never a
 /// silent pick: writing to the wrong board is unrecoverable work-state damage.
@@ -1105,10 +1125,7 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
         many => bail!(
             "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
             many.len(),
-            many.iter()
-                .map(|project| project.canonical_root.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            project_candidates(many)
         ),
     }
 }
@@ -1260,10 +1277,7 @@ fn store_path_readonly(args: &Args) -> Result<PathBuf> {
             many => bail!(
                 "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
                 many.len(),
-                many.iter()
-                    .map(|project| project.canonical_root.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                project_candidates(many)
             ),
         }
     } else {
@@ -2041,15 +2055,18 @@ fn run() -> Result<()> {
     };
 
     if command == "init" {
-        let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-        let fallback = workspace
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("project");
+        if args.has("rootless") && args.one("workspace").is_some() {
+            bail!("--rootless cannot be combined with --workspace");
+        }
+        let workspace = if args.has("rootless") {
+            None
+        } else {
+            Some(args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?))
+        };
         let mut registry = Registry::open()?;
         let record = registry.register(
-            &workspace,
-            args.one("name").unwrap_or(fallback),
+            workspace.as_deref(),
+            args.require("name")?,
             args.has("force"),
             args.one("as").unwrap_or("system@cli"),
         )?;
@@ -2065,7 +2082,7 @@ fn run() -> Result<()> {
         let mut registry = Registry::open()?;
         let record = registry.attach(
             &workspace,
-            Path::new(args.require("to")?),
+            args.require("to")?,
             args.one("as").unwrap_or("system@cli"),
         )?;
         return print(&record, args.has("json"));
@@ -2239,11 +2256,10 @@ fn run() -> Result<()> {
             // Checked before opening, because opening would create it.
             if !board_is_present(&project.board_path) {
                 healthy = false;
-                projects.push(json!({
-                    "name": project.name,
-                    "boardPath": project.board_path,
-                    "present": false,
-                }));
+                let mut value = object_of(&project)?;
+                value.insert("present".into(), json!(false));
+                value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
+                projects.push(Value::Object(value));
                 continue;
             }
             let store = Store::open(Path::new(&project.board_path))?;
@@ -2262,18 +2278,20 @@ fn run() -> Result<()> {
                 && future.is_empty()
                 && search_index.healthy
                 && audit.healthy;
-            projects.push(json!({
-                "name": project.name,
-                "boardPath": project.board_path,
-                "present": true,
-                "schemaVersion": board_schema,
-                "supportedSchemaVersion": db::BOARD_SCHEMA_VERSION,
-                "integrity": check,
-                "orphanedRows": orphans,
-                "futureDatedTasks": future,
-                "searchIndex": search_index,
-                "audit": audit,
-            }));
+            let mut value = object_of(&project)?;
+            value.insert("present".into(), json!(true));
+            value.insert("schemaVersion".into(), json!(board_schema));
+            value.insert(
+                "supportedSchemaVersion".into(),
+                json!(db::BOARD_SCHEMA_VERSION),
+            );
+            value.insert("integrity".into(), json!(check));
+            value.insert("orphanedRows".into(), json!(orphans));
+            value.insert("futureDatedTasks".into(), json!(future));
+            value.insert("searchIndex".into(), json!(search_index));
+            value.insert("audit".into(), json!(audit));
+            value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
+            projects.push(Value::Object(value));
         }
         let result = json!({
             "healthy": healthy,
