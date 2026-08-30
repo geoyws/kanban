@@ -10,6 +10,7 @@ mod registry;
 mod search;
 mod serve;
 mod store;
+mod watch;
 
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
@@ -43,6 +44,8 @@ Usage:
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
   kanban serve [--port N]
+  kanban watch [--task ID | --rule ID | --registry] [--kind KIND]
+             [--cursor TOKEN|0] [--follow] [--all] [--limit N] [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
   kanban deploy start --repo REPO --commit FULL_SHA --tier TIER --environment NAME
@@ -141,7 +144,7 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 25] = [
+pub(crate) const BOOLEAN: [&str; 26] = [
     "help",
     "json",
     "version",
@@ -167,6 +170,7 @@ pub(crate) const BOOLEAN: [&str; 25] = [
     "full",
     "all-boards",
     "registry",
+    "follow",
 ];
 
 /// Removed boolean flags that remain recognizable only to return an actionable
@@ -200,10 +204,16 @@ pub(crate) const REPEATABLE: [&str; 6] = [
 /// This was a bare `!= "mcp"` inside the tool builder until `serve` arrived and
 /// the filter named only the first of two. It is a set with a guard now,
 /// because the next one will be the same mistake.
-pub(crate) const LONG_RUNNING: [&str; 2] = ["mcp", "serve"];
+pub(crate) const LONG_RUNNING: [&str; 3] = ["mcp", "serve", "watch"];
 
 /// Accepted on every board command; see `store_path`.
 pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
+
+/// Upper bound for a watch replay batch.
+///
+/// The reader can ask for nothing or a small bounded batch, but a caller
+/// cannot request an unbounded `Vec` through `--limit`.
+pub(crate) const WATCH_BATCH_LIMIT: i64 = 1_000;
 
 /// The flags that each select a board. At most one may be given explicitly.
 const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
@@ -594,6 +604,15 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         true,
     ),
     ("stale", None, &[], &[], true),
+    (
+        "watch",
+        None,
+        &[
+            "task", "rule", "registry", "kind", "cursor", "follow", "all", "limit",
+        ],
+        &[],
+        true,
+    ),
     ("context", None, &["max-chars"], &["id"], true),
     ("todo", None, &["output"], &[], false),
 ];
@@ -2312,6 +2331,9 @@ fn run() -> Result<()> {
     if command == "serve" {
         return serve::serve(args.port(serve::DEFAULT_PORT)?);
     }
+    if command == "watch" {
+        return watch::run(&args);
+    }
     if command == "backup" {
         let registry = Registry::open()?;
         let directory = args
@@ -3494,6 +3516,47 @@ mod tests {
                 "--{flag} is repeatable but no command accepts it"
             );
         }
+    }
+
+    #[test]
+    fn watch_is_marked_long_running_in_the_manifest() {
+        assert!(LONG_RUNNING.contains(&"watch"));
+        let schema = schema();
+        let watch = schema
+            .get("operations")
+            .and_then(Value::as_array)
+            .and_then(|operations| {
+                operations
+                    .iter()
+                    .find(|operation| operation["name"] == "watch")
+            })
+            .expect("watch operation in schema");
+        assert_eq!(watch["longRunning"], true);
+        assert_eq!(watch["readOnly"], true);
+    }
+
+    #[test]
+    fn watch_follow_is_a_presence_boolean() {
+        assert!(BOOLEAN.contains(&"follow"));
+        let parsed =
+            Args::parse(vec!["watch".to_owned(), "--follow".to_owned()]).expect("parse watch args");
+        assert_eq!(parsed.one("follow"), Some("true"));
+
+        let schema = schema();
+        let watch = schema
+            .get("operations")
+            .and_then(Value::as_array)
+            .and_then(|operations| {
+                operations
+                    .iter()
+                    .find(|operation| operation["name"] == "watch")
+            })
+            .expect("watch operation in schema");
+        let follow = watch["flags"]
+            .as_array()
+            .and_then(|flags| flags.iter().find(|flag| flag["name"] == "follow"))
+            .expect("follow flag in watch schema");
+        assert_eq!(follow["kind"], "boolean");
     }
 
     #[test]
