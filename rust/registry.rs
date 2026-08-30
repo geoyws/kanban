@@ -1422,6 +1422,64 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    /// Ascending registry watch rows with multi-kind predicates applied before
+    /// LIMIT. Registry events have no board semantic snapshot, so only kinds
+    /// are supported here.
+    pub fn rule_events_since_filtered(
+        &self,
+        rule: Option<&str>,
+        kinds: &[String],
+        cursor: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        validate_event_limit(limit)?;
+        if let Some(id) = rule {
+            self.rule(id)?;
+        }
+        let mut sql = String::from(
+            "SELECT seq,rule_id,kind,actor,payload,created_at,prev_hash,event_hash \
+             FROM rule_events WHERE seq>?",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
+        if let Some(id) = rule {
+            sql.push_str(" AND rule_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if !kinds.is_empty() {
+            sql.push_str(" AND kind IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", kinds.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                kinds
+                    .iter()
+                    .cloned()
+                    .map(|kind| Box::new(kind) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                rule_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rule_events WHERE kind=?)",
+            [kind],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     pub fn projects(&self) -> Result<Vec<ProjectRecord>> {
         let boards = {
             let mut statement = self
@@ -1772,5 +1830,36 @@ mod tests {
             .expect_err("over-cap limits must be rejected")
             .to_string();
         assert!(over.contains("1000"), "{over}");
+    }
+
+    #[test]
+    fn filtered_registry_watch_rows_apply_multi_kind_before_limit() {
+        let registry = test_registry("registry-filtered-events");
+        insert_rule(&registry, "rule-1", 0);
+        for (kind, step) in [("legacy", 1), ("wanted", 2), ("other", 3)] {
+            crate::audit::append_registry_event(
+                &registry.connection,
+                "rule-1",
+                kind,
+                "codex",
+                &format!(r#"{{"step":{step}}}"#),
+                step,
+            )
+            .unwrap();
+        }
+        let kinds = vec!["wanted".to_owned(), "other".to_owned()];
+        let rows = registry
+            .rule_events_since_filtered(Some("rule-1"), &kinds, 0, 1)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "wanted");
+        assert!(
+            registry
+                .rule_events_since_filtered(Some("rule-1"), &["never-seen".to_owned()], 0, 10,)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(registry.event_kind_exists("wanted").unwrap());
+        assert!(!registry.event_kind_exists("never-seen").unwrap());
     }
 }

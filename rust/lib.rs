@@ -44,7 +44,9 @@ Usage:
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
   kanban serve [--port N]
-  kanban watch [--task ID | --rule ID | --registry] [--kind KIND]
+  kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
+             [--relation KIND:ID ...] [--prior-status STATUS ...]
+             [--current-status STATUS ...] [--tag NAME ...]
              [--cursor TOKEN|0] [--follow] [--all] [--limit N] [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
@@ -192,6 +194,11 @@ pub(crate) const REPEATABLE: [&str; 6] = [
     "board",
     "except-board",
 ];
+
+/// Watch-only list-valued filters. Other commands retain their historical
+/// single-valued `--kind` behavior.
+pub(crate) const WATCH_REPEATABLE: [&str; 4] =
+    ["kind", "relation", "prior-status", "current-status"];
 
 /// Commands that are processes rather than operations.
 ///
@@ -608,7 +615,18 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "watch",
         None,
         &[
-            "task", "rule", "registry", "kind", "cursor", "follow", "all", "limit",
+            "task",
+            "rule",
+            "registry",
+            "kind",
+            "relation",
+            "prior-status",
+            "current-status",
+            "tag",
+            "cursor",
+            "follow",
+            "all",
+            "limit",
         ],
         &[],
         true,
@@ -913,11 +931,15 @@ impl Args {
     /// Taking the last occurrence is a common convention and the wrong one
     /// here: the values disagree, only one of them is what the caller meant,
     /// and nothing in the receipt says which was used.
-    fn reject_repeated(&self) -> Result<()> {
+    fn reject_repeated_for(&self, command: Option<&str>) -> Result<()> {
         let mut repeated = self
             .flags
             .iter()
-            .filter(|(name, values)| values.len() > 1 && !REPEATABLE.contains(&name.as_str()))
+            .filter(|(name, values)| {
+                let repeatable = REPEATABLE.contains(&name.as_str())
+                    || (command == Some("watch") && WATCH_REPEATABLE.contains(&name.as_str()));
+                values.len() > 1 && !repeatable
+            })
             .map(|(name, values)| format!("--{name} ({})", values.join(", ")))
             .collect::<Vec<_>>();
         if repeated.is_empty() {
@@ -1191,7 +1213,9 @@ pub(crate) fn schema() -> Value {
             let flags = flags
                 .iter()
                 .map(|flag| {
-                    let kind = if REPEATABLE.contains(flag) {
+                    let kind = if REPEATABLE.contains(flag)
+                        || (*command == "watch" && WATCH_REPEATABLE.contains(flag))
+                    {
                         "list"
                     } else if BOOLEAN.contains(flag) {
                         "boolean"
@@ -2047,7 +2071,7 @@ fn run() -> Result<()> {
     match command_spec(command, spec_sub) {
         Some((allowed, positionals)) => {
             args.reject_unknown(allowed)?;
-            args.reject_repeated()?;
+            args.reject_repeated_for(Some(command))?;
             args.reject_extra_positionals(arity(spec_sub, positionals))?;
             args.reject_conflicting_board_selectors()?;
         }
@@ -3499,6 +3523,11 @@ mod tests {
         const SOURCE: &str = include_str!("lib.rs");
         for (command, sub, flags, ..) in COMMANDS {
             for flag in *flags {
+                // Watch owns additional list-valued filters while `--kind`
+                // remains scalar on notes, events and other operations.
+                if *command == "watch" && WATCH_REPEATABLE.contains(flag) {
+                    continue;
+                }
                 let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
                 assert_eq!(
                     collected,
@@ -3560,20 +3589,112 @@ mod tests {
     }
 
     #[test]
+    fn watch_filter_lists_are_repeatable_in_parser_and_schema() {
+        let parsed = Args::parse(
+            [
+                "watch",
+                "--kind",
+                "task_moved",
+                "--kind",
+                "task_added",
+                "--relation",
+                "parent:s-1",
+                "--prior-status",
+                "todo",
+                "--current-status",
+                "done",
+                "--tag",
+                "infra",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .expect("parse repeatable watch filters");
+        for (flag, expected) in [
+            ("kind", 2),
+            ("relation", 1),
+            ("prior-status", 1),
+            ("current-status", 1),
+            ("tag", 1),
+        ] {
+            assert_eq!(parsed.many(flag).len(), expected, "--{flag} was not parsed");
+            assert!(
+                REPEATABLE.contains(&flag) || WATCH_REPEATABLE.contains(&flag),
+                "--{flag} is not repeatable"
+            );
+        }
+        let schema = schema();
+        let watch = schema["operations"]
+            .as_array()
+            .and_then(|operations| operations.iter().find(|op| op["name"] == "watch"))
+            .expect("watch operation in schema");
+        for flag in ["kind", "relation", "prior-status", "current-status", "tag"] {
+            let descriptor = watch["flags"]
+                .as_array()
+                .and_then(|flags| flags.iter().find(|item| item["name"] == flag))
+                .expect("watch filter in schema");
+            assert_eq!(descriptor["kind"], "list", "--{flag} schema kind");
+        }
+    }
+
+    #[test]
     fn repeating_a_single_valued_flag_is_refused() {
-        assert!(args(&["--project", "alpha"]).reject_repeated().is_ok());
-        assert!(args(&[]).reject_repeated().is_ok());
+        assert!(
+            args(&["--project", "alpha"])
+                .reject_repeated_for(None)
+                .is_ok()
+        );
+        assert!(args(&[]).reject_repeated_for(None).is_ok());
         // A list-valued flag is exactly what repeating is for.
         assert!(
             args(&["--blocker", "a", "--blocker", "b"])
-                .reject_repeated()
+                .reject_repeated_for(None)
                 .is_ok()
         );
         let error = args(&["--project", "alpha", "--project", "beta"])
-            .reject_repeated()
+            .reject_repeated_for(None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("--project (alpha, beta)"), "{error}");
+    }
+
+    #[test]
+    fn kind_is_repeatable_only_for_watch() {
+        let repeated = args(&["--kind", "a", "--kind", "b"]);
+        assert!(repeated.reject_repeated_for(Some("watch")).is_ok());
+        let error = repeated
+            .reject_repeated_for(Some("events"))
+            .expect_err("events --kind must remain scalar")
+            .to_string();
+        assert!(error.contains("--kind (a, b)"), "{error}");
+
+        let schema = schema();
+        for operation in ["watch", "events", "note"] {
+            let descriptor = schema["operations"]
+                .as_array()
+                .and_then(|operations| {
+                    operations.iter().find(|item| {
+                        item["name"] == operation
+                            && item["flags"]
+                                .as_array()
+                                .is_some_and(|flags| flags.iter().any(|f| f["name"] == "kind"))
+                    })
+                })
+                .expect("operation with kind");
+            let kind = descriptor["flags"]
+                .as_array()
+                .and_then(|flags| flags.iter().find(|f| f["name"] == "kind"))
+                .expect("kind descriptor");
+            assert_eq!(
+                kind["kind"],
+                if operation == "watch" {
+                    "list"
+                } else {
+                    "value"
+                }
+            );
+        }
     }
 
     #[test]

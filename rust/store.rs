@@ -1182,6 +1182,144 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Ascending watch rows with semantic predicates applied before LIMIT.
+    ///
+    /// Watch filters must bound delivered events rather than the raw ledger
+    /// page: a sparse match at sequence 500 is still the first event in a
+    /// `--limit 1` request. The JSON predicates deliberately require the
+    /// private semantic snapshot, so legacy rows never match a semantic
+    /// filter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn events_since_filtered(
+        &self,
+        task: Option<&str>,
+        kinds: &[String],
+        relations: &[String],
+        prior_statuses: &[String],
+        current_statuses: &[String],
+        tags: &[String],
+        cursor: i64,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<Vec<Event>> {
+        validate_event_limit(limit)?;
+        let mut sql = String::from(
+            "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
+             FROM events WHERE seq>?",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
+        if let Some(id) = task {
+            sql.push_str(" AND task_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if !kinds.is_empty() {
+            sql.push_str(" AND kind IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", kinds.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                kinds
+                    .iter()
+                    .cloned()
+                    .map(|kind| Box::new(kind) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        if !include_archived {
+            sql.push_str(" AND archived=0");
+        }
+        let semantic = !relations.is_empty()
+            || !prior_statuses.is_empty()
+            || !current_statuses.is_empty()
+            || !tags.is_empty();
+        if semantic {
+            sql.push_str(
+                " AND json_valid(payload) AND json_type(payload,'$._semanticV1')='object'",
+            );
+        }
+        if !relations.is_empty() {
+            let mut clauses = Vec::new();
+            for relation in relations {
+                let Some((kind, id)) = relation.split_once(':') else {
+                    sql.push_str(" AND 0");
+                    continue;
+                };
+                clauses.push("EXISTS (SELECT 1 FROM json_each(json_extract(payload,'$._semanticV1.relations')) r WHERE json_extract(r.value,'$.kind')=? AND json_extract(r.value,'$.id')=?)");
+                values.push(Box::new(kind.to_owned()));
+                values.push(Box::new(id.to_owned()));
+            }
+            if !clauses.is_empty() {
+                sql.push_str(" AND (");
+                sql.push_str(&clauses.join(" OR "));
+                sql.push(')');
+            }
+        }
+        if !prior_statuses.is_empty() {
+            sql.push_str(" AND json_extract(payload,'$._semanticV1.priorStatus') IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", prior_statuses.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                prior_statuses
+                    .iter()
+                    .cloned()
+                    .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        if !current_statuses.is_empty() {
+            sql.push_str(" AND json_extract(payload,'$._semanticV1.currentStatus') IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", current_statuses.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                current_statuses
+                    .iter()
+                    .cloned()
+                    .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        if !tags.is_empty() {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(json_extract(payload,'$._semanticV1.tags')) t WHERE t.value IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", tags.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push_str("))");
+            values.extend(
+                tags.iter()
+                    .cloned()
+                    .map(|tag| Box::new(tag) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                board_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE kind=?)",
+            [kind],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
         let name = nonempty(name, "name")?;
         let actor = nonempty(actor, "actor")?;
@@ -3736,6 +3874,98 @@ mod tests {
             .events_since(Some("t-removed"), Some("task_removed"), 0, 10, true)
             .unwrap();
         assert_eq!(events.len(), 1);
+        let filtered = store
+            .events_since_filtered(
+                Some("t-removed"),
+                &["task_removed".to_owned()],
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                10,
+                true,
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn filtered_watch_rows_apply_semantics_before_limit_and_fail_closed_on_legacy_rows() {
+        let store = test_store("filtered-watch-sparse");
+        let append = |kind: &str, payload: &str| {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("gone-task"),
+                kind,
+                "codex",
+                payload,
+                1,
+            )
+            .unwrap();
+        };
+        append("legacy", r#"{"note":"no snapshot"}"#);
+        append(
+            "wanted",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[{"kind":"parent","type":"story","id":"s-1"}],"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
+        );
+        append(
+            "other",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[],"priorStatus":"todo","currentStatus":"review","tags":["docs"]}}"#,
+        );
+        let kinds = vec!["wanted".to_owned(), "missing-but-known".to_owned()];
+        let relations = vec!["parent:s-1".to_owned()];
+        let prior = vec!["todo".to_owned()];
+        let current = vec!["done".to_owned()];
+        let tags = vec!["infra".to_owned()];
+        let rows = store
+            .events_since_filtered(
+                Some("gone-task"),
+                &kinds,
+                &relations,
+                &prior,
+                &current,
+                &tags,
+                0,
+                1,
+                true,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "wanted");
+        assert!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &[],
+                    &relations,
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    10,
+                    true,
+                )
+                .unwrap()
+                .iter()
+                .all(|event| event.kind == "wanted")
+        );
+        assert!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &["unknown".to_owned()],
+                    0,
+                    10,
+                    true,
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
