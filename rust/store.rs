@@ -732,6 +732,25 @@ fn event_with_status(
     } else {
         payload["_semanticV1"] = Value::Null;
     }
+    event_at(connection, task_id, kind, actor, payload, now_ms())
+}
+
+pub(crate) fn event_at(
+    connection: &Connection,
+    task_id: Option<&str>,
+    kind: &str,
+    actor: Option<&str>,
+    payload: Value,
+    created_at: i64,
+) -> Result<()> {
+    let mut payload = payload;
+    if task_id.is_some() {
+        if !matches!(payload.get("_semanticV1"), Some(Value::Object(_))) {
+            bail!("task events require an object _semanticV1 snapshot");
+        }
+    } else if payload.get("_semanticV1").is_none() {
+        payload["_semanticV1"] = Value::Null;
+    }
     let actor = actor.context("actor is required for audited mutation")?;
     crate::audit::append_board_event(
         connection,
@@ -739,7 +758,7 @@ fn event_with_status(
         kind,
         actor,
         &payload.to_string(),
-        now_ms(),
+        created_at,
     )
 }
 
@@ -1135,9 +1154,6 @@ impl Store {
         include_archived: bool,
     ) -> Result<Vec<Event>> {
         validate_event_limit(limit)?;
-        if let Some(id) = task {
-            require_task(&self.connection, id)?;
-        }
         let mut sql = String::from(
             "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
              FROM events WHERE seq>?",
@@ -1851,6 +1867,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
+        let prior_status = require_task(&transaction, &input.task_id)?.status;
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -1871,12 +1888,14 @@ impl Store {
         if input.state != "continue" {
             transaction.execute("DELETE FROM task_claims WHERE task_id=?", [&input.task_id])?;
         }
-        event(
+        event_with_status(
             &transaction,
             Some(&input.task_id),
             "checkpoint_added",
             Some(&input.author),
             json!({"seq":seq,"state":input.state}),
+            Some(&prior_status),
+            Some(status),
         )?;
         let result = transaction.query_row(
             "SELECT * FROM checkpoints WHERE seq=?",
@@ -3091,12 +3110,12 @@ impl Store {
     }
 
     pub fn record_system_event(&self, kind: &str, actor: &str, payload: Value) -> Result<()> {
-        crate::audit::append_board_event(
+        event_at(
             &self.connection,
             None,
             kind,
-            nonempty(actor, "actor")?,
-            &payload.to_string(),
+            Some(nonempty(actor, "actor")?),
+            payload,
             now_ms(),
         )
     }
@@ -3687,6 +3706,91 @@ mod tests {
         assert!(relations.contains(&json!({"kind":"ancestor","type":"epic","id":"e-parent"})));
         assert!(relations.contains(&json!({"kind":"ancestor","type":"epic","id":"e-root"})));
         assert!(relations.contains(&json!({"kind":"depends-on","type":"task","id":"d-one"})));
+    }
+
+    #[test]
+    fn events_since_replays_removed_task_subjects() {
+        let mut store = test_store("events-since-removed");
+        store
+            .add_task(AddTask {
+                id: Some("t-removed".into()),
+                task_type: "task".into(),
+                parent_id: None,
+                title: "remove".into(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".into(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: json!({}),
+                actor: Some("test".into()),
+                tags: Vec::new(),
+            })
+            .unwrap();
+        store.remove_task("t-removed", "test", false).unwrap();
+        let events = store
+            .events_since(Some("t-removed"), Some("task_removed"), 0, 10, true)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_events_capture_each_projected_status() {
+        let mut store = test_store("checkpoint-status");
+        for (id, state, expected) in [
+            ("t-continue", "continue", "in_progress"),
+            ("t-blocked", "blocked", "blocked"),
+            ("t-done", "done", "done"),
+        ] {
+            insert_task(&store, id);
+            let claim = store
+                .claim(
+                    Some(id),
+                    ClaimOptions {
+                        agent_id: "test".into(),
+                        session_id: None,
+                        lease_ms: 60_000,
+                        caller_lane: None,
+                        role_filter: None,
+                        caller_scope: None,
+                        cross_lane: false,
+                        allow_reassign: false,
+                        git: None,
+                    },
+                )
+                .unwrap();
+            store
+                .checkpoint(CheckpointInput {
+                    task_id: id.into(),
+                    lease_token: claim.claim.lease_token,
+                    author: "test".into(),
+                    session_id: None,
+                    model: None,
+                    state: state.into(),
+                    summary: "summary".into(),
+                    intent: "intent".into(),
+                    next_action: "next".into(),
+                    blockers: Vec::new(),
+                    validations: Vec::new(),
+                    repo_path: None,
+                    branch: None,
+                    head_sha: None,
+                    dirty_summary: None,
+                    root_head: None,
+                })
+                .unwrap();
+            let event = store
+                .events(Some(id), Some("checkpoint_added"), 1, false)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(event.payload["_semanticV1"]["priorStatus"], "in_progress");
+            assert_eq!(event.payload["_semanticV1"]["currentStatus"], expected);
+        }
     }
 
     #[test]

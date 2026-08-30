@@ -538,12 +538,12 @@ fn normalize_and_insert(
             )?;
         }
     }
-    crate::audit::append_board_event(
+    crate::store::event_at(
         &transaction,
         None,
         "tasks_imported",
-        actor,
-        &json!({"taskIDs":inputs.iter().map(|i|&i.id).collect::<Vec<_>>()}).to_string(),
+        Some(actor),
+        json!({"taskIDs":inputs.iter().map(|i|&i.id).collect::<Vec<_>>() }),
         now_ms(),
     )?;
     // A preview that runs the real path and rolls back cannot disagree with

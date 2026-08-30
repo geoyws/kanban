@@ -616,12 +616,12 @@ pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<
         )?;
         embedded += 1;
     }
-    crate::audit::append_board_event(
+    crate::store::event_at(
         &transaction,
         None,
         "search_rebuilt",
-        actor,
-        &json!({"documents":documents.len(),"embeddingModel":EMBEDDING_MODEL}).to_string(),
+        Some(actor),
+        json!({"documents":documents.len(),"embeddingModel":EMBEDDING_MODEL}),
         now_ms(),
     )?;
     transaction.commit()?;
