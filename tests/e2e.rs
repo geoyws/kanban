@@ -1026,15 +1026,7 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "--json",
         ],
     );
-    let board_path = fixture
-        .ok_json(&fixture.main, &["workspace", "list", "--json"])
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|record| record["name"] == json!("WATCH-REPLAY"))
-        .and_then(|record| record["boardPath"].as_str())
-        .unwrap()
-        .to_owned();
+    let board_path = board_path_for_project(&fixture, &fixture.main, "SEARCH-A");
     Connection::open(board_path)
         .unwrap()
         .execute(
