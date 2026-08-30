@@ -1,3 +1,4 @@
+use crate::WATCH_BATCH_LIMIT;
 use crate::db::{
     checkpoint as wal_checkpoint, create_backup_target, integrity, open_board, open_board_readonly,
 };
@@ -164,6 +165,29 @@ fn article(word: &str) -> &'static str {
         Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
         _ => "a",
     }
+}
+
+#[allow(dead_code)]
+fn validate_event_limit(limit: i64) -> Result<()> {
+    if !(0..=WATCH_BATCH_LIMIT).contains(&limit) {
+        bail!("--limit must be between 0 and {WATCH_BATCH_LIMIT}, got {limit}");
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn board_event_row(row: &Row<'_>) -> rusqlite::Result<Event> {
+    Ok(Event {
+        seq: row.get("seq")?,
+        task_id: row.get("task_id")?,
+        kind: row.get("kind")?,
+        actor: row.get("actor")?,
+        payload: parse_value(row.get("payload")?),
+        created_at: row.get("created_at")?,
+        archived: row.get::<_, i64>("archived")? != 0,
+        prev_hash: row.get("prev_hash")?,
+        event_hash: row.get("event_hash")?,
+    })
 }
 
 /// How wide a container each type is: an epic contains stories, a story
@@ -1010,19 +1034,48 @@ impl Store {
         statement
             .query_map(
                 params_from_iter(values.iter().map(|value| value.as_ref())),
-                |row| {
-                    Ok(Event {
-                        seq: row.get("seq")?,
-                        task_id: row.get("task_id")?,
-                        kind: row.get("kind")?,
-                        actor: row.get("actor")?,
-                        payload: parse_value(row.get("payload")?),
-                        created_at: row.get("created_at")?,
-                        archived: row.get::<_, i64>("archived")? != 0,
-                        prev_hash: row.get("prev_hash")?,
-                        event_hash: row.get("event_hash")?,
-                    })
-                },
+                board_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn events_since(
+        &self,
+        task: Option<&str>,
+        kind: Option<&str>,
+        cursor: i64,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<Vec<Event>> {
+        validate_event_limit(limit)?;
+        if let Some(id) = task {
+            require_task(&self.connection, id)?;
+        }
+        let mut sql = String::from(
+            "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
+             FROM events WHERE seq>?",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
+        if let Some(id) = task {
+            sql.push_str(" AND task_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind=?");
+            values.push(Box::new(kind.to_owned()));
+        }
+        if !include_archived {
+            sql.push_str(" AND archived=0");
+        }
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                board_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -3353,6 +3406,45 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn board_db_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kanban-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("create temp board dir");
+        path.join("board.db")
+    }
+
+    fn test_store(name: &str) -> Store {
+        Store::open(&board_db_path(name)).expect("open test store")
+    }
+
+    fn insert_task(store: &Store, id: &str) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO tasks(id,type,parent_id,title,body,status,priority,created_at,updated_at,completed_at,metadata) \
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    "task",
+                    Option::<String>::None,
+                    "fixture task",
+                    Option::<String>::None,
+                    "todo",
+                    3,
+                    1_i64,
+                    1_i64,
+                    Option::<i64>::None,
+                    "{}",
+                ],
+            )
+            .expect("insert task");
+    }
+
+    fn board_event_seqs(events: &[Event]) -> Vec<i64> {
+        events.iter().map(|event| event.seq).collect()
+    }
 
     #[test]
     fn a_rule_requires_a_nonempty_first_line_and_preserves_valid_body_text() {
@@ -3592,5 +3684,131 @@ mod tests {
         let mut list = vec![1, 2];
         assert!(keep_newest(&mut list, 0));
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn ascending_board_events_resume_without_skips_and_respect_archives() {
+        let store = test_store("board-events");
+        insert_task(&store, "task-1");
+        insert_task(&store, "task-2");
+
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("task-1"),
+            "task_started",
+            "codex",
+            r#"{"step":1}"#,
+            10,
+        )
+        .expect("append first event");
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("task-2"),
+            "task_started",
+            "codex",
+            r#"{"step":2}"#,
+            11,
+        )
+        .expect("append second event");
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+                 VALUES(?,?,?,?,?,?,?,?,?)",
+                params![
+                    3_i64,
+                    "task-1",
+                    "task_archived",
+                    "codex",
+                    r#"{"step":3}"#,
+                    12_i64,
+                    1_i64,
+                    "prev-3",
+                    "hash-3",
+                ],
+            )
+            .expect("insert archived event");
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("task-1"),
+            "task_finished",
+            "codex",
+            r#"{"step":4}"#,
+            13,
+        )
+        .expect("append fourth event");
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("task-2"),
+            "task_finished",
+            "codex",
+            r#"{"step":5}"#,
+            14,
+        )
+        .expect("append fifth event");
+
+        let all = store
+            .events_since(None, None, 0, 10, true)
+            .expect("read all board events");
+        assert_eq!(board_event_seqs(&all), vec![1, 2, 3, 4, 5]);
+
+        let active = store
+            .events_since(None, None, 0, 10, false)
+            .expect("read active board events");
+        assert_eq!(board_event_seqs(&active), vec![1, 2, 4, 5]);
+
+        let empty = store
+            .events_since(None, None, 0, 0, true)
+            .expect("zero limit is allowed");
+        assert!(empty.is_empty());
+
+        let task_events = store
+            .events_since(Some("task-1"), None, 1, 10, true)
+            .expect("resume task events");
+        assert_eq!(board_event_seqs(&task_events), vec![3, 4]);
+
+        let kind_events = store
+            .events_since(Some("task-1"), Some("task_finished"), 0, 10, true)
+            .expect("filter by task and kind");
+        assert_eq!(board_event_seqs(&kind_events), vec![4]);
+
+        let first_batch = store
+            .events_since(Some("task-1"), None, 0, 1, true)
+            .expect("first batch");
+        assert_eq!(board_event_seqs(&first_batch), vec![1]);
+
+        let second_batch = store
+            .events_since(
+                Some("task-1"),
+                None,
+                first_batch.last().unwrap().seq,
+                1,
+                true,
+            )
+            .expect("second batch");
+        assert_eq!(board_event_seqs(&second_batch), vec![3]);
+
+        let third_batch = store
+            .events_since(
+                Some("task-1"),
+                None,
+                second_batch.last().unwrap().seq,
+                1,
+                true,
+            )
+            .expect("third batch");
+        assert_eq!(board_event_seqs(&third_batch), vec![4]);
+
+        let negative = store
+            .events_since(None, None, 0, -1, true)
+            .expect_err("negative limits must be rejected")
+            .to_string();
+        assert!(negative.contains("1000"), "{negative}");
+
+        let over = store
+            .events_since(None, None, 0, crate::WATCH_BATCH_LIMIT + 1, true)
+            .expect_err("over-cap limits must be rejected")
+            .to_string();
+        assert!(over.contains("1000"), "{over}");
     }
 }

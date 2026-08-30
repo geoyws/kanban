@@ -19,9 +19,10 @@ broker, a filesystem watcher, or another mutable projection. The current web
 surface already has a lightweight live-notice path: `kanban serve` fingerprints
 the registered SQLite database plus `-wal` and `-journal`, sends `ready`,
 `refresh`, and heartbeat frames on `/live`, and then fetches the canonical
-server-rendered page again. That path is a compatibility invalidation signal
-for the current UI, not a durable cursor stream, and it does not name the event
-that caused a refresh.
+server-rendered page again. That path remains compatibility invalidation for
+the current UI, not the canonical stream. The canonical long-running
+subscription is `kb watch`, which reads the append-only ledgers directly while
+`kb events` stays the newest-first snapshot reader.
 
 The CLI already exposes the underlying history through `kb events` for a task,
 a rule, or the registry, and the binary already treats long-running surfaces
@@ -40,64 +41,65 @@ filesystem change detector becomes authoritative.
 
 For board scope, the bus is the board database's `events` table. For registry
 scope, the bus is the registry database's `rule_events` table. A subscriber is
-bound to exactly one scope at a time.
+bound to exactly one scope at a time; there is no cross-board fan-in.
 
-The monotonic cursor is the ledger sequence number:
+The watch cursor is opaque. It binds the exact source, selector, kind, archive
+state, and last delivered `seq` together. Consumers persist that cursor and
+resume from the next ledger row after the last delivered one. Literal `0` is
+the only bootstrap cursor. Wall clock time, file mtime, WAL fingerprints, and
+payload hashes are not cursors.
 
-- board events use `events.seq`;
-- registry events use `rule_events.seq`.
-
-Consumers persist that integer and resume from the next value after the last
-delivered record. Wall clock time, file mtime, WAL fingerprints, and payload
-hashes are not cursors.
-
-The resume identity is broader than the bare cursor. A resumed watch must carry
-the stable addressed board or registry identity together with the selector kind
-and selector value that produced the stream. A cursor reused with a different
-scope or a different selector must fail closed rather than silently replaying
-the wrong trail.
+Reusing a cursor against a different scope, selector, kind, archive state, or
+future sequence must fail closed rather than silently replaying the wrong
+trail.
 
 ### 2. `kb watch` is a process, not an RPC tool
 
-`kb watch` does not exist yet. Implementing this ADR means adding it to the CLI
-help text, parser, `COMMANDS`, and `LONG_RUNNING` handling while keeping it out
-of the request-response generated tool schemas the same way the existing
-long-running surfaces are filtered out.
-
-`kb watch` is the canonical long-running subscription command once it lands. It
-is read-only, process-separated, and excluded from generated tool surfaces the
-same way `mcp` and `serve` are. Downstream adapters that want a subscription
-must spawn it or bridge it, not call it as an in-process function.
+`kb watch` is the canonical long-running subscription command. It is read-only
+and process-separated, and the generated command schema marks it
+`longRunning`/`readOnly` so MCP tool generation excludes it the same way it
+excludes the other long-running surfaces. Downstream adapters that want a
+subscription must spawn it or bridge it, not call it as an in-process
+function.
 
 The contract is:
 
 ```text
-kb watch [--task ID | --rule ID | --registry]
+kb watch [--project NAME] [--task ID | --rule ID | --registry]
          [--kind KIND]
-         [--cursor N]
+         [--cursor CURSOR]
          [--follow]
          [--all]
          [--limit N]
+         [--db PATH]
          [--json]
 ```
 
 Semantics:
 
-- With no selector flags, `kb watch` follows the addressed board's full
-  `events` trail, matching the current `kb events` history view.
-- `--task` narrows that addressed board trail to the selected task ID.
-- `--rule` narrows the registry `rule_events` trail to the selected rule ID.
-- `--registry` selects the explicit unfiltered registry trail.
-- These selector forms are mutually exclusive and they never imply a different
-  scope behind the caller's back.
-- `--cursor` is the durable resume point; the watcher replays rows with
-  sequence numbers greater than that cursor and never writes a cursor itself.
-- `--follow` keeps the process open after replaying the backlog and emits new
-  events as they are committed.
-- `--limit` bounds replay work for a bounded bootstrap or test fixture.
-- `--all` includes archived history where the underlying trail supports it.
-- `--json` is the machine contract. The stream stays JSON on stdout; human
-  diagnostics belong on stderr.
+- `--project` selects the addressed board. `--task` narrows the addressed
+  board's `events` trail to that task ID. `--rule` narrows the registry
+  `rule_events` trail to the selected rule ID. `--registry` selects the
+  registry trail directly. Exactly one of those scopes is active at a time.
+- Registry scope rejects board selectors and `--all`; board scope may include
+  archived history only where the underlying trail already supports it.
+- `--cursor` is the opaque resume point. Literal `0` is the only bootstrap
+  cursor. The watcher replays rows with sequence numbers greater than the last
+  delivered one and never writes the cursor itself.
+- The cursor is bound to the exact source, selector, kind, archive state, and
+  last delivered `seq`. Reusing a persisted cursor with a different source,
+  selector, kind, archive state, or future `seq` fails closed.
+- `--follow` keeps the process open after replaying the backlog. Each poll
+  reopens a read-only database transaction, reads the committed rows
+  synchronously with no intermediate queue, and then closes before the next
+  poll. The runtime requires `--limit` to be at least `1` whenever `--follow`
+  is set, so `--follow --limit 0` fails.
+- `--limit` bounds replay work and must be within `0..1000` in every mode;
+  follow mode additionally rejects `0`.
+- `--db PATH` opens that exact database file rather than re-resolving a board.
+- `--json` is the machine contract. The stream stays NDJSON on stdout; errors
+  and diagnostics belong on stderr.
+- Secrets are redacted recursively before payloads are emitted.
 
 Each delivery is an NDJSON envelope containing:
 
@@ -238,17 +240,15 @@ event trails and formalizes their cursor semantics.
 
 The implementation rollout should be staged:
 
-1. land `kb watch` as a read-only process over the existing event tables, and
-   wire it into CLI help, parser, `COMMANDS`, and `LONG_RUNNING` while keeping
-   it out of generated request-response tool schemas;
-2. add ascending cursor query primitives for board and registry trails, then
-   make `kb watch` consume those primitives directly rather than reversing the
-   bounded newest-first readers;
+1. keep `kb watch` wired into CLI help, parser, `COMMANDS`, and `LONG_RUNNING`
+   while keeping it out of generated request-response tool schemas;
+2. keep ascending cursor query primitives for board and registry trails as the
+   watch backend rather than reversing the bounded newest-first readers;
 3. teach adapters to bridge the NDJSON stream rather than poll for refresh;
 4. keep the current `/live` filesystem-fingerprint notice as compatibility
-   behavior until the cursor-driven replacement is ready, then swap the trigger
-   without changing the canonical rendered page or the interaction guards that
-   protect in-progress typing;
+   behavior while the cursor-driven replacement stays in place, without
+   changing the canonical rendered page or the interaction guards that protect
+   in-progress typing;
 5. preserve `kb events` as the bounded historical snapshot command;
 6. keep the stream shape stable once published.
 
@@ -256,7 +256,8 @@ The implementation rollout should be staged:
 
 Release evidence should come from separate compiled processes, per
 [ADR-006](ADR-006-rust-runtime-and-compiled-binary-e2e.md), and should prove
-all of the following:
+all of the following. Exactly five compiled-process tests cover the watch
+contract:
 
 - replay from cursor `0` returns the full trail in ascending `seq` order;
 - resuming from a saved cursor returns only newer rows;

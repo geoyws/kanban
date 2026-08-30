@@ -1,3 +1,4 @@
+use crate::WATCH_BATCH_LIMIT;
 use crate::db::{
     checkpoint, create_backup_target, integrity, open_board, open_registry, open_registry_readonly,
     own_private_dir,
@@ -93,6 +94,29 @@ fn rule_tags_apply(
         }
     }
     !saw_subsystem
+}
+
+#[allow(dead_code)]
+fn validate_event_limit(limit: i64) -> Result<()> {
+    if !(0..=WATCH_BATCH_LIMIT).contains(&limit) {
+        bail!("--limit must be between 0 and {WATCH_BATCH_LIMIT}, got {limit}");
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn rule_event_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+    Ok(Event {
+        seq: record.get("seq")?,
+        task_id: None,
+        kind: record.get("kind")?,
+        actor: Some(record.get("actor")?),
+        payload: serde_json::from_str(&record.get::<_, String>("payload")?).unwrap_or(json!({})),
+        created_at: record.get("created_at")?,
+        archived: false,
+        prev_hash: record.get("prev_hash")?,
+        event_hash: record.get("event_hash")?,
+    })
 }
 
 /// Milliseconds since the Unix epoch.
@@ -1355,20 +1379,44 @@ impl Registry {
         statement
             .query_map(
                 params_from_iter(values.iter().map(|value| value.as_ref())),
-                |row| {
-                    Ok(Event {
-                        seq: row.get("seq")?,
-                        task_id: None,
-                        kind: row.get("kind")?,
-                        actor: Some(row.get("actor")?),
-                        payload: serde_json::from_str(&row.get::<_, String>("payload")?)
-                            .unwrap_or(json!({})),
-                        created_at: row.get("created_at")?,
-                        archived: false,
-                        prev_hash: row.get("prev_hash")?,
-                        event_hash: row.get("event_hash")?,
-                    })
-                },
+                rule_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn rule_events_since(
+        &self,
+        rule: Option<&str>,
+        kind: Option<&str>,
+        cursor: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        validate_event_limit(limit)?;
+        if let Some(id) = rule {
+            self.rule(id)?;
+        }
+        let mut sql = String::from(
+            "SELECT seq,rule_id,kind,actor,payload,created_at,prev_hash,event_hash \
+             FROM rule_events WHERE seq>?",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
+        if let Some(id) = rule {
+            sql.push_str(" AND rule_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind=?");
+            values.push(Box::new(kind.to_owned()));
+        }
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                rule_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -1554,7 +1602,49 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    fn registry_db_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kanban-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("create temp registry dir");
+        path.join("registry.db")
+    }
+
+    fn test_registry(name: &str) -> Registry {
+        let root = registry_db_path(name)
+            .parent()
+            .expect("registry db parent")
+            .to_path_buf();
+        Registry {
+            connection: open_registry(&root.join("registry.db")).expect("open test registry"),
+            root,
+        }
+    }
+
+    fn insert_rule(registry: &Registry, id: &str, archived: i64) {
+        registry
+            .connection
+            .execute(
+                "INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags) \
+                 VALUES(?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    "Headline.\n\nBody.",
+                    "codex",
+                    archived,
+                    1_i64,
+                    1_i64,
+                    "[\"ALL\"]",
+                ],
+            )
+            .expect("insert rule");
+    }
+
+    fn rule_event_seqs(events: &[Event]) -> Vec<i64> {
+        events.iter().map(|event| event.seq).collect()
+    }
 
     #[test]
     fn millis_saturate_instead_of_wrapping() {
@@ -1590,5 +1680,97 @@ mod tests {
         let general = vec!["ALL".to_owned(), "EXCEPT:TWO".to_owned()];
         assert!(rule_tags_apply(&general, Some("ONE"), None));
         assert!(!rule_tags_apply(&general, Some("TWO"), None));
+    }
+
+    #[test]
+    fn ascending_registry_rule_events_resume_without_skips() {
+        let registry = test_registry("registry-events");
+        insert_rule(&registry, "rule-1", 1);
+        insert_rule(&registry, "rule-2", 0);
+
+        crate::audit::append_registry_event(
+            &registry.connection,
+            "rule-1",
+            "rule_created",
+            "codex",
+            r#"{"step":1}"#,
+            10,
+        )
+        .expect("append first registry event");
+        crate::audit::append_registry_event(
+            &registry.connection,
+            "rule-2",
+            "rule_created",
+            "codex",
+            r#"{"step":2}"#,
+            11,
+        )
+        .expect("append second registry event");
+        crate::audit::append_registry_event(
+            &registry.connection,
+            "rule-1",
+            "rule_updated",
+            "codex",
+            r#"{"step":3}"#,
+            12,
+        )
+        .expect("append third registry event");
+        crate::audit::append_registry_event(
+            &registry.connection,
+            "rule-1",
+            "rule_retired",
+            "codex",
+            r#"{"step":4}"#,
+            13,
+        )
+        .expect("append fourth registry event");
+
+        let all = registry
+            .rule_events_since(None, None, 0, 10)
+            .expect("read all registry events");
+        assert_eq!(rule_event_seqs(&all), vec![1, 2, 3, 4]);
+        assert!(all.iter().all(|event| !event.archived));
+
+        let rule_events = registry
+            .rule_events_since(Some("rule-1"), None, 1, 10)
+            .expect("resume rule events");
+        assert_eq!(rule_event_seqs(&rule_events), vec![3, 4]);
+
+        let kind_events = registry
+            .rule_events_since(Some("rule-1"), Some("rule_retired"), 0, 10)
+            .expect("filter by kind");
+        assert_eq!(rule_event_seqs(&kind_events), vec![4]);
+
+        let empty = registry
+            .rule_events_since(None, None, 0, 0)
+            .expect("zero limit is allowed");
+        assert!(empty.is_empty());
+
+        let first_batch = registry
+            .rule_events_since(Some("rule-1"), None, 0, 1)
+            .expect("first batch");
+        assert_eq!(rule_event_seqs(&first_batch), vec![1]);
+
+        let second_batch = registry
+            .rule_events_since(Some("rule-1"), None, first_batch.last().unwrap().seq, 1)
+            .expect("second batch");
+        assert_eq!(rule_event_seqs(&second_batch), vec![3]);
+
+        let third_batch = registry
+            .rule_events_since(Some("rule-1"), None, second_batch.last().unwrap().seq, 1)
+            .expect("third batch");
+        assert_eq!(rule_event_seqs(&third_batch), vec![4]);
+
+        let negative = registry
+            .rule_events_since(None, None, 0, -1)
+            .expect_err("negative limits must be rejected")
+            .to_string();
+        assert!(negative.contains("1000"), "{negative}");
+
+        let over = registry
+            .rule_events_since(None, None, 0, crate::WATCH_BATCH_LIMIT + 1)
+            .expect_err("over-cap limits must be rejected")
+            .to_string();
+        assert!(over.contains("1000"), "{over}");
     }
 }

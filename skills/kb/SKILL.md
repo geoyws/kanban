@@ -94,8 +94,8 @@ Selector rule: board-owned commands such as `task`, `tag`, `search`, `claim`,
 and `attention` should normally use `--project NAME` remotely. Registry-owned
 `rule` commands must not receive `--project`, `--workspace`, or `--db`; rules
 live once in the registry and select boards through `ALL`, `ONLY:<board>`, and
-`EXCEPT:<board>` tags. In particular, use `hax-kb r ls --json`, never
-`hax-kb r ls --project kanban`.
+`EXCEPT:<board>` tags. Registry watch helpers also reject board selectors and
+`--all`. In particular, use `hax-kb r ls --json`, never `hax-kb r ls --project kanban`.
 
 ## Aliases
 
@@ -577,6 +577,42 @@ as the board's identity.
 `--limit` must be zero or more. A negative one reads as *no limit* in SQL, so it
 is refused rather than silently handing back everything you asked to bound.
 
+## Watch — cursor-native live subscription
+
+`kb watch` is the canonical long-running process over the append-only ledgers.
+It is `longRunning` and `readOnly`, so generated MCP tool schemas exclude it.
+`kb events` stays the newest-first snapshot reader, and `/live` remains the
+compatibility invalidation socket for the browser.
+
+```bash
+kb watch --project NAME --task t-12345678 --cursor 0 --follow --json
+kb watch --registry --cursor CURSOR --limit 100 --json
+```
+
+Rules:
+
+- Exactly one scope is active at a time: a board via `--project`, a task within
+  that board via `--task`, a registry rule via `--rule`, or the registry via
+  `--registry`.
+- Registry-scope watch rejects board selectors and `--all`; board scope may use
+  `--all` only where the underlying trail already supports archived rows.
+- `--cursor` is opaque. Literal `0` bootstraps from the start, and a persisted
+  cursor is bound to the exact source, selector, kind, archive state, and last
+  delivered `seq`.
+- Malformed, mismatched, or future cursors fail closed.
+- `--follow` reopens read-only transactions between polls and emits rows
+  synchronously, with no intermediate queue. It requires `--limit` to be at
+  least `1`, so `--follow --limit 0` fails.
+- `--limit` is constrained to `0..1000` in every mode; follow mode additionally
+  rejects `0`.
+- `--db PATH` opens that exact database file.
+- NDJSON envelopes carry `version`, `scope`, `cursor`, `type`, and `payload`
+  on stdout only; errors and diagnostics go to stderr.
+- Heartbeats fill idle gaps.
+- Secrets are redacted recursively before emission.
+- `payload` stays the existing event JSON, including `seq` as the ledger row
+  number.
+
 ## Archival — bounded hot indexes, intact history
 
 ```bash
@@ -650,7 +686,9 @@ implements no authentication and trusts the edge, so the only correct value is
 the default. Updating is `install` then `systemctl restart kanban-serve`; the
 MCP server's in-place swap does not apply to an HTTP server. `/live` upgrades to
 a WebSocket and sends revision-only refresh notifications; agent CLI/MCP access
-does not depend on that socket.
+does not depend on that socket. That socket is compatibility invalidation only;
+`kb watch` is the canonical long-running stream over the append-only ledgers,
+and `kb events` stays the newest-first snapshot view.
 
 ## As an MCP server
 
