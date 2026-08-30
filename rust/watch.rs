@@ -259,6 +259,21 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
     let board_source = canonical_source_path(&board_path)?;
     let archived = args.has("all");
     let store = Store::open_readonly(&board_path)?;
+    if let Some(task_id) = task.as_deref()
+        && !store.watch_subject_exists(task_id)?
+    {
+        bail!("task {task_id} is not present in this board or its event history");
+    }
+    for relation in &relations {
+        let (kind, id) = relation
+            .split_once(':')
+            .expect("normalized relations always contain a separator");
+        if !store.watch_relation_target_exists(kind, id)? {
+            bail!(
+                "relation {relation} does not name a current task or an exact historical relation target"
+            );
+        }
+    }
     validate_kinds(&kinds, BOARD_EVENT_KINDS, |kind| {
         store.event_kind_exists(kind)
     })?;
@@ -1234,6 +1249,47 @@ mod tests {
             Source::Board { board_name, .. } => assert!(board_name.is_none()),
             Source::Registry => panic!("expected board source"),
         }
+    }
+
+    #[test]
+    fn direct_db_watch_rejects_unknown_subjects_and_relation_targets_but_accepts_history() {
+        let root = temp_watch_dir("direct-db-subject-relations");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-removed"),
+            "task_removed",
+            "codex",
+            r#"{"_semanticV1":{"relations":[{"kind":"parent","type":"story","id":"s-removed"}]}}"#,
+            1,
+        )
+        .expect("append historical semantic event");
+
+        let resolve = |extra: &[&str]| {
+            let mut raw = vec![
+                "watch".to_owned(),
+                "--db".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ];
+            raw.extend(extra.iter().map(|value| (*value).to_owned()));
+            let args = super::super::Args::parse(raw).expect("parse watch args");
+            resolve_with_source(&args, Some(path.clone()))
+        };
+
+        assert!(resolve(&["--task", "t-removed"]).is_ok());
+        assert!(resolve(&["--relation", "parent:s-removed"]).is_ok());
+        let subject = resolve(&["--task", "t-unknown"])
+            .expect_err("unknown task selector must fail")
+            .to_string();
+        assert!(subject.contains("not present"), "{subject}");
+        let relation = resolve(&["--relation", "parent:s-unknown"])
+            .expect_err("unknown relation target must fail")
+            .to_string();
+        assert!(
+            relation.contains("exact historical relation target"),
+            "{relation}"
+        );
     }
 
     #[test]

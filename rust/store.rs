@@ -1320,6 +1320,52 @@ impl Store {
         )? != 0)
     }
 
+    /// A watch selector may name a task that has since been removed, but a
+    /// typo must not read as an authoritative empty stream.
+    pub fn watch_subject_exists(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM tasks WHERE id=?1 \
+                 UNION ALL \
+                 SELECT 1 FROM events WHERE task_id=?1 \
+                 LIMIT 1\
+             )",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// Relation predicates accept current task identities and exact targets
+    /// retained in semantic history. Unknown IDs fail closed, while removed
+    /// parents and dependencies remain replayable.
+    pub fn watch_relation_target_exists(&self, kind: &str, id: &str) -> Result<bool> {
+        let current = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?)",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if current {
+            return Ok(true);
+        }
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(\
+                 SELECT 1 \
+                 FROM events, \
+                      json_each(\
+                          CASE WHEN json_valid(events.payload) \
+                               THEN CASE WHEN json_type(events.payload,'$._semanticV1.relations')='array' \
+                                         THEN json_extract(events.payload,'$._semanticV1.relations') \
+                                         ELSE '[]' END \
+                               ELSE '[]' END\
+                      ) relation \
+                 WHERE json_extract(relation.value,'$.kind')=?1 \
+                   AND json_extract(relation.value,'$.id')=?2\
+             )",
+            params![kind, id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
         let name = nonempty(name, "name")?;
         let actor = nonempty(actor, "actor")?;
@@ -3888,6 +3934,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(filtered.len(), 1);
+        assert!(store.watch_subject_exists("t-removed").unwrap());
+        assert!(!store.watch_subject_exists("t-never-existed").unwrap());
+    }
+
+    #[test]
+    fn watch_relation_targets_accept_current_and_historical_ids_but_reject_unknown_ids() {
+        let store = test_store("watch-relation-targets");
+        insert_task(&store, "s-current");
+        assert!(
+            store
+                .watch_relation_target_exists("parent", "s-current")
+                .unwrap()
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-historical"),
+            "task_removed",
+            "test",
+            r#"{"_semanticV1":{"relations":[{"kind":"parent","type":"story","id":"s-historical"}]}}"#,
+            1,
+        )
+        .unwrap();
+        assert!(
+            store
+                .watch_relation_target_exists("parent", "s-historical")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .watch_relation_target_exists("parent", "s-never-existed")
+                .unwrap()
+        );
     }
 
     #[test]
