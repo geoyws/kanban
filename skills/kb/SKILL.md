@@ -23,8 +23,8 @@ read or write, check the current host **before attempting SSH**:
 
 ```bash
 hostname                   # if this prints exactly "hax", stay in this shell
-command -v kb              # on hax, must resolve the installed HAX binary
-kb v                       # on hax, verify the installed binary
+test "$(command -v kb)" = /root/.local/bin/kb
+/root/.local/bin/kb v
 ```
 
 If `hostname` prints anything other than exactly `hax`, enter HAX and verify the
@@ -33,8 +33,8 @@ remote boundary there:
 ```bash
 ssh hax
 hostname                   # must now print exactly "hax"
-command -v kb              # must resolve the installed HAX binary
-kb v
+test "$(command -v kb)" = /root/.local/bin/kb
+/root/.local/bin/kb v
 ```
 
 A non-interactive `ssh hax 'kb ...'` does **not** load HAX's interactive
@@ -50,8 +50,10 @@ use the bundled argv-preserving wrapper for one-shot commands:
 
 The wrapper verifies that the remote host is exactly `hax`, invokes the fixed
 installed path `/root/.local/bin/kb`, and preserves spaces and shell
-metacharacters as literal arguments. Use an interactive `ssh hax` session for a
-related series of commands or prose-heavy mutations; use the wrapper for
+metacharacters as literal arguments. In an interactive `ssh hax` shell, use
+the same exact fail-closed check and invocation as above; any other `kb`
+resolution is a stale or shadowed PATH. Use an interactive `ssh hax` session
+for a related series of commands or prose-heavy mutations; use the wrapper for
 deterministic one-shots. Never fall back to a local `kb` after either path
 fails.
 
@@ -479,6 +481,9 @@ task contains nothing.
 **Tag your rows.** A board that cannot say whether a task is infra, queuer or
 askie makes you read titles to find out, and you are the one who knows.
 
+Presentation notation may prefix a registered Kanban tag with `:` as `:slug`,
+but storage and CLI always use the bare slug (`--tag slug`).
+
 ```bash
 kb tag ls --json                                   # the vocabulary, with use counts
 kb tag new infra --description "hosts, containers, deploys" --as "$AGENT" --json
@@ -507,6 +512,9 @@ subsystem as much as the task it produces does.
 **Tags are not lanes.** `lane` is *who picks this up* and `claim --next` routes
 on it; a tag is *what part of the system this touches*. Putting a subsystem in
 `lane` silently changes which driver receives the work.
+
+`@:team` is atmux routing identity, not a tag. Do not encode board, lane, team,
+host, tier, actor, priority, or typed row IDs as tags.
 
 Retiring a tag rows still carry is refused and says how many; `--force` strips it
 from them and records the count in the trail.
