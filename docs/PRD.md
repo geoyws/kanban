@@ -23,6 +23,9 @@ and transfer work to a replacement agent when context or tokens run low.
 6. Preserve history and prevent concurrent ownership or partial transitions.
 7. Replace atmux's embedded Kanban implementation and make atmux a consumer of
    this portable work-state engine.
+8. Expose a cursor-native `kb watch` process over the append-only ledgers,
+   while keeping `kb events` as the newest-first snapshot reader and `/live`
+   as compatibility invalidation for the served UI.
 
 ## Non-goals
 
@@ -70,6 +73,9 @@ write domains.
 - Fuse exact identifier/text retrieval, SQLite full-text ranking, and private
   local semantic similarity through one implementation shared by CLI, MCP, and
   the served UI.
+- Stream append-only board and registry ledger changes through `kb watch` with
+  one scope per invocation, opaque cursor resume, stdout NDJSON, stderr
+  diagnostics, and heartbeats for idle periods.
 - Return source-backed citations and bounded snippets, never an uncited
   synthesized answer.
 - Support project, source, status, tag, lane, time, and archive filters.
@@ -143,6 +149,8 @@ A handoff is valid only when:
 - Two processes cannot simultaneously own the same task.
 - An outgoing and incoming agent can complete a handoff using only Kanban and
   the repository checkout.
+- A saved watch cursor resumes the same ledger scope after restart and rejects
+  mismatched or future cursors.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
 

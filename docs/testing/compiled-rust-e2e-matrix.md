@@ -24,6 +24,7 @@ The release gate runs `cargo test --test e2e` after Cargo builds the production
 | SQLite-native RAG retrieval | Separate processes prove exact-ID top-one, the five-query paraphrase corpus, filters, cold-history opt-in, cross-board isolation, bounded cited results, explicit vector rebuild, and V12-to-V13 knowledge preservation. |
 | MCP search parity | The generated `search` read tool and `search_rebuild` write tool execute the real CLI over stdio and return a cited source. |
 | Served search | A real loopback HTTP conversation retrieves a cited cross-board result; byte comparison and source guards prove the pages expose no board mutation. |
+| Cursor-native watch | Exactly five compiled-process tests cover literal-0 bootstrap, persisted opaque cursors, scope and selector rejection, malformed or future cursor rejection, and heartbeat delivery across read-only reopen cycles. |
 | Deployment ledger | Separate compiled processes prove capability ownership, idempotent start, exact served-commit success, derived current release, CLI/MCP parity, and real HTTP rendering of the cross-board matrix and attempt detail. |
 | Deployment self-archive | A real archive process moves only old terminal non-current attempts out of default lists and hot partial indexes, keeps started and current successes hot, retains cold search and `--all` access, and proves a repeated sweep is idempotent. |
 | Browser-backed operator approval | A real Chrome session loads the compiled `kanban serve` page, types into the live comment box, watches the quick labels switch to `Comment and Approve` / `Comment and Reject`, clicks a real submit button, and verifies the persisted decision/comment through the compiled CLI/store boundary. |
@@ -33,13 +34,10 @@ not E2E evidence. The gate is incomplete until the compiled executable passes
 this matrix on a clean test data directory, including the real-browser path
 above.
 
-## 2026-08-16 release receipt
+## Watch coverage note
 
-- `cargo clippy --all-targets --locked -- -D warnings`: pass.
-- `cargo test --locked`: 5 compiled-binary E2E scenarios pass.
-- `cargo build --release --locked`: pass.
-- Eight read-consistent private-board snapshots opened with the release binary:
-  3,046 tasks total with per-board counts 9, 4, 308, 1,211, 24, 1,343, 90,
-  and 57.
-- atmux `tests/unit/adapters/kanban-cli.test.ts` against the release binary:
-  10 tests and 58 assertions pass.
+- Exactly five compiled-process watch tests are defined in this matrix.
+- They cover literal-0 bootstrap, persisted opaque cursors, malformed and
+  future cursor rejection, selector and scope mismatch rejection, and heartbeat
+  delivery across read-only reopen cycles.
+- This matrix does not claim deployment evidence or full-suite release status.

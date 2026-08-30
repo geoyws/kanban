@@ -527,7 +527,10 @@ and byte-for-byte process-boundary tests.
 `/live` is a WebSocket notification channel. It sends only revision notices and
 heartbeats; the browser fetches the canonical server-rendered page after a board
 changes. It never sends board content, cookies, credentials or lease tokens, and
-it defers a refresh while a reply is being typed.
+it defers a refresh while a reply is being typed. The compatibility socket
+stays on `/live`; the canonical long-running subscription is `kb watch`, which
+reads the append-only ledgers directly and leaves `kb events` as the newest-
+first snapshot view.
 
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google
@@ -580,6 +583,7 @@ row at the level. Projects with no queued work sink to the end.
 ```bash
 kb stale --json           # [{ id, staleMinutes, idleMinutes, overdueMinutes, lastSignal }]
 kb events --kind lease_seized
+kb watch --project NAME --json
 ```
 
 Snapshots are restorable, not just writable:
