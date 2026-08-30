@@ -649,6 +649,108 @@ pub(crate) fn event(
     actor: Option<&str>,
     payload: Value,
 ) -> Result<()> {
+    let status = task_id
+        .map(|id| {
+            connection
+                .query_row("SELECT status FROM tasks WHERE id=?", [id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+        })
+        .transpose()?
+        .flatten();
+    event_with_status(
+        connection,
+        task_id,
+        kind,
+        actor,
+        payload,
+        status.as_deref(),
+        status.as_deref(),
+    )
+}
+
+fn semantic_snapshot(
+    connection: &Connection,
+    task_id: &str,
+    prior_status: Option<&str>,
+    current_status: Option<&str>,
+) -> Result<Value> {
+    let task = require_task(connection, task_id)?;
+    let mut tags = connection
+        .prepare("SELECT tag FROM task_tags WHERE task_id=? ORDER BY tag")?
+        .query_map([task_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    tags.sort();
+
+    let mut relations = Vec::new();
+    let mut current = task.parent_id.clone();
+    let mut first = true;
+    while let Some(id) = current {
+        let parent = require_task(connection, &id)?;
+        relations.push(json!({
+            "kind": if first { "parent" } else { "ancestor" },
+            "type": parent.task_type,
+            "id": parent.id,
+        }));
+        current = parent.parent_id;
+        first = false;
+    }
+    let mut statement = connection.prepare(
+        "SELECT t.type,t.id FROM tasks t JOIN task_dependencies d ON d.depends_on=t.id WHERE d.task_id=? ORDER BY t.type,t.id",
+    )?;
+    let dependencies = statement
+        .query_map([task_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (task_type, id) in dependencies {
+        relations.push(json!({ "kind": "depends-on", "type": task_type, "id": id }));
+    }
+    relations.sort_by_key(|relation| relation.to_string());
+    Ok(json!({
+        "subject": { "type": task.task_type, "id": task.id },
+        "tags": tags,
+        "relations": relations,
+        "priorStatus": prior_status,
+        "currentStatus": current_status,
+    }))
+}
+
+fn event_with_status(
+    connection: &Connection,
+    task_id: Option<&str>,
+    kind: &str,
+    actor: Option<&str>,
+    mut payload: Value,
+    prior_status: Option<&str>,
+    current_status: Option<&str>,
+) -> Result<()> {
+    if let Some(task_id) = task_id {
+        payload["_semanticV1"] =
+            semantic_snapshot(connection, task_id, prior_status, current_status)?;
+    } else {
+        payload["_semanticV1"] = Value::Null;
+    }
+    event_at(connection, task_id, kind, actor, payload, now_ms())
+}
+
+pub(crate) fn event_at(
+    connection: &Connection,
+    task_id: Option<&str>,
+    kind: &str,
+    actor: Option<&str>,
+    payload: Value,
+    created_at: i64,
+) -> Result<()> {
+    let mut payload = payload;
+    if task_id.is_some() {
+        if !matches!(payload.get("_semanticV1"), Some(Value::Object(_))) {
+            bail!("task events require an object _semanticV1 snapshot");
+        }
+    } else if payload.get("_semanticV1").is_none() {
+        payload["_semanticV1"] = Value::Null;
+    }
     let actor = actor.context("actor is required for audited mutation")?;
     crate::audit::append_board_event(
         connection,
@@ -656,7 +758,7 @@ pub(crate) fn event(
         kind,
         actor,
         &payload.to_string(),
-        now_ms(),
+        created_at,
     )
 }
 
@@ -755,12 +857,14 @@ fn expire_claims(connection: &Connection, now: i64) -> Result<()> {
             "UPDATE tasks SET status='todo',assignee=CASE WHEN assignee=? THEN NULL ELSE assignee END,updated_at=? WHERE id=? AND status='in_progress'",
             params![agent, now, task_id],
         )?;
-        event(
+        event_with_status(
             connection,
             Some(&task_id),
             "claim_expired",
             Some(&agent),
             json!({}),
+            Some("in_progress"),
+            Some("todo"),
         )?;
     }
     Ok(())
@@ -1050,9 +1154,6 @@ impl Store {
         include_archived: bool,
     ) -> Result<Vec<Event>> {
         validate_event_limit(limit)?;
-        if let Some(id) = task {
-            require_task(&self.connection, id)?;
-        }
         let mut sql = String::from(
             "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
              FROM events WHERE seq>?",
@@ -1079,6 +1180,211 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Ascending watch rows with semantic predicates applied before LIMIT.
+    ///
+    /// Watch filters must bound delivered events rather than the raw ledger
+    /// page: a sparse match at sequence 500 is still the first event in a
+    /// `--limit 1` request. The JSON predicates deliberately require the
+    /// private semantic snapshot, so legacy rows never match a semantic
+    /// filter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn events_since_filtered(
+        &self,
+        task: Option<&str>,
+        kinds: &[String],
+        relations: &[String],
+        prior_statuses: &[String],
+        current_statuses: &[String],
+        tags: &[String],
+        cursor: i64,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<Vec<Event>> {
+        validate_event_limit(limit)?;
+        let mut sql = String::from(
+            "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
+             FROM events WHERE seq>?",
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
+        if let Some(id) = task {
+            sql.push_str(" AND task_id=?");
+            values.push(Box::new(id.to_owned()));
+        }
+        if !kinds.is_empty() {
+            sql.push_str(" AND kind IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", kinds.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                kinds
+                    .iter()
+                    .cloned()
+                    .map(|kind| Box::new(kind) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        if !include_archived {
+            sql.push_str(" AND archived=0");
+        }
+        let semantic_payload = "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END";
+        let semantic = !relations.is_empty()
+            || !prior_statuses.is_empty()
+            || !current_statuses.is_empty()
+            || !tags.is_empty();
+        if semantic {
+            sql.push_str(&format!(
+                " AND json_type({semantic_payload},'$._semanticV1')='object'"
+            ));
+        }
+        if !relations.is_empty() {
+            let semantic_relations = format!(
+                "CASE WHEN json_type({semantic_payload},'$._semanticV1.relations')='array' \
+                 THEN json_extract({semantic_payload},'$._semanticV1.relations') \
+                 ELSE '[]' END"
+            );
+            let mut clauses = Vec::new();
+            for relation in relations {
+                let Some((kind, id)) = relation.split_once(':') else {
+                    sql.push_str(" AND 0");
+                    continue;
+                };
+                clauses.push(format!(
+                    "EXISTS (SELECT 1 FROM json_each({semantic_relations}) r \
+                     WHERE r.type='object' \
+                       AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.kind')=? \
+                       AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.id')=?)"
+                ));
+                values.push(Box::new(kind.to_owned()));
+                values.push(Box::new(id.to_owned()));
+            }
+            if !clauses.is_empty() {
+                sql.push_str(" AND (");
+                sql.push_str(&clauses.join(" OR "));
+                sql.push(')');
+            }
+        }
+        if !prior_statuses.is_empty() {
+            sql.push_str(" AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.priorStatus') IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", prior_statuses.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                prior_statuses
+                    .iter()
+                    .cloned()
+                    .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        if !current_statuses.is_empty() {
+            sql.push_str(&format!(
+                " AND json_extract({semantic_payload},'$._semanticV1.currentStatus') IN ("
+            ));
+            sql.push_str(
+                &std::iter::repeat_n("?", current_statuses.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push(')');
+            values.extend(
+                current_statuses
+                    .iter()
+                    .cloned()
+                    .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        if !tags.is_empty() {
+            let semantic_tags = format!(
+                "CASE WHEN json_type({semantic_payload},'$._semanticV1.tags')='array' \
+                 THEN json_extract({semantic_payload},'$._semanticV1.tags') \
+                 ELSE '[]' END"
+            );
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM json_each({semantic_tags}) t WHERE t.value IN ("
+            ));
+            sql.push_str(
+                &std::iter::repeat_n("?", tags.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push_str("))");
+            values.extend(
+                tags.iter()
+                    .cloned()
+                    .map(|tag| Box::new(tag) as Box<dyn rusqlite::ToSql>),
+            );
+        }
+        sql.push_str(" ORDER BY seq ASC LIMIT ?");
+        values.push(Box::new(limit));
+        let mut statement = self.connection.prepare(&sql)?;
+        statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                board_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE kind=?)",
+            [kind],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// A watch selector may name a task that has since been removed, but a
+    /// typo must not read as an authoritative empty stream.
+    pub fn watch_subject_exists(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM tasks WHERE id=?1 \
+                 UNION ALL \
+                 SELECT 1 FROM events WHERE task_id=?1 \
+                 LIMIT 1\
+             )",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// Relation predicates accept current task identities and exact targets
+    /// retained in semantic history. Unknown IDs fail closed, while removed
+    /// parents and dependencies remain replayable.
+    pub fn watch_relation_target_exists(&self, kind: &str, id: &str) -> Result<bool> {
+        let current = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?)",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if current {
+            return Ok(true);
+        }
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(\
+                 SELECT 1 \
+                 FROM events, \
+                      json_each(\
+                          CASE WHEN json_valid(events.payload) \
+                               THEN CASE WHEN json_type(events.payload,'$._semanticV1.relations')='array' \
+                                         THEN json_extract(events.payload,'$._semanticV1.relations') \
+                                         ELSE '[]' END \
+                               ELSE '[]' END\
+                      ) relation \
+                 WHERE relation.type='object' \
+                   AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.kind')=?1 \
+                   AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.id')=?2\
+             )",
+            params![kind, id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
     }
 
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
@@ -1158,12 +1464,14 @@ impl Store {
         // carried no actor. An absent actor is still recorded as absent —
         // inventing one would be worse than the gap.
         set_tags(&transaction, &id, &input.tags)?;
-        event(
+        event_with_status(
             &transaction,
             Some(&id),
             "task_added",
             input.actor.as_deref(),
             json!({ "type": input.task_type, "status": input.status }),
+            None,
+            Some(&input.status),
         )?;
         transaction.commit()?;
         self.require_task(&id)
@@ -1316,12 +1624,14 @@ impl Store {
         if status != "in_progress" {
             transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
         }
-        event(
+        event_with_status(
             &transaction,
             Some(id),
             "task_moved",
             Some(&actor),
             json!({"status": status, "seizedFrom": seized.map(|claim| claim.agent_id), "gateBypassed": gate_bypassed}),
+            Some(&current.status),
+            Some(status),
         )?;
         transaction.commit()?;
         self.require_task(id)
@@ -1361,8 +1671,7 @@ impl Store {
             [id],
             |row| row.get::<_, i64>(0),
         )?;
-        transaction.execute("DELETE FROM tasks WHERE id=?", [id])?;
-        event(
+        event_with_status(
             &transaction,
             Some(id),
             "task_removed",
@@ -1373,7 +1682,10 @@ impl Store {
                 "discardedCheckpoints": checkpoints,
                 "seizedFrom": seized.map(|claim| claim.agent_id),
             }),
+            Some(&task.status),
+            None,
         )?;
+        transaction.execute("DELETE FROM tasks WHERE id=?", [id])?;
         transaction.commit()?;
         Ok(())
     }
@@ -1578,12 +1890,14 @@ impl Store {
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",
             params![agent, now, task.id],
         )?;
-        event(
+        event_with_status(
             &transaction,
             Some(&task.id),
             "task_claimed",
             Some(&agent),
             json!({"expiresAt": now+options.lease_ms}),
+            Some(&task.status),
+            Some("in_progress"),
         )?;
         let result = active_claim(&transaction, &task.id, now)?.context("claim was not created")?;
         transaction.commit()?;
@@ -1679,12 +1993,19 @@ impl Store {
                 params![now_ms(), id],
             )?;
         }
-        event(
+        let current_status = if keep_status {
+            require_task(&transaction, id)?.status
+        } else {
+            "todo".to_owned()
+        };
+        event_with_status(
             &transaction,
             Some(id),
             "claim_released",
             Some(&claim.agent_id),
             json!({}),
+            Some("in_progress"),
+            Some(&current_status),
         )?;
         transaction.commit()?;
         Ok(())
@@ -1751,6 +2072,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
+        let prior_status = require_task(&transaction, &input.task_id)?.status;
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -1771,12 +2093,14 @@ impl Store {
         if input.state != "continue" {
             transaction.execute("DELETE FROM task_claims WHERE task_id=?", [&input.task_id])?;
         }
-        event(
+        event_with_status(
             &transaction,
             Some(&input.task_id),
             "checkpoint_added",
             Some(&input.author),
             json!({"seq":seq,"state":input.state}),
+            Some(&prior_status),
+            Some(status),
         )?;
         let result = transaction.query_row(
             "SELECT * FROM checkpoints WHERE seq=?",
@@ -2435,6 +2759,11 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
+        let prior_status = input
+            .task_id
+            .as_deref()
+            .map(|task_id| require_task(&transaction, task_id).map(|task| task.status))
+            .transpose()?;
         // A task and a lease travel together: a lease exists only over a task,
         // and handing a task over without one would let any caller move work
         // they do not hold. Neither half is meaningful alone, so the pair is
@@ -2491,12 +2820,14 @@ impl Store {
                 params![now, task_id],
             )?;
         }
-        event(
+        event_with_status(
             &transaction,
             input.task_id.as_deref(),
             "handoff_created",
             Some(&input.from_agent),
             json!({"handoffID":id,"checkpointSeq":checkpoint_seq,"reason":input.reason,"toAgent":input.to_agent,"priority":input.priority,"priorityLevel":priority_level(input.priority)}),
+            prior_status.as_deref(),
+            Some("todo"),
         )?;
         let result =
             transaction.query_row("SELECT * FROM handoffs WHERE id=?", [&id], handoff_row)?;
@@ -2613,12 +2944,14 @@ impl Store {
             params![agent, now, task.id],
         )?;
         transaction.execute("UPDATE handoffs SET status='accepted',accepted_at=?,accepted_by=?,accepted_session=? WHERE id=? AND status='pending'",params![now,agent,session,id])?;
-        event(
+        event_with_status(
             &transaction,
             Some(&task.id),
             "handoff_accepted",
             Some(&agent),
             json!({"handoffID":id,"expiresAt":now+lease_ms}),
+            Some(&task.status),
+            Some("in_progress"),
         )?;
         let updated =
             transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
@@ -2823,12 +3156,14 @@ impl Store {
                     "UPDATE tasks SET status='in_progress',metadata=?,updated_at=? WHERE id=?",
                     params![Value::Object(metadata).to_string(), now, parent.id],
                 )?;
-                event(
+                event_with_status(
                     &transaction,
                     Some(&parent.id),
                     "epic_advanced",
                     Some(&actor),
                     json!({"from":"ready","to":"in-progress"}),
+                    Some(&parent.status),
+                    Some("in_progress"),
                 )?;
                 parent_flipped = true;
             }
@@ -2853,12 +3188,14 @@ impl Store {
                 "INSERT INTO tasks(id,type,parent_id,title,body,assignee,lane,deliverable,stale_minutes,driver_only,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![child_id,"task",id,format!("{} {id}",if entering_review {"review"} else {"merge"}),format!("Story {id} entered {target}."),assignee,if entering_review {"review"} else {"misc"},Option::<String>::None,Option::<i64>::None,0,"in_progress",1,now,now,Option::<i64>::None,json!({"workflowDispatch":target}).to_string()],
             )?;
-            event(
+            event_with_status(
                 &transaction,
                 Some(&child_id),
                 "task_created",
                 Some(&actor),
                 json!({"storyID":id,"workflowDispatch":target}),
+                None,
+                Some("in_progress"),
             )?;
             if !entering_review {
                 metadata.insert("mergeTaskID".into(), Value::String(child_id.clone()));
@@ -2876,12 +3213,14 @@ impl Store {
                 id
             ],
         )?;
-        event(
+        event_with_status(
             &transaction,
             Some(id),
             "story_advanced",
             Some(&actor),
             json!({"from":current,"to":target,"dispatchedTaskID":dispatched}),
+            Some(&story.status),
+            Some(status),
         )?;
         transaction.commit()?;
         Ok(
@@ -2976,12 +3315,12 @@ impl Store {
     }
 
     pub fn record_system_event(&self, kind: &str, actor: &str, payload: Value) -> Result<()> {
-        crate::audit::append_board_event(
+        event_at(
             &self.connection,
             None,
             kind,
-            nonempty(actor, "actor")?,
-            &payload.to_string(),
+            Some(nonempty(actor, "actor")?),
+            payload,
             now_ms(),
         )
     }
@@ -3444,6 +3783,421 @@ mod tests {
 
     fn board_event_seqs(events: &[Event]) -> Vec<i64> {
         events.iter().map(|event| event.seq).collect()
+    }
+
+    #[test]
+    fn task_added_event_contains_semantic_snapshot() {
+        let mut store = test_store("semantic-add");
+        store.add_tag("zeta", None, Some("test")).unwrap();
+        store.add_tag("alpha", None, Some("test")).unwrap();
+        store
+            .add_task(AddTask {
+                id: Some("t-semantic".into()),
+                task_type: "task".into(),
+                parent_id: None,
+                title: "semantic".into(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".into(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: json!({}),
+                actor: Some("test".into()),
+                tags: vec!["zeta".into(), "alpha".into()],
+            })
+            .unwrap();
+        let event = store
+            .events(Some("t-semantic"), Some("task_added"), 1, false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let snapshot = &event.payload["_semanticV1"];
+        assert_eq!(
+            snapshot["subject"],
+            json!({"type":"task","id":"t-semantic"})
+        );
+        assert_eq!(snapshot["tags"], json!(["alpha", "zeta"]));
+        assert_eq!(snapshot["priorStatus"], Value::Null);
+        assert_eq!(snapshot["currentStatus"], "todo");
+    }
+
+    #[test]
+    fn task_moved_event_records_status_transition() {
+        let mut store = test_store("semantic-move");
+        store
+            .add_task(AddTask {
+                id: Some("t-move".into()),
+                task_type: "task".into(),
+                parent_id: None,
+                title: "move".into(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".into(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: json!({}),
+                actor: Some("test".into()),
+                tags: Vec::new(),
+            })
+            .unwrap();
+        store
+            .move_task("t-move", "done", "test", json!({}), false)
+            .unwrap();
+        let event = store
+            .events(Some("t-move"), Some("task_moved"), 1, false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let snapshot = &event.payload["_semanticV1"];
+        assert_eq!(snapshot["priorStatus"], "todo");
+        assert_eq!(snapshot["currentStatus"], "done");
+    }
+
+    #[test]
+    fn semantic_snapshot_sorts_typed_parent_ancestor_and_dependency_relations() {
+        let store = test_store("semantic-relations");
+        for id in ["e-root", "e-parent", "s-parent", "d-one", "t-child"] {
+            insert_task(&store, id);
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET type='epic',parent_id=? WHERE id=?",
+                params![Option::<String>::None, "e-root"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET type='epic',parent_id=? WHERE id=?",
+                params!["e-root", "e-parent"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET type='story',parent_id=? WHERE id=?",
+                params!["e-parent", "s-parent"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET parent_id=? WHERE id=?",
+                params!["s-parent", "t-child"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
+                params!["t-child", "d-one"],
+            )
+            .unwrap();
+        let snapshot =
+            semantic_snapshot(&store.connection, "t-child", Some("todo"), Some("todo")).unwrap();
+        let relations = snapshot["relations"].as_array().unwrap();
+        let encoded = relations.iter().map(Value::to_string).collect::<Vec<_>>();
+        assert!(encoded.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(relations.contains(&json!({"kind":"parent","type":"story","id":"s-parent"})));
+        assert!(relations.contains(&json!({"kind":"ancestor","type":"epic","id":"e-parent"})));
+        assert!(relations.contains(&json!({"kind":"ancestor","type":"epic","id":"e-root"})));
+        assert!(relations.contains(&json!({"kind":"depends-on","type":"task","id":"d-one"})));
+    }
+
+    #[test]
+    fn events_since_replays_removed_task_subjects() {
+        let mut store = test_store("events-since-removed");
+        store
+            .add_task(AddTask {
+                id: Some("t-removed".into()),
+                task_type: "task".into(),
+                parent_id: None,
+                title: "remove".into(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".into(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: json!({}),
+                actor: Some("test".into()),
+                tags: Vec::new(),
+            })
+            .unwrap();
+        store.remove_task("t-removed", "test", false).unwrap();
+        let events = store
+            .events_since(Some("t-removed"), Some("task_removed"), 0, 10, true)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let filtered = store
+            .events_since_filtered(
+                Some("t-removed"),
+                &["task_removed".to_owned()],
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                10,
+                true,
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert!(store.watch_subject_exists("t-removed").unwrap());
+        assert!(!store.watch_subject_exists("t-never-existed").unwrap());
+    }
+
+    #[test]
+    fn watch_relation_targets_accept_current_and_historical_ids_but_reject_unknown_ids() {
+        let store = test_store("watch-relation-targets");
+        insert_task(&store, "s-current");
+        assert!(
+            store
+                .watch_relation_target_exists("parent", "s-current")
+                .unwrap()
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-invalid-relations"),
+            "task_removed",
+            "test",
+            r#"{"_semanticV1":{"relations":["oops",42,null]}}"#,
+            1,
+        )
+        .unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-historical"),
+            "task_removed",
+            "test",
+            r#"{"_semanticV1":{"relations":[{"kind":"parent","type":"story","id":"s-1"}]}}"#,
+            1,
+        )
+        .unwrap();
+        assert!(store.watch_relation_target_exists("parent", "s-1").unwrap());
+        assert!(
+            !store
+                .watch_relation_target_exists("parent", "not-history")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .watch_relation_target_exists("parent", "s-never-existed")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn filtered_watch_rows_apply_semantics_before_limit_and_fail_closed_on_legacy_rows() {
+        let store = test_store("filtered-watch-sparse");
+        let append = |kind: &str, payload: &str| {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("gone-task"),
+                kind,
+                "codex",
+                payload,
+                1,
+            )
+            .unwrap();
+        };
+        append("legacy", r#"{"note":"no snapshot"}"#);
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        append("malformed", "not json");
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .unwrap();
+        append(
+            "wrong-relations",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":{"kind":"parent","type":"story","id":"s-1"},"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
+        );
+        append(
+            "wrong-tags",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[{"kind":"parent","type":"story","id":"s-1"}],"priorStatus":"todo","currentStatus":"done","tags":{"name":"infra"}}}"#,
+        );
+        append(
+            "wrong-relation-elements",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":["oops",42,null],"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
+        );
+        append(
+            "wanted",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[{"kind":"parent","type":"story","id":"s-1"}],"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
+        );
+        append(
+            "other",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[],"priorStatus":"todo","currentStatus":"review","tags":["docs"]}}"#,
+        );
+        let relations = vec!["parent:s-1".to_owned()];
+        let prior = vec!["todo".to_owned()];
+        let current = vec!["done".to_owned()];
+        let tags = vec!["infra".to_owned()];
+        let rows = store
+            .events_since_filtered(
+                Some("gone-task"),
+                &[
+                    "malformed".to_owned(),
+                    "wrong-relations".to_owned(),
+                    "wrong-tags".to_owned(),
+                    "wrong-relation-elements".to_owned(),
+                    "wanted".to_owned(),
+                ],
+                &relations,
+                &prior,
+                &current,
+                &tags,
+                0,
+                1,
+                true,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "wanted");
+        assert_eq!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &[
+                        "wrong-relations".to_owned(),
+                        "wrong-relation-elements".to_owned(),
+                        "wanted".to_owned(),
+                    ],
+                    &relations,
+                    &prior,
+                    &current,
+                    &[],
+                    0,
+                    1,
+                    true,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec!["wanted".to_owned()]
+        );
+        assert_eq!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &["wrong-tags".to_owned(), "wanted".to_owned()],
+                    &[],
+                    &prior,
+                    &current,
+                    &tags,
+                    0,
+                    1,
+                    true,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec!["wanted".to_owned()]
+        );
+        assert!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &["wrong-relations".to_owned(), "wanted".to_owned()],
+                    &relations,
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    10,
+                    true,
+                )
+                .unwrap()
+                .iter()
+                .all(|event| event.kind == "wanted")
+        );
+        assert!(
+            store
+                .events_since_filtered(
+                    Some("gone-task"),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &["unknown".to_owned()],
+                    0,
+                    10,
+                    true,
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn checkpoint_events_capture_each_projected_status() {
+        let mut store = test_store("checkpoint-status");
+        for (id, state, expected) in [
+            ("t-continue", "continue", "in_progress"),
+            ("t-blocked", "blocked", "blocked"),
+            ("t-done", "done", "done"),
+        ] {
+            insert_task(&store, id);
+            let claim = store
+                .claim(
+                    Some(id),
+                    ClaimOptions {
+                        agent_id: "test".into(),
+                        session_id: None,
+                        lease_ms: 60_000,
+                        caller_lane: None,
+                        role_filter: None,
+                        caller_scope: None,
+                        cross_lane: false,
+                        allow_reassign: false,
+                        git: None,
+                    },
+                )
+                .unwrap();
+            store
+                .checkpoint(CheckpointInput {
+                    task_id: id.into(),
+                    lease_token: claim.claim.lease_token,
+                    author: "test".into(),
+                    session_id: None,
+                    model: None,
+                    state: state.into(),
+                    summary: "summary".into(),
+                    intent: "intent".into(),
+                    next_action: "next".into(),
+                    blockers: Vec::new(),
+                    validations: Vec::new(),
+                    repo_path: None,
+                    branch: None,
+                    head_sha: None,
+                    dirty_summary: None,
+                    root_head: None,
+                })
+                .unwrap();
+            let event = store
+                .events(Some(id), Some("checkpoint_added"), 1, false)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(event.payload["_semanticV1"]["priorStatus"], "in_progress");
+            assert_eq!(event.payload["_semanticV1"]["currentStatus"], expected);
+        }
     }
 
     #[test]

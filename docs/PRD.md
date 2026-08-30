@@ -24,6 +24,7 @@ and transfer work to a replacement agent when context or tokens run low.
 7. Replace atmux's embedded Kanban implementation and make atmux a consumer of
    this portable work-state engine.
 8. Expose a cursor-native `kb watch` process over the append-only ledgers,
+   with additive protocol-v1 event payloads and fail-closed cursor semantics,
    while keeping `kb events` as the newest-first snapshot reader and `/live`
    as compatibility invalidation for the served UI.
 
@@ -74,11 +75,15 @@ write domains.
   local semantic similarity through one implementation shared by CLI, MCP, and
   the served UI.
 - Stream append-only board and registry ledger changes through `kb watch` with
-  one scope per invocation, opaque cursor resume, stdout NDJSON, stderr
-  diagnostics, and heartbeats for idle periods.
+  one scope per invocation, opaque cursor resume, additive protocol-v1
+  payloads, a `--task` subject selector, repeatable `--kind`, `--relation`,
+  `--prior-status`, `--current-status`, and `--tag` predicates, stdout NDJSON, stderr
+  diagnostics, heartbeats for idle periods, and fail-closed unknown or
+  mismatched selectors.
 - Return source-backed citations and bounded snippets, never an uncited
   synthesized answer.
-- Support project, source, status, tag, lane, time, and archive filters.
+- Support project, source, status, tag, lane, time, and archive filters, while
+  keeping board semantic watch predicates off the registry scope.
 - Keep ordinary search read-only. Index repair and semantic-cache persistence
   must be explicit, audited operations covered by backup and doctor workflows.
 
@@ -150,7 +155,8 @@ A handoff is valid only when:
 - An outgoing and incoming agent can complete a handoff using only Kanban and
   the repository checkout.
 - A saved watch cursor resumes the same ledger scope after restart and rejects
-  mismatched or future cursors.
+  mismatched or future cursors. Removed subjects and historical relation
+  targets remain replayable.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
 
@@ -169,17 +175,17 @@ A handoff is valid only when:
 
 ## Current delivery status
 
-The foundation and most atmux parity surfaces are implemented. Seven non-empty
-legacy project sources have been imported into healthy private boards without
-activation, producing a 3,042-row fleet preparation receipt. The aggregate
-dashboard is usable now. Authority cutover remains gated on durable Kanban
-handoffs for live agents, stopped writers, per-project activation receipts,
-consumer restart verification, and a no-legacy-write observation period.
+The dated 2026-08-16 fleet preparation receipt records seven non-empty legacy
+project sources imported into private boards without activation, producing a
+3,042-row preparation snapshot. Those counts are historical evidence, not a
+statement of current fleet health. Authority cutover remains gated on durable
+Kanban handoffs for live agents, stopped writers, per-project activation
+receipts, consumer restart verification, and a no-legacy-write observation
+period.
 
-The production runtime is Rust per ADR-006. The compiled executable passes the
-full process-boundary E2E gate, opens read-consistent snapshots of all eight
-existing private boards (3,046 tasks), and satisfies atmux's focused CLI adapter
-contract suite. TypeScript and Bun are not production or development
-dependencies of Kanban.
+The production runtime is Rust per ADR-006. A release is ready only when the
+compiled executable passes the current process-boundary E2E matrix and the
+focused atmux CLI adapter contract suite against current data. TypeScript and
+Bun are not production or development dependencies of Kanban.
 
-See [the 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).
+See [the historical 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).

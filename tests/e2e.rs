@@ -5963,11 +5963,15 @@ fn the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it() {
             .unwrap()
     };
     assert_eq!(flag_kind("cursor"), "value");
+    assert_eq!(flag_kind("limit"), "value");
     assert_eq!(flag_kind("follow"), "boolean");
     assert_eq!(flag_kind("all"), "boolean");
     assert_eq!(flag_kind("task"), "value");
     assert_eq!(flag_kind("rule"), "value");
     assert_eq!(flag_kind("registry"), "boolean");
+    for name in ["kind", "relation", "prior-status", "current-status", "tag"] {
+        assert_eq!(flag_kind(name), "list", "{name} is not repeatable");
+    }
 
     let help = fixture.run(&fixture.main, &["watch", "--help"]);
     assert!(help.status.success());
@@ -6476,6 +6480,753 @@ fn watch_follow_streams_new_events_and_keeps_outputs_separated() {
         stderr.is_empty(),
         "watch did not keep stderr separate from NDJSON"
     );
+}
+
+#[test]
+fn watch_emits_truthful_bounded_semantic_envelopes() {
+    let fixture = Fixture::new("watch-semantic-envelope");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-SEMANTIC-ENVELOPE", "--json"],
+    );
+    for tag in ["alpha", "zeta"] {
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Root epic",
+            "--id",
+            "e-root",
+            "--type",
+            "epic",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Parent story",
+            "--id",
+            "s-parent",
+            "--type",
+            "story",
+            "--parent",
+            "e-root",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Completed dependency",
+            "--id",
+            "t-base",
+            "--status",
+            "done",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Child task",
+            "--id",
+            "t-child",
+            "--parent",
+            "s-parent",
+            "--depends-on",
+            "t-base",
+            "--tag",
+            "zeta",
+            "--tag",
+            "alpha",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-child", "done", "--as", "geo", "--json"],
+    );
+
+    let audit = fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
+    assert_eq!(audit["healthy"], true, "{audit}");
+    assert_eq!(audit["boards"][0]["audit"]["healthy"], true, "{audit}");
+
+    let board_path = board_path_for_project(&fixture, &fixture.main, "WATCH-SEMANTIC-ENVELOPE");
+    let board_id = fs::canonicalize(&board_path)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let legacy_seq = insert_raw_board_event(
+        &board_path,
+        Some("t-child"),
+        "legacy_semantic_probe",
+        "geo",
+        json!({
+            "token": "outer-secret",
+            "tokenized": "visible",
+            "nested": {
+                "secretValue": "inner-secret",
+                "keep": "visible",
+                "items": [{"materialValue": "deep-secret", "keep": "still-visible"}]
+            }
+        }),
+    );
+    let oversized_seq = insert_raw_board_event(
+        &board_path,
+        Some("t-child"),
+        "legacy_oversized_probe",
+        "geo",
+        json!({"blob": "x".repeat(20_000)}),
+    );
+
+    let output = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--task", "t-child", "--cursor", "0", "--limit", "16", "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "watch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = ndjson_values(&output);
+    let find = |kind: &str| {
+        rows.iter()
+            .find(|row| row["payload"]["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing {kind} in {rows:#?}"))
+    };
+    let added = find("task_added");
+    let moved = find("task_moved");
+
+    for envelope in [added, moved] {
+        let event = &envelope["payload"];
+        assert_eq!(envelope["version"], 1, "{envelope}");
+        assert_eq!(envelope["type"], "event", "{envelope}");
+        assert_eq!(event["schemaVersion"], 1, "{event}");
+        assert_eq!(event["board"]["id"], board_id, "{event}");
+        assert_eq!(event["board"]["name"], "WATCH-SEMANTIC-ENVELOPE", "{event}");
+        assert_eq!(event["eventID"], event["eventHash"], "{event}");
+        assert!(
+            event["eventID"].as_str().is_some_and(|id| !id.is_empty()),
+            "{event}"
+        );
+        assert!(event["seq"].as_i64().is_some_and(|seq| seq > 0), "{event}");
+        assert_eq!(event["timestamp"], event["createdAt"], "{event}");
+        assert!(
+            event["timestamp"].as_i64().is_some_and(|at| at > 0),
+            "{event}"
+        );
+        assert_eq!(event["actor"], "geo", "{event}");
+        assert_eq!(event["subject"], json!({"type":"task","id":"t-child"}));
+        assert_eq!(event["tags"], json!(["alpha", "zeta"]));
+        assert!(event["payload"].get("_semanticV1").is_none(), "{event}");
+        assert!(serde_json::to_vec(&event["metadata"]).unwrap().len() <= 16_384);
+        let relations = event["relations"].as_array().unwrap();
+        for relation in [
+            json!({"kind":"ancestor","type":"epic","id":"e-root"}),
+            json!({"kind":"depends-on","type":"task","id":"t-base"}),
+            json!({"kind":"parent","type":"story","id":"s-parent"}),
+        ] {
+            assert!(
+                relations.contains(&relation),
+                "missing {relation} in {event}"
+            );
+        }
+    }
+    assert_eq!(added["payload"]["priorStatus"], Value::Null);
+    assert_eq!(added["payload"]["currentStatus"], "todo");
+    assert_eq!(moved["payload"]["priorStatus"], "todo");
+    assert_eq!(moved["payload"]["currentStatus"], "done");
+
+    let legacy = &find("legacy_semantic_probe")["payload"];
+    assert_eq!(legacy["seq"], legacy_seq);
+    for field in [
+        "subject",
+        "relations",
+        "priorStatus",
+        "currentStatus",
+        "tags",
+    ] {
+        assert!(
+            legacy[field].is_null(),
+            "{field} was reconstructed: {legacy}"
+        );
+    }
+    assert!(legacy["payload"].get("token").is_none(), "{legacy}");
+    assert_eq!(legacy["payload"]["tokenized"], "visible");
+    assert!(
+        legacy["payload"]["nested"].get("secretValue").is_none(),
+        "{legacy}"
+    );
+    assert!(
+        legacy["payload"]["nested"]["items"][0]
+            .get("materialValue")
+            .is_none(),
+        "{legacy}"
+    );
+    assert_eq!(
+        legacy["payload"]["nested"]["items"][0]["keep"],
+        "still-visible"
+    );
+    assert_eq!(legacy["metadata"]["value"], legacy["payload"]);
+    assert_eq!(legacy["metadata"]["truncated"], false);
+    assert!(serde_json::to_vec(&legacy["metadata"]).unwrap().len() <= 16_384);
+
+    let oversized = &find("legacy_oversized_probe")["payload"];
+    assert_eq!(oversized["seq"], oversized_seq);
+    assert_eq!(oversized["metadata"]["value"], Value::Null);
+    assert_eq!(oversized["metadata"]["truncated"], true);
+    assert!(oversized["metadata"]["bytes"].as_u64().unwrap() > 16_384);
+    assert!(serde_json::to_vec(&oversized["metadata"]).unwrap().len() <= 16_384);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("_semanticV1"));
+}
+
+#[test]
+fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
+    let fixture = Fixture::new("watch-semantic-filters");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-SEMANTIC-FILTERS", "--json"],
+    );
+    for tag in ["alpha", "zeta"] {
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Root epic",
+            "--id",
+            "e-root",
+            "--type",
+            "epic",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Parent story",
+            "--id",
+            "s-parent",
+            "--type",
+            "story",
+            "--parent",
+            "e-root",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Other relation target",
+            "--id",
+            "t-other",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Dependency",
+            "--id",
+            "t-base",
+            "--status",
+            "done",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Filtered child",
+            "--id",
+            "t-child",
+            "--parent",
+            "s-parent",
+            "--depends-on",
+            "t-base",
+            "--tag",
+            "zeta",
+            "--tag",
+            "alpha",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-child", "done", "--as", "geo", "--json"],
+    );
+
+    let kinds = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-child",
+            "--kind",
+            "task_moved",
+            "--kind",
+            "task_added",
+            "--cursor",
+            "0",
+            "--limit",
+            "16",
+            "--json",
+        ],
+    );
+    assert!(
+        kinds.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kinds.stderr)
+    );
+    let kind_rows = ndjson_values(&kinds);
+    let kind_names = kind_rows
+        .iter()
+        .map(|row| row["payload"]["kind"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        kind_names,
+        std::collections::BTreeSet::from(["task_added", "task_moved"])
+    );
+
+    let filtered = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-child",
+            "--kind",
+            "task_moved",
+            "--kind",
+            "task_added",
+            "--relation",
+            "parent:s-parent",
+            "--relation",
+            "parent:t-other",
+            "--prior-status",
+            "todo",
+            "--current-status",
+            "done",
+            "--tag",
+            "alpha",
+            "--tag",
+            "zeta",
+            "--cursor",
+            "0",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(
+        filtered.status.success(),
+        "sparse filtered watch failed: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered_rows = ndjson_values(&filtered);
+    assert_eq!(
+        filtered_rows.len(),
+        1,
+        "{}",
+        String::from_utf8_lossy(&filtered.stdout)
+    );
+    assert_eq!(filtered_rows[0]["payload"]["kind"], "task_moved");
+    assert_eq!(filtered_rows[0]["payload"]["priorStatus"], "todo");
+    assert_eq!(filtered_rows[0]["payload"]["currentStatus"], "done");
+    let cursor = filtered_rows[0]["cursor"].as_str().unwrap().to_owned();
+    let cursor_json = decode_watch_cursor(&cursor);
+    assert_eq!(cursor_json["kinds"], json!(["task_added", "task_moved"]));
+    assert_eq!(
+        cursor_json["relations"],
+        json!(["parent:s-parent", "parent:t-other"])
+    );
+    assert_eq!(cursor_json["priorStatuses"], json!(["todo"]));
+    assert_eq!(cursor_json["currentStatuses"], json!(["done"]));
+    assert_eq!(cursor_json["tags"], json!(["alpha", "zeta"]));
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-child", "todo", "--as", "geo", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-child", "done", "--as", "geo", "--json"],
+    );
+    let resumed = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-child",
+            "--tag",
+            "zeta",
+            "--tag",
+            "alpha",
+            "--current-status",
+            "done",
+            "--prior-status",
+            "todo",
+            "--relation",
+            "parent:t-other",
+            "--relation",
+            "parent:s-parent",
+            "--kind",
+            "task_added",
+            "--kind",
+            "task_moved",
+            "--cursor",
+            &cursor,
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(
+        resumed.status.success(),
+        "normalized cursor did not resume: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed_rows = ndjson_values(&resumed);
+    assert_eq!(resumed_rows.len(), 1);
+    assert_eq!(resumed_rows[0]["payload"]["kind"], "task_moved");
+    assert!(
+        resumed_rows[0]["payload"]["seq"].as_i64().unwrap()
+            > filtered_rows[0]["payload"]["seq"].as_i64().unwrap()
+    );
+
+    let mismatch = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-child",
+            "--kind",
+            "task_added",
+            "--kind",
+            "task_moved",
+            "--relation",
+            "parent:s-parent",
+            "--relation",
+            "parent:t-other",
+            "--prior-status",
+            "todo",
+            "--current-status",
+            "done",
+            "--tag",
+            "alpha",
+            "--cursor",
+            &cursor,
+            "--json",
+        ],
+    );
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("different watch stream"));
+
+    let invalid_cases = [
+        (vec!["--task", "t-never-existed"], "not present"),
+        (vec!["--relation", "child:t-other"], "KIND:ID"),
+        (
+            vec!["--relation", "parent:t-never-existed"],
+            "historical relation target",
+        ),
+        (
+            vec!["--kind", "not_a_real_event"],
+            "unknown watch event kind",
+        ),
+        (vec!["--prior-status", "not-a-status"], "must be one of"),
+        (vec!["--current-status", "not-a-status"], "must be one of"),
+        (vec!["--tag", "not-a-tag"], "master file"),
+    ];
+    for (flags, expected) in invalid_cases {
+        let mut args = vec!["watch"];
+        args.extend(flags);
+        args.extend(["--cursor", "0", "--json"]);
+        let rejected = fixture.run(&fixture.main, &args);
+        assert!(
+            !rejected.status.success(),
+            "invalid watch succeeded: {args:?}"
+        );
+        assert!(
+            rejected.stdout.is_empty(),
+            "invalid watch wrote stdout: {args:?}"
+        );
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            error.contains(expected),
+            "{args:?}: expected {expected:?} in {error}"
+        );
+    }
+}
+
+#[test]
+fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
+    let fixture = Fixture::new("watch-removed-and-registry");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-REMOVED-REGISTRY", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Root epic",
+            "--id",
+            "e-root",
+            "--type",
+            "epic",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Historical parent",
+            "--id",
+            "s-parent",
+            "--type",
+            "story",
+            "--parent",
+            "e-root",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Removed subject",
+            "--id",
+            "t-removed",
+            "--parent",
+            "s-parent",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let preflight = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-removed",
+            "--cursor",
+            "0",
+            "--limit",
+            "16",
+            "--json",
+        ],
+    );
+    assert!(preflight.status.success());
+    let preflight_rows = ndjson_values(&preflight);
+    let start_cursor = preflight_rows.last().unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let watcher = WatchSession::start(
+        &fixture,
+        &fixture.main,
+        &fixture.data,
+        &[
+            "--task",
+            "t-removed",
+            "--cursor",
+            &start_cursor,
+            "--follow",
+            "--limit",
+            "8",
+            "--json",
+        ],
+    );
+    let idle = watcher.next_stdout_json(Duration::from_secs(5));
+    assert_eq!(idle["type"], "heartbeat");
+    assert_eq!(idle["payload"]["state"], "idle");
+    assert_eq!(idle["cursor"], start_cursor);
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "t-removed", "--as", "geo", "--json"],
+    );
+    let removed = watcher.next_stdout_json(Duration::from_secs(10));
+    assert_eq!(removed["type"], "event");
+    assert_eq!(removed["payload"]["kind"], "task_removed");
+    assert_eq!(
+        removed["payload"]["subject"],
+        json!({"type":"task","id":"t-removed"})
+    );
+    assert_eq!(removed["payload"]["priorStatus"], "todo");
+    assert!(removed["payload"]["currentStatus"].is_null());
+    assert!(watcher.finish().is_empty());
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "remove", "s-parent", "--as", "geo", "--json"],
+    );
+    let replay = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-removed",
+            "--relation",
+            "parent:s-parent",
+            "--kind",
+            "task_removed",
+            "--cursor",
+            "0",
+            "--limit",
+            "8",
+            "--json",
+        ],
+    );
+    assert!(
+        replay.status.success(),
+        "historical replay failed: {}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay_rows = ndjson_values(&replay);
+    assert_eq!(replay_rows.len(), 1);
+    assert_eq!(replay_rows[0]["payload"]["kind"], "task_removed");
+    let replay_cursor = replay_rows[0]["cursor"].as_str().unwrap();
+    let resumed = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-removed",
+            "--relation",
+            "parent:s-parent",
+            "--kind",
+            "task_removed",
+            "--cursor",
+            replay_cursor,
+            "--limit",
+            "8",
+            "--json",
+        ],
+    );
+    assert!(resumed.status.success());
+    assert!(ndjson_values(&resumed).is_empty());
+
+    let rule = fixture.ok_json(
+        &fixture.main,
+        &["rule", "add", "Registry event", "--as", "geo", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            rule["id"].as_str().unwrap(),
+            "--body",
+            "Updated registry event",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let registry = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--registry",
+            "--kind",
+            "rule_updated",
+            "--kind",
+            "rule_added",
+            "--cursor",
+            "0",
+            "--limit",
+            "16",
+            "--json",
+        ],
+    );
+    assert!(registry.status.success());
+    let registry_rows = ndjson_values(&registry);
+    let registry_kinds = registry_rows
+        .iter()
+        .map(|row| row["payload"]["kind"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        registry_kinds,
+        std::collections::BTreeSet::from(["rule_added", "rule_updated"])
+    );
+    assert!(
+        registry_rows
+            .iter()
+            .all(|row| row["payload"]["board"].is_null())
+    );
+
+    for (flag, value) in [
+        ("--relation", "parent:s-parent"),
+        ("--prior-status", "todo"),
+        ("--current-status", "done"),
+        ("--tag", "alpha"),
+    ] {
+        let rejected = fixture.run(
+            &fixture.main,
+            &[
+                "watch",
+                "--registry",
+                flag,
+                value,
+                "--cursor",
+                "0",
+                "--json",
+            ],
+        );
+        assert!(!rejected.status.success(), "registry accepted {flag}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("apply only to board watch events")
+        );
+    }
 }
 
 #[test]

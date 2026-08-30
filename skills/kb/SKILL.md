@@ -482,8 +482,9 @@ task contains nothing.
 **Tag your rows.** A board that cannot say whether a task is infra, queuer or
 askie makes you read titles to find out, and you are the one who knows.
 
-Presentation notation may prefix a registered Kanban tag with `:` as `:slug`,
-but storage and CLI always use the bare slug (`--tag slug`).
+Examples below use bare tag names in storage and CLI. Prose may render a
+registered Kanban tag as `:slug`, but storage and CLI always use the bare slug
+(`--tag slug`).
 
 ```bash
 kb tag ls --json                                   # the vocabulary, with use counts
@@ -584,6 +585,15 @@ It is `longRunning` and `readOnly`, so generated MCP tool schemas exclude it.
 `kb events` stays the newest-first snapshot reader, and `/live` remains the
 compatibility invalidation socket for the browser.
 
+`kb watch` emits protocol-v1 NDJSON envelopes. The payload is additive:
+`board {id,name?}` for board scope or `board: null` for registry scope,
+`eventID`, `eventHash`, `seq`, `timestamp`, `actor`, `kind`, `subject`, typed
+`parent`/`ancestor`/`depends-on` relations,
+`priorStatus`, `currentStatus`, sorted registered tags, bounded recursively
+redacted metadata, and explicit `null` semantic fields on legacy events. Board
+event payloads also store private `_semanticV1`; it is hash-covered in the
+ledger but never emitted.
+
 ```bash
 kb watch --project NAME --task t-12345678 --cursor 0 --follow --json
 kb watch --registry --cursor CURSOR --limit 100 --json
@@ -591,24 +601,36 @@ kb watch --registry --cursor CURSOR --limit 100 --json
 
 Rules:
 
-- Exactly one scope is active at a time: a board via `--project`, a task within
-  that board via `--task`, a registry rule via `--rule`, or the registry via
-  `--registry`.
-- Registry-scope watch rejects board selectors and `--all`; board scope may use
-  `--all` only where the underlying trail already supports archived rows.
+- Exactly one scope is active at a time: a board via `--project`, a task via
+  `--task`, a registry rule via `--rule`, or the registry via `--registry`.
+  There is no cross-board fan-in.
+- `--task` is the subject selector. `--kind`, `--relation`, `--prior-status`,
+  `--current-status`, and `--tag` are repeatable predicates. `--relation`
+  accepts typed forms `parent:ID`, `ancestor:ID`, and `depends-on:ID`.
+- Values within one predicate family are ORed. Families are ANDed together.
+- The command normalizes the full predicate set before binding it to the
+  cursor. Reusing a cursor with any different normalized predicate set fails
+  closed.
+- Unknown tasks, relation targets, kinds, statuses, or tags fail closed.
+- Removed subjects and historical relation targets remain replayable because
+  replay uses stored rows, not live lookups.
+- Registry scope supports `--kind` only and rejects board semantic predicates.
 - `--cursor` is opaque. Literal `0` bootstraps from the start, and a persisted
-  cursor is bound to the exact source, selector, kind, archive state, and last
-  delivered `seq`.
+  cursor is bound to the exact source, selector, normalized predicate set,
+  archive state, and last consumed ledger `seq`.
 - Malformed, mismatched, or future cursors fail closed.
 - `--follow` reopens read-only transactions between polls and emits rows
   synchronously, with no intermediate queue. It requires `--limit` to be at
   least `1`, so `--follow --limit 0` fails.
 - `--limit` is constrained to `0..1000` in every mode; follow mode additionally
-  rejects `0`.
+  rejects `0`. Sparse filtering happens before `--limit`, so the limit slices
+  the filtered result set rather than the raw rows.
 - `--db PATH` opens that exact database file.
 - NDJSON envelopes carry `version`, `scope`, `cursor`, `type`, and `payload`
   on stdout only; errors and diagnostics go to stderr.
-- Heartbeats fill idle gaps.
+- Idle heartbeats do not advance the durable cursor. If predicates skip a
+  committed unmatched tail, an `advanced` heartbeat moves the opaque cursor to
+  the last scanned row so follow mode does not loop over the same rows.
 - Secrets are redacted recursively before emission.
 - `payload` stays the existing event JSON, including `seq` as the ledger row
   number.
