@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -7,7 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
@@ -41,10 +42,14 @@ impl Fixture {
     }
 
     fn command(&self, cwd: &Path) -> Command {
+        self.command_with_data_dir(cwd, &self.data)
+    }
+
+    fn command_with_data_dir(&self, cwd: &Path, data_dir: &Path) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kanban"));
         command
             .current_dir(cwd)
-            .env("KANBAN_DATA_DIR", &self.data)
+            .env("KANBAN_DATA_DIR", data_dir)
             .env_remove("KANBAN_DB")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -66,6 +71,63 @@ impl Fixture {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     }
+}
+
+fn ndjson_values(output: &Output) -> Vec<Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn decode_watch_cursor(cursor: &str) -> Value {
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn board_path_for_project(fixture: &Fixture, cwd: &Path, project_name: &str) -> PathBuf {
+    fixture
+        .ok_json(cwd, &["workspace", "list", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"].as_str() == Some(project_name))
+        .unwrap_or_else(|| panic!("missing project named {project_name}"))["boardPath"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+fn insert_raw_board_event(
+    board_path: &Path,
+    task_id: Option<&str>,
+    kind: &str,
+    actor: &str,
+    payload: Value,
+) -> i64 {
+    let connection = Connection::open(board_path).unwrap();
+    let seq = connection
+        .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+             VALUES(?,?,?,?,?,?,0,?,?)",
+            params![
+                seq,
+                task_id,
+                kind,
+                actor,
+                payload.to_string(),
+                seq,
+                format!("prev-{seq}"),
+                format!("hash-{seq}")
+            ],
+        )
+        .unwrap();
+    seq
 }
 
 impl Drop for Fixture {
@@ -109,6 +171,107 @@ impl Drop for ServerGuard {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+struct WatchSession {
+    child: Option<std::process::Child>,
+    stdout_rx: mpsc::Receiver<String>,
+    stdout_thread: Option<std::thread::JoinHandle<()>>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchSession {
+    fn start(fixture: &Fixture, cwd: &Path, data_dir: &Path, args: &[&str]) -> Self {
+        let mut child = fixture
+            .command_with_data_dir(cwd, data_dir)
+            .args(["watch"])
+            .args(args)
+            .stdin(Stdio::null())
+            .env_remove("KANBAN_PROJECT")
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn kanban watch: {error}"));
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stdout_thread = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if stdout_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_sink = Arc::clone(&stderr_lines);
+        let stderr_thread = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                stderr_sink.lock().unwrap().push(line);
+            }
+        });
+        Self {
+            child: Some(child),
+            stdout_rx,
+            stdout_thread: Some(stdout_thread),
+            stderr_lines,
+            stderr_thread: Some(stderr_thread),
+        }
+    }
+
+    fn next_stdout_line(&self, timeout: Duration) -> String {
+        self.stdout_rx
+            .recv_timeout(timeout)
+            .unwrap_or_else(|error| panic!("watch stdout stalled: {error}"))
+    }
+
+    fn next_stdout_json(&self, timeout: Duration) -> Value {
+        serde_json::from_str(&self.next_stdout_line(timeout)).unwrap()
+    }
+
+    #[allow(dead_code)]
+    fn try_next_stdout_json(&self, timeout: Duration) -> Option<Value> {
+        match self.stdout_rx.recv_timeout(timeout) {
+            Ok(line) => Some(serde_json::from_str(&line).unwrap()),
+            Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                None
+            }
+        }
+    }
+
+    fn stderr_snapshot(&self) -> Vec<String> {
+        self.stderr_lines.lock().unwrap().clone()
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stdout_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.shutdown();
+        self.stderr_snapshot()
+    }
+}
+
+impl Drop for WatchSession {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -863,11 +1026,15 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             "--json",
         ],
     );
-    let board_path =
-        fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+    let board_path = fixture
+        .ok_json(&fixture.main, &["workspace", "list", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["name"] == json!("WATCH-REPLAY"))
+        .and_then(|record| record["boardPath"].as_str())
+        .unwrap()
+        .to_owned();
     Connection::open(board_path)
         .unwrap()
         .execute(
@@ -5781,6 +5948,711 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         let operation = operations.iter().find(|o| o["name"] == name).unwrap();
         assert_eq!(operation["readOnly"], false, "{name} is labelled readOnly");
     }
+}
+
+#[test]
+fn the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it() {
+    let fixture = Fixture::new("watch-surface");
+    fixture.ok_json(&fixture.main, &["init", "--name", "WATCH", "--json"]);
+
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operations = schema["operations"].as_array().unwrap();
+    let watch = operations
+        .iter()
+        .find(|operation| operation["name"] == "watch")
+        .expect("watch is missing from the manifest");
+    assert_eq!(watch["readOnly"], true);
+    assert_eq!(watch["longRunning"], true);
+    assert_eq!(watch["positionals"], json!([]));
+    let flags = watch["flags"].as_array().unwrap();
+    let flag_kind = |name: &str| -> &str {
+        flags.iter().find(|flag| flag["name"] == name).unwrap()["kind"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(flag_kind("cursor"), "value");
+    assert_eq!(flag_kind("follow"), "boolean");
+    assert_eq!(flag_kind("all"), "boolean");
+    assert_eq!(flag_kind("task"), "value");
+    assert_eq!(flag_kind("rule"), "value");
+    assert_eq!(flag_kind("registry"), "boolean");
+
+    let help = fixture.run(&fixture.main, &["watch", "--help"]);
+    assert!(help.status.success());
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    assert!(help_text.contains("kanban watch"));
+    assert!(help_text.contains("--cursor"));
+    assert!(help_text.contains("--follow"));
+    assert!(help_text.contains("--registry"));
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(
+        !tools.iter().any(|tool| tool["name"] == "watch"),
+        "the long-running watch command leaked into the MCP tool list"
+    );
+}
+
+#[test]
+fn watch_replays_resumes_and_respects_selector_boundaries() {
+    let fixture = Fixture::new("watch-replay");
+    fixture.ok_json(&fixture.main, &["init", "--name", "WATCH-REPLAY", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Main board task", "--id", "t-main", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-main",
+            "Main board task note",
+            "--as",
+            "geo",
+            "--kind",
+            "progress",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Settled board task",
+            "--id",
+            "t-settled",
+            "--json",
+        ],
+    );
+    let settled_claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-settled", "--as", "worker", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-settled",
+            "--lease",
+            settled_claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "worker",
+            "--state",
+            "done",
+            "--summary",
+            "settled",
+            "--intent",
+            "close it",
+            "--next-action",
+            "none",
+            "--json",
+        ],
+    );
+    let board_path = board_path_for_project(&fixture, &fixture.main, "WATCH-REPLAY");
+    Connection::open(&board_path)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=1,updated_at=1 WHERE id='t-settled'",
+            [],
+        )
+        .unwrap();
+    fixture.ok_json(
+        &fixture.worktree,
+        &["init", "--name", "WATCH-SECONDARY", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.worktree,
+        &[
+            "task",
+            "add",
+            "Second board task",
+            "--id",
+            "t-second",
+            "--json",
+        ],
+    );
+    let rule_alpha = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Alpha registry rule.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let rule_beta = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Beta registry rule.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let rule_alpha_id = rule_alpha["id"].as_str().unwrap().to_owned();
+    let rule_beta_id = rule_beta["id"].as_str().unwrap().to_owned();
+    let default_output = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "32", "--json"],
+    );
+    assert!(default_output.status.success());
+    let default_rows = ndjson_values(&default_output);
+    assert!(!default_rows.is_empty());
+    assert!(
+        default_rows
+            .iter()
+            .all(|row| row["payload"]["taskID"] != json!("t-second")),
+        "default board watch leaked the second board: {}",
+        String::from_utf8_lossy(&default_output.stdout)
+    );
+    let saved_cursor = default_rows.last().unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let saved_cursor_seq = decode_watch_cursor(&saved_cursor)["seq"].as_i64().unwrap();
+
+    for args in [
+        vec![
+            "watch",
+            "--task",
+            "t-main",
+            "--cursor",
+            &saved_cursor,
+            "--json",
+        ],
+        vec![
+            "watch",
+            "--kind",
+            "task_added",
+            "--cursor",
+            &saved_cursor,
+            "--json",
+        ],
+        vec!["watch", "--all", "--cursor", &saved_cursor, "--json"],
+        vec!["watch", "--registry", "--cursor", &saved_cursor, "--json"],
+        vec![
+            "watch",
+            "--rule",
+            &rule_alpha_id,
+            "--cursor",
+            &saved_cursor,
+            "--json",
+        ],
+    ] {
+        let mismatch = fixture.run(&fixture.main, &args);
+        assert!(
+            !mismatch.status.success(),
+            "selector mismatch unexpectedly reused the stream: {:?}",
+            args
+        );
+        assert!(
+            mismatch.stdout.is_empty(),
+            "selector mismatch wrote to stdout: {}",
+            String::from_utf8_lossy(&mismatch.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&mismatch.stderr).contains("different watch stream"),
+            "selector mismatch did not name the stream boundary: {}",
+            String::from_utf8_lossy(&mismatch.stderr)
+        );
+    }
+
+    let later = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Later board task",
+            "--id",
+            "t-later",
+            "--json",
+        ],
+    );
+    assert_eq!(later["id"], json!("t-later"));
+    let resumed = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--cursor",
+            &saved_cursor,
+            "--limit",
+            "32",
+            "--json",
+        ],
+    );
+    assert!(resumed.status.success());
+    let resumed_rows = ndjson_values(&resumed);
+    assert!(!resumed_rows.is_empty());
+    assert!(
+        resumed_rows.iter().all(|row| {
+            row["payload"]["seq"].as_i64().unwrap() > saved_cursor_seq
+                && row["payload"]["taskID"] == json!("t-later")
+                && row["payload"]["kind"] == json!("task_added")
+        }),
+        "resumed watch did not stay on the later task: {}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+
+    let main_task_output = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-main",
+            "--kind",
+            "task_added",
+            "--cursor",
+            "0",
+            "--limit",
+            "32",
+            "--json",
+        ],
+    );
+    assert!(main_task_output.status.success());
+    let main_task_rows = ndjson_values(&main_task_output);
+    assert!(!main_task_rows.is_empty());
+    assert!(
+        main_task_rows
+            .iter()
+            .all(|row| row["payload"]["taskID"] == json!("t-main")
+                && row["payload"]["kind"] == json!("task_added")),
+        "task/kind watch leaked other rows: {}",
+        String::from_utf8_lossy(&main_task_output.stdout)
+    );
+
+    let second_board_output = fixture.run(
+        &fixture.worktree,
+        &["watch", "--cursor", "0", "--limit", "32", "--json"],
+    );
+    assert!(second_board_output.status.success());
+    let second_board_rows = ndjson_values(&second_board_output);
+    assert!(
+        second_board_rows
+            .iter()
+            .any(|row| row["payload"]["taskID"] == json!("t-second")),
+        "second board watch never saw its task: {}",
+        String::from_utf8_lossy(&second_board_output.stdout)
+    );
+
+    let registry_output = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--registry",
+            "--cursor",
+            "0",
+            "--limit",
+            "32",
+            "--json",
+        ],
+    );
+    assert!(registry_output.status.success());
+    let registry_rows = ndjson_values(&registry_output);
+    assert!(!registry_rows.is_empty());
+    let registry_rule_ids = registry_rows
+        .iter()
+        .filter_map(|row| {
+            row["payload"]["payload"]["ruleID"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        registry_rule_ids.contains(&rule_alpha_id) && registry_rule_ids.contains(&rule_beta_id),
+        "registry watch did not include both rule IDs: {registry_rule_ids:?}"
+    );
+    assert!(
+        registry_rows
+            .iter()
+            .all(|row| row["payload"]["taskID"].is_null()),
+        "registry watch leaked board events: {}",
+        String::from_utf8_lossy(&registry_output.stdout)
+    );
+
+    let rule_output = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--rule",
+            &rule_alpha_id,
+            "--cursor",
+            "0",
+            "--limit",
+            "32",
+            "--json",
+        ],
+    );
+    assert!(rule_output.status.success());
+    let rule_rows = ndjson_values(&rule_output);
+    assert!(!rule_rows.is_empty());
+    assert!(
+        rule_rows
+            .iter()
+            .all(|row| row["payload"]["payload"]["ruleID"] == json!(rule_alpha_id)),
+        "rule watch crossed out of its selector: {}",
+        String::from_utf8_lossy(&rule_output.stdout)
+    );
+
+    let archive = fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "system@archive",
+            "--json",
+        ],
+    );
+    assert_eq!(archive["tasks"], 1);
+    let archived_default = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "64", "--json"],
+    );
+    assert!(archived_default.status.success());
+    let archived_default_rows = ndjson_values(&archived_default);
+    assert!(!archived_default_rows.is_empty());
+    assert!(
+        archived_default_rows
+            .iter()
+            .all(|row| row["payload"]["archived"] == json!(false)),
+        "default watch emitted archived history: {}",
+        String::from_utf8_lossy(&archived_default.stdout)
+    );
+    let archived_all = fixture.run(
+        &fixture.main,
+        &["watch", "--all", "--cursor", "0", "--limit", "64", "--json"],
+    );
+    assert!(archived_all.status.success());
+    let archived_all_rows = ndjson_values(&archived_all);
+    assert!(
+        archived_all_rows
+            .iter()
+            .any(|row| row["payload"]["archived"] == json!(true)),
+        "archive history stayed hidden from --all: {}",
+        String::from_utf8_lossy(&archived_all.stdout)
+    );
+
+    let exact_board = board_path_for_project(&fixture, &fixture.main, "WATCH-REPLAY");
+    let db_root = fixture.root.join("watch-db-only");
+    fs::create_dir_all(&db_root).unwrap();
+    let db_output = fixture
+        .command_with_data_dir(&db_root, &fixture.root.join("watch-db-data"))
+        .args([
+            "watch",
+            "--db",
+            exact_board.to_str().unwrap(),
+            "--cursor",
+            "0",
+            "--limit",
+            "32",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        db_output.status.success(),
+        "--db exact board path failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&db_output.stdout),
+        String::from_utf8_lossy(&db_output.stderr)
+    );
+    let db_rows = ndjson_values(&db_output);
+    assert!(!db_rows.is_empty());
+    let canonical_board = exact_board.canonicalize().unwrap_or(exact_board);
+    assert!(
+        db_rows.iter().all(|row| {
+            row["scope"]["sourceKind"] == json!("board")
+                && row["scope"]["selectorKind"] == json!("board")
+                && row["scope"]["source"] == json!(canonical_board.to_string_lossy().into_owned())
+        }),
+        "--db did not stay on the exact board path: {}",
+        String::from_utf8_lossy(&db_output.stdout)
+    );
+}
+
+#[test]
+fn watch_follow_streams_new_events_and_keeps_outputs_separated() {
+    let fixture = Fixture::new("watch-follow");
+    fixture.ok_json(&fixture.main, &["init", "--name", "WATCH-FOLLOW", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Follow me", "--id", "t-follow", "--json"],
+    );
+    let preflight = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "32", "--json"],
+    );
+    assert!(preflight.status.success());
+    let preflight_rows = ndjson_values(&preflight);
+    assert!(!preflight_rows.is_empty());
+    let start_cursor = preflight_rows.last().unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let start_cursor_json = decode_watch_cursor(&start_cursor);
+    assert!(start_cursor_json.get("seq").is_some());
+    assert!(start_cursor_json.get("lastSeq").is_none());
+    assert_eq!(
+        start_cursor_json["seq"].as_i64().unwrap(),
+        preflight_rows.last().unwrap()["payload"]["seq"]
+            .as_i64()
+            .unwrap()
+    );
+
+    let watch = WatchSession::start(
+        &fixture,
+        &fixture.main,
+        &fixture.data,
+        &[
+            "--cursor",
+            &start_cursor,
+            "--follow",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
+    let heartbeat = watch.next_stdout_json(Duration::from_secs(5));
+    assert_eq!(heartbeat["type"], "heartbeat");
+    assert_eq!(heartbeat["version"], 1);
+    assert!(
+        heartbeat["scope"]["sourceKind"] == json!("board")
+            && heartbeat["scope"]["selectorKind"] == json!("board")
+            && heartbeat["scope"]["selectorValue"].is_null()
+    );
+    let heartbeat_cursor = decode_watch_cursor(heartbeat["cursor"].as_str().unwrap());
+    assert_eq!(heartbeat_cursor["seq"], start_cursor_json["seq"]);
+
+    let board_path = board_path_for_project(&fixture, &fixture.main, "WATCH-FOLLOW");
+    let raw_secret_seq = insert_raw_board_event(
+        &board_path,
+        Some("t-follow"),
+        "watch_secret_probe",
+        "geo",
+        json!({
+            "token": "outer-secret",
+            "tokenCount": 7,
+            "snake_token": "snake-secret",
+            "camelToken": "camel-secret",
+            "nested": {
+                "tokenCount": 9,
+                "snake_token": "nested-snake-secret",
+                "camelToken": "nested-camel-secret",
+                "items": [
+                    {
+                        "tokenCount": 3,
+                        "materialValue": "deep-secret",
+                        "secretValue": "deeper-secret",
+                        "keep": "ok"
+                    }
+                ]
+            }
+        }),
+    );
+    let next_event = watch.next_stdout_json(Duration::from_secs(10));
+    assert_eq!(next_event["type"], "event");
+    let next_cursor = decode_watch_cursor(next_event["cursor"].as_str().unwrap());
+    assert_eq!(next_cursor["seq"].as_i64().unwrap(), raw_secret_seq);
+    let payload = &next_event["payload"]["payload"];
+    assert!(payload.get("token").is_none());
+    assert!(payload.get("snake_token").is_none());
+    assert!(payload.get("camelToken").is_none());
+    assert_eq!(payload["tokenCount"], 7);
+    assert!(payload["nested"].get("snake_token").is_none());
+    assert!(payload["nested"].get("camelToken").is_none());
+    assert_eq!(payload["nested"]["tokenCount"], 9);
+    assert!(payload["nested"]["items"][0].get("materialValue").is_none());
+    assert!(payload["nested"]["items"][0].get("secretValue").is_none());
+    assert_eq!(payload["nested"]["items"][0]["tokenCount"], 3);
+    assert_eq!(payload["nested"]["items"][0]["keep"], "ok");
+    assert!(
+        watch.stderr_snapshot().is_empty(),
+        "watch wrote diagnostics to stderr"
+    );
+    let stderr = watch.finish();
+    assert!(
+        stderr.is_empty(),
+        "watch did not keep stderr separate from NDJSON"
+    );
+}
+
+#[test]
+fn watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits() {
+    let fixture = Fixture::new("watch-bounded");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-BOUNDED", "--json"],
+    );
+    for (id, title) in [("t-one", "One"), ("t-two", "Two"), ("t-three", "Three")] {
+        fixture.ok_json(&fixture.main, &["task", "add", title, "--id", id, "--json"]);
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &["note", "t-one", "Backlog note", "--as", "geo", "--json"],
+    );
+    let board_path = board_path_for_project(&fixture, &fixture.main, "WATCH-BOUNDED");
+    let expected_seqs = {
+        let connection = Connection::open(&board_path).unwrap();
+        connection
+            .prepare("SELECT seq FROM events ORDER BY seq ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+
+    let bounded = WatchSession::start(
+        &fixture,
+        &fixture.main,
+        &fixture.data,
+        &["--cursor", "0", "--follow", "--limit", "2", "--json"],
+    );
+    let mut envelopes = Vec::new();
+    let heartbeat = loop {
+        let envelope = bounded.next_stdout_json(Duration::from_secs(5));
+        match envelope["type"].as_str().unwrap() {
+            "event" => envelopes.push(envelope),
+            "heartbeat" => break envelope,
+            other => panic!("unexpected watch envelope type {other}"),
+        }
+    };
+    let seqs = envelopes
+        .iter()
+        .map(|envelope| envelope["payload"]["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !seqs.is_empty(),
+        "bounded follow never replayed the backlog"
+    );
+    assert_eq!(
+        seqs, expected_seqs,
+        "bounded follow replayed the wrong seqs"
+    );
+    let heartbeat_cursor = decode_watch_cursor(heartbeat["cursor"].as_str().unwrap());
+    assert_eq!(
+        heartbeat_cursor["seq"].as_i64().unwrap(),
+        *expected_seqs.last().unwrap()
+    );
+    assert_eq!(heartbeat["scope"]["sourceKind"], json!("board"));
+    assert_eq!(heartbeat["scope"]["selectorKind"], json!("board"));
+    assert!(heartbeat["scope"]["selectorValue"].is_null());
+    assert!(bounded.finish().is_empty());
+
+    let huge_limit = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "1001", "--json"],
+    );
+    assert!(
+        !huge_limit.status.success(),
+        "an oversized watch limit was accepted"
+    );
+    let huge_limit_stderr = String::from_utf8_lossy(&huge_limit.stderr);
+    assert!(
+        huge_limit_stderr.contains("1000"),
+        "stderr did not name the exact watch limit cap: {huge_limit_stderr}"
+    );
+
+    let zero_follow = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--cursor", "0", "--follow", "--limit", "0", "--json",
+        ],
+    );
+    assert!(
+        !zero_follow.status.success(),
+        "--follow with --limit 0 stayed live instead of being rejected"
+    );
+}
+
+#[test]
+fn watch_rejects_malformed_unsupported_and_future_cursors() {
+    let fixture = Fixture::new("watch-cursors");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-CURSORS", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Cursor probe", "--id", "t-cursor", "--json"],
+    );
+
+    let preflight = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "1", "--json"],
+    );
+    assert!(preflight.status.success());
+    let preflight_rows = ndjson_values(&preflight);
+    assert!(!preflight_rows.is_empty());
+    let cursor = preflight_rows.last().unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cursor_json = decode_watch_cursor(&cursor);
+    assert!(cursor_json.get("seq").is_some());
+    assert!(cursor_json.get("lastSeq").is_none());
+    let board_path = board_path_for_project(&fixture, &fixture.main, "WATCH-CURSORS");
+    let head = Connection::open(&board_path)
+        .unwrap()
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+
+    let malformed = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "not-a-token", "--json"],
+    );
+    assert!(
+        !malformed.status.success(),
+        "malformed cursor unexpectedly worked"
+    );
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("valid watch token"),
+        "malformed cursor did not report a token error: {}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+
+    let mut unsupported_json = cursor_json.clone();
+    unsupported_json["version"] = json!(2);
+    let unsupported = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&unsupported_json).unwrap());
+    let unsupported_run = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", &unsupported, "--json"],
+    );
+    assert!(
+        !unsupported_run.status.success(),
+        "unsupported cursor protocol version unexpectedly worked"
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported_run.stderr).contains("unsupported protocol version"),
+        "unsupported cursor version did not fail clearly: {}",
+        String::from_utf8_lossy(&unsupported_run.stderr)
+    );
+
+    let mut future_json = cursor_json.clone();
+    future_json["seq"] = json!(head + 1);
+    let future = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&future_json).unwrap());
+    let future_run = fixture.run(&fixture.main, &["watch", "--cursor", &future, "--json"]);
+    assert!(
+        !future_run.status.success(),
+        "future cursor unexpectedly worked"
+    );
+    assert!(
+        String::from_utf8_lossy(&future_run.stderr).contains("ahead of the current ledger head"),
+        "future cursor did not report the current head check: {}",
+        String::from_utf8_lossy(&future_run.stderr)
+    );
 }
 
 /// A live MCP session, spoken over real pipes to the real binary.
