@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euo pipefail
+
+die() {
+  printf '%s\n' "$1" >&2
+  exit 64
+}
+
+project=${1-}
+kb_command=${2-}
+
+if [ -z "${project}" ] || [ -z "${kb_command}" ]; then
+  die 'usage: kb-board PROJECT KB_COMMAND [ARGS...]'
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    r|rule)
+      if [ "$arg" = "$kb_command" ]; then
+        die 'kb-board is for board-owned commands only; use hax-kb directly for registry rules (for example: hax-kb r ls --json).'
+      fi
+      ;;
+    --project|--project=*|--workspace|--workspace=*|--db|--db=*)
+      die "kb-board injects exactly one project selector; remove '$arg' and retry."
+      ;;
+  esac
+done
+
+shift 2
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+exec "$script_dir/hax-kb" --project "$project" "$kb_command" "$@"

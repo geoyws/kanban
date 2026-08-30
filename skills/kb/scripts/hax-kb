@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euo pipefail
+
+kb_bin=${HAX_KB_BIN:-/root/.local/bin/kb}
+
+shell_quote() {
+  local value=${1-}
+  local out="'"
+  local prefix
+
+  while [[ "$value" == *"'"* ]]; do
+    prefix=${value%%"'"*}
+    out+=$prefix
+    out+="'\"'\"'"
+    value=${value#*\'}
+  done
+
+  out+=$value
+  out+="'"
+  printf '%s' "$out"
+}
+
+if [ "$(/bin/hostname)" = "hax" ]; then
+  exec "$kb_bin" "$@"
+fi
+
+remote_cmd="if [ \"\$(/bin/hostname)\" = hax ]; then exec $(shell_quote "$kb_bin")"
+for arg in "$@"; do
+  remote_cmd+=" $(shell_quote "$arg")"
+done
+remote_cmd+="; else printf '%s\n' 'hax-kb: remote host is not hax' >&2; exit 69; fi"
+
+exec ssh -- "${HAX_SSH_HOST:-hax}" "$remote_cmd"
