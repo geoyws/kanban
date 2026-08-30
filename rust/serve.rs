@@ -429,10 +429,29 @@ fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
 }
 
 fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
-    projects()?
+    let matches = projects()?
         .into_iter()
-        .find(|(project, _)| project.name == name)
-        .with_context(|| format!("no board named {name}"))
+        .filter(|(project, _)| project.name == name)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().unwrap()),
+        0 => Err(anyhow::anyhow!("no board named {name}")),
+        _ => Err(anyhow::anyhow!(
+            "{} Kanban projects are named {name}; choose a unique board name before using /board: {}",
+            matches.len(),
+            matches
+                .iter()
+                .map(|(project, _)| {
+                    if project.workspace_roots.is_empty() {
+                        format!("{} (rootless)", project.name)
+                    } else {
+                        format!("{} [{}]", project.name, project.workspace_roots.join(", "))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 // --------------------------------------------------------------- live status
@@ -1279,9 +1298,19 @@ fn board(name: &str) -> Result<String> {
     let tasks = store.list_tasks(None, None, false)?;
     let rules = Registry::open()?.applicable_rules(Some(&project.name), None, false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
+    let roots = if project.workspace_roots.is_empty() {
+        "Rootless".to_owned()
+    } else {
+        project
+            .workspace_roots
+            .iter()
+            .map(|root| escape(root))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     html.push_str(&format!(
-        "<p class=meta>{} · {} rows</p>",
-        escape(&project.canonical_root),
+        "<p class=meta>Roots: {} · {} rows</p>",
+        roots,
         tasks.len()
     ));
     if !rules.is_empty() {

@@ -148,17 +148,17 @@ pub fn data_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/share/kanban"))
 }
 
-fn row(record: &rusqlite::Row<'_>, canonical: bool) -> rusqlite::Result<WorkspaceRecord> {
+fn row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
         root_path: record.get("root_path")?,
         name: record.get("name")?,
         board_path: record.get("board_path")?,
-        canonical,
         created_at: record.get("created_at")?,
         last_used_at: record.get("last_used_at")?,
         archived: record.get::<_, i64>("archived")? != 0,
         archived_at: record.get("archived_at")?,
         archived_by: record.get("archived_by")?,
+        rootless: record.get::<_, i64>("rootless")? != 0,
     })
 }
 
@@ -167,13 +167,66 @@ fn history_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> 
         root_path: record.get("root_path")?,
         name: record.get("name")?,
         board_path: record.get("board_path")?,
-        canonical: false,
         created_at: record.get("created_at")?,
         last_used_at: record.get("last_used_at")?,
         archived: true,
         archived_at: record.get("archived_at")?,
         archived_by: record.get("archived_by")?,
+        rootless: false,
     })
+}
+
+fn rootless_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        root_path: record.get("root_path")?,
+        name: record.get("name")?,
+        board_path: record.get("board_path")?,
+        created_at: record.get("created_at")?,
+        last_used_at: record.get("last_used_at")?,
+        archived: record.get::<_, i64>("archived")? != 0,
+        archived_at: record.get("archived_at")?,
+        archived_by: record.get("archived_by")?,
+        rootless: record.get::<_, i64>("rootless")? != 0,
+    })
+}
+
+fn active_named(
+    connection: &Connection,
+    name: &str,
+    exclude_board_path: Option<&str>,
+) -> Result<bool> {
+    let mut sql = String::from("SELECT 1 FROM boards WHERE name=?");
+    if exclude_board_path.is_some() {
+        sql.push_str(" AND board_path<>?");
+    }
+    sql.push_str(" LIMIT 1");
+    let found = if let Some(exclude_board_path) = exclude_board_path {
+        connection
+            .query_row(&sql, params![name, exclude_board_path], |_| Ok(()))
+            .optional()?
+            .is_some()
+    } else {
+        connection
+            .query_row(&sql, [name], |_| Ok(()))
+            .optional()?
+            .is_some()
+    };
+    Ok(found)
+}
+
+fn target_looks_like_path(target: &str) -> bool {
+    let path = Path::new(target);
+    path.has_root()
+        || target.contains(std::path::MAIN_SEPARATOR)
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
 }
 
 pub struct Registry {
@@ -195,85 +248,137 @@ impl Registry {
         Ok(Self { connection, root })
     }
 
+    fn project_for_board_path(&self, board_path: &str) -> Result<ProjectRecord> {
+        let (name, board_path, last_used_at): (String, String, i64) = self.connection.query_row(
+            "SELECT name,board_path,last_used_at FROM boards WHERE board_path=?",
+            [board_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT root_path FROM workspace_roots WHERE board_path=? ORDER BY last_used_at DESC,root_path",
+        )?;
+        let workspace_roots = statement
+            .query_map([&board_path], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ProjectRecord {
+            name,
+            board_path,
+            workspace_roots,
+            last_used_at,
+        })
+    }
+
     pub fn register(
         &mut self,
-        workspace: &Path,
+        workspace: Option<&Path>,
         name: &str,
         force: bool,
         actor: &str,
-    ) -> Result<WorkspaceRecord> {
+    ) -> Result<ProjectRecord> {
         let actor = validate_rule_actor(actor)?;
-        let root_path = workspace
-            .canonicalize()
-            .with_context(|| format!("resolve workspace {}", workspace.display()))?;
-        let root_text = root_path.to_string_lossy().into_owned();
         let now = now_ms();
-        // An init below a registered root used to create a second board that
-        // shadowed the first: tasks added from the subdirectory resolved to the
-        // nearer board and were invisible from the project root. Attaching is
-        // almost always what was meant; nesting has to be asked for.
-        if !force
-            && self.exact(&root_path)?.is_none()
-            && let Some(enclosing) = self.enclosing(&root_path)?
-        {
-            bail!(
-                "{} is already inside Kanban project {} ({}).\n\
-                 To share that project's board:   kanban workspace attach --to {}\n\
-                 To create a separate board here: kanban init --name {name} --force",
-                root_path.display(),
-                enclosing.name,
-                enclosing.root_path,
-                enclosing.root_path
-            );
-        }
-        if let Some(existing) = self.exact(&root_path)? {
-            let table = if existing.canonical {
-                "workspaces"
-            } else {
-                "workspace_aliases"
-            };
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute(
-                &format!("UPDATE {table} SET name=?,last_used_at=? WHERE root_path=?"),
-                params![name, now, root_text],
-            )?;
-            crate::audit::append_registry_event(
-                &transaction,
-                &format!("workspace:{root_text}"),
-                "workspace_registered",
-                actor,
-                &json!({"rootPath":root_text,"name":name,"existing":true}).to_string(),
-                now,
-            )?;
-            transaction.commit()?;
-            return self
-                .exact(&root_path)?
-                .context("registered workspace disappeared");
+        let root_path = workspace
+            .map(|workspace| {
+                workspace
+                    .canonicalize()
+                    .with_context(|| format!("resolve workspace {}", workspace.display()))
+            })
+            .transpose()?;
+        if let Some(root_path) = &root_path {
+            // An init below a registered root used to create a second board
+            // that shadowed the first: tasks added from the subdirectory
+            // resolved to the nearer board and were invisible from the project
+            // root. Attaching is almost always what was meant; nesting has to
+            // be asked for.
+            if !force
+                && self.exact(root_path)?.is_none()
+                && let Some(enclosing) = self.enclosing(root_path)?
+            {
+                bail!(
+                    "{} is already inside Kanban project {}.\n\
+                     To share that board:        kanban workspace attach --to {}\n\
+                     To create a separate board: kanban init --name {name} --force",
+                    root_path.display(),
+                    enclosing.name,
+                    enclosing.name
+                );
+            }
+            if let Some(existing) = self.exact(root_path)? {
+                let project = self.project_for_board_path(&existing.board_path)?;
+                if project.name != name {
+                    bail!(
+                        "{} is already registered to board {}; `init` does not rename boards",
+                        root_path.display(),
+                        project.name
+                    );
+                }
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "UPDATE boards SET last_used_at=? WHERE board_path=?",
+                    params![now, existing.board_path],
+                )?;
+                transaction.execute(
+                    "UPDATE workspace_roots SET last_used_at=? WHERE root_path=?",
+                    params![now, existing.root_path],
+                )?;
+                crate::audit::append_registry_event(
+                    &transaction,
+                    &format!("workspace:{}", existing.root_path),
+                    "workspace_registered",
+                    actor,
+                    &json!({
+                        "rootPath": existing.root_path,
+                        "name": project.name,
+                        "boardPath": existing.board_path,
+                        "existing": true,
+                    })
+                    .to_string(),
+                    now,
+                )?;
+                transaction.commit()?;
+                return self.project_for_board_path(&existing.board_path);
+            }
         }
         let board_path = self
             .root
             .join("boards")
             .join(format!("{}.db", Uuid::new_v4()));
+        let root_path_json = root_path
+            .as_ref()
+            .map(|root_path| root_path.to_string_lossy().to_string());
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if active_named(&transaction, name, None)? {
+            bail!("a Kanban board is already named {name}");
+        }
         transaction.execute(
-            "INSERT INTO workspaces(root_path,name,board_path,created_at,last_used_at) VALUES(?,?,?,?,?)",
-            params![root_text, name, board_path.to_string_lossy(), now, now],
+            "INSERT INTO boards(board_path,name,created_at,last_used_at) VALUES(?,?,?,?)",
+            params![board_path.to_string_lossy(), name, now, now],
         )?;
+        if let Some(root_path) = root_path {
+            transaction.execute(
+                "INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at) VALUES(?,?,?,?)",
+                params![root_path.to_string_lossy(), board_path.to_string_lossy(), now, now],
+            )?;
+        }
         crate::audit::append_registry_event(
             &transaction,
-            &format!("workspace:{root_text}"),
+            &format!("workspace:{}", board_path.to_string_lossy()),
             "workspace_registered",
             actor,
-            &json!({"rootPath":root_text,"name":name,"boardPath":board_path}).to_string(),
+            &json!({
+                "boardPath": board_path,
+                "name": name,
+                "rootPath": root_path_json,
+            })
+            .to_string(),
             now,
         )?;
         transaction.commit()?;
-        self.exact(&root_path)?
-            .context("registered workspace not found")
+        self.project_for_board_path(&board_path.to_string_lossy())
     }
 
     /// The nearest registered workspace strictly above `workspace`, if any.
@@ -293,22 +398,25 @@ impl Registry {
         let canonical = self
             .connection
             .query_row(
-                "SELECT * FROM workspaces WHERE root_path=? AND archived=0",
+                "SELECT workspace_roots.root_path AS root_path,\
+                        boards.name AS name,\
+                        workspace_roots.board_path AS board_path,\
+                        workspace_roots.created_at AS created_at,\
+                        workspace_roots.last_used_at AS last_used_at,\
+                        0 AS archived,\
+                        NULL AS archived_at,\
+                        NULL AS archived_by,\
+                        0 AS rootless \
+                 FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
+                 WHERE workspace_roots.root_path=?",
                 [text.as_ref()],
-                |r| row(r, true),
+                row,
             )
             .optional()?;
         if canonical.is_some() {
             return Ok(canonical);
         }
-        self.connection
-            .query_row(
-                "SELECT * FROM workspace_aliases WHERE root_path=? AND archived=0",
-                [text.as_ref()],
-                |r| row(r, false),
-            )
-            .optional()
-            .map_err(Into::into)
+        Ok(None)
     }
 
     pub fn resolve(&mut self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
@@ -317,14 +425,13 @@ impl Registry {
             .with_context(|| format!("resolve workspace {}", workspace.display()))?;
         loop {
             if let Some(found) = self.exact(&cursor)? {
-                let table = if found.canonical {
-                    "workspaces"
-                } else {
-                    "workspace_aliases"
-                };
                 self.connection.execute(
-                    &format!("UPDATE {table} SET last_used_at=? WHERE root_path=?"),
+                    "UPDATE workspace_roots SET last_used_at=? WHERE root_path=?",
                     params![now_ms(), found.root_path],
+                )?;
+                self.connection.execute(
+                    "UPDATE boards SET last_used_at=? WHERE board_path=?",
+                    params![now_ms(), found.board_path],
                 )?;
                 return self.exact(&cursor);
             }
@@ -351,14 +458,69 @@ impl Registry {
     pub fn attach(
         &mut self,
         workspace: &Path,
-        project_workspace: &Path,
+        target: &str,
         actor: &str,
     ) -> Result<WorkspaceRecord> {
         let actor = validate_rule_actor(actor)?;
         let root = workspace.canonicalize()?;
-        let project = self.resolve(project_workspace)?.with_context(|| {
-            format!("no Kanban project contains {}", project_workspace.display())
-        })?;
+        let project = if target_looks_like_path(target) {
+            let project_workspace = Path::new(target);
+            let found = self.resolve(project_workspace)?.with_context(|| {
+                format!("no Kanban project contains {}", project_workspace.display())
+            })?;
+            self.project_for_board_path(&found.board_path)?
+        } else {
+            let matches = self.by_name(target)?;
+            match matches.as_slice() {
+                [project] => project.clone(),
+                [] => bail!("no Kanban project named {target}"),
+                many => {
+                    let rootless = many
+                        .iter()
+                        .filter(|project| project.workspace_roots.is_empty())
+                        .collect::<Vec<_>>();
+                    match rootless.as_slice() {
+                        [project] => (*project).clone(),
+                        [] => bail!(
+                            "{} Kanban projects are named {target}; disambiguate with --workspace PATH: {}",
+                            many.len(),
+                            many.iter()
+                                .map(|project| {
+                                    if project.workspace_roots.is_empty() {
+                                        format!("{} (rootless)", project.name)
+                                    } else {
+                                        format!(
+                                            "{} [{}]",
+                                            project.name,
+                                            project.workspace_roots.join(", ")
+                                        )
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        _ => bail!(
+                            "{} rootless Kanban projects are named {target}; fix the registry so only one rootless board can carry a name: {}",
+                            rootless.len(),
+                            many.iter()
+                                .map(|project| {
+                                    if project.workspace_roots.is_empty() {
+                                        format!("{} (rootless)", project.name)
+                                    } else {
+                                        format!(
+                                            "{} [{}]",
+                                            project.name,
+                                            project.workspace_roots.join(", ")
+                                        )
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }
+                }
+            }
+        };
         if let Some(existing) = self.exact(&root)? {
             if existing.board_path != project.board_path {
                 bail!(
@@ -368,25 +530,25 @@ impl Registry {
             }
             return Ok(existing);
         }
-        let canonical_name: String = self.connection.query_row(
-            "SELECT name FROM workspaces WHERE board_path=?",
-            [&project.board_path],
-            |row| row.get(0),
-        )?;
         let now = now_ms();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO workspace_aliases(root_path,name,board_path,created_at,last_used_at) VALUES(?,?,?,?,?)",
-            params![root.to_string_lossy(), canonical_name, project.board_path, now, now],
+            "INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at) VALUES(?,?,?,?)",
+            params![root.to_string_lossy(), project.board_path, now, now],
+        )?;
+        transaction.execute(
+            "UPDATE boards SET last_used_at=? WHERE board_path=?",
+            params![now, project.board_path],
         )?;
         crate::audit::append_registry_event(
             &transaction,
             &format!("workspace:{}", root.to_string_lossy()),
             "workspace_attached",
             actor,
-            &json!({"rootPath":root,"boardPath":project.board_path}).to_string(),
+            &json!({"rootPath":root,"boardPath":project.board_path,"name":project.name})
+                .to_string(),
             now,
         )?;
         transaction.commit()?;
@@ -395,20 +557,42 @@ impl Registry {
 
     pub fn list(&self, include_archived: bool) -> Result<Vec<WorkspaceRecord>> {
         let mut out = Vec::new();
-        let suffix = if include_archived {
-            " ORDER BY last_used_at DESC"
-        } else {
-            " WHERE archived=0 ORDER BY last_used_at DESC"
-        };
-        for (table, canonical) in [("workspaces", true), ("workspace_aliases", false)] {
-            let sql = format!("SELECT * FROM {table}{suffix}");
-            let mut statement = self.connection.prepare(&sql)?;
-            out.extend(
-                statement
-                    .query_map([], |r| row(r, canonical))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-        }
+        let active_sql = "SELECT workspace_roots.root_path AS root_path,\
+                    boards.name AS name,\
+                    workspace_roots.board_path AS board_path,\
+                    workspace_roots.created_at AS created_at,\
+                    workspace_roots.last_used_at AS last_used_at,\
+                    0 AS archived,\
+                    NULL AS archived_at,\
+                    NULL AS archived_by,\
+                    0 AS rootless \
+             FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
+             ORDER BY workspace_roots.last_used_at DESC, workspace_roots.root_path";
+        let mut statement = self.connection.prepare(active_sql)?;
+        let mut active = statement
+            .query_map([], row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        active.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
+        out.extend(active);
+        let mut statement = self.connection.prepare(
+            "SELECT '' AS root_path,\
+                    boards.name AS name,\
+                    boards.board_path AS board_path,\
+                    boards.created_at AS created_at,\
+                    boards.last_used_at AS last_used_at,\
+                    0 AS archived,\
+                    NULL AS archived_at,\
+                    NULL AS archived_by,\
+                    1 AS rootless \
+             FROM boards \
+             WHERE NOT EXISTS (SELECT 1 FROM workspace_roots WHERE workspace_roots.board_path=boards.board_path) \
+             ORDER BY boards.last_used_at DESC, boards.board_path",
+        )?;
+        let mut rootless = statement
+            .query_map([], rootless_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rootless.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
+        out.extend(rootless);
         if include_archived {
             let mut statement = self.connection.prepare(
                 "SELECT * FROM workspace_alias_history ORDER BY archived_at DESC,seq DESC",
@@ -430,31 +614,39 @@ impl Registry {
         if actor.is_empty() {
             bail!("actor is required");
         }
-        let alias = self
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let alias = transaction
             .query_row(
-                "SELECT * FROM workspace_aliases WHERE root_path=?",
+                "SELECT workspace_roots.root_path AS root_path,\
+                        boards.name AS name,\
+                        workspace_roots.board_path AS board_path,\
+                        workspace_roots.created_at AS created_at,\
+                        workspace_roots.last_used_at AS last_used_at,\
+                        0 AS archived,\
+                        NULL AS archived_at,\
+                        NULL AS archived_by,\
+                        0 AS rootless \
+                 FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
+                 WHERE workspace_roots.root_path=?",
                 [root_path],
-                |record| row(record, false),
+                row,
             )
             .optional()?;
         let Some(alias) = alias else {
-            if self
-                .connection
+            if transaction
                 .query_row(
-                    "SELECT 1 FROM workspaces WHERE root_path=? AND archived=0",
+                    "SELECT 1 FROM workspace_roots WHERE root_path=?",
                     [root_path],
                     |_| Ok(()),
                 )
                 .optional()?
                 .is_some()
             {
-                bail!(
-                    "{root_path} is a canonical project root and cannot be detached; repoint it or attach another worktree instead"
-                );
+                bail!("{root_path} is already detached");
             }
-            let retired = self
-                .connection
+            let retired = transaction
                 .query_row(
                     "SELECT 1 FROM workspace_alias_history WHERE root_path=? LIMIT 1",
                     [root_path],
@@ -467,18 +659,24 @@ impl Registry {
             }
             bail!("workspace alias {root_path} is not registered");
         };
+        let remaining_roots: i64 = transaction.query_row(
+            "SELECT count(*) FROM workspace_roots WHERE board_path=?",
+            [&alias.board_path],
+            |row| row.get(0),
+        )?;
+        if remaining_roots == 1 && active_named(&transaction, &alias.name, Some(&alias.board_path))?
+        {
+            bail!(
+                "detaching the last root from {root_path} would create a second active board named {}",
+                alias.name
+            );
+        }
         let now = now_ms();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO workspace_alias_history(root_path,name,board_path,created_at,last_used_at,archived_at,archived_by) VALUES(?,?,?,?,?,?,?)",
             params![alias.root_path,alias.name,alias.board_path,alias.created_at,alias.last_used_at,now,actor],
         )?;
-        transaction.execute(
-            "DELETE FROM workspace_aliases WHERE root_path=?",
-            [root_path],
-        )?;
+        transaction.execute("DELETE FROM workspace_roots WHERE root_path=?", [root_path])?;
         crate::audit::append_registry_event(
             &transaction,
             &format!("workspace:{root_path}"),
@@ -491,6 +689,7 @@ impl Registry {
             archived: true,
             archived_at: Some(now),
             archived_by: Some(actor.to_owned()),
+            rootless: alias.rootless,
             ..alias
         };
         transaction.commit()?;
@@ -596,9 +795,9 @@ impl Registry {
     pub fn consolidate_board_rules(&mut self, actor: &str) -> Result<RuleMigrationReport> {
         let actor = validate_rule_actor(actor)?.to_owned();
         let projects = {
-            let mut statement = self.connection.prepare(
-                "SELECT name,board_path FROM workspaces WHERE archived=0 ORDER BY name,board_path",
-            )?;
+            let mut statement = self
+                .connection
+                .prepare("SELECT name,board_path FROM boards ORDER BY name,board_path")?;
             statement
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -623,7 +822,7 @@ impl Registry {
 
         for (board_name, board_path) in projects {
             let duplicate_names: i64 = self.connection.query_row(
-                "SELECT count(*) FROM workspaces WHERE archived=0 AND name=?",
+                "SELECT count(*) FROM boards WHERE name=?",
                 [&board_name],
                 |row| row.get(0),
             )?;
@@ -1176,34 +1375,35 @@ impl Registry {
     }
 
     pub fn projects(&self) -> Result<Vec<ProjectRecord>> {
-        let mut statement = self.connection.prepare("SELECT * FROM workspaces")?;
-        let canonical = statement
-            .query_map([], |r| row(r, true))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let aliases = self
-            .list(false)?
-            .into_iter()
-            .filter(|r| !r.canonical)
-            .collect::<Vec<_>>();
-        let mut projects = canonical
-            .into_iter()
-            .map(|record| {
-                let project_aliases = aliases.iter().filter(|a| a.board_path == record.board_path);
-                let mut roots = vec![record.root_path.clone()];
-                let mut last = record.last_used_at;
-                for alias in project_aliases {
-                    roots.push(alias.root_path.clone());
-                    last = last.max(alias.last_used_at);
-                }
-                ProjectRecord {
-                    name: record.name,
-                    board_path: record.board_path,
-                    canonical_root: record.root_path,
-                    workspace_roots: roots,
-                    last_used_at: last,
-                }
-            })
-            .collect::<Vec<_>>();
+        let boards = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT board_path,name,last_used_at FROM boards ORDER BY board_path")?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut projects = Vec::with_capacity(boards.len());
+        for (board_path, name, last_used_at) in boards {
+            let mut roots_statement = self.connection.prepare(
+                "SELECT root_path FROM workspace_roots WHERE board_path=? ORDER BY last_used_at DESC,root_path",
+            )?;
+            let workspace_roots = roots_statement
+                .query_map([&board_path], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            projects.push(ProjectRecord {
+                name,
+                board_path,
+                workspace_roots,
+                last_used_at,
+            });
+        }
         projects.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
         Ok(projects)
     }
@@ -1224,12 +1424,10 @@ impl Registry {
     /// project addressed only by name.
     pub fn touch_board(&self, board_path: &str) -> Result<()> {
         let now = now_ms();
-        for table in ["workspaces", "workspace_aliases"] {
-            self.connection.execute(
-                &format!("UPDATE {table} SET last_used_at=? WHERE board_path=?"),
-                params![now, board_path],
-            )?;
-        }
+        self.connection.execute(
+            "UPDATE boards SET last_used_at=? WHERE board_path=?",
+            params![now, board_path],
+        )?;
         Ok(())
     }
 
@@ -1271,6 +1469,9 @@ impl Registry {
     pub fn unreachable_roots(&self) -> Result<Vec<UnreachableRoot>> {
         let mut out = Vec::new();
         for record in self.list(false)? {
+            if record.rootless {
+                continue;
+            }
             let stored = Path::new(&record.root_path);
             let resolved = stored.canonicalize().ok();
             let reachable = resolved
@@ -1284,7 +1485,6 @@ impl Registry {
                 root_path: record.root_path,
                 board_path: record.board_path,
                 resolves_to: resolved.map(|p| p.to_string_lossy().into_owned()),
-                canonical: record.canonical,
             });
         }
         Ok(out)
@@ -1320,25 +1520,25 @@ impl Registry {
                  repoint to — the two would be one row"
             );
         }
-        let table = if broken.canonical {
-            "workspaces"
-        } else {
-            "workspace_aliases"
-        };
         let now = now_ms();
+        let board_path = broken.board_path.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            &format!("UPDATE {table} SET root_path=?, last_used_at=? WHERE root_path=?"),
-            params![target, now, root_path],
+            "UPDATE workspace_roots SET root_path=?, last_used_at=? WHERE root_path=?",
+            params![target.clone(), now, root_path],
+        )?;
+        transaction.execute(
+            "UPDATE boards SET last_used_at=? WHERE board_path=?",
+            params![now, board_path.clone()],
         )?;
         crate::audit::append_registry_event(
             &transaction,
             &format!("workspace:{target}"),
             "workspace_repointed",
             actor,
-            &json!({"previousRootPath":root_path,"rootPath":target,"boardPath":broken.board_path})
+            &json!({"previousRootPath":root_path,"rootPath":target,"boardPath":board_path})
                 .to_string(),
             now,
         )?;

@@ -246,30 +246,39 @@ tree. Board selection runs most explicit first ([ADR-007](docs/adr/ADR-007-globa
 kanban task list --project my-project          # from any directory
 export KANBAN_PROJECT=my-project               # or once per shell or agent cage
 kanban task add "ships from anywhere"
-kanban workspace list                          # the registered names to choose from
+kanban workspace list                          # registered names, including rootless boards
 ```
 
-Project names are not unique. If two projects share one, `--project` refuses and
-names the candidate roots; use `--workspace PATH` to pick one.
+Project names are not unique. If two boards share one, `--project` refuses and
+names every candidate, including rootless boards; use `--workspace PATH` or a
+registered path to pick one. `workspace attach --to .` and similar path-like
+inputs keep path resolution; bare names remain name-based.
 
-Initialize a project once, then attach additional Git worktrees to the same
-board:
+Register a board by explicit name, then attach additional Git worktrees to it
+when needed:
 
 ```bash
 kanban init --name my-project --workspace /path/to/main-worktree
+kanban init --name scratchboard --rootless
 cd /path/to/another-worktree
-kanban workspace attach --to /path/to/main-worktree
+kanban workspace attach --to my-project
 kanban workspace detach --root /path/to/retired-worktree --as geo
+```
 
-If a registered tree is later moved and a symlink left where it was, every path
-still works at the shell but none of them resolve to the board: registration
-stores a canonical path, resolution canonicalises the caller's cwd, and the two
-spellings no longer meet. `doctor` reports those roots and where they lead now;
-`kanban workspace repoint` points them at the tree's new home, repairing the
-project root and every lane beneath it together.
+If a name is reused and one candidate is rootless, `workspace attach --to NAME`
+chooses that unique rootless board. The registry refuses to create a second
+active board with the same name, and `workspace detach` refuses a last-root
+retirement only when it would create a second active board with that name, so
+the ambiguous state is blocked instead of becoming a dead end.
+
+If a registered tree is later moved and a symlink left where it was, the root
+row is now only a hint. `doctor` reports that stale root and where it leads
+now; `kanban workspace repoint` points it at the tree's new home, repairing the
+attached root without changing board identity.
 When an attached worktree is intentionally gone, `workspace detach` retires
-that alias without deleting its registry history; `workspace list --all` shows
-the detached row. Canonical project roots cannot be detached.
+that root without deleting its registry history; `workspace list --all` shows
+the detached row. The last root may be retired too, leaving a rootless board
+that stays reachable by name.
 kanban dashboard
 ```
 

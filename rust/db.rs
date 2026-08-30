@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde_json::json;
 use std::cell::Cell;
 use std::fs::{self, Permissions};
 use std::io::ErrorKind;
@@ -1091,8 +1092,41 @@ ALTER TABLE rule_events ADD COLUMN prev_hash TEXT;
 ALTER TABLE rule_events ADD COLUMN event_hash TEXT;
 "#;
 
+/// Split board identity from roots. The registry keeps the old legacy tables
+/// around for audit-readability, but the live API now resolves through the
+/// explicit board entity and optional unordered roots table.
+const REGISTRY_V11: &str = r#"
+CREATE TABLE boards (
+ board_path TEXT PRIMARY KEY NOT NULL,
+ name TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ last_used_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_boards_name ON boards(name,board_path);
+CREATE TABLE workspace_roots (
+ root_path TEXT PRIMARY KEY NOT NULL,
+ board_path TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ last_used_at INTEGER NOT NULL,
+ FOREIGN KEY(board_path) REFERENCES boards(board_path)
+) STRICT;
+CREATE INDEX idx_workspace_roots_board ON workspace_roots(board_path,last_used_at DESC);
+INSERT INTO boards(board_path,name,created_at,last_used_at)
+SELECT board_path,name,created_at,last_used_at FROM workspaces;
+INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at)
+SELECT root_path,board_path,created_at,last_used_at FROM workspaces;
+INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at)
+SELECT root_path,board_path,created_at,last_used_at FROM workspace_aliases;
+UPDATE boards
+SET last_used_at = COALESCE((
+  SELECT max(last_used_at)
+  FROM workspace_roots
+  WHERE board_path=boards.board_path
+), last_used_at);
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 20;
-pub const REGISTRY_SCHEMA_VERSION: usize = 10;
+pub const REGISTRY_SCHEMA_VERSION: usize = 11;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -1254,6 +1288,17 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
     }
     while current < migrations.len() {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        current = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current > migrations.len() {
+            bail!(
+                "database version {current} is newer than supported version {}",
+                migrations.len()
+            );
+        }
+        if current == migrations.len() {
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute_batch(migrations[current])?;
         transaction.pragma_update(None, "user_version", (current + 1) as i64)?;
         transaction.commit()?;
@@ -1320,7 +1365,61 @@ pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
     migrate(&mut connection, REGISTRY_MIGRATIONS)?;
     crate::audit::initialize_registry_chain(&mut connection)?;
+    record_workspace_name_drift(&mut connection)?;
     Ok(connection)
+}
+
+fn record_workspace_name_drift(connection: &mut Connection) -> Result<()> {
+    const KEY: &str = "workspace_root_model_v11_name_drift_audited";
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if transaction
+        .query_row("SELECT 1 FROM registry_meta WHERE key=?", [KEY], |_| Ok(()))
+        .optional()?
+        .is_some()
+    {
+        transaction.commit()?;
+        return Ok(());
+    }
+    let drifted = {
+        let mut statement = transaction.prepare(
+            "SELECT a.root_path,a.board_path,a.name,b.name \
+             FROM workspace_aliases a JOIN workspaces b ON b.board_path=a.board_path \
+             WHERE a.name<>b.name ORDER BY b.name,a.root_path",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let now = crate::registry::now_ms();
+    for (root_path, board_path, discarded_name, board_name) in drifted {
+        crate::audit::append_registry_event(
+            &transaction,
+            &format!("workspace:{root_path}"),
+            "workspace_alias_name_discarded",
+            "system@migration",
+            &json!({
+                "rootPath": root_path,
+                "boardPath": board_path,
+                "discardedName": discarded_name,
+                "boardName": board_name,
+            })
+            .to_string(),
+            now,
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO registry_meta(key,value) VALUES(?,?)",
+        params![KEY, now.to_string()],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 const REGISTRY_MIGRATIONS: &[&str] = &[
@@ -1334,6 +1433,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V8,
     REGISTRY_V9,
     REGISTRY_V10,
+    REGISTRY_V11,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
