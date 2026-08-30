@@ -1236,7 +1236,7 @@ impl Store {
             || !tags.is_empty();
         if semantic {
             sql.push_str(
-                " AND json_valid(payload) AND json_type(payload,'$._semanticV1')='object'",
+                " AND json_type(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1')='object'",
             );
         }
         if !relations.is_empty() {
@@ -1246,7 +1246,7 @@ impl Store {
                     sql.push_str(" AND 0");
                     continue;
                 };
-                clauses.push("EXISTS (SELECT 1 FROM json_each(json_extract(payload,'$._semanticV1.relations')) r WHERE json_extract(r.value,'$.kind')=? AND json_extract(r.value,'$.id')=?)");
+                clauses.push("EXISTS (SELECT 1 FROM json_each(json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.relations')) r WHERE json_extract(r.value,'$.kind')=? AND json_extract(r.value,'$.id')=?)");
                 values.push(Box::new(kind.to_owned()));
                 values.push(Box::new(id.to_owned()));
             }
@@ -1257,7 +1257,7 @@ impl Store {
             }
         }
         if !prior_statuses.is_empty() {
-            sql.push_str(" AND json_extract(payload,'$._semanticV1.priorStatus') IN (");
+            sql.push_str(" AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.priorStatus') IN (");
             sql.push_str(
                 &std::iter::repeat_n("?", prior_statuses.len())
                     .collect::<Vec<_>>()
@@ -1272,7 +1272,7 @@ impl Store {
             );
         }
         if !current_statuses.is_empty() {
-            sql.push_str(" AND json_extract(payload,'$._semanticV1.currentStatus') IN (");
+            sql.push_str(" AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.currentStatus') IN (");
             sql.push_str(
                 &std::iter::repeat_n("?", current_statuses.len())
                     .collect::<Vec<_>>()
@@ -1287,7 +1287,7 @@ impl Store {
             );
         }
         if !tags.is_empty() {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(json_extract(payload,'$._semanticV1.tags')) t WHERE t.value IN (");
+            sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.tags')) t WHERE t.value IN (");
             sql.push_str(
                 &std::iter::repeat_n("?", tags.len())
                     .collect::<Vec<_>>()
@@ -3983,6 +3983,15 @@ mod tests {
             .unwrap();
         };
         append("legacy", r#"{"note":"no snapshot"}"#);
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        append("malformed", "not json");
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .unwrap();
         append(
             "wanted",
             r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[{"kind":"parent","type":"story","id":"s-1"}],"priorStatus":"todo","currentStatus":"done","tags":["infra"]}}"#,
@@ -3991,7 +4000,7 @@ mod tests {
             "other",
             r#"{"_semanticV1":{"subject":{"type":"task","id":"gone-task"},"relations":[],"priorStatus":"todo","currentStatus":"review","tags":["docs"]}}"#,
         );
-        let kinds = vec!["wanted".to_owned(), "missing-but-known".to_owned()];
+        let kinds = vec!["malformed".to_owned(), "wanted".to_owned()];
         let relations = vec!["parent:s-1".to_owned()];
         let prior = vec!["todo".to_owned()];
         let current = vec!["done".to_owned()];
