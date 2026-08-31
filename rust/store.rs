@@ -1963,6 +1963,19 @@ impl Store {
         &self,
         now: i64,
     ) -> Result<Option<SubscriptionDeliveryCandidate>> {
+        self.next_due_subscription_delivery_for_consumer(now, None)
+    }
+
+    /// The oldest due delivery candidate for one exact consumer, when given.
+    ///
+    /// Filtering belongs in the eligibility query rather than after `LIMIT 1`:
+    /// otherwise an unrelated consumer at the head of the queue can make a
+    /// targeted dispatcher report a false idle result.
+    pub(crate) fn next_due_subscription_delivery_for_consumer(
+        &self,
+        now: i64,
+        consumer_id: Option<&str>,
+    ) -> Result<Option<SubscriptionDeliveryCandidate>> {
         validate_nonnegative_now(now, "dispatcher now")?;
         let cutoff = now.saturating_sub(60_000);
         let mut statement = self.connection.prepare(
@@ -1972,14 +1985,18 @@ impl Store {
              WHERE d.status IN ('pending','retry_wait') \
                AND s.status='active' \
                AND d.next_attempt_at IS NOT NULL \
-               AND d.next_attempt_at<=? \
-               AND (SELECT COUNT(*) FROM subscription_delivery_attempts a WHERE a.subscription_id=s.id AND a.started_at>=? AND a.started_at<=?) < s.rate_per_minute \
+               AND d.next_attempt_at<=?1 \
+               AND (?4 IS NULL OR s.consumer_id=?4) \
+               AND (SELECT COUNT(*) FROM subscription_delivery_attempts a WHERE a.subscription_id=s.id AND a.started_at>=?2 AND a.started_at<=?3) < s.rate_per_minute \
                AND (SELECT COUNT(*) FROM subscription_deliveries l WHERE l.subscription_id=s.id AND l.status='leased') < s.max_concurrency \
              ORDER BY d.next_attempt_at ASC,d.event_seq ASC,d.subscription_id ASC,d.event_id ASC \
              LIMIT 1",
         )?;
         let delivery = statement
-            .query_row(params![now, cutoff, now], subscription_delivery_row)
+            .query_row(
+                params![now, cutoff, now, consumer_id],
+                subscription_delivery_row,
+            )
             .optional()?;
         let Some(delivery) = delivery else {
             return Ok(None);
@@ -6018,6 +6035,66 @@ mod tests {
                 .unwrap()
                 .start_event_seq,
             tail_added.start_event_seq
+        );
+    }
+
+    #[test]
+    fn subscription_delivery_candidate_filters_in_sql_by_exact_consumer() {
+        let mut store = subscription_store("subscriptions-delivery-consumer-filter");
+        let mut first = delivery_subscription_input("sub-consumer-a");
+        first.consumer_id = "consumer.a".into();
+        let mut second = delivery_subscription_input("sub-consumer-b");
+        second.consumer_id = "consumer.b".into();
+        store.add_subscription(first).unwrap();
+        store.add_subscription(second).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        assert_eq!(store.materialize_subscriptions().unwrap(), 2);
+
+        let due_at = delivery_row(
+            &store,
+            "sub-consumer-a",
+            &delivery_event_ids(&store, "sub-consumer-a")[0],
+        )
+        .next_attempt_at
+        .unwrap();
+        assert_eq!(
+            store
+                .next_due_subscription_delivery_for_consumer(due_at, Some("consumer.b"))
+                .unwrap()
+                .unwrap()
+                .subscription
+                .id,
+            "sub-consumer-b"
+        );
+        assert!(
+            store
+                .next_due_subscription_delivery_for_consumer(due_at, Some("consumer.missing"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .next_due_subscription_delivery(due_at)
+                .unwrap()
+                .unwrap()
+                .subscription
+                .id,
+            "sub-consumer-a"
         );
     }
 

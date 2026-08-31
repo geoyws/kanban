@@ -162,6 +162,10 @@ fn exact_identifier(value: &str, label: &str, max: usize) -> Result<String> {
     Ok(value.to_owned())
 }
 
+pub(crate) fn validate_consumer_id(value: &str) -> Result<String> {
+    exact_identifier(value, "consumer id", IDENTIFIER_MAX)
+}
+
 fn exact_env_name(value: &str, label: &str) -> Result<String> {
     let value = nonempty(value, label)?;
     if value.len() > ENV_NAME_MAX
@@ -378,7 +382,7 @@ fn verify_executable(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn consumer_lock_path(consumer_id: &str) -> Result<PathBuf> {
-    let consumer_id = exact_identifier(consumer_id, "consumer id", IDENTIFIER_MAX)?;
+    let consumer_id = validate_consumer_id(consumer_id)?;
     let digest = Sha256::digest(consumer_id.as_bytes());
     Ok(config_root()?
         .join(LOCK_DIR)
@@ -518,9 +522,16 @@ impl DispatcherConfigLoader {
 }
 
 impl DispatcherConfig {
+    pub(crate) fn require_consumer(&self, consumer_id: &str) -> Result<()> {
+        let consumer_id = validate_consumer_id(consumer_id)?;
+        if !self.consumers.contains_key(&consumer_id) {
+            bail!("unknown consumer {consumer_id}");
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve(&self, subscription: &Subscription) -> Result<ResolvedDispatch> {
-        let consumer_id =
-            exact_identifier(&subscription.consumer_id, "consumer id", IDENTIFIER_MAX)?;
+        let consumer_id = validate_consumer_id(&subscription.consumer_id)?;
         let action_id = exact_identifier(&subscription.action_id, "action id", IDENTIFIER_MAX)?;
         let consumer = self
             .consumers
@@ -777,6 +788,8 @@ mod tests {
         write_config(&root.path, &base_config(executable, secret_source), 0o600);
 
         let config = DispatcherConfigLoader::load().unwrap();
+        config.require_consumer("consumer-a").unwrap();
+        assert!(config.require_consumer("consumer-missing").is_err());
         let resolved = config.resolve(&subscription(Some("secret-a"))).unwrap();
         assert_eq!(resolved.consumer_id, "consumer-a");
         assert_eq!(resolved.action_id, "action-a");
