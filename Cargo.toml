@@ -25,6 +25,10 @@ path = "rust/bin/kb.rs"
 name = "kanban-dispatcher"
 path = "rust/bin/kanban-dispatcher.rs"
 
+[[bin]]
+name = "kanban-codex-queue-adapter"
+path = "rust/bin/kanban-codex-queue-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"

@@ -1,6 +1,7 @@
 mod adapter_process;
 mod adapter_protocol;
 mod audit;
+mod codex_queue_adapter;
 mod context;
 mod db;
 mod dispatch;
@@ -2094,6 +2095,18 @@ pub fn entrypoint() -> ! {
 /// Entry point for the dedicated durable-subscription worker binary.
 pub fn dispatcher_entrypoint() -> ! {
     match dispatcher::command(env::args_os().skip(1).collect()) {
+        Ok(()) => std::process::exit(0),
+        Err(error) if reader_left(&error) => std::process::exit(0),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the Codex queue adapter binary.
+pub fn codex_queue_adapter_entrypoint() -> ! {
+    match codex_queue_adapter::entrypoint() {
         Ok(()) => std::process::exit(0),
         Err(error) if reader_left(&error) => std::process::exit(0),
         Err(error) => {

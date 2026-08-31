@@ -62,7 +62,7 @@ fn contains_private_key(value: &Value) -> bool {
     }
 }
 
-pub(crate) fn encode_request(request: &AdapterRequest) -> Result<Vec<u8>> {
+pub(crate) fn validate_request(request: &AdapterRequest) -> Result<()> {
     if request.protocol_version != 1 {
         bail!(
             "unsupported adapter request protocol version {}",
@@ -91,11 +91,27 @@ pub(crate) fn encode_request(request: &AdapterRequest) -> Result<Vec<u8>> {
     if contains_private_key(&request.event) {
         bail!("adapter event contains a private key");
     }
+    Ok(())
+}
+
+pub(crate) fn encode_request(request: &AdapterRequest) -> Result<Vec<u8>> {
+    validate_request(request)?;
     let encoded = serde_json::to_vec(request)?;
     if encoded.len() > MAX_MESSAGE_BYTES {
         bail!("adapter request exceeds {MAX_MESSAGE_BYTES} bytes");
     }
     Ok(encoded)
+}
+
+pub(crate) fn decode_request(bytes: &[u8]) -> Result<AdapterRequest> {
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        bail!("adapter request exceeds {MAX_MESSAGE_BYTES} bytes");
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let request = AdapterRequest::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    validate_request(&request)?;
+    Ok(request)
 }
 
 pub(crate) fn decode_response(bytes: &[u8], request: &AdapterRequest) -> Result<AdapterResponse> {
