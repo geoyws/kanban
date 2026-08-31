@@ -450,7 +450,7 @@ fn spawn_server(fixture: &Fixture) -> ServerGuard {
                 Ok(line) => {
                     if line_is_server_ready_banner(&expected_banner, &line) {
                         match std::panic::catch_unwind(|| http_get(port, "/")) {
-                            Ok((status, _body)) if status == 200 => {
+                            Ok((200, _body)) => {
                                 return ServerGuard {
                                     child: Some(child),
                                     port,
