@@ -869,3 +869,157 @@ pub fn import_sqlite(
         options,
     )?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_root(label: &str) -> TempRoot {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock moved backwards")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kanban-import-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp import dir");
+        TempRoot(root)
+    }
+
+    fn test_store(root: &Path) -> Store {
+        Store::open(&root.join("board.db")).expect("open test store")
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        fs::write(path, serde_json::to_vec(value).expect("serialize source"))
+            .expect("write source");
+    }
+
+    #[test]
+    fn import_json_normalizes_warnings_and_preserves_only_the_valid_links() {
+        let root = temp_root("warnings");
+        let source = root.0.join("kanban.json");
+        write_json(
+            &source,
+            &json!({
+                "epics": [],
+                "stories": [],
+                "tasks": [
+                    {
+                        "id": "t-parent",
+                        "subject": "Parent",
+                        "status": "todo",
+                        "created_at": 1700000000
+                    },
+                    {
+                        "id": "t-child",
+                        "subject": "Child",
+                        "status": "todo",
+                        "created_at": 1700000001,
+                        "completed_at": 1700000123,
+                        "story": "t-missing",
+                        "deps": ["t-parent", "t-dangling"]
+                    }
+                ]
+            }),
+        );
+
+        let mut store = test_store(&root.0);
+        let dry_run = match import_json(
+            &mut store,
+            &source,
+            "operator",
+            ImportOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .expect("dry run import")
+        {
+            Outcome::Import(receipt) => receipt,
+            _ => panic!("expected import receipt"),
+        };
+
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.imported, 2);
+        assert_eq!(dry_run.created, 2);
+        assert_eq!(dry_run.updated, 0);
+        assert_eq!(dry_run.warnings.missing_parents.len(), 1);
+        assert_eq!(dry_run.warnings.missing_parents[0].task_id, "t-child");
+        assert_eq!(dry_run.warnings.missing_parents[0].parent_id, "t-missing");
+        assert_eq!(dry_run.warnings.dangling_dependencies.len(), 1);
+        assert_eq!(dry_run.warnings.dangling_dependencies[0].task_id, "t-child");
+        assert_eq!(
+            dry_run.warnings.dangling_dependencies[0].dependency_id,
+            "t-dangling"
+        );
+        assert_eq!(dry_run.warnings.nonterminal_completions.len(), 1);
+        assert_eq!(
+            dry_run.warnings.nonterminal_completions[0].task_id,
+            "t-child"
+        );
+        assert_eq!(dry_run.warnings.nonterminal_completions[0].status, "todo");
+        assert_eq!(
+            dry_run.warnings.nonterminal_completions[0].completed_at,
+            1_700_000_123_000
+        );
+        assert!(
+            store.require_task("t-child").is_err(),
+            "dry run wrote a task"
+        );
+
+        let written = match import_json(&mut store, &source, "operator", ImportOptions::default())
+            .expect("real import")
+        {
+            Outcome::Import(receipt) => receipt,
+            _ => panic!("expected import receipt"),
+        };
+
+        assert!(!written.dry_run);
+        assert_eq!(written.warnings.missing_parents[0].parent_id, "t-missing");
+        assert_eq!(
+            written.warnings.dangling_dependencies[0].dependency_id,
+            "t-dangling"
+        );
+        assert_eq!(
+            written.warnings.nonterminal_completions[0].completed_at,
+            1_700_000_123_000
+        );
+
+        let child = store.require_task("t-child").expect("imported child");
+        assert_eq!(child.parent_id, None);
+        assert_eq!(child.completed_at, None);
+        assert_eq!(
+            child.metadata["legacyMissingParent"],
+            Value::String("t-missing".into())
+        );
+        assert_eq!(
+            child.metadata["legacyDanglingDependencies"],
+            json!(["t-dangling"])
+        );
+        assert_eq!(
+            child.metadata["legacyCompletedAt"],
+            json!(1_700_000_123_000i64)
+        );
+        let deps = store
+            .dependencies("t-child")
+            .expect("read child dependencies")
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(deps, vec!["t-parent"]);
+    }
+}

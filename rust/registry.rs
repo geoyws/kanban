@@ -1862,4 +1862,52 @@ mod tests {
         assert!(registry.event_kind_exists("wanted").unwrap());
         assert!(!registry.event_kind_exists("never-seen").unwrap());
     }
+
+    #[test]
+    fn registering_the_same_root_and_name_reuses_the_board_and_marks_it_existing() {
+        let mut registry = test_registry("registry-reregister");
+        let root = registry.root.join("workspace");
+        fs::create_dir_all(&root).expect("create workspace root");
+
+        let first = registry
+            .register(Some(&root), "Alpha", false, "codex")
+            .expect("initial register");
+        let second = registry
+            .register(Some(&root), "Alpha", false, "codex")
+            .expect("repeat register");
+
+        assert_eq!(first.board_path, second.board_path);
+        assert_eq!(first.name, second.name);
+        assert_eq!(second.workspace_roots.len(), 1);
+        assert_eq!(
+            second.workspace_roots[0],
+            root.canonicalize()
+                .expect("canonicalize root")
+                .to_string_lossy()
+                .into_owned()
+        );
+
+        let event_count: i64 = registry
+            .connection
+            .query_row(
+                "SELECT count(*) FROM rule_events WHERE kind='workspace_registered'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count register events");
+        assert_eq!(event_count, 2);
+
+        let payload: String = registry
+            .connection
+            .query_row(
+                "SELECT payload FROM rule_events ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read register payload");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse payload");
+        assert_eq!(payload["existing"], true);
+        assert_eq!(payload["name"], "Alpha");
+        assert_eq!(payload["boardPath"], first.board_path);
+    }
 }

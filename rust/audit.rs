@@ -438,6 +438,50 @@ pub fn hash_at(connection: &Connection, table: &str, seq: i64) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_connection(label: &str) -> (TempRoot, Connection) {
+        let root = std::env::temp_dir().join(format!(
+            "kanban-audit-{label}-{}-{}",
+            std::process::id(),
+            crate::registry::now_ms()
+        ));
+        fs::create_dir_all(&root).expect("create temp audit dir");
+        let connection = Connection::open(root.join("registry.db")).expect("open registry db");
+        (TempRoot(root), connection)
+    }
+
+    fn create_registry_tables(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE registry_meta (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                ) STRICT;
+                CREATE TABLE rule_events (
+                    seq INTEGER PRIMARY KEY NOT NULL,
+                    rule_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+                    created_at INTEGER NOT NULL,
+                    prev_hash TEXT,
+                    event_hash TEXT
+                ) STRICT;
+                "#,
+            )
+            .expect("create audit schema");
+    }
 
     #[test]
     fn canonical_encoding_is_sensitive_to_boundaries_and_order() {
@@ -460,5 +504,85 @@ mod tests {
         let c = make(2, "ab", "c");
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn registry_chain_bootstraps_and_helper_guards_fail_closed() {
+        let (_root, mut connection) = temp_connection("bootstrap");
+        create_registry_tables(&connection);
+        connection
+            .execute(
+                "INSERT INTO rule_events(seq,rule_id,kind,actor,payload,created_at,prev_hash,event_hash) \
+                 VALUES(1,'rule-1','rule_created','codex','{}',10,NULL,NULL)",
+                [],
+            )
+            .expect("insert legacy registry event");
+
+        initialize_registry_chain(&mut connection).expect("bootstrap registry chain");
+        initialize_registry_chain(&mut connection).expect("idempotent bootstrap");
+
+        let legacy_entries: i64 = connection
+            .query_row(
+                "SELECT value FROM registry_meta WHERE key='audit_chain_legacy_entries'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read legacy count")
+            .parse()
+            .expect("parse legacy count");
+        assert_eq!(legacy_entries, 1);
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM registry_meta WHERE key='audit_chain_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read chain version");
+        assert_eq!(version, "1");
+        let (prev_hash, event_hash): (String, String) = connection
+            .query_row(
+                "SELECT prev_hash,event_hash FROM rule_events WHERE seq=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("read bootstrapped event");
+        assert_eq!(
+            prev_hash,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(event_hash.len(), 64);
+
+        let report = verify_registry(&connection).expect("verify bootstrapped chain");
+        assert!(report.healthy);
+        assert_eq!(report.legacy_entries, 1);
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.last_seq, 1);
+
+        let blank_actor =
+            append_registry_event(&connection, "rule-1", "rule_updated", " ", "{}", 11)
+                .expect_err("blank actor must be rejected")
+                .to_string();
+        assert!(blank_actor.contains("actor is required"), "{blank_actor}");
+
+        let (_guard_root, guard_connection) = temp_connection("uninitialized-head");
+        create_registry_tables(&guard_connection);
+        guard_connection
+            .execute(
+                "INSERT INTO rule_events(seq,rule_id,kind,actor,payload,created_at,prev_hash,event_hash) \
+                 VALUES(1,'rule-1','rule_created','codex','{}',10,NULL,NULL)",
+                [],
+            )
+            .expect("insert legacy row with uninitialized head");
+        let head = append_registry_event(
+            &guard_connection,
+            "rule-1",
+            "rule_updated",
+            "codex",
+            "{}",
+            11,
+        )
+        .expect_err("uninitialized head must be rejected")
+        .to_string();
+        assert!(head.contains("uninitialized at its current head"), "{head}");
     }
 }
