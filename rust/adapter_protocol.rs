@@ -1,5 +1,8 @@
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,6 +45,31 @@ pub(crate) struct AdapterResponse {
     pub(crate) replay: bool,
 }
 
+pub(crate) fn decode_response(bytes: &[u8], request: &AdapterRequest) -> Result<AdapterResponse> {
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        bail!("adapter response exceeds {MAX_RESPONSE_BYTES} bytes");
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let response = AdapterResponse::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    if response.protocol_version != 1 {
+        bail!(
+            "unsupported adapter response protocol version {}",
+            response.protocol_version
+        );
+    }
+    if response.subscription_id != request.delivery.subscription_id {
+        bail!("adapter response subscription identity does not match request");
+    }
+    if response.event_id != request.delivery.event_id {
+        bail!("adapter response event identity does not match request");
+    }
+    if response.created_at != request.delivery.created_at {
+        bail!("adapter response timestamp does not match request");
+    }
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +90,16 @@ mod tests {
             },
             event: json!({"eventID": "a".repeat(64), "timestamp": 123}),
         }
+    }
+
+    fn response_value() -> Value {
+        json!({
+            "protocolVersion": 1,
+            "subscriptionID": "sub-test",
+            "eventID": "a".repeat(64),
+            "createdAt": 123,
+            "replay": false
+        })
     }
 
     #[test]
@@ -145,5 +183,53 @@ mod tests {
             "unknown": true
         });
         assert!(serde_json::from_value::<AdapterResponse>(value).is_err());
+    }
+
+    #[test]
+    fn strict_response_decoder_accepts_one_matching_value_and_whitespace() {
+        let mut bytes = serde_json::to_vec(&response_value()).unwrap();
+        bytes.extend_from_slice(b" \n\t");
+        assert!(!decode_response(&bytes, &request()).unwrap().replay);
+    }
+
+    #[test]
+    fn strict_response_decoder_enforces_the_inclusive_size_limit() {
+        let mut at_limit = serde_json::to_vec(&response_value()).unwrap();
+        at_limit.resize(MAX_RESPONSE_BYTES, b' ');
+        assert!(decode_response(&at_limit, &request()).is_ok());
+
+        at_limit.push(b' ');
+        assert!(decode_response(&at_limit, &request()).is_err());
+    }
+
+    #[test]
+    fn strict_response_decoder_rejects_extra_json_or_non_whitespace() {
+        let encoded = serde_json::to_string(&response_value()).unwrap();
+        assert!(decode_response(format!("{encoded} {{}}").as_bytes(), &request()).is_err());
+        assert!(decode_response(format!("{encoded} junk").as_bytes(), &request()).is_err());
+    }
+
+    #[test]
+    fn strict_response_decoder_rejects_unknown_fields() {
+        let mut value = response_value();
+        value["unknown"] = json!(true);
+        assert!(decode_response(&serde_json::to_vec(&value).unwrap(), &request()).is_err());
+    }
+
+    #[test]
+    fn strict_response_decoder_rejects_version_identity_and_timestamp_mismatches() {
+        for (field, value) in [
+            ("protocolVersion", json!(2)),
+            ("subscriptionID", json!("sub-other")),
+            ("eventID", json!("b".repeat(64))),
+            ("createdAt", json!(124)),
+        ] {
+            let mut response = response_value();
+            response[field] = value;
+            assert!(
+                decode_response(&serde_json::to_vec(&response).unwrap(), &request()).is_err(),
+                "field {field} must fail closed"
+            );
+        }
     }
 }
