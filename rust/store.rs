@@ -103,6 +103,22 @@ fn validate_nonnegative_now(now: i64, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_event_bounds(after: Option<i64>, before: Option<i64>) -> Result<()> {
+    if after.is_some_and(|value| value < 0) {
+        bail!("--after must be non-negative");
+    }
+    if before.is_some_and(|value| value < 0) {
+        bail!("--before must be non-negative");
+    }
+    if after
+        .zip(before)
+        .is_some_and(|(after, before)| after > before)
+    {
+        bail!("--after must not be later than --before");
+    }
+    Ok(())
+}
+
 fn validate_delivery_error_code(value: &str) -> Result<String> {
     let value = nonempty(value, "delivery error code")?;
     if value != value.to_ascii_lowercase() {
@@ -2459,6 +2475,19 @@ impl Store {
         limit: i64,
         include_archived: bool,
     ) -> Result<Vec<Event>> {
+        self.events_with_bounds(task, kind, None, None, limit, include_archived)
+    }
+
+    pub fn events_with_bounds(
+        &self,
+        task: Option<&str>,
+        kind: Option<&str>,
+        after: Option<i64>,
+        before: Option<i64>,
+        limit: i64,
+        include_archived: bool,
+    ) -> Result<Vec<Event>> {
+        validate_event_bounds(after, before)?;
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
@@ -2471,6 +2500,14 @@ impl Store {
         if let Some(kind) = kind {
             sql.push_str(" AND kind=?");
             values.push(Box::new(kind.to_owned()));
+        }
+        if let Some(after) = after {
+            sql.push_str(" AND created_at>=?");
+            values.push(Box::new(after));
+        }
+        if let Some(before) = before {
+            sql.push_str(" AND created_at<?");
+            values.push(Box::new(before));
         }
         if !include_archived {
             sql.push_str(" AND archived=0");
@@ -5064,6 +5101,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    fn query_plan_details<P: rusqlite::Params>(
+        connection: &Connection,
+        sql: &str,
+        params: P,
+    ) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare explain query plan");
+        statement
+            .query_map(params, |row| row.get::<_, String>(3))
+            .expect("run explain query plan")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect query plan details")
+    }
+
     fn board_db_path(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("kanban-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp board dir");
@@ -5119,6 +5171,168 @@ mod tests {
                 ],
             )
             .expect("insert task");
+    }
+
+    #[test]
+    fn events_with_bounds_respect_half_open_bounds_limit_and_archive_visibility() {
+        let store = test_store("events-with-bounds");
+        insert_task(&store, "t-events");
+
+        for (kind, created_at) in [
+            ("task_created", 10_i64),
+            ("task_updated", 20_i64),
+            ("task_moved", 30_i64),
+            ("task_finished", 40_i64),
+            ("task_removed", 100_i64),
+        ] {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("t-events"),
+                kind,
+                "codex",
+                "{}",
+                created_at,
+            )
+            .expect("append event");
+        }
+        store
+            .connection
+            .execute("UPDATE events SET archived=1 WHERE seq=5", [])
+            .unwrap();
+
+        let exact_bounds = store
+            .events_with_bounds(None, None, Some(20), Some(40), 10, false)
+            .expect("read half-open bounded events");
+        assert_eq!(board_event_seqs(&exact_bounds), vec![3, 2]);
+
+        let equal_bounds = store
+            .events_with_bounds(None, None, Some(30), Some(30), 10, false)
+            .expect("read equal bounded events");
+        assert!(board_event_seqs(&equal_bounds).is_empty());
+
+        let after_only = store
+            .events_with_bounds(None, None, Some(30), None, 10, true)
+            .expect("read after-only bounded events");
+        assert_eq!(board_event_seqs(&after_only), vec![5, 4, 3]);
+
+        let before_only = store
+            .events_with_bounds(None, None, None, Some(40), 10, true)
+            .expect("read before-only bounded events");
+        assert_eq!(board_event_seqs(&before_only), vec![3, 2, 1]);
+
+        let bounded_limit = store
+            .events_with_bounds(None, None, Some(15), Some(45), 1, false)
+            .expect("read limit-bounded events");
+        assert_eq!(board_event_seqs(&bounded_limit), vec![4]);
+
+        let active = store
+            .events_with_bounds(None, None, None, None, 10, false)
+            .expect("read active events");
+        assert_eq!(board_event_seqs(&active), vec![4, 3, 2, 1]);
+
+        let all = store.events(None, None, 10, true).expect("read all events");
+        assert_eq!(board_event_seqs(&all), vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn events_with_bounds_rejects_negative_and_reversed_bounds() {
+        let store = test_store("events-with-bounds-validation");
+
+        let negative_after = store
+            .events_with_bounds(None, None, Some(-1), None, 10, false)
+            .expect_err("negative after must be rejected")
+            .to_string();
+        assert_eq!(negative_after, "--after must be non-negative");
+
+        let negative_before = store
+            .events_with_bounds(None, None, None, Some(-1), 10, false)
+            .expect_err("negative before must be rejected")
+            .to_string();
+        assert_eq!(negative_before, "--before must be non-negative");
+
+        let reversed = store
+            .events_with_bounds(None, None, Some(40), Some(30), 10, false)
+            .expect_err("reversed bounds must be rejected")
+            .to_string();
+        assert_eq!(reversed, "--after must not be later than --before");
+    }
+
+    #[test]
+    fn production_query_shapes_use_their_covering_indexes_without_force_hints() {
+        let store = test_store("query-plan-shapes");
+
+        for index in 0_i64..32 {
+            let id = format!("task-{index:02}");
+            insert_task(&store, &id);
+            store
+                .connection
+                .execute(
+                    "UPDATE tasks SET priority=?,created_at=?,updated_at=? WHERE id=?",
+                    params![index % 10, 10_000 + index, 10_000 + index, id],
+                )
+                .unwrap();
+        }
+
+        for (kind, created_at) in [
+            ("task_created", 10_i64),
+            ("task_updated", 20_i64),
+            ("task_moved", 30_i64),
+            ("task_finished", 40_i64),
+            ("task_removed", 100_i64),
+        ] {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("task-00"),
+                kind,
+                "codex",
+                "{}",
+                created_at,
+            )
+            .expect("append planning event");
+        }
+        for offset in 0_i64..256 {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("task-00"),
+                "task_updated",
+                "codex",
+                "{}",
+                1_000 + offset,
+            )
+            .expect("append planning tail event");
+        }
+
+        store.connection.execute_batch("ANALYZE").unwrap();
+
+        let task_plan = query_plan_details(
+            &store.connection,
+            "SELECT * FROM tasks WHERE 1=1 ORDER BY priority,created_at,id",
+            params![],
+        );
+        let task_plan_text = task_plan.join("\n");
+        assert!(
+            task_plan_text.contains("idx_tasks_priority_created_id"),
+            "{task_plan_text}"
+        );
+        assert!(
+            !task_plan_text.contains("USE TEMP B-TREE"),
+            "{task_plan_text}"
+        );
+
+        let event_plan = query_plan_details(
+            &store.connection,
+            "SELECT * FROM events WHERE 1=1 AND created_at>=? AND created_at<? AND archived=0 ORDER BY seq DESC LIMIT ?",
+            params![1_240_i64, 1_248_i64, 1_i64],
+        );
+        let event_plan_text = event_plan.join("\n");
+        assert!(
+            event_plan_text.contains("idx_events_created_seq"),
+            "{event_plan_text}"
+        );
+        assert!(
+            event_plan_text.contains("created_at>") || event_plan_text.contains("created_at<"),
+            "{event_plan_text}"
+        );
     }
 
     #[test]

@@ -1348,6 +1348,13 @@ END;
 CREATE INDEX idx_subscription_delivery_attempts_rate ON subscription_delivery_attempts(subscription_id,started_at);
 "#;
 
+const BOARD_V23: &str = r#"
+DROP INDEX IF EXISTS idx_tasks_priority_created_id;
+CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at,id);
+DROP INDEX IF EXISTS idx_events_created_seq;
+CREATE INDEX idx_events_created_seq ON events(created_at,seq);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1521,7 +1528,7 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 22;
+pub const BOARD_SCHEMA_VERSION: usize = 23;
 pub const REGISTRY_SCHEMA_VERSION: usize = 11;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1729,7 +1736,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.
@@ -2443,6 +2450,38 @@ mod tests {
 
     use super::*;
 
+    fn index_sql(connection: &Connection, name: &str) -> String {
+        connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
+    fn index_columns(connection: &Connection, name: &str) -> Vec<String> {
+        let sql = format!("PRAGMA index_info('{name}')");
+        connection
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn index_names(connection: &Connection, table: &str) -> Vec<String> {
+        let sql = format!("PRAGMA index_list('{table}')");
+        connection
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
     #[test]
     fn jitter_stays_inside_its_bound() {
         assert_eq!(jitter(0), 0);
@@ -2484,5 +2523,50 @@ mod tests {
                 "retry {count} would pause for {ceiling}ms"
             );
         }
+    }
+
+    #[test]
+    fn board_schema_v23_creates_the_priority_and_created_indexes_without_a_seq_only_event_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..22]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 22);
+        connection
+            .execute_batch(
+                r#"
+                CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at);
+                CREATE INDEX idx_events_created_seq ON events(seq);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            index_sql(&connection, "idx_tasks_priority_created_id"),
+            "CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at)"
+        );
+        assert_eq!(
+            index_sql(&connection, "idx_events_created_seq"),
+            "CREATE INDEX idx_events_created_seq ON events(seq)"
+        );
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+
+        assert_eq!(schema_version(&connection).unwrap(), 23);
+        assert_eq!(
+            index_sql(&connection, "idx_tasks_priority_created_id"),
+            "CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at,id)"
+        );
+        assert_eq!(
+            index_sql(&connection, "idx_events_created_seq"),
+            "CREATE INDEX idx_events_created_seq ON events(created_at,seq)"
+        );
+
+        let seq_only_secondary = index_names(&connection, "events")
+            .into_iter()
+            .filter(|name| index_columns(&connection, name) == vec!["seq".to_owned()])
+            .collect::<Vec<_>>();
+        assert!(
+            seq_only_secondary.is_empty(),
+            "unexpected seq-only event index(es): {}",
+            seq_only_secondary.join(", ")
+        );
     }
 }

@@ -38,6 +38,15 @@ board or omit from recovery.
 - A successful non-empty sweep writes one `archive_swept` audit event. A dry run
   writes nothing.
 
+## Current schema23
+
+As of 2026-09-01, schema v23 keeps the operational sort keys explicit:
+`tasks` uses `(priority, created_at, id)`, `events` keeps the full
+`(created_at, seq)` order for bounded reads, and there is no `seq`-only
+secondary index. The task list `--all` path stays free of a temporary b-tree,
+while bounded event reads may use an intentional temporary ordering to preserve
+`seq` descending after the time-index narrowing step.
+
 ## Consequences
 
 - Operational indexes scale with current work rather than lifetime history.

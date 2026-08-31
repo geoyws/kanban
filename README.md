@@ -641,8 +641,14 @@ row at the level. Projects with no queued work sink to the end.
 ```bash
 kb stale --json           # [{ id, staleMinutes, idleMinutes, overdueMinutes, lastSignal }]
 kb events --kind lease_seized
+kb events --task <id> --after START_MS --before END_MS --json
+kb events --task <id> --all --after START_MS --before END_MS --json
 kb watch --project NAME --json
 ```
+
+`events`/`ev` read board history in a half-open millisecond window:
+`[after,before)`. SQL filters happen before `--limit`, `--all` includes
+archived rows, and registry or rule scopes reject `--after`/`--before`.
 
 Snapshots are restorable, not just writable:
 

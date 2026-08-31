@@ -820,7 +820,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|project| project["schemaVersion"] == 22)
+            .all(|project| project["schemaVersion"] == 23)
     );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -1016,9 +1016,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 11);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 11);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 22);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 22);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 22);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 23);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 23);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 23);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -1653,7 +1653,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     assert_eq!(
         reopened
@@ -3326,7 +3326,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 22"),
+        version.contains("board schema 23"),
         "version output: {version}"
     );
     assert!(
@@ -6373,6 +6373,286 @@ fn the_watch_surface_matches_help_and_the_mcp_manifest_excludes_it() {
 }
 
 #[test]
+fn compiled_binary_events_after_before_archive_and_schema_match() {
+    let fixture = Fixture::new("events-after-before");
+    fixture.ok_json(&fixture.main, &["init", "--name", "EVENTS", "--json"]);
+
+    for (id, title) in [
+        ("e-1", "first event"),
+        ("e-2", "second event"),
+        ("e-3", "third event"),
+        ("e-4", "fourth event"),
+    ] {
+        fixture.ok_json(&fixture.main, &["task", "add", title, "--id", id, "--json"]);
+    }
+
+    let board_path = board_path_for_project(&fixture, &fixture.main, "EVENTS");
+    let seqs = {
+        let connection = Connection::open(&board_path).unwrap();
+        let seqs = connection
+            .prepare("SELECT seq FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            seqs.len() >= 4,
+            "expected at least four ledger events, found {}",
+            seqs.len()
+        );
+        for (index, seq) in seqs.iter().enumerate() {
+            connection
+                .execute(
+                    "UPDATE events SET created_at=?, archived=? WHERE seq=?",
+                    params![
+                        1000_i64 * (index as i64 + 1),
+                        if index == 0 { 1_i64 } else { 0_i64 },
+                        seq,
+                    ],
+                )
+                .unwrap();
+        }
+        seqs
+    };
+    let board_db = board_path.to_string_lossy().into_owned();
+
+    let help = fixture.run(&fixture.main, &["events", "--help"]);
+    assert!(help.status.success());
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    for flag in [
+        "--task",
+        "--rule",
+        "--registry",
+        "--kind",
+        "--after",
+        "--before",
+        "--limit",
+        "--all",
+    ] {
+        assert!(
+            help_text.contains(flag),
+            "help text is missing {flag}: {help_text}"
+        );
+    }
+
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let events = schema["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["name"] == "events")
+        .expect("events is missing from the manifest");
+    let flags = events["flags"].as_array().unwrap();
+    let flag_kind = |name: &str| -> &str {
+        flags.iter().find(|flag| flag["name"] == name).unwrap()["kind"]
+            .as_str()
+            .unwrap()
+    };
+    for name in ["task", "rule", "kind", "after", "before", "limit"] {
+        assert_eq!(flag_kind(name), "value", "--{name} should remain scalar");
+    }
+    assert_eq!(flag_kind("registry"), "boolean");
+    assert_eq!(flag_kind("all"), "boolean");
+
+    let half_open = fixture.run(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--after", "2000", "--before", "3000", "--limit", "10",
+            "--json",
+        ],
+    );
+    assert!(half_open.status.success());
+    let half_open_json: Value = serde_json::from_slice(&half_open.stdout).unwrap();
+    let half_open_rows = half_open_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        half_open_rows,
+        vec![seqs[1]],
+        "half-open bounds should include the start and exclude the end: {}",
+        String::from_utf8_lossy(&half_open.stdout)
+    );
+
+    let bounded = fixture.run(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--after", "2000", "--before", "4000", "--limit", "1",
+            "--json",
+        ],
+    );
+    assert!(bounded.status.success());
+    let bounded_json: Value = serde_json::from_slice(&bounded.stdout).unwrap();
+    let bounded_rows = bounded_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounded_rows,
+        vec![seqs[2]],
+        "SQL filtering should happen before limit: {}",
+        String::from_utf8_lossy(&bounded.stdout)
+    );
+
+    let equal_bounds = fixture.run(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--after", "3000", "--before", "3000", "--limit", "10",
+            "--json",
+        ],
+    );
+    assert!(equal_bounds.status.success());
+    let equal_bounds_json: Value = serde_json::from_slice(&equal_bounds.stdout).unwrap();
+    assert!(
+        equal_bounds_json.as_array().unwrap().is_empty(),
+        "equal bounds should be empty: {}",
+        String::from_utf8_lossy(&equal_bounds.stdout)
+    );
+
+    let after_only = fixture.run(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--after", "3000", "--limit", "10", "--json",
+        ],
+    );
+    assert!(after_only.status.success());
+    let after_only_json: Value = serde_json::from_slice(&after_only.stdout).unwrap();
+    let after_only_rows = after_only_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_only_rows,
+        seqs[2..].iter().rev().copied().collect::<Vec<_>>(),
+        "after-only bounds should include the lower edge and all later rows: {}",
+        String::from_utf8_lossy(&after_only.stdout)
+    );
+
+    let before_only = fixture.run(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--before", "4000", "--limit", "10", "--json",
+        ],
+    );
+    assert!(before_only.status.success());
+    let before_only_json: Value = serde_json::from_slice(&before_only.stdout).unwrap();
+    let before_only_rows = before_only_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before_only_rows,
+        vec![seqs[2], seqs[1]],
+        "before-only bounds should exclude rows at or after the upper edge: {}",
+        String::from_utf8_lossy(&before_only.stdout)
+    );
+
+    let default_rows = fixture.ok_json(
+        &fixture.main,
+        &["events", "--db", &board_db, "--limit", "10", "--json"],
+    );
+    let default_seqs = default_rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        default_seqs,
+        seqs[1..].iter().rev().copied().collect::<Vec<_>>(),
+        "default output lost seq-desc ordering"
+    );
+    assert!(
+        default_rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row["archived"].as_bool().unwrap()),
+        "default events output leaked archived history: {default_rows}"
+    );
+
+    let all_rows = fixture.ok_json(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--all", "--limit", "10", "--json",
+        ],
+    );
+    let all_seqs = all_rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        all_seqs,
+        seqs.iter().rev().copied().collect::<Vec<_>>(),
+        "--all did not preserve seq-desc ordering"
+    );
+    assert!(
+        all_rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["archived"] == json!(true)),
+        "--all hid the archived event: {all_rows}"
+    );
+
+    for args in [
+        ["events", "--db", &board_db, "--after", "-1", "--json"].as_slice(),
+        ["events", "--db", &board_db, "--before", "-1", "--json"].as_slice(),
+    ] {
+        let rejected = fixture.run(&fixture.main, args);
+        assert!(!rejected.status.success());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("must be non-negative"),
+            "negative bound was not rejected correctly: {stderr}"
+        );
+    }
+
+    let reversed = fixture.run(
+        &fixture.main,
+        &[
+            "events", "--db", &board_db, "--after", "3000", "--before", "2000", "--json",
+        ],
+    );
+    assert!(!reversed.status.success());
+    assert!(
+        String::from_utf8_lossy(&reversed.stderr)
+            .contains("--after must not be later than --before")
+    );
+
+    let registry_rejected = fixture.run(
+        &fixture.main,
+        &["events", "--registry", "--after", "2000", "--json"],
+    );
+    assert!(!registry_rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&registry_rejected.stderr)
+            .contains("--after and --before only apply to board events")
+    );
+
+    let rule_rejected = fixture.run(
+        &fixture.main,
+        &["events", "--rule", "r-missing", "--after", "2000", "--json"],
+    );
+    assert!(!rule_rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rule_rejected.stderr)
+            .contains("--after and --before only apply to board events")
+    );
+}
+
+#[test]
 fn watch_replays_resumes_and_respects_selector_boundaries() {
     let fixture = Fixture::new("watch-replay");
     fixture.ok_json(&fixture.main, &["init", "--name", "WATCH-REPLAY", "--json"]);
@@ -8801,7 +9081,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        22
+        23
     );
 }
 
@@ -9208,7 +9488,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     assert_eq!(
         connection

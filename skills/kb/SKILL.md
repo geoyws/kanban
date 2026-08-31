@@ -557,6 +557,8 @@ invented, and the command works exactly the same.
 kb ctx <id> --json              # the bounded cold-start packet for a resuming agent
 kb dash --json                  # per-board counts, incl. openAttention + pendingHandoffs
 kb ev --task <id> --json        # the durable audit trail
+kb ev --task <id> --after START_MS --before END_MS --json
+kb ev --task <id> --all --after START_MS --before END_MS --json
 kb ev --registry --json         # registry rules and workspace lifecycle
 kb stale --json                 # work that overran its stale budget
 kb doctor --json                # integrity plus advisory unreachable-root hints
@@ -569,6 +571,10 @@ kb w repoint --json             # after moving a repo: point its registered root
 `lease_seized`, `handoff_created`, `attention_raised`, `attention_resolved` and
 so on. It records **what happened**; `att` records **what needs George**. Use
 `ev` to reconstruct history, `att` to find open questions.
+
+`ev` time windows are board-only and half-open in milliseconds:
+`[after,before)`. SQL filters are applied before `--limit`, `--all` includes
+archived history, and registry/rule scopes reject `--after` and `--before`.
 
 `ctx` is bounded and says so: `truncated` is computed, never assumed, and the
 marker survives the truncation it describes.

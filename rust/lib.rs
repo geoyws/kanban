@@ -48,6 +48,8 @@ Usage:
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
   kanban serve [--port N]
+  kanban events [--task ID | --rule ID | --registry] [--kind KIND]
+             [--after MS] [--before MS] [--limit N] [--all] [--json]
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
              [--relation KIND:ID ...] [--prior-status STATUS ...]
              [--current-status STATUS ...] [--tag NAME ...]
@@ -123,7 +125,6 @@ Usage:
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
   kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
   kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
-  kanban events [--task ID | --rule ID | --registry] [--kind KIND] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
@@ -654,7 +655,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "events",
         None,
-        &["task", "rule", "registry", "kind", "limit", "all"],
+        &[
+            "task", "rule", "registry", "kind", "after", "before", "limit", "all",
+        ],
         &[],
         true,
     ),
@@ -2499,6 +2502,9 @@ fn run() -> Result<()> {
         if args.has("task") || (args.one("rule").is_some() && args.has("registry")) {
             bail!("--task, --rule and --registry address different event trails; pass one");
         }
+        if args.has("after") || args.has("before") {
+            bail!("--after and --before only apply to board events");
+        }
         return print(
             &Registry::open_readonly()?.rule_events(
                 args.one("rule"),
@@ -3275,10 +3281,26 @@ fn run() -> Result<()> {
         );
     }
     if command == "events" {
+        let after = args.optional_integer("after")?;
+        let before = args.optional_integer("before")?;
+        if after.is_some_and(|value| value < 0) {
+            bail!("--after must be non-negative");
+        }
+        if before.is_some_and(|value| value < 0) {
+            bail!("--before must be non-negative");
+        }
+        if after
+            .zip(before)
+            .is_some_and(|(after, before)| after > before)
+        {
+            bail!("--after must not be later than --before");
+        }
         return print(
-            &store.events(
+            &store.events_with_bounds(
                 args.one("task"),
                 args.one("kind"),
+                after,
+                before,
                 args.limit(50)?,
                 args.has("all"),
             )?,
