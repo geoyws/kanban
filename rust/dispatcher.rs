@@ -467,8 +467,8 @@ fn scheduler_step<B: SchedulerBackend>(backend: &mut B) -> Result<StepOutcome> {
     match backend.invoke(&claim, &resolved) {
         Ok(()) => {
             // Compiled-process recovery tests replace this hook with an exact
-            // event-id crash. Production reaches it only when that explicitly
-            // test-named environment variable is present.
+            // event-id crash. Release builds compile the hook out entirely;
+            // debug builds reach it only through the test-named environment.
             backend.after_adapter_success(&claim);
             if !backend.finalize_success(&claim)? {
                 bail!("dispatcher success acknowledgement lost its exact lease");
