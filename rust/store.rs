@@ -5338,6 +5338,21 @@ mod tests {
             .unwrap()
     }
 
+    fn error_string<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn flip_lower_hex_prefix(hash: &str) -> String {
+        let mut chars = hash.chars().collect::<Vec<_>>();
+        if let Some(first) = chars.first_mut() {
+            *first = if *first == '0' { '1' } else { '0' };
+        }
+        chars.into_iter().collect()
+    }
+
     fn event_hashes(events: Vec<Event>) -> Vec<String> {
         events
             .into_iter()
@@ -6958,6 +6973,168 @@ mod tests {
         };
         assert!(claim_error.contains("expected event hash"), "{claim_error}");
         assert_eq!(board_event_count(&store), board_events_before);
+    }
+
+    #[test]
+    fn subscription_delivery_validation_helpers_reject_mutated_states_and_event_identity_drift() {
+        let mut store = subscription_store("subscriptions-delivery-validation-helpers");
+        let mut input = delivery_subscription_input("sub-delivery-validation-helpers");
+        input.max_retries = 1;
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+
+        let subscription = store.require_subscription(&added.id).unwrap();
+        let due_at = delivery_row(&store, &added.id, &delivery_event_ids(&store, &added.id)[0])
+            .next_attempt_at
+            .unwrap();
+        let candidate = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let candidate_event = board_event_by_seq(&store, candidate.event_seq);
+
+        let mut malformed_pending = delivery_row(&store, &added.id, &candidate.event_id);
+        malformed_pending.attempts = 1;
+        let pending_error = error_string(validate_pending_or_retry_delivery(
+            &malformed_pending,
+            &subscription,
+        ));
+        assert!(
+            pending_error.contains("malformed pending state"),
+            "{pending_error}"
+        );
+
+        let leased = store
+            .claim_subscription_delivery(&added.id, &candidate.event_id, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        let mut malformed_leased = delivery_row(&store, &added.id, &candidate.event_id);
+        malformed_leased.attempts = 0;
+        let leased_error = error_string(validate_leased_delivery(&malformed_leased));
+        assert!(
+            leased_error.contains("malformed leased state"),
+            "{leased_error}"
+        );
+
+        let mut unexpected_status = delivery_row(&store, &added.id, &candidate.event_id);
+        unexpected_status.status = "leased".to_owned();
+        let unexpected_error = error_string(validate_pending_or_retry_delivery(
+            &unexpected_status,
+            &subscription,
+        ));
+        assert!(
+            unexpected_error.contains("not pending or retry_wait"),
+            "{unexpected_error}"
+        );
+
+        let mut malformed_retry_wait = delivery_row(&store, &added.id, &candidate.event_id);
+        malformed_retry_wait.status = "retry_wait".to_owned();
+        malformed_retry_wait.attempts = 0;
+        malformed_retry_wait.last_attempt_at = Some(candidate.next_attempt_at);
+        malformed_retry_wait.last_error_code = Some("adapter_failed".to_owned());
+        let retry_wait_error = error_string(validate_pending_or_retry_delivery(
+            &malformed_retry_wait,
+            &subscription,
+        ));
+        assert!(
+            retry_wait_error.contains("malformed retry_wait state"),
+            "{retry_wait_error}"
+        );
+
+        let mut malformed_hash = delivery_row(&store, &added.id, &candidate.event_id);
+        malformed_hash.event_id = "not-a-hash".to_owned();
+        let hash_error = error_string(require_delivery_event_identity(
+            &store.connection,
+            &malformed_hash,
+            &subscription,
+        ));
+        assert!(hash_error.contains("malformed event hash"), "{hash_error}");
+
+        let mut anchored = delivery_row(&store, &added.id, &candidate.event_id);
+        anchored.event_seq = subscription.start_event_seq;
+        let anchor_error = error_string(require_delivery_event_identity(
+            &store.connection,
+            &anchored,
+            &subscription,
+        ));
+        assert!(
+            anchor_error.contains("at or before start anchor"),
+            "{anchor_error}"
+        );
+
+        let mut missing_seq = delivery_row(&store, &added.id, &candidate.event_id);
+        missing_seq.event_seq = candidate_event.seq + 1_000;
+        let missing_seq_error = error_string(require_delivery_event_identity(
+            &store.connection,
+            &missing_seq,
+            &subscription,
+        ));
+        assert!(
+            missing_seq_error.contains("expected event seq"),
+            "{missing_seq_error}"
+        );
+
+        let mut mismatched_hash = delivery_row(&store, &added.id, &candidate.event_id);
+        mismatched_hash.event_id = flip_lower_hex_prefix(
+            candidate_event
+                .event_hash
+                .as_deref()
+                .expect("board event hash is required"),
+        );
+        let mismatch_hash_error = error_string(require_delivery_event_identity(
+            &store.connection,
+            &mismatched_hash,
+            &subscription,
+        ));
+        assert!(
+            mismatch_hash_error.contains("expected event hash"),
+            "{mismatch_hash_error}"
+        );
+
+        let mut mismatched_kind = delivery_row(&store, &added.id, &candidate.event_id);
+        mismatched_kind.event_kind = "task_moved".to_owned();
+        let mismatch_kind_error = error_string(require_delivery_event_identity(
+            &store.connection,
+            &mismatched_kind,
+            &subscription,
+        ));
+        assert!(
+            mismatch_kind_error.contains("expected event kind"),
+            "{mismatch_kind_error}"
+        );
+
+        let mut mismatched_created_at = delivery_row(&store, &added.id, &candidate.event_id);
+        mismatched_created_at.event_created_at = candidate_event.created_at + 1;
+        let mismatch_created_at_error = error_string(require_delivery_event_identity(
+            &store.connection,
+            &mismatched_created_at,
+            &subscription,
+        ));
+        assert!(
+            mismatch_created_at_error.contains("expected event created_at"),
+            "{mismatch_created_at_error}"
+        );
+
+        assert_eq!(leased.delivery_status, "leased");
+        assert_eq!(leased.attempt_number, 1);
     }
 
     #[test]
