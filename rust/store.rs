@@ -1647,6 +1647,12 @@ impl Store {
         Ok(store)
     }
 
+    pub(crate) fn open_for_dispatcher(path: &Path) -> Result<Self> {
+        Ok(Self {
+            connection: open_board(path)?,
+        })
+    }
+
     pub fn open_readonly(path: &Path) -> Result<Self> {
         Ok(Self {
             connection: open_board_readonly(path)?,
@@ -5051,6 +5057,30 @@ mod tests {
         Store::open(&board_db_path(name)).expect("open test store")
     }
 
+    fn expired_claim_board(name: &str) -> PathBuf {
+        let path = board_db_path(name);
+        let mut store = Store::open(&path).expect("open expired-claim fixture");
+        store.initialize(name, "test@driver").unwrap();
+        insert_task(&store, "t-expired");
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET status='in_progress',assignee='ghost' WHERE id='t-expired'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO task_claims(task_id,agent_id,lease_token,claimed_at,heartbeat_at,expires_at) \
+                 VALUES('t-expired','ghost','expired-token',1,1,1)",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        path
+    }
+
     fn insert_task(store: &Store, id: &str) {
         store
             .connection
@@ -5072,6 +5102,73 @@ mod tests {
                 ],
             )
             .expect("insert task");
+    }
+
+    #[test]
+    fn dispatcher_open_does_not_sweep_unrelated_expired_task_claims() {
+        let dispatcher_path = expired_claim_board("dispatcher-open-preserves-expired-claim");
+        let dispatcher = Store::open_for_dispatcher(&dispatcher_path).unwrap();
+        let dispatcher_claims: i64 = dispatcher
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_claims WHERE task_id='t-expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dispatcher_expiry_events: i64 = dispatcher
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE task_id='t-expired' AND kind='claim_expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dispatcher_task: (String, Option<String>) = dispatcher
+            .connection
+            .query_row(
+                "SELECT status,assignee FROM tasks WHERE id='t-expired'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dispatcher_claims, 1);
+        assert_eq!(dispatcher_expiry_events, 0);
+        assert_eq!(
+            dispatcher_task,
+            ("in_progress".into(), Some("ghost".into()))
+        );
+        drop(dispatcher);
+
+        let ordinary_path = expired_claim_board("ordinary-open-sweeps-expired-claim");
+        let ordinary = Store::open(&ordinary_path).unwrap();
+        let ordinary_claims: i64 = ordinary
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_claims WHERE task_id='t-expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ordinary_expiry_events: i64 = ordinary
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE task_id='t-expired' AND kind='claim_expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ordinary_task: (String, Option<String>) = ordinary
+            .connection
+            .query_row(
+                "SELECT status,assignee FROM tasks WHERE id='t-expired'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ordinary_claims, 0);
+        assert_eq!(ordinary_expiry_events, 1);
+        assert_eq!(ordinary_task, ("todo".into(), None));
     }
 
     fn board_event_seqs(events: &[Event]) -> Vec<i64> {
