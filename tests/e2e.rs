@@ -493,6 +493,352 @@ fn remove_v18_board_audit_schema(connection: &Connection) {
         .unwrap();
 }
 
+/// Return a current fixture to the exact pre-subscription schema shape before
+/// a historical migration test lowers `user_version` below V21.
+fn remove_v21_subscription_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP INDEX idx_subscriptions_consumer;\
+             DROP INDEX idx_subscriptions_status;\
+             DROP TABLE subscriptions;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
+    let fixture = Fixture::new("subscriptions");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SUBSCRIPTIONS", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "pubsub", "--as", "geo", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Parent", "--id", "e-sub", "--type", "epic", "--status", "todo", "--as",
+            "geo", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Subject",
+            "--id",
+            "t-subject",
+            "--parent",
+            "e-sub",
+            "--tag",
+            "pubsub",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+
+    let added = fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "add",
+            "--id",
+            "sub-e2e",
+            "--subject",
+            "task:t-subject",
+            "--relation",
+            "parent:e-sub",
+            "--kind",
+            "checkpoint_added",
+            "--prior-status",
+            "todo",
+            "--current-status",
+            "in_progress",
+            "--tag",
+            "pubsub",
+            "--consumer",
+            "codex.queue",
+            "--action",
+            "enqueue-turn",
+            "--timeout-ms",
+            "30000",
+            "--max-retries",
+            "3",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--secret-ref",
+            "codex_queue_token",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(added["id"], "sub-e2e");
+    assert_eq!(added["protocolVersion"], 1);
+    assert_eq!(added["subjectTaskID"], "t-subject");
+    assert_eq!(added["consumerID"], "codex.queue");
+    assert_eq!(added["actionID"], "enqueue-turn");
+    assert_eq!(added["secretRef"], "codex_queue_token");
+
+    // Read-only subscription commands must not run the mutating open path,
+    // whose lease sweep would remove an expired claim and append an event.
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-subject", "--as", "lease-probe", "--json"],
+    );
+    let board_path = board_path_for_project(&fixture, &fixture.main, "SUBSCRIPTIONS");
+    let connection = Connection::open(&board_path).unwrap();
+    connection
+        .execute(
+            "UPDATE task_claims SET expires_at=1 WHERE task_id='t-subject'",
+            [],
+        )
+        .unwrap();
+    let claim_expired_before: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='claim_expired'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["subscription", "show", "sub-e2e", "--json"]
+        ),
+        added
+    );
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["subscription", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let connection = Connection::open(&board_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_claims WHERE task_id='t-subject'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "subscription show/list swept an expired claim"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='claim_expired'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        claim_expired_before,
+        "subscription show/list appended a claim_expired event"
+    );
+    drop(connection);
+
+    let event = fixture.ok_json(
+        &fixture.main,
+        &[
+            "watch",
+            "--kind",
+            "subscription_added",
+            "--cursor",
+            "0",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    );
+    assert_eq!(event["type"], "event");
+    assert_eq!(event["payload"]["kind"], "subscription_added");
+    assert_eq!(event["payload"]["payload"]["subscriptionID"], "sub-e2e");
+    let event_text = event.to_string();
+    assert!(!event_text.contains("secretRef"), "{event_text}");
+    assert!(!event_text.contains("codex_queue_token"), "{event_text}");
+
+    let paused = fixture.ok_json(
+        &fixture.main,
+        &["subscription", "pause", "sub-e2e", "--as", "geo", "--json"],
+    );
+    assert_eq!(paused["status"], "paused");
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["subscription", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["subscription", "list", "--all", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let resumed = fixture.ok_json(
+        &fixture.main,
+        &["subscription", "resume", "sub-e2e", "--as", "geo", "--json"],
+    );
+    assert_eq!(resumed["status"], "active");
+
+    for (label, args) in [
+        (
+            "unknown subject",
+            vec![
+                "subscription",
+                "add",
+                "--id",
+                "sub-bad-subject",
+                "--subject",
+                "task:missing",
+                "--consumer",
+                "codex.queue",
+                "--action",
+                "enqueue-turn",
+                "--timeout-ms",
+                "1",
+                "--max-retries",
+                "0",
+                "--rate-per-minute",
+                "1",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        ),
+        (
+            "raw secret",
+            vec![
+                "subscription",
+                "add",
+                "--id",
+                "sub-bad-secret",
+                "--consumer",
+                "codex.queue",
+                "--action",
+                "enqueue-turn",
+                "--timeout-ms",
+                "1",
+                "--max-retries",
+                "0",
+                "--rate-per-minute",
+                "1",
+                "--max-concurrency",
+                "1",
+                "--secret-ref",
+                "env:TOKEN=raw",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        ),
+        (
+            "id collision",
+            vec![
+                "subscription",
+                "add",
+                "--id",
+                "sub-e2e",
+                "--consumer",
+                "codex.queue",
+                "--action",
+                "enqueue-turn",
+                "--timeout-ms",
+                "1",
+                "--max-retries",
+                "0",
+                "--rate-per-minute",
+                "1",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        ),
+        (
+            "missing pause target",
+            vec![
+                "subscription",
+                "pause",
+                "sub-missing",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        ),
+        (
+            "missing resume target",
+            vec![
+                "subscription",
+                "resume",
+                "sub-missing",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        ),
+    ] {
+        let output = fixture.run(&fixture.main, &args);
+        assert!(!output.status.success(), "{label} was accepted");
+    }
+
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&second).unwrap();
+    fixture.ok_json(&second, &["init", "--name", "SUBSCRIPTIONS-B", "--json"]);
+    assert!(
+        fixture
+            .ok_json(&second, &["subscription", "list", "--all", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert!(doctor["healthy"].as_bool().unwrap());
+    assert!(
+        doctor["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|project| project["schemaVersion"] == 21)
+    );
+
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    for (name, read_only) in [
+        ("subscription add", false),
+        ("subscription list", true),
+        ("subscription show", true),
+        ("subscription pause", false),
+        ("subscription resume", false),
+    ] {
+        let operation = schema["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["name"] == name)
+            .unwrap_or_else(|| panic!("missing schema operation {name}"));
+        assert_eq!(operation["readOnly"], read_only, "{name}");
+        assert_eq!(operation["longRunning"], false, "{name}");
+    }
+}
+
 #[test]
 fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     let fixture = Fixture::new("handoff");
@@ -667,9 +1013,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 11);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 11);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 20);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 20);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 20);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 21);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 21);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 21);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -1273,6 +1619,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         .unwrap()
         .to_owned();
     let connection = Connection::open(&board).unwrap();
+    remove_v21_subscription_schema(&connection);
     remove_v18_board_audit_schema(&connection);
     remove_v13_search_schema(&connection);
     connection
@@ -1303,7 +1650,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        20
+        21
     );
     assert_eq!(
         reopened
@@ -2976,7 +3323,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 20"),
+        version.contains("board schema 21"),
         "version output: {version}"
     );
     assert!(
@@ -5841,6 +6188,30 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         ],
     );
     let deployment_id = deployment["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "add",
+            "--id",
+            "sub-schema-readonly",
+            "--consumer",
+            "schema.probe",
+            "--action",
+            "observe",
+            "--timeout-ms",
+            "1000",
+            "--max-retries",
+            "0",
+            "--rate-per-minute",
+            "1",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
     let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
         .as_str()
         .unwrap()
@@ -5861,6 +6232,10 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "rule list" => vec!["rule", "list"],
             "rule show" => vec!["rule", "show", &rule_id],
             "sitrep list" => vec!["sitrep", "list"],
+            "subscription list" => vec!["subscription", "list"],
+            "subscription show" => {
+                vec!["subscription", "show", "sub-schema-readonly"]
+            }
             "deploy show" => vec!["deploy", "show", &deployment_id],
             "deploy list" => vec!["deploy", "list"],
             "deploy current" => vec!["deploy", "current"],
@@ -8410,6 +8785,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         .unwrap()
         .to_owned();
     let connection = Connection::open(&board).unwrap();
+    remove_v21_subscription_schema(&connection);
     remove_v18_board_audit_schema(&connection);
     connection.execute_batch("PRAGMA user_version=16;").unwrap();
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
@@ -8422,7 +8798,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        20
+        21
     );
 }
 
@@ -8727,6 +9103,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
     // it through the compiled binary below must run V10, not merely exercise
     // fresh-board behaviour.
     let connection = Connection::open(&board).unwrap();
+    remove_v21_subscription_schema(&connection);
     remove_v18_board_audit_schema(&connection);
     remove_v13_search_schema(&connection);
     connection
@@ -8828,7 +9205,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        20
+        21
     );
     assert_eq!(
         connection

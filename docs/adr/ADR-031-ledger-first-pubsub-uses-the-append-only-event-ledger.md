@@ -233,6 +233,41 @@ Downstream consumers remain thin adapters over the canonical bus:
 The important rule is that pub/sub invalidates or replays; it does not become a
 second ledger or a third write path.
 
+### 7. Durable subscriptions are declarative board records
+
+`kb subscription add|list|show|pause|resume` manages the durable control-plane
+record for one board. The addressed board database is the tenancy predicate;
+there is no stored root, board path, or cross-board fan-in. Board schema v21
+stores only:
+
+- protocol version `1` and an immutable `sub-*` identity;
+- an optional `task:ID` subject plus normalized `parent`, `ancestor`, and
+  `depends-on` relations;
+- normalized event-kind, prior/current-status, and registered-tag predicates;
+- a strict named consumer and action identifier for later allow-list resolution;
+- bounded timeout, retry, rate, and concurrency policy; and
+- an optional opaque secret-reference identifier.
+
+The row never stores shell text, executable arguments, roots, credentials, raw
+tokens, or a caller-controlled adapter command. A later dispatcher must resolve
+the consumer and action through host-local trusted configuration and must treat
+the secret reference only as a lookup name. Adding, pausing, and resuming a
+subscription append `subscription_added`, `subscription_paused`, or
+`subscription_resumed` to the existing hash-chained board ledger. Those audit
+payloads omit even the opaque secret reference.
+
+Unknown subjects, historical relation targets, event kinds, statuses, or tags
+fail closed at creation. Pause and resume are idempotent state transitions; no
+update or delete surface can silently retarget an existing identity.
+`subscription list` and `subscription show` are read-only request-response
+operations and remain in generated MCP schemas. Delivery state and adapter
+execution are explicitly deferred to the dispatcher phase.
+
+The immutable delivery identity is `(subscriptionID, eventID)`. The
+subscription protocol version, watch envelope version, stored event semantic
+schema version, and binary release version are independent compatibility
+numbers and must not be inferred from one another.
+
 ## Consequences
 
 The repository gets one canonical live-history contract for both boards and the
@@ -271,8 +306,10 @@ cursor itself.
 
 ## Rollout
 
-This ADR does not require a schema migration. It adopts the existing append-only
-event trails and formalizes their cursor semantics.
+The watch-stream phase did not require a schema migration: it adopted the
+existing append-only event trails. The durable subscription phase adds board
+schema v21 for declarative records while continuing to audit every lifecycle
+mutation through that same board event trail.
 
 The implementation rollout should be staged:
 
@@ -287,6 +324,8 @@ The implementation rollout should be staged:
    in-progress typing;
 5. preserve `kb events` as the bounded historical snapshot command;
 6. keep the stream shape stable once published.
+7. add board-local subscription records and command-schema projections before
+   any dispatcher or adapter can execute them.
 
 ## Tests and operations
 
@@ -312,6 +351,16 @@ count-driven:
 - idle periods produce heartbeats;
 - and a slow consumer does not force writers to block or share a mutable queue
   with them.
+
+The durable-subscription acceptance slice additionally proves:
+
+- migration to schema v21 through a compiled process;
+- add/list/show/pause/resume across separate compiled invocations;
+- fail-closed selectors, policy bounds, identifiers, and secret references;
+- one-board isolation and immutable subscription identity;
+- lifecycle events on the existing audited watch stream with no secret
+  reference in their payload; and
+- accurate read-only/list-valued command-schema metadata.
 
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:
