@@ -988,6 +988,366 @@ CREATE INDEX idx_subscriptions_status ON subscriptions(status,created_at,id);
 CREATE INDEX idx_subscriptions_consumer ON subscriptions(consumer_id,status,created_at,id);
 "#;
 
+/// Keep subscriptions from retroactively seeing events that already existed
+/// when they were created.
+///
+/// The new `start_event_seq` is backfilled from each row's own
+/// `subscription_added` anchor rather than from the current tail, then
+/// enforced with triggers because SQLite cannot add a true NOT NULL column in
+/// place without rebuilding the table. The delivery ledger keeps the
+/// immutable event hash separate from the sequenced foreign key, and the
+/// attempt table preserves retry history so rate accounting does not depend on
+/// one mutable timestamp.
+const BOARD_V22: &str = r#"
+ALTER TABLE subscriptions ADD COLUMN start_event_seq INTEGER CHECK(start_event_seq IS NULL OR start_event_seq >= 0);
+WITH valid_anchors AS (
+ SELECT
+  e.seq,
+  json_extract(e.payload, '$.subscriptionID') AS subscription_id
+ FROM events e
+ WHERE e.kind='subscription_added'
+   AND json_valid(e.payload)
+   AND json_type(e.payload)='object'
+   AND json_type(e.payload, '$.subscriptionID')='text'
+   AND length(CAST(json_extract(e.payload, '$.subscriptionID') AS BLOB)) BETWEEN 5 AND 64
+   AND json_extract(e.payload, '$.subscriptionID') GLOB 'sub-[0-9A-Za-z]*'
+   AND json_extract(e.payload, '$.subscriptionID') NOT GLOB '*[^0-9A-Za-z._-]*'
+),
+subscription_anchors AS (
+ SELECT
+  s.id AS subscription_id,
+  COUNT(v.seq) AS anchor_count,
+  MIN(v.seq) AS anchor_seq
+ FROM subscriptions s
+ LEFT JOIN valid_anchors v ON v.subscription_id = s.id
+ GROUP BY s.id
+),
+bad_anchors AS (
+ SELECT COUNT(*) AS bad_count
+ FROM events e
+ WHERE e.kind='subscription_added'
+   AND CASE
+        WHEN NOT json_valid(e.payload) THEN 1
+        WHEN json_type(e.payload) IS NOT 'object' THEN 1
+        WHEN json_type(e.payload, '$.subscriptionID') IS NOT 'text' THEN 1
+        WHEN length(CAST(json_extract(e.payload, '$.subscriptionID') AS BLOB)) NOT BETWEEN 5 AND 64 THEN 1
+        WHEN json_extract(e.payload, '$.subscriptionID') NOT GLOB 'sub-[0-9A-Za-z]*' THEN 1
+        WHEN json_extract(e.payload, '$.subscriptionID') GLOB '*[^0-9A-Za-z._-]*' THEN 1
+        ELSE 0
+       END = 1
+),
+exact_anchors AS (
+ SELECT subscription_id, anchor_seq
+ FROM subscription_anchors
+ WHERE anchor_count = 1
+)
+UPDATE subscriptions
+SET start_event_seq = (
+ SELECT anchor_seq FROM exact_anchors
+ WHERE exact_anchors.subscription_id = subscriptions.id
+)
+WHERE start_event_seq IS NULL
+  AND (SELECT bad_count FROM bad_anchors) = 0;
+WITH valid_anchors AS (
+ SELECT
+  e.seq,
+  json_extract(e.payload, '$.subscriptionID') AS subscription_id
+ FROM events e
+ WHERE e.kind='subscription_added'
+   AND json_valid(e.payload)
+   AND json_type(e.payload)='object'
+   AND json_type(e.payload, '$.subscriptionID')='text'
+   AND length(CAST(json_extract(e.payload, '$.subscriptionID') AS BLOB)) BETWEEN 5 AND 64
+   AND json_extract(e.payload, '$.subscriptionID') GLOB 'sub-[0-9A-Za-z]*'
+   AND json_extract(e.payload, '$.subscriptionID') NOT GLOB '*[^0-9A-Za-z._-]*'
+),
+subscription_anchors AS (
+ SELECT
+  s.id AS subscription_id,
+  COUNT(v.seq) AS anchor_count,
+  MIN(v.seq) AS anchor_seq
+ FROM subscriptions s
+ LEFT JOIN valid_anchors v ON v.subscription_id = s.id
+ GROUP BY s.id
+),
+bad_anchors AS (
+ SELECT COUNT(*) AS bad_count
+ FROM events e
+ WHERE e.kind='subscription_added'
+   AND CASE
+        WHEN NOT json_valid(e.payload) THEN 1
+        WHEN json_type(e.payload) IS NOT 'object' THEN 1
+        WHEN json_type(e.payload, '$.subscriptionID') IS NOT 'text' THEN 1
+        WHEN length(CAST(json_extract(e.payload, '$.subscriptionID') AS BLOB)) NOT BETWEEN 5 AND 64 THEN 1
+        WHEN json_extract(e.payload, '$.subscriptionID') NOT GLOB 'sub-[0-9A-Za-z]*' THEN 1
+        WHEN json_extract(e.payload, '$.subscriptionID') GLOB '*[^0-9A-Za-z._-]*' THEN 1
+        ELSE 0
+       END = 1
+),
+exact_anchors AS (
+ SELECT subscription_id, anchor_seq
+ FROM subscription_anchors
+ WHERE anchor_count = 1
+)
+UPDATE subscriptions
+SET start_event_seq = -1
+WHERE start_event_seq IS NULL
+   OR (SELECT bad_count FROM bad_anchors) > 0;
+CREATE TRIGGER subscriptions_start_event_seq_bi
+BEFORE INSERT ON subscriptions
+WHEN new.start_event_seq IS NULL OR new.start_event_seq < 0 BEGIN
+ SELECT RAISE(ABORT, 'subscriptions.start_event_seq is required');
+END;
+CREATE TRIGGER subscriptions_start_event_seq_bu
+BEFORE UPDATE OF start_event_seq ON subscriptions
+WHEN new.start_event_seq IS NULL
+  OR new.start_event_seq < 0
+  OR new.start_event_seq IS NOT old.start_event_seq BEGIN
+ SELECT RAISE(ABORT, 'subscriptions.start_event_seq is immutable');
+END;
+CREATE TABLE board_materialization_cursor (
+ id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+ event_seq INTEGER NOT NULL CHECK(event_seq >= 0),
+ updated_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO board_materialization_cursor(id,event_seq,updated_at)
+VALUES (
+  1,
+  0,
+  COALESCE((SELECT max(created_at) FROM events), 0)
+)
+ON CONFLICT(id) DO UPDATE SET
+ event_seq=excluded.event_seq,
+ updated_at=excluded.updated_at;
+CREATE TABLE subscription_deliveries (
+ subscription_id TEXT NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+ event_id TEXT NOT NULL CHECK(length(event_id)=64 AND event_id NOT GLOB '*[^0-9a-f]*'),
+ event_seq INTEGER NOT NULL REFERENCES events(seq) ON DELETE CASCADE,
+ event_kind TEXT NOT NULL,
+ event_created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','leased','retry_wait','acked','dead_letter')),
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+ lease_token TEXT,
+ lease_deadline_at INTEGER,
+ next_attempt_at INTEGER,
+ last_attempt_at INTEGER,
+ last_error_code TEXT,
+ acked_at INTEGER,
+ dead_lettered_at INTEGER,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY(subscription_id,event_id),
+ UNIQUE(subscription_id,event_seq),
+  CHECK(updated_at >= created_at),
+  CHECK(status <> 'pending' OR (
+   attempts = 0 AND
+   next_attempt_at IS NOT NULL AND
+   next_attempt_at >= created_at AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   last_attempt_at IS NULL AND
+   last_error_code IS NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'leased' OR (
+   attempts >= 1 AND
+   lease_token IS NOT NULL AND
+   lease_deadline_at IS NOT NULL AND
+   next_attempt_at IS NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'retry_wait' OR (
+   attempts >= 1 AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   next_attempt_at IS NOT NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NOT NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'acked' OR (
+   attempts >= 1 AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   next_attempt_at IS NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NULL AND
+   acked_at IS NOT NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'dead_letter' OR (
+   attempts >= 1 AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   next_attempt_at IS NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NOT NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NOT NULL
+ ))
+) STRICT;
+CREATE TRIGGER subscription_deliveries_insert_bi
+BEFORE INSERT ON subscription_deliveries
+WHEN new.status <> 'pending'
+  OR new.attempts <> 0
+  OR new.lease_token IS NOT NULL
+  OR new.lease_deadline_at IS NOT NULL
+  OR new.next_attempt_at IS NULL
+  OR new.last_attempt_at IS NOT NULL
+  OR new.last_error_code IS NOT NULL
+  OR new.acked_at IS NOT NULL
+  OR new.dead_lettered_at IS NOT NULL BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries must be inserted as pending');
+END;
+CREATE INDEX idx_subscription_deliveries_due ON subscription_deliveries(status,next_attempt_at,event_seq,subscription_id)
+ WHERE status IN ('pending','retry_wait');
+CREATE INDEX idx_subscription_deliveries_lease_expiry ON subscription_deliveries(status,lease_deadline_at,event_seq,subscription_id)
+ WHERE status='leased';
+CREATE INDEX idx_subscription_deliveries_subscription_status ON subscription_deliveries(subscription_id,status,event_seq);
+CREATE TRIGGER subscription_deliveries_event_binding_bi
+BEFORE INSERT ON subscription_deliveries
+WHEN NOT EXISTS (
+ SELECT 1
+ FROM subscriptions s
+ JOIN events e ON e.seq = new.event_seq
+ WHERE s.id = new.subscription_id
+   AND e.event_hash = new.event_id
+   AND e.event_hash IS NOT NULL
+   AND length(e.event_hash) = 64
+   AND e.event_hash NOT GLOB '*[^0-9a-f]*'
+   AND e.kind = new.event_kind
+   AND e.created_at = new.event_created_at
+   AND e.seq > s.start_event_seq
+) BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries.event_id must match events.event_hash');
+END;
+CREATE TRIGGER subscription_deliveries_event_binding_bu
+BEFORE UPDATE OF subscription_id,event_id,event_seq,event_kind,event_created_at ON subscription_deliveries
+WHEN NOT EXISTS (
+ SELECT 1
+ FROM subscriptions s
+ JOIN events e ON e.seq = new.event_seq
+ WHERE s.id = new.subscription_id
+   AND e.event_hash = new.event_id
+   AND e.event_hash IS NOT NULL
+   AND length(e.event_hash) = 64
+   AND e.event_hash NOT GLOB '*[^0-9a-f]*'
+   AND e.kind = new.event_kind
+   AND e.created_at = new.event_created_at
+   AND e.seq > s.start_event_seq
+) BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries.event_id must match events.event_hash');
+END;
+CREATE TRIGGER subscription_deliveries_identity_bu
+BEFORE UPDATE OF subscription_id,event_id,event_seq,event_kind,event_created_at,created_at ON subscription_deliveries
+WHEN new.subscription_id IS NOT old.subscription_id
+  OR new.event_id IS NOT old.event_id
+  OR new.event_seq IS NOT old.event_seq
+  OR new.event_kind IS NOT old.event_kind
+  OR new.event_created_at IS NOT old.event_created_at
+  OR new.created_at IS NOT old.created_at BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries identity is immutable');
+END;
+CREATE TRIGGER subscription_deliveries_updated_at_bu
+BEFORE UPDATE OF updated_at ON subscription_deliveries
+WHEN new.updated_at < old.updated_at BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries.updated_at must be monotonic');
+END;
+CREATE TRIGGER subscription_deliveries_state_bu
+BEFORE UPDATE ON subscription_deliveries
+WHEN old.status IN ('acked','dead_letter')
+  OR (old.status IN ('pending','retry_wait') AND new.status <> 'leased')
+  OR (old.status = 'leased' AND new.status NOT IN ('retry_wait','acked','dead_letter'))
+  OR (new.status = 'leased' AND new.attempts <> old.attempts + 1)
+  OR (new.status = 'leased' AND (
+        new.lease_token IS NULL OR
+        new.lease_deadline_at IS NULL OR
+        new.next_attempt_at IS NOT NULL OR
+        new.last_attempt_at IS NULL OR
+        new.last_error_code IS NOT NULL OR
+        new.acked_at IS NOT NULL OR
+        new.dead_lettered_at IS NOT NULL
+      ))
+  OR (old.status = 'leased' AND new.attempts <> old.attempts)
+  OR (old.status = 'leased' AND (
+        new.lease_token IS NOT NULL OR
+        new.lease_deadline_at IS NOT NULL OR
+        new.last_attempt_at IS NULL OR
+        new.updated_at < old.updated_at
+      ))
+  OR (new.status = 'retry_wait' AND (
+        new.next_attempt_at IS NULL OR
+        new.last_error_code IS NULL OR
+        new.acked_at IS NOT NULL OR
+        new.dead_lettered_at IS NOT NULL
+      ))
+  OR (new.status = 'acked' AND (
+        new.next_attempt_at IS NOT NULL OR
+        new.last_error_code IS NOT NULL OR
+        new.acked_at IS NULL OR
+        new.dead_lettered_at IS NOT NULL
+      ))
+  OR (new.status = 'dead_letter' AND (
+        new.next_attempt_at IS NOT NULL OR
+        new.last_error_code IS NULL OR
+        new.acked_at IS NOT NULL OR
+        new.dead_lettered_at IS NULL
+      )) BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries state transition is invalid');
+END;
+CREATE TRIGGER subscription_deliveries_delete_bu
+BEFORE DELETE ON subscription_deliveries
+WHEN EXISTS (SELECT 1 FROM subscriptions WHERE id=old.subscription_id) BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries are immutable');
+END;
+CREATE TABLE subscription_delivery_attempts (
+ subscription_id TEXT NOT NULL,
+ event_id TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt >= 1),
+ started_at INTEGER NOT NULL,
+ finished_at INTEGER,
+ outcome TEXT NOT NULL CHECK(outcome IN ('claim','success','retry','dead','lease_expired','timeout')),
+ error_code TEXT CHECK(error_code IS NULL OR (length(error_code) > 0 AND error_code NOT GLOB '*[^a-z0-9_:-]*')),
+ CHECK(finished_at IS NULL OR finished_at >= started_at),
+ PRIMARY KEY(subscription_id,event_id,attempt),
+ FOREIGN KEY(subscription_id,event_id) REFERENCES subscription_deliveries(subscription_id,event_id) ON DELETE CASCADE
+) STRICT;
+CREATE TRIGGER subscription_delivery_attempts_insert_bi
+BEFORE INSERT ON subscription_delivery_attempts
+WHEN new.outcome <> 'claim'
+  OR new.finished_at IS NOT NULL
+  OR new.error_code IS NOT NULL BEGIN
+ SELECT RAISE(ABORT, 'subscription_delivery_attempts must be inserted as open claims');
+END;
+CREATE TRIGGER subscription_delivery_attempts_update_bu
+BEFORE UPDATE ON subscription_delivery_attempts
+WHEN old.finished_at IS NOT NULL
+  OR old.outcome <> 'claim'
+  OR new.subscription_id IS NOT old.subscription_id
+  OR new.event_id IS NOT old.event_id
+  OR new.attempt IS NOT old.attempt
+  OR new.started_at IS NOT old.started_at
+  OR new.finished_at IS NULL
+  OR new.outcome = 'claim'
+  OR new.outcome NOT IN ('success','retry','dead','lease_expired','timeout')
+  OR (new.outcome = 'success' AND new.error_code IS NOT NULL)
+  OR (new.outcome <> 'success' AND new.error_code IS NULL)
+  OR new.finished_at < old.started_at BEGIN
+ SELECT RAISE(ABORT, 'subscription_delivery_attempts state transition is invalid');
+END;
+CREATE TRIGGER subscription_delivery_attempts_delete_bu
+BEFORE DELETE ON subscription_delivery_attempts
+WHEN EXISTS (SELECT 1 FROM subscriptions WHERE id=old.subscription_id) BEGIN
+ SELECT RAISE(ABORT, 'subscription_delivery_attempts are immutable');
+END;
+CREATE INDEX idx_subscription_delivery_attempts_rate ON subscription_delivery_attempts(subscription_id,started_at);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1161,7 +1521,7 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 21;
+pub const BOARD_SCHEMA_VERSION: usize = 22;
 pub const REGISTRY_SCHEMA_VERSION: usize = 11;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1369,7 +1729,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.
@@ -1607,6 +1967,428 @@ mod tests {
             REGISTRY_SCHEMA_VERSION,
             SOURCE.matches(registry_declaration.as_str()).count()
         );
+    }
+
+    #[test]
+    fn board_v22_anchors_start_event_seq_and_materializes_the_first_later_match() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..21]).unwrap();
+
+        crate::audit::append_board_event(
+            &connection,
+            Some("t-subject"),
+            "task_created",
+            "geo",
+            "{}",
+            10,
+        )
+        .unwrap();
+        let anchor_payload = r#"{"subscriptionID":"sub-1"}"#;
+        crate::audit::append_board_event(
+            &connection,
+            None,
+            "subscription_added",
+            "geo",
+            anchor_payload,
+            11,
+        )
+        .unwrap();
+        let matching_payload = r#"{"_semanticV1":{"subject":{"type":"task","id":"t-subject"},"relations":[],"priorStatus":"todo","currentStatus":"in_progress","tags":["pubsub"]}}"#;
+        crate::audit::append_board_event(
+            &connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "geo",
+            matching_payload,
+            12,
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    "sub-1",
+                    1,
+                    Option::<String>::None,
+                    "[]",
+                    "[\"checkpoint_added\"]",
+                    "[]",
+                    "[]",
+                    "[\"pubsub\"]",
+                    "consumer",
+                    "action",
+                    1000,
+                    3,
+                    60,
+                    2,
+                    Option::<String>::None,
+                    "active",
+                    20,
+                    "geo",
+                    20,
+                    "geo",
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                ],
+            )
+            .unwrap();
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT start_event_seq FROM subscriptions WHERE id='sub-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT event_seq FROM board_materialization_cursor WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let mut store = crate::store::Store { connection };
+        assert_eq!(store.materialize_subscriptions().unwrap(), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT event_seq FROM board_materialization_cursor WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT event_seq FROM subscription_deliveries WHERE subscription_id='sub-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT event_id FROM subscription_deliveries WHERE subscription_id='sub-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            store
+                .connection
+                .query_row("SELECT event_hash FROM events WHERE seq=3", [], |row| {
+                    row.get::<_, String>(0)
+                },)
+                .unwrap()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO subscription_deliveries(subscription_id,event_id,event_seq,event_kind,event_created_at,status,attempts,lease_token,lease_deadline_at,next_attempt_at,last_attempt_at,last_error_code,acked_at,dead_lettered_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![
+                        "sub-1",
+                        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                        2,
+                        "subscription_added",
+                        11,
+                        "pending",
+                        0,
+                        Option::<String>::None,
+                        Option::<i64>::None,
+                        11,
+                        Option::<i64>::None,
+                        Option::<String>::None,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        11,
+                        11,
+                    ],
+                )
+                .is_err(),
+            "subscription_deliveries accepted a post-anchor event that did not match the event identity"
+        );
+    }
+
+    #[test]
+    fn board_v22_allows_a_valid_historical_removed_subscription_anchor() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..21]).unwrap();
+
+        crate::audit::append_board_event(
+            &connection,
+            Some("t-subject"),
+            "task_created",
+            "geo",
+            "{}",
+            10,
+        )
+        .unwrap();
+        crate::audit::append_board_event(
+            &connection,
+            None,
+            "subscription_added",
+            "geo",
+            r#"{"subscriptionID":"sub-1"}"#,
+            11,
+        )
+        .unwrap();
+        crate::audit::append_board_event(
+            &connection,
+            None,
+            "subscription_added",
+            "geo",
+            r#"{"subscriptionID":"sub-old"}"#,
+            12,
+        )
+        .unwrap();
+        crate::audit::append_board_event(
+            &connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "geo",
+            r#"{"_semanticV1":{"subject":{"type":"task","id":"t-subject"},"relations":[],"priorStatus":"todo","currentStatus":"in_progress","tags":["pubsub"]}}"#,
+            13,
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    "sub-1",
+                    1,
+                    Option::<String>::None,
+                    "[]",
+                    "[\"checkpoint_added\"]",
+                    "[]",
+                    "[]",
+                    "[\"pubsub\"]",
+                    "consumer",
+                    "action",
+                    1000,
+                    3,
+                    60,
+                    2,
+                    Option::<String>::None,
+                    "active",
+                    20,
+                    "geo",
+                    20,
+                    "geo",
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                ],
+            )
+            .unwrap();
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT start_event_seq FROM subscriptions WHERE id='sub-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn board_v22_fails_closed_for_missing_duplicate_or_malformed_anchors() {
+        let cases = [
+            ("missing", "{}", "{}", 1usize),
+            (
+                "duplicate",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-1"}"#,
+                2,
+            ),
+            (
+                "malformed",
+                r#"{"subscriptionID":1}"#,
+                r#"{"subscriptionID":"sub-1"}"#,
+                1,
+            ),
+            (
+                "mixed",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":1}"#,
+                2,
+            ),
+            (
+                "mixed-missing-path",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"other":"value"}"#,
+                2,
+            ),
+            (
+                "mixed-null-path",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":null}"#,
+                2,
+            ),
+            (
+                "empty-id",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":""}"#,
+                2,
+            ),
+            (
+                "suffix-only",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-"}"#,
+                2,
+            ),
+            (
+                "overlong",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                2,
+            ),
+            (
+                "non-ascii",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-é"}"#,
+                2,
+            ),
+            (
+                "space",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-1 2"}"#,
+                2,
+            ),
+            (
+                "slash",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-1/2"}"#,
+                2,
+            ),
+            (
+                "colon",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-1:2"}"#,
+                2,
+            ),
+            (
+                "punctuation",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"sub-1+2"}"#,
+                2,
+            ),
+            (
+                "wrong-prefix",
+                r#"{"subscriptionID":"sub-1"}"#,
+                r#"{"subscriptionID":"xub-1"}"#,
+                2,
+            ),
+        ];
+
+        for (label, first_payload, second_payload, anchor_count) in cases {
+            let mut connection = Connection::open_in_memory().unwrap();
+            migrate(&mut connection, &BOARD_MIGRATIONS[..21]).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![
+                        1,
+                        Option::<String>::None,
+                        "task_created",
+                        "geo",
+                        "{}",
+                        10,
+                        0,
+                        "prev-1",
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    ],
+                )
+                .unwrap();
+            if label != "missing" {
+                connection
+                    .execute(
+                        "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            2,
+                            Option::<String>::None,
+                            "subscription_added",
+                            "geo",
+                            first_payload,
+                            11,
+                            0,
+                            "prev-2",
+                            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                        ],
+                    )
+                    .unwrap();
+            }
+            if anchor_count == 2 {
+                connection
+                    .execute(
+                        "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            3,
+                            Option::<String>::None,
+                            "subscription_added",
+                            "geo",
+                            second_payload,
+                            12,
+                            0,
+                            "prev-3",
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        ],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![
+                        "sub-1",
+                        1,
+                        Option::<String>::None,
+                        "[]",
+                        "[]",
+                        "[]",
+                        "[]",
+                        "[]",
+                        "consumer",
+                        "action",
+                        1000,
+                        3,
+                        60,
+                        2,
+                        Option::<String>::None,
+                        "active",
+                        20,
+                        "geo",
+                        20,
+                        "geo",
+                        Option::<i64>::None,
+                        Option::<String>::None,
+                    ],
+                )
+                .unwrap();
+
+            assert!(
+                migrate(&mut connection, BOARD_MIGRATIONS).is_err(),
+                "{label}: bad anchors must fail closed"
+            );
+        }
     }
 
     #[test]

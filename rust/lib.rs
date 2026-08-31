@@ -1,6 +1,10 @@
+mod adapter_process;
+mod adapter_protocol;
 mod audit;
 mod context;
 mod db;
+mod dispatch;
+mod dispatcher;
 mod gitctx;
 mod import;
 mod lock;
@@ -2076,6 +2080,18 @@ pub fn entrypoint() -> ! {
         // stdout the moment head has what it wants, and every other Unix tool
         // ends quietly at that point rather than reporting an error the user
         // did not cause.
+        Err(error) if reader_left(&error) => std::process::exit(0),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the dedicated durable-subscription worker binary.
+pub fn dispatcher_entrypoint() -> ! {
+    match dispatcher::command(env::args_os().skip(1).collect()) {
+        Ok(()) => std::process::exit(0),
         Err(error) if reader_left(&error) => std::process::exit(0),
         Err(error) => {
             let _ = writeln!(io::stderr(), "Error: {error:#}");

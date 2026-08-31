@@ -485,7 +485,8 @@ askie makes you read titles to find out, and you are the one who knows.
 
 Examples below use bare tag names in storage and CLI. Prose may render a
 registered Kanban tag as `:slug`, but storage and CLI always use the bare slug
-(`--tag slug`).
+(`--tag slug`). The colon is only presentation notation; do not create another
+sigil namespace inside KB tags.
 
 ```bash
 kb tag ls --json                                   # the vocabulary, with use counts
@@ -517,7 +518,9 @@ on it; a tag is *what part of the system this touches*. Putting a subsystem in
 `lane` silently changes which driver receives the work.
 
 `@:team` is atmux routing identity, not a tag. Do not encode board, lane, team,
-host, tier, actor, priority, or typed row IDs as tags.
+host, tier, actor, priority, or typed row IDs as tags. In particular, `:module`
+means the registered KB tag `module`, while `@:team` names an atmux team; they
+are different types and must never be normalized into one another.
 
 Retiring a tag rows still carry is refused and says how many; `--force` strips it
 from them and records the count in the trail.
@@ -636,7 +639,7 @@ Rules:
 - `payload` stays the existing event JSON, including `seq` as the ledger row
   number.
 
-## Subscription records — durable declarations, not execution
+## Subscription records and dispatcher delivery
 
 Use `kb subscription add|list|show|pause|resume` to manage one board's durable
 delivery intent. The addressed board is the tenancy predicate; do not put a
@@ -665,13 +668,46 @@ Rules:
 - `--secret-ref` is an optional opaque identifier containing only ASCII
   letters, digits, dot, underscore, and hyphen. Never pass a credential or raw
   token value.
-- Rows contain no root, board path, shell text, adapter arguments, credentials,
-  delivery acknowledgement, cursor, or dead-letter state.
+- Subscription rows contain no root, board path, shell text, adapter arguments,
+  credentials, delivery acknowledgement, cursor, or dead-letter state.
 - Add/pause/resume append audited board events; their payloads omit the secret
   reference. List/show are read-only request-response operations.
-- Delivery identity is `(subscriptionID,eventID)`. Actual capability lookup,
-  locking, invocation, acknowledgement, retry, and dead-letter behavior belong
-  to the later dispatcher phase and host-local trusted configuration.
+- Delivery identity is `(subscriptionID,eventID)`.
+
+Run delivery through the separate compiled worker with exactly one explicit
+board selector:
+
+```bash
+kanban-dispatcher --project NAME [--consumer consumer.name] [--once] [--json]
+kanban-dispatcher --workspace /registered/root [--once] [--json]
+kanban-dispatcher --db /exact/board.db [--once] [--json]
+```
+
+On HAX use the fixed installed path `/root/.local/bin/kanban-dispatcher` after
+the same host-boundary verification used for `/root/.local/bin/kb`. The worker
+is not a `kb-board` subcommand. `--consumer` restricts execution to one consumer
+identity; `--once` performs one scheduler step; without `--once` it polls until
+SIGINT/SIGTERM. Help and version do not open board or registry state.
+
+The allow-list is the private host-local
+`$KANBAN_DATA_DIR/dispatchers.json`, protocol version `1`. It maps strict
+consumer/action names to a declared capability, an absolute executable, fixed
+arguments, and optional secret-reference mappings from `sourceEnv` to one safe
+adapter `targetEnv`. Put environment-variable names there, never credential
+values. Keep the data root and config inaccessible to group/other users; the
+executable must be a regular non-symlink with an execute bit and no group/other
+write bit. The adapter starts with an empty environment and receives only the
+configured target secret when the subscription names that reference.
+
+Startup validates configuration before the first materialization or claim. Each
+scheduler step materializes and recovers work, resolves the candidate, then
+serializes per consumer, reloads configuration under the lock, and claims for
+`timeoutMs + 30 seconds`. It runs the adapter outside SQLite and finalizes only
+the exact lease token. Failures retry deterministically then dead-letter;
+pause/resume is rechecked before claim. A crash after adapter success but before
+acknowledgement is retried after lease expiry, so adapters must treat
+`(subscriptionID,eventID)` as an idempotency key: delivery is at-least-once,
+never exactly-once.
 
 ## Archival — bounded hot indexes, intact history
 

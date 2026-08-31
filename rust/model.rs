@@ -119,6 +119,7 @@ pub struct Subscription {
     pub max_retries: i64,
     pub rate_per_minute: i64,
     pub max_concurrency: i64,
+    pub start_event_seq: i64,
     /// Opaque host-local lookup name, never a credential value.
     pub secret_ref: Option<String>,
     pub status: String,
@@ -128,6 +129,41 @@ pub struct Subscription {
     pub updated_by: String,
     pub paused_at: Option<i64>,
     pub paused_by: Option<String>,
+}
+
+/// A due delivery candidate selected from the durable dispatcher queue.
+///
+/// The nested subscription carries the immutable consumer/action capability
+/// lookup plus the selection policy. The dispatcher resolves the raw event
+/// row itself when it needs to claim the delivery.
+#[derive(Clone)]
+pub(crate) struct SubscriptionDeliveryCandidate {
+    pub(crate) subscription: Subscription,
+    pub(crate) event_id: String,
+    pub(crate) event_seq: i64,
+    pub(crate) event_kind: String,
+    pub(crate) delivery_status: String,
+    pub(crate) attempt_number: i64,
+    pub(crate) next_attempt_at: i64,
+}
+
+/// A claimed delivery with a live lease token and deadline.
+///
+/// The raw event stays crate-private so the dispatcher can project it
+/// through the canonical watch redaction path before anything outside the
+/// crate sees it.
+#[derive(Clone)]
+pub(crate) struct SubscriptionDeliveryClaim {
+    pub(crate) subscription: Subscription,
+    pub(crate) event_id: String,
+    pub(crate) event_seq: i64,
+    pub(crate) event_kind: String,
+    pub(crate) event_created_at: i64,
+    pub(crate) event: Event,
+    pub(crate) delivery_status: String,
+    pub(crate) attempt_number: i64,
+    pub(crate) lease_token: String,
+    pub(crate) lease_deadline_at: i64,
 }
 
 #[derive(Debug, Clone)]

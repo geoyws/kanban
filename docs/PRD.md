@@ -28,8 +28,8 @@ and transfer work to a replacement agent when context or tokens run low.
    while keeping `kb events` as the newest-first snapshot reader and `/live`
    as compatibility invalidation for the served UI.
 9. Persist board-local declarative subscriptions with immutable identity,
-   fail-closed predicates, bounded consumer policy, and secret references only,
-   before any external dispatcher is allowed to execute them.
+   fail-closed predicates, bounded consumer policy, and secret references only;
+   execute them only through the separate capability-gated compiled dispatcher.
 
 ## Non-goals
 
@@ -94,6 +94,11 @@ write domains.
   consumer/action identifiers, bounded timeout/retry/rate/concurrency policy,
   and an optional opaque secret reference. Store no root, path, shell text,
   executable argument, credential, raw token, cursor, or delivery state.
+- Run delivery through `kanban-dispatcher` with exactly one explicit board
+  selector. Resolve executable, fixed arguments, capability allow-list, and
+  secret environment mapping only from private host-local configuration;
+  materialize before claim, serialize per consumer, invoke outside the SQLite
+  transaction, and acknowledge or fail only the exact lease token.
 
 ### P0 — first usable slice
 
@@ -169,7 +174,10 @@ A handoff is valid only when:
   targets remain replayable.
 - A subscription created on one board is invisible on every other board;
   pause/resume preserves its immutable ID and `(subscriptionID,eventID)` is the
-  later dispatcher's deduplication identity.
+  dispatcher's delivery identity.
+- Two dispatcher processes can contend for one delivery but only one adapter
+  invocation succeeds; a post-success/pre-ack crash is retried after lease
+  expiry and is truthfully treated as at-least-once delivery.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
 
@@ -185,8 +193,8 @@ A handoff is valid only when:
    token-threshold integration.
 5. **Personal UI:** fast portfolio and project board views.
 6. **Optional mobility:** encrypted operator-only cross-host transport.
-7. **Durable dispatch control plane:** board-local subscription declarations,
-   followed by an external capability-gated dispatcher and fake adapter proof.
+7. **Durable dispatch:** board-local declarations plus the separate compiled,
+   capability-gated dispatcher and a real fake-adapter process proof.
 
 ## Current delivery status
 

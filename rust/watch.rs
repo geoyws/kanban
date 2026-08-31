@@ -418,18 +418,35 @@ fn scope_envelope(key: &StreamKey, board_name: Option<String>) -> ScopeEnvelope 
 }
 
 fn event_payload(event: Event, source: &Source) -> Result<Value> {
+    match source {
+        Source::Board { path, board_name } => {
+            project_board_event(event, path, board_name.as_deref())
+        }
+        Source::Registry => project_event(event, None),
+    }
+}
+
+pub(crate) fn project_board_event(
+    event: Event,
+    path: &Path,
+    board_name: Option<&str>,
+) -> Result<Value> {
+    project_event(event, Some((path, board_name)))
+}
+
+fn project_event(event: Event, board_source: Option<(&Path, Option<&str>)>) -> Result<Value> {
     let mut value = serde_json::to_value(event)?;
     let payload = value
         .get_mut("payload")
         .map(Value::take)
         .unwrap_or(Value::Null);
-    let snapshot = match source {
-        Source::Board { .. } => payload
+    let snapshot = match board_source {
+        Some(_) => payload
             .as_object()
             .and_then(|object| object.get("_semanticV1"))
             .filter(|snapshot| snapshot.is_object())
             .cloned(),
-        Source::Registry => None,
+        None => None,
     };
     let mut payload = payload;
     if let Some(object) = payload.as_object_mut() {
@@ -437,8 +454,8 @@ fn event_payload(event: Event, source: &Source) -> Result<Value> {
     }
     let payload = redact(payload);
     value["payload"] = payload.clone();
-    let board = match source {
-        Source::Board { path, board_name } => {
+    let board = match board_source {
+        Some((path, board_name)) => {
             let mut board = serde_json::Map::new();
             board.insert("id".into(), json!(canonical_source_path(path)?));
             if let Some(name) = board_name {
@@ -446,7 +463,7 @@ fn event_payload(event: Event, source: &Source) -> Result<Value> {
             }
             Value::Object(board)
         }
-        Source::Registry => Value::Null,
+        None => Value::Null,
     };
     let event_id = value.get("eventHash").cloned().unwrap_or(Value::Null);
     let timestamp = value.get("createdAt").cloned().unwrap_or(Value::Null);
@@ -650,7 +667,7 @@ fn redact(value: Value) -> Value {
     }
 }
 
-fn secret_key(value: &str) -> bool {
+pub(crate) fn secret_key(value: &str) -> bool {
     let normalized = value
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -980,21 +997,26 @@ mod tests {
 
     #[test]
     fn event_projection_strips_private_snapshot_and_adds_semantic_fields() {
-        let projected = event_payload(
-            event(json!({
-                "_semanticV1": {
-                    "subject": {"type":"task", "id":"t-1"},
-                    "relations": [{"kind":"parent", "type":"story", "id":"s-1"}],
-                    "priorStatus": "todo",
-                    "currentStatus": "done",
-                    "tags": ["infra"]
-                },
-                "token": "private",
-                "note": "visible"
-            })),
-            &board_source(),
-        )
-        .unwrap();
+        let source = board_source();
+        let fixture = event(json!({
+            "_semanticV1": {
+                "subject": {"type":"task", "id":"t-1"},
+                "relations": [{"kind":"parent", "type":"story", "id":"s-1"}],
+                "priorStatus": "todo",
+                "currentStatus": "done",
+                "tags": ["infra"]
+            },
+            "token": "private",
+            "note": "visible"
+        }));
+        let projected = event_payload(fixture.clone(), &source).unwrap();
+        let direct = match &source {
+            Source::Board { path, board_name } => {
+                project_board_event(fixture, path, board_name.as_deref()).unwrap()
+            }
+            Source::Registry => unreachable!(),
+        };
+        assert_eq!(projected, direct);
         assert_eq!(projected["schemaVersion"], 1);
         assert_eq!(projected["eventID"], "hash-7");
         assert_eq!(projected["timestamp"], 123);
