@@ -409,6 +409,44 @@ mod tests {
         run_process(&fixture_spec(mode.into()), input, timeout_ms, cancelled)
     }
 
+    fn spawn_child_fixture(mode: &str) -> std::process::Child {
+        Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "adapter_process::tests::child_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("KANBAN_TEST_ADAPTER", mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    struct ChildReaper(Option<std::process::Child>);
+
+    impl ChildReaper {
+        fn new(child: std::process::Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn child(&self) -> &std::process::Child {
+            self.0.as_ref().unwrap()
+        }
+    }
+
+    impl Drop for ChildReaper {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     #[test]
     fn child_fixture() {
         let Some(mode) = env::var_os("KANBAN_TEST_ADAPTER") else {
@@ -534,7 +572,8 @@ mod tests {
         let missing = signal_group(i32::MAX as u32, libc::SIGTERM).unwrap();
         assert!(!missing);
 
-        let error = signal_group(std::process::id(), 9999).unwrap_err();
+        let child = ChildReaper::new(spawn_child_fixture("sleep"));
+        let error = signal_group(child.child().id(), 9999).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 
