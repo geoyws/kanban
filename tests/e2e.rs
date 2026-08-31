@@ -1278,6 +1278,19 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     assert!(paraphrase["resultChars"].as_u64().unwrap() <= 1000);
     assert_eq!(paraphrase["embeddingModel"], "kanban-semantic-lite-v1");
 
+    let tag_driven = fixture.ok_json(
+        &fixture.main,
+        &["search", "release ops", "--limit", "3", "--json"],
+    );
+    assert!(
+        tag_driven["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["sourceId"] == "t-release"),
+        "tag-driven search stopped returning the tagged task: {tag_driven}"
+    );
+
     let rule = fixture.ok_json(
         &fixture.main,
         &[
@@ -1468,6 +1481,66 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
             .unwrap()
             .iter()
             .any(|result| result["sourceId"] == "t-auth")
+    );
+}
+
+#[test]
+fn compiled_binary_excludes_tag_only_canonical_id_collisions() {
+    let fixture = Fixture::new("canonical-id-tag-collision");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SEARCH-C", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "sub-deadbeef", "--as", "tester", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Tagged collision",
+            "--id",
+            "t-tagged",
+            "--body",
+            "No literal match lives here.",
+            "--tag",
+            "sub-deadbeef",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Literal body hit",
+            "--id",
+            "t-literal",
+            "--body",
+            "Keep sub-deadbeef in the source body.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+
+    let search = fixture.ok_json(
+        &fixture.main,
+        &["search", "sub-deadbeef", "--limit", "5", "--json"],
+    );
+    let results = search["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|result| result["sourceId"] == "t-literal"),
+        "literal source/body hit was not returned: {search}"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|result| result["sourceId"] != "t-tagged"),
+        "tag-only canonical ID collision leaked into search: {search}"
     );
 }
 

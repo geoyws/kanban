@@ -272,6 +272,40 @@ fn lexical_scores(connection: &Connection, query: &str) -> Result<HashMap<i64, f
     Ok(scores)
 }
 
+fn literal_exact_score(document: &Document, query: &str, query_words: &[String]) -> f64 {
+    let query = query.to_lowercase();
+    let source_id = document.source_id.to_lowercase();
+    let title = document.title.to_lowercase();
+    let body = document.body.to_lowercase();
+    if source_id == query {
+        return 1.0;
+    }
+    if !query.is_empty() {
+        if title == query {
+            return 0.99;
+        }
+        if title.starts_with(&query) {
+            return 0.98;
+        }
+        if title.contains(&query) {
+            return 0.95;
+        }
+        if body.contains(&query) {
+            return 0.9;
+        }
+    }
+    let haystack = format!("{source_id}\n{title}\n{body}");
+    if query_words.is_empty() {
+        return 0.0;
+    }
+    query_words
+        .iter()
+        .filter(|word| haystack.contains(word.as_str()))
+        .count() as f64
+        / query_words.len() as f64
+        * 0.7
+}
+
 fn exact_score(document: &Document, query: &str, query_words: &[String]) -> f64 {
     let query = query.to_lowercase();
     let source_id = document.source_id.to_lowercase();
@@ -388,7 +422,11 @@ pub fn search(
                 document.lane.as_deref().unwrap_or("")
             ))
         });
-        let exact = exact_score(&document, &options.query, &query_words);
+        let exact = if canonical_generated_id_query(&options.query) {
+            literal_exact_score(&document, &options.query, &query_words)
+        } else {
+            exact_score(&document, &options.query, &query_words)
+        };
         let lexical = lexical.get(&document.seq).copied().unwrap_or(0.0);
         let semantic = cosine(&query_vector, &vector);
         if !result_is_eligible(&options.query, exact, lexical, semantic) {
@@ -772,5 +810,72 @@ mod tests {
             0.0,
             0.19
         ));
+    }
+
+    #[test]
+    fn literal_exact_score_ignores_tag_only_canonical_id_collisions() {
+        let tagged = Document {
+            seq: 1,
+            source_kind: "task".to_owned(),
+            source_id: "t-tagged".to_owned(),
+            task_id: Some("t-tagged".to_owned()),
+            title: "Tagged collision".to_owned(),
+            body: "No literal match here.".to_owned(),
+            status: None,
+            lane: None,
+            tags: "sub-deadbeef".to_owned(),
+            created_at: 0,
+            updated_at: 0,
+            archived: false,
+            source_hash: None,
+            embedding_model: None,
+            embedding: None,
+        };
+        let literal = Document {
+            seq: 2,
+            source_kind: "task".to_owned(),
+            source_id: "t-literal".to_owned(),
+            task_id: Some("t-literal".to_owned()),
+            title: "Literal source body hit".to_owned(),
+            body: "Keep sub-deadbeef in the source body.".to_owned(),
+            status: None,
+            lane: None,
+            tags: "irrelevant".to_owned(),
+            created_at: 0,
+            updated_at: 0,
+            archived: false,
+            source_hash: None,
+            embedding_model: None,
+            embedding: None,
+        };
+        let query_words = words("sub-deadbeef");
+        assert_eq!(
+            literal_exact_score(&tagged, "sub-deadbeef", &query_words),
+            0.0
+        );
+        assert!(literal_exact_score(&literal, "sub-deadbeef", &query_words) >= 0.9);
+    }
+
+    #[test]
+    fn exact_score_still_counts_tag_tokens_for_natural_language_queries() {
+        let tagged = Document {
+            seq: 1,
+            source_kind: "task".to_owned(),
+            source_id: "t-tagged".to_owned(),
+            task_id: Some("t-tagged".to_owned()),
+            title: "Tagged collision".to_owned(),
+            body: "No literal match here.".to_owned(),
+            status: None,
+            lane: None,
+            tags: "release ops".to_owned(),
+            created_at: 0,
+            updated_at: 0,
+            archived: false,
+            source_hash: None,
+            embedding_model: None,
+            embedding: None,
+        };
+        let query_words = words("release ops");
+        assert!(exact_score(&tagged, "release ops", &query_words) > 0.0);
     }
 }
