@@ -471,6 +471,47 @@ pub fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempExecutable(PathBuf);
+
+    impl TempExecutable {
+        fn new(body: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "kanban-mcp-{}-{}.sh",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            Self(path)
+        }
+    }
+
+    impl AsRef<Path> for TempExecutable {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempExecutable {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn tool(name: &str) -> Value {
+        tools()
+            .into_iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool named {name}"))
+    }
 
     #[test]
     fn a_tool_only_offers_globals_the_cli_accepts() {
@@ -538,5 +579,186 @@ mod tests {
         let total = names.len();
         names.dedup();
         assert_eq!(total, names.len(), "two operations share a tool name");
+    }
+
+    #[test]
+    fn the_manifest_records_required_optional_list_and_boolean_shapes() {
+        let claim = tool("claim");
+        assert_eq!(claim["inputSchema"]["required"], json!([]));
+        assert_eq!(claim["inputSchema"]["properties"]["id"]["type"], "string");
+        assert_eq!(
+            claim["inputSchema"]["properties"]["id"]["description"],
+            "Positional argument id."
+        );
+
+        let add = tool("task_add");
+        assert_eq!(add["inputSchema"]["required"], json!(["title"]));
+        assert_eq!(
+            add["inputSchema"]["properties"]["depends-on"]["type"],
+            "array"
+        );
+        assert_eq!(
+            add["inputSchema"]["properties"]["driver-only"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            add["inputSchema"]["properties"]["priority"]["type"],
+            "string"
+        );
+
+        let list = tool("task_list");
+        assert_eq!(list["inputSchema"]["properties"]["all"]["type"], "boolean");
+        assert_eq!(
+            list["inputSchema"]["properties"]["with-relations"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn arguments_translate_null_false_repeatable_and_unknown_shapes() {
+        let argv = arguments_for(
+            "task_add",
+            &json!({
+                "title": "Write the test",
+                "id": null,
+                "depends-on": ["t-1", "t-2"],
+                "driver-only": false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(argv[0], "task");
+        assert_eq!(argv[1], "add");
+        assert_eq!(argv.last().map(String::as_str), Some("--json"));
+        assert!(!argv.iter().any(|arg| arg == "null"));
+        assert!(!argv.iter().any(|arg| arg == "--id"));
+        assert!(!argv.iter().any(|arg| arg == "--driver-only"));
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| arg.as_str() == "--depends-on")
+                .count(),
+            2
+        );
+        assert!(argv.iter().any(|arg| arg == "t-1"));
+        assert!(argv.iter().any(|arg| arg == "t-2"));
+
+        let absent = arguments_for("task_list", &json!({"all": false})).unwrap();
+        assert_eq!(absent, vec!["task", "list", "--json"]);
+
+        let unknown = arguments_for("task_add", &json!({"title": "x", "frobnicate": true}))
+            .expect_err("an unknown argument must be rejected");
+        let unknown = unknown.to_string();
+        assert!(unknown.contains("frobnicate"), "{unknown}");
+
+        let malformed = arguments_for("task_list", &json!("not-an-object"))
+            .expect_err("a non-object arguments payload must be rejected");
+        let malformed = malformed.to_string();
+        assert!(malformed.contains("must be an object"), "{malformed}");
+    }
+
+    #[test]
+    fn respond_handles_notifications_default_initialize_ping_list_missing_name_and_unknown_method()
+    {
+        let path = Path::new("/tmp/kanban-mcp-unused");
+
+        assert!(respond(path, &json!({"jsonrpc": "2.0", "method": "ping"})).is_none());
+
+        let initialize = respond(
+            path,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+        )
+        .unwrap();
+        assert_eq!(initialize["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(initialize["result"]["serverInfo"]["name"], "kanban");
+        assert_eq!(
+            initialize["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+
+        let ping = respond(path, &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})).unwrap();
+        assert_eq!(ping["result"], json!({}));
+
+        let listed = respond(
+            path,
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+        )
+        .unwrap();
+        assert!(!listed["result"]["tools"].as_array().unwrap().is_empty());
+
+        let missing_name = respond(
+            path,
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"arguments": {}}}),
+        )
+        .unwrap();
+        assert_eq!(missing_name["error"]["code"], -32602);
+        assert!(
+            missing_name["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("name")
+        );
+
+        let unknown_method = respond(
+            path,
+            &json!({"jsonrpc": "2.0", "id": 5, "method": "no/such"}),
+        )
+        .unwrap();
+        assert_eq!(unknown_method["error"]["code"], -32601);
+        assert!(
+            unknown_method["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no such method")
+        );
+    }
+
+    #[test]
+    fn call_translates_success_nonzero_and_exec_failures_safely() {
+        let ok = TempExecutable::new(
+            r#"#!/bin/sh
+printf '%s\n' "$@"
+"#,
+        );
+        let succeeded = call(
+            ok.as_ref(),
+            "task_add",
+            &json!({
+                "title": "Cover the shim",
+                "id": null,
+                "depends-on": ["t-a", "t-b"],
+                "driver-only": true
+            }),
+        );
+        assert_eq!(succeeded["isError"], false);
+        let text = succeeded["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("task"), "{text}");
+        assert!(text.contains("add"), "{text}");
+        assert!(text.contains("--depends-on"), "{text}");
+        assert!(text.contains("t-a"), "{text}");
+        assert!(text.contains("t-b"), "{text}");
+        assert!(text.contains("--driver-only"), "{text}");
+        assert!(text.contains("--json"), "{text}");
+
+        let failed = TempExecutable::new(
+            r#"#!/bin/sh
+printf 'refused by shim\n' >&2
+exit 7
+"#,
+        );
+        let refused = call(failed.as_ref(), "task_list", &json!({"all": false}));
+        assert_eq!(refused["isError"], true);
+        assert_eq!(refused["content"][0]["text"], "refused by shim");
+
+        let missing = call(
+            Path::new("/definitely/not/a/binary"),
+            "task_list",
+            &json!({}),
+        );
+        assert_eq!(missing["isError"], true);
+        assert!(
+            missing["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not run kanban")
+        );
     }
 }

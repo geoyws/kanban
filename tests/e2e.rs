@@ -8131,9 +8131,15 @@ fn watch_rejects_malformed_unsupported_and_future_cursors() {
 
 /// A live MCP session, spoken over real pipes to the real binary.
 struct Session {
-    child: std::process::Child,
-    outgoing: std::process::ChildStdin,
+    child: Option<std::process::Child>,
+    outgoing: Option<std::process::ChildStdin>,
     incoming: std::sync::mpsc::Receiver<String>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+enum ShutdownResult {
+    Clean(std::process::ExitStatus),
+    TimedOut,
 }
 
 impl Session {
@@ -8152,7 +8158,7 @@ impl Session {
         let outgoing = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (sender, incoming) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             use std::io::BufRead;
             for line in std::io::BufReader::new(stdout)
                 .lines()
@@ -8164,10 +8170,19 @@ impl Session {
             }
         });
         Self {
-            child,
-            outgoing,
+            child: Some(child),
+            outgoing: Some(outgoing),
             incoming,
+            reader: Some(reader),
         }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+
+    fn writer(&mut self) -> &mut std::process::ChildStdin {
+        self.outgoing.as_mut().unwrap()
     }
 
     /// Write several requests in one syscall, so the server can pull more than
@@ -8180,8 +8195,8 @@ impl Session {
             frame.push_str(&request.to_string());
             frame.push('\n');
         }
-        self.outgoing.write_all(frame.as_bytes()).unwrap();
-        self.outgoing.flush().unwrap();
+        self.writer().write_all(frame.as_bytes()).unwrap();
+        self.writer().flush().unwrap();
     }
 
     /// The next reply, whichever request it belongs to.
@@ -8196,20 +8211,63 @@ impl Session {
     /// Send one request and wait for its reply. Never blocks forever: a hung
     /// server is a failure, not a test that runs until someone kills it.
     fn ask(&mut self, request: Value) -> Value {
-        writeln!(self.outgoing, "{request}").unwrap();
-        self.outgoing.flush().unwrap();
+        writeln!(self.writer(), "{request}").unwrap();
+        self.writer().flush().unwrap();
         let line = self
             .incoming
             .recv_timeout(Duration::from_secs(20))
             .unwrap_or_else(|_| panic!("no reply to {request}"));
         serde_json::from_str(&line).unwrap()
     }
+
+    fn finish(mut self) {
+        match self.shutdown(Duration::from_secs(5)) {
+            ShutdownResult::Clean(status) => {
+                assert!(
+                    status.success(),
+                    "session exited nonzero after a clean EOF: {status}"
+                );
+            }
+            ShutdownResult::TimedOut => {
+                panic!("session did not exit cleanly before the 5-second timeout");
+            }
+        }
+    }
+
+    fn shutdown(&mut self, timeout: Duration) -> ShutdownResult {
+        let Some(mut child) = self.child.take() else {
+            return ShutdownResult::TimedOut;
+        };
+        let _ = self.outgoing.take();
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if let Some(reader) = self.reader.take() {
+                        let _ = reader.join();
+                    }
+                    return ShutdownResult::Clean(status);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
+        let _ = child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        ShutdownResult::TimedOut
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.shutdown(Duration::ZERO);
     }
 }
 
@@ -8356,12 +8414,12 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     // question afterwards proves the stream is still aligned: a stray reply
     // would arrive here, one response out of step, and fail the assertion.
     writeln!(
-        session.outgoing,
+        session.writer(),
         "{}",
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
     )
     .unwrap();
-    session.outgoing.flush().unwrap();
+    session.writer().flush().unwrap();
     let ping = session.ask(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}));
     assert_eq!(ping["id"], 6, "a notification was answered");
 
@@ -8442,6 +8500,48 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
 
     let unknown_method = session.ask(json!({"jsonrpc": "2.0", "id": 12, "method": "no/such"}));
     assert_eq!(unknown_method["error"]["code"], -32601);
+
+    session.finish();
+}
+
+#[test]
+fn the_mcp_server_reports_protocol_edges_over_stdio() {
+    let fixture = Fixture::new("mcp-protocol-edge");
+    fixture.ok_json(&fixture.main, &["init", "--name", "EDGE", "--json"]);
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+
+    let default_initialize = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize"
+    }));
+    assert_eq!(
+        default_initialize["result"]["protocolVersion"],
+        "2024-11-05"
+    );
+
+    writeln!(session.writer(), "{{not-json").unwrap();
+    session.writer().flush().unwrap();
+    let malformed = session.recv();
+    assert_eq!(malformed["error"]["code"], -32700);
+    assert_eq!(malformed["id"], Value::Null);
+
+    let missing_name = session.ask(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "arguments": {} }
+    }));
+    assert_eq!(missing_name["error"]["code"], -32602);
+    assert!(
+        missing_name["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("name")
+    );
+
+    session.finish();
 }
 
 #[test]
@@ -8455,7 +8555,7 @@ fn the_mcp_server_replaces_itself_without_dropping_the_session() {
     copy_executable(Path::new(env!("CARGO_BIN_EXE_kanban")), &binary);
 
     let mut session = Session::start(&binary, &fixture.main, &fixture.data);
-    let pid = session.child.id();
+    let pid = session.pid();
     let before =
         session.ask(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}));
     assert_eq!(
@@ -8483,7 +8583,7 @@ fn the_mcp_server_replaces_itself_without_dropping_the_session() {
             env!("CARGO_PKG_VERSION"),
             "a broken build was adopted at request {id}"
         );
-        assert_eq!(session.child.id(), pid, "the process was replaced anyway");
+        assert_eq!(session.pid(), pid, "the process was replaced anyway");
     }
 
     // Now a replacement that works. It answers `version` like the real binary,
@@ -8516,7 +8616,7 @@ done
     // The whole point: same process, same pipes, no reconnection. A client
     // that had to restart the server would not be undisturbed.
     assert_eq!(
-        session.child.id(),
+        session.pid(),
         pid,
         "the process id changed, so the client's pipe did too"
     );
