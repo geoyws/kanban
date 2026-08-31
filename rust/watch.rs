@@ -667,7 +667,7 @@ fn redact(value: Value) -> Value {
     }
 }
 
-fn secret_key(value: &str) -> bool {
+pub(crate) fn secret_key(value: &str) -> bool {
     let normalized = value
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())

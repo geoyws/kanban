@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MAX_RESPONSE_BYTES: usize = 1 << 20;
+const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -45,9 +45,62 @@ pub(crate) struct AdapterResponse {
     pub(crate) replay: bool,
 }
 
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn contains_private_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| crate::watch::secret_key(key) || contains_private_key(value)),
+        Value::Array(values) => values.iter().any(contains_private_key),
+        _ => false,
+    }
+}
+
+pub(crate) fn encode_request(request: &AdapterRequest) -> Result<Vec<u8>> {
+    if request.protocol_version != 1 {
+        bail!(
+            "unsupported adapter request protocol version {}",
+            request.protocol_version
+        );
+    }
+    if request.delivery.attempt < 1 {
+        bail!("adapter delivery attempt must be at least 1");
+    }
+    if !is_lower_hex_64(&request.delivery.event_id) {
+        bail!("adapter delivery event ID must be lowercase 64-hex");
+    }
+    let event = request
+        .event
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("adapter event must be an object"))?;
+    if event.get("eventID").and_then(Value::as_str) != Some(request.delivery.event_id.as_str()) {
+        bail!("adapter event ID does not match delivery");
+    }
+    if event.get("eventHash").and_then(Value::as_str) != Some(request.delivery.event_id.as_str()) {
+        bail!("adapter event hash does not match delivery");
+    }
+    if event.get("timestamp").and_then(Value::as_i64) != Some(request.delivery.created_at) {
+        bail!("adapter event timestamp does not match delivery");
+    }
+    if contains_private_key(&request.event) {
+        bail!("adapter event contains a private key");
+    }
+    let encoded = serde_json::to_vec(request)?;
+    if encoded.len() > MAX_MESSAGE_BYTES {
+        bail!("adapter request exceeds {MAX_MESSAGE_BYTES} bytes");
+    }
+    Ok(encoded)
+}
+
 pub(crate) fn decode_response(bytes: &[u8], request: &AdapterRequest) -> Result<AdapterResponse> {
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        bail!("adapter response exceeds {MAX_RESPONSE_BYTES} bytes");
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        bail!("adapter response exceeds {MAX_MESSAGE_BYTES} bytes");
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let response = AdapterResponse::deserialize(&mut deserializer)?;
@@ -88,7 +141,11 @@ mod tests {
                 consumer_id: "consumer.test".into(),
                 action_id: "enqueue".into(),
             },
-            event: json!({"eventID": "a".repeat(64), "timestamp": 123}),
+            event: json!({
+                "eventID": "a".repeat(64),
+                "eventHash": "a".repeat(64),
+                "timestamp": 123
+            }),
         }
     }
 
@@ -121,6 +178,7 @@ mod tests {
                 },
                 "event": {
                     "eventID": "a".repeat(64),
+                    "eventHash": "a".repeat(64),
                     "timestamp": 123
                 }
             })
@@ -195,7 +253,7 @@ mod tests {
     #[test]
     fn strict_response_decoder_enforces_the_inclusive_size_limit() {
         let mut at_limit = serde_json::to_vec(&response_value()).unwrap();
-        at_limit.resize(MAX_RESPONSE_BYTES, b' ');
+        at_limit.resize(MAX_MESSAGE_BYTES, b' ');
         assert!(decode_response(&at_limit, &request()).is_ok());
 
         at_limit.push(b' ');
@@ -231,5 +289,82 @@ mod tests {
                 "field {field} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn request_encoder_accepts_a_matching_public_event() {
+        let fixture = request();
+        let encoded = encode_request(&fixture).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AdapterRequest>(&encoded).unwrap(),
+            fixture
+        );
+    }
+
+    #[test]
+    fn request_encoder_rejects_version_attempt_and_event_hash_shape() {
+        let mut unsupported = request();
+        unsupported.protocol_version = 2;
+        assert!(encode_request(&unsupported).is_err());
+
+        let mut zero_attempt = request();
+        zero_attempt.delivery.attempt = 0;
+        assert!(encode_request(&zero_attempt).is_err());
+
+        for event_id in ["a".repeat(63), "g".repeat(64), "A".repeat(64)] {
+            let mut malformed = request();
+            malformed.delivery.event_id = event_id;
+            assert!(encode_request(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn request_encoder_rejects_missing_or_mismatched_event_identity() {
+        for field in ["eventID", "eventHash"] {
+            let mut missing = request();
+            missing.event.as_object_mut().unwrap().remove(field);
+            assert!(encode_request(&missing).is_err(), "missing {field}");
+
+            let mut mismatched = request();
+            mismatched.event[field] = json!("b".repeat(64));
+            assert!(encode_request(&mismatched).is_err(), "mismatched {field}");
+        }
+    }
+
+    #[test]
+    fn request_encoder_rejects_missing_mismatched_or_noninteger_timestamp() {
+        let mut missing = request();
+        missing.event.as_object_mut().unwrap().remove("timestamp");
+        assert!(encode_request(&missing).is_err());
+
+        for value in [json!(124), json!(123.0), json!("123")] {
+            let mut malformed = request();
+            malformed.event["timestamp"] = value;
+            assert!(encode_request(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn request_encoder_rejects_nonobject_events_and_recursive_private_keys() {
+        let mut nonobject = request();
+        nonobject.event = json!([]);
+        assert!(encode_request(&nonobject).is_err());
+
+        for payload in [
+            json!({"authToken": "private"}),
+            json!({"nested": {"credential": "private"}}),
+            json!({"nested": [{"materialValue": "private"}]}),
+        ] {
+            let mut private = request();
+            private.event["payload"] = payload;
+            assert!(encode_request(&private).is_err());
+        }
+    }
+
+    #[test]
+    fn request_encoder_rejects_messages_over_one_mibibyte() {
+        let mut oversized = request();
+        oversized.event["metadata"] = json!("x".repeat(MAX_MESSAGE_BYTES));
+        assert!(encode_request(&oversized).is_err());
     }
 }
