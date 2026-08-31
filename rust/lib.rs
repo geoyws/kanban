@@ -1,3 +1,4 @@
+mod adapter_process;
 mod adapter_protocol;
 mod audit;
 mod context;
