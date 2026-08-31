@@ -422,6 +422,25 @@ fn browser_sandbox_enabled(effective_uid: u32) -> bool {
     effective_uid != 0
 }
 
+fn assert_reply_recorded(tab: &headless_chrome::Tab, origin: &str, reply_id: &str, label: &str) {
+    let success = tab
+        .wait_for_element("p.success")
+        .unwrap_or_else(|error| panic!("{label} success element: {error}"));
+    let success_text = success
+        .get_inner_text()
+        .unwrap_or_else(|error| panic!("{label} success text: {error}"));
+    let expected_url = format!("{origin}?replied={reply_id}");
+    assert!(
+        success_text == format!("Reply recorded for {reply_id}."),
+        "{label} success text: {success_text}"
+    );
+    assert!(
+        tab.get_url() == expected_url,
+        "{label} redirect url: {}",
+        tab.get_url()
+    );
+}
+
 #[test]
 fn chrome_discovery_prefers_explicit_then_platform_then_path_then_defaults() {
     let cache_root = unique_test_dir("chrome-discovery-cache-root");
@@ -12050,10 +12069,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
         "Comment and Reject"
     );
     approve_button.click().expect("submit approve");
-    tab.wait_until_navigated().expect("approve navigation");
-    let approve_page = tab.get_content().expect("approve page");
-    assert!(approve_page.contains("Reply recorded"), "{approve_page}");
-    assert!(tab.get_url().contains("/?replied="), "{}", tab.get_url());
+    assert_reply_recorded(&tab, &origin, approve_id, "approve");
     let resolved = fixture.ok_json(
         &fixture.main,
         &["attention", "list", "--status", "resolved", "--json"],
@@ -12097,9 +12113,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
         "Comment and Reject"
     );
     reject_quick.click().expect("submit reject");
-    tab.wait_until_navigated().expect("reject navigation");
-    let reject_page = tab.get_content().expect("reject page");
-    assert!(reject_page.contains("Reply recorded"), "{reject_page}");
+    assert_reply_recorded(&tab, &origin, reject_id, "reject");
     let resolved = fixture.ok_json(
         &fixture.main,
         &["attention", "list", "--status", "resolved", "--json"],
@@ -12132,9 +12146,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
         "Comment and Resolve"
     );
     reply_button.click().expect("submit reply");
-    tab.wait_until_navigated().expect("reply navigation");
-    let reply_page = tab.get_content().expect("reply page");
-    assert!(reply_page.contains("Reply recorded"), "{reply_page}");
+    assert_reply_recorded(&tab, &origin, reply_id, "reply");
     let resolved = fixture.ok_json(
         &fixture.main,
         &["attention", "list", "--status", "resolved", "--json"],
