@@ -517,6 +517,43 @@ mod tests {
     }
 
     #[test]
+    fn process_failure_formats_the_public_fields() {
+        let failure = ProcessFailure {
+            code: "adapter_example",
+            timed_out: true,
+        };
+        assert_eq!(
+            format!("{failure:?}"),
+            "ProcessFailure { code: \"adapter_example\", timed_out: true }"
+        );
+        assert_eq!(failure.to_string(), "adapter_example");
+    }
+
+    #[test]
+    fn signal_group_distinguishes_missing_process_groups_from_other_errors() {
+        let missing = signal_group(i32::MAX as u32, libc::SIGTERM).unwrap();
+        assert!(!missing);
+
+        let error = signal_group(std::process::id(), 9999).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn run_process_rejects_relative_targets_and_bad_timeouts() {
+        let spec = ProcessSpec {
+            executable: PathBuf::from("relative/path"),
+            args: Vec::new(),
+            secret: None,
+        };
+        let error = run_process(&spec, b"", 5_000, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(error.code, "adapter_target_invalid");
+
+        let spec = fixture_spec("echo".into());
+        let error = run_process(&spec, b"", 0, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(error.code, "adapter_target_invalid");
+    }
+
+    #[test]
     fn process_runner_writes_stdin_and_captures_stdout() {
         let output = run_fixture("echo", b"request-body", 5_000, &AtomicBool::new(false)).unwrap();
         assert!(
