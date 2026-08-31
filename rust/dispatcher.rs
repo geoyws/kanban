@@ -430,6 +430,70 @@ trait SchedulerBackend {
     }
 }
 
+trait DispatcherClock {
+    fn now_ms(&mut self) -> i64;
+}
+
+trait DispatcherPreparationStore {
+    type Candidate;
+
+    fn materialize_subscriptions(&mut self) -> Result<usize>;
+    fn recover_expired_subscription_deliveries(&mut self, now: i64) -> Result<usize>;
+    fn next_due_subscription_delivery(
+        &mut self,
+        now: i64,
+        consumer_id: Option<&str>,
+    ) -> Result<Option<Self::Candidate>>;
+}
+
+struct SystemClock;
+
+impl DispatcherClock for SystemClock {
+    fn now_ms(&mut self) -> i64 {
+        now_ms()
+    }
+}
+
+impl DispatcherPreparationStore for Store {
+    type Candidate = SubscriptionDeliveryCandidate;
+
+    fn materialize_subscriptions(&mut self) -> Result<usize> {
+        Store::materialize_subscriptions(self)
+    }
+
+    fn recover_expired_subscription_deliveries(&mut self, now: i64) -> Result<usize> {
+        Store::recover_expired_subscription_deliveries(self, now)
+    }
+
+    fn next_due_subscription_delivery(
+        &mut self,
+        now: i64,
+        consumer_id: Option<&str>,
+    ) -> Result<Option<Self::Candidate>> {
+        match consumer_id {
+            Some(consumer_id) => {
+                Store::next_due_subscription_delivery_for_consumer(self, now, Some(consumer_id))
+            }
+            None => Store::next_due_subscription_delivery(self, now),
+        }
+    }
+}
+
+fn prepare_subscription_delivery<S, C>(
+    store: &mut S,
+    clock: &mut C,
+    consumer_id: Option<&str>,
+) -> Result<Option<S::Candidate>>
+where
+    S: DispatcherPreparationStore,
+    C: DispatcherClock,
+{
+    store.materialize_subscriptions()?;
+    let now = clock.now_ms();
+    store.recover_expired_subscription_deliveries(now)?;
+    store.next_due_subscription_delivery(now, consumer_id)
+}
+
 fn scheduler_step<B: SchedulerBackend>(backend: &mut B) -> Result<StepOutcome> {
     if backend.cancelled() {
         return Ok(StepOutcome::Cancelled);
@@ -578,15 +642,12 @@ impl SchedulerBackend for SystemBackend {
     }
 
     fn prepare(&mut self) -> Result<Option<Self::Candidate>> {
-        let now = now_ms();
-        self.store.materialize_subscriptions()?;
-        self.store.recover_expired_subscription_deliveries(now)?;
-        match self.context.consumer.as_deref() {
-            Some(consumer_id) => self
-                .store
-                .next_due_subscription_delivery_for_consumer(now, Some(consumer_id)),
-            None => self.store.next_due_subscription_delivery(now),
-        }
+        let mut clock = SystemClock;
+        prepare_subscription_delivery(
+            &mut self.store,
+            &mut clock,
+            self.context.consumer.as_deref(),
+        )
     }
 
     fn resolve(&mut self, candidate: &Self::Candidate) -> Result<Self::Resolved> {
@@ -729,8 +790,10 @@ fn reset_cancellation() {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::cell::RefCell;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::rc::Rc;
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -761,6 +824,65 @@ mod tests {
                 cancel_at_check: None,
                 resolve_count: 0,
             }
+        }
+    }
+
+    struct RecordingClock {
+        trace: Rc<RefCell<Vec<String>>>,
+        now: i64,
+    }
+
+    impl DispatcherClock for RecordingClock {
+        fn now_ms(&mut self) -> i64 {
+            self.trace.borrow_mut().push("clock".into());
+            self.now
+        }
+    }
+
+    struct RecordingPreparationStore {
+        trace: Rc<RefCell<Vec<String>>>,
+        materialized: bool,
+        recovered_now: Option<i64>,
+        candidate: Option<FakeCandidate>,
+    }
+
+    impl DispatcherPreparationStore for RecordingPreparationStore {
+        type Candidate = FakeCandidate;
+
+        fn materialize_subscriptions(&mut self) -> Result<usize> {
+            self.trace.borrow_mut().push("materialize".into());
+            self.materialized = true;
+            Ok(1)
+        }
+
+        fn recover_expired_subscription_deliveries(&mut self, now: i64) -> Result<usize> {
+            self.trace.borrow_mut().push(format!("recover:{now}"));
+            assert!(
+                self.materialized,
+                "materialization must happen before recovery"
+            );
+            self.recovered_now = Some(now);
+            Ok(0)
+        }
+
+        fn next_due_subscription_delivery(
+            &mut self,
+            now: i64,
+            consumer_id: Option<&str>,
+        ) -> Result<Option<Self::Candidate>> {
+            self.trace
+                .borrow_mut()
+                .push(format!("due:{now}:{}", consumer_id.unwrap_or("-")));
+            assert!(
+                self.materialized,
+                "materialization must happen before due lookup"
+            );
+            assert_eq!(
+                self.recovered_now,
+                Some(now),
+                "the same post-materialization now must drive recovery and due lookup"
+            );
+            Ok(self.candidate.take())
         }
     }
 
@@ -1045,6 +1167,30 @@ mod tests {
                 "success:lease-token",
             ]
         );
+    }
+
+    #[test]
+    fn prepare_materializes_before_sampling_now_and_returns_the_visible_due_candidate() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut store = RecordingPreparationStore {
+            trace: Rc::clone(&trace),
+            materialized: false,
+            recovered_now: None,
+            candidate: Some(FakeCandidate { timeout_ms: 11 }),
+        };
+        let mut clock = RecordingClock {
+            trace: Rc::clone(&trace),
+            now: 42,
+        };
+
+        let candidate =
+            prepare_subscription_delivery(&mut store, &mut clock, Some("consumer.test")).unwrap();
+
+        assert_eq!(
+            trace.borrow().as_slice(),
+            ["materialize", "clock", "recover:42", "due:42:consumer.test"]
+        );
+        assert!(matches!(candidate, Some(FakeCandidate { timeout_ms: 11 })));
     }
 
     #[test]
