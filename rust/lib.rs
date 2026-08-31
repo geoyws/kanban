@@ -4,6 +4,7 @@ mod audit;
 mod context;
 mod db;
 mod dispatch;
+mod dispatcher;
 mod gitctx;
 mod import;
 mod lock;
