@@ -9,6 +9,7 @@ use rusqlite::{
     Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter, types::Type,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 use uuid::Uuid;
@@ -86,6 +87,35 @@ fn validate_subscription_bounds(input: &AddSubscription) -> Result<()> {
         bail!("subscription max concurrency must be between 1 and 64");
     }
     Ok(())
+}
+
+fn validate_delivery_lease_duration(lease_duration_ms: i64) -> Result<()> {
+    if !(1..=300_000).contains(&lease_duration_ms) {
+        bail!("subscription delivery lease duration must be between 1 and 300000 milliseconds");
+    }
+    Ok(())
+}
+
+fn validate_nonnegative_now(now: i64, label: &str) -> Result<()> {
+    if now < 0 {
+        bail!("{label} must be non-negative");
+    }
+    Ok(())
+}
+
+fn validate_delivery_error_code(value: &str) -> Result<String> {
+    let value = nonempty(value, "delivery error code")?;
+    if value != value.to_ascii_lowercase() {
+        bail!("delivery error code must be lowercase");
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b':')
+    }) {
+        bail!(
+            "delivery error code must contain only lowercase letters, digits, underscore, hyphen, or colon"
+        );
+    }
+    Ok(value.to_owned())
 }
 
 fn full_commit(value: &str, label: &str) -> Result<String> {
@@ -473,6 +503,173 @@ fn parse_subscription_strings(text: String) -> rusqlite::Result<Vec<String>> {
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }
 
+fn audit_digest(
+    previous: &str,
+    seq: i64,
+    subject: Option<&str>,
+    kind: &str,
+    actor: Option<&str>,
+    payload: &str,
+    created_at: i64,
+) -> String {
+    fn field(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+
+    let mut hash = Sha256::new();
+    for value in [
+        b"kanban-audit".as_slice(),
+        b"1".as_slice(),
+        b"board".as_slice(),
+        seq.to_string().as_bytes(),
+        previous.as_bytes(),
+        subject.unwrap_or("").as_bytes(),
+        kind.as_bytes(),
+        actor.unwrap_or("").as_bytes(),
+        payload.as_bytes(),
+        created_at.to_string().as_bytes(),
+    ] {
+        field(&mut hash, value);
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+struct EventFilterSpec<'a> {
+    task: Option<&'a str>,
+    kinds: &'a [String],
+    relations: &'a [String],
+    prior_statuses: &'a [String],
+    current_statuses: &'a [String],
+    tags: &'a [String],
+    include_archived: bool,
+    semantic_payload: &'a str,
+}
+
+fn append_event_filters(
+    sql: &mut String,
+    values: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    spec: EventFilterSpec<'_>,
+) {
+    if let Some(id) = spec.task {
+        sql.push_str(" AND task_id=?");
+        values.push(Box::new(id.to_owned()));
+    }
+    if !spec.kinds.is_empty() {
+        sql.push_str(" AND kind IN (");
+        sql.push_str(
+            &std::iter::repeat_n("?", spec.kinds.len())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push(')');
+        values.extend(
+            spec.kinds
+                .iter()
+                .cloned()
+                .map(|kind| Box::new(kind) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    if !spec.include_archived {
+        sql.push_str(" AND archived=0");
+    }
+    let semantic = !spec.relations.is_empty()
+        || !spec.prior_statuses.is_empty()
+        || !spec.current_statuses.is_empty()
+        || !spec.tags.is_empty();
+    if semantic {
+        sql.push_str(&format!(
+            " AND json_type({},'$._semanticV1')='object'",
+            spec.semantic_payload
+        ));
+    }
+    if !spec.relations.is_empty() {
+        let semantic_relations = format!(
+            "CASE WHEN json_type({},'$._semanticV1.relations')='array' \
+             THEN json_extract({},'$._semanticV1.relations') \
+             ELSE '[]' END",
+            spec.semantic_payload, spec.semantic_payload
+        );
+        let mut clauses = Vec::new();
+        for relation in spec.relations {
+            let Some((kind, id)) = relation.split_once(':') else {
+                sql.push_str(" AND 0");
+                continue;
+            };
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each({semantic_relations}) r \
+                 WHERE r.type='object' \
+                   AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.kind')=? \
+                   AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.id')=?)"
+                ));
+            values.push(Box::new(kind.to_owned()));
+            values.push(Box::new(id.to_owned()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" AND (");
+            sql.push_str(&clauses.join(" OR "));
+            sql.push(')');
+        }
+    }
+    if !spec.prior_statuses.is_empty() {
+        sql.push_str(" AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.priorStatus') IN (");
+        sql.push_str(
+            &std::iter::repeat_n("?", spec.prior_statuses.len())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push(')');
+        values.extend(
+            spec.prior_statuses
+                .iter()
+                .cloned()
+                .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    if !spec.current_statuses.is_empty() {
+        sql.push_str(&format!(
+            " AND json_extract({},'$._semanticV1.currentStatus') IN (",
+            spec.semantic_payload
+        ));
+        sql.push_str(
+            &std::iter::repeat_n("?", spec.current_statuses.len())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push(')');
+        values.extend(
+            spec.current_statuses
+                .iter()
+                .cloned()
+                .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    if !spec.tags.is_empty() {
+        let semantic_tags = format!(
+            "CASE WHEN json_type({},'$._semanticV1.tags')='array' \
+             THEN json_extract({},'$._semanticV1.tags') \
+             ELSE '[]' END",
+            spec.semantic_payload, spec.semantic_payload
+        );
+        for tag in spec.tags {
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM json_each({semantic_tags}) tag WHERE tag.value=?)"
+            ));
+            values.push(Box::new(tag.to_owned()));
+        }
+    }
+}
+
 fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: row.get("id")?,
@@ -545,6 +742,7 @@ fn subscription_row(row: &Row<'_>) -> rusqlite::Result<Subscription> {
         max_retries: row.get("max_retries")?,
         rate_per_minute: row.get("rate_per_minute")?,
         max_concurrency: row.get("max_concurrency")?,
+        start_event_seq: row.get("start_event_seq")?,
         secret_ref: row.get("secret_ref")?,
         status: row.get("status")?,
         created_at: row.get("created_at")?,
@@ -688,6 +886,254 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         accepted_session: row.get("accepted_session")?,
         archived: row.get::<_, i64>("archived")? != 0,
     })
+}
+
+#[derive(Debug)]
+struct BoardEventIdentityRow {
+    seq: i64,
+    task_id: Option<String>,
+    kind: String,
+    actor: Option<String>,
+    payload: String,
+    created_at: i64,
+    prev_hash: Option<String>,
+    event_hash: Option<String>,
+}
+
+fn board_event_identity_row(row: &Row<'_>) -> rusqlite::Result<BoardEventIdentityRow> {
+    Ok(BoardEventIdentityRow {
+        seq: row.get("seq")?,
+        task_id: row.get("task_id")?,
+        kind: row.get("kind")?,
+        actor: row.get("actor")?,
+        payload: row.get("payload")?,
+        created_at: row.get("created_at")?,
+        prev_hash: row.get("prev_hash")?,
+        event_hash: row.get("event_hash")?,
+    })
+}
+
+#[derive(Debug)]
+struct SubscriptionDeliveryRow {
+    subscription_id: String,
+    event_id: String,
+    event_seq: i64,
+    event_kind: String,
+    event_created_at: i64,
+    status: String,
+    attempts: i64,
+    next_attempt_at: Option<i64>,
+    lease_token: Option<String>,
+    lease_deadline_at: Option<i64>,
+    last_attempt_at: Option<i64>,
+    last_error_code: Option<String>,
+    acked_at: Option<i64>,
+    dead_lettered_at: Option<i64>,
+}
+
+fn validate_pending_or_retry_delivery(
+    delivery: &SubscriptionDeliveryRow,
+    subscription: &Subscription,
+) -> Result<()> {
+    if delivery.attempts > subscription.max_retries {
+        bail!(
+            "subscription {} delivery {} has exhausted its retry budget",
+            delivery.subscription_id,
+            delivery.event_id
+        );
+    }
+    match delivery.status.as_str() {
+        "pending" => {
+            if delivery.attempts != 0
+                || delivery.lease_token.is_some()
+                || delivery.last_attempt_at.is_some()
+                || delivery.last_error_code.is_some()
+                || delivery.acked_at.is_some()
+                || delivery.dead_lettered_at.is_some()
+            {
+                bail!(
+                    "subscription {} delivery {} has malformed pending state",
+                    delivery.subscription_id,
+                    delivery.event_id
+                );
+            }
+        }
+        "retry_wait" => {
+            if delivery.attempts < 1
+                || delivery.attempts > subscription.max_retries
+                || delivery.lease_token.is_some()
+                || delivery.last_attempt_at.is_none()
+                || delivery.last_error_code.is_none()
+                || delivery.acked_at.is_some()
+                || delivery.dead_lettered_at.is_some()
+            {
+                bail!(
+                    "subscription {} delivery {} has malformed retry_wait state",
+                    delivery.subscription_id,
+                    delivery.event_id
+                );
+            }
+        }
+        _ => bail!(
+            "subscription {} delivery {} is not pending or retry_wait",
+            delivery.subscription_id,
+            delivery.event_id
+        ),
+    }
+    Ok(())
+}
+
+fn validate_leased_delivery(delivery: &SubscriptionDeliveryRow) -> Result<()> {
+    if delivery.attempts < 1
+        || delivery.lease_token.is_none()
+        || delivery.lease_deadline_at.is_none()
+        || delivery.last_attempt_at.is_none()
+        || delivery.last_error_code.is_some()
+        || delivery.acked_at.is_some()
+        || delivery.dead_lettered_at.is_some()
+    {
+        bail!(
+            "subscription {} delivery {} has malformed leased state",
+            delivery.subscription_id,
+            delivery.event_id
+        );
+    }
+    Ok(())
+}
+
+fn subscription_delivery_row(row: &Row<'_>) -> rusqlite::Result<SubscriptionDeliveryRow> {
+    Ok(SubscriptionDeliveryRow {
+        subscription_id: row.get("subscription_id")?,
+        event_id: row.get("event_id")?,
+        event_seq: row.get("event_seq")?,
+        event_kind: row.get("event_kind")?,
+        event_created_at: row.get("event_created_at")?,
+        status: row.get("status")?,
+        attempts: row.get("attempts")?,
+        next_attempt_at: row.get("next_attempt_at")?,
+        lease_token: row.get("lease_token")?,
+        lease_deadline_at: row.get("lease_deadline_at")?,
+        last_attempt_at: row.get("last_attempt_at")?,
+        last_error_code: row.get("last_error_code")?,
+        acked_at: row.get("acked_at")?,
+        dead_lettered_at: row.get("dead_lettered_at")?,
+    })
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SubscriptionDeliveryAttemptRow {
+    attempt: i64,
+    started_at: i64,
+    finished_at: Option<i64>,
+    outcome: String,
+    error_code: Option<String>,
+}
+
+#[cfg(test)]
+fn subscription_delivery_attempt_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<SubscriptionDeliveryAttemptRow> {
+    Ok(SubscriptionDeliveryAttemptRow {
+        attempt: row.get("attempt")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
+        outcome: row.get("outcome")?,
+        error_code: row.get("error_code")?,
+    })
+}
+
+fn delivery_retry_delay_ms(attempt_number: i64, timeout_ms: i64) -> i64 {
+    let exponential = 1_000_i64
+        .checked_shl((attempt_number.saturating_sub(1)) as u32)
+        .unwrap_or(i64::MAX);
+    exponential.min(timeout_ms)
+}
+
+fn require_delivery_event_identity(
+    connection: &Connection,
+    delivery: &SubscriptionDeliveryRow,
+    subscription: &Subscription,
+) -> Result<Event> {
+    if delivery.event_seq <= subscription.start_event_seq {
+        bail!(
+            "subscription {} delivery {} referenced event seq {} at or before start anchor {}",
+            subscription.id,
+            delivery.event_id,
+            delivery.event_seq,
+            subscription.start_event_seq
+        );
+    }
+    let event = connection
+        .query_row(
+            "SELECT * FROM events WHERE seq=?",
+            [delivery.event_seq],
+            board_event_row,
+        )
+        .with_context(|| {
+            format!(
+                "subscription {} delivery {} expected event seq {} to exist",
+                subscription.id, delivery.event_id, delivery.event_seq
+            )
+        })?;
+    if event.event_hash.as_deref() != Some(delivery.event_id.as_str()) {
+        bail!(
+            "subscription {} delivery {} expected event hash {} at seq {}, found {:?}",
+            subscription.id,
+            delivery.event_id,
+            delivery.event_id,
+            delivery.event_seq,
+            event.event_hash
+        );
+    }
+    if event.kind != delivery.event_kind {
+        bail!(
+            "subscription {} delivery {} expected event kind {}, found {}",
+            subscription.id,
+            delivery.event_id,
+            delivery.event_kind,
+            event.kind
+        );
+    }
+    if event.created_at != delivery.event_created_at {
+        bail!(
+            "subscription {} delivery {} expected event created_at {}, found {}",
+            subscription.id,
+            delivery.event_id,
+            delivery.event_created_at,
+            event.created_at
+        );
+    }
+    Ok(event)
+}
+
+fn subscription_delivery_rate_count(
+    connection: &Connection,
+    subscription_id: &str,
+    now: i64,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_delivery_attempts \
+             WHERE subscription_id=? AND started_at>=? AND started_at<=?",
+            params![subscription_id, now.saturating_sub(60_000), now],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn subscription_delivery_leased_count(
+    connection: &Connection,
+    subscription_id: &str,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_deliveries \
+             WHERE subscription_id=? AND status='leased'",
+            [subscription_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn get_task(connection: &Connection, id: &str) -> Result<Option<Task>> {
@@ -1285,8 +1731,12 @@ impl Store {
             "subscription",
         )?;
         let now = now_ms();
+        let start_event_seq =
+            transaction.query_row("SELECT COALESCE(max(seq),0)+1 FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
         transaction.execute(
-            "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?,?,?,NULL,NULL)",
+            "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,start_event_seq,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'active',?16,?17,?18,?19,NULL,NULL)",
             params![
                 id,
                 subject_task_id,
@@ -1301,6 +1751,7 @@ impl Store {
                 input.max_retries,
                 input.rate_per_minute,
                 input.max_concurrency,
+                start_event_seq,
                 secret_ref,
                 now,
                 actor,
@@ -1330,6 +1781,36 @@ impl Store {
                 "maxConcurrency": input.max_concurrency,
             }),
         )?;
+        let tail = transaction.query_row(
+            "SELECT seq,kind,payload FROM events ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if tail.0 != start_event_seq {
+            bail!(
+                "subscription {id} expected subscription_added at seq {start_event_seq}, found seq {}",
+                tail.0
+            );
+        }
+        if tail.1 != "subscription_added" {
+            bail!(
+                "subscription {id} expected subscription_added at seq {start_event_seq}, found {}",
+                tail.1
+            );
+        }
+        let payload: Value = serde_json::from_str(&tail.2)
+            .context("subscription_added payload is malformed JSON")?;
+        if payload.get("subscriptionID").and_then(Value::as_str) != Some(id.as_str()) {
+            bail!(
+                "subscription {id} expected subscription_added payload to reference subscriptionID {id}"
+            );
+        }
         let result = transaction.query_row(
             "SELECT * FROM subscriptions WHERE id=?",
             [&id],
@@ -1452,6 +1933,449 @@ impl Store {
         self.set_subscription_paused(id, false, actor)
     }
 
+    /// The oldest due delivery candidate, if one is currently eligible.
+    ///
+    /// The read path does not mutate or lease anything. The dispatcher takes
+    /// its own lock after reading the returned candidate, then calls the claim
+    /// method that rechecks the same eligibility gates inside one transaction.
+    pub(crate) fn next_due_subscription_delivery(
+        &self,
+        now: i64,
+    ) -> Result<Option<SubscriptionDeliveryCandidate>> {
+        validate_nonnegative_now(now, "dispatcher now")?;
+        let cutoff = now.saturating_sub(60_000);
+        let mut statement = self.connection.prepare(
+            "SELECT d.subscription_id,d.event_id,d.event_seq,d.event_kind,d.event_created_at,d.status,d.attempts,d.next_attempt_at,d.lease_token,d.lease_deadline_at,d.last_attempt_at,d.last_error_code,d.acked_at,d.dead_lettered_at,d.created_at,d.updated_at \
+             FROM subscription_deliveries d \
+             JOIN subscriptions s ON s.id=d.subscription_id \
+             WHERE d.status IN ('pending','retry_wait') \
+               AND s.status='active' \
+               AND d.next_attempt_at IS NOT NULL \
+               AND d.next_attempt_at<=? \
+               AND (SELECT COUNT(*) FROM subscription_delivery_attempts a WHERE a.subscription_id=s.id AND a.started_at>=? AND a.started_at<=?) < s.rate_per_minute \
+               AND (SELECT COUNT(*) FROM subscription_deliveries l WHERE l.subscription_id=s.id AND l.status='leased') < s.max_concurrency \
+             ORDER BY d.next_attempt_at ASC,d.event_seq ASC,d.subscription_id ASC,d.event_id ASC \
+             LIMIT 1",
+        )?;
+        let delivery = statement
+            .query_row(params![now, cutoff, now], subscription_delivery_row)
+            .optional()?;
+        let Some(delivery) = delivery else {
+            return Ok(None);
+        };
+        let subscription = self
+            .connection
+            .query_row(
+                "SELECT * FROM subscriptions WHERE id=?",
+                [&delivery.subscription_id],
+                subscription_row,
+            )
+            .with_context(|| format!("subscription {} not found", delivery.subscription_id))?;
+        validate(
+            &subscription.status,
+            &SUBSCRIPTION_STATUSES,
+            "subscription status",
+        )?;
+        if subscription.status != "active" {
+            return Ok(None);
+        }
+        validate_pending_or_retry_delivery(&delivery, &subscription)?;
+        let _event = require_delivery_event_identity(&self.connection, &delivery, &subscription)?;
+        let next_attempt_at = delivery
+            .next_attempt_at
+            .context("subscription delivery candidate is missing next_attempt_at")?;
+        let result = SubscriptionDeliveryCandidate {
+            subscription,
+            event_id: delivery.event_id,
+            event_seq: delivery.event_seq,
+            event_kind: delivery.event_kind,
+            delivery_status: delivery.status,
+            attempt_number: delivery.attempts + 1,
+            next_attempt_at,
+        };
+        let _ = (
+            &result.subscription,
+            &result.event_id,
+            result.event_seq,
+            &result.event_kind,
+            &result.delivery_status,
+            result.attempt_number,
+            result.next_attempt_at,
+        );
+        Ok(Some(result))
+    }
+
+    /// Claim one exact delivery candidate, or return `None` when it lost
+    /// eligibility before the transaction could commit it.
+    pub(crate) fn claim_subscription_delivery(
+        &mut self,
+        subscription_id: &str,
+        event_id: &str,
+        now: i64,
+        lease_duration_ms: i64,
+    ) -> Result<Option<SubscriptionDeliveryClaim>> {
+        validate_delivery_lease_duration(lease_duration_ms)?;
+        validate_nonnegative_now(now, "dispatcher now")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let delivery = transaction
+            .query_row(
+                "SELECT * FROM subscription_deliveries \
+                 WHERE subscription_id=? AND event_id=? \
+                   AND status IN ('pending','retry_wait') \
+                   AND next_attempt_at IS NOT NULL \
+                   AND next_attempt_at<=?",
+                params![subscription_id, event_id, now],
+                subscription_delivery_row,
+            )
+            .optional()?;
+        let Some(delivery) = delivery else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let subscription = transaction
+            .query_row(
+                "SELECT * FROM subscriptions WHERE id=?",
+                [subscription_id],
+                subscription_row,
+            )
+            .optional()?
+            .with_context(|| format!("subscription {subscription_id} not found"))?;
+        validate(
+            &subscription.status,
+            &SUBSCRIPTION_STATUSES,
+            "subscription status",
+        )?;
+        if subscription.status != "active" {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        validate_pending_or_retry_delivery(&delivery, &subscription)?;
+        let rate_count = subscription_delivery_rate_count(&transaction, subscription_id, now)?;
+        if rate_count >= subscription.rate_per_minute {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let leased_count = subscription_delivery_leased_count(&transaction, subscription_id)?;
+        if leased_count >= subscription.max_concurrency {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let event = require_delivery_event_identity(&transaction, &delivery, &subscription)?;
+        let attempt_number = delivery.attempts + 1;
+        let lease_token = format!("lease-{}", Uuid::new_v4().simple());
+        let lease_deadline_at = now
+            .checked_add(lease_duration_ms)
+            .context("subscription lease deadline overflowed")?;
+        let updated = transaction.execute(
+            "UPDATE subscription_deliveries SET status='leased',attempts=?,lease_token=?,lease_deadline_at=?,next_attempt_at=NULL,last_attempt_at=?,last_error_code=NULL,acked_at=NULL,dead_lettered_at=NULL,updated_at=? \
+             WHERE subscription_id=? AND event_id=? AND status IN ('pending','retry_wait') AND next_attempt_at IS NOT NULL AND next_attempt_at<=? AND lease_token IS NULL",
+            params![
+                attempt_number,
+                lease_token,
+                lease_deadline_at,
+                now,
+                now,
+                subscription_id,
+                event_id,
+                now
+            ],
+        )?;
+        if updated != 1 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO subscription_delivery_attempts(subscription_id,event_id,attempt,started_at,finished_at,outcome,error_code) VALUES(?,?,?,?,NULL,'claim',NULL)",
+            params![subscription_id, event_id, attempt_number, now],
+        )?;
+        let result = SubscriptionDeliveryClaim {
+            subscription,
+            event_id: delivery.event_id,
+            event_seq: delivery.event_seq,
+            event_kind: delivery.event_kind,
+            event_created_at: delivery.event_created_at,
+            event,
+            delivery_status: "leased".to_owned(),
+            attempt_number,
+            lease_token,
+            lease_deadline_at,
+        };
+        let _ = (
+            &result.subscription,
+            &result.event_id,
+            result.event_seq,
+            &result.event_kind,
+            result.event_created_at,
+            &result.event,
+            &result.delivery_status,
+            result.attempt_number,
+            &result.lease_token,
+            result.lease_deadline_at,
+        );
+        transaction.commit()?;
+        Ok(Some(result))
+    }
+
+    /// Release expired leases and either retry them immediately or dead-letter
+    /// them once they exhausted their retry budget.
+    pub(crate) fn recover_expired_subscription_deliveries(&mut self, now: i64) -> Result<usize> {
+        validate_nonnegative_now(now, "dispatcher now")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deliveries = transaction
+            .prepare(
+                "SELECT * FROM subscription_deliveries \
+                 WHERE status='leased' AND lease_deadline_at<=? \
+                 ORDER BY lease_deadline_at,event_seq,subscription_id,event_id",
+            )?
+            .query_map([now], subscription_delivery_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut recovered = 0_usize;
+        for delivery in deliveries {
+            validate_leased_delivery(&delivery)?;
+            let subscription = transaction
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [&delivery.subscription_id],
+                    subscription_row,
+                )
+                .optional()?
+                .with_context(|| format!("subscription {} not found", delivery.subscription_id))?;
+            validate(
+                &subscription.status,
+                &SUBSCRIPTION_STATUSES,
+                "subscription status",
+            )?;
+            let _event = require_delivery_event_identity(&transaction, &delivery, &subscription)?;
+            let terminal = delivery.attempts > subscription.max_retries;
+            let next_attempt_at = if terminal {
+                None
+            } else {
+                Some(
+                    now.checked_add(delivery_retry_delay_ms(
+                        delivery.attempts,
+                        subscription.timeout_ms,
+                    ))
+                    .context("subscription retry deadline overflowed")?,
+                )
+            };
+            let dead_lettered_at = terminal.then_some(now);
+            let updated = transaction.execute(
+                "UPDATE subscription_deliveries SET status=?,lease_token=NULL,lease_deadline_at=NULL,next_attempt_at=?,last_error_code='dispatcher_lease_expired',acked_at=NULL,dead_lettered_at=?,updated_at=? \
+                 WHERE subscription_id=? AND event_id=? AND status='leased' AND lease_deadline_at<=?",
+                params![
+                    if terminal { "dead_letter" } else { "retry_wait" },
+                    next_attempt_at,
+                    dead_lettered_at,
+                    now,
+                    delivery.subscription_id,
+                    delivery.event_id,
+                    now
+                ],
+            )?;
+            if updated != 1 {
+                bail!(
+                    "subscription {} delivery {} stopped being leased while recovering expiry",
+                    delivery.subscription_id,
+                    delivery.event_id
+                );
+            }
+            let attempt = transaction.execute(
+                "UPDATE subscription_delivery_attempts SET finished_at=?,outcome='lease_expired',error_code='dispatcher_lease_expired' WHERE subscription_id=? AND event_id=? AND attempt=? AND finished_at IS NULL",
+                params![now, delivery.subscription_id, delivery.event_id, delivery.attempts],
+            )?;
+            if attempt != 1 {
+                bail!(
+                    "subscription {} delivery {} missing open claim attempt during expiry recovery",
+                    delivery.subscription_id,
+                    delivery.event_id
+                );
+            }
+            recovered += 1;
+        }
+        transaction.commit()?;
+        Ok(recovered)
+    }
+
+    /// Ack a leased delivery and close its matching attempt row.
+    pub(crate) fn finalize_subscription_delivery_success(
+        &mut self,
+        subscription_id: &str,
+        event_id: &str,
+        lease_token: &str,
+        now: i64,
+    ) -> Result<bool> {
+        validate_nonnegative_now(now, "dispatcher now")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let delivery = transaction
+            .query_row(
+                "SELECT * FROM subscription_deliveries \
+                 WHERE subscription_id=? AND event_id=? AND lease_token=? AND status='leased'",
+                params![subscription_id, event_id, lease_token],
+                subscription_delivery_row,
+            )
+            .optional()?;
+        let Some(delivery) = delivery else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        validate_leased_delivery(&delivery)?;
+        let subscription = transaction
+            .query_row(
+                "SELECT * FROM subscriptions WHERE id=?",
+                [subscription_id],
+                subscription_row,
+            )
+            .optional()?
+            .with_context(|| format!("subscription {subscription_id} not found"))?;
+        validate(
+            &subscription.status,
+            &SUBSCRIPTION_STATUSES,
+            "subscription status",
+        )?;
+        let _event = require_delivery_event_identity(&transaction, &delivery, &subscription)?;
+        if delivery
+            .lease_deadline_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let updated = transaction.execute(
+            "UPDATE subscription_deliveries SET status='acked',lease_token=NULL,lease_deadline_at=NULL,next_attempt_at=NULL,last_error_code=NULL,acked_at=?,dead_lettered_at=NULL,updated_at=? \
+             WHERE subscription_id=? AND event_id=? AND lease_token=? AND status='leased'",
+            params![now, now, subscription_id, event_id, lease_token],
+        )?;
+        if updated != 1 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let attempt = transaction.execute(
+            "UPDATE subscription_delivery_attempts SET finished_at=?,outcome='success' WHERE subscription_id=? AND event_id=? AND attempt=? AND finished_at IS NULL",
+            params![now, subscription_id, event_id, delivery.attempts],
+        )?;
+        if attempt != 1 {
+            bail!(
+                "subscription {} delivery {} missing open claim attempt during success finalization",
+                subscription_id,
+                event_id
+            );
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Record a leased delivery failure and schedule the next deterministic
+    /// retry, or dead-letter it once the retry budget is exhausted.
+    ///
+    /// Retry delays use a fixed exponential schedule with no jitter so a crash
+    /// and a restart agree on the same next attempt time:
+    /// `now + min(timeout_ms, 1000ms * 2^(attempt_number - 1))`.
+    pub(crate) fn finalize_subscription_delivery_failure(
+        &mut self,
+        subscription_id: &str,
+        event_id: &str,
+        lease_token: &str,
+        now: i64,
+        timed_out: bool,
+        error_code: &str,
+    ) -> Result<bool> {
+        let error_code = validate_delivery_error_code(error_code)?;
+        validate_nonnegative_now(now, "dispatcher now")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let delivery = transaction
+            .query_row(
+                "SELECT * FROM subscription_deliveries \
+                 WHERE subscription_id=? AND event_id=? AND lease_token=? AND status='leased'",
+                params![subscription_id, event_id, lease_token],
+                subscription_delivery_row,
+            )
+            .optional()?;
+        let Some(delivery) = delivery else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        validate_leased_delivery(&delivery)?;
+        let subscription = transaction
+            .query_row(
+                "SELECT * FROM subscriptions WHERE id=?",
+                [subscription_id],
+                subscription_row,
+            )
+            .optional()?
+            .with_context(|| format!("subscription {subscription_id} not found"))?;
+        validate(
+            &subscription.status,
+            &SUBSCRIPTION_STATUSES,
+            "subscription status",
+        )?;
+        let _event = require_delivery_event_identity(&transaction, &delivery, &subscription)?;
+        if delivery
+            .lease_deadline_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let terminal = delivery.attempts > subscription.max_retries;
+        let next_attempt_at = if terminal {
+            None
+        } else {
+            Some(
+                now.checked_add(delivery_retry_delay_ms(
+                    delivery.attempts,
+                    subscription.timeout_ms,
+                ))
+                .context("subscription retry deadline overflowed")?,
+            )
+        };
+        let updated = transaction.execute(
+            "UPDATE subscription_deliveries SET status=?,lease_token=NULL,lease_deadline_at=NULL,next_attempt_at=?,last_error_code=?,acked_at=NULL,dead_lettered_at=?,updated_at=? \
+             WHERE subscription_id=? AND event_id=? AND lease_token=? AND status='leased'",
+            params![
+                if terminal { "dead_letter" } else { "retry_wait" },
+                next_attempt_at,
+                error_code,
+                terminal.then_some(now),
+                now,
+                subscription_id,
+                event_id,
+                lease_token
+            ],
+        )?;
+        if updated != 1 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let outcome = if timed_out {
+            "timeout"
+        } else if terminal {
+            "dead"
+        } else {
+            "retry"
+        };
+        let attempt = transaction.execute(
+            "UPDATE subscription_delivery_attempts SET finished_at=?,outcome=?,error_code=? WHERE subscription_id=? AND event_id=? AND attempt=? AND finished_at IS NULL",
+            params![now, outcome, error_code, subscription_id, event_id, delivery.attempts],
+        )?;
+        if attempt != 1 {
+            bail!(
+                "subscription {} delivery {} missing open claim attempt during failure finalization",
+                subscription_id,
+                event_id
+            );
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Retire leases that have run out, before anything reads the board.
     ///
     /// Expiry used to happen only inside `claim` and `accept_handoff`, so a
@@ -1523,7 +2447,7 @@ impl Store {
     #[allow(dead_code)]
     pub fn events_since(
         &self,
-        task: Option<&str>,
+        _task: Option<&str>,
         kind: Option<&str>,
         cursor: i64,
         limit: i64,
@@ -1535,10 +2459,6 @@ impl Store {
              FROM events WHERE seq>?",
         );
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
-        if let Some(id) = task {
-            sql.push_str(" AND task_id=?");
-            values.push(Box::new(id.to_owned()));
-        }
         if let Some(kind) = kind {
             sql.push_str(" AND kind=?");
             values.push(Box::new(kind.to_owned()));
@@ -1584,118 +2504,20 @@ impl Store {
              FROM events WHERE seq>?",
         );
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor)];
-        if let Some(id) = task {
-            sql.push_str(" AND task_id=?");
-            values.push(Box::new(id.to_owned()));
-        }
-        if !kinds.is_empty() {
-            sql.push_str(" AND kind IN (");
-            sql.push_str(
-                &std::iter::repeat_n("?", kinds.len())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            sql.push(')');
-            values.extend(
-                kinds
-                    .iter()
-                    .cloned()
-                    .map(|kind| Box::new(kind) as Box<dyn rusqlite::ToSql>),
-            );
-        }
-        if !include_archived {
-            sql.push_str(" AND archived=0");
-        }
-        let semantic_payload = "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END";
-        let semantic = !relations.is_empty()
-            || !prior_statuses.is_empty()
-            || !current_statuses.is_empty()
-            || !tags.is_empty();
-        if semantic {
-            sql.push_str(&format!(
-                " AND json_type({semantic_payload},'$._semanticV1')='object'"
-            ));
-        }
-        if !relations.is_empty() {
-            let semantic_relations = format!(
-                "CASE WHEN json_type({semantic_payload},'$._semanticV1.relations')='array' \
-                 THEN json_extract({semantic_payload},'$._semanticV1.relations') \
-                 ELSE '[]' END"
-            );
-            let mut clauses = Vec::new();
-            for relation in relations {
-                let Some((kind, id)) = relation.split_once(':') else {
-                    sql.push_str(" AND 0");
-                    continue;
-                };
-                clauses.push(format!(
-                    "EXISTS (SELECT 1 FROM json_each({semantic_relations}) r \
-                     WHERE r.type='object' \
-                       AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.kind')=? \
-                       AND json_extract(CASE WHEN r.type='object' THEN r.value ELSE '{{}}' END,'$.id')=?)"
-                ));
-                values.push(Box::new(kind.to_owned()));
-                values.push(Box::new(id.to_owned()));
-            }
-            if !clauses.is_empty() {
-                sql.push_str(" AND (");
-                sql.push_str(&clauses.join(" OR "));
-                sql.push(')');
-            }
-        }
-        if !prior_statuses.is_empty() {
-            sql.push_str(" AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.priorStatus') IN (");
-            sql.push_str(
-                &std::iter::repeat_n("?", prior_statuses.len())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            sql.push(')');
-            values.extend(
-                prior_statuses
-                    .iter()
-                    .cloned()
-                    .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
-            );
-        }
-        if !current_statuses.is_empty() {
-            sql.push_str(&format!(
-                " AND json_extract({semantic_payload},'$._semanticV1.currentStatus') IN ("
-            ));
-            sql.push_str(
-                &std::iter::repeat_n("?", current_statuses.len())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            sql.push(')');
-            values.extend(
-                current_statuses
-                    .iter()
-                    .cloned()
-                    .map(|status| Box::new(status) as Box<dyn rusqlite::ToSql>),
-            );
-        }
-        if !tags.is_empty() {
-            let semantic_tags = format!(
-                "CASE WHEN json_type({semantic_payload},'$._semanticV1.tags')='array' \
-                 THEN json_extract({semantic_payload},'$._semanticV1.tags') \
-                 ELSE '[]' END"
-            );
-            sql.push_str(&format!(
-                " AND EXISTS (SELECT 1 FROM json_each({semantic_tags}) t WHERE t.value IN ("
-            ));
-            sql.push_str(
-                &std::iter::repeat_n("?", tags.len())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            sql.push_str("))");
-            values.extend(
-                tags.iter()
-                    .cloned()
-                    .map(|tag| Box::new(tag) as Box<dyn rusqlite::ToSql>),
-            );
-        }
+        append_event_filters(
+            &mut sql,
+            &mut values,
+            EventFilterSpec {
+                task,
+                kinds,
+                relations,
+                prior_statuses,
+                current_statuses,
+                tags,
+                include_archived,
+                semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
+            },
+        );
         sql.push_str(" ORDER BY seq ASC LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
@@ -1706,6 +2528,119 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn materialize_subscriptions(&mut self) -> Result<usize> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let global_cursor: i64 = transaction.query_row(
+            "SELECT event_seq FROM board_materialization_cursor WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let head: i64 =
+            transaction.query_row("SELECT COALESCE(max(seq),0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        if head < global_cursor {
+            bail!(
+                "board materialization cursor {global_cursor} is ahead of the current event head {head}"
+            );
+        }
+        let now = now_ms();
+        let subscriptions = transaction
+            .prepare("SELECT * FROM subscriptions ORDER BY created_at,id")?
+            .query_map([], subscription_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut inserted = 0_usize;
+        for subscription in subscriptions {
+            let lower = global_cursor.max(subscription.start_event_seq);
+            if lower >= head {
+                continue;
+            }
+            let mut sql = String::from(
+                "SELECT seq,task_id,kind,actor,payload,created_at,prev_hash,event_hash \
+                 FROM events WHERE seq>? AND seq<=?",
+            );
+            let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(lower), Box::new(head)];
+            append_event_filters(
+                &mut sql,
+                &mut values,
+                EventFilterSpec {
+                    task: subscription.subject_task_id.as_deref(),
+                    kinds: &subscription.kinds,
+                    relations: &subscription.relations,
+                    prior_statuses: &subscription.prior_statuses,
+                    current_statuses: &subscription.current_statuses,
+                    tags: &subscription.tags,
+                    include_archived: false,
+                    semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
+                },
+            );
+            sql.push_str(" ORDER BY seq ASC");
+            let rows = {
+                let mut statement = transaction.prepare(&sql)?;
+                statement
+                    .query_map(
+                        params_from_iter(values.iter().map(|value| value.as_ref())),
+                        board_event_identity_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for row in rows {
+                let prev_hash = row
+                    .prev_hash
+                    .as_deref()
+                    .context(format!("event {} is missing prev_hash", row.seq))?;
+                let event_hash = row
+                    .event_hash
+                    .as_deref()
+                    .context(format!("event {} is missing event_hash", row.seq))?;
+                if !is_lower_hex_64(prev_hash) {
+                    bail!("event {} has malformed prev_hash", row.seq);
+                }
+                if !is_lower_hex_64(event_hash) {
+                    bail!("event {} has malformed event_hash", row.seq);
+                }
+                let expected = audit_digest(
+                    prev_hash,
+                    row.seq,
+                    row.task_id.as_deref(),
+                    &row.kind,
+                    row.actor.as_deref(),
+                    &row.payload,
+                    row.created_at,
+                );
+                if expected != event_hash {
+                    bail!(
+                        "event {} has mismatched stored identity: expected {expected}, stored {event_hash}",
+                        row.seq
+                    );
+                }
+                inserted += transaction.execute(
+                    "INSERT INTO subscription_deliveries(subscription_id,event_id,event_seq,event_kind,event_created_at,status,attempts,next_attempt_at,created_at,updated_at) \
+                     VALUES(?,?,?,?,?,'pending',0,?,?,?) \
+                     ON CONFLICT(subscription_id,event_id) DO NOTHING",
+                    params![
+                        subscription.id.as_str(),
+                        event_hash,
+                        row.seq,
+                        row.kind,
+                        row.created_at,
+                        now,
+                        now,
+                        now,
+                    ],
+                )? as usize;
+            }
+        }
+        transaction.execute(
+            "UPDATE board_materialization_cursor SET event_seq=?,updated_at=? WHERE id=1",
+            params![head, now],
+        )?;
+        transaction.commit()?;
+        Ok(inserted)
     }
 
     pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
@@ -4143,6 +5078,18 @@ mod tests {
         }
     }
 
+    fn delivery_subscription_input(id: &str) -> AddSubscription {
+        let mut input = subscription_input(id);
+        input.subject_task_id = None;
+        input.relations.clear();
+        input.kinds = vec!["checkpoint_added".into()];
+        input.prior_statuses.clear();
+        input.current_statuses.clear();
+        input.tags.clear();
+        input.secret_ref = None;
+        input
+    }
+
     fn subscription_store(name: &str) -> Store {
         let mut store = test_store(name);
         store.initialize(name, "test@driver").unwrap();
@@ -4150,6 +5097,118 @@ mod tests {
         insert_task(&store, "t-subject");
         insert_task(&store, "t-parent");
         store
+    }
+
+    fn semantic_event_payload(
+        subject: &str,
+        relation: (&str, &str),
+        prior_status: &str,
+        current_status: &str,
+        tags: &[&str],
+    ) -> Value {
+        json!({
+            "_semanticV1": {
+                "subject": { "type": "task", "id": subject },
+                "relations": [
+                    { "kind": relation.0, "type": "task", "id": relation.1 }
+                ],
+                "priorStatus": prior_status,
+                "currentStatus": current_status,
+                "tags": tags,
+            }
+        })
+    }
+
+    fn delivery_event_ids(store: &Store, subscription_id: &str) -> Vec<String> {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT event_id FROM subscription_deliveries \
+                 WHERE subscription_id=? ORDER BY event_seq,event_id",
+            )
+            .unwrap();
+        statement
+            .query_map([subscription_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn board_event_count(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn delivery_count(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM subscription_deliveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn delivery_row(
+        store: &Store,
+        subscription_id: &str,
+        event_id: &str,
+    ) -> SubscriptionDeliveryRow {
+        store
+            .connection
+            .query_row(
+                "SELECT * FROM subscription_deliveries WHERE subscription_id=? AND event_id=?",
+                params![subscription_id, event_id],
+                subscription_delivery_row,
+            )
+            .unwrap()
+    }
+
+    fn delivery_attempt_rows(
+        store: &Store,
+        subscription_id: &str,
+        event_id: &str,
+    ) -> Vec<SubscriptionDeliveryAttemptRow> {
+        store
+            .connection
+            .prepare(
+                "SELECT * FROM subscription_delivery_attempts \
+                 WHERE subscription_id=? AND event_id=? ORDER BY attempt",
+            )
+            .unwrap()
+            .query_map(
+                params![subscription_id, event_id],
+                subscription_delivery_attempt_row,
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn materialization_cursor(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT event_seq FROM board_materialization_cursor WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn board_event_by_seq(store: &Store, seq: i64) -> Event {
+        store
+            .connection
+            .query_row("SELECT * FROM events WHERE seq=?", [seq], board_event_row)
+            .unwrap()
+    }
+
+    fn event_hashes(events: Vec<Event>) -> Vec<String> {
+        events
+            .into_iter()
+            .map(|event| event.event_hash.expect("board event hash is required"))
+            .collect()
     }
 
     #[test]
@@ -4186,10 +5245,38 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
+        assert_eq!(added.start_event_seq, add_event.seq);
+        assert_eq!(
+            store
+                .require_subscription("sub-unit")
+                .unwrap()
+                .start_event_seq,
+            add_event.seq
+        );
         let encoded = add_event.payload.to_string();
         assert!(!encoded.contains("secretRef"), "{encoded}");
         assert!(!encoded.contains("codex_queue_token"), "{encoded}");
         assert_eq!(add_event.payload["_semanticV1"], Value::Null);
+
+        let mut unfiltered_store = subscription_store("subscriptions-lifecycle-unfiltered");
+        let mut unfiltered_input = subscription_input("sub-open");
+        unfiltered_input.subject_task_id = None;
+        unfiltered_input.relations.clear();
+        unfiltered_input.kinds.clear();
+        unfiltered_input.prior_statuses.clear();
+        unfiltered_input.current_statuses.clear();
+        unfiltered_input.tags.clear();
+        unfiltered_input.secret_ref = None;
+        let unfiltered = unfiltered_store.add_subscription(unfiltered_input).unwrap();
+        assert_eq!(
+            unfiltered_store
+                .require_subscription("sub-open")
+                .unwrap()
+                .start_event_seq,
+            unfiltered.start_event_seq
+        );
+        assert_eq!(unfiltered_store.materialize_subscriptions().unwrap(), 0);
+        assert!(delivery_event_ids(&unfiltered_store, "sub-open").is_empty());
 
         let paused = store.pause_subscription("sub-unit", "test@driver").unwrap();
         assert_eq!(paused.status, "paused");
@@ -4380,6 +5467,1118 @@ mod tests {
             )
             .unwrap();
         assert!(malformed_row_store.subscriptions(None, None, true).is_err());
+    }
+
+    #[test]
+    fn subscription_materialization_skips_history_and_self_add_and_dedupes() {
+        let mut store = subscription_store("subscriptions-materialization-history");
+        let prehistory = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &prehistory.to_string(),
+            10,
+        )
+        .unwrap();
+        let mut input = subscription_input("sub-history");
+        input.kinds = vec!["checkpoint_added".into()];
+        let added = store.add_subscription(input).unwrap();
+        let matching = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &matching.to_string(),
+            20,
+        )
+        .unwrap();
+        let unmatched = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "review",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &unmatched.to_string(),
+            30,
+        )
+        .unwrap();
+
+        let expected = event_hashes(
+            store
+                .events_since_filtered(
+                    Some("t-subject"),
+                    &["checkpoint_added".to_owned()],
+                    &["parent:t-parent".to_owned()],
+                    &["todo".to_owned()],
+                    &["in_progress".to_owned()],
+                    &["pubsub".to_owned()],
+                    added.start_event_seq,
+                    10,
+                    false,
+                )
+                .unwrap(),
+        );
+
+        let events_before = board_event_count(&store);
+        let inserted = store.materialize_subscriptions().unwrap();
+        assert_eq!(inserted, expected.len());
+        assert_eq!(delivery_event_ids(&store, "sub-history"), expected);
+        assert_eq!(delivery_count(&store), expected.len() as i64);
+        assert_eq!(materialization_cursor(&store), board_event_count(&store));
+        assert_eq!(board_event_count(&store), events_before);
+
+        let repeated = store.materialize_subscriptions().unwrap();
+        assert_eq!(repeated, 0);
+        assert_eq!(delivery_event_ids(&store, "sub-history"), expected);
+        assert_eq!(delivery_count(&store), expected.len() as i64);
+    }
+
+    #[test]
+    fn subscription_materialization_matches_filtered_watch_rows_for_active_and_paused_subscriptions()
+     {
+        let mut store = subscription_store("subscriptions-materialization-parity");
+        store.add_tag("ops", None, Some("test@driver")).unwrap();
+        insert_task(&store, "t-other");
+        insert_task(&store, "t-other-parent");
+
+        let mut active_input = subscription_input("sub-active");
+        active_input.kinds = vec!["checkpoint_added".into()];
+        let active = store.add_subscription(active_input).unwrap();
+        let mut paused_input = subscription_input("sub-paused");
+        paused_input.subject_task_id = Some("t-other".into());
+        paused_input.relations = vec!["parent:t-other-parent".into()];
+        paused_input.kinds = vec!["task_moved".into()];
+        paused_input.prior_statuses = vec!["todo".into()];
+        paused_input.current_statuses = vec!["done".into()];
+        paused_input.tags = vec!["ops".into()];
+        let paused = store.add_subscription(paused_input).unwrap();
+        store
+            .pause_subscription("sub-paused", "test@driver")
+            .unwrap();
+
+        let active_payload = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &active_payload.to_string(),
+            20,
+        )
+        .unwrap();
+
+        let paused_payload = semantic_event_payload(
+            "t-other",
+            ("parent", "t-other-parent"),
+            "todo",
+            "done",
+            &["ops"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-other"),
+            "task_moved",
+            "test",
+            &paused_payload.to_string(),
+            30,
+        )
+        .unwrap();
+
+        let inserted = store.materialize_subscriptions().unwrap();
+        assert_eq!(inserted, 2);
+        assert_eq!(store.subscriptions(None, None, false).unwrap().len(), 1);
+        assert_eq!(store.subscriptions(None, None, true).unwrap().len(), 2);
+
+        let active_expected = event_hashes(
+            store
+                .events_since_filtered(
+                    Some("t-subject"),
+                    &["checkpoint_added".to_owned()],
+                    &["parent:t-parent".to_owned()],
+                    &["todo".to_owned()],
+                    &["in_progress".to_owned()],
+                    &["pubsub".to_owned()],
+                    active.start_event_seq,
+                    10,
+                    false,
+                )
+                .unwrap(),
+        );
+        let paused_expected = event_hashes(
+            store
+                .events_since_filtered(
+                    Some("t-other"),
+                    &["task_moved".to_owned()],
+                    &["parent:t-other-parent".to_owned()],
+                    &["todo".to_owned()],
+                    &["done".to_owned()],
+                    &["ops".to_owned()],
+                    paused.start_event_seq,
+                    10,
+                    false,
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(delivery_event_ids(&store, "sub-active"), active_expected);
+        assert_eq!(delivery_event_ids(&store, "sub-paused"), paused_expected);
+        assert_eq!(materialization_cursor(&store), board_event_count(&store));
+    }
+
+    #[test]
+    fn subscription_materialization_fails_closed_on_non_duplicate_constraint_errors() {
+        let mut store = subscription_store("subscriptions-materialization-constraints");
+        let mut input = subscription_input("sub-constraint");
+        input.kinds = vec!["checkpoint_added".into()];
+        let added = store.add_subscription(input).unwrap();
+        let first = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &first.to_string(),
+            20,
+        )
+        .unwrap();
+        assert_eq!(store.materialize_subscriptions().unwrap(), 1);
+        assert_eq!(delivery_count(&store), 1);
+        store
+            .connection
+            .execute(
+                "CREATE UNIQUE INDEX idx_subscription_deliveries_test_kind ON subscription_deliveries(subscription_id,event_kind)",
+                [],
+            )
+            .unwrap();
+        let second = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &second.to_string(),
+            30,
+        )
+        .unwrap();
+        let error = store.materialize_subscriptions().unwrap_err().to_string();
+        assert!(
+            error.contains("UNIQUE") || error.contains("unique"),
+            "{error}"
+        );
+        assert_eq!(delivery_count(&store), 1);
+        assert_eq!(store.require_subscription(&added.id).unwrap().id, added.id);
+    }
+
+    #[test]
+    fn subscription_materialization_rolls_back_on_bad_hash_and_advances_over_unmatched_tail() {
+        let mut store = subscription_store("subscriptions-materialization-failures");
+        let mut fail_input = subscription_input("sub-fail");
+        fail_input.kinds = vec!["checkpoint_added".into()];
+        let _added = store.add_subscription(fail_input).unwrap();
+        let matching = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &matching.to_string(),
+            20,
+        )
+        .unwrap();
+        let good = store
+            .connection
+            .query_row(
+                "SELECT seq,event_hash FROM events ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let bad_payload = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) \
+                 VALUES(?,?,?,?,?, ?,0,?,?)",
+                params![
+                    good.0 + 1,
+                    "t-subject",
+                    "checkpoint_added",
+                    "test",
+                    bad_payload.to_string(),
+                    30_i64,
+                    good.1,
+                    "not-a-hash",
+                ],
+            )
+            .unwrap();
+        let cursor_before = materialization_cursor(&store);
+        let events_before = board_event_count(&store);
+        let error = store.materialize_subscriptions().unwrap_err().to_string();
+        assert!(error.contains("malformed event_hash"), "{error}");
+        assert_eq!(delivery_count(&store), 0);
+        assert_eq!(materialization_cursor(&store), cursor_before);
+        assert_eq!(board_event_count(&store), events_before);
+
+        let mut tail = subscription_store("subscriptions-materialization-tail");
+        let mut tail_input = subscription_input("sub-tail");
+        tail_input.kinds = vec!["checkpoint_added".into()];
+        let tail_added = tail.add_subscription(tail_input).unwrap();
+        let unmatched = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "review",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &tail.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &unmatched.to_string(),
+            20,
+        )
+        .unwrap();
+        let first = tail.materialize_subscriptions().unwrap();
+        assert_eq!(first, 0);
+        let cursor_after_unmatched = materialization_cursor(&tail);
+        let expected_after_unmatched = event_hashes(
+            tail.events_since_filtered(
+                Some("t-subject"),
+                &["checkpoint_added".to_owned()],
+                &["parent:t-parent".to_owned()],
+                &["todo".to_owned()],
+                &["review".to_owned()],
+                &["pubsub".to_owned()],
+                cursor_after_unmatched,
+                10,
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(expected_after_unmatched.is_empty());
+
+        let matching_tail = semantic_event_payload(
+            "t-subject",
+            ("parent", "t-parent"),
+            "todo",
+            "in_progress",
+            &["pubsub"],
+        );
+        crate::audit::append_board_event(
+            &tail.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &matching_tail.to_string(),
+            30,
+        )
+        .unwrap();
+        let inserted = tail.materialize_subscriptions().unwrap();
+        assert_eq!(inserted, 1);
+        let expected = event_hashes(
+            tail.events_since_filtered(
+                Some("t-subject"),
+                &["checkpoint_added".to_owned()],
+                &["parent:t-parent".to_owned()],
+                &["todo".to_owned()],
+                &["in_progress".to_owned()],
+                &["pubsub".to_owned()],
+                cursor_after_unmatched,
+                10,
+                false,
+            )
+            .unwrap(),
+        );
+        assert_eq!(delivery_event_ids(&tail, "sub-tail"), expected);
+        assert_eq!(materialization_cursor(&tail), board_event_count(&tail));
+        assert_eq!(tail.subscriptions(None, None, true).unwrap().len(), 1);
+        assert_eq!(
+            tail.require_subscription("sub-tail")
+                .unwrap()
+                .start_event_seq,
+            tail_added.start_event_seq
+        );
+    }
+
+    #[test]
+    fn subscription_delivery_claim_finalize_and_wrong_lease_are_atomic_and_side_effect_free() {
+        let mut store = subscription_store("subscriptions-delivery-claim");
+        let mut input = delivery_subscription_input("sub-delivery-claim");
+        input.max_retries = 1;
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let board_events_before = board_event_count(&store);
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let candidate = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.subscription.id, added.id);
+        assert_eq!(candidate.subscription.secret_ref, None);
+        assert_eq!(candidate.delivery_status, "pending");
+        assert_eq!(candidate.attempt_number, 1);
+        let candidate_event = board_event_by_seq(&store, candidate.event_seq);
+        assert_eq!(
+            candidate.event_id,
+            candidate_event.event_hash.clone().unwrap()
+        );
+        assert_eq!(candidate.event_seq, candidate_event.seq);
+        assert_eq!(candidate.event_kind, candidate_event.kind);
+        assert_eq!(candidate.next_attempt_at, due_at);
+        assert_eq!(board_event_count(&store), board_events_before);
+
+        let claimed = store
+            .claim_subscription_delivery(&added.id, &candidate.event_id, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.delivery_status, "leased");
+        assert_eq!(claimed.attempt_number, 1);
+        assert_eq!(claimed.lease_deadline_at, due_at + 5_000);
+        assert!(!claimed.lease_token.is_empty());
+        assert_eq!(board_event_count(&store), board_events_before);
+        assert!(
+            store
+                .claim_subscription_delivery(&added.id, &candidate.event_id, due_at + 1, 5_000,)
+                .unwrap()
+                .is_none()
+        );
+
+        let leased = delivery_row(&store, &added.id, &candidate.event_id);
+        assert_eq!(leased.status, "leased");
+        assert_eq!(leased.attempts, 1);
+        assert_eq!(
+            leased.lease_token.as_deref(),
+            Some(claimed.lease_token.as_str())
+        );
+        assert_eq!(leased.next_attempt_at, None);
+        assert_eq!(leased.last_attempt_at, Some(candidate.next_attempt_at));
+
+        let attempts = delivery_attempt_rows(&store, &added.id, &candidate.event_id);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt, 1);
+        assert_eq!(attempts[0].outcome, "claim");
+        assert_eq!(attempts[0].started_at, due_at);
+        assert_eq!(attempts[0].finished_at, None);
+
+        assert!(
+            !store
+                .finalize_subscription_delivery_success(
+                    &added.id,
+                    &candidate.event_id,
+                    "wrong-lease",
+                    due_at + 2,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            delivery_row(&store, &added.id, &candidate.event_id).status,
+            "leased"
+        );
+
+        assert!(
+            store
+                .finalize_subscription_delivery_success(
+                    &added.id,
+                    &candidate.event_id,
+                    &claimed.lease_token,
+                    due_at + 3,
+                )
+                .unwrap()
+        );
+        let acked = delivery_row(&store, &added.id, &candidate.event_id);
+        assert_eq!(acked.status, "acked");
+        assert_eq!(acked.acked_at, Some(due_at + 3));
+        assert!(acked.lease_token.is_none());
+        assert!(acked.dead_lettered_at.is_none());
+        let attempts = delivery_attempt_rows(&store, &added.id, &candidate.event_id);
+        assert_eq!(attempts[0].outcome, "success");
+        assert_eq!(attempts[0].finished_at, Some(due_at + 3));
+        assert_eq!(board_event_count(&store), board_events_before);
+        assert!(
+            !store
+                .finalize_subscription_delivery_success(
+                    &added.id,
+                    &candidate.event_id,
+                    &claimed.lease_token,
+                    due_at + 4,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .next_due_subscription_delivery(due_at + 4)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn subscription_delivery_rejects_equal_anchor_sequences_and_negative_now() {
+        let mut store = subscription_store("subscriptions-delivery-anchor");
+        let mut input = delivery_subscription_input("sub-delivery-anchor");
+        input.max_retries = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let anchor_event = board_event_by_seq(&store, added.start_event_seq);
+        let anchor_event_id = anchor_event.event_hash.clone().unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE subscription_deliveries SET event_seq=?,event_id=?,event_kind=?,event_created_at=? WHERE subscription_id=? AND event_id=?",
+                params![
+                    anchor_event.seq,
+                    anchor_event_id.clone(),
+                    anchor_event.kind,
+                    anchor_event.created_at,
+                    added.id,
+                    event_ids[0],
+                ],
+            )
+            .unwrap();
+        let delivery = delivery_row(&store, &added.id, &anchor_event_id);
+        let subscription = store.require_subscription(&added.id).unwrap();
+        assert_eq!(subscription.start_event_seq, anchor_event.seq);
+        let anchor_error =
+            match require_delivery_event_identity(&store.connection, &delivery, &subscription) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("expected an anchor rejection"),
+            };
+        assert!(
+            anchor_error.contains("at or before start anchor"),
+            "{anchor_error}"
+        );
+        assert!(store.next_due_subscription_delivery(-1).is_err());
+        assert!(
+            store
+                .claim_subscription_delivery(&added.id, &event_ids[0], -1, 5_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn subscription_delivery_rejects_exhausted_retry_rows_in_candidate_and_claim_paths() {
+        let mut store = subscription_store("subscriptions-delivery-exhausted");
+        let mut input = delivery_subscription_input("sub-delivery-exhausted");
+        input.max_retries = 1;
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let first = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let first_claim = store
+            .claim_subscription_delivery(&added.id, &first.event_id, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .finalize_subscription_delivery_failure(
+                    &added.id,
+                    &first.event_id,
+                    &first_claim.lease_token,
+                    due_at + 1,
+                    false,
+                    "adapter_failed",
+                )
+                .unwrap()
+        );
+        let retry_due_at = delivery_row(&store, &added.id, &first.event_id)
+            .next_attempt_at
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE subscription_deliveries SET attempts=2 WHERE subscription_id=? AND event_id=?",
+                params![&added.id, &first.event_id],
+            )
+            .unwrap();
+        let retry_error = match store.next_due_subscription_delivery(retry_due_at) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected an exhausted-budget rejection"),
+        };
+        assert!(retry_error.contains("retry budget"), "{retry_error}");
+        let claim_error = match store.claim_subscription_delivery(
+            &added.id,
+            &first.event_id,
+            retry_due_at,
+            5_000,
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected an exhausted-budget rejection"),
+        };
+        assert!(claim_error.contains("retry budget"), "{claim_error}");
+    }
+
+    #[test]
+    fn subscription_delivery_pause_resume_rechecks_and_concurrency_blocks_when_one_lease_is_live() {
+        let mut store = subscription_store("subscriptions-delivery-pause-resume");
+        let mut input = delivery_subscription_input("sub-delivery-pause-resume");
+        input.max_concurrency = 1;
+        input.rate_per_minute = 60;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            30,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let board_events_after_materialization = board_event_count(&store);
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let due = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(due.event_id, event_ids[0]);
+        let paused = store.pause_subscription(&added.id, "test@driver").unwrap();
+        assert_eq!(paused.status, "paused");
+        assert!(
+            store
+                .next_due_subscription_delivery(due_at)
+                .unwrap()
+                .is_none()
+        );
+        let resumed = store.resume_subscription(&added.id, "test@driver").unwrap();
+        assert_eq!(resumed.status, "active");
+        let due_again = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(due_again.event_id, event_ids[0]);
+        let claimed = store
+            .claim_subscription_delivery(&added.id, &due_again.event_id, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            board_event_count(&store),
+            board_events_after_materialization + 2
+        );
+        assert!(
+            store
+                .next_due_subscription_delivery(due_at)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .finalize_subscription_delivery_success(
+                    &added.id,
+                    &due_again.event_id,
+                    &claimed.lease_token,
+                    due_at + 1,
+                )
+                .unwrap()
+        );
+        let second = store
+            .next_due_subscription_delivery(due_at + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.event_id, event_ids[1]);
+        assert_eq!(
+            board_event_count(&store),
+            board_events_after_materialization + 2
+        );
+    }
+
+    #[test]
+    fn subscription_delivery_rate_limit_counts_durable_attempt_rows_and_blocks_retry_until_window_clears()
+     {
+        let mut store = subscription_store("subscriptions-delivery-rate");
+        let mut input = delivery_subscription_input("sub-delivery-rate");
+        input.rate_per_minute = 1;
+        input.max_concurrency = 2;
+        input.max_retries = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let board_events_before = board_event_count(&store);
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let candidate = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_subscription_delivery(&added.id, &candidate.event_id, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .finalize_subscription_delivery_failure(
+                    &added.id,
+                    &candidate.event_id,
+                    &claimed.lease_token,
+                    due_at + 1,
+                    false,
+                    "adapter_failed",
+                )
+                .unwrap()
+        );
+        let retry_due_at = due_at + 1 + 1_000;
+        let waiting = delivery_row(&store, &added.id, &candidate.event_id);
+        assert_eq!(waiting.status, "retry_wait");
+        assert_eq!(waiting.next_attempt_at, Some(retry_due_at));
+        assert!(
+            store
+                .next_due_subscription_delivery(retry_due_at)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .next_due_subscription_delivery(retry_due_at + 60_001)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(board_event_count(&store), board_events_before);
+    }
+
+    #[test]
+    fn subscription_delivery_retry_schedule_is_deterministic_and_stops_after_max_retries() {
+        let mut store = subscription_store("subscriptions-delivery-retry");
+        let mut input = delivery_subscription_input("sub-delivery-retry");
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        input.max_retries = 2;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let board_events_before = board_event_count(&store);
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let first = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let first_claim = store
+            .claim_subscription_delivery(&added.id, &first.event_id, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        let first_failure_at = due_at + 1;
+        assert!(
+            store
+                .finalize_subscription_delivery_failure(
+                    &added.id,
+                    &first.event_id,
+                    &first_claim.lease_token,
+                    first_failure_at,
+                    false,
+                    "adapter_failed",
+                )
+                .unwrap()
+        );
+        let retry1 = delivery_row(&store, &added.id, &first.event_id)
+            .next_attempt_at
+            .unwrap();
+        assert_eq!(retry1, first_failure_at + 1_000);
+        let second = store
+            .next_due_subscription_delivery(retry1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.attempt_number, 2);
+        let second_claim = store
+            .claim_subscription_delivery(&added.id, &second.event_id, second.next_attempt_at, 5_000)
+            .unwrap()
+            .unwrap();
+        let second_failure_at = second.next_attempt_at + 1;
+        assert!(
+            store
+                .finalize_subscription_delivery_failure(
+                    &added.id,
+                    &second.event_id,
+                    &second_claim.lease_token,
+                    second_failure_at,
+                    true,
+                    "adapter_timeout",
+                )
+                .unwrap()
+        );
+        let retry2 = delivery_row(&store, &added.id, &first.event_id)
+            .next_attempt_at
+            .unwrap();
+        assert_eq!(retry2, second_failure_at + 2_000);
+        let third = store
+            .next_due_subscription_delivery(retry2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.attempt_number, 3);
+        let third_claim = store
+            .claim_subscription_delivery(&added.id, &third.event_id, third.next_attempt_at, 5_000)
+            .unwrap()
+            .unwrap();
+        let terminal_failure_at = third.next_attempt_at + 1;
+        assert!(
+            store
+                .finalize_subscription_delivery_failure(
+                    &added.id,
+                    &third.event_id,
+                    &third_claim.lease_token,
+                    terminal_failure_at,
+                    true,
+                    "adapter_failed",
+                )
+                .unwrap()
+        );
+        let finished = delivery_row(&store, &added.id, &first.event_id);
+        assert_eq!(finished.status, "dead_letter");
+        assert_eq!(finished.attempts, 3);
+        assert_eq!(finished.dead_lettered_at, Some(terminal_failure_at));
+        assert!(finished.next_attempt_at.is_none());
+        let attempts = delivery_attempt_rows(&store, &added.id, &first.event_id);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|row| row.outcome.as_str())
+                .collect::<Vec<_>>(),
+            vec!["retry", "timeout", "timeout"]
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|row| row.finished_at.is_some())
+                .collect::<Vec<_>>(),
+            vec![true, true, true]
+        );
+        assert_eq!(board_event_count(&store), board_events_before);
+    }
+
+    #[test]
+    fn subscription_delivery_expired_leases_recover_to_dead_letter_with_stable_error_code() {
+        let mut store = subscription_store("subscriptions-delivery-expired");
+        let mut input = delivery_subscription_input("sub-delivery-expired");
+        input.max_retries = 1;
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let board_events_before = board_event_count(&store);
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let candidate = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_subscription_delivery(&added.id, &candidate.event_id, due_at, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store
+                .finalize_subscription_delivery_success(
+                    &added.id,
+                    &candidate.event_id,
+                    &claimed.lease_token,
+                    claimed.lease_deadline_at,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .finalize_subscription_delivery_failure(
+                    &added.id,
+                    &candidate.event_id,
+                    &claimed.lease_token,
+                    claimed.lease_deadline_at,
+                    true,
+                    "adapter_timeout",
+                )
+                .unwrap()
+        );
+        let still_leased = delivery_row(&store, &added.id, &candidate.event_id);
+        assert_eq!(still_leased.status, "leased");
+        let recovered = store
+            .recover_expired_subscription_deliveries(claimed.lease_deadline_at)
+            .unwrap();
+        assert_eq!(recovered, 1);
+        let finished = delivery_row(&store, &added.id, &candidate.event_id);
+        assert_eq!(finished.status, "retry_wait");
+        let retry_at = claimed.lease_deadline_at + 1_000;
+        assert_eq!(finished.next_attempt_at, Some(retry_at));
+        assert!(finished.dead_lettered_at.is_none());
+        assert_eq!(
+            finished.last_error_code.as_deref(),
+            Some("dispatcher_lease_expired")
+        );
+        assert!(finished.lease_token.is_none());
+        let attempts = delivery_attempt_rows(&store, &added.id, &candidate.event_id);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, "lease_expired");
+        assert_eq!(
+            attempts[0].error_code.as_deref(),
+            Some("dispatcher_lease_expired")
+        );
+        assert_eq!(attempts[0].finished_at, Some(claimed.lease_deadline_at));
+        assert_eq!(board_event_count(&store), board_events_before);
+        assert!(
+            store
+                .next_due_subscription_delivery(claimed.lease_deadline_at)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .next_due_subscription_delivery(retry_at)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn subscription_delivery_detects_malformed_event_identity_and_fails_closed() {
+        let mut store = subscription_store("subscriptions-delivery-malformed");
+        let mut input = delivery_subscription_input("sub-delivery-malformed");
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let candidate = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let board_events_before = board_event_count(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE events SET event_hash=? WHERE seq=?",
+                params![
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    candidate.event_seq
+                ],
+            )
+            .unwrap();
+        let next_error = match store.next_due_subscription_delivery(due_at) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected a malformed event identity rejection"),
+        };
+        assert!(next_error.contains("expected event hash"), "{next_error}");
+        assert_eq!(
+            delivery_row(&store, &added.id, &candidate.event_id).status,
+            "pending"
+        );
+        let claim_error = match store.claim_subscription_delivery(
+            &added.id,
+            &candidate.event_id,
+            due_at,
+            5_000,
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected a malformed event identity rejection"),
+        };
+        assert!(claim_error.contains("expected event hash"), "{claim_error}");
+        assert_eq!(board_event_count(&store), board_events_before);
     }
 
     #[test]

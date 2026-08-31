@@ -988,6 +988,164 @@ CREATE INDEX idx_subscriptions_status ON subscriptions(status,created_at,id);
 CREATE INDEX idx_subscriptions_consumer ON subscriptions(consumer_id,status,created_at,id);
 "#;
 
+/// Keep subscriptions from retroactively seeing events that already existed
+/// when they were created.
+///
+/// The new `start_event_seq` is backfilled to the current event tail for every
+/// v21 row, then enforced with triggers because SQLite cannot add a true NOT
+/// NULL column in place without rebuilding the table. The delivery ledger keeps
+/// the immutable event hash separate from the sequenced foreign key, and the
+/// attempt table preserves retry history so rate accounting does not depend on
+/// one mutable timestamp.
+const BOARD_V22: &str = r#"
+ALTER TABLE subscriptions ADD COLUMN start_event_seq INTEGER CHECK(start_event_seq IS NULL OR start_event_seq >= 0);
+UPDATE subscriptions
+SET start_event_seq = COALESCE((SELECT max(seq) FROM events), 0)
+WHERE start_event_seq IS NULL;
+CREATE TRIGGER subscriptions_start_event_seq_bi
+BEFORE INSERT ON subscriptions
+WHEN new.start_event_seq IS NULL OR new.start_event_seq < 0 BEGIN
+ SELECT RAISE(ABORT, 'subscriptions.start_event_seq is required');
+END;
+CREATE TRIGGER subscriptions_start_event_seq_bu
+BEFORE UPDATE OF start_event_seq ON subscriptions
+WHEN new.start_event_seq IS NULL
+  OR new.start_event_seq < 0
+  OR new.start_event_seq IS NOT old.start_event_seq BEGIN
+ SELECT RAISE(ABORT, 'subscriptions.start_event_seq is immutable');
+END;
+CREATE TABLE board_materialization_cursor (
+ id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+ event_seq INTEGER NOT NULL CHECK(event_seq >= 0),
+ updated_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO board_materialization_cursor(id,event_seq,updated_at)
+VALUES (
+  1,
+  COALESCE((SELECT max(seq) FROM events), 0),
+  COALESCE((SELECT max(created_at) FROM events), 0)
+)
+ON CONFLICT(id) DO UPDATE SET
+ event_seq=excluded.event_seq,
+ updated_at=excluded.updated_at;
+CREATE TABLE subscription_deliveries (
+ subscription_id TEXT NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+ event_id TEXT NOT NULL CHECK(length(event_id)=64 AND event_id NOT GLOB '*[^0-9a-f]*'),
+ event_seq INTEGER NOT NULL REFERENCES events(seq) ON DELETE CASCADE,
+ event_kind TEXT NOT NULL,
+ event_created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','leased','retry_wait','acked','dead_letter')),
+ attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+ lease_token TEXT,
+ lease_deadline_at INTEGER,
+ next_attempt_at INTEGER,
+ last_attempt_at INTEGER,
+ last_error_code TEXT,
+ acked_at INTEGER,
+ dead_lettered_at INTEGER,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY(subscription_id,event_id),
+ UNIQUE(subscription_id,event_seq),
+  CHECK(updated_at >= created_at),
+  CHECK(status <> 'pending' OR (
+   attempts = 0 AND
+   next_attempt_at IS NOT NULL AND
+   next_attempt_at >= created_at AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   last_attempt_at IS NULL AND
+   last_error_code IS NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'leased' OR (
+   attempts >= 1 AND
+   lease_token IS NOT NULL AND
+   lease_deadline_at IS NOT NULL AND
+   next_attempt_at IS NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'retry_wait' OR (
+   attempts >= 1 AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   next_attempt_at IS NOT NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NOT NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'acked' OR (
+   attempts >= 1 AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   next_attempt_at IS NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NULL AND
+   acked_at IS NOT NULL AND
+   dead_lettered_at IS NULL
+ )),
+ CHECK(status <> 'dead_letter' OR (
+   attempts >= 1 AND
+   lease_token IS NULL AND
+   lease_deadline_at IS NULL AND
+   next_attempt_at IS NULL AND
+   last_attempt_at IS NOT NULL AND
+   last_error_code IS NOT NULL AND
+   acked_at IS NULL AND
+   dead_lettered_at IS NOT NULL
+ ))
+) STRICT;
+CREATE INDEX idx_subscription_deliveries_due ON subscription_deliveries(status,next_attempt_at,event_seq,subscription_id)
+ WHERE status IN ('pending','retry_wait');
+CREATE INDEX idx_subscription_deliveries_lease_expiry ON subscription_deliveries(status,lease_deadline_at,event_seq,subscription_id)
+ WHERE status='leased';
+CREATE INDEX idx_subscription_deliveries_subscription_status ON subscription_deliveries(subscription_id,status,event_seq);
+CREATE TRIGGER subscription_deliveries_event_binding_bi
+BEFORE INSERT ON subscription_deliveries
+WHEN NOT EXISTS (
+ SELECT 1
+ FROM events
+ WHERE seq = new.event_seq
+   AND event_hash = new.event_id
+   AND event_hash IS NOT NULL
+   AND length(event_hash) = 64
+   AND event_hash NOT GLOB '*[^0-9a-f]*'
+) BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries.event_id must match events.event_hash');
+END;
+CREATE TRIGGER subscription_deliveries_event_binding_bu
+BEFORE UPDATE OF event_id,event_seq ON subscription_deliveries
+WHEN NOT EXISTS (
+ SELECT 1
+ FROM events
+ WHERE seq = new.event_seq
+   AND event_hash = new.event_id
+   AND event_hash IS NOT NULL
+   AND length(event_hash) = 64
+   AND event_hash NOT GLOB '*[^0-9a-f]*'
+) BEGIN
+ SELECT RAISE(ABORT, 'subscription_deliveries.event_id must match events.event_hash');
+END;
+CREATE TABLE subscription_delivery_attempts (
+ subscription_id TEXT NOT NULL,
+ event_id TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt >= 1),
+ started_at INTEGER NOT NULL,
+ finished_at INTEGER,
+ outcome TEXT NOT NULL CHECK(outcome IN ('claim','success','retry','dead','lease_expired','timeout')),
+ error_code TEXT CHECK(error_code IS NULL OR (length(error_code) > 0 AND error_code NOT GLOB '*[^a-z0-9_:-]*')),
+ CHECK(finished_at IS NULL OR finished_at >= started_at),
+ PRIMARY KEY(subscription_id,event_id,attempt),
+ FOREIGN KEY(subscription_id,event_id) REFERENCES subscription_deliveries(subscription_id,event_id) ON DELETE CASCADE
+) STRICT;
+CREATE INDEX idx_subscription_delivery_attempts_rate ON subscription_delivery_attempts(subscription_id,started_at);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1161,7 +1319,7 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 21;
+pub const BOARD_SCHEMA_VERSION: usize = 22;
 pub const REGISTRY_SCHEMA_VERSION: usize = 11;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1369,7 +1527,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.
@@ -1606,6 +1764,161 @@ mod tests {
         assert_eq!(
             REGISTRY_SCHEMA_VERSION,
             SOURCE.matches(registry_declaration.as_str()).count()
+        );
+    }
+
+    #[test]
+    fn board_v22_backfills_start_event_seq_and_binds_delivery_hashes_to_event_seq() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..21]).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) VALUES(?,?,?,?,?, ?,?,?,?)",
+                rusqlite::params![
+                    1,
+                    Option::<String>::None,
+                    "task_created",
+                    "geo",
+                    "{}",
+                    10,
+                    0,
+                    "prev-1",
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) VALUES(?,?,?,?,?, ?,?,?,?)",
+                rusqlite::params![
+                    2,
+                    Option::<String>::None,
+                    "task_updated",
+                    "geo",
+                    "{}",
+                    11,
+                    0,
+                    "prev-2",
+                    "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    "sub-1",
+                    1,
+                    Option::<String>::None,
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "consumer",
+                    "action",
+                    1000,
+                    3,
+                    60,
+                    2,
+                    Option::<String>::None,
+                    "active",
+                    20,
+                    "geo",
+                    20,
+                    "geo",
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                ],
+            )
+            .unwrap();
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT start_event_seq FROM subscriptions WHERE id='sub-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        connection
+            .execute(
+                "UPDATE subscriptions SET start_event_seq=start_event_seq WHERE id='sub-1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE subscriptions SET start_event_seq=1 WHERE id='sub-1'",
+                    [],
+                )
+                .is_err(),
+            "subscriptions.start_event_seq changed after migration"
+        );
+
+        connection
+            .execute(
+                "INSERT INTO subscription_deliveries(subscription_id,event_id,event_seq,event_kind,event_created_at,status,attempts,lease_token,lease_deadline_at,next_attempt_at,last_attempt_at,last_error_code,acked_at,dead_lettered_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    "sub-1",
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    1,
+                    "task_created",
+                    10,
+                    "pending",
+                    0,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    10,
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    10,
+                    10,
+                ],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO subscription_deliveries(subscription_id,event_id,event_seq,event_kind,event_created_at,status,attempts,lease_token,lease_deadline_at,next_attempt_at,last_attempt_at,last_error_code,acked_at,dead_lettered_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    rusqlite::params![
+                        "sub-1",
+                        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+                        1,
+                        "task_created",
+                        10,
+                        "pending",
+                        0,
+                        Option::<String>::None,
+                        Option::<i64>::None,
+                        10,
+                        Option::<i64>::None,
+                        Option::<String>::None,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        10,
+                        10,
+                    ],
+                )
+                .is_err(),
+            "subscription_deliveries accepted a hash that did not match events.event_hash"
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE subscription_deliveries SET event_seq=2 WHERE subscription_id='sub-1' AND event_id='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'",
+                    [],
+                )
+                .is_err(),
+            "subscription_deliveries accepted an event_seq that did not match event_id"
         );
     }
 

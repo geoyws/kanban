@@ -1,6 +1,7 @@
 mod audit;
 mod context;
 mod db;
+mod dispatch;
 mod gitctx;
 mod import;
 mod lock;
@@ -16,7 +17,7 @@ use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
 use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
-use crate::store::{ClaimOptions, Store, UpdateTask};
+pub use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2084,7 +2085,32 @@ pub fn entrypoint() -> ! {
     }
 }
 
+fn warm_dispatcher_symbols() {
+    let _ = std::mem::size_of::<SubscriptionDeliveryCandidate>();
+    let _ = std::mem::size_of::<SubscriptionDeliveryClaim>();
+    let _ = Store::next_due_subscription_delivery
+        as fn(&Store, i64) -> anyhow::Result<Option<SubscriptionDeliveryCandidate>>;
+    let _ = Store::claim_subscription_delivery
+        as fn(
+            &mut Store,
+            &str,
+            &str,
+            i64,
+            i64,
+        ) -> anyhow::Result<Option<SubscriptionDeliveryClaim>>;
+    let _ = Store::recover_expired_subscription_deliveries
+        as fn(&mut Store, i64) -> anyhow::Result<usize>;
+    let _ = Store::finalize_subscription_delivery_success
+        as fn(&mut Store, &str, &str, &str, i64) -> anyhow::Result<bool>;
+    let _ = Store::finalize_subscription_delivery_failure
+        as fn(&mut Store, &str, &str, &str, i64, bool, &str) -> anyhow::Result<bool>;
+    let _ = Store::materialize_subscriptions as fn(&mut Store) -> anyhow::Result<usize>;
+}
+
 fn run() -> Result<()> {
+    if env::var_os("KANBAN_INTERNAL_DISPATCHER_WARMUP").is_some() {
+        warm_dispatcher_symbols();
+    }
     let args = Args::parse(env::args().skip(1).collect())?;
     if args.has("version") {
         emit(&version_string())?;
