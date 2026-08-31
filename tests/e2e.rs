@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -8392,17 +8392,33 @@ enum ShutdownResult {
 
 impl Session {
     fn start(binary: &Path, cwd: &Path, data: &Path) -> Self {
-        let mut child = Command::new(binary)
-            .arg("mcp")
-            .current_dir(cwd)
-            .env("KANBAN_DATA_DIR", data)
-            .env_remove("KANBAN_DB")
-            .env_remove("KANBAN_PROJECT")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut backoff = Duration::from_millis(10);
+        let mut child = loop {
+            match Command::new(binary)
+                .arg("mcp")
+                .current_dir(cwd)
+                .env("KANBAN_DATA_DIR", data)
+                .env_remove("KANBAN_DB")
+                .env_remove("KANBAN_PROJECT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "spawn kanban mcp kept failing with ETXTBSY past the 750ms deadline: {error}"
+                        );
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(50));
+                }
+                Err(error) => panic!("spawn kanban mcp: {error}"),
+            }
+        };
         let outgoing = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (sender, incoming) = std::sync::mpsc::channel();
