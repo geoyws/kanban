@@ -498,7 +498,10 @@ fn remove_v18_board_audit_schema(connection: &Connection) {
 fn remove_v21_subscription_schema(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP INDEX idx_subscriptions_consumer;\
+            "DROP TABLE subscription_delivery_attempts;\
+             DROP TABLE subscription_deliveries;\
+             DROP TABLE board_materialization_cursor;\
+             DROP INDEX idx_subscriptions_consumer;\
              DROP INDEX idx_subscriptions_status;\
              DROP TABLE subscriptions;",
         )
@@ -817,7 +820,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|project| project["schemaVersion"] == 21)
+            .all(|project| project["schemaVersion"] == 22)
     );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -1013,9 +1016,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 11);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 11);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 21);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 21);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 21);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 22);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 22);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 22);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -1650,7 +1653,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        21
+        22
     );
     assert_eq!(
         reopened
@@ -3323,7 +3326,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 21"),
+        version.contains("board schema 22"),
         "version output: {version}"
     );
     assert!(
@@ -8798,7 +8801,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        21
+        22
     );
 }
 
@@ -9205,7 +9208,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        21
+        22
     );
     assert_eq!(
         connection

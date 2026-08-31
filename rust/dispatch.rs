@@ -61,7 +61,6 @@ struct SecretConfig {
 pub(crate) struct ResolvedDispatch {
     pub(crate) consumer_id: String,
     pub(crate) action_id: String,
-    pub(crate) capability: String,
     pub(crate) executable: PathBuf,
     pub(crate) args: Vec<String>,
     pub(crate) secret: Option<ResolvedSecret>,
@@ -572,7 +571,6 @@ impl DispatcherConfig {
         let resolved = ResolvedDispatch {
             consumer_id,
             action_id,
-            capability,
             executable,
             args: action.args.clone(),
             secret,
@@ -793,7 +791,6 @@ mod tests {
         let resolved = config.resolve(&subscription(Some("secret-a"))).unwrap();
         assert_eq!(resolved.consumer_id, "consumer-a");
         assert_eq!(resolved.action_id, "action-a");
-        assert_eq!(resolved.capability, "cap-a");
         assert_eq!(resolved.executable, PathBuf::from(executable));
         assert_eq!(resolved.args, vec!["--mode", "dispatch"]);
         let secret = resolved.secret.as_ref().unwrap();

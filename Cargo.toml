@@ -21,6 +21,10 @@ path = "rust/bin/kanban.rs"
 name = "kb"
 path = "rust/bin/kb.rs"
 
+[[bin]]
+name = "kanban-dispatcher"
+path = "rust/bin/kanban-dispatcher.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"

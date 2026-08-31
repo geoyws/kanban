@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,19 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 static SIGNALS_INSTALLED: AtomicBool = AtomicBool::new(false);
 const LEASE_CLEANUP_HEADROOM_MS: i64 = 30_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(debug_assertions)]
 const TEST_CRASH_EVENT_ENV: &str = "KANBAN_DISPATCHER_TEST_CRASH_AFTER_EVENT_ID";
+const HELP: &str = r#"kanban-dispatcher — durable subscription delivery worker
+
+Usage:
+  kanban-dispatcher (--db PATH | --project NAME | --workspace PATH)
+                    [--consumer NAME] [--once] [--json]
+  kanban-dispatcher --help
+  kanban-dispatcher --version
+
+The board selector is always explicit. KANBAN_DB and KANBAN_PROJECT may only
+repeat the matching explicit selector; conflicting implicit selection fails.
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardSelector {
@@ -48,7 +61,6 @@ pub(crate) struct DispatcherContext {
     pub(crate) board_name: Option<String>,
     pub(crate) consumer: Option<String>,
     pub(crate) once: bool,
-    pub(crate) json: bool,
     _data_root_lock: Option<DataRootLock>,
 }
 
@@ -324,7 +336,6 @@ pub(crate) fn resolve_context(args: DispatcherArgs) -> Result<DispatcherContext>
         board_name,
         consumer: args.consumer,
         once: args.once,
-        json: args.json,
         _data_root_lock: data_root_lock,
     })
 }
@@ -570,8 +581,12 @@ impl SchedulerBackend for SystemBackend {
         let now = now_ms();
         self.store.materialize_subscriptions()?;
         self.store.recover_expired_subscription_deliveries(now)?;
-        self.store
-            .next_due_subscription_delivery_for_consumer(now, self.context.consumer.as_deref())
+        match self.context.consumer.as_deref() {
+            Some(consumer_id) => self
+                .store
+                .next_due_subscription_delivery_for_consumer(now, Some(consumer_id)),
+            None => self.store.next_due_subscription_delivery(now),
+        }
     }
 
     fn resolve(&mut self, candidate: &Self::Candidate) -> Result<Self::Resolved> {
@@ -636,8 +651,9 @@ impl SchedulerBackend for SystemBackend {
         Ok(())
     }
 
-    fn after_adapter_success(&mut self, claim: &Self::Claim) {
-        if env::var_os(TEST_CRASH_EVENT_ENV).as_deref() == Some(OsStr::new(&claim.event_id)) {
+    fn after_adapter_success(&mut self, _claim: &Self::Claim) {
+        #[cfg(debug_assertions)]
+        if env::var_os(TEST_CRASH_EVENT_ENV).as_deref() == Some(OsStr::new(&_claim.event_id)) {
             std::process::exit(86);
         }
     }
@@ -668,6 +684,40 @@ pub(crate) fn run(context: DispatcherContext) -> Result<DispatcherReport> {
     let once = context.once;
     let mut backend = SystemBackend::open(context)?;
     drive(&mut backend, once)
+}
+
+pub(crate) fn command(values: Vec<OsString>) -> Result<()> {
+    let args = parse_args(values)?;
+    if args.help {
+        io::stdout().write_all(HELP.as_bytes())?;
+        return Ok(());
+    }
+    if args.version {
+        writeln!(
+            io::stdout(),
+            "kanban-dispatcher {}",
+            env!("CARGO_PKG_VERSION")
+        )?;
+        return Ok(());
+    }
+    let json = args.json;
+    let report = run(resolve_context(args)?)?;
+    if json {
+        serde_json::to_writer(io::stdout().lock(), &report)?;
+        writeln!(io::stdout())?;
+    } else {
+        writeln!(
+            io::stdout(),
+            "attempted={} succeeded={} failed={} idle={} busy={} cancelled={}",
+            report.attempted,
+            report.succeeded,
+            report.failed,
+            report.idle,
+            report.busy,
+            report.cancelled
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -2088,32 +2088,19 @@ pub fn entrypoint() -> ! {
     }
 }
 
-fn warm_dispatcher_symbols() {
-    let _ = std::mem::size_of::<SubscriptionDeliveryCandidate>();
-    let _ = std::mem::size_of::<SubscriptionDeliveryClaim>();
-    let _ = Store::next_due_subscription_delivery
-        as fn(&Store, i64) -> anyhow::Result<Option<SubscriptionDeliveryCandidate>>;
-    let _ = Store::claim_subscription_delivery
-        as fn(
-            &mut Store,
-            &str,
-            &str,
-            i64,
-            i64,
-        ) -> anyhow::Result<Option<SubscriptionDeliveryClaim>>;
-    let _ = Store::recover_expired_subscription_deliveries
-        as fn(&mut Store, i64) -> anyhow::Result<usize>;
-    let _ = Store::finalize_subscription_delivery_success
-        as fn(&mut Store, &str, &str, &str, i64) -> anyhow::Result<bool>;
-    let _ = Store::finalize_subscription_delivery_failure
-        as fn(&mut Store, &str, &str, &str, i64, bool, &str) -> anyhow::Result<bool>;
-    let _ = Store::materialize_subscriptions as fn(&mut Store) -> anyhow::Result<usize>;
+/// Entry point for the dedicated durable-subscription worker binary.
+pub fn dispatcher_entrypoint() -> ! {
+    match dispatcher::command(env::args_os().skip(1).collect()) {
+        Ok(()) => std::process::exit(0),
+        Err(error) if reader_left(&error) => std::process::exit(0),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
 }
 
 fn run() -> Result<()> {
-    if env::var_os("KANBAN_INTERNAL_DISPATCHER_WARMUP").is_some() {
-        warm_dispatcher_symbols();
-    }
     let args = Args::parse(env::args().skip(1).collect())?;
     if args.has("version") {
         emit(&version_string())?;
