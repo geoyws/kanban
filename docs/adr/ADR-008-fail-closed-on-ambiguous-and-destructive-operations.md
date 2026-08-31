@@ -440,6 +440,20 @@ one this project keeps hitting — a test that exercises the right behaviour
 through a mechanism that cannot observe it is a test that reports success for
 the wrong reason.
 
+## Amendment — 2026-09-01: `init` serializes before registry registration
+
+`kanban init` can race with another `kanban init` in the same data root even
+though it is not an ordinary board mutation. Two writers may try to register
+the same board name at once, and SQLite contention can turn the loser into a
+lock error instead of the exact duplicate-name refusal the operator needs.
+
+**`init` takes its own stable `.init.lock` exclusively, separately from the
+ordinary `.lock`.** The `init` command waits up to 15 seconds in a bounded
+polling loop before refusing, while board commands and `restore` keep their
+existing shared/exclusive `.lock` semantics unchanged. The separate lock makes
+`init` serialize before `Registry::open`, so the loser reaches the duplicate-
+name refusal rather than leaking SQLite lock errors across the command boundary.
+
 ## References
 
 - [ADR-001](ADR-001-durable-agent-work-ledger.md) — durable resume contract

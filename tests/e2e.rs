@@ -8150,6 +8150,15 @@ fn write_executable(path: &Path, body: &str) {
     fs::rename(&staging, path).unwrap();
 }
 
+fn copy_executable(source: &Path, target: &Path) {
+    // Stage the executable beside the target, then rename it into place so
+    // initial publication has the same atomic boundary as later replacements.
+    let staging = target.with_extension("staging");
+    fs::copy(source, &staging).unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&staging, target).unwrap();
+}
+
 #[test]
 fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     let fixture = Fixture::new("mcp");
@@ -8370,8 +8379,7 @@ fn the_mcp_server_replaces_itself_without_dropping_the_session() {
     // Serve from a copy, so the test can replace the binary underneath it the
     // way `install` does.
     let binary = fixture.root.join("kanban");
-    fs::copy(env!("CARGO_BIN_EXE_kanban"), &binary).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(Path::new(env!("CARGO_BIN_EXE_kanban")), &binary);
 
     let mut session = Session::start(&binary, &fixture.main, &fixture.data);
     let pid = session.child.id();
@@ -8453,8 +8461,7 @@ fn a_reload_never_swallows_a_request_already_on_the_wire() {
     fixture.ok_json(&fixture.main, &["init", "--name", "PIPELINE", "--json"]);
 
     let binary = fixture.root.join("kanban");
-    fs::copy(env!("CARGO_BIN_EXE_kanban"), &binary).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(Path::new(env!("CARGO_BIN_EXE_kanban")), &binary);
 
     let mut session = Session::start(&binary, &fixture.main, &fixture.data);
     assert_eq!(

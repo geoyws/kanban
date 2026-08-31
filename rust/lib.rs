@@ -2180,6 +2180,7 @@ fn run() -> Result<()> {
         } else {
             Some(args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?))
         };
+        let _initialization = lock::initialization()?;
         let mut registry = Registry::open()?;
         let record = registry.register(
             workspace.as_deref(),

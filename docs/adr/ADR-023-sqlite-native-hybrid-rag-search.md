@@ -66,6 +66,11 @@ contract does not expose the storage implementation.
 2. FTS5/BM25 lexical rank;
 3. semantic vector similarity.
 
+When a query exactly matches a canonical generated ID shape, literal
+source/title/body matches are the only admissible hits; lexical-token and
+semantic-only collisions do not qualify. Natural-language queries retain all
+three signals.
+
 The ranks are fused rather than pretending their raw scores share a scale.
 Each result names the board, source type, source ID, linked task ID, title,
 bounded snippet, filters, timestamps, archived state, per-signal scores and a

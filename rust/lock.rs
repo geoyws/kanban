@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 /// Deliberately the same 5s as the SQLite `busy_timeout` those commands
 /// already run under, so contention feels identical whichever layer it hits.
 const WAIT: Duration = Duration::from_millis(5_000);
+const INIT_WAIT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(25);
 
 /// Held for the lifetime of a command. The kernel drops the lock when the
@@ -37,15 +38,15 @@ pub struct DataRootLock {
     _file: File,
 }
 
-/// Open (never create-and-delete) the lock file.
+/// Open (never create-and-delete) the named lock file.
 ///
 /// The file is not removed afterwards on purpose: unlinking it would let the
 /// next process create a *different* inode and take a lock that excludes
 /// nobody. It is an empty 0600 marker whose only content is its identity.
-fn open_lock_file() -> Result<(PathBuf, File)> {
+fn open_lock_file(name: &str) -> Result<(PathBuf, File)> {
     let root = data_root()?;
     own_private_dir(&root)?;
-    let path = root.join(".lock");
+    let path = root.join(name);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -66,7 +67,7 @@ fn open_lock_file() -> Result<(PathBuf, File)> {
 /// useful answer is to say so and stop, not to block the operator's terminal
 /// for as long as some agent keeps working.
 pub fn exclusive() -> Result<DataRootLock> {
-    let (path, file) = open_lock_file()?;
+    let (path, file) = open_lock_file(".lock")?;
     match file.try_lock() {
         Ok(()) => Ok(DataRootLock { _file: file }),
         Err(TryLockError::WouldBlock) => bail!(
@@ -84,7 +85,7 @@ pub fn exclusive() -> Result<DataRootLock> {
 /// Take the data root shared, for a caller that reads and writes through
 /// SQLite. Excludes nothing but a restore.
 pub fn shared() -> Result<DataRootLock> {
-    let (path, file) = open_lock_file()?;
+    let (path, file) = open_lock_file(".lock")?;
     let deadline = Instant::now() + WAIT;
     loop {
         match file.try_lock_shared() {
@@ -94,6 +95,29 @@ pub fn shared() -> Result<DataRootLock> {
                 "a kanban restore is replacing {} (waited {}s); retry once it finishes",
                 path.parent().unwrap_or(&path).display(),
                 WAIT.as_secs()
+            ),
+            Err(TryLockError::Error(error)) => {
+                return Err(anyhow::Error::new(error).context(format!("lock {}", path.display())));
+            }
+        }
+    }
+}
+
+/// Take the data root exclusively while an `init` is registering a board.
+///
+/// This uses its own stable `.init.lock`, so it never contends with the
+/// ordinary `.lock` used by restore and board commands.
+pub fn initialization() -> Result<DataRootLock> {
+    let (path, file) = open_lock_file(".init.lock")?;
+    let deadline = Instant::now() + INIT_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(DataRootLock { _file: file }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => sleep(POLL),
+            Err(TryLockError::WouldBlock) => bail!(
+                "another init is registering a board in {}; waited {}s; retry once it finishes",
+                path.parent().unwrap_or(&path).display(),
+                INIT_WAIT.as_secs()
             ),
             Err(TryLockError::Error(error)) => {
                 return Err(anyhow::Error::new(error).context(format!("lock {}", path.display())));
