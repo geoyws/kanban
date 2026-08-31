@@ -1796,6 +1796,271 @@ dd{margin:0;font-size:.9rem;word-break:break-word}\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AddTask, FinishDeployment, StartDeployment};
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const RENDER_CHILD_TEST: &str = "serve::tests::serve_render_fixture_child_process";
+    const RENDER_CHILD_MARKER: &str = "serve-render-fixture-child";
+
+    struct RenderFixture {
+        epic_id: String,
+        story_id: String,
+        task_id: String,
+        current_deployment_id: String,
+        failed_deployment_id: String,
+    }
+
+    struct TempDataDir(PathBuf);
+
+    impl TempDataDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "kanban-serve-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create isolated data dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn spawn_render_child(data_dir: &Path) -> Output {
+        Command::new(env::current_exe().expect("current test binary"))
+            .args(["--exact", "--ignored", RENDER_CHILD_TEST, "--nocapture"])
+            .env("KANBAN_DATA_DIR", data_dir)
+            .env("KANBAN_SERVE_RENDER_CHILD", RENDER_CHILD_MARKER)
+            .output()
+            .expect("spawn child render fixture")
+    }
+
+    fn seed_render_fixture(data_dir: &Path) -> RenderFixture {
+        fs::create_dir_all(data_dir).expect("create isolated data dir");
+        let mut registry = Registry::open().expect("open registry");
+        let board_name = "SERVE-RENDER";
+        let project = registry
+            .register(None, board_name, false, "geo")
+            .expect("register rootless board");
+        let board_path = PathBuf::from(&project.board_path);
+        let mut store = Store::open(&board_path).expect("open store");
+        store
+            .initialize(board_name, "geo")
+            .expect("initialize board metadata");
+        store
+            .add_tag("ops", Some("Operational work"), Some("geo"))
+            .expect("register ops tag");
+        store
+            .add_tag("release", Some("Release work"), Some("geo"))
+            .expect("register release tag");
+        let epic = store
+            .add_task(AddTask {
+                id: Some("e-serve-render".to_owned()),
+                task_type: "epic".to_owned(),
+                parent_id: None,
+                title: "Plan <b>render</b>".to_owned(),
+                body: Some("Draft body with <script>alert(1)</script>".to_owned()),
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "draft".to_owned(),
+                priority: 0,
+                dependencies: vec![],
+                metadata: serde_json::json!({"workflowStatus": "planning"}),
+                actor: Some("geo".to_owned()),
+                tags: vec!["ops".to_owned()],
+            })
+            .expect("add epic");
+        let story = store
+            .add_task(AddTask {
+                id: Some("s-serve-render".to_owned()),
+                task_type: "story".to_owned(),
+                parent_id: Some(epic.id.clone()),
+                title: "Ship <script>render</script>".to_owned(),
+                body: Some("Story body with <em>markup</em>".to_owned()),
+                assignee: Some("geo".to_owned()),
+                lane: None,
+                deliverable: Some("Release package".to_owned()),
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 2,
+                dependencies: vec![],
+                metadata: serde_json::json!({}),
+                actor: Some("geo".to_owned()),
+                tags: vec!["release".to_owned()],
+            })
+            .expect("add story");
+        let task = store
+            .add_task(AddTask {
+                id: Some("t-serve-render".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: Some(epic.id.clone()),
+                title: "Implement <i>escape</i>".to_owned(),
+                body: Some("Task body with & < >".to_owned()),
+                assignee: Some("geo".to_owned()),
+                lane: Some("driver-2".to_owned()),
+                deliverable: None,
+                stale_minutes: Some(120),
+                driver_only: false,
+                status: "in_progress".to_owned(),
+                priority: 1,
+                dependencies: vec![story.id.clone()],
+                metadata: serde_json::json!({"focus": "render"}),
+                actor: Some("geo".to_owned()),
+                tags: vec!["ops".to_owned(), "release".to_owned()],
+            })
+            .expect("add task");
+        let done = store
+            .add_task(AddTask {
+                id: Some("t-serve-done".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: Some(epic.id.clone()),
+                title: "Completed <span>delivery</span>".to_owned(),
+                body: Some("Done body with <u>markup</u>".to_owned()),
+                assignee: Some("geo".to_owned()),
+                lane: Some("driver-3".to_owned()),
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "done".to_owned(),
+                priority: 3,
+                dependencies: vec![task.id.clone()],
+                metadata: serde_json::json!({"done": true}),
+                actor: Some("geo".to_owned()),
+                tags: vec!["release".to_owned()],
+            })
+            .expect("add done task");
+        store
+            .add_note(
+                &epic.id,
+                "geo",
+                "decision",
+                "Keep the <script> tag escaped & readable.",
+            )
+            .expect("add note");
+        let attention = store
+            .raise_attention(
+                "Please review <strong>before release</strong>.",
+                "decision",
+                "geo",
+                Some(&epic.id),
+                0,
+                &["ops".to_owned(), "release".to_owned()],
+            )
+            .expect("raise attention");
+        store
+            .post_sitrep(
+                "driver-2",
+                "Working <i>quietly</i> on the render page.",
+                "agent",
+                Some(&task.id),
+                None,
+            )
+            .expect("post driver-2 sitrep");
+        store
+            .post_sitrep(
+                "driver-3",
+                "A second lane with <b>markup</b> to sort.",
+                "agent",
+                Some(&done.id),
+                None,
+            )
+            .expect("post driver-3 sitrep");
+        let current_start = store
+            .start_deployment(StartDeployment {
+                task_id: Some(epic.id.clone()),
+                repo: "geoyws/kanban".to_owned(),
+                commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                branch: Some("feature/render".to_owned()),
+                tier: "@_s".to_owned(),
+                environment: "staging".to_owned(),
+                host: "serve-host".to_owned(),
+                url: "https://serve.invalid/current".to_owned(),
+                mechanism: Some("manual".to_owned()),
+                operation_id: Some("serve-op-current".to_owned()),
+                retry_of: None,
+                actor: "geo".to_owned(),
+                lane: Some("deploy".to_owned()),
+            })
+            .expect("start current deployment");
+        let current = store
+            .finish_deployment(FinishDeployment {
+                id: current_start.deployment.id.clone(),
+                capability_token: current_start.capability_token.clone(),
+                result: "succeeded".to_owned(),
+                phase: Some("verification".to_owned()),
+                receipt: Some("served <release> successfully".to_owned()),
+                artifact_uri: Some("artifact://kanban/<render>".to_owned()),
+                served_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                actor: "geo".to_owned(),
+            })
+            .expect("finish current deployment");
+        let failed_start = store
+            .start_deployment(StartDeployment {
+                task_id: Some(story.id.clone()),
+                repo: "geoyws/kanban".to_owned(),
+                commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                branch: Some("feature/render-failure".to_owned()),
+                tier: "@_bs".to_owned(),
+                environment: "staging".to_owned(),
+                host: "serve-host".to_owned(),
+                url: "https://serve.invalid/failed".to_owned(),
+                mechanism: Some("manual".to_owned()),
+                operation_id: Some("serve-op-failed".to_owned()),
+                retry_of: None,
+                actor: "geo".to_owned(),
+                lane: Some("deploy".to_owned()),
+            })
+            .expect("start failed deployment");
+        let failed = store
+            .finish_deployment(FinishDeployment {
+                id: failed_start.deployment.id.clone(),
+                capability_token: failed_start.capability_token.clone(),
+                result: "failed".to_owned(),
+                phase: Some("build".to_owned()),
+                receipt: Some("build <failed> because the render check did not pass".to_owned()),
+                artifact_uri: None,
+                served_commit: None,
+                actor: "geo".to_owned(),
+            })
+            .expect("finish failed deployment");
+        assert_eq!(attention.task_id.as_deref(), Some(epic.id.as_str()));
+        assert_eq!(current.status, "succeeded");
+        assert_eq!(failed.status, "failed");
+        RenderFixture {
+            epic_id: epic.id,
+            story_id: story.id,
+            task_id: task.id,
+            current_deployment_id: current.id,
+            failed_deployment_id: failed.id,
+        }
+    }
+
+    fn assert_html_contains(html: &str, needle: &str) {
+        assert!(html.contains(needle), "missing {needle:?} in {html}");
+    }
+
+    fn assert_page_title(html: &str, title: &str) {
+        assert_html_contains(html, &format!("<title>{title} · kanban</title>"));
+    }
 
     #[test]
     fn operator_shell_keeps_phone_touch_and_live_status_contract() {
@@ -1842,6 +2107,183 @@ mod tests {
         );
         assert!(compose_resolution_note("reply", Some("   ")).is_err());
         assert!(compose_resolution_note("banana", Some("nope")).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn serve_render_fixture_child_process() {
+        let Ok(marker) = env::var("KANBAN_SERVE_RENDER_CHILD") else {
+            return;
+        };
+        if marker != RENDER_CHILD_MARKER {
+            return;
+        }
+        let data_dir = env::var_os("KANBAN_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("child data dir");
+        let fixture = seed_render_fixture(&data_dir);
+
+        let home = render("/").expect("render needs-you");
+        assert_page_title(&home, "Needs you");
+        assert_html_contains(&home, "Needs you");
+        assert_html_contains(
+            &home,
+            "Please review &lt;strong&gt;before release&lt;/strong&gt;",
+        );
+        assert_html_contains(&home, "data-comment-label=\"Comment and Approve\"");
+        assert_html_contains(&home, "data-comment-label=\"Comment and Reject\"");
+        assert_html_contains(&home, "/board/SERVE-RENDER");
+        assert!(!home.contains("<strong>before release</strong>"));
+
+        let replied = render(&format!("/?replied={}", fixture.epic_id)).expect("render replied");
+        assert_page_title(&replied, "Needs you");
+        assert_html_contains(&replied, "Reply recorded for <code>e-serve-render</code>.");
+
+        let boards = render("/boards").expect("render boards");
+        assert_page_title(&boards, "Boards");
+        assert_html_contains(&boards, "<h1>Boards</h1>");
+        assert_html_contains(&boards, "SERVE-RENDER");
+        assert_html_contains(&boards, "<td class=\"n waiting\">1</td>");
+
+        let plans = render("/plans").expect("render plans");
+        assert_page_title(&plans, "Plans");
+        assert_html_contains(&plans, "Open plan");
+        assert_html_contains(&plans, "Holds back 3 rows");
+        assert_html_contains(&plans, "Plan &lt;b&gt;render&lt;/b&gt;");
+        assert_html_contains(&plans, "Ship &lt;script&gt;render&lt;/script&gt;");
+        assert_html_contains(&plans, "Implement &lt;i&gt;escape&lt;/i&gt;");
+
+        let opened =
+            render(&format!("/plans?opened={}", fixture.epic_id)).expect("render opened plans");
+        assert_page_title(&opened, "Plans");
+        assert_html_contains(&opened, "Opened plan <code>e-serve-render</code>.");
+
+        let deployments = render("/deployments").expect("render deployments");
+        assert_page_title(&deployments, "Deployments");
+        assert_html_contains(&deployments, "Current releases");
+        assert_html_contains(&deployments, "In progress");
+        assert_html_contains(&deployments, "Recent failures");
+        assert_html_contains(&deployments, "geoyws/kanban");
+        assert_html_contains(&deployments, "build &lt;failed&gt;");
+
+        let deployment_detail = render(&format!(
+            "/deployment/SERVE-RENDER/{}",
+            fixture.current_deployment_id
+        ))
+        .expect("render deployment detail");
+        assert_page_title(
+            &deployment_detail,
+            &format!("Deployment {}", fixture.current_deployment_id),
+        );
+        assert_html_contains(&deployment_detail, "Deployment");
+        assert_html_contains(&deployment_detail, "artifact://kanban/&lt;render&gt;");
+        assert_html_contains(&deployment_detail, "served &lt;release&gt; successfully");
+
+        let lanes = render("/lanes").expect("render lanes");
+        assert_page_title(&lanes, "Lanes");
+        assert_html_contains(&lanes, "driver-2");
+        assert_html_contains(&lanes, "driver-3");
+        assert_html_contains(
+            &lanes,
+            "Working &lt;i&gt;quietly&lt;/i&gt; on the render page.",
+        );
+        assert_html_contains(
+            &lanes,
+            "A second lane with &lt;b&gt;markup&lt;/b&gt; to sort.",
+        );
+
+        let search_empty = render("/search").expect("render empty search");
+        assert_page_title(&search_empty, "Search");
+        assert_html_contains(
+            &search_empty,
+            "Search every board, including tasks, notes, checkpoints, handoffs, attention, sitreps, rules, and their audit trail.",
+        );
+
+        let search = render("/search?q=render").expect("render search");
+        assert_page_title(&search, "Search: render");
+        assert_html_contains(&search, "Search: render");
+        assert_html_contains(&search, "kanban://SERVE-RENDER/task/e-serve-render");
+        assert_html_contains(&search, "Plan &lt;b&gt;render&lt;/b&gt;");
+        assert_html_contains(&search, "Ship &lt;script&gt;render&lt;/script&gt;");
+
+        let board = render("/board/SERVE-RENDER").expect("render board");
+        assert_page_title(&board, "SERVE-RENDER");
+        assert_html_contains(&board, "Rootless");
+        assert_html_contains(&board, "priority-p0");
+        assert_html_contains(&board, "priority-p1");
+        assert_html_contains(&board, "priority-p2");
+        assert_html_contains(&board, "type-epic");
+        assert_html_contains(&board, "type-story");
+        assert_html_contains(&board, "type-task");
+        assert_html_contains(&board, "Implement &lt;i&gt;escape&lt;/i&gt;");
+        assert_html_contains(&board, "Ship &lt;script&gt;render&lt;/script&gt;");
+
+        let task_detail =
+            render(&format!("/task/SERVE-RENDER/{}", fixture.epic_id)).expect("render task detail");
+        assert_page_title(&task_detail, "Plan &lt;b&gt;render&lt;/b&gt;");
+        assert_html_contains(&task_detail, "Open attention");
+        assert_html_contains(
+            &task_detail,
+            "Keep the &lt;script&gt; tag escaped &amp; readable.",
+        );
+        assert_html_contains(&task_detail, "Trail");
+        assert_html_contains(&task_detail, "decision");
+        assert_html_contains(
+            &task_detail,
+            "Please review &lt;strong&gt;before release&lt;/strong&gt;",
+        );
+
+        let story_detail = render(&format!("/task/SERVE-RENDER/{}", fixture.story_id))
+            .expect("render story detail");
+        assert_page_title(&story_detail, "Ship &lt;script&gt;render&lt;/script&gt;");
+        assert_html_contains(&story_detail, "Story body with &lt;em&gt;markup&lt;/em&gt;");
+        assert_html_contains(&story_detail, "type-story");
+
+        let task_page =
+            render(&format!("/task/SERVE-RENDER/{}", fixture.task_id)).expect("render task detail");
+        assert_page_title(&task_page, "Implement &lt;i&gt;escape&lt;/i&gt;");
+        assert_html_contains(&task_page, "Task body with &amp; &lt; &gt;");
+        assert_html_contains(&task_page, "driver-2");
+
+        let failed_detail = render(&format!(
+            "/deployment/SERVE-RENDER/{}",
+            fixture.failed_deployment_id
+        ))
+        .expect("render failed deployment detail");
+        assert_page_title(
+            &failed_detail,
+            &format!("Deployment {}", fixture.failed_deployment_id),
+        );
+        assert_html_contains(&failed_detail, "failed");
+        assert_html_contains(&failed_detail, "build &lt;failed&gt;");
+
+        let not_found = render("/no/such/page").expect("render 404 page");
+        assert_page_title(&not_found, "Not found");
+        assert_html_contains(&not_found, "No page at that address");
+        assert!(render("/board/NO-SUCH-BOARD").is_err());
+        assert!(render("/task/SERVE-RENDER/no-such-task").is_err());
+    }
+
+    #[test]
+    fn serve_render_fixture_parent_spawns_child_process() {
+        let data_dir = TempDataDir::new("render");
+        let output = spawn_render_child(data_dir.path());
+        if !output.status.success() {
+            panic!(
+                "child render fixture failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test"),
+            "child did not run exactly one test\n{stdout}"
+        );
+        assert!(
+            stdout.contains("test serve::tests::serve_render_fixture_child_process ... ok"),
+            "child did not execute the ignored render fixture\n{stdout}"
+        );
     }
 
     #[test]
