@@ -33,6 +33,8 @@ executables. Each test invokes its `CARGO_BIN_EXE_*` binary through
 | Deployment self-archive | A real archive process moves only old terminal non-current attempts out of default lists and hot partial indexes, keeps started and current successes hot, retains cold search and `--all` access, and proves a repeated sweep is idempotent. |
 | Browser-backed operator approval | A real Chrome session loads the compiled `kanban serve` page, types into the live comment box, watches the quick labels switch to `Comment and Approve` / `Comment and Reject`, clicks a real submit button, and verifies the persisted decision/comment through the compiled CLI/store boundary. |
 
+Browser discovery for that gate is ordered as `KANBAN_CHROME`, then the existing platform, `PATH`, and fixed-system candidates, then the newest executable Playwright Chromium under `XDG_CACHE_HOME/ms-playwright` or `HOME/.cache/ms-playwright`. Chromium sandboxing stays enabled for non-root launches and is disabled only when the effective UID is `0`, because upstream Chrome refuses sandboxed root.
+
 Passing library/unit tests or invoking `rust/main.rs` through an interpreter is
 not E2E evidence. The gate is incomplete until the compiled executable passes
 this matrix on a clean test data directory, including the real-browser path

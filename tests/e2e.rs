@@ -281,14 +281,16 @@ impl Drop for WatchSession {
 
 fn chrome_binary() -> PathBuf {
     let explicit = env::var_os("KANBAN_CHROME").map(PathBuf::from);
+    let playwright_cache_root = playwright_cache_root();
     let candidates = chrome_binary_candidates(
         explicit.as_deref().and_then(Path::to_str),
         env::var_os("PATH")
             .as_deref()
             .and_then(std::ffi::OsStr::to_str),
         cfg!(target_os = "macos"),
+        playwright_cache_root.as_deref(),
     );
-    if let Some(path) = chrome_binary_from_candidates(candidates.clone(), Path::exists) {
+    if let Some(path) = chrome_binary_from_candidates(candidates.clone(), is_regular_executable) {
         return path;
     }
     panic!(
@@ -305,6 +307,7 @@ fn chrome_binary_candidates(
     explicit: Option<&str>,
     path_env: Option<&str>,
     is_macos: bool,
+    playwright_cache_root: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = explicit {
@@ -338,7 +341,64 @@ fn chrome_binary_candidates(
     ] {
         candidates.push(PathBuf::from(path));
     }
+    candidates.extend(playwright_chromium_candidates(playwright_cache_root));
     candidates
+}
+
+fn playwright_cache_root() -> Option<PathBuf> {
+    env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+}
+
+fn playwright_chromium_candidates(playwright_cache_root: Option<&Path>) -> Vec<PathBuf> {
+    let Some(playwright_cache_root) = playwright_cache_root else {
+        return Vec::new();
+    };
+    let cache_root = playwright_cache_root.join("ms-playwright");
+    let Ok(entries) = fs::read_dir(&cache_root) else {
+        return Vec::new();
+    };
+    let mut chromium_dirs = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(version) = file_name.strip_prefix("chromium-") else {
+            continue;
+        };
+        let Some(version_key) = chromium_version_key(version) else {
+            continue;
+        };
+        chromium_dirs.push((version_key, entry.path()));
+    }
+    chromium_dirs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    chromium_dirs
+        .into_iter()
+        .map(|(_, chromium_dir)| chromium_dir.join("chrome-linux64").join("chrome"))
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ChromiumVersionKey(Vec<u64>);
+
+fn chromium_version_key(version: &str) -> Option<ChromiumVersionKey> {
+    let components = version
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|component| !component.is_empty())
+        .map(|component| component.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if components.is_empty() {
+        return None;
+    }
+    Some(ChromiumVersionKey(components))
 }
 
 fn chrome_binary_from_candidates<F>(candidates: Vec<PathBuf>, exists: F) -> Option<PathBuf>
@@ -348,9 +408,33 @@ where
     candidates.into_iter().find(|path| exists(path))
 }
 
+fn is_regular_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+fn browser_sandbox_enabled(effective_uid: u32) -> bool {
+    effective_uid != 0
+}
+
 #[test]
 fn chrome_discovery_prefers_explicit_then_platform_then_path_then_defaults() {
-    let candidates = chrome_binary_candidates(Some("/explicit/chrome"), Some("/a:/b"), true);
+    let cache_root = unique_test_dir("chrome-discovery-cache-root");
+    let playwright_root = cache_root.join("ms-playwright");
+    fs::create_dir_all(playwright_root.join("chromium-2/chrome-linux64")).unwrap();
+    fs::create_dir_all(playwright_root.join("chromium-10/chrome-linux64")).unwrap();
+    fs::create_dir_all(playwright_root.join("chromium-10.1/chrome-linux64")).unwrap();
+    let candidates = chrome_binary_candidates(
+        Some("/explicit/chrome"),
+        Some("/a:/b"),
+        true,
+        Some(&cache_root),
+    );
     assert_eq!(candidates[0], PathBuf::from("/explicit/chrome"));
     assert_eq!(
         candidates[1],
@@ -362,6 +446,14 @@ fn chrome_discovery_prefers_explicit_then_platform_then_path_then_defaults() {
     assert_eq!(candidates[5], PathBuf::from("/a/chromium-browser"));
     assert_eq!(candidates[6], PathBuf::from("/b/google-chrome"));
     assert_eq!(candidates[10], PathBuf::from("/usr/bin/google-chrome"));
+    assert_eq!(
+        &candidates[candidates.len() - 3..],
+        [
+            playwright_root.join("chromium-10.1/chrome-linux64/chrome"),
+            playwright_root.join("chromium-10/chrome-linux64/chrome"),
+            playwright_root.join("chromium-2/chrome-linux64/chrome"),
+        ]
+    );
     let picked = chrome_binary_from_candidates(
         vec![
             PathBuf::from("/missing"),
@@ -372,15 +464,75 @@ fn chrome_discovery_prefers_explicit_then_platform_then_path_then_defaults() {
     )
     .unwrap();
     assert_eq!(picked, PathBuf::from("/found"));
+    fs::remove_dir_all(&cache_root).unwrap();
+}
+
+#[test]
+fn chrome_discovery_rejects_missing_and_non_executable_candidates() {
+    let root = unique_test_dir("chrome-discovery-executable-check");
+    let missing = root.join("missing");
+    let non_executable = root.join("non-executable");
+    let executable = root.join("executable");
+    fs::write(&non_executable, b"#!/bin/sh\n").unwrap();
+    let mut non_executable_permissions = fs::metadata(&non_executable).unwrap().permissions();
+    non_executable_permissions.set_mode(0o644);
+    fs::set_permissions(&non_executable, non_executable_permissions).unwrap();
+    fs::write(&executable, b"#!/bin/sh\n").unwrap();
+    let mut executable_permissions = fs::metadata(&executable).unwrap().permissions();
+    executable_permissions.set_mode(0o755);
+    fs::set_permissions(&executable, executable_permissions).unwrap();
+    let picked = chrome_binary_from_candidates(
+        vec![missing, non_executable, executable.clone()],
+        is_regular_executable,
+    )
+    .unwrap();
+    assert_eq!(picked, executable);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn chrome_discovery_keeps_explicit_before_path_candidates() {
+    let candidates = chrome_binary_candidates(Some("/explicit/chrome"), Some("/a:/b"), false, None);
+    assert_eq!(candidates[0], PathBuf::from("/explicit/chrome"));
+    assert_eq!(candidates[1], PathBuf::from("/a/google-chrome"));
+    assert_eq!(candidates[2], PathBuf::from("/a/google-chrome-stable"));
+    assert_eq!(candidates[3], PathBuf::from("/a/chromium"));
+    assert_eq!(candidates[4], PathBuf::from("/a/chromium-browser"));
+    assert_eq!(candidates[5], PathBuf::from("/b/google-chrome"));
+}
+
+#[test]
+fn browser_sandbox_disables_only_for_root_uid() {
+    assert!(browser_sandbox_enabled(1));
+    assert!(browser_sandbox_enabled(1000));
+    assert!(!browser_sandbox_enabled(0));
 }
 
 fn launch_browser(chrome_path: PathBuf) -> Browser {
     let options = LaunchOptionsBuilder::default()
         .path(Some(chrome_path))
         .headless(true)
+        .sandbox(browser_sandbox_enabled(effective_uid()))
         .build()
         .expect("build Chrome launch options");
     Browser::new(options).expect("launch Chrome")
+}
+
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
+}
+
+fn unique_test_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "kanban-chrome-test-{label}-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path).unwrap();
+    path
 }
 
 fn browser_loopback_reservation_supported() -> Result<(), String> {
