@@ -306,6 +306,28 @@ fn exact_score(document: &Document, query: &str, query_words: &[String]) -> f64 
         * 0.7
 }
 
+fn canonical_generated_id_query(query: &str) -> bool {
+    let query = query.trim();
+    let Some((prefix, suffix)) = query.split_once('-') else {
+        return false;
+    };
+    matches!(
+        prefix,
+        "t" | "e" | "s" | "d" | "sr" | "a" | "h" | "sub" | "r"
+    ) && suffix.len() == 8
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn result_is_eligible(query: &str, exact: f64, lexical: f64, semantic: f64) -> bool {
+    if canonical_generated_id_query(query) {
+        exact >= 0.9
+    } else {
+        exact > 0.0 || lexical > 0.0 || semantic >= 0.18
+    }
+}
+
 fn snippet(document: &Document, query_words: &[String]) -> String {
     let text = format!("{} — {}", document.title.trim(), document.body.trim());
     let lower = text.to_lowercase();
@@ -369,7 +391,7 @@ pub fn search(
         let exact = exact_score(&document, &options.query, &query_words);
         let lexical = lexical.get(&document.seq).copied().unwrap_or(0.0);
         let semantic = cosine(&query_vector, &vector);
-        if exact == 0.0 && lexical == 0.0 && semantic < 0.18 {
+        if !result_is_eligible(&options.query, exact, lexical, semantic) {
             continue;
         }
         let score = if exact >= 1.0 {
@@ -475,7 +497,7 @@ pub fn search_rules(rules: &[Rule], options: &SearchOptions) -> Vec<SearchResult
                     * 0.7
             };
             let semantic = cosine(&query_vector, &embed(&rule.body));
-            (exact > 0.0 || semantic >= 0.18).then(|| SearchResult {
+            result_is_eligible(&options.query, exact, 0.0, semantic).then(|| SearchResult {
                 board: "rules".to_owned(),
                 source_kind: "rule".to_owned(),
                 source_id: rule.id.clone(),
@@ -712,5 +734,43 @@ mod tests {
         let vector = embed("SQLite retrieval");
         assert_eq!(vector.len(), EMBEDDING_DIMS);
         assert_eq!(decode(&encode(&vector)), Some(vector));
+    }
+
+    #[test]
+    fn canonical_generated_id_queries_are_recognized_by_the_documented_shape() {
+        for prefix in ["t", "e", "s", "d", "sr", "a", "h", "sub", "r"] {
+            assert!(
+                canonical_generated_id_query(&format!("{prefix}-1234abcd")),
+                "{prefix}"
+            );
+        }
+        assert!(canonical_generated_id_query(" t-1234abcd "));
+        assert!(!canonical_generated_id_query("t-1234abc"));
+        assert!(!canonical_generated_id_query("t-1234abcg"));
+        assert!(!canonical_generated_id_query("t-1234ABCD"));
+        assert!(!canonical_generated_id_query("foo-bar"));
+        assert!(!canonical_generated_id_query("sub-12345678-extra"));
+        assert!(canonical_generated_id_query("r-1234abcd"));
+    }
+
+    #[test]
+    fn canonical_generated_id_queries_keep_only_literal_hits() {
+        assert!(result_is_eligible("sub-deadbeef", 0.95, 0.99, 0.99));
+        assert!(result_is_eligible("sub-deadbeef", 0.9, 0.0, 0.0));
+        assert!(!result_is_eligible("sub-deadbeef", 0.7, 0.99, 0.99));
+        assert!(!result_is_eligible("sub-deadbeef", 0.0, 0.99, 0.99));
+        assert!(!result_is_eligible("sub-deadbeef", 0.0, 0.3, 0.99));
+        assert!(result_is_eligible(
+            "keep old completed items",
+            0.0,
+            0.0,
+            0.19
+        ));
+        assert!(result_is_eligible(
+            "keep-old-completed-items",
+            0.0,
+            0.0,
+            0.19
+        ));
     }
 }
