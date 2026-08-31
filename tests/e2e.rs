@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -157,6 +157,7 @@ fn seed_legacy_rootless_duplicate(fixture: &Fixture, slug: &str, name: &str) {
 struct ServerGuard {
     child: Option<std::process::Child>,
     port: u16,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ServerGuard {
@@ -170,6 +171,9 @@ impl Drop for ServerGuard {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -385,6 +389,14 @@ fn browser_loopback_reservation_supported() -> Result<(), String> {
         .map_err(|error| format!("reserve loopback port for browser tests: {error}"))
 }
 
+fn server_ready_banner(port: u16) -> String {
+    format!("kanban serve: http://127.0.0.1:{port} (loopback only; front it with nginx)")
+}
+
+fn line_is_server_ready_banner(expected_banner: &str, line: &str) -> bool {
+    line == expected_banner
+}
+
 fn spawn_server(fixture: &Fixture) -> ServerGuard {
     let mut failures = Vec::new();
     for attempt in 0..16_u16 {
@@ -403,44 +415,88 @@ fn spawn_server(fixture: &Fixture) -> ServerGuard {
             .args(["serve", "--port", &port.to_string()])
             .spawn()
             .unwrap_or_else(|error| panic!("spawn kanban serve on {port}: {error}"));
+        let stderr = child.stderr.take().unwrap();
+        let expected_banner = server_ready_banner(port);
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_sink = Arc::clone(&stderr_lines);
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let stderr_thread = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                stderr_sink.lock().unwrap().push(line.clone());
+                if stderr_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
         let deadline = Instant::now() + Duration::from_secs(20);
-        let mut stderr = String::new();
         loop {
             if let Some(status) = child
                 .try_wait()
                 .unwrap_or_else(|error| panic!("wait on kanban serve candidate {port}: {error}"))
             {
-                if let Some(mut reader) = child.stderr.take() {
-                    let _ = reader.read_to_string(&mut stderr);
-                }
+                let _ = child.wait();
+                let _ = stderr_thread.join();
+                let stderr = stderr_lines.lock().unwrap().join("\n");
                 failures.push(format!(
                     "port {port} exited before readiness on attempt {attempt}: {status}: {stderr}"
                 ));
                 break;
             }
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                if let Some(status) = child.try_wait().unwrap_or_else(|error| {
-                    panic!("post-connect wait on kanban serve candidate {port}: {error}")
-                }) {
-                    if let Some(mut reader) = child.stderr.take() {
-                        let _ = reader.read_to_string(&mut stderr);
+            match stderr_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(line) => {
+                    if line_is_server_ready_banner(&expected_banner, &line) {
+                        match std::panic::catch_unwind(|| http_get(port, "/")) {
+                            Ok((status, _body)) if status == 200 => {
+                                return ServerGuard {
+                                    child: Some(child),
+                                    port,
+                                    stderr_thread: Some(stderr_thread),
+                                };
+                            }
+                            Ok((status, body)) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                let _ = stderr_thread.join();
+                                let stderr = stderr_lines.lock().unwrap().join("\n");
+                                failures.push(format!(
+                                    "port {port} printed readiness banner but GET / returned {status} on attempt {attempt}: {body}\n{stderr}"
+                                ));
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                let _ = stderr_thread.join();
+                                let stderr = stderr_lines.lock().unwrap().join("\n");
+                                failures.push(format!(
+                                    "port {port} printed readiness banner but GET / panicked on attempt {attempt}\n{stderr}"
+                                ));
+                                break;
+                            }
+                        }
                     }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stderr_thread.join();
+                    let stderr = stderr_lines.lock().unwrap().join("\n");
                     failures.push(format!(
-                        "port {port} connected but exited before usable readiness on attempt {attempt}: {status}: {stderr}"
+                        "port {port} stopped emitting stderr before readiness on attempt {attempt}: {stderr}"
                     ));
                     break;
                 }
-                return ServerGuard {
-                    child: Some(child),
-                    port,
-                };
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(mut reader) = child.stderr.take() {
-                    let _ = reader.read_to_string(&mut stderr);
-                }
+                let _ = stderr_thread.join();
+                let stderr = stderr_lines.lock().unwrap().join("\n");
                 failures.push(format!(
                     "port {port} timed out on attempt {attempt}: {stderr}"
                 ));
@@ -454,6 +510,27 @@ fn spawn_server(fixture: &Fixture) -> ServerGuard {
         failures.len(),
         failures.join("\n---\n")
     );
+}
+
+#[test]
+fn serve_readiness_banner_matches_exact_output() {
+    let port = 14200;
+    assert!(line_is_server_ready_banner(
+        &server_ready_banner(port),
+        &server_ready_banner(port)
+    ));
+    assert!(!line_is_server_ready_banner(
+        &server_ready_banner(port),
+        "kanban serve: http://127.0.0.1:14200/listening (loopback only; front it with nginx)"
+    ));
+    assert!(!line_is_server_ready_banner(
+        &server_ready_banner(port),
+        "tcp listener on 127.0.0.1:14200 is available"
+    ));
+    assert!(!line_is_server_ready_banner(
+        &server_ready_banner(port + 1),
+        &server_ready_banner(port)
+    ));
 }
 
 /// Return a current fixture to the exact pre-search schema shape before a
