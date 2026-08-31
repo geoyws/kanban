@@ -536,6 +536,30 @@ reads the append-only ledgers directly and leaves `kb events` as the newest-
 first snapshot view. `kb watch` uses the additive protocol-v1 envelope and the
 same fail-closed cursor rules described in ADR-031.
 
+Durable delivery intent is managed separately from the live process:
+
+```bash
+kb subscription add --project NAME --id sub-codex-queue \
+  --subject task:t-12345678 --kind checkpoint_added --tag orchestration \
+  --consumer codex.queue --action enqueue-turn \
+  --timeout-ms 30000 --max-retries 3 --rate-per-minute 60 \
+  --max-concurrency 1 --secret-ref codex_queue_token --as geo --json
+kb subscription list --project NAME --json
+kb subscription pause sub-codex-queue --project NAME --as geo --json
+kb subscription resume sub-codex-queue --project NAME --as geo --json
+```
+
+Subscriptions are board-local declarative records. The selected board is the
+board predicate; rows store no board path or root. Predicates, consumer/action
+names and numeric policy are normalized and validated fail-closed. The optional
+`secretRef` is a strict opaque lookup identifier, never a credential. There is
+no shell text, adapter argument list, token value, update, delete, delivery, or
+execution surface in this phase. Lifecycle mutations are audited on the board
+ledger, while `subscription list` and `subscription show` remain read-only
+request-response operations in the generated command schema. Delivery identity
+is `(subscriptionID,eventID)`; the later dispatcher resolves allow-listed
+consumer capabilities from host-local trusted configuration.
+
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google
 SSO at `https://kb.geoy.ws`; only `geoyws@gmail.com` is allowed, and the
@@ -560,6 +584,7 @@ Commands and subcommands have short forms:
 | `handoff` | `ls`=list · `new`=create · `acc`=accept |
 | `workspace` | `ls`=list · `att`=attach |
 | `sitrep` | `ls`=list · `new`=post |
+| `subscription` | `ls`=list · `new`=add · `cat`=show |
 
 ```bash
 kb t ls --status todo

@@ -5,8 +5,11 @@ use crate::db::{
 use crate::model::*;
 use crate::registry::now_ms;
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter, types::Type,
+};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -38,6 +41,49 @@ fn validate_rule_body(value: &str) -> Result<()> {
 fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     if !allowed.contains(&value) {
         bail!("invalid {label} {value}");
+    }
+    Ok(())
+}
+
+fn subscription_identifier(value: &str, label: &str, max: usize) -> Result<String> {
+    let value = nonempty(value, label)?;
+    if value.len() > max
+        || !value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "{label} must be at most {max} ASCII characters, start with a letter or digit, and contain only letters, digits, dot, underscore, or hyphen"
+        );
+    }
+    Ok(value.to_owned())
+}
+
+fn normalized_unique(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn validate_subscription_bounds(input: &AddSubscription) -> Result<()> {
+    if !(1..=300_000).contains(&input.timeout_ms) {
+        bail!("subscription timeout must be between 1 and 300000 milliseconds");
+    }
+    if !(0..=20).contains(&input.max_retries) {
+        bail!("subscription max retries must be between 0 and 20");
+    }
+    if !(1..=10_000).contains(&input.rate_per_minute) {
+        bail!("subscription rate per minute must be between 1 and 10000");
+    }
+    if !(1..=64).contains(&input.max_concurrency) {
+        bail!("subscription max concurrency must be between 1 and 64");
     }
     Ok(())
 }
@@ -422,6 +468,11 @@ fn parse_strings(text: String) -> Vec<String> {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+fn parse_subscription_strings(text: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&text)
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
+}
+
 fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: row.get("id")?,
@@ -475,6 +526,33 @@ fn deployment_row(row: &Row<'_>) -> rusqlite::Result<DeploymentAttempt> {
         completed_at: row.get("completed_at")?,
         archived: row.get::<_, i64>("archived")? != 0,
         archived_at: row.get("archived_at")?,
+    })
+}
+
+fn subscription_row(row: &Row<'_>) -> rusqlite::Result<Subscription> {
+    Ok(Subscription {
+        id: row.get("id")?,
+        protocol_version: row.get("protocol_version")?,
+        subject_task_id: row.get("subject_task_id")?,
+        relations: parse_subscription_strings(row.get("relations")?)?,
+        kinds: parse_subscription_strings(row.get("kinds")?)?,
+        prior_statuses: parse_subscription_strings(row.get("prior_statuses")?)?,
+        current_statuses: parse_subscription_strings(row.get("current_statuses")?)?,
+        tags: parse_subscription_strings(row.get("tags")?)?,
+        consumer_id: row.get("consumer_id")?,
+        action_id: row.get("action_id")?,
+        timeout_ms: row.get("timeout_ms")?,
+        max_retries: row.get("max_retries")?,
+        rate_per_minute: row.get("rate_per_minute")?,
+        max_concurrency: row.get("max_concurrency")?,
+        secret_ref: row.get("secret_ref")?,
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+        created_by: row.get("created_by")?,
+        updated_at: row.get("updated_at")?,
+        updated_by: row.get("updated_by")?,
+        paused_at: row.get("paused_at")?,
+        paused_by: row.get("paused_by")?,
     })
 }
 
@@ -629,6 +707,56 @@ fn require_active_task(connection: &Connection, id: &str) -> Result<Task> {
         bail!("task {id} is archived history and cannot be changed");
     }
     Ok(task)
+}
+
+fn board_event_kind_exists(connection: &Connection, kind: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE kind=?)",
+        [kind],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn watch_subject_exists_on(connection: &Connection, id: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(\
+             SELECT 1 FROM tasks WHERE id=?1 \
+             UNION ALL \
+             SELECT 1 FROM events WHERE task_id=?1 \
+             LIMIT 1\
+         )",
+        [id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn watch_relation_target_exists_on(connection: &Connection, kind: &str, id: &str) -> Result<bool> {
+    let current = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?)",
+        [id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if current {
+        return Ok(true);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(\
+             SELECT 1 \
+             FROM events, \
+                  json_each(\
+                      CASE WHEN json_valid(events.payload) \
+                           THEN CASE WHEN json_type(events.payload,'$._semanticV1.relations')='array' \
+                                     THEN json_extract(events.payload,'$._semanticV1.relations') \
+                                     ELSE '[]' END \
+                           ELSE '[]' END\
+                  ) relation \
+             WHERE relation.type='object' \
+               AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.kind')=?1 \
+               AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.id')=?2\
+         )",
+        params![kind, id],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 fn dependencies(connection: &Connection, task_id: &str) -> Result<Vec<Task>> {
@@ -1076,6 +1204,254 @@ impl Store {
         crate::search::health(&self.connection)
     }
 
+    pub fn add_subscription(&mut self, input: AddSubscription) -> Result<Subscription> {
+        validate_subscription_bounds(&input)?;
+        let actor = nonempty(&input.actor, "actor")?.to_owned();
+        let consumer_id = subscription_identifier(&input.consumer_id, "consumer id", 64)?;
+        let action_id = subscription_identifier(&input.action_id, "action id", 64)?;
+        let secret_ref = input
+            .secret_ref
+            .as_deref()
+            .map(|value| subscription_identifier(value, "secret reference", 128))
+            .transpose()?;
+        let id = match input.id.as_deref() {
+            Some(value) => subscription_identifier(value, "subscription id", 64)?,
+            None => {
+                let random = Uuid::new_v4().simple().to_string();
+                format!("sub-{}", &random[..8])
+            }
+        };
+        if !id.starts_with("sub-") || id.len() == 4 {
+            bail!("subscription id must start with sub- and include a suffix");
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let subject_task_id = input
+            .subject_task_id
+            .as_deref()
+            .map(|value| nonempty(value, "subscription subject task id").map(str::to_owned))
+            .transpose()?;
+        if let Some(subject) = subject_task_id.as_deref()
+            && !watch_subject_exists_on(&transaction, subject)?
+        {
+            bail!(
+                "subscription subject task {subject} not found in current or historical board state"
+            );
+        }
+
+        let mut relations = Vec::new();
+        for relation in normalized_unique(&input.relations) {
+            let (kind, target) = relation
+                .split_once(':')
+                .context("subscription relation must be KIND:ID")?;
+            validate(
+                kind,
+                &["parent", "ancestor", "depends-on"],
+                "subscription relation kind",
+            )?;
+            if target.trim().is_empty() || target != target.trim() {
+                bail!("subscription relation target is required");
+            }
+            if !watch_relation_target_exists_on(&transaction, kind, target)? {
+                bail!(
+                    "subscription relation target {kind}:{target} not found in current or historical board state"
+                );
+            }
+            relations.push(format!("{kind}:{target}"));
+        }
+
+        let kinds = normalized_unique(&input.kinds);
+        for kind in &kinds {
+            nonempty(kind, "subscription event kind")?;
+            if !BOARD_EVENT_KINDS.contains(&kind.as_str())
+                && !board_event_kind_exists(&transaction, kind)?
+            {
+                bail!("subscription event kind {kind} not found in this board's event history");
+            }
+        }
+        let prior_statuses = normalized_unique(&input.prior_statuses);
+        for status in &prior_statuses {
+            validate(status, &TASK_STATUSES, "subscription prior status")?;
+        }
+        let current_statuses = normalized_unique(&input.current_statuses);
+        for status in &current_statuses {
+            validate(status, &TASK_STATUSES, "subscription current status")?;
+        }
+        let tags = validate_registered_tags(
+            &transaction,
+            &normalized_unique(&input.tags),
+            "subscription",
+        )?;
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO subscriptions(id,protocol_version,subject_task_id,relations,kinds,prior_statuses,current_statuses,tags,consumer_id,action_id,timeout_ms,max_retries,rate_per_minute,max_concurrency,secret_ref,status,created_at,created_by,updated_at,updated_by,paused_at,paused_by) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active',?,?,?,?,NULL,NULL)",
+            params![
+                id,
+                subject_task_id,
+                serde_json::to_string(&relations)?,
+                serde_json::to_string(&kinds)?,
+                serde_json::to_string(&prior_statuses)?,
+                serde_json::to_string(&current_statuses)?,
+                serde_json::to_string(&tags)?,
+                consumer_id,
+                action_id,
+                input.timeout_ms,
+                input.max_retries,
+                input.rate_per_minute,
+                input.max_concurrency,
+                secret_ref,
+                now,
+                actor,
+                now,
+                actor,
+            ],
+        )?;
+        event(
+            &transaction,
+            None,
+            "subscription_added",
+            Some(&actor),
+            json!({
+                "subscriptionID": id,
+                "protocolVersion": SUBSCRIPTION_PROTOCOL_VERSION,
+                "subjectTaskID": subject_task_id,
+                "relations": relations,
+                "kinds": kinds,
+                "priorStatuses": prior_statuses,
+                "currentStatuses": current_statuses,
+                "tags": tags,
+                "consumerID": consumer_id,
+                "actionID": action_id,
+                "timeoutMs": input.timeout_ms,
+                "maxRetries": input.max_retries,
+                "ratePerMinute": input.rate_per_minute,
+                "maxConcurrency": input.max_concurrency,
+            }),
+        )?;
+        let result = transaction.query_row(
+            "SELECT * FROM subscriptions WHERE id=?",
+            [&id],
+            subscription_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn require_subscription(&self, id: &str) -> Result<Subscription> {
+        self.connection
+            .query_row(
+                "SELECT * FROM subscriptions WHERE id=?",
+                [id],
+                subscription_row,
+            )
+            .optional()?
+            .with_context(|| format!("subscription {id} not found"))
+    }
+
+    pub fn subscriptions(
+        &self,
+        status: Option<&str>,
+        consumer_id: Option<&str>,
+        include_paused: bool,
+    ) -> Result<Vec<Subscription>> {
+        if let Some(status) = status {
+            validate(status, &SUBSCRIPTION_STATUSES, "subscription status")?;
+        }
+        if let Some(consumer) = consumer_id {
+            subscription_identifier(consumer, "consumer id", 64)?;
+        }
+        let mut sql = String::from("SELECT * FROM subscriptions WHERE 1=1");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(status) = status {
+            sql.push_str(" AND status=?");
+            values.push(Box::new(status.to_owned()));
+        } else if !include_paused {
+            sql.push_str(" AND status='active'");
+        }
+        if let Some(consumer) = consumer_id {
+            sql.push_str(" AND consumer_id=?");
+            values.push(Box::new(consumer.to_owned()));
+        }
+        sql.push_str(" ORDER BY created_at,id");
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            subscription_row,
+        );
+        rows?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn set_subscription_paused(
+        &mut self,
+        id: &str,
+        paused: bool,
+        actor: &str,
+    ) -> Result<Subscription> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT * FROM subscriptions WHERE id=?",
+                [id],
+                subscription_row,
+            )
+            .optional()?
+            .with_context(|| format!("subscription {id} not found"))?;
+        let desired = if paused { "paused" } else { "active" };
+        if current.status == desired {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE subscriptions SET status=?,updated_at=?,updated_by=?,paused_at=?,paused_by=? WHERE id=?",
+            params![
+                desired,
+                now,
+                actor,
+                paused.then_some(now),
+                paused.then_some(actor.as_str()),
+                id
+            ],
+        )?;
+        event(
+            &transaction,
+            None,
+            if paused {
+                "subscription_paused"
+            } else {
+                "subscription_resumed"
+            },
+            Some(&actor),
+            json!({
+                "subscriptionID": id,
+                "consumerID": current.consumer_id,
+                "actionID": current.action_id,
+            }),
+        )?;
+        let result = transaction.query_row(
+            "SELECT * FROM subscriptions WHERE id=?",
+            [id],
+            subscription_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn pause_subscription(&mut self, id: &str, actor: &str) -> Result<Subscription> {
+        self.set_subscription_paused(id, true, actor)
+    }
+
+    pub fn resume_subscription(&mut self, id: &str, actor: &str) -> Result<Subscription> {
+        self.set_subscription_paused(id, false, actor)
+    }
+
     /// Retire leases that have run out, before anything reads the board.
     ///
     /// Expiry used to happen only inside `claim` and `accept_handoff`, so a
@@ -1333,58 +1709,20 @@ impl Store {
     }
 
     pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE kind=?)",
-            [kind],
-            |row| row.get::<_, i64>(0),
-        )? != 0)
+        board_event_kind_exists(&self.connection, kind)
     }
 
     /// A watch selector may name a task that has since been removed, but a
     /// typo must not read as an authoritative empty stream.
     pub fn watch_subject_exists(&self, id: &str) -> Result<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(\
-                 SELECT 1 FROM tasks WHERE id=?1 \
-                 UNION ALL \
-                 SELECT 1 FROM events WHERE task_id=?1 \
-                 LIMIT 1\
-             )",
-            [id],
-            |row| row.get::<_, i64>(0),
-        )? != 0)
+        watch_subject_exists_on(&self.connection, id)
     }
 
     /// Relation predicates accept current task identities and exact targets
     /// retained in semantic history. Unknown IDs fail closed, while removed
     /// parents and dependencies remain replayable.
     pub fn watch_relation_target_exists(&self, kind: &str, id: &str) -> Result<bool> {
-        let current = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?)",
-            [id],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        if current {
-            return Ok(true);
-        }
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(\
-                 SELECT 1 \
-                 FROM events, \
-                      json_each(\
-                          CASE WHEN json_valid(events.payload) \
-                               THEN CASE WHEN json_type(events.payload,'$._semanticV1.relations')='array' \
-                                         THEN json_extract(events.payload,'$._semanticV1.relations') \
-                                         ELSE '[]' END \
-                               ELSE '[]' END\
-                      ) relation \
-                 WHERE relation.type='object' \
-                   AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.kind')=?1 \
-                   AND json_extract(CASE WHEN relation.type='object' THEN relation.value ELSE '{}' END,'$.id')=?2\
-             )",
-            params![kind, id],
-            |row| row.get::<_, i64>(0),
-        )? != 0)
+        watch_relation_target_exists_on(&self.connection, kind, id)
     }
 
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
@@ -3783,6 +4121,265 @@ mod tests {
 
     fn board_event_seqs(events: &[Event]) -> Vec<i64> {
         events.iter().map(|event| event.seq).collect()
+    }
+
+    fn subscription_input(id: &str) -> AddSubscription {
+        AddSubscription {
+            id: Some(id.into()),
+            subject_task_id: Some("t-subject".into()),
+            relations: vec!["parent:t-parent".into()],
+            kinds: vec!["board_initialized".into()],
+            prior_statuses: vec!["todo".into()],
+            current_statuses: vec!["in_progress".into()],
+            tags: vec!["pubsub".into()],
+            consumer_id: "codex.queue".into(),
+            action_id: "enqueue-turn".into(),
+            timeout_ms: 30_000,
+            max_retries: 3,
+            rate_per_minute: 60,
+            max_concurrency: 1,
+            secret_ref: Some("codex_queue_token".into()),
+            actor: "test@driver".into(),
+        }
+    }
+
+    fn subscription_store(name: &str) -> Store {
+        let mut store = test_store(name);
+        store.initialize(name, "test@driver").unwrap();
+        store.add_tag("pubsub", None, Some("test@driver")).unwrap();
+        insert_task(&store, "t-subject");
+        insert_task(&store, "t-parent");
+        store
+    }
+
+    #[test]
+    fn subscriptions_are_normalized_audited_and_secret_values_never_enter_events() {
+        let mut store = subscription_store("subscriptions-lifecycle");
+        let mut input = subscription_input("sub-unit");
+        input.relations.push("parent:t-parent".into());
+        input.kinds = vec!["subscription_resumed".into(), "checkpoint_added".into()];
+        input.tags.push("pubsub".into());
+        let added = store.add_subscription(input).unwrap();
+        assert_eq!(added.protocol_version, SUBSCRIPTION_PROTOCOL_VERSION);
+        assert_eq!(added.relations, vec!["parent:t-parent"]);
+        assert_eq!(
+            added.kinds,
+            vec!["checkpoint_added", "subscription_resumed"]
+        );
+        assert_eq!(added.tags, vec!["pubsub"]);
+        assert_eq!(added.secret_ref.as_deref(), Some("codex_queue_token"));
+        assert_eq!(
+            store.subscriptions(None, None, false).unwrap(),
+            vec![added.clone()]
+        );
+        assert_eq!(
+            store
+                .subscriptions(Some("active"), Some("codex.queue"), true)
+                .unwrap(),
+            vec![added.clone()]
+        );
+        assert!(store.subscriptions(Some("unknown"), None, true).is_err());
+        assert!(store.subscriptions(None, Some("../../bad"), true).is_err());
+
+        let add_event = store
+            .events(None, Some("subscription_added"), 1, true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let encoded = add_event.payload.to_string();
+        assert!(!encoded.contains("secretRef"), "{encoded}");
+        assert!(!encoded.contains("codex_queue_token"), "{encoded}");
+        assert_eq!(add_event.payload["_semanticV1"], Value::Null);
+
+        let paused = store.pause_subscription("sub-unit", "test@driver").unwrap();
+        assert_eq!(paused.status, "paused");
+        assert!(store.subscriptions(None, None, false).unwrap().is_empty());
+        assert_eq!(store.subscriptions(None, None, true).unwrap().len(), 1);
+        let paused_again = store.pause_subscription("sub-unit", "test@driver").unwrap();
+        assert_eq!(paused_again, paused);
+        assert_eq!(
+            store
+                .events(None, Some("subscription_paused"), 10, true)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let resumed = store
+            .resume_subscription("sub-unit", "test@driver")
+            .unwrap();
+        assert_eq!(resumed.status, "active");
+        assert!(resumed.paused_at.is_none());
+        assert!(resumed.paused_by.is_none());
+        assert!(store.audit().unwrap().healthy);
+    }
+
+    #[test]
+    fn subscription_validation_fails_closed_for_every_untrusted_field_family() {
+        let mut store = subscription_store("subscriptions-invalid");
+        type InvalidCase = (&'static str, fn(&mut AddSubscription));
+        let cases: Vec<InvalidCase> = vec![
+            ("subject", |input| {
+                input.subject_task_id = Some("missing".into())
+            }),
+            ("relation kind", |input| {
+                input.relations = vec!["child:t-parent".into()]
+            }),
+            ("relation target", |input| {
+                input.relations = vec!["parent:missing".into()]
+            }),
+            ("empty relation target", |input| {
+                input.relations = vec!["parent:".into()]
+            }),
+            ("event kind", |input| {
+                input.kinds = vec!["never_happened".into()]
+            }),
+            ("prior status", |input| {
+                input.prior_statuses = vec!["running".into()]
+            }),
+            ("current status", |input| {
+                input.current_statuses = vec!["running".into()]
+            }),
+            ("tag", |input| input.tags = vec!["unknown".into()]),
+            ("consumer", |input| {
+                input.consumer_id = "../../bin/sh".into()
+            }),
+            ("action", |input| input.action_id = "run command".into()),
+            ("secret", |input| {
+                input.secret_ref = Some("env:TOKEN".into())
+            }),
+            ("id prefix", |input| input.id = Some("bad-id".into())),
+            ("id suffix", |input| input.id = Some("sub-".into())),
+            ("timeout", |input| input.timeout_ms = 0),
+            ("retries", |input| input.max_retries = 21),
+            ("rate", |input| input.rate_per_minute = 0),
+            ("concurrency", |input| input.max_concurrency = 65),
+        ];
+        for (index, (label, mutate)) in cases.into_iter().enumerate() {
+            let mut input = subscription_input(&format!("sub-invalid-{index}"));
+            mutate(&mut input);
+            assert!(
+                store.add_subscription(input).is_err(),
+                "{label} was accepted"
+            );
+        }
+        assert!(store.subscriptions(None, None, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn subscription_identity_is_immutable_and_collisions_fail() {
+        let mut store = subscription_store("subscriptions-identity");
+        store
+            .add_subscription(subscription_input("sub-stable"))
+            .unwrap();
+        let error = store
+            .add_subscription(subscription_input("sub-stable"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("UNIQUE") || error.contains("unique"),
+            "{error}"
+        );
+        assert_eq!(
+            store.require_subscription("sub-stable").unwrap().id,
+            "sub-stable"
+        );
+        assert!(store.require_subscription("sub-missing").is_err());
+
+        let mut generated_input = subscription_input("sub-unused");
+        generated_input.id = None;
+        let generated = store.add_subscription(generated_input).unwrap();
+        assert!(generated.id.starts_with("sub-"), "{}", generated.id);
+    }
+
+    #[test]
+    fn subscription_storage_faults_fail_closed_and_surface_the_database_error() {
+        let mut kind_store = subscription_store("subscriptions-broken-kind-ledger");
+        kind_store
+            .connection
+            .execute_batch("DROP TABLE events;")
+            .unwrap();
+        let mut kind_input = subscription_input("sub-broken-kind");
+        kind_input.subject_task_id = None;
+        kind_input.relations.clear();
+        kind_input.kinds = vec!["extension_kind".into()];
+        assert!(kind_store.add_subscription(kind_input).is_err());
+
+        let mut subject_store = subscription_store("subscriptions-broken-subject-ledger");
+        subject_store
+            .connection
+            .execute_batch("DROP TABLE tasks;")
+            .unwrap();
+        assert!(
+            subject_store
+                .add_subscription(subscription_input("sub-broken-subject"))
+                .is_err()
+        );
+
+        let mut current_relation_store =
+            subscription_store("subscriptions-broken-current-relation");
+        current_relation_store
+            .connection
+            .execute_batch("DROP TABLE tasks;")
+            .unwrap();
+        let mut current_relation = subscription_input("sub-broken-current-relation");
+        current_relation.subject_task_id = None;
+        assert!(
+            current_relation_store
+                .add_subscription(current_relation)
+                .is_err()
+        );
+
+        let mut historical_relation_store =
+            subscription_store("subscriptions-broken-historical-relation");
+        historical_relation_store
+            .connection
+            .execute_batch("DELETE FROM tasks WHERE id='t-parent'; DROP TABLE events;")
+            .unwrap();
+        let mut historical_relation = subscription_input("sub-broken-historical-relation");
+        historical_relation.subject_task_id = None;
+        assert!(
+            historical_relation_store
+                .add_subscription(historical_relation)
+                .is_err()
+        );
+
+        let mut add_event_store = subscription_store("subscriptions-broken-add-event");
+        add_event_store
+            .connection
+            .execute_batch("DROP TABLE events;")
+            .unwrap();
+        let mut add_event = subscription_input("sub-broken-add-event");
+        add_event.subject_task_id = None;
+        add_event.kinds.clear();
+        assert!(add_event_store.add_subscription(add_event).is_err());
+
+        let mut pause_event_store = subscription_store("subscriptions-broken-pause-event");
+        pause_event_store
+            .add_subscription(subscription_input("sub-broken-pause-event"))
+            .unwrap();
+        pause_event_store
+            .connection
+            .execute_batch("DROP TABLE events;")
+            .unwrap();
+        assert!(
+            pause_event_store
+                .pause_subscription("sub-broken-pause-event", "test@driver")
+                .is_err()
+        );
+
+        let mut malformed_row_store = subscription_store("subscriptions-malformed-row");
+        malformed_row_store
+            .add_subscription(subscription_input("sub-malformed-row"))
+            .unwrap();
+        malformed_row_store
+            .connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints=ON;\
+                 UPDATE subscriptions SET relations='not-json' WHERE id='sub-malformed-row';",
+            )
+            .unwrap();
+        assert!(malformed_row_store.subscriptions(None, None, true).is_err());
     }
 
     #[test]

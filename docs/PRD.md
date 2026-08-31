@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** George
-**Updated:** 2026-08-16
+**Updated:** 2026-08-31
 
 ## Product statement
 
@@ -27,6 +27,9 @@ and transfer work to a replacement agent when context or tokens run low.
    with additive protocol-v1 event payloads and fail-closed cursor semantics,
    while keeping `kb events` as the newest-first snapshot reader and `/live`
    as compatibility invalidation for the served UI.
+9. Persist board-local declarative subscriptions with immutable identity,
+   fail-closed predicates, bounded consumer policy, and secret references only,
+   before any external dispatcher is allowed to execute them.
 
 ## Non-goals
 
@@ -86,6 +89,11 @@ write domains.
   keeping board semantic watch predicates off the registry scope.
 - Keep ordinary search read-only. Index repair and semantic-cache persistence
   must be explicit, audited operations covered by backup and doctor workflows.
+- Manage subscription add/list/show/pause/resume through the compiled CLI and
+  generated schema. Store only normalized selection predicates, named
+  consumer/action identifiers, bounded timeout/retry/rate/concurrency policy,
+  and an optional opaque secret reference. Store no root, path, shell text,
+  executable argument, credential, raw token, cursor, or delivery state.
 
 ### P0 — first usable slice
 
@@ -146,6 +154,8 @@ A handoff is valid only when:
 - Secrets and lease tokens do not appear in notes, checkpoints, handoffs, or
   rendered model context.
 - Every mutation has an actor and an auditable event.
+- Subscription lifecycle audit events omit even the opaque secret reference;
+  executable capabilities remain in host-local trusted configuration.
 
 ## Success measures
 
@@ -157,6 +167,9 @@ A handoff is valid only when:
 - A saved watch cursor resumes the same ledger scope after restart and rejects
   mismatched or future cursors. Removed subjects and historical relation
   targets remain replayable.
+- A subscription created on one board is invisible on every other board;
+  pause/resume preserves its immutable ID and `(subscriptionID,eventID)` is the
+  later dispatcher's deduplication identity.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
 
@@ -172,6 +185,8 @@ A handoff is valid only when:
    token-threshold integration.
 5. **Personal UI:** fast portfolio and project board views.
 6. **Optional mobility:** encrypted operator-only cross-host transport.
+7. **Durable dispatch control plane:** board-local subscription declarations,
+   followed by an external capability-gated dispatcher and fake adapter proof.
 
 ## Current delivery status
 

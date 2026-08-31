@@ -132,6 +132,7 @@ Scoped to their group:
 | `tag` | `ls`=list `rm`=remove `new`=add |
 | `rule` | `ls`=list `new`=add `up`=update `cat`=show |
 | `sitrep` | `ls`=list `new`=post |
+| `subscription` | `ls`=list `new`=add `cat`=show |
 
 ⚠ `att` means **attach** inside `workspace` and **attention** at the top level.
 Both are exact-match and scoped, so they never collide — but read
@@ -634,6 +635,43 @@ Rules:
 - Secrets are redacted recursively before emission.
 - `payload` stays the existing event JSON, including `seq` as the ledger row
   number.
+
+## Subscription records — durable declarations, not execution
+
+Use `kb subscription add|list|show|pause|resume` to manage one board's durable
+delivery intent. The addressed board is the tenancy predicate; do not put a
+board path or root in the record.
+
+```bash
+kb subscription add --project NAME --id sub-codex-queue \
+  --subject task:t-12345678 --kind checkpoint_added --tag orchestration \
+  --consumer codex.queue --action enqueue-turn \
+  --timeout-ms 30000 --max-retries 3 --rate-per-minute 60 \
+  --max-concurrency 1 --secret-ref codex_queue_token --as geo --json
+kb subscription list --project NAME --json
+kb subscription show sub-codex-queue --project NAME --json
+kb subscription pause sub-codex-queue --project NAME --as geo --json
+kb subscription resume sub-codex-queue --project NAME --as geo --json
+```
+
+Rules:
+
+- IDs are immutable `sub-*` identities. There is no update or delete command.
+- `--subject` accepts only `task:ID`. `--relation`, `--kind`,
+  `--prior-status`, `--current-status`, and `--tag` are repeatable, normalized
+  predicates; unknown values fail closed.
+- `--consumer` and `--action` are strict names, not executable commands.
+- Timeout, retries, rate, and concurrency are required and bounded.
+- `--secret-ref` is an optional opaque identifier containing only ASCII
+  letters, digits, dot, underscore, and hyphen. Never pass a credential or raw
+  token value.
+- Rows contain no root, board path, shell text, adapter arguments, credentials,
+  delivery acknowledgement, cursor, or dead-letter state.
+- Add/pause/resume append audited board events; their payloads omit the secret
+  reference. List/show are read-only request-response operations.
+- Delivery identity is `(subscriptionID,eventID)`. Actual capability lookup,
+  locking, invocation, acknowledgement, retry, and dead-letter behavior belong
+  to the later dispatcher phase and host-local trusted configuration.
 
 ## Archival — bounded hot indexes, intact history
 

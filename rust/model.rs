@@ -49,6 +49,106 @@ pub struct Rule {
     pub source_rule_id: Option<String>,
 }
 
+pub const SUBSCRIPTION_STATUSES: [&str; 2] = ["active", "paused"];
+pub const SUBSCRIPTION_PROTOCOL_VERSION: i64 = 1;
+
+/// Event kinds emitted by the compiled board ledger.
+///
+/// Watch and durable subscriptions share this source of truth so a consumer
+/// can select a built-in kind before that kind has occurred on a new board.
+pub const BOARD_EVENT_KINDS: &[&str] = &[
+    "archive_swept",
+    "attention_raised",
+    "attention_reopened",
+    "attention_resolved",
+    "attention_updated",
+    "board_initialized",
+    "claim_expired",
+    "claim_heartbeat",
+    "claim_released",
+    "checkpoint_added",
+    "deployment_abandoned",
+    "deployment_finished",
+    "deployment_started",
+    "epic_advanced",
+    "handoff_accepted",
+    "handoff_created",
+    "lease_seized",
+    "note_added",
+    "rule_consolidated",
+    "rule_retired",
+    "search_rebuilt",
+    "sitrep_posted",
+    "snapshot_restored",
+    "story_advanced",
+    "story_signed_off",
+    "story_signoff_revoked",
+    "subscription_added",
+    "subscription_paused",
+    "subscription_resumed",
+    "tag_added",
+    "tag_removed",
+    "task_added",
+    "task_claimed",
+    "task_created",
+    "task_metadata_patched",
+    "task_moved",
+    "task_removed",
+    "task_updated",
+    "tasks_imported",
+];
+
+/// One durable, declarative consumer selection for exactly one board.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Subscription {
+    pub id: String,
+    pub protocol_version: i64,
+    #[serde(rename = "subjectTaskID")]
+    pub subject_task_id: Option<String>,
+    pub relations: Vec<String>,
+    pub kinds: Vec<String>,
+    pub prior_statuses: Vec<String>,
+    pub current_statuses: Vec<String>,
+    pub tags: Vec<String>,
+    #[serde(rename = "consumerID")]
+    pub consumer_id: String,
+    #[serde(rename = "actionID")]
+    pub action_id: String,
+    pub timeout_ms: i64,
+    pub max_retries: i64,
+    pub rate_per_minute: i64,
+    pub max_concurrency: i64,
+    /// Opaque host-local lookup name, never a credential value.
+    pub secret_ref: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub created_by: String,
+    pub updated_at: i64,
+    pub updated_by: String,
+    pub paused_at: Option<i64>,
+    pub paused_by: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddSubscription {
+    pub id: Option<String>,
+    pub subject_task_id: Option<String>,
+    pub relations: Vec<String>,
+    pub kinds: Vec<String>,
+    pub prior_statuses: Vec<String>,
+    pub current_statuses: Vec<String>,
+    pub tags: Vec<String>,
+    pub consumer_id: String,
+    pub action_id: String,
+    pub timeout_ms: i64,
+    pub max_retries: i64,
+    pub rate_per_minute: i64,
+    pub max_concurrency: i64,
+    pub secret_ref: Option<String>,
+    pub actor: String,
+}
+
 /// The always-carried table-of-contents entry for a rule.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

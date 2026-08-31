@@ -952,6 +952,42 @@ CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
 END;
 "#;
 
+/// Board-local declarative pub/sub subscriptions (ADR-031).
+///
+/// The addressed board is the tenancy boundary, so rows store no root or
+/// path. Execution arguments, credentials, and delivery state belong to the
+/// later dispatcher phase and are deliberately absent.
+const BOARD_V21: &str = r#"
+CREATE TABLE subscriptions (
+ id TEXT PRIMARY KEY NOT NULL,
+ protocol_version INTEGER NOT NULL CHECK(protocol_version=1),
+ subject_task_id TEXT,
+ relations TEXT NOT NULL CHECK(json_valid(relations) AND json_type(relations)='array'),
+ kinds TEXT NOT NULL CHECK(json_valid(kinds) AND json_type(kinds)='array'),
+ prior_statuses TEXT NOT NULL CHECK(json_valid(prior_statuses) AND json_type(prior_statuses)='array'),
+ current_statuses TEXT NOT NULL CHECK(json_valid(current_statuses) AND json_type(current_statuses)='array'),
+ tags TEXT NOT NULL CHECK(json_valid(tags) AND json_type(tags)='array'),
+ consumer_id TEXT NOT NULL,
+ action_id TEXT NOT NULL,
+ timeout_ms INTEGER NOT NULL CHECK(timeout_ms BETWEEN 1 AND 300000),
+ max_retries INTEGER NOT NULL CHECK(max_retries BETWEEN 0 AND 20),
+ rate_per_minute INTEGER NOT NULL CHECK(rate_per_minute BETWEEN 1 AND 10000),
+ max_concurrency INTEGER NOT NULL CHECK(max_concurrency BETWEEN 1 AND 64),
+ secret_ref TEXT,
+ status TEXT NOT NULL CHECK(status IN ('active','paused')),
+ created_at INTEGER NOT NULL,
+ created_by TEXT NOT NULL,
+ updated_at INTEGER NOT NULL,
+ updated_by TEXT NOT NULL,
+ paused_at INTEGER,
+ paused_by TEXT,
+ CHECK((status='active' AND paused_at IS NULL AND paused_by IS NULL) OR
+       (status='paused' AND paused_at IS NOT NULL AND paused_by IS NOT NULL))
+) STRICT;
+CREATE INDEX idx_subscriptions_status ON subscriptions(status,created_at,id);
+CREATE INDEX idx_subscriptions_consumer ON subscriptions(consumer_id,status,created_at,id);
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1125,7 +1161,7 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 20;
+pub const BOARD_SCHEMA_VERSION: usize = 21;
 pub const REGISTRY_SCHEMA_VERSION: usize = 11;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1333,7 +1369,7 @@ pub fn open_board(path: &Path) -> Result<Connection> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21,
 ];
 
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.

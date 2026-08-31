@@ -48,6 +48,14 @@ Usage:
              [--relation KIND:ID ...] [--prior-status STATUS ...]
              [--current-status STATUS ...] [--tag NAME ...]
              [--cursor TOKEN|0] [--follow] [--all] [--limit N] [--json]
+  kanban subscription add --consumer NAME --action NAME --timeout-ms N
+             --max-retries N --rate-per-minute N --max-concurrency N --as ACTOR
+             [--id ID] [--subject task:ID] [--relation KIND:ID ...]
+             [--kind KIND ...] [--prior-status STATUS ...]
+             [--current-status STATUS ...] [--tag NAME ...] [--secret-ref NAME] [--json]
+  kanban subscription list [--status active|paused] [--consumer NAME] [--all] [--json]
+  kanban subscription show ID [--json]
+  kanban subscription pause|resume ID --as ACTOR [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
   kanban deploy start --repo REPO --commit FULL_SHA --tier TIER --environment NAME
@@ -200,6 +208,9 @@ pub(crate) const REPEATABLE: [&str; 6] = [
 pub(crate) const WATCH_REPEATABLE: [&str; 4] =
     ["kind", "relation", "prior-status", "current-status"];
 
+pub(crate) const SUBSCRIPTION_REPEATABLE: [&str; 4] =
+    ["kind", "relation", "prior-status", "current-status"];
+
 /// Commands that are processes rather than operations.
 ///
 /// `mcp` and `serve` block until killed. That makes them meaningless as tool
@@ -342,6 +353,39 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         true,
     ),
     ("deploy", Some("current"), &[], &[], true),
+    (
+        "subscription",
+        Some("add"),
+        &[
+            "id",
+            "subject",
+            "relation",
+            "kind",
+            "prior-status",
+            "current-status",
+            "tag",
+            "consumer",
+            "action",
+            "timeout-ms",
+            "max-retries",
+            "rate-per-minute",
+            "max-concurrency",
+            "secret-ref",
+            "as",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "subscription",
+        Some("list"),
+        &["status", "consumer", "all"],
+        &[],
+        true,
+    ),
+    ("subscription", Some("show"), &[], &["id"], true),
+    ("subscription", Some("pause"), &["as"], &["id"], false),
+    ("subscription", Some("resume"), &["as"], &["id"], false),
     ("restore", None, &["from", "force", "as"], &[], false),
     (
         "task",
@@ -657,7 +701,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 11] = [
+const SUBCOMMAND_GROUPS: [&str; 12] = [
     "task",
     "story",
     "handoff",
@@ -669,6 +713,7 @@ const SUBCOMMAND_GROUPS: [&str; 11] = [
     "sitrep",
     "audit",
     "deploy",
+    "subscription",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -730,6 +775,9 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("sitrep", "new") => "post",
         ("deploy", "ls") => "list",
         ("deploy", "cat") => "show",
+        ("subscription", "ls") => "list",
+        ("subscription", "new") => "add",
+        ("subscription", "cat") => "show",
         (_, other) => other,
     }
 }
@@ -937,7 +985,9 @@ impl Args {
             .iter()
             .filter(|(name, values)| {
                 let repeatable = REPEATABLE.contains(&name.as_str())
-                    || (command == Some("watch") && WATCH_REPEATABLE.contains(&name.as_str()));
+                    || (command == Some("watch") && WATCH_REPEATABLE.contains(&name.as_str()))
+                    || (command == Some("subscription")
+                        && SUBSCRIPTION_REPEATABLE.contains(&name.as_str()));
                 values.len() > 1 && !repeatable
             })
             .map(|(name, values)| format!("--{name} ({})", values.join(", ")))
@@ -1215,6 +1265,7 @@ pub(crate) fn schema() -> Value {
                 .map(|flag| {
                     let kind = if REPEATABLE.contains(flag)
                         || (*command == "watch" && WATCH_REPEATABLE.contains(flag))
+                        || (*command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag))
                     {
                         "list"
                     } else if BOOLEAN.contains(flag) {
@@ -1572,6 +1623,10 @@ fn effective_rule_summaries(
 
 fn option_string(args: &Args, name: &str) -> Option<String> {
     args.one(name).map(str::to_owned)
+}
+
+fn subscription_values(args: &Args, name: &str) -> Vec<String> {
+    args.many(name)
 }
 
 /// Serialize a struct that is always a JSON object, so callers can extend it.
@@ -2563,7 +2618,83 @@ fn run() -> Result<()> {
         );
     }
 
+    if command == "subscription" && sub == Some("list") {
+        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        return print(
+            &store.subscriptions(args.one("status"), args.one("consumer"), args.has("all"))?,
+            args.has("json"),
+        );
+    }
+    if command == "subscription" && sub == Some("show") {
+        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        return print(
+            &store.require_subscription(rest.first().context("subscription id is required")?)?,
+            args.has("json"),
+        );
+    }
+
     let mut store = open_store(&args)?;
+    if command == "subscription" && sub == Some("add") {
+        for required in [
+            "consumer",
+            "action",
+            "timeout-ms",
+            "max-retries",
+            "rate-per-minute",
+            "max-concurrency",
+            "as",
+        ] {
+            args.require(required)?;
+        }
+        let subject_task_id = match args.one("subject") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .strip_prefix("task:")
+                    .filter(|id| !id.is_empty())
+                    .context("--subject must be task:ID")?
+                    .to_owned(),
+            ),
+        };
+        return print(
+            &store.add_subscription(AddSubscription {
+                id: option_string(&args, "id"),
+                subject_task_id,
+                relations: subscription_values(&args, "relation"),
+                kinds: subscription_values(&args, "kind"),
+                prior_statuses: subscription_values(&args, "prior-status"),
+                current_statuses: subscription_values(&args, "current-status"),
+                tags: args.many("tag"),
+                consumer_id: args.require("consumer")?.to_owned(),
+                action_id: args.require("action")?.to_owned(),
+                timeout_ms: args.integer("timeout-ms", 0)?,
+                max_retries: args.integer("max-retries", -1)?,
+                rate_per_minute: args.integer("rate-per-minute", 0)?,
+                max_concurrency: args.integer("max-concurrency", 0)?,
+                secret_ref: option_string(&args, "secret-ref"),
+                actor: args.require("as")?.to_owned(),
+            })?,
+            args.has("json"),
+        );
+    }
+    if command == "subscription" && sub == Some("pause") {
+        return print(
+            &store.pause_subscription(
+                rest.first().context("subscription id is required")?,
+                args.require("as")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "subscription" && sub == Some("resume") {
+        return print(
+            &store.resume_subscription(
+                rest.first().context("subscription id is required")?,
+                args.require("as")?,
+            )?,
+            args.has("json"),
+        );
+    }
     if command == "deploy" && sub == Some("start") {
         return print(
             &store.start_deployment(StartDeployment {
@@ -3528,6 +3659,9 @@ mod tests {
                 if *command == "watch" && WATCH_REPEATABLE.contains(flag) {
                     continue;
                 }
+                if *command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag) {
+                    continue;
+                }
                 let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
                 assert_eq!(
                     collected,
@@ -3660,9 +3794,10 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_repeatable_only_for_watch() {
+    fn kind_is_repeatable_only_for_watch_and_subscription_add() {
         let repeated = args(&["--kind", "a", "--kind", "b"]);
         assert!(repeated.reject_repeated_for(Some("watch")).is_ok());
+        assert!(repeated.reject_repeated_for(Some("subscription")).is_ok());
         let error = repeated
             .reject_repeated_for(Some("events"))
             .expect_err("events --kind must remain scalar")
@@ -3670,7 +3805,12 @@ mod tests {
         assert!(error.contains("--kind (a, b)"), "{error}");
 
         let schema = schema();
-        for operation in ["watch", "events", "note"] {
+        for (operation, list) in [
+            ("watch", true),
+            ("subscription add", true),
+            ("events", false),
+            ("note", false),
+        ] {
             let descriptor = schema["operations"]
                 .as_array()
                 .and_then(|operations| {
@@ -3686,14 +3826,7 @@ mod tests {
                 .as_array()
                 .and_then(|flags| flags.iter().find(|f| f["name"] == "kind"))
                 .expect("kind descriptor");
-            assert_eq!(
-                kind["kind"],
-                if operation == "watch" {
-                    "list"
-                } else {
-                    "value"
-                }
-            );
+            assert_eq!(kind["kind"], if list { "list" } else { "value" });
         }
     }
 

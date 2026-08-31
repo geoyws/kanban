@@ -1,5 +1,5 @@
 use crate::WATCH_BATCH_LIMIT;
-use crate::model::{Event, TASK_STATUSES};
+use crate::model::{BOARD_EVENT_KINDS, Event, TASK_STATUSES};
 use crate::registry::{Registry, data_root};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
@@ -13,44 +13,6 @@ use std::time::Duration;
 const PROTOCOL_VERSION: u8 = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const METADATA_LIMIT: usize = 16 * 1024;
-const BOARD_EVENT_KINDS: &[&str] = &[
-    "archive_swept",
-    "attention_raised",
-    "attention_reopened",
-    "attention_resolved",
-    "attention_updated",
-    "board_initialized",
-    "claim_expired",
-    "claim_heartbeat",
-    "claim_released",
-    "checkpoint_added",
-    "deployment_abandoned",
-    "deployment_finished",
-    "deployment_started",
-    "epic_advanced",
-    "handoff_accepted",
-    "handoff_created",
-    "lease_seized",
-    "note_added",
-    "rule_consolidated",
-    "rule_retired",
-    "search_rebuilt",
-    "sitrep_posted",
-    "snapshot_restored",
-    "story_advanced",
-    "story_signed_off",
-    "story_signoff_revoked",
-    "tag_added",
-    "tag_removed",
-    "task_added",
-    "task_claimed",
-    "task_created",
-    "task_metadata_patched",
-    "task_moved",
-    "task_removed",
-    "task_updated",
-    "tasks_imported",
-];
 const REGISTRY_EVENT_KINDS: &[&str] = &[
     "rule_added",
     "rule_consolidated",
