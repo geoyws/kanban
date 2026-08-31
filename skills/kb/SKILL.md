@@ -680,6 +680,22 @@ Rules:
   reference. List/show are read-only request-response operations.
 - Delivery identity is `(subscriptionID,eventID)`.
 
+The first queue bridge is the Codex consumer `codex.queue` with action
+`enqueue-turn`. The subscription row still stores only the normalized
+predicates, the named consumer/action, and bounded policy. It does not store
+an executable path, shell text, or arbitrary args. Host-local
+`dispatchers.json` binds that consumer/action to the checked-in
+`kanban-codex-queue-adapter`, the installed Codex executable, the exact
+thread/session target, the required installed version, and the fixed host-local
+Codex state directory argument `--codex-home /root/.codex` with matching
+`CODEX_HOME=/root/.codex`. Every invocation must direct-exec the installed
+Codex binary to verify the exact version and the `codex queue --help`
+surface, and it must fail closed on drift. The adapter passes only that fixed
+`CODEX_HOME` to child Codex processes. On HAX, direct ingress is
+`/root/.local/bin/codex queue --thread UUID_OR_EXACT_SESSION_NAME --message
+TEXT` when `codex-cli 0.150.1` is installed. The separately named HAX live
+smoke receipt is the distinct runtime check for installed Codex support.
+
 Run delivery through the separate compiled worker with exactly one explicit
 board selector:
 
@@ -703,7 +719,8 @@ adapter `targetEnv`. Put environment-variable names there, never credential
 values. Keep the data root and config inaccessible to group/other users; the
 executable must be a regular non-symlink with an execute bit and no group/other
 write bit. The adapter starts with an empty environment and receives only the
-configured target secret when the subscription names that reference.
+configured target secret and fixed `CODEX_HOME` when the subscription names
+that reference.
 
 Startup validates configuration before the first materialization or claim. Each
 scheduler step materializes and recovers work, resolves the candidate, then

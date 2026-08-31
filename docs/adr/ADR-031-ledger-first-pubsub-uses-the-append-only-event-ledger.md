@@ -407,6 +407,21 @@ The implementation rollout should be staged:
 8. ship the compiled dispatcher, host-local capability allow-list, durable
    delivery scheduler, and process-separated fake-adapter proof.
 
+The first Codex queue bridge sits behind that dispatcher contract. The board
+record names consumer `codex.queue` and action `enqueue-turn`; the checked-in
+adapter executable is `kanban-codex-queue-adapter`. Host-local
+`dispatchers.json` also pins the installed Codex executable, the exact
+thread/session target, the required installed version, and a fixed host-local
+Codex state directory argument `--codex-home /root/.codex` with matching
+`CODEX_HOME=/root/.codex`. The subscription row does not select an executable,
+session, shell text, or arbitrary args. Every invocation probes the installed
+Codex binary directly for the exact version and the
+`codex queue --help` surface, then fails closed on drift. The adapter passes
+only that fixed `CODEX_HOME` to child Codex processes. On HAX, direct ingress
+is `/root/.local/bin/codex queue --thread UUID_OR_EXACT_SESSION_NAME --message
+TEXT` for `codex-cli 0.150.1`. Live support for that bridge is a separate smoke
+receipt and is not implied by the architecture alone.
+
 ## Tests and operations
 
 Release evidence should come from separate compiled processes, per
@@ -442,8 +457,8 @@ The durable-subscription acceptance slice additionally proves:
   reference in their payload; and
 - accurate read-only/list-valued command-schema metadata.
 
-The dispatcher acceptance slice additionally proves through the compiled
-`kanban-dispatcher` and a separately compiled fake adapter process:
+The generic dispatcher acceptance slice additionally proves through the
+compiled `kanban-dispatcher` and a separately compiled fake adapter process:
 
 - help/version avoid database access and all three explicit selectors resolve;
 - configuration fails before materialization or claim and one consumer filter
@@ -457,6 +472,22 @@ The dispatcher acceptance slice additionally proves through the compiled
 - pause/resume and SIGTERM operate at real process boundaries; and
 - a post-success/pre-ack process crash survives lease expiry, records
   `lease_expired`, invokes the adapter again, and then records `success`.
+
+The Codex queue adapter-contract slice additionally proves through compiled-
+process adapter-contract coverage with a fake Codex executable:
+
+- the adapter boundary only: argv selection, fixed `CODEX_HOME`, environment
+  clearing, unrelated child acknowledgement, and an adapter-derived response;
+- focused unit coverage for exact installed-version and `codex queue --help`
+  drift rejection, trusted path identity, and bounded input/output handling;
+  and
+- no claim that installed Codex support is live.
+
+The separately named HAX live smoke receipt is the distinct runtime check for
+installed Codex support. It must use a separately owned idle test session in a
+disposable workspace, with no human driver session, no shared repository
+mutation, no terminal input modification, and no `send-keys`; it verifies the
+installed version, the exact ingress path, and one received queued message.
 
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:

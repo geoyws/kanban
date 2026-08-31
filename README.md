@@ -557,6 +557,23 @@ mutations are audited on the board ledger, while `subscription list` and
 `subscription show` remain read-only request-response operations in the
 generated command schema.
 
+The first queue bridge is the Codex consumer `codex.queue` with action
+`enqueue-turn`. The subscription row still stores only the normalized
+predicates, the named consumer/action, and bounded policy. It does not store
+an executable path, shell text, or arbitrary args. Host-local
+`dispatchers.json` binds that consumer/action to the checked-in
+`kanban-codex-queue-adapter`, the installed Codex executable, the exact
+thread/session target, the required installed version, and the fixed host-local
+Codex state directory argument `--codex-home /root/.codex` with matching
+`CODEX_HOME=/root/.codex`. Every invocation must
+direct-exec the installed Codex binary to verify the exact version and the
+`codex queue --help` surface, and it must fail closed on drift. The adapter
+passes only that fixed `CODEX_HOME` to child Codex processes. On HAX, direct
+ingress is `/root/.local/bin/codex queue --thread UUID_OR_EXACT_SESSION_NAME
+--message TEXT` when `codex-cli 0.150.1` is installed. This contract is not
+itself the live-smoke receipt; the separately named HAX live smoke receipt is
+the distinct runtime check for installed Codex support.
+
 The declaration-only phase historically stopped there. The shipped delivery
 worker is now a separate compiled process with one explicit board selector:
 
@@ -586,7 +603,8 @@ deterministic retry eventually dead-letters exhausted work. Pause and resume
 are rechecked at claim time, SIGINT/SIGTERM stop polling and cancel a running
 adapter cleanly, and a crash after adapter success but before acknowledgement
 is recovered after lease expiry. Delivery is therefore at-least-once, with
-immutable identity `(subscriptionID,eventID)`.
+immutable identity `(subscriptionID,eventID)` as the idempotency key rather
+than an exactly-once promise.
 
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google

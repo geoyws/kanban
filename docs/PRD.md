@@ -29,7 +29,9 @@ and transfer work to a replacement agent when context or tokens run low.
    as compatibility invalidation for the served UI.
 9. Persist board-local declarative subscriptions with immutable identity,
    fail-closed predicates, bounded consumer policy, and secret references only;
-   execute them only through the separate capability-gated compiled dispatcher.
+   execute them only through the separate capability-gated compiled dispatcher,
+   with the first Codex queue bridge remaining a separate HAX-smoke-gated
+   contract before it counts as live.
 
 ## Non-goals
 
@@ -99,6 +101,16 @@ write domains.
   secret environment mapping only from private host-local configuration;
   materialize before claim, serialize per consumer, invoke outside the SQLite
   transaction, and acknowledge or fail only the exact lease token.
+- For the first Codex queue bridge, host-local `dispatchers.json` binds
+  consumer `codex.queue` and action `enqueue-turn` to the checked-in
+  `kanban-codex-queue-adapter`, the installed Codex executable, the exact
+  thread/session target, the required installed version, and the fixed
+  `--codex-home /root/.codex` state directory or the implementation's exact
+  spelling. The subscription row never chooses executable, session, shell
+  text, or arbitrary args. Each invocation probes the installed Codex binary
+  directly for the exact version and `codex queue --help`, fails closed on
+  drift, starts with an empty environment, and passes only that fixed
+  `CODEX_HOME` to child Codex processes.
 
 ### P0 — first usable slice
 
@@ -178,6 +190,14 @@ A handoff is valid only when:
 - Two dispatcher processes can contend for one delivery but only one adapter
   invocation succeeds; a post-success/pre-ack crash is retried after lease
   expiry and is truthfully treated as at-least-once delivery.
+- The Codex queue compiled-process adapter-contract coverage with a fake
+  Codex executable proves only the bridge boundary: argv selection, fixed
+  `CODEX_HOME`, environment clearing, unrelated child acknowledgement, and an
+  adapter-derived response. Focused unit tests prove version/help drift
+  rejection and bounded input/output rendering.
+- A separately named HAX live smoke receipt against a separately owned idle
+  test session in a disposable workspace proves installed Codex support, exact
+  ingress, and one received queued message.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
 
@@ -194,7 +214,9 @@ A handoff is valid only when:
 5. **Personal UI:** fast portfolio and project board views.
 6. **Optional mobility:** encrypted operator-only cross-host transport.
 7. **Durable dispatch:** board-local declarations plus the separate compiled,
-   capability-gated dispatcher and a real fake-adapter process proof.
+   capability-gated dispatcher, the Codex queue compiled-process
+   adapter-contract coverage, and the separately named HAX live smoke receipt
+   for installed Codex support.
 
 ## Current delivery status
 
