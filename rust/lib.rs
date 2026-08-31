@@ -17,7 +17,7 @@ use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
 use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
-pub use crate::store::{ClaimOptions, Store, UpdateTask};
+use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};

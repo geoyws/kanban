@@ -90,8 +90,8 @@ fn validate_subscription_bounds(input: &AddSubscription) -> Result<()> {
 }
 
 fn validate_delivery_lease_duration(lease_duration_ms: i64) -> Result<()> {
-    if !(1..=300_000).contains(&lease_duration_ms) {
-        bail!("subscription delivery lease duration must be between 1 and 300000 milliseconds");
+    if !(1..=330_000).contains(&lease_duration_ms) {
+        bail!("subscription delivery lease duration must be between 1 and 330000 milliseconds");
     }
     Ok(())
 }
@@ -1055,6 +1055,13 @@ fn require_delivery_event_identity(
     delivery: &SubscriptionDeliveryRow,
     subscription: &Subscription,
 ) -> Result<Event> {
+    if !is_lower_hex_64(&delivery.event_id) {
+        bail!(
+            "subscription {} delivery {} has malformed event hash",
+            subscription.id,
+            delivery.event_id
+        );
+    }
     if delivery.event_seq <= subscription.start_event_seq {
         bail!(
             "subscription {} delivery {} referenced event seq {} at or before start anchor {}",
@@ -1084,6 +1091,14 @@ fn require_delivery_event_identity(
             delivery.event_id,
             delivery.event_seq,
             event.event_hash
+        );
+    }
+    if !event.event_hash.as_deref().is_some_and(is_lower_hex_64) {
+        bail!(
+            "subscription {} delivery {} expected a well-formed event hash at seq {}",
+            subscription.id,
+            delivery.event_id,
+            delivery.event_seq
         );
     }
     if event.kind != delivery.event_kind {
@@ -2150,19 +2165,24 @@ impl Store {
                 "subscription status",
             )?;
             let _event = require_delivery_event_identity(&transaction, &delivery, &subscription)?;
+            let lease_deadline_at = delivery
+                .lease_deadline_at
+                .context("leased delivery is missing lease_deadline_at")?;
             let terminal = delivery.attempts > subscription.max_retries;
             let next_attempt_at = if terminal {
                 None
             } else {
                 Some(
-                    now.checked_add(delivery_retry_delay_ms(
-                        delivery.attempts,
-                        subscription.timeout_ms,
-                    ))
-                    .context("subscription retry deadline overflowed")?,
+                    lease_deadline_at
+                        .checked_add(delivery_retry_delay_ms(
+                            delivery.attempts,
+                            subscription.timeout_ms,
+                        ))
+                        .context("subscription retry deadline overflowed")?,
                 )
             };
-            let dead_lettered_at = terminal.then_some(now);
+            let finished_at = lease_deadline_at;
+            let dead_lettered_at = terminal.then_some(lease_deadline_at);
             let updated = transaction.execute(
                 "UPDATE subscription_deliveries SET status=?,lease_token=NULL,lease_deadline_at=NULL,next_attempt_at=?,last_error_code='dispatcher_lease_expired',acked_at=NULL,dead_lettered_at=?,updated_at=? \
                  WHERE subscription_id=? AND event_id=? AND status='leased' AND lease_deadline_at<=?",
@@ -2185,7 +2205,7 @@ impl Store {
             }
             let attempt = transaction.execute(
                 "UPDATE subscription_delivery_attempts SET finished_at=?,outcome='lease_expired',error_code='dispatcher_lease_expired' WHERE subscription_id=? AND event_id=? AND attempt=? AND finished_at IS NULL",
-                params![now, delivery.subscription_id, delivery.event_id, delivery.attempts],
+                params![finished_at, delivery.subscription_id, delivery.event_id, delivery.attempts],
             )?;
             if attempt != 1 {
                 bail!(
@@ -2574,7 +2594,7 @@ impl Store {
                     prior_statuses: &subscription.prior_statuses,
                     current_statuses: &subscription.current_statuses,
                     tags: &subscription.tags,
-                    include_archived: false,
+                    include_archived: true,
                     semantic_payload: "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END",
                 },
             );
@@ -5555,6 +5575,58 @@ mod tests {
     }
 
     #[test]
+    fn subscription_materialization_includes_archived_events_after_the_anchor() {
+        let mut store = subscription_store("subscriptions-materialization-archived");
+        let mut input = delivery_subscription_input("sub-archived");
+        input.kinds = vec!["checkpoint_added".into()];
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        let archived_seq = board_event_count(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE events SET archived=1 WHERE seq=?",
+                params![archived_seq],
+            )
+            .unwrap();
+
+        let inserted = store.materialize_subscriptions().unwrap();
+        let expected = event_hashes(
+            store
+                .events_since_filtered(
+                    Some("t-subject"),
+                    &["checkpoint_added".to_owned()],
+                    &[],
+                    &["todo".to_owned()],
+                    &["in_progress".to_owned()],
+                    &["pubsub".to_owned()],
+                    added.start_event_seq,
+                    10,
+                    true,
+                )
+                .unwrap(),
+        );
+        assert_eq!(inserted, 1);
+        assert_eq!(delivery_event_ids(&store, &added.id), expected);
+        assert_eq!(delivery_count(&store), 1);
+    }
+
+    #[test]
     fn subscription_materialization_matches_filtered_watch_rows_for_active_and_paused_subscriptions()
      {
         let mut store = subscription_store("subscriptions-materialization-parity");
@@ -5932,6 +6004,24 @@ mod tests {
         assert_eq!(attempts[0].outcome, "claim");
         assert_eq!(attempts[0].started_at, due_at);
         assert_eq!(attempts[0].finished_at, None);
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO subscription_delivery_attempts(subscription_id,event_id,attempt,started_at,finished_at,outcome,error_code) VALUES(?,?,?,?,?,?,?)",
+                    params![
+                        &added.id,
+                        &candidate.event_id,
+                        2,
+                        due_at + 1,
+                        due_at + 2,
+                        "success",
+                        Option::<String>::None,
+                    ],
+                )
+                .is_err(),
+            "subscription_delivery_attempts accepted a terminal insert"
+        );
 
         assert!(
             !store
@@ -5966,6 +6056,26 @@ mod tests {
         let attempts = delivery_attempt_rows(&store, &added.id, &candidate.event_id);
         assert_eq!(attempts[0].outcome, "success");
         assert_eq!(attempts[0].finished_at, Some(due_at + 3));
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE subscription_delivery_attempts SET outcome='retry',finished_at=? WHERE subscription_id=? AND event_id=? AND attempt=?",
+                    params![due_at + 4, &added.id, &candidate.event_id, 1],
+                )
+                .is_err(),
+            "subscription_delivery_attempts accepted a second update"
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "DELETE FROM subscription_delivery_attempts WHERE subscription_id=? AND event_id=? AND attempt=?",
+                    params![&added.id, &candidate.event_id, 1],
+                )
+                .is_err(),
+            "subscription_delivery_attempts accepted a direct delete"
+        );
         assert_eq!(board_event_count(&store), board_events_before);
         assert!(
             !store
@@ -5986,7 +6096,14 @@ mod tests {
     }
 
     #[test]
-    fn subscription_delivery_rejects_equal_anchor_sequences_and_negative_now() {
+    fn subscription_delivery_lease_duration_has_30_second_cleanup_headroom() {
+        assert!(validate_delivery_lease_duration(330_000).is_ok());
+        assert!(validate_delivery_lease_duration(330_001).is_err());
+        assert!(validate_delivery_lease_duration(0).is_err());
+    }
+
+    #[test]
+    fn subscription_delivery_rejects_schema_retargeting_and_negative_now() {
         let mut store = subscription_store("subscriptions-delivery-anchor");
         let mut input = delivery_subscription_input("sub-delivery-anchor");
         input.max_retries = 1;
@@ -6009,33 +6126,59 @@ mod tests {
         .unwrap();
         store.materialize_subscriptions().unwrap();
         let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let _claimed = store
+            .claim_subscription_delivery(&added.id, &event_ids[0], due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        let current = delivery_row(&store, &added.id, &event_ids[0]);
+        let (created_at, updated_at): (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT created_at,updated_at FROM subscription_deliveries WHERE subscription_id=? AND event_id=?",
+                params![&added.id, &event_ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         let anchor_event = board_event_by_seq(&store, added.start_event_seq);
         let anchor_event_id = anchor_event.event_hash.clone().unwrap();
-        store
+        let update_error = store
             .connection
             .execute(
-                "UPDATE subscription_deliveries SET event_seq=?,event_id=?,event_kind=?,event_created_at=? WHERE subscription_id=? AND event_id=?",
+                "UPDATE subscription_deliveries SET status=?,attempts=?,event_seq=?,event_id=?,event_kind=?,event_created_at=?,lease_token=?,lease_deadline_at=?,next_attempt_at=?,last_attempt_at=?,last_error_code=?,acked_at=?,dead_lettered_at=?,created_at=?,updated_at=? WHERE subscription_id=? AND event_id=?",
                 params![
+                    "retry_wait",
+                    current.attempts,
                     anchor_event.seq,
                     anchor_event_id.clone(),
                     anchor_event.kind,
                     anchor_event.created_at,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    current.next_attempt_at.unwrap_or(anchor_event.created_at + 1),
+                    current.last_attempt_at,
+                    "adapter_failed",
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    created_at,
+                    updated_at + 1,
                     added.id,
                     event_ids[0],
                 ],
             )
-            .unwrap();
-        let delivery = delivery_row(&store, &added.id, &anchor_event_id);
-        let subscription = store.require_subscription(&added.id).unwrap();
-        assert_eq!(subscription.start_event_seq, anchor_event.seq);
-        let anchor_error =
-            match require_delivery_event_identity(&store.connection, &delivery, &subscription) {
-                Err(error) => error.to_string(),
-                Ok(_) => panic!("expected an anchor rejection"),
-            };
+            .unwrap_err()
+            .to_string();
         assert!(
-            anchor_error.contains("at or before start anchor"),
-            "{anchor_error}"
+            update_error.contains("immutable")
+                || update_error.contains("identity")
+                || update_error.contains("event_id must match"),
+            "{update_error}"
+        );
+        assert_eq!(
+            delivery_row(&store, &added.id, &event_ids[0]).event_seq,
+            anchor_event.seq + 1
         );
         assert!(store.next_due_subscription_delivery(-1).is_err());
         assert!(
@@ -6046,7 +6189,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_delivery_rejects_exhausted_retry_rows_in_candidate_and_claim_paths() {
+    fn subscription_delivery_rejects_attempt_tampering_and_keeps_retry_rows_eligible() {
         let mut store = subscription_store("subscriptions-delivery-exhausted");
         let mut input = delivery_subscription_input("sub-delivery-exhausted");
         input.max_retries = 1;
@@ -6097,28 +6240,31 @@ mod tests {
         let retry_due_at = delivery_row(&store, &added.id, &first.event_id)
             .next_attempt_at
             .unwrap();
-        store
+        let tamper_error = store
             .connection
             .execute(
                 "UPDATE subscription_deliveries SET attempts=2 WHERE subscription_id=? AND event_id=?",
                 params![&added.id, &first.event_id],
             )
-            .unwrap();
-        let retry_error = match store.next_due_subscription_delivery(retry_due_at) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("expected an exhausted-budget rejection"),
-        };
-        assert!(retry_error.contains("retry budget"), "{retry_error}");
-        let claim_error = match store.claim_subscription_delivery(
-            &added.id,
-            &first.event_id,
-            retry_due_at,
-            5_000,
-        ) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("expected an exhausted-budget rejection"),
-        };
-        assert!(claim_error.contains("retry budget"), "{claim_error}");
+            .unwrap_err()
+            .to_string();
+        assert!(
+            tamper_error.contains("state transition is invalid")
+                || tamper_error.contains("immutable"),
+            "{tamper_error}"
+        );
+        assert!(
+            store
+                .next_due_subscription_delivery(retry_due_at)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_subscription_delivery(&added.id, &first.event_id, retry_due_at, 5_000)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -6418,7 +6564,8 @@ mod tests {
     }
 
     #[test]
-    fn subscription_delivery_expired_leases_recover_to_dead_letter_with_stable_error_code() {
+    fn subscription_delivery_expired_leases_recover_to_retry_wait_with_stable_error_code_and_late_retry_is_due_immediately()
+     {
         let mut store = subscription_store("subscriptions-delivery-expired");
         let mut input = delivery_subscription_input("sub-delivery-expired");
         input.max_retries = 1;
@@ -6479,8 +6626,9 @@ mod tests {
         );
         let still_leased = delivery_row(&store, &added.id, &candidate.event_id);
         assert_eq!(still_leased.status, "leased");
+        let recovery_now = claimed.lease_deadline_at + 10_000;
         let recovered = store
-            .recover_expired_subscription_deliveries(claimed.lease_deadline_at)
+            .recover_expired_subscription_deliveries(recovery_now)
             .unwrap();
         assert_eq!(recovered, 1);
         let finished = delivery_row(&store, &added.id, &candidate.event_id);
@@ -6504,15 +6652,72 @@ mod tests {
         assert_eq!(board_event_count(&store), board_events_before);
         assert!(
             store
+                .next_due_subscription_delivery(recovery_now)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
                 .next_due_subscription_delivery(claimed.lease_deadline_at)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn subscription_delivery_expired_leases_dead_letter_at_the_stored_deadline_when_recovered_late()
+    {
+        let mut store = subscription_store("subscriptions-delivery-expired-terminal");
+        let mut input = delivery_subscription_input("sub-delivery-expired-terminal");
+        input.max_retries = 0;
+        input.rate_per_minute = 60;
+        input.max_concurrency = 1;
+        let added = store.add_subscription(input).unwrap();
+        crate::audit::append_board_event(
+            &store.connection,
+            Some("t-subject"),
+            "checkpoint_added",
+            "test",
+            &semantic_event_payload(
+                "t-subject",
+                ("parent", "t-parent"),
+                "todo",
+                "in_progress",
+                &["pubsub"],
+            )
+            .to_string(),
+            20,
+        )
+        .unwrap();
+        store.materialize_subscriptions().unwrap();
+        let event_ids = delivery_event_ids(&store, &added.id);
+        let due_at = delivery_row(&store, &added.id, &event_ids[0])
+            .next_attempt_at
+            .unwrap();
+        let candidate = store
+            .next_due_subscription_delivery(due_at)
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_subscription_delivery(&added.id, &candidate.event_id, due_at, 1)
+            .unwrap()
+            .unwrap();
+        let recovery_now = claimed.lease_deadline_at + 10_000;
+        let recovered = store
+            .recover_expired_subscription_deliveries(recovery_now)
+            .unwrap();
+        assert_eq!(recovered, 1);
+        let finished = delivery_row(&store, &added.id, &candidate.event_id);
+        assert_eq!(finished.status, "dead_letter");
+        assert_eq!(finished.dead_lettered_at, Some(claimed.lease_deadline_at));
+        assert!(finished.next_attempt_at.is_none());
+        let attempts = delivery_attempt_rows(&store, &added.id, &candidate.event_id);
+        assert_eq!(attempts[0].finished_at, Some(claimed.lease_deadline_at));
         assert!(
             store
-                .next_due_subscription_delivery(retry_at)
+                .next_due_subscription_delivery(recovery_now)
                 .unwrap()
-                .is_some()
+                .is_none()
         );
     }
 
@@ -7273,7 +7478,7 @@ mod tests {
                     r#"{"step":3}"#,
                     12_i64,
                     1_i64,
-                    "prev-3",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "hash-3",
                 ],
             )
@@ -7313,24 +7518,38 @@ mod tests {
         assert!(empty.is_empty());
 
         let task_events = store
-            .events_since(Some("task-1"), None, 1, 10, true)
+            .events_since_filtered(Some("task-1"), &[], &[], &[], &[], &[], 1, 10, true)
             .expect("resume task events");
         assert_eq!(board_event_seqs(&task_events), vec![3, 4]);
 
         let kind_events = store
-            .events_since(Some("task-1"), Some("task_finished"), 0, 10, true)
+            .events_since_filtered(
+                Some("task-1"),
+                &["task_finished".to_owned()],
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                10,
+                true,
+            )
             .expect("filter by task and kind");
         assert_eq!(board_event_seqs(&kind_events), vec![4]);
 
         let first_batch = store
-            .events_since(Some("task-1"), None, 0, 1, true)
+            .events_since_filtered(Some("task-1"), &[], &[], &[], &[], &[], 0, 1, true)
             .expect("first batch");
         assert_eq!(board_event_seqs(&first_batch), vec![1]);
 
         let second_batch = store
-            .events_since(
+            .events_since_filtered(
                 Some("task-1"),
-                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
                 first_batch.last().unwrap().seq,
                 1,
                 true,
@@ -7339,9 +7558,13 @@ mod tests {
         assert_eq!(board_event_seqs(&second_batch), vec![3]);
 
         let third_batch = store
-            .events_since(
+            .events_since_filtered(
                 Some("task-1"),
-                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
                 second_batch.last().unwrap().seq,
                 1,
                 true,

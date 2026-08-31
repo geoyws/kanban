@@ -5,6 +5,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Read;
@@ -69,11 +70,11 @@ pub(crate) struct ResolvedDispatch {
 #[derive(Clone)]
 pub(crate) struct ResolvedSecret {
     pub(crate) target_env: String,
-    secret_value: String,
+    secret_value: OsString,
 }
 
 impl ResolvedSecret {
-    pub(crate) fn secret_value(&self) -> &str {
+    pub(crate) fn secret_value(&self) -> &OsStr {
         &self.secret_value
     }
 }
@@ -101,6 +102,8 @@ pub(crate) struct DispatcherConfig {
 struct FileSnapshot {
     dev: u64,
     ino: u64,
+    uid: u32,
+    gid: u32,
     mode: u32,
     is_dir: bool,
     is_file: bool,
@@ -112,6 +115,8 @@ impl FileSnapshot {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
             mode: metadata.mode(),
             is_dir: metadata.is_dir(),
             is_file: metadata.is_file(),
@@ -122,6 +127,8 @@ impl FileSnapshot {
     fn matches(&self, other: &Self) -> bool {
         self.dev == other.dev
             && self.ino == other.ino
+            && self.uid == other.uid
+            && self.gid == other.gid
             && self.mode == other.mode
             && self.is_dir == other.is_dir
             && self.is_file == other.is_file
@@ -171,6 +178,33 @@ fn exact_env_name(value: &str, label: &str) -> Result<String> {
         );
     }
     Ok(value.to_owned())
+}
+
+fn unsafe_target_env_name(value: &str) -> bool {
+    matches!(
+        value,
+        "PATH"
+            | "LD_PRELOAD"
+            | "BASH_ENV"
+            | "ENV"
+            | "SHELLOPTS"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "PERL5LIB"
+            | "PERLLIB"
+            | "RUBYOPT"
+            | "RUBYLIB"
+            | "NODE_OPTIONS"
+    ) || value.starts_with("LD_")
+        || value.starts_with("DYLD_")
+}
+
+fn exact_target_env_name(value: &str, label: &str) -> Result<String> {
+    let value = exact_env_name(value, label)?;
+    if unsafe_target_env_name(&value) {
+        bail!("{label} must not use execution-sensitive environment names");
+    }
+    Ok(value)
 }
 
 fn reject_nul(value: &str, label: &str) -> Result<()> {
@@ -322,7 +356,7 @@ fn validate_action_config(action: &ActionConfig, action_id: &str) -> Result<()> 
 
 fn validate_secret_config(secret: &SecretConfig, secret_id: &str) -> Result<()> {
     exact_env_name(&secret.source_env, "source env")?;
-    exact_env_name(&secret.target_env, "target env")?;
+    exact_target_env_name(&secret.target_env, "target env")?;
     exact_identifier(secret_id, "secret reference", SECRET_REF_MAX)?;
     Ok(())
 }
@@ -431,7 +465,16 @@ pub(crate) fn try_consumer_lock(consumer_id: &str) -> Result<Option<ConsumerLock
         "dispatcher lock directory",
     )?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(ConsumerLock { _file: file })),
+        Ok(()) => {
+            verify_lock_file_snapshot(&path, &file, None, "dispatcher lock file")?;
+            verify_dir_snapshot(
+                &lock_dir,
+                &lock_dir_snapshot,
+                LOCK_DIR_MODE,
+                "dispatcher lock directory",
+            )?;
+            Ok(Some(ConsumerLock { _file: file }))
+        }
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(error)) => {
             Err(anyhow::Error::new(error).context(format!("lock file {}", path.display())))
@@ -504,9 +547,10 @@ impl DispatcherConfig {
                     format!("unknown secret {secret_ref} for consumer {consumer_id}")
                 })?;
                 let source_env = exact_env_name(&secret.source_env, "source env")?;
-                let target_env = exact_env_name(&secret.target_env, "target env")?;
-                let value = env::var(&source_env)
-                    .with_context(|| format!("missing source env for secret {secret_ref}"))?;
+                let target_env = exact_target_env_name(&secret.target_env, "target env")?;
+                let Some(value) = env::var_os(&source_env) else {
+                    bail!("missing source env for secret {secret_ref}");
+                };
                 Some(ResolvedSecret {
                     target_env,
                     secret_value: value,
@@ -538,7 +582,9 @@ mod tests {
     use super::*;
     use crate::model::Subscription;
     use serde_json::json;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, OnceLock};
     use uuid::Uuid;
@@ -568,7 +614,7 @@ mod tests {
         }
     }
 
-    fn set_env(key: &str, value: Option<&str>) -> Option<EnvRestore> {
+    fn set_env_os(key: &str, value: Option<&OsStr>) -> Option<EnvRestore> {
         let original = env::var_os(key);
         unsafe {
             match value {
@@ -580,6 +626,10 @@ mod tests {
             key: key.to_owned(),
             original,
         })
+    }
+
+    fn set_env(key: &str, value: Option<&str>) -> Option<EnvRestore> {
+        set_env_os(key, value.map(OsStr::new))
     }
 
     fn temp_root() -> PathBuf {
@@ -735,7 +785,7 @@ mod tests {
         assert_eq!(resolved.args, vec!["--mode", "dispatch"]);
         let secret = resolved.secret.as_ref().unwrap();
         assert_eq!(secret.target_env, "DISPATCH_TOKEN");
-        assert_eq!(secret.secret_value(), "supersecret");
+        assert_eq!(secret.secret_value(), OsStr::new("supersecret"));
         assert!(!format!("{secret:?}").contains("supersecret"));
         resolved.validate().unwrap();
     }
@@ -800,6 +850,51 @@ mod tests {
             "{source_error}"
         );
         assert!(!source_error.contains(secret_source), "{source_error}");
+    }
+
+    #[test]
+    fn unsafe_target_env_names_are_rejected_and_the_allowlisted_target_resolves() {
+        let _env = env_guard();
+        let root = TestRoot::new();
+        let executable = "/bin/sh";
+        let secret_source = "KANBAN_DISPATCH_SECRET_TARGET";
+        let _secret = set_env(secret_source, Some("supersecret"));
+        for target_env in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PERL5LIB",
+            "PERLLIB",
+            "RUBYOPT",
+            "RUBYLIB",
+            "NODE_OPTIONS",
+        ] {
+            let mut config = base_config(executable, secret_source);
+            config["consumers"]["consumer-a"]["secrets"]["secret-a"]["targetEnv"] =
+                json!(target_env);
+            write_config(&root.path, &config, 0o600);
+            let error = DispatcherConfigLoader::load().unwrap_err().to_string();
+            assert!(
+                error.contains("execution-sensitive environment names"),
+                "{target_env}: {error}"
+            );
+        }
+
+        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        let config = DispatcherConfigLoader::load().unwrap();
+        let secret = config
+            .resolve(&subscription(Some("secret-a")))
+            .unwrap()
+            .secret
+            .unwrap();
+        assert_eq!(secret.target_env, "DISPATCH_TOKEN");
+        assert_eq!(secret.secret_value(), OsStr::new("supersecret"));
     }
 
     #[test]
@@ -949,7 +1044,7 @@ mod tests {
             })
             .unwrap();
         let secret = resolved.secret.as_ref().unwrap();
-        assert_eq!(secret.secret_value(), secret_value);
+        assert_eq!(secret.secret_value(), OsStr::new(secret_value));
         assert!(!format!("{secret:?}").contains(secret_value));
 
         let rejected_ref = repeated_ascii('t', SECRET_REF_MAX + 1);
@@ -1035,7 +1130,7 @@ mod tests {
             .unwrap()
             .secret
             .unwrap();
-        assert_eq!(secret.secret_value(), secret_value);
+        assert_eq!(secret.secret_value(), OsStr::new(secret_value));
         assert!(!format!("{secret:?}").contains(secret_value));
 
         let error = config
@@ -1046,6 +1141,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!error.contains(secret_value), "{error}");
+    }
+
+    #[test]
+    fn non_unicode_secret_values_round_trip_without_unicode_conversion_leaks() {
+        let _env = env_guard();
+        let root = TestRoot::new();
+        let executable = "/bin/sh";
+        let secret_source = "KANBAN_DISPATCH_SECRET_NONUNICODE";
+        let secret_value = OsString::from_vec(vec![b's', b'e', b'c', b'r', b'e', b't', 0x80]);
+        let _secret = set_env_os(secret_source, Some(secret_value.as_os_str()));
+        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+
+        let config = DispatcherConfigLoader::load().unwrap();
+        let secret = config
+            .resolve(&subscription(Some("secret-a")))
+            .unwrap()
+            .secret
+            .unwrap();
+        let debug = format!("{secret:?}");
+        assert_eq!(secret.secret_value(), secret_value.as_os_str());
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains("\\x80"), "{debug}");
+
+        unsafe { env::remove_var(secret_source) };
+        let error = DispatcherConfigLoader::load()
+            .unwrap()
+            .resolve(&subscription(Some("secret-a")))
+            .unwrap_err();
+        let error_text = error.to_string();
+        assert!(error_text.contains("missing source env"), "{error_text}");
+        assert_eq!(error.chain().count(), 1, "{error_text}");
+        assert!(!format!("{error:?}").contains("NotUnicode"));
     }
 
     #[test]
