@@ -654,6 +654,7 @@ mod tests {
 
     struct TestRoot {
         path: PathBuf,
+        executable: PathBuf,
         original: Option<std::ffi::OsString>,
         _env: Option<EnvRestore>,
     }
@@ -661,13 +662,21 @@ mod tests {
     impl TestRoot {
         fn new() -> Self {
             let path = temp_root();
+            let executable = path.join("dispatch-ok.sh");
+            fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
             let original = env::var_os("KANBAN_DATA_DIR");
             let _env = set_env("KANBAN_DATA_DIR", path.to_str());
             Self {
                 path,
+                executable,
                 original,
                 _env,
             }
+        }
+
+        fn executable_path(&self) -> &Path {
+            self.executable.as_path()
         }
     }
 
@@ -780,10 +789,14 @@ mod tests {
     fn valid_exact_resolution_returns_a_redacted_secret_and_validates_the_executable() {
         let _env = env_guard();
         let root = TestRoot::new();
-        let executable = "/bin/sh";
+        let executable = root.executable_path();
         let secret_source = "KANBAN_DISPATCH_SECRET";
         let _secret = set_env(secret_source, Some("supersecret"));
-        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(executable.to_str().unwrap(), secret_source),
+            0o600,
+        );
 
         let config = DispatcherConfigLoader::load().unwrap();
         config.require_consumer("consumer-a").unwrap();
@@ -804,9 +817,13 @@ mod tests {
     fn unknown_consumer_action_capability_secret_and_missing_source_env_fail_closed() {
         let _env = env_guard();
         let root = TestRoot::new();
-        let executable = "/bin/sh";
+        let executable = root.executable_path();
         let secret_source = "KANBAN_DISPATCH_SECRET";
-        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(executable.to_str().unwrap(), secret_source),
+            0o600,
+        );
         let config = DispatcherConfigLoader::load().unwrap();
 
         let consumer_error = config
@@ -830,14 +847,18 @@ mod tests {
             .to_string();
         assert!(action_error.contains("action-missing"), "{action_error}");
 
-        let mut capability_config = base_config(executable, secret_source);
+        let mut capability_config = base_config(executable.to_str().unwrap(), secret_source);
         capability_config["consumers"]["consumer-a"]["capabilities"] = json!(["cap-b"]);
         write_config(&root.path, &capability_config, 0o600);
         let config = DispatcherConfigLoader::load().unwrap();
         let capability_error = config.resolve(&subscription(None)).unwrap_err().to_string();
         assert!(capability_error.contains("cap-a"), "{capability_error}");
 
-        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(executable.to_str().unwrap(), secret_source),
+            0o600,
+        );
         let config = DispatcherConfigLoader::load().unwrap();
         let secret_error = config
             .resolve(&Subscription {
@@ -849,7 +870,11 @@ mod tests {
         assert!(secret_error.contains("secret-missing"), "{secret_error}");
 
         unsafe { env::remove_var(secret_source) };
-        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(executable.to_str().unwrap(), secret_source),
+            0o600,
+        );
         let config = DispatcherConfigLoader::load().unwrap();
         let source_error = config
             .resolve(&subscription(Some("secret-a")))
@@ -866,7 +891,7 @@ mod tests {
     fn unsafe_target_env_names_are_rejected_and_the_allowlisted_target_resolves() {
         let _env = env_guard();
         let root = TestRoot::new();
-        let executable = "/bin/sh";
+        let executable = root.executable_path();
         let secret_source = "KANBAN_DISPATCH_SECRET_TARGET";
         let _secret = set_env(secret_source, Some("supersecret"));
         for target_env in [
@@ -885,7 +910,7 @@ mod tests {
             "RUBYLIB",
             "NODE_OPTIONS",
         ] {
-            let mut config = base_config(executable, secret_source);
+            let mut config = base_config(executable.to_str().unwrap(), secret_source);
             config["consumers"]["consumer-a"]["secrets"]["secret-a"]["targetEnv"] =
                 json!(target_env);
             write_config(&root.path, &config, 0o600);
@@ -896,7 +921,11 @@ mod tests {
             );
         }
 
-        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(executable.to_str().unwrap(), secret_source),
+            0o600,
+        );
         let config = DispatcherConfigLoader::load().unwrap();
         let secret = config
             .resolve(&subscription(Some("secret-a")))
@@ -1042,7 +1071,11 @@ mod tests {
         let accepted_ref = repeated_ascii('s', SECRET_REF_MAX);
         write_config(
             &root.path,
-            &config_with_secret(&accepted_ref, secret_source, "/bin/sh"),
+            &config_with_secret(
+                &accepted_ref,
+                secret_source,
+                root.executable_path().to_str().unwrap(),
+            ),
             0o600,
         );
 
@@ -1133,7 +1166,11 @@ mod tests {
         let secret_source = "KANBAN_DISPATCH_SECRET";
         let secret_value = "supersecret";
         let _secret = set_env(secret_source, Some(secret_value));
-        write_config(&root.path, &base_config("/bin/sh", secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(root.executable_path().to_str().unwrap(), secret_source),
+            0o600,
+        );
         let config = DispatcherConfigLoader::load().unwrap();
         let secret = config
             .resolve(&subscription(Some("secret-a")))
@@ -1157,11 +1194,15 @@ mod tests {
     fn non_unicode_secret_values_round_trip_without_unicode_conversion_leaks() {
         let _env = env_guard();
         let root = TestRoot::new();
-        let executable = "/bin/sh";
+        let executable = root.executable_path();
         let secret_source = "KANBAN_DISPATCH_SECRET_NONUNICODE";
         let secret_value = OsString::from_vec(vec![b's', b'e', b'c', b'r', b'e', b't', 0x80]);
         let _secret = set_env_os(secret_source, Some(secret_value.as_os_str()));
-        write_config(&root.path, &base_config(executable, secret_source), 0o600);
+        write_config(
+            &root.path,
+            &base_config(executable.to_str().unwrap(), secret_source),
+            0o600,
+        );
 
         let config = DispatcherConfigLoader::load().unwrap();
         let secret = config
