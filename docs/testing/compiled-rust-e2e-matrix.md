@@ -1,7 +1,8 @@
 # Compiled Rust E2E matrix
 
-The release gate runs `cargo test --test e2e` after Cargo builds the production
-`kanban` executable. Each test invokes `CARGO_BIN_EXE_kanban` through
+The release gate runs `cargo test --test e2e` and
+`cargo test --test dispatcher_e2e` after Cargo builds the production
+executables. Each test invokes its `CARGO_BIN_EXE_*` binary through
 `std::process::Command`; no test calls Kanban domain functions in-process.
 
 | Requirement | Process-boundary evidence |
@@ -25,7 +26,8 @@ The release gate runs `cargo test --test e2e` after Cargo builds the production
 | MCP search parity | The generated `search` read tool and `search_rebuild` write tool execute the real CLI over stdio and return a cited source. |
 | Served search | A real loopback HTTP conversation retrieves a cited cross-board result; byte comparison and source guards prove the pages expose no board mutation. |
 | Cursor-native watch | Compiled-process tests cover literal-0 bootstrap, additive protocol-v1 payload and redaction, repeatable semantic predicates before the delivery limit, full normalized cursor binding, fail-closed selectors, malformed or future cursors, heartbeat delivery across read-only reopen cycles, and replay of removed subjects and historical relation targets. |
-| Durable subscriptions | Separate compiled invocations migrate board schema v21; add, list, show, pause and resume a declarative subscription; observe its audited watch event without a secret reference; reject unknown selectors, raw-value-shaped secret references and duplicate identities; verify generated read-only/list metadata; and prove a second board cannot see the row. |
+| Durable subscriptions | Separate compiled invocations migrate a pre-subscription board through declaration schema v21 to current schema v22; add, list, show, pause and resume a declarative subscription; observe its audited watch event without a secret reference; reject unknown selectors, raw-value-shaped secret references and duplicate identities; verify generated read-only/list metadata; and prove a second board cannot see the row. |
+| Durable subscription dispatcher | The dedicated compiled `kanban-dispatcher` process resolves each explicit board selector, targets one consumer, proves missing host-local allow-listed configuration fails at startup before the first materialization or claim, invokes a separately compiled deterministic fake adapter, clears inherited environment, injects only the named secret, and persists exact success/failure attempt state. Competing worker processes produce one claim/invocation; pause/resume is rechecked; exit, malformed, mismatched, oversized and timeout responses keep stable error codes; SIGTERM stops idle polling and a running adapter; and a real post-success/pre-ack process crash recovers after lease expiry with two invocations and durable `lease_expired` then `success` attempts, proving at-least-once rather than exactly-once delivery. |
 | Deployment ledger | Separate compiled processes prove capability ownership, idempotent start, exact served-commit success, derived current release, CLI/MCP parity, and real HTTP rendering of the cross-board matrix and attempt detail. |
 | Deployment self-archive | A real archive process moves only old terminal non-current attempts out of default lists and hot partial indexes, keeps started and current successes hot, retains cold search and `--all` access, and proves a repeated sweep is idempotent. |
 | Browser-backed operator approval | A real Chrome session loads the compiled `kanban serve` page, types into the live comment box, watches the quick labels switch to `Comment and Approve` / `Comment and Reject`, clicks a real submit button, and verifies the persisted decision/comment through the compiled CLI/store boundary. |

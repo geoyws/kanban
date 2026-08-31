@@ -552,13 +552,41 @@ kb subscription resume sub-codex-queue --project NAME --as geo --json
 Subscriptions are board-local declarative records. The selected board is the
 board predicate; rows store no board path or root. Predicates, consumer/action
 names and numeric policy are normalized and validated fail-closed. The optional
-`secretRef` is a strict opaque lookup identifier, never a credential. There is
-no shell text, adapter argument list, token value, update, delete, delivery, or
-execution surface in this phase. Lifecycle mutations are audited on the board
-ledger, while `subscription list` and `subscription show` remain read-only
-request-response operations in the generated command schema. Delivery identity
-is `(subscriptionID,eventID)`; the later dispatcher resolves allow-listed
-consumer capabilities from host-local trusted configuration.
+`secretRef` is a strict opaque lookup identifier, never a credential. Lifecycle
+mutations are audited on the board ledger, while `subscription list` and
+`subscription show` remain read-only request-response operations in the
+generated command schema.
+
+The declaration-only phase historically stopped there. The shipped delivery
+worker is now a separate compiled process with one explicit board selector:
+
+```bash
+kanban-dispatcher --project NAME [--consumer consumer.name] [--once] [--json]
+kanban-dispatcher --workspace /registered/root [--once] [--json]
+kanban-dispatcher --db /exact/board.db [--once] [--json]
+```
+
+It resolves consumer/action capabilities from the operator-owned protocol-v1
+`$KANBAN_DATA_DIR/dispatchers.json`, never from a subscription row. The file
+maps strict consumer and action names to an allow-listed capability, one
+absolute executable and fixed arguments; an optional secret reference maps a
+named source environment variable to one safe adapter environment variable.
+The private data root and config must not be group- or other-accessible, and an
+adapter executable must be a regular, executable, non-symlink file that is not
+group- or other-writable. Do not put a credential value in the config, board,
+command line, documentation, or adapter arguments.
+
+Startup validates configuration before the first materialization or claim.
+Each scheduler step then materializes and recovers durable work, resolves its
+candidate before lock contention, serializes per consumer, reloads and
+revalidates configuration under that lock, and claims with a lease equal to the
+adapter timeout plus 30 seconds. Adapter execution is outside the SQLite
+transaction. Success and failure close only the exact lease token;
+deterministic retry eventually dead-letters exhausted work. Pause and resume
+are rechecked at claim time, SIGINT/SIGTERM stop polling and cancel a running
+adapter cleanly, and a crash after adapter success but before acknowledgement
+is recovered after lease expiry. Delivery is therefore at-least-once, with
+immutable identity `(subscriptionID,eventID)`.
 
 Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google
@@ -570,9 +598,10 @@ Reasoning: `docs/adr/ADR-016-*`.
 
 ## Short names
 
-The crate installs two binaries, `kanban` and `kb`, which are the same program.
-`kb` is a real binary rather than a shell alias because agents invoke it from
-non-interactive cages that never source a shell profile.
+The crate installs `kanban` and `kb` as two names for the same operator CLI,
+plus the separate `kanban-dispatcher` worker. `kb` is a real binary rather than
+a shell alias because agents invoke it from non-interactive cages that never
+source a shell profile.
 
 Commands and subcommands have short forms:
 

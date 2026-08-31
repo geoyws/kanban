@@ -233,12 +233,13 @@ Downstream consumers remain thin adapters over the canonical bus:
 The important rule is that pub/sub invalidates or replays; it does not become a
 second ledger or a third write path.
 
-### 7. Durable subscriptions are declarative board records
+### 7. Durable subscriptions began as declarative board records
 
-`kb subscription add|list|show|pause|resume` manages the durable control-plane
+The declaration phase introduced
+`kb subscription add|list|show|pause|resume` as the durable control-plane
 record for one board. The addressed board database is the tenancy predicate;
 there is no stored root, board path, or cross-board fan-in. Board schema v21
-stores only:
+stored only:
 
 - protocol version `1` and an immutable `sub-*` identity;
 - an optional `task:ID` subject plus normalized `parent`, `ancestor`, and
@@ -249,24 +250,100 @@ stores only:
 - an optional opaque secret-reference identifier.
 
 The row never stores shell text, executable arguments, roots, credentials, raw
-tokens, or a caller-controlled adapter command. A later dispatcher must resolve
-the consumer and action through host-local trusted configuration and must treat
-the secret reference only as a lookup name. Adding, pausing, and resuming a
-subscription append `subscription_added`, `subscription_paused`, or
-`subscription_resumed` to the existing hash-chained board ledger. Those audit
-payloads omit even the opaque secret reference.
+tokens, or a caller-controlled adapter command. That phase deliberately left a
+later dispatcher to resolve consumer and action through host-local trusted
+configuration and treat the secret reference only as a lookup name. Adding,
+pausing, and resuming a subscription append `subscription_added`,
+`subscription_paused`, or `subscription_resumed` to the existing hash-chained
+board ledger. Those audit payloads omit even the opaque secret reference.
 
 Unknown subjects, historical relation targets, event kinds, statuses, or tags
 fail closed at creation. Pause and resume are idempotent state transitions; no
 update or delete surface can silently retarget an existing identity.
 `subscription list` and `subscription show` are read-only request-response
 operations and remain in generated MCP schemas. Delivery state and adapter
-execution are explicitly deferred to the dispatcher phase.
+execution were explicitly deferred from that declaration phase.
 
 The immutable delivery identity is `(subscriptionID, eventID)`. The
 subscription protocol version, watch envelope version, stored event semantic
 schema version, and binary release version are independent compatibility
 numbers and must not be inferred from one another.
+
+### 8. The dispatcher is a separate capability-gated process
+
+Board schema v22 adds durable materialization, delivery, lease, attempt, retry,
+acknowledgement, and dead-letter state. The worker is the dedicated compiled
+`kanban-dispatcher` binary, never an in-process callback:
+
+```bash
+kanban-dispatcher --project NAME [--consumer consumer.name] [--once] [--json]
+kanban-dispatcher --workspace /registered/root [--once] [--json]
+kanban-dispatcher --db /exact/board.db [--once] [--json]
+```
+
+Normal execution requires exactly one explicit selector. `--consumer`
+restricts execution to one consumer identity, `--once` performs one scheduler
+step, and `--json` emits the bounded report on stdout. Help and version return
+without opening registry or board state. Conflicting explicit and environment
+selectors fail closed.
+
+The trusted protocol-v1 configuration is
+`$KANBAN_DATA_DIR/dispatchers.json`. A representative shape is:
+
+```json
+{
+  "version": 1,
+  "consumers": {
+    "consumer.name": {
+      "capabilities": ["deliver"],
+      "actions": {
+        "send": {
+          "capability": "deliver",
+          "executable": "/absolute/path/to/adapter",
+          "args": ["fixed-subcommand"]
+        }
+      },
+      "secrets": {
+        "token-ref": {
+          "sourceEnv": "HOST_SECRET_NAME",
+          "targetEnv": "ADAPTER_TOKEN"
+        }
+      }
+    }
+  }
+}
+```
+
+The example names environment variables, not values. The private data root and
+config refuse group/other access and symlinks. The executable must be an
+absolute regular non-symlink with an execute bit and no group/other write bit.
+Consumers, actions, capabilities, fixed arguments, and secret mappings come
+only from this operator-owned file. Adapter execution starts with a cleared
+environment and receives only the configured target secret variable when the
+subscription names that opaque reference. The dispatcher writes the validated
+protocol-v1 request to stdin, drains stdout and stderr concurrently with a 1 MiB
+cap on each, validates the response against the exact request, and supervises
+the adapter process group across timeout or cancellation. This is a host trust
+boundary, not an OS sandbox.
+
+Startup loads and validates configuration before the first materialization or
+claim. Each scheduler step then materializes new matches, recovers expired
+leases, selects one due candidate, and resolves its configured target before
+lock contention. It takes a per-consumer host lock, reloads and revalidates the
+configuration under that lock, and atomically claims the candidate. The
+delivery lease lasts `timeoutMs + 30 seconds`; the adapter runs outside any
+SQLite transaction. Success or failure finalizes only the exact
+`(subscriptionID,eventID,leaseToken)` claim. Failures use deterministic bounded
+exponential retry and become dead letters after the declared budget. A paused
+subscription is ineligible at claim time, so pause/resume is rechecked even for
+already materialized rows.
+
+SIGINT and SIGTERM stop polling and terminate a running adapter process group
+before the exact failure is recorded. If the dispatcher or host dies after the
+adapter succeeds but before acknowledgement, lease recovery records
+`lease_expired` and retries. That boundary is intentionally at-least-once: an
+adapter must use `(subscriptionID,eventID)` as its idempotency key and must not
+assume exactly-once side effects.
 
 ## Consequences
 
@@ -307,9 +384,10 @@ cursor itself.
 ## Rollout
 
 The watch-stream phase did not require a schema migration: it adopted the
-existing append-only event trails. The durable subscription phase adds board
-schema v21 for declarative records while continuing to audit every lifecycle
-mutation through that same board event trail.
+existing append-only event trails. The durable subscription declaration phase
+added board schema v21. The dispatcher phase adds board schema v22 for durable
+delivery state while continuing to audit subscription lifecycle through the
+same board event trail.
 
 The implementation rollout should be staged:
 
@@ -325,7 +403,9 @@ The implementation rollout should be staged:
 5. preserve `kb events` as the bounded historical snapshot command;
 6. keep the stream shape stable once published.
 7. add board-local subscription records and command-schema projections before
-   any dispatcher or adapter can execute them.
+   any dispatcher or adapter can execute them;
+8. ship the compiled dispatcher, host-local capability allow-list, durable
+   delivery scheduler, and process-separated fake-adapter proof.
 
 ## Tests and operations
 
@@ -361,6 +441,22 @@ The durable-subscription acceptance slice additionally proves:
 - lifecycle events on the existing audited watch stream with no secret
   reference in their payload; and
 - accurate read-only/list-valued command-schema metadata.
+
+The dispatcher acceptance slice additionally proves through the compiled
+`kanban-dispatcher` and a separately compiled fake adapter process:
+
+- help/version avoid database access and all three explicit selectors resolve;
+- configuration fails before materialization or claim and one consumer filter
+  cannot claim another consumer's work;
+- the adapter inherits no ambient environment and receives only the configured
+  secret target, while request/report/error paths do not reveal its value;
+- success and stable exit, malformed, mismatch, overflow, timeout, and
+  cancellation failures persist their exact attempt outcomes;
+- two worker processes contend for one delivery but produce one claim and one
+  adapter invocation;
+- pause/resume and SIGTERM operate at real process boundaries; and
+- a post-success/pre-ack process crash survives lease expiry, records
+  `lease_expired`, invokes the adapter again, and then records `success`.
 
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:
