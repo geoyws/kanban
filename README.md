@@ -574,6 +574,23 @@ ingress is `/root/.local/bin/codex queue --thread UUID_OR_EXACT_SESSION_NAME
 itself the live-smoke receipt; the separately named HAX live smoke receipt is
 the distinct runtime check for installed Codex support.
 
+The second experimental and opt-in bridge uses consumer `codex.app-server`,
+action `start-readonly-turn`, and capability `start`, implemented by
+`kanban-codex-app-server-adapter`. The host allow-list binding
+is installed, but this rollout enables no active declarative subscription.
+When the dispatcher invokes it, the adapter still accepts a structured
+`AdapterRequest` and returns `AdapterResponse`; that is the normal dispatcher
+path, not a general subscription bypass. Its operator synopsis, pins, and
+fail-closed rules live in `docs/PRD.md`; the architecture and acceptance
+matrix live in
+`docs/adr/ADR-031-ledger-first-pubsub-uses-the-append-only-event-ledger.md`.
+The host pins Codex CLI `0.150.1`, the `ClientRequest` hash
+`efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, and the
+combined v2 schema hash
+`8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`; each
+invocation clears child environment except `CODEX_HOME`, probes version/help,
+and emits only `AdapterResponse` on success.
+
 The declaration-only phase historically stopped there. The shipped delivery
 worker is now a separate compiled process with one explicit board selector:
 

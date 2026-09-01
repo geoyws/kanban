@@ -696,6 +696,26 @@ surface, and it must fail closed on drift. The adapter passes only that fixed
 TEXT` when `codex-cli 0.150.1` is installed. The separately named HAX live
 smoke receipt is the distinct runtime check for installed Codex support.
 
+The second experimental and opt-in bridge uses consumer `codex.app-server`,
+action `start-readonly-turn`, and capability `start`. The
+host allow-list binding is installed, but this rollout enables no active
+declarative subscription. When the dispatcher invokes it, the adapter still
+accepts a structured `AdapterRequest` and returns `AdapterResponse`; that is
+the normal dispatcher path, not a general subscription bypass. The host pins
+Codex CLI `0.150.1`, the `ClientRequest` hash
+`efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, and the
+combined v2 schema hash
+`8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`. The
+host config owns those pins. Each invocation clears child environment except
+`CODEX_HOME`, probes version/help, regenerates and verifies schema in an
+identity-pinned 0700 temp dir, and fails closed on request, notification,
+tool-ish items, policy/identity/status/schema/size drift, malformed output,
+stderr, timeout, wrong/extra/duplicate ack, errors, and post-completion
+output. It uses one ephemeral thread/delivery, approval never, a read-only
+sandbox (`{type:readOnly,networkAccess:false}`), stdio only, no
+terminal/tmux/send-keys, and emits only `AdapterResponse` after one accepted
+completion.
+
 Run delivery through the separate compiled worker with exactly one explicit
 board selector:
 

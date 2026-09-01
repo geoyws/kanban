@@ -111,6 +111,31 @@ write domains.
   directly for the exact version and `codex queue --help`, fails closed on
   drift, starts with an empty environment, and passes only that fixed
   `CODEX_HOME` to child Codex processes.
+- For the second experimental and opt-in bridge, host-local `dispatchers.json`
+  binds consumer `codex.app-server`, action `start-readonly-turn`, and
+  capability `start` to the checked-in `kanban-codex-app-server-adapter`.
+  The host allow-list binding is installed, but this rollout enables no active
+  declarative subscription. When the dispatcher invokes it, the adapter still
+  accepts a structured `AdapterRequest` and returns `AdapterResponse`; that is
+  the normal dispatcher path, not a general subscription bypass. Private host
+  config pins the canonical Codex path, private `CODEX_HOME`, private
+  empty cwd, exact Codex CLI `0.150.1`, the
+  `ClientRequest` hash
+  `efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, the
+  combined v2 schema hash
+  `8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`, and
+  the protocol timeout. Each invocation clears child environment except
+  `CODEX_HOME`, probes version/help, generates the schema with experimental
+  API disabled in its own identity-pinned 0700 temp dir, verifies both hashes,
+  and removes only that directory. The turn is read-only (`{type:readOnly,
+  networkAccess:false}`), approval is never requested, the instruction set
+  forbids tools/files/network/commands and terminal/tmux/send-keys, and seven
+  ambient/reasoning notification classes are explicitly opted out. Server
+  requests, unconsumed notifications, tool-ish items, policy/identity/status/
+  schema/size drift, malformed output, stderr, timeout, wrong/extra/duplicate
+  ack, errors, and post-completion output fail closed. Success stdout is only
+  `AdapterResponse` after exactly one `{accepted:true,idempotencyKey:<subscriptionID:eventID>}`
+  completion. Delivery remains at-least-once.
 
 ### P0 — first usable slice
 
