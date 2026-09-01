@@ -54,6 +54,7 @@ struct CommandScenario {
     stdout: Emit,
     stderr: Emit,
     exit_code: i32,
+    delay_ms: u64,
 }
 
 #[derive(Clone)]
@@ -221,11 +222,13 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
             stdout: Emit::plain(format!("codex-cli {TEST_CODEX_VERSION}\n")),
             stderr: Emit::None,
             exit_code: 0,
+            delay_ms: 0,
         },
         help: CommandScenario {
             stdout: Emit::plain("Usage: codex app-server\n--listen <URL>\ngenerate-json-schema\n"),
             stderr: Emit::None,
             exit_code: 0,
+            delay_ms: 0,
         },
         schema_stdout: Emit::None,
         schema_stderr: Emit::None,
@@ -374,9 +377,14 @@ impl Scenario {
             "version.exit".to_owned(),
             self.version.exit_code.to_string(),
         ));
+        lines.push((
+            "version.delay_ms".to_owned(),
+            self.version.delay_ms.to_string(),
+        ));
         lines.push(("help.stdout".to_owned(), self.help.stdout.spec()));
         lines.push(("help.stderr".to_owned(), self.help.stderr.spec()));
         lines.push(("help.exit".to_owned(), self.help.exit_code.to_string()));
+        lines.push(("help.delay_ms".to_owned(), self.help.delay_ms.to_string()));
         lines.push((
             "schema.client_request".to_owned(),
             format!("hex:{}", hex_encode(&self.schema_client_request)),
@@ -923,13 +931,30 @@ fn compiled_process_rechecks_that_cwd_stays_empty_before_each_spawn() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = fixture_with_mutation("cwd-dirty-after-validate", |scenario| {
-        scenario.version.stdout = Emit::Sleep(1_000);
+        scenario.version.delay_ms = 1_000;
     });
     let dirty_path = fixture.cwd.join("marker");
+    let capture_path = fixture.capture.clone();
     let writer = std::thread::spawn({
         let dirty_path = dirty_path.clone();
         move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if fs::read_to_string(&capture_path)
+                    .map(|text| {
+                        text.contains("\"mode\":\"version-stage\"")
+                            && text.contains("\"phase\":\"entered\"")
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "version probe did not reach the entered boundary"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
             fs::write(dirty_path, b"seed").unwrap();
         }
     });

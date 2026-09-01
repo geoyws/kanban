@@ -221,6 +221,12 @@ fn command_stderr(map: &HashMap<String, String>, prefix: &str) -> Emit {
     get_spec(map, &format!("{prefix}.stderr"))
 }
 
+fn command_delay_ms(map: &HashMap<String, String>, prefix: &str) -> u64 {
+    map.get(&format!("{prefix}.delay_ms"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 fn ignore_termination() {
     // SAFETY: signal(2) receives the portable SIG_IGN sentinel and fixed
     // SIGINT/SIGTERM values shared by the supported macOS and Linux targets.
@@ -333,6 +339,7 @@ fn run_version_or_help(mode: &str, map: &HashMap<String, String>, argv: &[String
         "",
         &[("phase", "entered".to_owned())],
     );
+    thread::sleep(Duration::from_millis(command_delay_ms(map, mode)));
     emit(&mut stdout, &stdout_emit, &mut captured_stdout);
     emit(&mut stderr, &stderr_emit, &mut captured_stderr);
     capture_record(
