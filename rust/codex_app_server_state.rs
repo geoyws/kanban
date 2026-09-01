@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::path::Path;
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const EXPECTED_APPROVAL_POLICY: &str = "never";
@@ -43,6 +44,7 @@ pub(crate) enum Transition {
 #[derive(Debug, Clone)]
 pub(crate) struct StateMachine {
     canonical_cwd: String,
+    canonical_codex_home: String,
     expected_idempotency_key: String,
     phase: Phase,
     thread_id: Option<String>,
@@ -61,14 +63,18 @@ struct AckPayload {
 impl StateMachine {
     pub(crate) fn new(
         canonical_cwd: impl Into<String>,
+        canonical_codex_home: impl Into<String>,
         idempotency_key: impl Into<String>,
     ) -> Result<Self> {
         let canonical_cwd = canonical_cwd.into();
+        let canonical_codex_home = canonical_codex_home.into();
         let expected_idempotency_key = idempotency_key.into();
         validate_cwd(&canonical_cwd)?;
+        validate_absolute_path(&canonical_codex_home, "codex home")?;
         validate_key(&expected_idempotency_key, "idempotency key")?;
         Ok(Self {
             canonical_cwd,
+            canonical_codex_home,
             expected_idempotency_key,
             phase: Phase::AwaitInitResponse,
             thread_id: None,
@@ -103,7 +109,8 @@ impl StateMachine {
         match self.phase {
             Phase::AwaitInitResponse => {
                 expect_response_id(object, 1)?;
-                expect_success_response(object)?;
+                let result = expect_success_response(object)?;
+                validate_initialize_response(result, &self.canonical_codex_home)?;
                 self.phase = Phase::AwaitThreadStartResponse;
                 Ok(Transition::SendThreadStart)
             }
@@ -685,18 +692,39 @@ fn validate_key(value: &str, label: &str) -> Result<()> {
 }
 
 fn validate_cwd(value: &str) -> Result<()> {
+    validate_absolute_path(value, "cwd")
+}
+
+fn validate_absolute_path(value: &str, label: &str) -> Result<()> {
     if value.is_empty() {
-        bail!("cwd must be a nonempty absolute path");
+        bail!("{label} must be a nonempty absolute path");
     }
     if !std::path::Path::new(value).is_absolute() {
-        bail!("cwd must be a nonempty absolute path");
+        bail!("{label} must be a nonempty absolute path");
     }
     if value.chars().any(|ch| ch.is_control()) {
-        bail!("cwd must not contain control characters");
+        bail!("{label} must not contain control characters");
     }
     if value.len() > MAX_LINE_BYTES {
-        bail!("cwd exceeds {MAX_LINE_BYTES} bytes");
+        bail!("{label} exceeds {MAX_LINE_BYTES} bytes");
     }
+    Ok(())
+}
+
+fn validate_initialize_response(
+    result: &Map<String, Value>,
+    expected_codex_home: &str,
+) -> Result<()> {
+    let codex_home = nonempty_string_field(result, "codexHome", "initialize response")?;
+    if !Path::new(codex_home).is_absolute() {
+        bail!("initialize response codexHome must be an absolute path");
+    }
+    if codex_home != expected_codex_home {
+        bail!("initialize response codexHome does not match");
+    }
+    nonempty_string_field(result, "platformFamily", "initialize response")?;
+    nonempty_string_field(result, "platformOs", "initialize response")?;
+    nonempty_string_field(result, "userAgent", "initialize response")?;
     Ok(())
 }
 
@@ -767,12 +795,13 @@ mod tests {
     use serde_json::json;
 
     const CWD: &str = "/private/tmp/kanban-app-messages";
+    const CODEX_HOME: &str = "/private/tmp/kanban-codex-home";
     const ID_KEY: &str = "ack-key-1";
     const THREAD_ID: &str = "01890f3b-2c3d-7abc-8def-0123456789ab";
     const TURN_ID: &str = "01890f3b-2c3d-7abc-8def-0123456789ac";
 
     fn new_state() -> StateMachine {
-        StateMachine::new(CWD, ID_KEY).unwrap()
+        StateMachine::new(CWD, CODEX_HOME, ID_KEY).unwrap()
     }
 
     fn line(value: Value) -> Vec<u8> {
@@ -782,7 +811,24 @@ mod tests {
     }
 
     fn init_response() -> Vec<u8> {
-        line(json!({"id": 1, "result": {}}))
+        initialize_response(CODEX_HOME, "codex-cli/0.150.1", "unix", "linux")
+    }
+
+    fn initialize_response(
+        codex_home: &str,
+        user_agent: &str,
+        platform_family: &str,
+        platform_os: &str,
+    ) -> Vec<u8> {
+        line(json!({
+            "id": 1,
+            "result": {
+                "codexHome": codex_home,
+                "platformFamily": platform_family,
+                "platformOs": platform_os,
+                "userAgent": user_agent
+            }
+        }))
     }
 
     fn thread_start_response(cwd: &str, thread_id: &str) -> Vec<u8> {
@@ -1098,6 +1144,77 @@ mod tests {
             Transition::Completed
         ));
         assert!(state.feed(&token_usage(THREAD_ID, TURN_ID)).is_err());
+    }
+
+    #[test]
+    fn rejects_initialize_response_shape_mismatches() {
+        for response in [
+            line(json!({
+                "id": 1,
+                "result": {
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": "codex-cli/0.150.1"
+                }
+            })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": 7,
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": "codex-cli/0.150.1"
+                }
+            })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": "relative/codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": "codex-cli/0.150.1"
+                }
+            })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": "/private/tmp/kanban-codex-home-mismatch",
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": "codex-cli/0.150.1"
+                }
+            })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": CODEX_HOME,
+                    "platformFamily": "",
+                    "platformOs": "linux",
+                    "userAgent": "codex-cli/0.150.1"
+                }
+            })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": CODEX_HOME,
+                    "platformFamily": "unix",
+                    "platformOs": "",
+                    "userAgent": "codex-cli/0.150.1"
+                }
+            })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": CODEX_HOME,
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": ""
+                }
+            })),
+        ] {
+            let mut state = new_state();
+            assert!(state.feed(&response).is_err());
+        }
     }
 
     #[test]

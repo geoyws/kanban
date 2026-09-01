@@ -124,7 +124,7 @@ fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
     }
 }
 
-fn child_exited_unreaped(pid: u32) -> io::Result<bool> {
+pub(crate) fn child_exited_unreaped(pid: u32) -> io::Result<bool> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child pid exceeds pid_t"))?;
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -164,7 +164,9 @@ fn reap_if_exited(child: &mut std::process::Child) -> io::Result<Option<std::pro
 /// Returns the real exit status when the leader had already exited before the
 /// first signal. Once this function sends a signal, the caller's timeout or
 /// cancellation reason owns the outcome.
-fn terminate_and_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+pub(crate) fn terminate_and_reap(
+    child: &mut std::process::Child,
+) -> Option<std::process::ExitStatus> {
     if let Ok(Some(status)) = reap_if_exited(child) {
         return Some(status);
     }

@@ -1,3 +1,4 @@
+use crate::adapter_process::{child_exited_unreaped, terminate_and_reap};
 use crate::adapter_protocol::{AdapterRequest, AdapterResponse, decode_request};
 use crate::audit;
 use crate::codex_app_server_messages::{
@@ -10,6 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -163,12 +165,13 @@ pub(crate) fn entrypoint() -> Result<()> {
 
 fn run(args: Args) -> Result<()> {
     let validated = validate_paths(&args)?;
-    probe_codex_version(&validated)?;
-    probe_codex_app_server_help(&validated)?;
-    verify_generated_schema(&validated)?;
+    let deadline = Instant::now() + Duration::from_millis(validated.protocol_timeout_ms);
+    probe_codex_version(&validated, deadline)?;
+    probe_codex_app_server_help(&validated, deadline)?;
+    verify_generated_schema(&validated, deadline)?;
     let request = decode_request_from_stdin()?;
     validate_request_target(&request)?;
-    let response = drive_app_server(&validated, &request)?;
+    let response = drive_app_server(&validated, &request, deadline)?;
     let mut stdout = io::stdout();
     stdout.write_all(&render_response(&response)?)?;
     stdout.flush()?;
@@ -556,11 +559,12 @@ fn codex_command(validated: &Validated, args: &[OsString]) -> Command {
         .current_dir(&validated.canonical_cwd)
         .env_clear()
         .env("CODEX_HOME", &validated.canonical_codex_home)
-        .args(args);
+        .args(args)
+        .process_group(0);
     command
 }
 
-fn capture_output(mut child: Child, label: &str) -> Result<Output> {
+fn capture_output(mut child: Child, label: &str, deadline: Instant) -> Result<Output> {
     let stdout = child
         .stdout
         .take()
@@ -573,7 +577,34 @@ fn capture_output(mut child: Child, label: &str) -> Result<Output> {
     let stdout_thread = thread::spawn(move || read_bounded_stream(stdout, MAX_STREAM_BYTES));
     let stderr_thread = thread::spawn(move || read_bounded_stream(stderr, MAX_STREAM_BYTES));
 
-    let status = child.wait()?;
+    enum Outcome {
+        Exited(std::process::ExitStatus),
+        TimedOut,
+        WaitFailed,
+    }
+
+    let outcome = loop {
+        match child_exited_unreaped(child.id()) {
+            Ok(true) => {
+                let status = terminate_and_reap(&mut child)
+                    .ok_or_else(|| anyhow::anyhow!("{label} exited without a reaped status"))?;
+                break Outcome::Exited(status);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                let _ = terminate_and_reap(&mut child);
+                break Outcome::WaitFailed;
+            }
+        }
+        if Instant::now() >= deadline {
+            break match terminate_and_reap(&mut child) {
+                Some(status) => Outcome::Exited(status),
+                None => Outcome::TimedOut,
+            };
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
     let (stdout, stdout_overflowed) = stdout_thread
         .join()
         .map_err(|_| anyhow::anyhow!("{label} stdout capture panicked"))??;
@@ -588,11 +619,15 @@ fn capture_output(mut child: Child, label: &str) -> Result<Output> {
         bail!("{label} stderr exceeds {MAX_STREAM_BYTES} bytes");
     }
 
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    match outcome {
+        Outcome::Exited(status) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Outcome::TimedOut => bail!("{label} timed out before the deadline"),
+        Outcome::WaitFailed => bail!("{label} wait failed"),
+    }
 }
 
 fn read_bounded_stream<R: io::Read>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, bool)> {
@@ -618,14 +653,19 @@ fn read_bounded_stream<R: io::Read>(mut reader: R, limit: usize) -> io::Result<(
     Ok((bytes, overflowed))
 }
 
-fn run_codex_command(validated: &Validated, args: &[OsString], label: &str) -> Result<Output> {
+fn run_codex_command(
+    validated: &Validated,
+    args: &[OsString],
+    label: &str,
+    deadline: Instant,
+) -> Result<Output> {
     validate_identities_before_spawn(validated)?;
     let child = codex_command(validated, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    capture_output(child, label)
+    capture_output(child, label, deadline)
 }
 
 fn version_args() -> Vec<OsString> {
@@ -693,27 +733,29 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
-fn probe_codex_version(validated: &Validated) -> Result<()> {
-    let output = run_codex_command(validated, &version_args(), "codex version probe")?;
+fn probe_codex_version(validated: &Validated, deadline: Instant) -> Result<()> {
+    let output = run_codex_command(validated, &version_args(), "codex version probe", deadline)?;
     validate_version_probe(&output, &validated.required_version)
 }
 
-fn probe_codex_app_server_help(validated: &Validated) -> Result<()> {
+fn probe_codex_app_server_help(validated: &Validated, deadline: Instant) -> Result<()> {
     let output = run_codex_command(
         validated,
         &app_server_help_args(),
         "codex app-server help probe",
+        deadline,
     )?;
     validate_app_server_help_probe(&output)
 }
 
-fn verify_generated_schema(validated: &Validated) -> Result<()> {
+fn verify_generated_schema(validated: &Validated, deadline: Instant) -> Result<()> {
     let mut temp = TempSchemaDir::new()?;
     let out_dir = temp.path().to_path_buf();
     let output = run_codex_command(
         validated,
         &schema_generation_args(&out_dir),
         "codex app-server schema generation",
+        deadline,
     )?;
     if !output.status.success() {
         bail!("codex app-server schema generation failed");
@@ -926,7 +968,9 @@ fn write_line(stdin: &mut impl io::Write, line: &str) -> Result<()> {
 fn wait_for_clean_exit(child: &mut Child) -> Result<Output> {
     let deadline = Instant::now() + CLEANUP_WINDOW;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if child_exited_unreaped(child.id())? {
+            let status = terminate_and_reap(child)
+                .ok_or_else(|| anyhow::anyhow!("app-server exited without a reaped status"))?;
             return Ok(Output {
                 status,
                 stdout: Vec::new(),
@@ -938,27 +982,12 @@ fn wait_for_clean_exit(child: &mut Child) -> Result<Output> {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = terminate_and_reap(child);
     bail!("app-server did not exit cleanly within the cleanup window");
 }
 
 fn abort_child(child: &mut Child) {
-    let _ = child.kill();
-    let deadline = Instant::now() + CLEANUP_WINDOW;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    let _ = terminate_and_reap(child);
 }
 
 struct AppServerCleanup {
@@ -1040,18 +1069,25 @@ impl AppServerCleanup {
     }
 }
 
-fn drive_app_server(validated: &Validated, request: &AdapterRequest) -> Result<AdapterResponse> {
+fn drive_app_server(
+    validated: &Validated,
+    request: &AdapterRequest,
+    deadline: Instant,
+) -> Result<AdapterResponse> {
     validate_identities_before_spawn(validated)?;
-    let protocol_deadline = Instant::now() + Duration::from_millis(validated.protocol_timeout_ms);
     let cwd = validated
         .canonical_cwd
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("cwd must be valid UTF-8"))?;
+    let codex_home = validated
+        .canonical_codex_home
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("codex home must be valid UTF-8"))?;
     let idempotency_key = format!(
         "{}:{}",
         request.delivery.subscription_id, request.delivery.event_id
     );
-    let mut state = StateMachine::new(cwd, idempotency_key.clone())?;
+    let mut state = StateMachine::new(cwd, codex_home, idempotency_key.clone())?;
 
     let mut child = app_server_command(validated)
         .spawn()
@@ -1088,10 +1124,10 @@ fn drive_app_server(validated: &Validated, request: &AdapterRequest) -> Result<A
 
         loop {
             let now = Instant::now();
-            if now >= protocol_deadline {
+            if now >= deadline {
                 bail!("protocol timed out");
             }
-            let remaining = protocol_deadline.saturating_duration_since(now);
+            let remaining = deadline.saturating_duration_since(now);
             let event = match stdout_rx.recv_timeout(remaining) {
                 Ok(event) => event?,
                 Err(RecvTimeoutError::Timeout) => bail!("protocol timed out"),
@@ -1229,6 +1265,82 @@ mod tests {
         }
     }
 
+    fn spawn_descendant_fixture(marker: &Path) -> Child {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "adapter_process::tests::child_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(
+                "KANBAN_TEST_ADAPTER",
+                format!("descendant:{}", marker.display()),
+            )
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        command.spawn().unwrap()
+    }
+
+    fn pid_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    fn validated_for_script(prefix: &str, script: &str) -> Validated {
+        let root = temp_dir(prefix);
+        let codex = root.join("codex.sh");
+        write_file(&codex, 0o755, script.as_bytes());
+        let codex_home = root.join("codex-home");
+        write_dir(&codex_home, 0o700);
+        let cwd = root.join("cwd");
+        write_dir(&cwd, 0o700);
+
+        let canonical_codex = fs::canonicalize(&codex).unwrap();
+        let canonical_codex_file = fs::File::open(&canonical_codex).unwrap();
+        let canonical_codex_identity = file_identity(&canonical_codex_file.metadata().unwrap());
+
+        let canonical_codex_home = fs::canonicalize(&codex_home).unwrap();
+        let canonical_codex_home_file = fs::File::open(&canonical_codex_home).unwrap();
+        let canonical_codex_home_identity =
+            file_identity(&canonical_codex_home_file.metadata().unwrap());
+
+        let canonical_cwd = fs::canonicalize(&cwd).unwrap();
+        let canonical_cwd_file = fs::File::open(&canonical_cwd).unwrap();
+        let canonical_cwd_identity = file_identity(&canonical_cwd_file.metadata().unwrap());
+
+        Validated {
+            canonical_codex,
+            canonical_codex_file,
+            canonical_codex_identity,
+            canonical_codex_home,
+            canonical_codex_home_file,
+            canonical_codex_home_identity,
+            canonical_cwd,
+            canonical_cwd_file,
+            canonical_cwd_identity,
+            required_version: "0.150.1".to_owned(),
+            client_request_sha256: "a".repeat(64),
+            protocol_schema_sha256: "b".repeat(64),
+            protocol_timeout_ms: 1_000,
+        }
+    }
+
+    fn spawnable_validated() -> Validated {
+        validated_for_script("spawn-group", "#!/bin/sh\n/bin/sleep 30\n")
+    }
+
+    fn descendant_timeout_validated() -> Validated {
+        validated_for_script(
+            "probe-timeout",
+            "#!/bin/sh\n/bin/sleep 30 &\n/bin/sleep 30\n",
+        )
+    }
+
     #[test]
     fn parse_outcome_accepts_help_and_version_only() {
         assert!(matches!(
@@ -1297,6 +1409,60 @@ mod tests {
         .unwrap();
         assert_eq!(bytes.len(), MAX_STREAM_BYTES);
         assert!(overflowed);
+    }
+
+    #[test]
+    fn shared_process_group_cleanup_removes_app_server_descendants() {
+        let marker = std::env::temp_dir().join(format!(
+            "kanban-app-server-descendant-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut child = spawn_descendant_fixture(&marker);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let pid = loop {
+            if let Ok(text) = fs::read_to_string(&marker)
+                && let Ok(pid) = text.trim().parse::<i32>()
+                && pid_exists(pid)
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant pid marker was never created"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        let _ = terminate_and_reap(&mut child);
+
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pid_exists(pid) && std::time::Instant::now() < cleanup_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !pid_exists(pid),
+            "descendant process {pid} survived cleanup"
+        );
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn app_server_spawn_uses_a_private_process_group() {
+        let validated = spawnable_validated();
+        let mut child = app_server_command(&validated).spawn().unwrap();
+        let pid = child.id() as i32;
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        let _ = terminate_and_reap(&mut child);
+    }
+
+    #[test]
+    fn run_codex_command_times_out_and_reaps_descendants() {
+        let validated = descendant_timeout_validated();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let error = run_codex_command(&validated, &version_args(), "codex version probe", deadline)
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
     }
 
     #[test]
