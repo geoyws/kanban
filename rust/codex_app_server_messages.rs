@@ -6,7 +6,7 @@ const MAX_RENDER_BYTES: usize = 64 * 1024;
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
-const CLIENT_NAME: &str = "kanban-codex-app-server-adapter";
+pub(crate) const CLIENT_NAME: &str = "kanban-codex-app-server-adapter";
 const BASE_INSTRUCTIONS: &str = "Return only the JSON acknowledgement.";
 const DEVELOPER_INSTRUCTIONS: &str =
     "Do not use tools, files, network, or commands. Return only the JSON acknowledgement.";
@@ -43,7 +43,7 @@ struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 struct InitializeCapabilities {
     experimental_api: bool,
-    opt_out_notification_methods: [&'static str; 7],
+    opt_out_notification_methods: [&'static str; 8],
 }
 
 #[derive(Serialize)]
@@ -219,6 +219,18 @@ pub(crate) fn initialize_line() -> Result<String> {
             capabilities: InitializeCapabilities {
                 experimental_api: false,
                 opt_out_notification_methods: [
+                    // Suppresses the notification the server emits when the
+                    // adapter's cwd is an untrusted project directory; the
+                    // state machine stays fail-closed on unknown methods, so
+                    // without this the handshake aborts.
+                    //
+                    // NOT PINNED LOCALLY. This spelling was measured against
+                    // installed codex-cli 0.150.1 on 2026-09-01; no protocol
+                    // schema is vendored here (only sha256 hashes are checked,
+                    // against a schema the server generates at runtime), so a
+                    // typo would keep this suite green and fail only at the
+                    // HAX live smoke. The live smoke is its only true pin.
+                    "configWarning",
                     "remoteControl/status/changed",
                     "mcpServer/startupStatus/updated",
                     "thread/status/changed",
@@ -320,6 +332,7 @@ mod tests {
                     "capabilities": {
                         "experimentalApi": false,
                         "optOutNotificationMethods": [
+                            "configWarning",
                             "remoteControl/status/changed",
                             "mcpServer/startupStatus/updated",
                             "thread/status/changed",

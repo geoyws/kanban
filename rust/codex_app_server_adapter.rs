@@ -23,7 +23,10 @@ use uuid::Uuid;
 const HELP: &str = "kanban-codex-app-server-adapter --codex PATH --codex-home PATH --cwd PATH --required-version VER --client-request-sha256 HEX --protocol-schema-sha256 HEX --protocol-timeout-ms N";
 const MAX_STDIN_BYTES: usize = 1 << 16;
 const MAX_STREAM_BYTES: usize = 1 << 16;
-const CLIENT_NAME: &str = "kanban-codex-app-server-adapter";
+const CLIENT_NAME: &str = crate::codex_app_server_messages::CLIENT_NAME;
+// Fixed, never inherited: without a PATH the app server cannot find the
+// system bubblewrap and falls back to its bundled copy.
+const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
 const CODEX_APP_SERVER_CONSUMER_ID: &str = "codex.app-server";
 const START_READONLY_TURN_ACTION_ID: &str = "start-readonly-turn";
 const APP_SERVER_HELP_USAGE: &str = "Usage: codex app-server";
@@ -913,6 +916,7 @@ fn codex_command(validated: &Validated, args: &[OsString]) -> Command {
         .current_dir(&validated.canonical_cwd)
         .env_clear()
         .env("CODEX_HOME", &validated.canonical_codex_home)
+        .env("PATH", CODEX_CHILD_PATH)
         .args(args)
         .process_group(0);
     // SAFETY: the hook invokes only async-signal-safe libc operations. It

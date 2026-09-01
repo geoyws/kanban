@@ -281,7 +281,10 @@ impl Fixture {
                 "codexHome": codex_home,
                 "platformFamily": "unix",
                 "platformOs": "linux",
-                "userAgent": format!("codex-cli/{}", env!("CARGO_PKG_VERSION")),
+                "userAgent": format!(
+                    "kanban-codex-app-server-adapter/{version} (Ubuntu 24.4.0; x86_64) unknown (kanban-codex-app-server-adapter; {version})",
+                    version = env!("CARGO_PKG_VERSION")
+                ),
             }
         })
         .to_string();

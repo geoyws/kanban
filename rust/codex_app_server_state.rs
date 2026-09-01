@@ -1,3 +1,4 @@
+use crate::codex_app_server_messages::CLIENT_NAME;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -830,7 +831,19 @@ fn validate_initialize_response(
     nonempty_string_field(result, "platformFamily", "initialize response")?;
     nonempty_string_field(result, "platformOs", "initialize response")?;
     let user_agent = nonempty_string_field(result, "userAgent", "initialize response")?;
-    if user_agent != format!("codex-cli/{required_version}") {
+    validate_user_agent(user_agent, required_version)?;
+    Ok(())
+}
+
+/// The app server reports `{client}/{codexVersion} ({os}; {arch}) {terminal}
+/// ({client}; {clientVersion})`, where the originator is the client name we
+/// send. Bind exactly the two fields that identify us and pin the Codex
+/// version; the platform and terminal text in between is descriptive only.
+fn validate_user_agent(user_agent: &str, required_version: &str) -> Result<()> {
+    if !user_agent.starts_with(&format!("{CLIENT_NAME}/{required_version} ")) {
+        bail!("initialize response userAgent does not match");
+    }
+    if !user_agent.ends_with(&format!("({CLIENT_NAME}; {})", env!("CARGO_PKG_VERSION"))) {
         bail!("initialize response userAgent does not match");
     }
     Ok(())
@@ -919,13 +932,31 @@ mod tests {
         bytes
     }
 
-    fn init_response() -> Vec<u8> {
-        initialize_response(
-            CODEX_HOME,
-            &format!("codex-cli/{TEST_CODEX_VERSION}"),
-            "unix",
-            "linux",
+    /// Everything up to the trailing client group of the `userAgent` the
+    /// installed HAX `codex-cli 0.150.1` returned for this adapter's own
+    /// `initialize` line, spelled out verbatim so the accepting test stays
+    /// pinned to the measurement. The measured Codex version stays a literal;
+    /// only the trailing client group tracks `CARGO_PKG_VERSION`, so bumping
+    /// this crate cannot be mistaken for Codex protocol drift.
+    const MEASURED_USER_AGENT_HEAD: &str =
+        "kanban-codex-app-server-adapter/0.150.1 (Ubuntu 24.4.0; x86_64) unknown";
+
+    fn measured_user_agent() -> String {
+        format!(
+            "{MEASURED_USER_AGENT_HEAD} ({CLIENT_NAME}; {})",
+            env!("CARGO_PKG_VERSION")
         )
+    }
+
+    fn user_agent() -> String {
+        format!(
+            "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {})",
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn init_response() -> Vec<u8> {
+        initialize_response(CODEX_HOME, &user_agent(), "unix", "linux")
     }
 
     fn initialize_response(
@@ -1458,6 +1489,133 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_measured_real_world_initialize_user_agent() {
+        // The measured head pins the Codex half against the real server; the
+        // derived form must agree with it under the versions under test.
+        assert!(
+            user_agent().starts_with(MEASURED_USER_AGENT_HEAD),
+            "the required Codex version drifted from the HAX measurement"
+        );
+        let mut state = new_state();
+        assert!(matches!(
+            state
+                .feed(&initialize_response(
+                    CODEX_HOME,
+                    &measured_user_agent(),
+                    "unix",
+                    "linux"
+                ))
+                .unwrap(),
+            Transition::SendThreadStart
+        ));
+    }
+
+    #[test]
+    fn accepts_initialize_user_agent_with_unfamiliar_descriptive_text() {
+        let tolerated = format!(
+            "{CLIENT_NAME}/{TEST_CODEX_VERSION} (macOS 26.1; aarch64) ghostty ({CLIENT_NAME}; {})",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_ne!(tolerated, measured_user_agent());
+        let mut state = new_state();
+        assert!(matches!(
+            state
+                .feed(&initialize_response(
+                    CODEX_HOME, &tolerated, "unix", "linux"
+                ))
+                .unwrap(),
+            Transition::SendThreadStart
+        ));
+    }
+
+    #[test]
+    fn rejects_initialize_response_user_agent_drift() {
+        let package_version = env!("CARGO_PKG_VERSION");
+        let rejected = [
+            // The originator is the client name we send, never `codex-cli`.
+            format!(
+                "codex-cli/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            format!(
+                "kanban-codex-app-server-adaptor/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            // The Codex version stays exactly pinned.
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION}.1 (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            format!(
+                "{CLIENT_NAME}/0.150.2 (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            format!(
+                "{CLIENT_NAME}/0.150 (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            // The version must be delimited by a space, not run into the rest.
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION}(Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            // The trailing client group is missing.
+            format!("{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown"),
+            // The trailing client group is altered.
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown [{CLIENT_NAME}; {package_version}]"
+            ),
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}: {package_version})"
+            ),
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version}"
+            ),
+            // The trailing client group names someone else.
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown (codex-cli; {package_version})"
+            ),
+            // The trailing client group carries the wrong package version.
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version}.1)"
+            ),
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {TEST_CODEX_VERSION})"
+            ),
+            // The trailing client group is not at the end.
+            format!(
+                "{CLIENT_NAME}/{TEST_CODEX_VERSION} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version}) "
+            ),
+        ];
+        for user_agent in rejected {
+            let mut state = new_state();
+            let error = state
+                .feed(&initialize_response(
+                    CODEX_HOME,
+                    &user_agent,
+                    "unix",
+                    "linux",
+                ))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error, "initialize response userAgent does not match",
+                "{user_agent:?} was rejected for the wrong reason"
+            );
+        }
+    }
+
+    /// An empty `userAgent` is rejected one step earlier, by the shared
+    /// nonempty-field check rather than by `validate_user_agent`. It is
+    /// asserted on its own message so it cannot stand in for a shape case.
+    #[test]
+    fn rejects_an_empty_initialize_response_user_agent() {
+        let mut state = new_state();
+        let error = state
+            .feed(&initialize_response(CODEX_HOME, "", "unix", "linux"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "initialize response field userAgent must be nonempty"
+        );
+    }
+
+    #[test]
     fn rejects_initialize_response_shape_mismatches() {
         for response in [
             line(json!({
@@ -1465,7 +1623,7 @@ mod tests {
                 "result": {
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
+                    "userAgent": user_agent()
                 }
             })),
             line(json!({
@@ -1474,7 +1632,7 @@ mod tests {
                     "codexHome": 7,
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
+                    "userAgent": user_agent()
                 }
             })),
             line(json!({
@@ -1483,7 +1641,7 @@ mod tests {
                     "codexHome": "relative/codex-home",
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
+                    "userAgent": user_agent()
                 }
             })),
             line(json!({
@@ -1492,7 +1650,7 @@ mod tests {
                     "codexHome": "/private/tmp/kanban-codex-home-mismatch",
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
+                    "userAgent": user_agent()
                 }
             })),
             line(json!({
@@ -1501,7 +1659,7 @@ mod tests {
                     "codexHome": CODEX_HOME,
                     "platformFamily": "",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
+                    "userAgent": user_agent()
                 }
             })),
             line(json!({
@@ -1510,25 +1668,7 @@ mod tests {
                     "codexHome": CODEX_HOME,
                     "platformFamily": "unix",
                     "platformOs": "",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
-                }
-            })),
-            line(json!({
-                "id": 1,
-                "result": {
-                    "codexHome": CODEX_HOME,
-                    "platformFamily": "unix",
-                    "platformOs": "linux",
-                    "userAgent": ""
-                }
-            })),
-            line(json!({
-                "id": 1,
-                "result": {
-                    "codexHome": CODEX_HOME,
-                    "platformFamily": "unix",
-                    "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}.1")
+                    "userAgent": user_agent()
                 }
             })),
         ] {

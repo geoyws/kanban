@@ -15,12 +15,22 @@ const SUBSCRIPTION_ID: &str = "sub-test";
 const EVENT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const EVENT_HASH: &str = EVENT_ID;
 const TEST_CODEX_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CLIENT_NAME: &str = "kanban-codex-app-server-adapter";
 const BASE_INSTRUCTIONS: &str = "Return only the JSON acknowledgement.";
 const DEVELOPER_INSTRUCTIONS: &str =
     "Do not use tools, files, network, or commands. Return only the JSON acknowledgement.";
 const AT_LEAST_ONCE_INSTRUCTION: &str = "At-least-once delivery; deduplicate by idempotency key.";
 const TIMED_FAILURE_TIMEOUT_MS: u64 = 2_500;
 const TIMED_FAILURE_SLEEP_MS: u64 = 4_000;
+
+/// A `userAgent` in the real app server shape:
+/// `{client}/{codexVersion} ({os}; {arch}) {terminal} ({client}; {clientVersion})`.
+fn user_agent(codex_version: &str) -> String {
+    format!(
+        "{CLIENT_NAME}/{codex_version} (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 #[derive(Clone)]
 enum Emit {
@@ -251,7 +261,7 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
                     "codexHome": codex_home,
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}"),
+                    "userAgent": user_agent(TEST_CODEX_VERSION),
                 }
             })),
             response2: Emit::plain(response2),
@@ -765,8 +775,13 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
+    // Every child of `codex_command` gets the same cleared environment: exactly
+    // `CODEX_HOME` plus a fixed `PATH`. Without the `PATH` the installed app
+    // server cannot find the system bubblewrap, so the app-server spawn is
+    // pinned here too, not just the probes.
+    let expected_env = json!([["CODEX_HOME", codex_home], ["PATH", "/usr/bin:/bin"]]);
     assert_eq!(version["argv"], json!(["--version"]));
-    assert_eq!(version["env"], json!([["CODEX_HOME", codex_home]]));
+    assert_eq!(version["env"], expected_env);
     assert_eq!(version["cwd"], json!(cwd));
     assert_eq!(
         version["stdout"].as_str().unwrap().trim_end_matches('\n'),
@@ -780,7 +795,10 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         "Usage: codex app-server\n--listen <URL>\ngenerate-json-schema"
     );
 
+    assert_eq!(help["env"], expected_env);
+
     let schema = parse_invocation(&records, "schema");
+    assert_eq!(schema["env"], expected_env);
     let out_dir = PathBuf::from(schema["out_dir"].as_str().unwrap());
     assert!(!out_dir.starts_with(&fixture.cwd));
     assert!(!out_dir.exists());
@@ -832,6 +850,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     assert_eq!(
         initialize["params"]["capabilities"]["optOutNotificationMethods"],
         json!([
+            "configWarning",
             "remoteControl/status/changed",
             "mcpServer/startupStatus/updated",
             "thread/status/changed",
@@ -898,6 +917,12 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         json!({"eventHash":EVENT_HASH,"eventID":EVENT_ID,"timestamp":1720000000_i64})
     );
 
+    assert_eq!(
+        listen["argv"],
+        json!(["app-server", "--listen", "stdio://"])
+    );
+    assert_eq!(listen["env"], expected_env);
+
     let listen_stdout_lines = listen["stdout"]
         .as_str()
         .unwrap()
@@ -913,7 +938,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     assert_eq!(initialize_response["result"]["platformOs"], "linux");
     assert_eq!(
         initialize_response["result"]["userAgent"],
-        format!("codex-cli/{TEST_CODEX_VERSION}")
+        user_agent(TEST_CODEX_VERSION)
     );
     assert_eq!(
         parse_line(&format!("{}\n", listen_stdout_lines[1]))["id"],
@@ -1012,7 +1037,7 @@ fn compiled_process_initialize_response_user_agent_drift_is_fail_closed() {
                 "codexHome": codex_home.to_string_lossy().into_owned(),
                 "platformFamily": "unix",
                 "platformOs": "linux",
-                "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}.1"),
+                "userAgent": user_agent(&format!("{TEST_CODEX_VERSION}.1")),
             }
         }));
     });
@@ -1594,9 +1619,15 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
 
     let cases: Vec<ProbeCase> = vec![
         ("init-codex-home-mismatch", |scenario| {
-            scenario.listen.response1 = Emit::plain(
-                "{\"id\":1,\"result\":{\"codexHome\":\"/wrong\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"codex-cli/0.150.1.1\"}}",
-            );
+            scenario.listen.response1 = Emit::text(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": "/wrong",
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": user_agent(TEST_CODEX_VERSION),
+                }
+            }));
         }),
         ("init-user-agent-missing", |scenario| {
             scenario.listen.response1 = Emit::plain(
