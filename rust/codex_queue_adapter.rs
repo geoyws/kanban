@@ -62,11 +62,13 @@ pub(crate) struct Args {
     required_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Validated {
     canonical_codex: PathBuf,
+    canonical_codex_file: fs::File,
     canonical_codex_identity: FileIdentity,
     canonical_codex_home: PathBuf,
+    canonical_codex_home_file: fs::File,
     canonical_codex_home_identity: FileIdentity,
     thread: String,
     required_version: String,
@@ -258,21 +260,25 @@ pub(crate) fn validate_paths(args: &Args) -> Result<Validated> {
         bail!("--codex-home must be owned by the effective user or root");
     }
 
+    let canonical_codex_file = fs::File::open(&canonical_codex)?;
+    let canonical_codex_identity = file_identity(&canonical_codex_file.metadata()?);
+    if canonical_codex_identity != file_identity(&codex_stat) {
+        bail!("--codex must resolve to a regular file");
+    }
+
+    let canonical_codex_home_file = fs::File::open(&canonical_codex_home)?;
+    let canonical_codex_home_identity = file_identity(&canonical_codex_home_file.metadata()?);
+    if canonical_codex_home_identity != file_identity(&codex_home_stat) {
+        bail!("--codex-home must resolve to a directory");
+    }
+
     let validated = Validated {
         canonical_codex,
-        canonical_codex_identity: FileIdentity {
-            dev: codex_stat.dev(),
-            ino: codex_stat.ino(),
-            uid: codex_uid,
-            mode: codex_mode,
-        },
+        canonical_codex_file,
+        canonical_codex_identity,
         canonical_codex_home,
-        canonical_codex_home_identity: FileIdentity {
-            dev: codex_home_stat.dev(),
-            ino: codex_home_stat.ino(),
-            uid: codex_home_uid,
-            mode: codex_home_mode,
-        },
+        canonical_codex_home_file,
+        canonical_codex_home_identity,
         thread: args.thread.clone(),
         required_version: args.required_version.clone(),
     };
@@ -444,6 +450,15 @@ fn validate_canonical_path_trust(validated: &Validated) -> Result<()> {
     Ok(())
 }
 
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        mode: metadata.permissions().mode(),
+    }
+}
+
 fn validate_codex_identity(validated: &Validated) -> Result<()> {
     let codex_stat = fs::metadata(&validated.canonical_codex)?;
     if !codex_stat.file_type().is_file() {
@@ -464,13 +479,12 @@ fn validate_codex_identity(validated: &Validated) -> Result<()> {
         bail!("codex target is no longer trusted");
     }
 
-    if (FileIdentity {
-        dev: codex_stat.dev(),
-        ino: codex_stat.ino(),
-        uid,
-        mode,
-    }) != validated.canonical_codex_identity
-    {
+    let pinned_identity = file_identity(&validated.canonical_codex_file.metadata()?);
+    if pinned_identity != validated.canonical_codex_identity {
+        bail!("codex target is no longer trusted");
+    }
+
+    if file_identity(&codex_stat) != pinned_identity {
         bail!("codex target is no longer trusted");
     }
 
@@ -494,13 +508,12 @@ fn validate_codex_home_identity(validated: &Validated) -> Result<()> {
         bail!("codex home is no longer trusted");
     }
 
-    if (FileIdentity {
-        dev: codex_home_stat.dev(),
-        ino: codex_home_stat.ino(),
-        uid,
-        mode,
-    }) != validated.canonical_codex_home_identity
-    {
+    let pinned_identity = file_identity(&validated.canonical_codex_home_file.metadata()?);
+    if pinned_identity != validated.canonical_codex_home_identity {
+        bail!("codex home is no longer trusted");
+    }
+
+    if file_identity(&codex_home_stat) != pinned_identity {
         bail!("codex home is no longer trusted");
     }
 
@@ -673,7 +686,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::os::unix::fs::symlink;
 
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -1102,32 +1115,28 @@ mod tests {
         let validated = validate_paths(&args).unwrap();
         assert_eq!(validated.canonical_codex, fs::canonicalize(&codex).unwrap());
         let codex_stat = fs::metadata(&codex).unwrap();
-        let effective_uid = unsafe { libc::geteuid() };
         assert_eq!(
             validated.canonical_codex_identity,
-            FileIdentity {
-                dev: codex_stat.dev(),
-                ino: codex_stat.ino(),
-                uid: codex_stat.uid(),
-                mode: codex_stat.permissions().mode(),
-            }
+            file_identity(&codex_stat)
         );
-        assert!(matches!(
-            validated.canonical_codex_identity.uid,
-            uid if uid == effective_uid || uid == 0
-        ));
+        assert_eq!(validated.canonical_codex_identity.uid, codex_stat.uid());
+        assert_eq!(
+            validated.canonical_codex_identity.mode,
+            codex_stat.permissions().mode()
+        );
         assert_eq!(
             validated.canonical_codex_home,
             fs::canonicalize(&home).unwrap()
         );
         assert_eq!(
             validated.canonical_codex_home_identity,
-            FileIdentity {
-                dev: fs::metadata(&home).unwrap().dev(),
-                ino: fs::metadata(&home).unwrap().ino(),
-                uid: fs::metadata(&home).unwrap().uid(),
-                mode: fs::metadata(&home).unwrap().permissions().mode(),
-            }
+            file_identity(&fs::metadata(&home).unwrap())
+        );
+        let home_stat = fs::metadata(&home).unwrap();
+        assert_eq!(validated.canonical_codex_home_identity.uid, home_stat.uid());
+        assert_eq!(
+            validated.canonical_codex_home_identity.mode,
+            home_stat.permissions().mode()
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1174,8 +1183,13 @@ mod tests {
 
         let validated = validate_paths(&args).unwrap();
 
+        write_file(&home.join("marker"), 0o600);
+
+        validate_codex_home_identity(&validated).unwrap();
+
         fs::remove_dir_all(&home).unwrap();
         write_dir(&home, 0o700);
+        write_file(&home.join("marker"), 0o600);
 
         let err = validate_codex_home_identity(&validated)
             .unwrap_err()
@@ -1203,12 +1217,7 @@ mod tests {
         assert_eq!(validated.canonical_codex_home, canonical_home);
         assert_eq!(
             validated.canonical_codex_home_identity,
-            FileIdentity {
-                dev: fs::metadata(&canonical_home).unwrap().dev(),
-                ino: fs::metadata(&canonical_home).unwrap().ino(),
-                uid: fs::metadata(&canonical_home).unwrap().uid(),
-                mode: fs::metadata(&canonical_home).unwrap().permissions().mode(),
-            }
+            file_identity(&fs::metadata(&canonical_home).unwrap())
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1231,9 +1240,13 @@ mod tests {
 
         validate_codex_identity(&validated).unwrap();
 
+        let original_identity = validated.canonical_codex_identity;
         fs::remove_file(&codex).unwrap();
-        write_script(&replacement, 0o755, "");
+        write_script(&replacement, 0o755, "#!/bin/sh\necho replaced\n");
         fs::rename(&replacement, &codex).unwrap();
+
+        let replacement_identity = file_identity(&fs::metadata(&codex).unwrap());
+        assert_ne!(replacement_identity, original_identity);
 
         let err = validate_codex_identity(&validated).unwrap_err().to_string();
         assert!(err.contains("no longer trusted"), "{err}");
