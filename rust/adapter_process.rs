@@ -71,6 +71,11 @@ fn failure(code: &'static str, timed_out: bool) -> ProcessFailure {
     ProcessFailure { code, timed_out }
 }
 
+#[cfg(coverage)]
+fn inherited_llvm_profile_file() -> Option<OsString> {
+    std::env::var_os("LLVM_PROFILE_FILE")
+}
+
 pub(crate) fn drain_bounded<R: Read>(mut reader: R) -> io::Result<BoundedOutput> {
     let mut bytes = Vec::new();
     let mut overflowed = false;
@@ -124,7 +129,7 @@ fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
     }
 }
 
-fn child_exited_unreaped(pid: u32) -> io::Result<bool> {
+pub(crate) fn child_exited_unreaped(pid: u32) -> io::Result<bool> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child pid exceeds pid_t"))?;
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -164,7 +169,9 @@ fn reap_if_exited(child: &mut std::process::Child) -> io::Result<Option<std::pro
 /// Returns the real exit status when the leader had already exited before the
 /// first signal. Once this function sends a signal, the caller's timeout or
 /// cancellation reason owns the outcome.
-fn terminate_and_reap(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+pub(crate) fn terminate_and_reap(
+    child: &mut std::process::Child,
+) -> Option<std::process::ExitStatus> {
     if let Ok(Some(status)) = reap_if_exited(child) {
         return Some(status);
     }
@@ -230,6 +237,8 @@ pub(crate) fn run_process(
         return Err(failure("adapter_target_invalid", false));
     }
 
+    #[cfg(coverage)]
+    let llvm_profile_file = inherited_llvm_profile_file();
     let mut command = Command::new(&spec.executable);
     command
         .args(&spec.args)
@@ -238,6 +247,10 @@ pub(crate) fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    #[cfg(coverage)]
+    if let Some(value) = llvm_profile_file {
+        command.env("LLVM_PROFILE_FILE", value);
+    }
     if let Some((name, value)) = &spec.secret {
         command.env(name, value);
     }
@@ -410,7 +423,8 @@ mod tests {
     }
 
     fn spawn_child_fixture(mode: &str) -> std::process::Child {
-        Command::new(env::current_exe().unwrap())
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "adapter_process::tests::child_fixture",
@@ -421,9 +435,12 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap()
+            .process_group(0);
+        #[cfg(coverage)]
+        if let Some(value) = inherited_llvm_profile_file() {
+            command.env("LLVM_PROFILE_FILE", value);
+        }
+        command.spawn().unwrap()
     }
 
     struct ChildReaper(Option<std::process::Child>);
@@ -464,6 +481,16 @@ mod tests {
                     std::process::exit(9);
                 }
                 io::stdout().write_all(b"isolated").unwrap();
+            }
+            #[cfg(coverage)]
+            "coverage-profile" => {
+                use std::os::unix::ffi::OsStrExt;
+
+                let value = env::var_os("LLVM_PROFILE_FILE")
+                    .expect("coverage builds must preserve LLVM_PROFILE_FILE");
+                io::stdout()
+                    .write_all(value.as_os_str().as_bytes())
+                    .unwrap();
             }
             "exit" => std::process::exit(7),
             "exit-ok" => {}
@@ -615,6 +642,26 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(coverage)]
+    #[test]
+    fn process_runner_preserves_llvm_profile_file_under_coverage() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let expected = env::var_os("LLVM_PROFILE_FILE")
+            .expect("llvm-cov must set LLVM_PROFILE_FILE for coverage builds");
+        let output = run_fixture("coverage-profile", b"", 5_000, &AtomicBool::new(false)).unwrap();
+        assert!(
+            output
+                .bytes
+                .windows(expected.as_os_str().as_bytes().len())
+                .any(|window| window == expected.as_os_str().as_bytes())
+        );
+    }
+
     #[test]
     fn process_runner_classifies_exit_and_stream_overflow() {
         for (mode, code) in [
@@ -653,20 +700,7 @@ mod tests {
 
     #[test]
     fn termination_preserves_an_exit_observed_before_any_signal() {
-        let mut child = Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "adapter_process::tests::child_fixture",
-                "--nocapture",
-            ])
-            .env_clear()
-            .env("KANBAN_TEST_ADAPTER", "exit-ok")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let mut child = spawn_child_fixture("exit-ok");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !child_exited_unreaped(child.id()).unwrap() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));

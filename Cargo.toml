@@ -29,6 +29,10 @@ path = "rust/bin/kanban-dispatcher.rs"
 name = "kanban-codex-queue-adapter"
 path = "rust/bin/kanban-codex-queue-adapter.rs"
 
+[[bin]]
+name = "kanban-codex-app-server-adapter"
+path = "rust/bin/kanban-codex-app-server-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
@@ -43,6 +47,9 @@ uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]
 headless_chrome = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [profile.release]
 lto = "thin"

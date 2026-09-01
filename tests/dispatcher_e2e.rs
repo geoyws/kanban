@@ -1,11 +1,12 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,6 +44,52 @@ fn fake_adapter() -> &'static Path {
         .as_path()
 }
 
+fn fake_codex() -> &'static Path {
+    static CODEX: OnceLock<PathBuf> = OnceLock::new();
+    CODEX
+        .get_or_init(|| {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_app_server_adapter_fake_codex.rs");
+            let root = env::temp_dir().join(format!(
+                "kanban-dispatcher-fake-codex-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let binary = root.join("fake-codex");
+            let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args(["--edition=2024"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "compile fake codex from {}",
+                source.display()
+            );
+            binary
+        })
+        .as_path()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(rendered, "{byte:02x}").unwrap();
+    }
+    rendered
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 struct Fixture {
     root: PathBuf,
     data: PathBuf,
@@ -64,6 +111,7 @@ impl Fixture {
         let data = root.join("data");
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
         let output = Self::kanban_command(&project, &data)
             .args(["init", "--name", "DISPATCH-E2E", "--json"])
             .output()
@@ -143,6 +191,33 @@ impl Fixture {
         assert_success(&output, "subscription add");
     }
 
+    fn add_app_server_subscription(&self, timeout_ms: &str) {
+        let output = self.kanban(&[
+            "subscription",
+            "add",
+            "--id",
+            "sub-app-server",
+            "--consumer",
+            "codex.app-server",
+            "--action",
+            "start-readonly-turn",
+            "--timeout-ms",
+            timeout_ms,
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--kind",
+            "tag_added",
+            "--as",
+            "test@dispatcher",
+            "--json",
+        ]);
+        assert_success(&output, "app-server subscription add");
+    }
+
     fn append_event(&self, tag: &str) {
         let output = self.kanban(&["tag", "add", tag, "--as", "test@dispatcher", "--json"]);
         assert_success(&output, "tag add");
@@ -186,6 +261,90 @@ impl Fixture {
         serde_json::to_writer_pretty(&mut file, &json!({"version": 1, "consumers": consumers}))
             .unwrap();
         file.write_all(b"\n").unwrap();
+    }
+
+    fn write_real_app_server_config(&self) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let codex = self.root.join("fake-codex");
+        fs::copy(fake_codex(), &codex).unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        let codex_home = self.root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
+        let child_pid = self.root.join("app-server.pid");
+        let grandchild_pid = self.root.join("app-server-grandchild.pid");
+        let adapter_pid = self.root.join("app-server-adapter.pid");
+        let cwd = self.project.canonicalize().unwrap();
+        let codex_home = codex_home.canonicalize().unwrap();
+        let initialize_response = json!({
+            "id": 1,
+            "result": {
+                "codexHome": codex_home,
+                "platformFamily": "unix",
+                "platformOs": "linux",
+                "userAgent": format!("codex-cli/{}", env!("CARGO_PKG_VERSION")),
+            }
+        })
+        .to_string();
+        let scenario = format!(
+            "version.stdout=hex:{}\nhelp.stdout=hex:{}\nlisten.response1=hex:{}\nlisten.stubborn_after_stage=1\nlisten.adapter_pid_file={}\nlisten.pid_file={}\nlisten.grandchild_pid_file={}\n",
+            hex_encode(format!("codex-cli {}\n", env!("CARGO_PKG_VERSION")).as_bytes()),
+            hex_encode(b"Usage: codex app-server\n--listen <URL>\ngenerate-json-schema\n"),
+            hex_encode(initialize_response.as_bytes()),
+            adapter_pid.display(),
+            child_pid.display(),
+            grandchild_pid.display(),
+        );
+        fs::write(self.root.join("scenario.txt"), scenario).unwrap();
+
+        let client_hash = sha256(b"{\"kind\":\"client-request\"}");
+        let protocol_hash = sha256(b"{\"kind\":\"protocol-schema\"}");
+        let args = vec![
+            "--codex".to_owned(),
+            codex.to_string_lossy().into_owned(),
+            "--codex-home".to_owned(),
+            codex_home.to_string_lossy().into_owned(),
+            "--cwd".to_owned(),
+            cwd.to_string_lossy().into_owned(),
+            "--required-version".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            "--client-request-sha256".to_owned(),
+            client_hash,
+            "--protocol-schema-sha256".to_owned(),
+            protocol_hash,
+            "--protocol-timeout-ms".to_owned(),
+            "5000".to_owned(),
+        ];
+        let config = json!({
+            "version": 1,
+            "consumers": {
+                "codex.app-server": {
+                    "capabilities": ["start"],
+                    "actions": {
+                        "start-readonly-turn": {
+                            "capability": "start",
+                            "executable": env!("CARGO_BIN_EXE_kanban-codex-app-server-adapter"),
+                            "args": args,
+                        }
+                    },
+                    "secrets": {}
+                }
+            }
+        });
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.data.join("dispatchers.json"))
+            .unwrap();
+        serde_json::to_writer_pretty(&mut file, &config).unwrap();
+        file.write_all(b"\n").unwrap();
+        (
+            adapter_pid,
+            child_pid,
+            grandchild_pid,
+            self.root.join("capture.ndjson"),
+        )
     }
 
     fn seed(&self, mode: &str, timeout_ms: &str, max_retries: &str) {
@@ -234,6 +393,42 @@ fn wait_for_file(path: &Path, timeout: Duration) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+fn wait_with_output_bounded(mut child: Child, timeout: Duration, label: &str) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "{label} did not exit within {timeout:?}; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn pid_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks process existence/permission.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn assert_pid_disappears(pid: i32, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pid_exists(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !pid_exists(pid),
+        "{label} process {pid} survived cancellation"
+    );
 }
 
 #[test]
@@ -635,4 +830,83 @@ fn dispatcher_sigterm_stops_long_poll_and_running_adapter_cleanly() {
         )
         .unwrap();
     assert_eq!(state, ("retry_wait".into(), "adapter_cancelled".into()));
+}
+
+#[test]
+fn dispatcher_sigterm_contains_real_app_server_adapter_and_stubborn_descendants() {
+    let fixture = Fixture::new("real-app-server-signal");
+    let before = fs::read_dir(&fixture.project)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let (adapter_pid_file, child_pid_file, grandchild_pid_file, capture) =
+        fixture.write_real_app_server_config();
+    fixture.add_app_server_subscription("5000");
+    fixture.append_event("dispatch-real-app-server-signal");
+
+    let child = fixture
+        .dispatcher()
+        .stdin(Stdio::null())
+        .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
+        .spawn()
+        .unwrap();
+    wait_for_file(&adapter_pid_file, Duration::from_secs(5));
+    wait_for_file(&child_pid_file, Duration::from_secs(5));
+    wait_for_file(&grandchild_pid_file, Duration::from_secs(5));
+    wait_for_file(&capture, Duration::from_secs(5));
+    let adapter_pid: i32 = fs::read_to_string(&adapter_pid_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let app_server_pid: i32 = fs::read_to_string(&child_pid_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let grandchild_pid: i32 = fs::read_to_string(&grandchild_pid_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(pid_exists(adapter_pid));
+    assert!(pid_exists(app_server_pid));
+    assert!(pid_exists(grandchild_pid));
+
+    let signal_started = Instant::now();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let output = wait_with_output_bounded(child, Duration::from_secs(2), "dispatcher SIGTERM");
+    let cancellation_elapsed = signal_started.elapsed();
+    eprintln!(
+        "dispatcher_cancellation_elapsed_ms={}",
+        cancellation_elapsed.as_millis()
+    );
+    assert_success(&output, "real app-server adapter SIGTERM");
+    assert!(
+        cancellation_elapsed < Duration::from_secs(1),
+        "cancellation elapsed={cancellation_elapsed:?}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["failed"], 1);
+    let state: (String, String) = fixture
+        .db()
+        .query_row(
+            "SELECT status,last_error_code FROM subscription_deliveries WHERE subscription_id='sub-app-server'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("retry_wait".into(), "adapter_cancelled".into()));
+
+    assert_pid_disappears(adapter_pid, "app-server adapter");
+    assert_pid_disappears(app_server_pid, "app-server");
+    assert_pid_disappears(grandchild_pid, "app-server grandchild");
+    let capture_text = fs::read_to_string(&capture).unwrap();
+    assert!(capture_text.contains("\"stage\":\"1\""), "{capture_text}");
+    assert!(
+        capture_text.contains("\"phase\":\"stubborn\""),
+        "{capture_text}"
+    );
+    let after = fs::read_dir(&fixture.project)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before, "adapter mutated its configured cwd");
 }

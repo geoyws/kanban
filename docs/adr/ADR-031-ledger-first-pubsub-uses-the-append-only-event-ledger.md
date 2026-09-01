@@ -489,6 +489,30 @@ disposable workspace, with no human driver session, no shared repository
 mutation, no terminal input modification, and no `send-keys`; it verifies the
 installed version, the exact ingress path, and one received queued message.
 
+The second experimental and opt-in bridge is consumer `codex.app-server`,
+action `start-readonly-turn`, and capability `start`, via
+`kanban-codex-app-server-adapter`. The host allow-list binding is installed,
+but this rollout enables no active declarative subscription. When the
+dispatcher invokes it, the adapter still accepts a structured `AdapterRequest`
+and returns `AdapterResponse`; that is the normal dispatcher path, not a
+general subscription bypass. The host pins the installed Codex CLI `0.150.1`,
+the canonical path, private
+`CODEX_HOME`, private empty cwd, the `ClientRequest` hash
+`efcd14b3433960c5e64a294e0071d48150429a603a5a18df536c84b76a902317`, the
+combined v2 schema hash
+`8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8`, and the
+protocol timeout. Each turn clears child env except `CODEX_HOME`, probes
+version/help, regenerates the schema with experimental API disabled in an
+identity-pinned 0700 temp dir, verifies both hashes, and cleans only that
+directory. The turn is read-only, approval never, stdio only, and any request,
+tool-ish item, policy/identity/status/schema/size drift, malformed output,
+stderr, timeout, wrong/extra/duplicate ack, or post-completion output fails
+closed. Success stdout is only `AdapterResponse` after one accepted
+`(subscriptionID,eventID)` completion. The acceptance matrix for this bridge
+is separate: focused unit protocol/runtime coverage, compiled-process
+adapter-contract coverage against a dependency-free fake Codex, and a distinct
+HAX live smoke against installed Codex/model.
+
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:
 
