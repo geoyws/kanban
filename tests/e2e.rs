@@ -6594,6 +6594,662 @@ fn compiled_binary_reports_a_missing_board_instead_of_replacing_it() {
     );
 }
 
+/// Take a board's permissions away, and report whether that actually denied
+/// this process.
+///
+/// `chmod 000` only stops a process the mode bits apply to. Root bypasses them
+/// entirely, so under a privileged runner the unreadable case cannot be staged
+/// at all. Skipping there would report green while measuring nothing, so the
+/// callers branch instead and assert the true statement for the situation they
+/// are really in: if this harness can still read the file, so can the binary,
+/// and the board must come back readable.
+fn deny_board_reads(board: &Path) -> bool {
+    fs::set_permissions(board, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::read(board).is_err()
+}
+
+fn count_pre_restore_snapshots(data: &Path) -> usize {
+    let backups = data.join("backups");
+    if !backups.is_dir() {
+        return 0;
+    }
+    fs::read_dir(backups)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pre-restore-")
+        })
+        .count()
+}
+
+/// Every survey tells a board it could not open from one that is gone.
+///
+/// Before this, both answered `present: false` and nothing else — byte for
+/// byte the same receipt for intact data behind a permission bit and for data
+/// that had been deleted. The move an operator makes on `missing` is to restore
+/// a snapshot over the path, so the receipt was the instruction to destroy the
+/// board it was describing. Boards are created `0600`, which is all it takes:
+/// one written by root, or living on a shared path, reads as gone.
+#[test]
+fn compiled_binary_tells_an_unreadable_board_from_a_missing_one() {
+    let fixture = Fixture::new("unreadable-board");
+    let project = fixture.ok_json(&fixture.main, &["init", "--name", "Locked", "--json"]);
+    let board = PathBuf::from(project["boardPath"].as_str().unwrap());
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "real work", "--id", "t-1", "--json"],
+    );
+
+    // A healthy board first, so the new field is measured against all three
+    // answers and not just the one this is about.
+    let healthy = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(healthy["healthy"], true);
+    assert_eq!(healthy["projects"][0]["present"], true);
+    assert_eq!(healthy["projects"][0]["boardState"], "readable");
+
+    if !deny_board_reads(&board) {
+        // Privileged runner: the file stayed readable, so the binary reads it
+        // too and the only honest assertion is that nothing changed.
+        let still_fine = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+        assert_eq!(still_fine["projects"][0]["boardState"], "readable");
+        fs::set_permissions(&board, fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+
+    // doctor: unhealthy, because nothing about this board was checked at all —
+    // and unreadable rather than absent, with the reason that stopped it.
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        !checked.status.success(),
+        "doctor certified a board it never opened"
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["projects"][0]["boardState"], "unreadable");
+    assert_eq!(
+        report["projects"][0]["unreadableReason"],
+        "Permission denied (os error 13)"
+    );
+    assert!(board.is_file(), "doctor removed the board it inspected");
+
+    // dashboard: never `boardMissing`, which is the flag a reader acts on.
+    let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    assert_eq!(dashboard[0]["boardState"], "unreadable");
+    assert_eq!(
+        dashboard[0]["boardUnreadableReason"],
+        "Permission denied (os error 13)"
+    );
+    assert!(
+        dashboard[0].get("boardMissing").is_none(),
+        "dashboard called a board that is right there missing: {}",
+        dashboard[0]
+    );
+
+    // backup: still snapshots what it can, and names what it left out as
+    // unreadable rather than filing it under boards that no longer exist.
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    assert_eq!(snapshot["boards"].as_array().unwrap().len(), 0);
+    assert_eq!(snapshot["missingBoards"].as_array().unwrap().len(), 0);
+    assert_eq!(snapshot["unreadableBoards"][0]["name"], "Locked");
+    assert_eq!(
+        snapshot["unreadableBoards"][0]["boardPath"],
+        board.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        snapshot["unreadableBoards"][0]["reason"],
+        "Permission denied (os error 13)"
+    );
+    // The manifest carries it too, so a snapshot's own record says it is
+    // incomplete rather than looking whole.
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(snapshot["manifest"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(manifest["missingBoards"].as_array().unwrap().len(), 0);
+    assert_eq!(manifest["unreadableBoards"][0]["name"], "Locked");
+
+    // audit verify: not healthy, because an unopened ledger has had nothing
+    // verified about it and the whole receipt is a claim about ledgers checked.
+    let audited = fixture.run(&fixture.main, &["audit", "verify", "--json"]);
+    assert!(!audited.status.success());
+    let audit: Value = serde_json::from_slice(&audited.stdout).unwrap();
+    assert_eq!(audit["healthy"], false);
+    assert_eq!(audit["missingBoards"].as_array().unwrap().len(), 0);
+    assert_eq!(audit["unreadableBoards"][0]["name"], "Locked");
+
+    // search --all-boards
+    let searched = fixture.ok_json(&fixture.main, &["search", "real", "--all-boards", "--json"]);
+    assert_eq!(searched["missingBoards"].as_array().unwrap().len(), 0);
+    assert_eq!(searched["unreadableBoards"][0]["name"], "Locked");
+
+    // search-rebuild --all-boards
+    let rebuilt = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search-rebuild",
+            "--all-boards",
+            "--as",
+            "codex@cli",
+            "--json",
+        ],
+    );
+    assert_eq!(rebuilt["missingBoards"].as_array().unwrap().len(), 0);
+    assert_eq!(rebuilt["unreadableBoards"][0]["name"], "Locked");
+
+    // The same board deleted still reports missing, and reports nothing under
+    // unreadable — the two answers stay apart in both directions.
+    fs::set_permissions(&board, fs::Permissions::from_mode(0o600)).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", board.display()));
+    }
+
+    let gone = fixture.run(&fixture.main, &["doctor", "--json"]);
+    let gone_report: Value = serde_json::from_slice(&gone.stdout).unwrap();
+    assert_eq!(gone_report["projects"][0]["boardState"], "missing");
+    assert_eq!(gone_report["projects"][0]["present"], false);
+    assert!(
+        gone_report["projects"][0].get("unreadableReason").is_none(),
+        "a deleted board carried a read failure"
+    );
+
+    let gone_dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    assert_eq!(gone_dashboard[0]["boardState"], "missing");
+    assert_eq!(gone_dashboard[0]["boardMissing"], true);
+
+    let gone_snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"]);
+    assert_eq!(
+        gone_snapshot["missingBoards"][0],
+        board.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        gone_snapshot["unreadableBoards"].as_array().unwrap().len(),
+        0
+    );
+
+    let gone_audit = fixture.run(&fixture.main, &["audit", "verify", "--json"]);
+    let gone_audit_report: Value = serde_json::from_slice(&gone_audit.stdout).unwrap();
+    assert_eq!(gone_audit_report["missingBoards"][0], "Locked");
+    assert_eq!(
+        gone_audit_report["unreadableBoards"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let gone_search = fixture.ok_json(&fixture.main, &["search", "real", "--all-boards", "--json"]);
+    assert_eq!(gone_search["missingBoards"][0], "Locked");
+    assert_eq!(gone_search["unreadableBoards"].as_array().unwrap().len(), 0);
+
+    let gone_rebuild = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search-rebuild",
+            "--all-boards",
+            "--as",
+            "codex@cli",
+            "--json",
+        ],
+    );
+    assert_eq!(gone_rebuild["missingBoards"][0], "Locked");
+    assert_eq!(
+        gone_rebuild["unreadableBoards"].as_array().unwrap().len(),
+        0
+    );
+}
+
+/// `restore` stops rather than replacing a board it could not copy first.
+///
+/// Measured before the refusal existed: a live board at mode 000, holding a
+/// task added after the snapshot was taken, was skipped by the pre-restore
+/// rescue copy as "missing" and then replaced anyway — `replace_database`
+/// renames over the path, which needs the directory's permissions and not the
+/// file's. The command exited 0, the rescue snapshot had no `boards` directory
+/// in it at all, and the post-snapshot task was gone with nothing to recover it
+/// from. The rescue copy is the only thing that makes `--force` reversible.
+#[test]
+fn compiled_binary_refuses_to_restore_over_a_board_it_cannot_rescue() {
+    let fixture = Fixture::new("unreadable-restore");
+    let project = fixture.ok_json(&fixture.main, &["init", "--name", "Rescue", "--json"]);
+    let board = PathBuf::from(project["boardPath"].as_str().unwrap());
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "in the snapshot", "--id", "t-1", "--json"],
+    );
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Work committed after the snapshot: this is what the rescue copy exists to
+    // preserve, and what the measured bug destroyed.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "added after the backup",
+            "--id",
+            "t-2",
+            "--json",
+        ],
+    );
+
+    if !deny_board_reads(&board) {
+        // Privileged runner: the board is readable, so it is rescued the
+        // ordinary way and the restore goes through.
+        let done = fixture.ok_json(
+            &fixture.main,
+            &["restore", "--from", &snapshot, "--force", "--json"],
+        );
+        let rescue = PathBuf::from(done["rescueSnapshot"].as_str().unwrap());
+        assert!(
+            rescue.join("boards").is_dir(),
+            "the rescue snapshot kept no copy of the live board"
+        );
+        fs::set_permissions(&board, fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+
+    let refused = fixture.run(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+    assert!(
+        !refused.status.success(),
+        "restore replaced a board it could not copy first"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("cannot copy into the rescue snapshot first"),
+        "stderr: {message}"
+    );
+    assert!(
+        message.contains("Permission denied (os error 13)"),
+        "the refusal did not say what stopped the read: {message}"
+    );
+    assert!(
+        message.contains("very likely intact"),
+        "the refusal read as data loss rather than a permission problem: {message}"
+    );
+    assert_eq!(
+        count_pre_restore_snapshots(&fixture.data),
+        0,
+        "a refused restore left a half-built rescue snapshot behind"
+    );
+
+    // The board was not touched, and the work added after the snapshot is
+    // still there once the permission bit is back.
+    fs::set_permissions(&board, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-2", "--json"])["title"],
+        "added after the backup"
+    );
+
+    // And with the board readable the restore runs, rescuing it on the way
+    // through — so the refusal gated on the rescue copy, nothing else.
+    let done = fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+    let rescue = PathBuf::from(done["rescueSnapshot"].as_str().unwrap());
+    assert!(
+        rescue.join("boards").is_dir(),
+        "the rescue snapshot kept no copy of the live board"
+    );
+    let rescue_manifest: Value =
+        serde_json::from_slice(&fs::read(rescue.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        rescue_manifest["unreadableBoards"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        rescue_manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|file| file["kind"] == "board")
+            .count(),
+        1,
+        "the rescue manifest recorded no board copy"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["title"],
+        "in the snapshot"
+    );
+}
+
+/// `restore` rescues what it will overwrite, not what the registry happens to
+/// list.
+///
+/// The destruction is keyed to the filesystem: the replacement loop renames a
+/// snapshot file over `<root>/boards/<file name>` for every board in the
+/// snapshot, registered or not. Restoring an older snapshot drops a project
+/// from the registry while leaving its file on disk, so restoring a newer one
+/// then renames over a file that nothing classifies. Measured before this was
+/// keyed correctly: the work committed after that snapshot was destroyed with
+/// no rescue copy, and the unreadable-board refusal could not fire either,
+/// because it was keyed to the registry too.
+#[test]
+fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
+    let fixture = Fixture::new("unregistered-overwrite");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let first = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let bee = fixture.ok_json(&fixture.worktree, &["init", "--name", "Bee", "--json"]);
+    let bee_board = PathBuf::from(bee["boardPath"].as_str().unwrap());
+    fixture.ok_json(
+        &fixture.worktree,
+        &[
+            "task",
+            "add",
+            "in the second snapshot",
+            "--id",
+            "b-1",
+            "--json",
+        ],
+    );
+    let second = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Committed after the second snapshot: exactly what a rescue copy is for.
+    fixture.ok_json(
+        &fixture.worktree,
+        &[
+            "task",
+            "add",
+            "after the second snapshot",
+            "--id",
+            "b-2",
+            "--json",
+        ],
+    );
+
+    // Restoring the older snapshot drops Bee from the registry and leaves its
+    // file where it is — the state that hides the next overwrite from anything
+    // classifying by registry membership.
+    fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &first, "--force", "--json"],
+    );
+    let listed = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "Bee"),
+        "the older snapshot did not drop Bee, so this never reaches the case: {listed}"
+    );
+    assert!(
+        bee_board.is_file(),
+        "restoring an older snapshot deleted a board it never mentioned"
+    );
+
+    // Restoring the newer snapshot renames over that unregistered file, so it
+    // has to reach the rescue snapshot first.
+    let done = fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &second, "--force", "--json"],
+    );
+    let rescue = PathBuf::from(done["rescueSnapshot"].as_str().unwrap());
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(rescue.join("manifest.json")).unwrap()).unwrap();
+    let rescued = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| file["kind"] == "board")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rescued.len(),
+        2,
+        "a board about to be overwritten was left out of the rescue snapshot: {manifest}"
+    );
+    let unregistered = rescued
+        .iter()
+        .find(|file| file["project"] == Value::Null)
+        .unwrap_or_else(|| {
+            panic!("the file the registry no longer lists was not rescued: {manifest}")
+        });
+    assert_eq!(
+        unregistered["path"],
+        format!(
+            "boards/{}",
+            bee_board.file_name().unwrap().to_string_lossy()
+        ),
+        "the unnamed rescue copy is not the file that was overwritten"
+    );
+
+    // The rescue copy holds the work the overwrite destroyed. This is the whole
+    // guarantee: the live file is gone, and it is recoverable.
+    let copy = rescue.join(unregistered["path"].as_str().unwrap());
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "show",
+                "b-2",
+                "--db",
+                copy.to_str().unwrap(),
+                "--json"
+            ],
+        )["title"],
+        "after the second snapshot"
+    );
+    // And the live file really was replaced, as restore promises.
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "show",
+                "b-1",
+                "--db",
+                bee_board.to_str().unwrap(),
+                "--json",
+            ],
+        )["title"],
+        "in the second snapshot"
+    );
+}
+
+/// A file that is not a board is copied out of the way, not silently replaced.
+///
+/// `BoardFile::Foreign`'s contract is "Never opened, never migrated, never
+/// overwritten", and it exists because `task list --db notes.txt` once left
+/// 372736 bytes of SQLite where an operator's file had been. `restore` renames
+/// over `<root>/boards/<file name>` for every board in the snapshot, so it can
+/// destroy such a file just as completely.
+///
+/// Refusing was the wrong way to keep that promise: a board whose header is
+/// damaged classifies as foreign too, so refusing would block recovery of
+/// exactly the disaster `restore` exists for. Copying keeps the file
+/// recoverable, which is what the promise protects, and the receipt names it so
+/// the replacement is never silent.
+#[test]
+fn compiled_binary_copies_a_foreign_file_out_of_the_way_before_replacing_it() {
+    let fixture = Fixture::new("foreign-overwrite");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let bee = fixture.ok_json(&fixture.worktree, &["init", "--name", "Bee", "--json"]);
+    let bee_board = PathBuf::from(bee["boardPath"].as_str().unwrap());
+    let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Something that is not a board, sitting exactly where the restore writes.
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", bee_board.display()));
+    }
+    fs::write(&bee_board, "operator notes, not a database\n").unwrap();
+
+    let done = fixture.ok_json(
+        &fixture.main,
+        &["restore", "--from", &snapshot, "--force", "--json"],
+    );
+    let unparsed = done["rescuedUnparsed"].as_array().unwrap();
+    assert_eq!(
+        unparsed.len(),
+        1,
+        "a file that was never a board was replaced with no copy: {done}"
+    );
+    assert_eq!(
+        unparsed[0]["originalPath"],
+        bee_board.to_string_lossy().as_ref()
+    );
+    assert_eq!(unparsed[0]["reason"], "not a Kanban board");
+
+    // The bytes survive verbatim in the rescue snapshot.
+    let rescue = PathBuf::from(done["rescueSnapshot"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(rescue.join(unparsed[0]["path"].as_str().unwrap())).unwrap(),
+        "operator notes, not a database\n",
+        "the operator's file was destroyed rather than copied"
+    );
+
+    // And the restore did its job: the path is a board again.
+    assert_eq!(
+        fixture.ok_json(&fixture.worktree, &["doctor", "--json"])["healthy"],
+        true
+    );
+}
+
+/// Corrupt the pages of a board while leaving the file readable.
+///
+/// `offset` selects how deep the damage goes, which decides which layer
+/// notices: the 16-byte header is checked by the classifier, the schema lives
+/// in the first page, and anything past that is invisible until every page is
+/// read.
+fn corrupt_board_bytes(board: &Path, offset: usize, fill: u8) {
+    let mut bytes = fs::read(board).unwrap();
+    let end = bytes.len().min(65536);
+    assert!(
+        end > offset,
+        "board too small to corrupt at {offset}: {} bytes",
+        bytes.len()
+    );
+    for byte in &mut bytes[offset..end] {
+        *byte = fill;
+    }
+    fs::write(board, &bytes).unwrap();
+}
+
+/// A corrupt board is what `restore` is for, so it must not block on one.
+///
+/// Measured before this predicate was corrected: `restore` refused with
+/// `database disk image is malformed` and told the operator to check
+/// permissions that were fine — the one command that recovers from disk
+/// corruption, refusing because of disk corruption. The rescue copy does not
+/// need SQLite to parse a file, only to read it, so the question is whether the
+/// bytes can be read, and every readable file is copied out of the way.
+///
+/// Three depths, because three different layers notice: a damaged header stops
+/// the classifier, a damaged first page stops the online backup, and damage
+/// past the first page is invisible until the copy's audit chain is read back.
+#[test]
+fn compiled_binary_restores_over_a_corrupt_board_and_keeps_a_copy_of_it() {
+    for (label, offset, fill) in [
+        ("damaged-header", 0usize, b'!'),
+        ("schema-page", 100, 0x5A),
+        ("past-the-first-page", 4096, 0xAA),
+    ] {
+        let fixture = Fixture::new(&format!("corrupt-restore-{label}"));
+        let project = fixture.ok_json(&fixture.main, &["init", "--name", "Ord", "--json"]);
+        let board = PathBuf::from(project["boardPath"].as_str().unwrap());
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", "good work", "--id", "t-1", "--json"],
+        );
+        let snapshot = fixture.ok_json(&fixture.main, &["backup", "--json"])["directory"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        corrupt_board_bytes(&board, offset, fill);
+        let damaged = fs::read(&board).unwrap();
+        assert!(
+            fs::read(&board).is_ok(),
+            "{label}: the harness cannot read the file, so this measures the wrong thing"
+        );
+
+        // The recovery must run, not refuse.
+        let done = fixture.ok_json(
+            &fixture.main,
+            &["restore", "--from", &snapshot, "--force", "--json"],
+        );
+
+        // The corrupt file was copied out of the way before being replaced,
+        // byte for byte, and the receipt says so rather than staying silent.
+        let unparsed = done["rescuedUnparsed"].as_array().unwrap();
+        assert_eq!(
+            unparsed.len(),
+            1,
+            "{label}: the corrupt board was replaced without a copy: {done}"
+        );
+        assert_eq!(
+            unparsed[0]["originalPath"],
+            board.to_string_lossy().as_ref(),
+            "{label}"
+        );
+        assert!(
+            !unparsed[0]["reason"].as_str().unwrap().is_empty(),
+            "{label}: no reason recorded"
+        );
+
+        let rescue = PathBuf::from(done["rescueSnapshot"].as_str().unwrap());
+        let copy = rescue.join(unparsed[0]["path"].as_str().unwrap());
+        assert_eq!(
+            fs::read(&copy).unwrap(),
+            damaged,
+            "{label}: the rescue copy is not the file that was replaced"
+        );
+
+        // The rescue manifest records it, and the rescue snapshot as a whole
+        // still verifies — an unparsed copy must not make it unrestorable.
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(rescue.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["unparsedFiles"].as_array().unwrap().len(),
+            1,
+            "{label}"
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "audit",
+                "verify",
+                "--against",
+                rescue.join("manifest.json").to_str().unwrap(),
+                "--json",
+            ],
+        );
+
+        // And the restore actually recovered the board.
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["title"],
+            "good work",
+            "{label}"
+        );
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["doctor", "--json"])["healthy"],
+            true,
+            "{label}"
+        );
+    }
+}
+
 #[test]
 fn compiled_binary_doctor_looks_past_the_btree() {
     let fixture = Fixture::new("doctor-depth");

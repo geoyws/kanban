@@ -421,6 +421,18 @@ healthy. Commands that do work on one board now refuse and name the recovery;
 `doctor`, `dashboard` and `backup` report the gap and carry on, and `backup`
 lists what it could not include under `missingBoards`.
 
+A board that is there and will not open is reported apart from one that is
+gone, because the two call for opposite moves: you recover a missing board by
+restoring a snapshot over its path, and doing that to an unreadable one
+overwrites intact data. Boards are created `0600`, so one written by another
+user is unreadable and perfectly healthy at the same time. `doctor` and
+`dashboard` carry `boardState` — `readable`, `unreadable` or `missing` — with
+the reason the read failed beside it; `backup`, `audit verify`, `search
+--all-boards` and `search-rebuild --all-boards` carry an `unreadableBoards`
+list alongside `missingBoards`. `doctor` and `audit verify` count an unreadable
+board as unhealthy: nothing about it was checked, and a tool that could not
+open a file cannot certify it.
+
 Import an existing atmux board into the currently registered project without
 writing to the source database:
 
@@ -750,7 +762,25 @@ kb audit verify --against <SNAPSHOT>/manifest.json --json
 `restore` verifies the manifested file set, byte digests and audit chains
 before it touches live state, refuses without `--force`, and writes a
 `pre-restore-<stamp>` rescue snapshot of
-what it replaced, including its own manifest. The receipt names the restored
+what it replaced, including its own manifest. It creates no rescue directory and
+touches no board file until it has classified every path it is about to write.
+What it overwrites is `<root>/boards/<file name>` for each board in the
+snapshot — decided by the snapshot and the filesystem, not by the registry, so
+a file the registry no longer lists is still rescued before being replaced.
+
+The test at each of those paths is whether the file can be *copied*, not
+whether it is a healthy board, because a rescue copy needs the bytes and
+nothing more. A board that opens is copied with SQLite's online backup, which
+is WAL-correct. Anything else readable — corrupt pages, a damaged header, a
+file that was never a board — is copied verbatim into `unparsed/` in the rescue
+snapshot and listed under `unparsedFiles` in its manifest and `rescuedUnparsed`
+in the receipt, so it is replaced but never silently. That matters because a
+corrupt board is the disaster `restore` exists for: refusing to run on one
+would block the only command that recovers it. `restore` refuses only when a
+file's bytes cannot be read at all, which is the one case where no copy is
+possible — and then the message says the data is very likely intact, because
+nothing opened the file to find otherwise. Fix the permissions and run it
+again, or move the file aside. The receipt names the restored
 and rescue journal heads, so a deliberate rollback remains visible. It also takes
 the data root exclusively and refuses outright while any other kanban process
 holds it — you do not have to remember to stop them. `--keep` prunes only the

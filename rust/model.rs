@@ -736,6 +736,26 @@ pub struct SearchResult {
     pub citation: String,
 }
 
+/// A registered board a survey could not open, and the reason it could not.
+///
+/// Reported separately from the `missingBoards` list beside it because the two
+/// call for opposite responses. A missing board is recovered by restoring a
+/// snapshot over its path; doing that to an unreadable one overwrites intact
+/// data with older data. Boards are created `0600`, so one written by another
+/// user is unreadable and perfectly healthy at the same time, and a survey that
+/// prints `missing` at an operator has pointed them at the destructive move.
+///
+/// Carries the path as well as the name, because the fix is on the file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadableBoard {
+    pub name: String,
+    pub board_path: String,
+    /// What stopped the read, verbatim — `Permission denied (os error 13)` and
+    /// a locked-database failure are different problems with different fixes.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchReceipt {
@@ -743,6 +763,9 @@ pub struct SearchReceipt {
     pub embedding_model: String,
     pub boards: Vec<String>,
     pub missing_boards: Vec<String>,
+    /// Boards that exist and would not open. Never folded into
+    /// `missing_boards`: see [`UnreadableBoard`].
+    pub unreadable_boards: Vec<UnreadableBoard>,
     pub results: Vec<SearchResult>,
     pub result_chars: usize,
     pub truncated: bool,

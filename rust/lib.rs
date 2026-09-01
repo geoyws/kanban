@@ -1912,25 +1912,129 @@ fn board_file(board_path: &str) -> BoardFile {
     }
 }
 
-/// Whether a registered board's file is still on disk, and still a board.
+/// What a survey should say about one registered board.
 ///
 /// Opening a board creates it, which is right for `--db` on a creating command
 /// — that is how a board outside the registry is made — and wrong for one the
 /// registry already knows about. A registered board file that has gone missing
 /// was destroyed, and standing an empty one up in its place turns recoverable
-/// data loss into a board that reports itself fine. `board_is_present` was
-/// added because `doctor` did exactly that: it recreated the file it was asked
-/// to inspect, then certified the result healthy.
+/// data loss into a board that reports itself fine. This check exists because
+/// `doctor` did exactly that: it recreated the file it was asked to inspect,
+/// then certified the result healthy.
 ///
 /// Commands that do work on one board refuse. Commands that survey every board
 /// — `doctor`, `dashboard`, `backup` — report the gap and carry on, because
 /// dying on the first missing board is no use to whoever has to fix it, and
 /// `restore` would otherwise be unable to repair the very thing that stops it
-/// from running. A registered path holding something that is not a database now
+/// from running. A registered path holding something that is not a database
 /// counts as a gap for them too, which is the honest answer: it is not a board
 /// they can read, and a survey that dies on it helps nobody.
-fn board_is_present(board_path: &str) -> bool {
-    matches!(board_file(board_path), BoardFile::Board)
+///
+/// The answer is three-way because the boolean this replaced could not tell
+/// "the data is gone" from "this process could not open it". Measured on the
+/// same board and the same command, a board at mode 000 with its data intact
+/// and a board that had been deleted produced byte-identical receipts. The move
+/// an operator makes after reading `missing` is to restore a snapshot over the
+/// path — so on the unreadable board, the receipt was the cause of the data
+/// loss. Boards are created `0600`, which makes one written by another user
+/// unreadable and perfectly healthy at once.
+///
+/// This reads [`board_file`], the same classifier the single-board resolvers
+/// use, rather than a second one beside it: two classifiers of the same
+/// question drift, and the drift is what produced this.
+enum SurveyBoard {
+    /// Opened, and it holds a board. The survey reads it.
+    Readable,
+    /// There, and this process could not look inside it. The reason travels
+    /// with it, because `Permission denied` and a locked database are different
+    /// problems with different fixes. Never reported as missing: nothing here
+    /// is evidence that anything is wrong with the data.
+    Unreadable(String),
+    /// Nothing at the path, or something there that is not a board.
+    Missing,
+}
+
+fn survey_board(board_path: &str) -> SurveyBoard {
+    match board_file(board_path) {
+        BoardFile::Board => SurveyBoard::Readable,
+        BoardFile::Unreadable(reason) => SurveyBoard::Unreadable(reason),
+        // `Foreign` and `Unfinished` keep the bucket they have always had.
+        // Neither is a board a survey can read, and separating them is a
+        // different question from this one.
+        BoardFile::Absent | BoardFile::Foreign | BoardFile::Unfinished => SurveyBoard::Missing,
+    }
+}
+
+/// One row of the `unreadableBoards` list the surveys carry.
+fn unreadable_board(project: &ProjectRecord, reason: String) -> UnreadableBoard {
+    UnreadableBoard {
+        name: project.name.clone(),
+        board_path: project.board_path.clone(),
+        reason,
+    }
+}
+
+/// Resolve a path as far as the filesystem allows, so two spellings of one file
+/// compare equal. A path that does not exist yet cannot be canonicalized and
+/// compares by its literal form, which is the right answer for a destination.
+fn resolved(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_owned())
+}
+
+/// What `restore` will find at one path it is about to rename over.
+///
+/// The question is "can this file be copied out of the way", not "is this a
+/// healthy board". Those come apart exactly where it matters: a board with
+/// corrupt pages, or a damaged 16-byte header, is the disaster `restore` exists
+/// to recover from, and refusing to run because SQLite cannot parse it blocks
+/// the one command that would fix it. That refusal was measured — `database
+/// disk image is malformed`, followed by advice to check permissions that were
+/// never wrong.
+///
+/// So the split is by what a copy needs. Anything readable can be moved out of
+/// the way, so the restore proceeds; only a file this process cannot read at
+/// all is genuinely unrescuable. That also makes the refusal's "very likely
+/// intact — could not open it to look" a true sentence for every case that
+/// still reaches it, rather than a guess that was wrong for corruption.
+enum RestoreTarget {
+    /// Nothing to lose. Either no file, or a database with no tables in it —
+    /// an interrupted board creation, which holds no rows by definition.
+    Vacant,
+    /// A board SQLite can open. Copied with the online backup API, which is
+    /// WAL-correct: a byte copy of the `.db` alone would drop commits still
+    /// sitting in the write-ahead log, and those are exactly the recent work
+    /// the rescue copy exists to keep.
+    Rescue,
+    /// Readable bytes SQLite will not open as a board — corrupt pages, a
+    /// damaged header, or a file that was never a board. Copied verbatim,
+    /// carrying why it would not open.
+    Copy(String),
+    /// The bytes cannot be read, so nothing can copy it. The one case left that
+    /// has to stop the restore.
+    Blocked(String),
+}
+
+fn restore_target(path: &Path) -> RestoreTarget {
+    match board_file(&path.to_string_lossy()) {
+        BoardFile::Absent | BoardFile::Unfinished => RestoreTarget::Vacant,
+        BoardFile::Board => RestoreTarget::Rescue,
+        // `BoardFile::Foreign`'s contract is "Never opened, never migrated,
+        // never overwritten", and it exists because `task list --db notes.txt`
+        // once left 372736 bytes of SQLite where an operator's file had been.
+        // Copying it verbatim keeps that promise where it counts — the file is
+        // still there afterwards, in the rescue snapshot — without blocking the
+        // restore. Blocking would be worse than it sounds: a board whose header
+        // is damaged classifies as foreign too, so refusing here would refuse
+        // the recovery of the very thing that broke. It is never replaced
+        // silently; the receipt and the rescue manifest both name it.
+        BoardFile::Foreign => RestoreTarget::Copy("not a Kanban board".to_owned()),
+        BoardFile::Unreadable(reason) => match fs::File::open(path) {
+            // SQLite would not open it, but the bytes are there to copy. A
+            // rescue copy needs the file read, not parsed.
+            Ok(_) => RestoreTarget::Copy(reason),
+            Err(error) => RestoreTarget::Blocked(error.to_string()),
+        },
+    }
 }
 
 /// A registered board that is gone, no longer a board, or unreadable.
@@ -2141,10 +2245,18 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
         let mut results = Vec::new();
         let mut boards = Vec::new();
         let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
         for project in registry.projects()? {
-            if !board_is_present(&project.board_path) {
-                missing.push(project.name);
-                continue;
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.name);
+                    continue;
+                }
             }
             let store = Store::open(Path::new(&project.board_path))?;
             results.extend(store.search(&project.name, &options)?);
@@ -2160,6 +2272,7 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
             query,
             boards,
             missing,
+            unreadable,
             results,
             options.limit,
             options.max_chars,
@@ -2182,6 +2295,9 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
         query,
         vec![board],
         Vec::new(),
+        // One named board, already resolved: an unreadable one refused before
+        // reaching here.
+        Vec::new(),
         results,
         options.limit,
         options.max_chars,
@@ -2195,15 +2311,27 @@ fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value>
         let registry = Registry::open()?;
         let mut reports = Vec::new();
         let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
         for project in registry.projects()? {
-            if !board_is_present(&project.board_path) {
-                missing.push(project.name);
-                continue;
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.name);
+                    continue;
+                }
             }
             let mut store = Store::open(Path::new(&project.board_path))?;
             reports.push(store.rebuild_search(&project.name, actor)?);
         }
-        return Ok(json!({"reports":reports,"missingBoards":missing}));
+        // An index left unrebuilt because the file would not open is not the
+        // same as one whose board is gone: the first is retried after a chmod.
+        return Ok(
+            json!({"reports":reports,"missingBoards":missing,"unreadableBoards":unreadable}),
+        );
     }
     let mut store = open_store(args, creation)?;
     let board = selected_board_name(args)?
@@ -2358,6 +2486,26 @@ struct SnapshotFile {
     audit: crate::audit::AuditReport,
 }
 
+/// A file copied out of the way byte for byte, because SQLite would not open it
+/// as a database.
+///
+/// Deliberately outside `files` and outside the `boards` directory. Every entry
+/// in `files` carries a schema version and an audit head, and both can only be
+/// read from a database that opens; `verify_snapshot_manifest` also enumerates
+/// `boards/*.db` and demands that set match `files` exactly, so a copy that
+/// cannot be described that way would make its own rescue snapshot fail
+/// verification. These sit under `unparsed/` and are described by what can
+/// actually be known of them: size, digest, and why they would not open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnparsedFile {
+    path: String,
+    original_path: String,
+    bytes: u64,
+    sha256: String,
+    reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotManifest {
@@ -2365,6 +2513,23 @@ struct SnapshotManifest {
     created_at: i64,
     files: Vec<SnapshotFile>,
     missing_boards: Vec<String>,
+    /// Registered boards that exist and would not open, so are absent from
+    /// `files` while their data is very likely intact. A snapshot missing one
+    /// of these is incomplete in a way a later restore must not silently paper
+    /// over.
+    ///
+    /// `default` rather than a format bump: every manifest written before this
+    /// field existed recorded no unreadable boards, which an empty list states
+    /// exactly, and bumping the version would make those snapshots unrestorable
+    /// to buy nothing. Unknown fields are ignored on the way in, so an older
+    /// binary still reads a manifest written by this one.
+    #[serde(default)]
+    unreadable_boards: Vec<UnreadableBoard>,
+    /// Files copied verbatim because they would not open as databases. Same
+    /// `default` reasoning as above: a manifest written before this field
+    /// existed recorded none, which an empty list states exactly.
+    #[serde(default)]
+    unparsed_files: Vec<UnparsedFile>,
 }
 
 fn load_snapshot_manifest(path: &Path) -> Result<SnapshotManifest> {
@@ -2467,17 +2632,17 @@ fn snapshot_file(
 fn write_snapshot_manifest(
     directory: &Path,
     registry_path: &Path,
-    boards: &[(String, PathBuf)],
+    // The project name is optional because a file the restore is about to
+    // overwrite need not be registered at all, and inventing a name for one
+    // would put a fiction in the manifest.
+    boards: &[(Option<String>, PathBuf)],
     missing_boards: &[String],
+    unreadable_boards: &[UnreadableBoard],
+    unparsed_files: &[UnparsedFile],
 ) -> Result<(PathBuf, String)> {
     let mut files = vec![snapshot_file(directory, registry_path, "registry", None)?];
     for (project, path) in boards {
-        files.push(snapshot_file(
-            directory,
-            path,
-            "board",
-            Some(project.clone()),
-        )?);
+        files.push(snapshot_file(directory, path, "board", project.clone())?);
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = SnapshotManifest {
@@ -2485,6 +2650,8 @@ fn write_snapshot_manifest(
         created_at: now_ms(),
         files,
         missing_boards: missing_boards.to_vec(),
+        unreadable_boards: unreadable_boards.to_vec(),
+        unparsed_files: unparsed_files.to_vec(),
     };
     let path = directory.join("manifest.json");
     let mut output = fs::OpenOptions::new()
@@ -2626,42 +2793,247 @@ fn restore(args: &Args) -> Result<()> {
     // Snapshot what is about to be overwritten, so a mistaken restore is itself
     // recoverable.
     let root = data_root()?;
-    let rescue = root
-        .join("backups")
-        .join(format!("pre-restore-{}", now_ms()));
-    let registry = Registry::open()?;
-    let rescue_registry = rescue.join("registry.db");
-    registry.backup(&rescue_registry)?;
-    let mut rescue_boards = Vec::new();
-    let mut rescue_missing = Vec::new();
-    for project in registry.projects()? {
-        // A board that is already gone is what a restore is often for; it
-        // cannot be a precondition of running one.
-        if !board_is_present(&project.board_path) {
-            rescue_missing.push(project.name);
-            continue;
-        }
-        let file_name = Path::new(&project.board_path)
-            .file_name()
-            .with_context(|| format!("board path has no file name: {}", project.board_path))?;
-        let destination = rescue.join("boards").join(file_name);
-        Store::open(Path::new(&project.board_path))?.backup(&destination)?;
-        rescue_boards.push((project.name, destination));
-    }
-    let (rescue_manifest, rescue_manifest_sha256) =
-        write_snapshot_manifest(&rescue, &rescue_registry, &rescue_boards, &rescue_missing)?;
-    drop(registry);
 
-    let mut restored = Vec::new();
-    for (from, to) in std::iter::once((registry_source.clone(), root.join("registry.db"))).chain(
-        boards.iter().map(|path| {
+    // Every path this is about to rename over, derived once and used both to
+    // build the rescue copy and to do the replacing, so the two cannot come to
+    // disagree about which files are at risk.
+    //
+    // What gets destroyed is decided by the snapshot and the filesystem, never
+    // by the registry: the replacement below writes `<root>/boards/<file name>`
+    // for every board file in the snapshot, listed or not. Keying the rescue
+    // off `registry.projects()` protected the wrong set, and measurably so.
+    // Restoring an older snapshot drops a project from the registry while
+    // leaving its file on disk; restoring a newer one then renames over that
+    // file, which by then is registered nowhere, so nothing classified it and
+    // nothing copied it. Work committed after the snapshot went with it — and
+    // the unreadable-board refusal could not fire either, because it was keyed
+    // to the registry too.
+    let overwrites = boards
+        .iter()
+        .map(|path| {
             (
                 path.clone(),
                 root.join("boards")
                     .join(path.file_name().unwrap_or_default()),
             )
-        }),
-    ) {
+        })
+        .collect::<Vec<_>>();
+
+    // `Registry::open` can migrate the live registry and re-assert its mode, so
+    // this is not "before anything is written". What holds is narrower and is
+    // what the risk actually needs: no rescue directory is created and no board
+    // file is touched until every refusal below has had its say.
+    let registry = Registry::open()?;
+    let registered = registry.projects()?;
+    let name_at = |target: &Path| -> Option<String> {
+        let target = resolved(target);
+        registered
+            .iter()
+            .find(|project| resolved(Path::new(&project.board_path)) == target)
+            .map(|project| project.name.clone())
+    };
+
+    let mut rescue_sources: Vec<(Option<String>, PathBuf)> = Vec::new();
+    let mut verbatim = Vec::new();
+    let mut blocked = Vec::new();
+    for (_, target) in &overwrites {
+        match restore_target(target) {
+            RestoreTarget::Vacant => {}
+            RestoreTarget::Rescue => rescue_sources.push((name_at(target), target.clone())),
+            RestoreTarget::Copy(reason) => verbatim.push((target.clone(), reason)),
+            RestoreTarget::Blocked(reason) => {
+                blocked.push((name_at(target), target.clone(), reason));
+            }
+        }
+    }
+
+    // Registered boards outside the overwrite set keep the rescue copy they
+    // have always had: the registry row that reaches them is being replaced, so
+    // the copy is part of undoing a mistaken restore. Their files are not
+    // touched, though, so one that will not open is recorded in the manifest
+    // rather than refused — refusing there would block a restore that destroys
+    // nothing.
+    let targeted = overwrites
+        .iter()
+        .map(|(_, target)| resolved(target))
+        .collect::<HashSet<_>>();
+    let mut rescue_missing = Vec::new();
+    let mut rescue_unreadable = Vec::new();
+    for project in &registered {
+        if targeted.contains(&resolved(Path::new(&project.board_path))) {
+            continue;
+        }
+        match survey_board(&project.board_path) {
+            SurveyBoard::Readable => rescue_sources.push((
+                Some(project.name.clone()),
+                PathBuf::from(&project.board_path),
+            )),
+            // A board that is already gone is what a restore is often for; it
+            // cannot be a precondition of running one.
+            SurveyBoard::Missing => rescue_missing.push(project.name.clone()),
+            SurveyBoard::Unreadable(reason) => {
+                rescue_unreadable.push(unreadable_board(project, reason));
+            }
+        }
+    }
+
+    // Measured before this refusal existed: a live board at mode 000, holding
+    // work committed after the snapshot was taken, was skipped by the rescue
+    // copy as "missing", then replaced anyway — `replace_database` renames over
+    // the path, which needs the directory's permissions and not the file's. The
+    // command exited 0, the rescue snapshot had no `boards` directory at all,
+    // and the task added after the backup was gone with nothing to recover it
+    // from. The rescue copy is the only thing that makes `--force` reversible,
+    // so a file it cannot copy stops the restore rather than becoming a line in
+    // a manifest nobody reads until afterwards.
+    if !blocked.is_empty() {
+        let listed = blocked
+            .iter()
+            .map(|(name, path, reason)| {
+                format!(
+                    "  {} ({}): {reason}",
+                    name.as_deref().unwrap_or("not in the registry"),
+                    path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "restore would overwrite files it cannot copy into the rescue snapshot first.\n\
+             That snapshot is the only thing that makes --force reversible, so a file whose bytes \
+             cannot be read stops the restore:\n{listed}\n\
+             Nothing here says the data is damaged — this could not open the file to look, so it \
+             is very likely intact. Fix its permissions and run this again, or move it aside to \
+             discard what is in it.\n\
+             A corrupt or unrecognisable board does not reach this: it is copied out of the way \
+             byte for byte and the restore proceeds, which is what a restore is for."
+        );
+    }
+
+    // The same file can be both an overwrite target and a registered project;
+    // collapsing those is safe because it is one file either way.
+    let mut seen_source = HashSet::new();
+    rescue_sources.retain(|(_, path)| seen_source.insert(resolved(path)));
+
+    // Two *different* files sharing a base name would copy to the same path
+    // inside the rescue snapshot, and the second would land on the first: one
+    // board rescued, one silently not, which is the failure everything above
+    // exists to prevent. It also produces a manifest with a duplicate path,
+    // which `verify_snapshot_manifest` rejects — so the rescue snapshot would
+    // be unrestorable, discovered only after the live files were gone.
+    let mut seen_name = HashSet::new();
+    let collisions = rescue_sources
+        .iter()
+        .filter(|(_, path)| !seen_name.insert(path.file_name().unwrap_or_default().to_owned()))
+        .map(|(_, path)| format!("  {}", path.display()))
+        .collect::<Vec<_>>();
+    if !collisions.is_empty() {
+        bail!(
+            "restore cannot build a rescue snapshot: these board files share a file name with \
+             another board it is also rescuing, so one copy would overwrite the other:\n{}\n\
+             Move or rename one of them, then run this again.",
+            collisions.join("\n")
+        );
+    }
+
+    let rescue = root
+        .join("backups")
+        .join(format!("pre-restore-{}", now_ms()));
+    let rescue_registry = rescue.join("registry.db");
+    registry.backup(&rescue_registry)?;
+    let mut rescue_boards = Vec::new();
+    for (name, path) in rescue_sources {
+        let file_name = path
+            .file_name()
+            .with_context(|| format!("board path has no file name: {}", path.display()))?;
+        let destination = rescue.join("boards").join(file_name);
+        // Read-only, because this is a copy and nothing else: opening writable
+        // runs migrations, and running a migration into a board that is about
+        // to be rescued for being damaged can only make the copy worse.
+        //
+        // The online backup is WAL-correct, so it is the first choice for any
+        // board that opens at all. It can still fail on a file the classifier
+        // accepted: `probe_board_schema` reads the schema out of the first
+        // page, so corruption further into the file is invisible to it and
+        // surfaces only here, when every page is read. Measured — a board with
+        // its header and schema intact and its later pages overwritten passed
+        // classification and then failed the backup with `database disk image
+        // is malformed`, aborting the restore that was recovering it. The
+        // fallback keeps the guarantee whole: whatever the damage turns out to
+        // be, the file is copied out of the way before anything replaces it.
+        //
+        // Describing the copy is part of making it. Every manifest entry
+        // carries a schema version and an audit head, both read back out of the
+        // copy, and that read walks rows the page-level backup never validated:
+        // a board whose corruption sits in free pages copied cleanly and then
+        // failed here, aborting the restore just the same. Anything that cannot
+        // be copied *and* described as a board becomes a verbatim copy instead.
+        match Store::open_readonly(&path)
+            .and_then(|store| store.backup(&destination))
+            .and_then(|()| snapshot_file(&rescue, &destination, "board", name.clone()))
+        {
+            Ok(_) => rescue_boards.push((name, destination)),
+            Err(error) => {
+                // Leave nothing half-described behind: an unmanifested `.db`
+                // under `boards/` is exactly what `verify_snapshot_manifest`
+                // rejects, so the failed copy goes before the verbatim one
+                // takes its place.
+                let _ = fs::remove_file(&destination);
+                for suffix in ["-wal", "-shm"] {
+                    let mut sidecar = destination.as_os_str().to_owned();
+                    sidecar.push(suffix);
+                    let _ = fs::remove_file(Path::new(&sidecar));
+                }
+                verbatim.push((path, format!("{error:#}")));
+            }
+        }
+    }
+    // Copied rather than exported, because SQLite will not open these. The
+    // sidecars go too: `replace_database` deletes the `-wal` and `-shm` beside
+    // the file it replaces, and for a corrupt main database the write-ahead log
+    // is often the part a recovery would still want.
+    let mut rescue_unparsed = Vec::new();
+    for (path, reason) in &verbatim {
+        let file_name = path
+            .file_name()
+            .with_context(|| format!("overwrite target has no file name: {}", path.display()))?;
+        let destination = rescue.join("unparsed").join(file_name);
+        db::create_private_dir_all(&rescue.join("unparsed"))?;
+        fs::copy(path, &destination)
+            .with_context(|| format!("copy {} to {}", path.display(), destination.display()))?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.is_file() {
+                let mut beside = destination.as_os_str().to_owned();
+                beside.push(suffix);
+                fs::copy(&sidecar, Path::new(&beside))
+                    .with_context(|| format!("copy {}", sidecar.display()))?;
+            }
+        }
+        rescue_unparsed.push(UnparsedFile {
+            path: format!("unparsed/{}", file_name.to_string_lossy()),
+            original_path: path.to_string_lossy().into_owned(),
+            bytes: fs::metadata(&destination)?.len(),
+            sha256: audit::file_sha256(&destination)?,
+            reason: reason.clone(),
+        });
+    }
+    let (rescue_manifest, rescue_manifest_sha256) = write_snapshot_manifest(
+        &rescue,
+        &rescue_registry,
+        &rescue_boards,
+        &rescue_missing,
+        &rescue_unreadable,
+        &rescue_unparsed,
+    )?;
+    drop(registry);
+
+    let mut restored = Vec::new();
+    for (from, to) in std::iter::once((registry_source.clone(), root.join("registry.db")))
+        .chain(overwrites.iter().cloned())
+    {
         db::replace_database(&from, &to)?;
         restored.push(to.to_string_lossy().into_owned());
     }
@@ -2678,11 +3050,8 @@ fn restore(args: &Args) -> Result<()> {
             "rescueManifestSha256":rescue_manifest_sha256,
         }),
     )?;
-    for path in &boards {
-        let destination = root
-            .join("boards")
-            .join(path.file_name().unwrap_or_default());
-        Store::open(&destination)?.record_system_event(
+    for (_, destination) in &overwrites {
+        Store::open(destination)?.record_system_event(
             "snapshot_restored",
             actor,
             json!({
@@ -2706,6 +3075,11 @@ fn restore(args: &Args) -> Result<()> {
             "rescueSnapshot":rescue,
             "rescueManifest":rescue_manifest,
             "rescueManifestSha256":rescue_manifest_sha256,
+            // Replaced without ever being opened as a database. Named here so
+            // that overwriting a corrupt board, or a file that was never a
+            // board, is something the operator is told rather than something
+            // they find out later.
+            "rescuedUnparsed":rescue_unparsed,
         }),
         args.has("json"),
     )
@@ -2935,15 +3309,35 @@ fn run() -> Result<()> {
         let mut output = Vec::new();
         for project in registry.projects()? {
             let mut value = object_of(&project)?;
-            if !board_is_present(&project.board_path) {
-                value.insert("boardMissing".into(), json!(true));
-                output.push((
-                    i64::MAX,
-                    i64::MAX,
-                    project.name.clone(),
-                    Value::Object(value),
-                ));
-                continue;
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {
+                    value.insert("boardState".into(), json!("readable"));
+                }
+                SurveyBoard::Unreadable(reason) => {
+                    // Deliberately not `boardMissing`. That flag is the one a
+                    // reader acts on, and acting on it here means restoring a
+                    // snapshot over a file that is still there.
+                    value.insert("boardState".into(), json!("unreadable"));
+                    value.insert("boardUnreadableReason".into(), json!(reason));
+                    output.push((
+                        i64::MAX,
+                        i64::MAX,
+                        project.name.clone(),
+                        Value::Object(value),
+                    ));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    value.insert("boardState".into(), json!("missing"));
+                    value.insert("boardMissing".into(), json!(true));
+                    output.push((
+                        i64::MAX,
+                        i64::MAX,
+                        project.name.clone(),
+                        Value::Object(value),
+                    ));
+                    continue;
+                }
             }
             let store = Store::open(Path::new(&project.board_path))?;
             let tasks = store.list_tasks(None, None, false)?;
@@ -3026,11 +3420,23 @@ fn run() -> Result<()> {
         let mut healthy = registry_audit.healthy;
         let mut boards = Vec::new();
         let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
         for project in registry.projects()? {
-            if !board_is_present(&project.board_path) {
-                healthy = false;
-                missing.push(project.name);
-                continue;
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    // Not healthy: an unopened ledger has had nothing verified
+                    // about it, and this command's whole output is a claim
+                    // about ledgers it verified.
+                    healthy = false;
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    healthy = false;
+                    missing.push(project.name);
+                    continue;
+                }
             }
             let store = Store::open_readonly(Path::new(&project.board_path))?;
             let mut audit = store.audit()?;
@@ -3050,6 +3456,7 @@ fn run() -> Result<()> {
             "registry": registry_audit,
             "boards": boards,
             "missingBoards": missing,
+            "unreadableBoards": unreadable,
         });
         print(&receipt, args.has("json"))?;
         if !healthy {
@@ -3070,13 +3477,41 @@ fn run() -> Result<()> {
         let mut healthy = registry_check == vec!["ok"] && registry_audit.healthy;
         for project in registry.projects()? {
             // Checked before opening, because opening would create it.
-            if !board_is_present(&project.board_path) {
-                healthy = false;
-                let mut value = object_of(&project)?;
-                value.insert("present".into(), json!(false));
-                value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
-                projects.push(Value::Object(value));
-                continue;
+            //
+            // `present` keeps the value it has always carried: true exactly
+            // when this run opened the path and found a board, false otherwise.
+            // That is unchanged for both a healthy board and a deleted one, so
+            // no adapter reading it sees a different answer than before. What
+            // was missing is a way to tell the two `false` cases apart, and
+            // `boardState` is that field — read it rather than `present` to
+            // decide whether anything needs recovering.
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    // Unhealthy, and not because anything is known to be wrong
+                    // with the board. Nothing about it was checked at all:
+                    // integrity, orphans, future dating, the search index and
+                    // the audit chain each need the file open. Reporting
+                    // healthy here would be certifying a file this process
+                    // never read.
+                    healthy = false;
+                    let mut value = object_of(&project)?;
+                    value.insert("present".into(), json!(false));
+                    value.insert("boardState".into(), json!("unreadable"));
+                    value.insert("unreadableReason".into(), json!(reason));
+                    value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
+                    projects.push(Value::Object(value));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    healthy = false;
+                    let mut value = object_of(&project)?;
+                    value.insert("present".into(), json!(false));
+                    value.insert("boardState".into(), json!("missing"));
+                    value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
+                    projects.push(Value::Object(value));
+                    continue;
+                }
             }
             let store = Store::open(Path::new(&project.board_path))?;
             let board_schema = db::schema_version(&store.connection)?;
@@ -3096,6 +3531,7 @@ fn run() -> Result<()> {
                 && audit.healthy;
             let mut value = object_of(&project)?;
             value.insert("present".into(), json!(true));
+            value.insert("boardState".into(), json!("readable"));
             value.insert("schemaVersion".into(), json!(board_schema));
             value.insert(
                 "supportedSchemaVersion".into(),
@@ -3141,12 +3577,25 @@ fn run() -> Result<()> {
         registry.backup(&registry_path)?;
         let mut board_files = Vec::new();
         let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
         for project in registry.projects()? {
             // A snapshot of what is still here beats refusing to snapshot
-            // anything, but it has to say what it could not include.
-            if !board_is_present(&project.board_path) {
-                missing.push(project.board_path.clone());
-                continue;
+            // anything, but it has to say what it could not include — and
+            // "missing", about a file that is sitting right there, is not
+            // saying it. Backup stays permissive because refusing to snapshot
+            // eight healthy boards over a ninth's permission bit throws away
+            // the recovery this command exists to provide; `restore` is where
+            // the refusal belongs, because `restore` is the destructive half.
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(unreadable_board(&project, reason));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.board_path.clone());
+                    continue;
+                }
             }
             let store = Store::open(Path::new(&project.board_path))?;
             let file_name = Path::new(&project.board_path)
@@ -3154,10 +3603,17 @@ fn run() -> Result<()> {
                 .with_context(|| format!("board path has no file name: {}", project.board_path))?;
             let destination = directory.join("boards").join(file_name);
             store.backup(&destination)?;
-            board_files.push((project.name, destination));
+            board_files.push((Some(project.name), destination));
         }
-        let (manifest, manifest_sha256) =
-            write_snapshot_manifest(&directory, &registry_path, &board_files, &missing)?;
+        let (manifest, manifest_sha256) = write_snapshot_manifest(
+            &directory,
+            &registry_path,
+            &board_files,
+            &missing,
+            &unreadable,
+            // `backup` opens every board it copies, so it never produces one.
+            &[],
+        )?;
         let boards = board_files
             .iter()
             .map(|(_, path)| path.to_string_lossy().into_owned())
@@ -3172,6 +3628,7 @@ fn run() -> Result<()> {
                 "registry":registry_path,
                 "boards":boards,
                 "missingBoards":missing,
+                "unreadableBoards":unreadable,
                 "manifest":manifest,
                 "manifestSha256":manifest_sha256,
                 "pruned":pruned,

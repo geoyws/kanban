@@ -841,6 +841,9 @@ fn search_page(query: &str) -> Result<String> {
         query,
         boards,
         missing,
+        // This page classifies board paths with its own `is_file` check rather
+        // than the shared classifier, so it never produces this bucket.
+        Vec::new(),
         results,
         options.limit,
         options.max_chars,

@@ -1,5 +1,6 @@
 use crate::model::{
     Rule, SearchIndexHealth, SearchIndexReport, SearchOptions, SearchReceipt, SearchResult,
+    UnreadableBoard,
 };
 use crate::registry::now_ms;
 use anyhow::{Result, bail};
@@ -578,6 +579,7 @@ pub fn bound_receipt(
     query: &str,
     boards: Vec<String>,
     missing_boards: Vec<String>,
+    unreadable_boards: Vec<UnreadableBoard>,
     mut results: Vec<SearchResult>,
     limit: usize,
     max_chars: usize,
@@ -615,6 +617,7 @@ pub fn bound_receipt(
         embedding_model: EMBEDDING_MODEL.to_owned(),
         boards,
         missing_boards,
+        unreadable_boards,
         results: kept,
         result_chars: chars,
         truncated,
