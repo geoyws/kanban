@@ -121,10 +121,16 @@ pub(crate) fn run(args: &super::Args) -> Result<()> {
 }
 
 fn resolve(args: &super::Args) -> Result<WatchSpec> {
-    resolve_with_source(args, super::direct_db(args))
+    resolve_with_source(args, super::direct_board(args))
 }
 
-fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result<WatchSpec> {
+/// `direct_board` carries whether the caller named the path or `KANBAN_DB` did,
+/// because the board guard says different things about the two and `watch`
+/// opens the file itself instead of going through `store_path_readonly`.
+fn resolve_with_source(
+    args: &super::Args,
+    direct_db: Option<(PathBuf, bool)>,
+) -> Result<WatchSpec> {
     let task = args.one("task").map(str::to_owned);
     let rule = args.one("rule").map(str::to_owned);
     let registry = args.has("registry");
@@ -218,7 +224,12 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
         });
     }
 
-    let (board_path, board_name) = if let Some(path) = direct_db {
+    let (board_path, board_name) = if let Some((path, explicit)) = direct_db {
+        // `Store::open_readonly` cannot create a file — it passes
+        // SQLITE_OPEN_READ_ONLY — so this branch was safe by accident, and said
+        // so with a raw `Error code 14`. The guard makes the safety deliberate
+        // and the diagnosis the same one every other board path gives.
+        super::require_board_file(&path, explicit, super::BoardCreation::Refused)?;
         (path, None)
     } else {
         let path = super::store_path_readonly(args)?;
@@ -1407,7 +1418,7 @@ mod tests {
             .collect(),
         )
         .expect("parse args");
-        let spec = resolve_with_source(&args, Some(path)).expect("resolve direct db");
+        let spec = resolve_with_source(&args, Some((path, true))).expect("resolve direct db");
         match spec.source {
             Source::Board { board_name, .. } => assert!(board_name.is_none()),
             Source::Registry { .. } => panic!("expected board source"),
@@ -1437,7 +1448,7 @@ mod tests {
             ];
             raw.extend(extra.iter().map(|value| (*value).to_owned()));
             let args = super::super::Args::parse(raw).expect("parse watch args");
-            resolve_with_source(&args, Some(path.clone()))
+            resolve_with_source(&args, Some((path.clone(), true)))
         };
 
         assert!(resolve(&["--task", "t-removed"]).is_ok());
@@ -1473,7 +1484,7 @@ mod tests {
             .collect(),
         )
         .expect("parse args");
-        let error = resolve_with_source(&args, Some(path))
+        let error = resolve_with_source(&args, Some((path, true)))
             .expect_err("zero limit with follow must fail")
             .to_string();
         assert!(error.contains("at least 1"), "{error}");
@@ -1519,7 +1530,7 @@ mod tests {
             .collect(),
         )
         .expect("parse args");
-        let error = resolve_with_source(&args, Some(path))
+        let error = resolve_with_source(&args, Some((path, true)))
             .expect_err("future cursor must be rejected")
             .to_string();
         assert!(

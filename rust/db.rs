@@ -1741,6 +1741,118 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23,
 ];
 
+/// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
+/// has, and that a board written by the retired TypeScript implementation has
+/// too. Distinctive together: another application's `tasks` table is not also
+/// carrying `parent_id`, `priority` and a `metadata` document.
+const BOARD_TASK_COLUMNS: [&str; 5] = ["id", "status", "priority", "parent_id", "metadata"];
+
+/// Whether this file carries a Kanban board's schema, without migrating it.
+///
+/// "Is this SQLite" cannot answer whether opening the file is safe, because
+/// `migrate` starts from the file's own `PRAGMA user_version` and runs the
+/// ladder into whatever it finds. A foreign database sits at version 0, so it
+/// gets all of it: an 8192-byte browser database measured 376832 bytes
+/// afterwards, its own table still there among 26 of ours.
+///
+/// Two signals, because either alone is wrong:
+///
+/// The column shape, not a set of table names. Requiring `board_meta`, `tasks`
+/// and `events` looked safer and was measured wrong — a v3 board written by the
+/// retired TypeScript implementation has only `tasks`, and
+/// `compiled_binary_imports_both_atmux_formats_backs_up_and_opens_v3_databases`
+/// exists because opening one has to keep working. Requiring only the *name*
+/// `tasks` would be far too loose in the other direction.
+///
+/// And `user_version` at 1 or more, which every board reaches on its first
+/// migration and which almost nothing else sets. No upper bound: a board from a
+/// newer schema must reach `migrate`, so that it can say "database version N is
+/// newer than supported" instead of being called a stranger.
+///
+/// This is a heuristic and worth naming as one. A database that has a `tasks`
+/// table with these five columns AND a nonzero `user_version` is treated as a
+/// board. Nothing cheaper distinguishes the two without opening the file the
+/// way the thing we are trying to prevent would.
+///
+/// The open is read-only, so the probe never writes to the file's own pages and
+/// cannot migrate it. It is not side-effect free, and the difference matters:
+/// opening a WAL database read-only can create and map its `-shm` sidecar. That
+/// is acceptable here because the caller has already matched the SQLite header,
+/// so this only ever runs against something that is a database.
+///
+/// # Errors
+///
+/// Every SQLite failure is returned rather than folded into `Other`. "Could not
+/// determine" and "is not a board" are different answers and only one of them is
+/// safe to act on: a `SQLITE_BUSY` reported as "not a board" is a false
+/// statement about healthy data, made to a caller that will act on it.
+pub fn probe_board_schema(path: &Path) -> rusqlite::Result<BoardSchema> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Every other board and registry open in this file installs this. Without
+    // it a probe is not merely slower under contention, it answers *wrongly*:
+    // `Store::drop` runs `PRAGMA wal_checkpoint(TRUNCATE)` on every command's
+    // exit, which takes exclusive WAL locks, so a concurrent read gets
+    // SQLITE_BUSY as a matter of routine rather than of bad luck.
+    connection.busy_handler(Some(busy_backoff))?;
+    let tables: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // Both halves, not just the table count. `migrate` writes `BOARD_V1`'s
+    // tables and `user_version=1` in one IMMEDIATE transaction, so no committed
+    // board state has tables without a version, or a version without tables.
+    // Requiring both excludes a database that stamps `user_version` before
+    // writing its schema, at no cost to the case this is for.
+    if tables == 0 && version == 0 {
+        return Ok(BoardSchema::Unwritten);
+    }
+    if version < 1 {
+        return Ok(BoardSchema::Other);
+    }
+    let mut statement = connection.prepare("SELECT name FROM pragma_table_info('tasks')")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(
+        if BOARD_TASK_COLUMNS
+            .iter()
+            .all(|wanted| columns.iter().any(|name| name == wanted))
+        {
+            BoardSchema::Board
+        } else {
+            BoardSchema::Other
+        },
+    )
+}
+
+/// What a readable SQLite file at a board path turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoardSchema {
+    /// Carries a board's schema, at any version from v1 onward.
+    Board,
+    /// A database with no tables and no schema version.
+    ///
+    /// Named for what it matches, not for what caused it. A board creation
+    /// passes through exactly this state — `open` creates the file and sets
+    /// `journal_mode=WAL` before the first migration commits — but so does any
+    /// database that has been created and not yet written to. And the state
+    /// cannot say *when*: under WAL a reader sees last-committed state, so a
+    /// creation running in another process right now is indistinguishable from
+    /// one that was interrupted an hour ago. Callers must not assert either.
+    ///
+    /// What it does support is proceeding: there are no tables to lose, and
+    /// `migrate` re-reads `user_version` inside its IMMEDIATE transaction, so
+    /// two processes finishing the same board serialize rather than collide.
+    Unwritten,
+    /// A database that belongs to something else.
+    Other,
+}
+
 /// Open a current board without creating, migrating, sweeping, or checkpointing it.
 ///
 /// Scheduler inspection must be observational: an agent asking what it could
@@ -2590,6 +2702,174 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
+    }
+
+    /// The probe retries a locked board on this crate's budget, not SQLite's.
+    ///
+    /// It was the one board access in this file installing no busy handler.
+    /// Measured, that does *not* mean it fails instantly: rusqlite installs a
+    /// five-second `busy_timeout` of its own, so routine contention was already
+    /// absorbed. What it meant was that the probe alone ran on SQLite's built-in
+    /// handler — a third of the budget every other board access gets, on the
+    /// fixed unjittered schedule `busy_backoff` exists to replace, exactly where
+    /// giving up produces a false statement rather than a slow answer.
+    ///
+    /// The lock is held for seven seconds: past rusqlite's five-second default,
+    /// well inside this crate's fifteen. Both margins are wide, and the holder
+    /// takes the lock deliberately rather than racing for it, so the test cannot
+    /// be flaky in the direction that matters. It costs seven seconds, which is
+    /// the price of measuring a timeout instead of asserting one.
+    #[test]
+    fn the_board_probe_retries_a_locked_board_on_this_crate_s_budget() {
+        let root = std::env::temp_dir().join(format!("kanban-probe-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp probe dir");
+        let path = root.join("board.db");
+        drop(open_board(&path).expect("open writable board"));
+        assert_eq!(
+            probe_board_schema(&path).expect("probe an idle board"),
+            BoardSchema::Board,
+            "the board must be recognized when nothing is contending for it"
+        );
+
+        const HOLD: Duration = Duration::from_secs(7);
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let holder_started = std::sync::Arc::clone(&held);
+        let locked = path.clone();
+        let holder = std::thread::spawn(move || {
+            let connection = Connection::open(&locked).expect("open the lock holder");
+            connection
+                .execute_batch(
+                    "PRAGMA locking_mode=EXCLUSIVE; BEGIN IMMEDIATE; \
+                     CREATE TABLE probe_contention(x INTEGER);",
+                )
+                .expect("take an exclusive lock");
+            holder_started.wait();
+            std::thread::sleep(HOLD);
+            connection.execute_batch("ROLLBACK").expect("release");
+        });
+        held.wait();
+        let started = Instant::now();
+        let probed = probe_board_schema(&path);
+        let waited = started.elapsed();
+        holder.join().expect("lock holder finished");
+
+        match probed {
+            Ok(BoardSchema::Board) => {}
+            Ok(other) => panic!(
+                "a locked board was classified {other:?}: a false statement about healthy data, \
+                 and every caller acts on it"
+            ),
+            Err(error) => panic!(
+                "the probe gave up after {waited:?} on a lock held {HOLD:?}, inside a {}s budget: \
+                 {error}",
+                BUSY_BUDGET.as_secs()
+            ),
+        }
+        assert!(
+            waited >= HOLD,
+            "the probe answered in {waited:?} without waiting out a {HOLD:?} lock, so this \
+             measured nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A damaged board reads as unreadable, never as a stranger's database.
+    ///
+    /// This is the half that produced the lie. The probe returned `bool`, so
+    /// every SQLite failure — `SQLITE_BUSY`, `CORRUPT`, `NOTADB`, `IOERR` —
+    /// arrived at the caller as "this is not a Kanban board", which is a
+    /// statement about the file's contents that the probe never established.
+    /// "Could not determine" and "is not a board" are different answers and
+    /// only one of them is safe to act on.
+    #[test]
+    fn a_damaged_board_reads_as_unreadable_rather_than_as_a_stranger() {
+        let root =
+            std::env::temp_dir().join(format!("kanban-probe-damaged-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp probe dir");
+        let path = root.join("board.db");
+        // A valid SQLite header over a body that is not a database: past the
+        // caller's header check, and straight into a SQLite error.
+        let mut damaged = b"SQLite format 3\0".to_vec();
+        damaged.extend(std::iter::repeat_n(0xA5u8, 4096));
+        fs::write(&path, &damaged).expect("write the damaged file");
+
+        let error = probe_board_schema(&path)
+            .expect_err("a damaged database must not be answered with a verdict about its schema");
+        assert!(
+            !error.to_string().is_empty(),
+            "the reason has to survive, or the caller cannot say what went wrong"
+        );
+        assert_eq!(
+            fs::read(&path).expect("re-read the damaged file"),
+            damaged,
+            "probing a damaged file must not write to it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An interrupted creation is recoverable, not a permanent refusal.
+    ///
+    /// `open` creates the file and sets `journal_mode=WAL` before the first
+    /// migration commits. A Ctrl-C, a kill or ENOSPC in that window leaves a
+    /// header with no tables behind it — which the schema probe must call
+    /// `Unwritten`, not `Other`, or the retry of the very command that was
+    /// interrupted is refused forever.
+    #[test]
+    fn an_interrupted_creation_reads_as_unwritten_rather_than_a_stranger() {
+        let root =
+            std::env::temp_dir().join(format!("kanban-probe-partial-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp probe dir");
+
+        // Exactly what `open` leaves before the first migration commits.
+        let half = root.join("half.db");
+        let connection = Connection::open(&half).expect("create the partial file");
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("set WAL, as open does");
+        drop(connection);
+        assert_eq!(
+            probe_board_schema(&half).expect("probe the partial file"),
+            BoardSchema::Unwritten
+        );
+
+        // Zero tables is not on its own enough. A database that stamps its
+        // schema version before creating anything is a stranger, and treating
+        // it as an unfinished board would migrate 26 kanban tables into it.
+        // `migrate` commits `BOARD_V1` and `user_version=1` together, so no
+        // board of ours can present this way.
+        let versioned = root.join("versioned-empty.db");
+        let connection = Connection::open(&versioned).expect("create a versioned empty database");
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA user_version=4;")
+            .expect("stamp a version with no tables");
+        drop(connection);
+        assert_eq!(
+            probe_board_schema(&versioned).expect("probe the versioned empty database"),
+            BoardSchema::Other,
+            "a stranger that versions itself before writing its schema was taken for our own \
+             unfinished board"
+        );
+
+        // A database with tables that are not ours stays a stranger.
+        let stranger = root.join("stranger.db");
+        let connection = Connection::open(&stranger).expect("create a foreign database");
+        connection
+            .execute_batch("PRAGMA user_version=7; CREATE TABLE tasks(id INTEGER, name TEXT);")
+            .expect("write a foreign schema");
+        drop(connection);
+        assert_eq!(
+            probe_board_schema(&stranger).expect("probe the foreign database"),
+            BoardSchema::Other,
+            "a tasks table alone must not be mistaken for a board"
+        );
+
+        // And finishing the interrupted one produces a board.
+        drop(open_board(&half).expect("finish the interrupted creation"));
+        assert_eq!(
+            probe_board_schema(&half).expect("probe the finished board"),
+            BoardSchema::Board
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

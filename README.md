@@ -236,21 +236,56 @@ open queue without clearing `resolvedAt`, `resolvedBy` or `resolution`; it adds
 ## Working from anywhere
 
 Boards are addressable from any directory, not only from inside the project
-tree. Board selection runs most explicit first ([ADR-007](docs/adr/ADR-007-global-project-addressing.md)):
+tree. Every flag you type is consulted before any environment default, and
+defaults are consulted before the working directory
+([ADR-007](docs/adr/ADR-007-global-project-addressing.md),
+[ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)):
 
-| Selector | Meaning |
-| --- | --- |
-| `--db PATH` / `KANBAN_DB` | a board file directly |
-| `--project NAME` / `KANBAN_PROJECT` | a registered project by name, from anywhere |
-| `--workspace PATH` | the project containing `PATH` |
-| _(none)_ | the project containing the working directory |
+| Order | Selector | Meaning |
+| --- | --- | --- |
+| 1 | `--db PATH` | a board file directly |
+| 2 | `--project NAME` | a registered project by name, from anywhere |
+| 3 | `--workspace PATH` | the project containing `PATH` |
+| 4 | `KANBAN_DB` | the default for `--db` |
+| 5 | `KANBAN_PROJECT` | the default for `--project` |
+| 6 | _(none)_ | the project containing the working directory |
+
+A flag beats an environment default, because a default is what applies when
+nothing was asked for — with `KANBAN_DB` exported, `task list --project alpha`
+reads alpha. Two flags are a different thing: `--project alpha --db /tmp/x.db`
+is refused rather than resolved, because the values disagree and nothing in the
+receipt would say which one was used.
 
 ```bash
 kanban task list --project my-project          # from any directory
 export KANBAN_PROJECT=my-project               # or once per shell or agent cage
 kanban task add "ships from anywhere"
+kanban task list --project other               # the flag still wins over the export
 kanban workspace list                          # registered names, including rootless boards
 ```
+
+A `--db` path that does not exist is created only by `task add`, and only when
+you name the path yourself: `KANBAN_DB` pointing at nothing is a misconfigured
+default, not a request to make a board, and every other command reports the
+missing file rather than answering `[]` from one it just made.
+
+A `--db` path that already holds a file is opened only if that file looks like
+a board: a `tasks` table carrying kanban's own columns, and a schema version
+that has been set. Opening a board migrates it, so this is what stops a mistyped
+path from being rewritten — an empty file, a text file, a directory, a FIFO and
+another application's SQLite database are all refused and left byte-for-byte as
+they were.
+
+Two limits worth stating rather than implying. It is a heuristic: a database
+that happens to have a kanban-shaped `tasks` table would still be treated as a
+board. And it only guards paths that already hold a file — typo `--db` onto a
+path that does not exist and `task add` will start a board there, because that
+is indistinguishable from asking for one.
+
+`kanban schema --json` publishes this: each operation carries `readOnly` (writes
+nothing anywhere) and `createsBoard` (may bring a board file into existence).
+They are different questions — `todo` writes a file, so it is not read-only, and
+it still may not create a board — and adapters can rely on both.
 
 Project names are not unique. If two boards share one, `--project` refuses and
 names every candidate, including rootless boards; use `--workspace PATH` or a

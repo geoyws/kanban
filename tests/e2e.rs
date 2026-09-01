@@ -3548,6 +3548,804 @@ fn compiled_binary_addresses_projects_globally_without_cwd() {
     );
 }
 
+/// A selector the caller typed outranks every environment default, and no read
+/// stands a board up.
+///
+/// `direct_db` returned `--db` *or* `KANBAN_DB`, and `store_path` consulted it
+/// before anything else, so with `KANBAN_DB` exported an explicit `--project`
+/// was never reached. `task list --project Alpha` answered `[]` from the
+/// environment's path — and created a fully migrated board there on the way.
+/// The `[]` is the dangerous half: a plausible answer rather than an error, so
+/// the caller acts on "no tasks" when the truth is "wrong board".
+///
+/// This has to cross a real process boundary. The defect is in how a process
+/// reads its own environment against its own argv, and a unit test calling the
+/// resolver in-process would inherit the harness's environment rather than a
+/// controlled one — which is why the resolver's own tests never caught it.
+#[test]
+fn compiled_binary_lets_a_typed_selector_override_its_environment_default() {
+    let fixture = Fixture::new("selector-precedence");
+    let beta = fixture.root.join("beta");
+    fs::create_dir_all(&beta).unwrap();
+
+    let alpha = fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let alpha_board = alpha["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(&beta, &["init", "--name", "Beta", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "alpha work", "--id", "t-alpha", "--json"],
+    );
+    fixture.ok_json(
+        &beta,
+        &["task", "add", "beta work", "--id", "t-beta", "--json"],
+    );
+
+    let ids = |value: &Value| -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // Every assertion naming this path also asserts it stayed absent, until the
+    // last leg creates it deliberately.
+    let ghost = fixture.root.join("ghost.db");
+    let ghost_path = ghost.to_str().unwrap().to_owned();
+    // Owns no project: resolution walks up from here and finds nothing, so any
+    // leg that resolves a board did so through the selector under test.
+    let outside = fixture.root.clone();
+
+    let with_env = |key: &str, value: &str, args: &[&str]| -> Output {
+        fixture
+            .command(&outside)
+            .env(key, value)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let ok_with_env = |key: &str, value: &str, args: &[&str]| -> Value {
+        let output = with_env(key, value, args);
+        assert!(
+            output.status.success(),
+            "{key}={value} {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    // (1) KANBAN_DB set, --project typed: the flag wins, and the environment's
+    // path is neither read nor created.
+    assert_eq!(
+        ids(&ok_with_env(
+            "KANBAN_DB",
+            &ghost_path,
+            &["task", "list", "--project", "Alpha", "--json"]
+        )),
+        vec!["t-alpha".to_owned()],
+        "KANBAN_DB outvoted an explicit --project"
+    );
+    assert!(
+        !ghost.exists(),
+        "an overridden KANBAN_DB still conjured a board"
+    );
+
+    // (2) Same for --workspace, which sat two rungs below KANBAN_DB.
+    assert_eq!(
+        ids(&ok_with_env(
+            "KANBAN_DB",
+            &ghost_path,
+            &[
+                "task",
+                "list",
+                "--workspace",
+                beta.to_str().unwrap(),
+                "--json"
+            ]
+        )),
+        vec!["t-beta".to_owned()],
+        "KANBAN_DB outvoted an explicit --workspace"
+    );
+    assert!(!ghost.exists());
+
+    // (3) And the other direction: KANBAN_PROJECT is a default too.
+    assert_eq!(
+        ids(&ok_with_env(
+            "KANBAN_PROJECT",
+            "Beta",
+            &["task", "list", "--db", &alpha_board, "--json"]
+        )),
+        vec!["t-alpha".to_owned()],
+        "KANBAN_PROJECT outvoted an explicit --db"
+    );
+    assert_eq!(
+        ids(&ok_with_env(
+            "KANBAN_PROJECT",
+            "Beta",
+            &[
+                "task",
+                "list",
+                "--workspace",
+                fixture.main.to_str().unwrap(),
+                "--json"
+            ]
+        )),
+        vec!["t-alpha".to_owned()],
+        "KANBAN_PROJECT outvoted an explicit --workspace"
+    );
+
+    // (4) A write obeys the same order. Answering from the wrong board is bad;
+    // writing to it is the unrecoverable case ADR-007 exists to prevent.
+    ok_with_env(
+        "KANBAN_DB",
+        &ghost_path,
+        &[
+            "task",
+            "add",
+            "typed",
+            "--id",
+            "t-typed",
+            "--project",
+            "Beta",
+            "--json",
+        ],
+    );
+    assert!(!ghost.exists(), "a write landed on the environment's board");
+    assert!(
+        ids(&fixture.ok_json(&outside, &["task", "list", "--project", "Beta", "--json"]))
+            .contains(&"t-typed".to_owned()),
+        "the write did not land on the board --project named"
+    );
+
+    // (5) With no flag to override it, each default still applies unchanged.
+    assert_eq!(
+        ids(&ok_with_env(
+            "KANBAN_DB",
+            &alpha_board,
+            &["task", "list", "--json"]
+        )),
+        vec!["t-alpha".to_owned()],
+        "KANBAN_DB stopped working as a default"
+    );
+    assert_eq!(
+        ids(&ok_with_env(
+            "KANBAN_PROJECT",
+            "Alpha",
+            &["task", "list", "--json"]
+        )),
+        vec!["t-alpha".to_owned()],
+        "KANBAN_PROJECT stopped working as a default"
+    );
+
+    // (6) Two flags the caller typed stay a refusal. A default is not a second
+    // request; a second flag is.
+    let two_flags = fixture.run(
+        &outside,
+        &[
+            "task",
+            "list",
+            "--project",
+            "Beta",
+            "--db",
+            &alpha_board,
+            "--json",
+        ],
+    );
+    assert!(
+        !two_flags.status.success(),
+        "the two-flag refusal stopped firing"
+    );
+    let conflict = String::from_utf8_lossy(&two_flags.stderr).into_owned();
+    assert!(conflict.contains("each name a board"), "{conflict}");
+
+    // (7) A read reports a board file that is not there rather than creating
+    // it, whichever selector named the path.
+    let read_flag = fixture.run(&outside, &["task", "list", "--db", &ghost_path, "--json"]);
+    assert!(
+        !read_flag.status.success(),
+        "a read created the board it was asked to read"
+    );
+    let read_message = String::from_utf8_lossy(&read_flag.stderr).into_owned();
+    assert!(read_message.contains("does not exist"), "{read_message}");
+    assert!(read_message.contains("never creates one"), "{read_message}");
+    assert!(!ghost.exists(), "the refused read left a board behind");
+
+    let read_env = with_env("KANBAN_DB", &ghost_path, &["task", "list", "--json"]);
+    assert!(
+        !read_env.status.success(),
+        "a read through KANBAN_DB created the board it was asked to read"
+    );
+    assert!(!ghost.exists());
+
+    // The read-only resolver reaches the same boards by a second code path, so
+    // it carries both guarantees too.
+    let read_only = fixture.run(
+        &outside,
+        &["subscription", "list", "--db", &ghost_path, "--json"],
+    );
+    assert!(
+        !read_only.status.success(),
+        "the read-only resolver created a board"
+    );
+    assert!(!ghost.exists());
+    ok_with_env(
+        "KANBAN_DB",
+        &ghost_path,
+        &["subscription", "list", "--project", "Alpha", "--json"],
+    );
+    assert!(!ghost.exists());
+
+    // `watch` is the third caller of the same resolver, and it reaches it by a
+    // branch of its own. `--limit 0` returns immediately, so this asks nothing
+    // of the stream beyond which board it resolved. It emits no batch, so the
+    // exit status is the whole assertion.
+    let watched = with_env(
+        "KANBAN_DB",
+        &ghost_path,
+        &["watch", "--limit", "0", "--project", "Alpha", "--json"],
+    );
+    assert!(
+        watched.status.success(),
+        "watch resolved the environment's board over an explicit --project: {}",
+        String::from_utf8_lossy(&watched.stderr)
+    );
+    assert!(!ghost.exists());
+
+    // (8) A write through KANBAN_DB does not create one either. An inherited or
+    // mistyped default is not a request to make a board.
+    let write_env = with_env(
+        "KANBAN_DB",
+        &ghost_path,
+        &["task", "add", "ghost", "--json"],
+    );
+    assert!(
+        !write_env.status.success(),
+        "KANBAN_DB conjured a board on a write"
+    );
+    let write_message = String::from_utf8_lossy(&write_env.stderr).into_owned();
+    assert!(write_message.contains("KANBAN_DB names"), "{write_message}");
+    assert!(!ghost.exists());
+
+    // (9) Naming the path on the command line still is such a request: that is
+    // how a board outside the registry is made, and it keeps working.
+    fixture.ok_json(
+        &outside,
+        &["task", "add", "deliberate", "--db", &ghost_path, "--json"],
+    );
+    assert!(
+        ghost.is_file(),
+        "--db on a command that writes no longer creates a board"
+    );
+    assert_eq!(
+        ids(&fixture.ok_json(&outside, &["task", "list", "--db", &ghost_path, "--json"])).len(),
+        1
+    );
+}
+
+/// A board file comes into existence only where creating one is the point.
+///
+/// Permission to create was derived from the `readOnly` bit in `COMMANDS`, and
+/// that bit answers a different question — whether an operation writes anything
+/// *anywhere* — which is why `backup` and `todo` are not read-only despite
+/// changing no work state. Ask it about board creation and it answers about
+/// file writes, and the two diverge exactly where it hurts.
+///
+/// Measured against the tree before this fix: `archive --dry-run
+/// --older-than-days 30 --as me --db <typo>` reported zero rows, exited 0, and
+/// left a 372736-byte migrated board at the typo — from a flag whose entire
+/// promise is to change nothing. `todo --db <typo>` did the same.
+#[test]
+fn compiled_binary_creates_a_board_only_where_creation_is_the_point() {
+    let fixture = Fixture::new("board-creation");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+
+    // Each leg gets its own path, so "no file appeared" is about this command
+    // and not about a neighbour having cleaned up.
+    let refuses = |label: &str, args: &[&str]| {
+        let ghost = fixture.root.join(format!("{label}.db"));
+        let path = ghost.to_str().unwrap().to_owned();
+        let mut argv = args.to_vec();
+        argv.extend(["--db", path.as_str(), "--json"]);
+        let output = fixture.run(&fixture.main, &argv);
+        assert!(
+            !output.status.success(),
+            "{label} answered from a board it created instead of reporting"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("does not exist") && stderr.contains("never creates one"),
+            "{label} refused for some other reason, so this proves nothing: {stderr}"
+        );
+        assert!(
+            !ghost.exists(),
+            "{label} left a board behind at a path it refused to answer from"
+        );
+    };
+
+    // The two the `readOnly` derivation got wrong. `--dry-run` is the sharpest:
+    // the flag exists to promise nothing changes.
+    refuses(
+        "archive-dry-run",
+        &[
+            "archive",
+            "--dry-run",
+            "--older-than-days",
+            "30",
+            "--as",
+            "me",
+        ],
+    );
+    refuses("todo", &["todo"]);
+    // A plain read, which the derivation did get right — kept so a later
+    // simplification cannot quietly lose it.
+    refuses("task-list", &["task", "list"]);
+    // `watch` reaches the board by a branch of its own that bypassed the guard
+    // entirely. It was safe only because `Store::open_readonly` passes
+    // SQLITE_OPEN_READ_ONLY and physically cannot create; the diagnosis was a
+    // raw `Error code 14`.
+    refuses("watch", &["watch", "--limit", "0"]);
+
+    // And through the environment, where the honest complaint is different:
+    // nobody typed this path.
+    let env_ghost = fixture.root.join("watch-env.db");
+    let watched = fixture
+        .command(&fixture.main)
+        .env("KANBAN_DB", env_ghost.to_str().unwrap())
+        .args(["watch", "--limit", "0", "--json"])
+        .output()
+        .unwrap();
+    assert!(!watched.status.success());
+    let watched_stderr = String::from_utf8_lossy(&watched.stderr).into_owned();
+    assert!(
+        watched_stderr.contains("KANBAN_DB names"),
+        "watch did not name the environment default as the problem: {watched_stderr}"
+    );
+    assert!(!env_ghost.exists());
+
+    // The one command whose point is to put the first work state somewhere
+    // still does, or a scratch board becomes uncreatable.
+    let made = fixture.root.join("made.db");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "first",
+            "--db",
+            made.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        made.is_file(),
+        "task add --db no longer starts a board outside the registry"
+    );
+}
+
+/// Widening the set of commands that may create a board is a deliberate act.
+///
+/// The allowlist has one entry and the dangerous direction is silent growth: a
+/// command that creates when it should not answers from a board it just made,
+/// which is indistinguishable from the empty board the caller meant. The
+/// manifest publishes the bit, so this reads it back and fails until a new
+/// creator is written down here too.
+#[test]
+fn the_only_board_creator_is_declared() {
+    let fixture = Fixture::new("board-creators");
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operations = schema["operations"].as_array().unwrap();
+
+    let creators = operations
+        .iter()
+        .filter(|operation| operation["createsBoard"] == true)
+        .map(|operation| operation["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        creators,
+        vec!["task add".to_owned()],
+        "the set of commands that may bring a board into existence changed"
+    );
+
+    // And the bit is not a restatement of `readOnly`. These two are the reason
+    // deriving one from the other was wrong, so pin the disagreement: someone
+    // "fixing" this by flipping `readOnly` is changing the wrong thing.
+    for name in ["todo", "archive"] {
+        let operation = operations
+            .iter()
+            .find(|operation| operation["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is missing from the manifest"));
+        assert_eq!(
+            operation["readOnly"], false,
+            "{name} writes something somewhere, which is exactly why readOnly \
+             could not answer whether it may create a board"
+        );
+        assert_eq!(
+            operation["createsBoard"], false,
+            "{name} may create a board"
+        );
+    }
+}
+
+/// A mistyped `--db` never overwrites what is already at the path, and a
+/// command that refuses leaves the filesystem as it found it.
+///
+/// Two defects, both measured against the tree before this fix:
+///
+/// The board guard asked `Path::is_file`, so a path naming an existing EMPTY
+/// file passed it. `task list --db notes.txt` against a 0-byte file printed
+/// `[]` and left 372736 bytes of SQLite where the operator's file had been —
+/// a plausible wrong answer and a destroyed file in one command. A non-empty
+/// non-SQLite file already failed loudly, so empty files were the whole hole.
+///
+/// And `open_store` ran before any command read its own positionals, so
+/// `task add --db /new/deep/nest/board.db` with no title printed "task title is
+/// required" *after* creating the board and both directories above it.
+#[test]
+fn compiled_binary_never_overwrites_a_file_it_was_pointed_at_by_mistake() {
+    let fixture = Fixture::new("mistyped-db");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+
+    // A file that exists and is not a board: the guard has to read it, not
+    // merely stat it.
+    let empty = fixture.root.join("notes.txt");
+    fs::write(&empty, b"").unwrap();
+    let prose = fixture.root.join("notes.md");
+    fs::write(&prose, b"my important notes\n").unwrap();
+
+    // And a real SQLite database belonging to something else. This is the one
+    // a header check cannot catch: it IS SQLite, so `migrate` started from its
+    // `user_version` of 0 and ran the whole ladder into it — measured at 8192
+    // bytes in and 376832 bytes out, `bookmarks` still sitting among 26 kanban
+    // tables. Being a database is not the same as being *this* database.
+    let foreign = fixture.root.join("firefox.db");
+    {
+        let connection = Connection::open(&foreign).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE bookmarks(id INTEGER PRIMARY KEY, url TEXT);\
+                 INSERT INTO bookmarks VALUES(1,'https://example.com');",
+            )
+            .unwrap();
+    }
+
+    for (label, victim) in [("empty", &empty), ("prose", &prose), ("sqlite", &foreign)] {
+        let before = fs::read(victim).unwrap();
+        // Both a pure read and the one command allowed to create a board.
+        // Permission to start one where there is nothing is not permission to
+        // overwrite something that is already there.
+        for command in [
+            vec!["task", "list"],
+            vec!["task", "add", "clobber"],
+            vec!["todo"],
+        ] {
+            let mut argv = command.clone();
+            argv.extend(["--db", victim.to_str().unwrap(), "--json"]);
+            let output = fixture.run(&fixture.main, &argv);
+            assert!(
+                !output.status.success(),
+                "{label}: {command:?} opened a file that is not a board"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                stderr.contains("is not a Kanban board"),
+                "{label}: {command:?} refused for some other reason: {stderr}"
+            );
+            assert_eq!(
+                fs::read(victim).unwrap(),
+                before,
+                "{label}: {command:?} rewrote a file it was pointed at by mistake"
+            );
+        }
+    }
+
+    // The guard reads the SQLite header, so a real board is still just a board.
+    let board = board_path_for_project(&fixture, &fixture.main, "Alpha");
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--db", board.to_str().unwrap(), "--json"],
+    );
+
+    // A command that cannot run creates nothing on its way to saying so —
+    // not the board, and not the directories above it.
+    let nest = fixture.root.join("deep/nest");
+    let typo = nest.join("typo.db");
+    let untitled = fixture.run(
+        &fixture.main,
+        &["task", "add", "--db", typo.to_str().unwrap(), "--json"],
+    );
+    assert!(!untitled.status.success());
+    // The filesystem claim first: it is the one that matters, and asserting the
+    // message first would let a mutation be caught by the wrong assertion.
+    assert!(!typo.exists(), "a failed task add left a board behind");
+    assert!(
+        !nest.exists() && !fixture.root.join("deep").exists(),
+        "a failed task add left the directories it would have needed"
+    );
+    let untitled_stderr = String::from_utf8_lossy(&untitled.stderr).into_owned();
+    assert!(
+        untitled_stderr.contains("title is required"),
+        "{untitled_stderr}"
+    );
+    assert!(
+        untitled_stderr.contains("usage: kanban task add TITLE"),
+        "the refusal must say what the command wanted: {untitled_stderr}"
+    );
+
+    // With the title supplied, the same path is still created — absence is
+    // what makes a new board legitimate, and that has not changed.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "titled",
+            "--db",
+            typo.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(typo.is_file(), "task add --db no longer starts a new board");
+}
+
+/// Classifying a board path answers promptly and does not say false things.
+///
+/// Two defects in the guard that replaced `Path::is_file`, both introduced by
+/// the fix for the empty-file case:
+///
+/// It reached straight for `File::open`. `open(O_RDONLY)` on a FIFO blocks
+/// until a writer appears, and Rust passes no `O_NONBLOCK` — and this runs in a
+/// loop over every registered board in `doctor`, `dashboard`, `backup`,
+/// `restore`, `audit verify` and both `--all-boards` searches. One FIFO would
+/// stop the survey of all the others with no output and no timeout, which is
+/// precisely what the survey design exists to avoid. `is_file()` answered in
+/// microseconds and is false for a FIFO, so the stat goes first.
+///
+/// And an unreadable file was classified as "not a Kanban board", which is a
+/// false statement about intact data and sends the operator hunting for
+/// corruption instead of a permission bit.
+#[test]
+fn compiled_binary_classifies_a_board_path_promptly_and_truthfully() {
+    let fixture = Fixture::new("board-path-classification");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let board = board_path_for_project(&fixture, &fixture.main, "Alpha");
+
+    // A FIFO. The assertion is the deadline: without the stat this never
+    // returns at all, so the test would hang rather than fail. Waiting with a
+    // bound turns that into a reportable failure.
+    let fifo = fixture.root.join("pipe.db");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be available to exercise the blocking-open case");
+    assert!(made.success(), "mkfifo failed");
+
+    let mut child = fixture
+        .command(&fixture.main)
+        .args(["task", "list", "--db", fifo.to_str().unwrap(), "--json"])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let finished = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let Some(status) = finished else {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("classifying a FIFO blocked; one bad path would hang every survey");
+    };
+    assert!(!status.success(), "a FIFO was accepted as a board");
+
+    // An intact board that cannot be read is reported as unreadable, not as
+    // something it is not.
+    //
+    // Root bypasses the mode bits, so the scenario is unreachable when this
+    // runs privileged. Both branches assert a true thing rather than skipping:
+    // if the harness itself can still read the file, so can the binary, and the
+    // command must succeed.
+    fs::set_permissions(&board, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable_anyway = fs::read(&board).is_ok();
+    let denied = fixture.run(
+        &fixture.main,
+        &["task", "list", "--db", board.to_str().unwrap(), "--json"],
+    );
+    fs::set_permissions(&board, fs::Permissions::from_mode(0o600)).unwrap();
+
+    if readable_anyway {
+        assert!(
+            denied.status.success(),
+            "running privileged, so the board was readable and the read should have worked: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+    } else {
+        assert!(!denied.status.success());
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains("cannot be read"),
+            "an unreadable board must say so: {stderr}"
+        );
+        assert!(
+            !stderr.contains("is not a Kanban board"),
+            "an intact board was reported as not being one: {stderr}"
+        );
+    }
+
+    // The file survived being classified, either way.
+    assert!(board.is_file());
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--db", board.to_str().unwrap(), "--json"],
+    );
+
+    // A SQLite failure is not a verdict about what the file holds. The probe
+    // returned `bool`, so BUSY, CORRUPT, NOTADB and IOERR all reached the
+    // operator as "this is not a Kanban board" — a claim about contents that
+    // nothing had established. A damaged file gets that treatment immediately,
+    // with no lock to wait on.
+    let damaged = fixture.root.join("damaged.db");
+    let mut bytes = b"SQLite format 3\0".to_vec();
+    bytes.extend(std::iter::repeat_n(0xA5u8, 4096));
+    fs::write(&damaged, &bytes).unwrap();
+    let reported = fixture.run(
+        &fixture.main,
+        &["task", "list", "--db", damaged.to_str().unwrap(), "--json"],
+    );
+    assert!(!reported.status.success());
+    let reported_stderr = String::from_utf8_lossy(&reported.stderr).into_owned();
+    assert!(
+        reported_stderr.contains("cannot be read"),
+        "a damaged database must be reported as unreadable: {reported_stderr}"
+    );
+    assert!(
+        !reported_stderr.contains("is not a Kanban board"),
+        "a SQLite failure was turned into a claim about the file's contents: {reported_stderr}"
+    );
+    assert_eq!(
+        fs::read(&damaged).unwrap(),
+        bytes,
+        "a damaged file was written to while being classified"
+    );
+}
+
+/// An interrupted board creation is recoverable, not a permanent refusal.
+///
+/// `open` creates the file and sets `journal_mode=WAL` before the first
+/// migration commits, so a Ctrl-C, a kill or ENOSPC in that window leaves a
+/// database with no tables. Classified as a stranger's database, the retry of
+/// the very command that was interrupted is refused forever, with a message
+/// asserting the path holds something it does not.
+///
+/// `init` makes it worse: it commits the registry row before `Store::open` runs
+/// the migrations, so an interrupt there strands a *registered* board that no
+/// command can open.
+#[test]
+fn compiled_binary_finishes_a_board_creation_that_was_interrupted() {
+    let fixture = Fixture::new("interrupted-creation");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+
+    // Exactly what `open` leaves behind before the first migration commits.
+    let half = fixture.root.join("half.db");
+    {
+        let connection = Connection::open(&half).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+    }
+
+    // A command that does not create says what it found and both ways out.
+    let reported = fixture.run(
+        &fixture.main,
+        &["task", "list", "--db", half.to_str().unwrap(), "--json"],
+    );
+    assert!(!reported.status.success());
+    let stderr = String::from_utf8_lossy(&reported.stderr).into_owned();
+    // What was observed, not what caused it.
+    assert!(
+        stderr.contains("no tables in it"),
+        "the message must report what it saw: {stderr}"
+    );
+    // Both causes, because nothing here can tell them apart: under WAL this
+    // probe sees last-committed state, so a creation running in another process
+    // right now looks exactly like one abandoned an hour ago.
+    assert!(
+        stderr.contains("interrupted") && stderr.contains("another process"),
+        "the message must name both causes, not assert one: {stderr}"
+    );
+    // And it must never call the file abandoned, or call removal safe. Both
+    // are false during a concurrent creation, and the second is destructive
+    // advice stated as fact.
+    assert!(
+        !stderr.contains("loses no work") && !stderr.contains("holds nothing"),
+        "the message asserted that deleting the file is safe: {stderr}"
+    );
+    assert!(
+        stderr.contains("confirm no other process is creating it"),
+        "removal must be conditioned on the check only the operator can make: {stderr}"
+    );
+
+    // And the command that creates finishes the job rather than refusing.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "recovered",
+            "--db",
+            half.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--db", half.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(listed[0]["title"], "recovered");
+
+    // A registered board interrupted the same way is not stranded: `init`
+    // commits the registry row first, so refusing here would leave a project
+    // no command could open.
+    let stranded = fixture.root.join("stranded");
+    fs::create_dir_all(&stranded).unwrap();
+    fixture.ok_json(&stranded, &["init", "--name", "Stranded", "--json"]);
+    let registered = board_path_for_project(&fixture, &stranded, "Stranded");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", registered.display()));
+    }
+    {
+        let connection = Connection::open(&registered).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+    }
+    fixture.ok_json(&stranded, &["task", "add", "after the interrupt", "--json"]);
+}
+
+/// A board that is behind on migrations is still a board.
+///
+/// The schema check is the one that refuses a stranger's database, and the
+/// risk it carries is refusing one of ours mid-upgrade. It looks for the three
+/// tables `BOARD_V1` creates and nothing has dropped since, so every version
+/// from v1 to current passes it and `open_board` migrates as it always did.
+/// A stricter signal — `user_version` equal to the current schema — would have
+/// turned every board due an upgrade into "not a Kanban board".
+#[test]
+fn compiled_binary_still_migrates_a_board_that_is_behind() {
+    let fixture = Fixture::new("behind-schema");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Behind", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "older work", "--id", "t-old", "--json"],
+    );
+    let board = board_path_for_project(&fixture, &fixture.main, "Behind");
+
+    let current: i64 = Connection::open(&board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert!(current > 1, "expected a migrated board, got v{current}");
+    Connection::open(&board)
+        .unwrap()
+        .execute_batch(&format!("PRAGMA user_version={}", current - 1))
+        .unwrap();
+
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--db", board.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(
+        listed[0]["id"], "t-old",
+        "a board one version behind was refused"
+    );
+    let after: i64 = Connection::open(&board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, current, "the board was not migrated forward");
+}
+
 #[test]
 fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
     let fixture = Fixture::new("rootless-doctor-repoint");
@@ -3754,11 +4552,20 @@ fn compiled_binary_never_repermissions_directories_it_does_not_own() {
         fs::metadata(&board).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    // Directories kanban does create are private from creation.
+    // Directories kanban does create are private from creation. The vehicle
+    // has to be a command that writes: a read no longer stands a board up, so
+    // `task list` would report the missing file instead of creating anything.
     let nested = shared.join("deep/nest/board.db");
     fixture.ok_json(
         &fixture.main,
-        &["--db", nested.to_str().unwrap(), "task", "list", "--json"],
+        &[
+            "--db",
+            nested.to_str().unwrap(),
+            "task",
+            "add",
+            "nested board",
+            "--json",
+        ],
     );
     assert_eq!(
         fs::metadata(shared.join("deep"))

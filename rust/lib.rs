@@ -34,7 +34,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -988,6 +988,44 @@ impl Args {
         );
     }
 
+    /// Fail when a command was not given a positional it cannot work without.
+    ///
+    /// This has to run in the parse phase, not where the value is read. Every
+    /// command that takes a positional read it *after* `open_store`, so
+    /// `task add --db /new/board.db` with no title created and migrated a
+    /// 372736-byte board — and every parent directory above it — and only then
+    /// reported that the title was missing. A command that fails must leave
+    /// nothing behind, and the only way to guarantee that is to refuse before
+    /// anything is opened.
+    ///
+    /// The names come from `COMMANDS`, the same row the arity check reads, so a
+    /// command cannot declare a positional here and forget to require it.
+    fn reject_missing_positionals(&self, words: &[&str], positionals: &[&str]) -> Result<()> {
+        let supplied = self.positionals.len().saturating_sub(words.len());
+        let missing = positionals
+            .iter()
+            .enumerate()
+            .filter(|(index, name)| *index >= supplied && !name.starts_with('?'))
+            .map(|(_, name)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let usage = positionals
+            .iter()
+            .map(|name| match name.strip_prefix('?') {
+                Some(optional) => format!("[{}]", optional.to_uppercase()),
+                None => name.to_uppercase(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        bail!(
+            "{} is required.\nusage: kanban {} {usage}",
+            missing.join(" and "),
+            words.join(" ")
+        );
+    }
+
     /// Fail on a single-valued flag given more than once.
     ///
     /// Taking the last occurrence is a common convention and the wrong one
@@ -1235,20 +1273,6 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
     }
 }
 
-/// Board selection, most explicit first:
-///   1. `--db` / `KANBAN_DB`        — a board file directly
-///   2. `--project` / `KANBAN_PROJECT` — a registered project by name, from anywhere
-///   3. `--workspace PATH`          — the project containing PATH
-///   4. the current directory       — the project containing it
-///
-/// The order resolves a flag against its environment default, and a flag
-/// against the working directory. It never resolves two flags against each
-/// other: `reject_conflicting_board_selectors` refuses that command line before
-/// this runs, so at most one of (1)-(3) is ever present as a flag here.
-///
-/// (2) and (3) are what make the CLI usable outside a registered tree: an agent
-/// in an unrelated cage, a cron line, or any shell in $HOME can address a board
-/// without cd-ing into it.
 /// The operation surface, as data a harness can generate an adapter from.
 ///
 /// [ADR-001](../docs/adr/ADR-001-durable-agent-work-ledger.md) §6 says
@@ -1301,6 +1325,11 @@ pub(crate) fn schema() -> Value {
                 // `?` marks one the command can do without.
                 "positionals": positionals,
                 "readOnly": read_only,
+                // Distinct from `readOnly`, which asks whether the operation
+                // writes anything anywhere. This asks the narrower question the
+                // board resolver actually needs: may naming a `--db` path that
+                // is not there bring one into existence.
+                "createsBoard": board_creation(command, *sub) == BoardCreation::Permitted,
             })
         })
         .collect::<Vec<_>>();
@@ -1322,107 +1351,471 @@ fn here() -> Option<gitctx::GitContext> {
     gitctx::resolve(&cwd().ok()?)
 }
 
+/// Whether this invocation may bring a board file into existence.
+///
+/// Deliberately not derived from `readOnly`. That bit answers a different
+/// question — whether an operation writes *anything, anywhere* — which is why
+/// `backup` and `todo` are not read-only despite changing no work state. Ask it
+/// about board creation and it answers about file writes, and the two diverge
+/// exactly where it hurts: `todo` and `archive --dry-run` are both `readOnly:
+/// false`, both accept `--db`, and both stood a 372736-byte board up at a
+/// mistyped path and exited 0 — `archive` from a flag whose whole promise is to
+/// change nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoardCreation {
+    /// The command's purpose is to put work state into the board it names, so
+    /// naming a path that is not there is a request to start one.
+    Permitted,
+    /// A board file that is not there is reported, never conjured.
+    Refused,
+}
+
+/// The only commands that may bring a board file into existence.
+///
+/// An allowlist rather than a sixth column on [`CommandRow`], because the two
+/// shapes fail differently. A per-row bit is forty-five bits of which
+/// forty-four must be `false`, and the way it breaks is someone copying a
+/// neighbouring row and inheriting a `true` — silently, in the dangerous
+/// direction. Absence from a list cannot be got wrong that way: a command
+/// that is not written here cannot create anything, including a command that
+/// does not exist yet, and including one whose author never read this file.
+///
+/// `task add` is the entry because it is the only command whose point is to put
+/// the first work state into a board. Everything else addresses rows that would
+/// have to be there already — you cannot usefully `claim`, `move`,
+/// `checkpoint`, `archive` or `todo` a board into being. `init` is absent
+/// because it never consults `--db` at all; it creates through the registry.
+///
+/// Widening this is a deliberate act, and `the_only_board_creator_is_declared`
+/// fails until the new entry is written down in the test too.
+const BOARD_CREATORS: [(&str, Option<&str>); 1] = [("task", Some("add"))];
+
+/// Which of the selectors this invocation addresses a board with.
+///
+/// Resolved in exactly one place so the store, the read-only store, the
+/// board-name lookup and the data-root lock can never disagree about what was
+/// addressed.
+///
+/// Every flag the caller typed outranks every environment default. A default is
+/// what applies when nothing was asked for, so reading one ahead of a flag lets
+/// the environment silently outvote the command line: with `KANBAN_DB` set,
+/// `task list --project alpha` read the environment's file, reported `[]`, and
+/// created that file on the way. Two typed flags never reach here —
+/// `reject_conflicting_board_selectors` refuses that command line first — so
+/// this order only ever resolves a flag against a default, or a flag against the
+/// working directory, and neither of those is a second request.
+enum BoardSelection {
+    /// A board file named straight by path, bypassing the registry entirely.
+    ///
+    /// `explicit` separates `--db PATH`, which is how a board outside the
+    /// registry is made, from `KANBAN_DB`, which is only a default for it.
+    Db { path: PathBuf, explicit: bool },
+    /// A registered project by name, addressable from anywhere.
+    Project(String),
+    /// `--workspace PATH`, or the working directory when nothing named a board.
+    Workspace(Option<PathBuf>),
+}
+
+fn board_selection(args: &Args) -> BoardSelection {
+    if let Some(path) = args.one("db") {
+        return BoardSelection::Db {
+            path: PathBuf::from(path),
+            explicit: true,
+        };
+    }
+    if let Some(name) = args.one("project") {
+        return BoardSelection::Project(name.to_owned());
+    }
+    if let Some(workspace) = args.one("workspace") {
+        return BoardSelection::Workspace(Some(PathBuf::from(workspace)));
+    }
+    if let Some(path) = env::var_os("KANBAN_DB") {
+        return BoardSelection::Db {
+            path: PathBuf::from(path),
+            explicit: false,
+        };
+    }
+    if let Some(name) = env::var("KANBAN_PROJECT")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return BoardSelection::Project(name);
+    }
+    BoardSelection::Workspace(None)
+}
+
 /// A board named straight by path, bypassing the registry entirely.
 ///
 /// Read by both the board resolver and the data-root lock, so the two can
 /// never disagree about whether an invocation is registry-addressed.
 fn direct_db(args: &Args) -> Option<PathBuf> {
-    args.one("db")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("KANBAN_DB").map(PathBuf::from))
+    direct_board(args).map(|(path, _)| path)
 }
 
-fn store_path(args: &Args) -> Result<PathBuf> {
-    if let Some(path) = direct_db(args) {
-        return Ok(path);
+/// The same board, with whether the caller named it or the environment did.
+///
+/// `watch` needs both halves: it opens the path itself rather than going
+/// through `store_path_readonly`, so without the origin it cannot tell a
+/// mistyped `KANBAN_DB` from a `--db` the caller typed.
+fn direct_board(args: &Args) -> Option<(PathBuf, bool)> {
+    match board_selection(args) {
+        BoardSelection::Db { path, explicit } => Some((path, explicit)),
+        BoardSelection::Project(_) | BoardSelection::Workspace(_) => None,
     }
-    let mut registry = Registry::open()?;
-    let named = args.one("project").map(str::to_owned).or_else(|| {
-        env::var("KANBAN_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-    });
-    if let Some(name) = named {
-        let path = board_by_name(&registry, &name)?;
-        if !board_is_present(&path.to_string_lossy()) {
-            return Err(missing_board_error(&path.to_string_lossy()));
+}
+
+/// The commands from [`BOARD_CREATORS`], for an error that names the way out.
+fn board_creator_names() -> String {
+    BOARD_CREATORS
+        .iter()
+        .map(|(command, sub)| match sub {
+            Some(sub) => format!("{command} {sub}"),
+            None => (*command).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether this command may create the board it names.
+///
+/// Fails closed twice over: a command absent from [`BOARD_CREATORS`] cannot
+/// create, and so cannot a command absent from `COMMANDS` entirely. That second
+/// case is unreachable today — `command_spec` refuses an unknown command a few
+/// lines after this is called — but it is guaranteed here rather than left to
+/// the order two statements happen to be in.
+fn board_creation(command: &str, sub: Option<&str>) -> BoardCreation {
+    if BOARD_CREATORS.contains(&(command, sub)) {
+        BoardCreation::Permitted
+    } else {
+        BoardCreation::Refused
+    }
+}
+
+/// Refuse to conjure a board file nobody asked for.
+///
+/// Opening a board creates it, and ADR-008 records that as the aggravating half
+/// of the wrong-board defect, not as a feature: a `--db` path that did not exist
+/// was "conjured empty and answered from", so the caller got a board with
+/// nothing in it and an exit status of zero. Creation therefore needs all three
+/// of: the file is absent, the caller named the path themselves, and the command
+/// is one whose purpose is to put work state there.
+///
+/// Each missing condition is its own defect. A command that only reports
+/// creating its subject answers from the file it just made — `doctor` did that
+/// to a registered board and certified the result healthy, and `todo` and
+/// `archive --dry-run` did it to a path. And `KANBAN_DB` is a default, not a
+/// request: one inherited from a parent process or mistyped in a profile
+/// standing a board up as a side effect is the wrong-board write ADR-007 exists
+/// to prevent, reached without anyone naming the file on the command line.
+fn require_board_file(path: &Path, explicit: bool, creation: BoardCreation) -> Result<()> {
+    match board_file(&path.to_string_lossy()) {
+        BoardFile::Board => return Ok(()),
+        // Refused for every command, `task add` included. Permission to start a
+        // board where there is nothing is not permission to overwrite a file
+        // that is already there.
+        BoardFile::Foreign => return Err(foreign_board_error(&path.to_string_lossy())),
+        BoardFile::Unreadable(reason) => {
+            return Err(unreadable_board_error(&path.to_string_lossy(), &reason));
         }
-        return Ok(path);
-    }
-    let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-    if let Some(record) = registry.resolve(&workspace)? {
-        if !board_is_present(&record.board_path) {
-            return Err(missing_board_error(&record.board_path));
+        // An interrupted creation left a database with nothing in it. Finishing
+        // the job is the recovery, and it needs the same two conditions
+        // creating one does: the caller typed the path, and the command is one
+        // whose purpose is to put work state there. Anything else reports,
+        // because otherwise a stale `KANBAN_DB` silently adopts the wreckage.
+        BoardFile::Unfinished => {
+            return match (creation, explicit) {
+                (BoardCreation::Permitted, true) => Ok(()),
+                _ => Err(unfinished_board_error(&path.to_string_lossy())),
+            };
         }
-        return Ok(PathBuf::from(record.board_path));
+        BoardFile::Absent => {}
     }
-    bail!(
-        "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT, or run 'kanban init' there{}",
-        workspace.display(),
-        known_projects(&registry)?
-    )
+    // The environment case first: when both apply, the actionable half is that
+    // nobody typed this path.
+    if !explicit {
+        bail!(
+            "KANBAN_DB names {}, which does not exist, and an environment default is not a \
+             request to create a board.\n\
+             Create it deliberately:  kanban {} ... --db {}\n\
+             Or address another one:  --project NAME, or unset KANBAN_DB.",
+            path.display(),
+            board_creator_names(),
+            path.display()
+        );
+    }
+    match creation {
+        BoardCreation::Permitted => Ok(()),
+        BoardCreation::Refused => bail!(
+            "board file {} does not exist, and this command never creates one: it would answer \
+             from a board it had just made, which is indistinguishable from the empty board you \
+             meant.\n\
+             Address an existing board with --project NAME, or start this one with: kanban {} \
+             ... --db {}",
+            path.display(),
+            board_creator_names(),
+            path.display()
+        ),
+    }
+}
+
+/// Board selection, most explicit first:
+///   1. `--db PATH`           — a board file directly
+///   2. `--project NAME`      — a registered project by name, from anywhere
+///   3. `--workspace PATH`    — the project containing PATH
+///   4. `KANBAN_DB`           — the default for (1)
+///   5. `KANBAN_PROJECT`      — the default for (2)
+///   6. the current directory — the project containing it
+///
+/// Flags come before defaults, not interleaved with them: see [`BoardSelection`]
+/// for why an environment default must never outrank a typed flag.
+///
+/// (2) and (3) are what make the CLI usable outside a registered tree: an agent
+/// in an unrelated cage, a cron line, or any shell in $HOME can address a board
+/// without cd-ing into it.
+fn store_path(args: &Args, creation: BoardCreation) -> Result<PathBuf> {
+    match board_selection(args) {
+        BoardSelection::Db { path, explicit } => {
+            require_board_file(&path, explicit, creation)?;
+            Ok(path)
+        }
+        BoardSelection::Project(name) => {
+            let registry = Registry::open()?;
+            let path = board_by_name(&registry, &name)?;
+            require_registered_board(&path.to_string_lossy())?;
+            Ok(path)
+        }
+        BoardSelection::Workspace(workspace) => {
+            let mut registry = Registry::open()?;
+            let workspace = match workspace {
+                Some(path) => path,
+                None => cwd()?,
+            };
+            if let Some(record) = registry.resolve(&workspace)? {
+                require_registered_board(&record.board_path)?;
+                return Ok(PathBuf::from(record.board_path));
+            }
+            bail!(
+                "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT, or run 'kanban init' there{}",
+                workspace.display(),
+                known_projects(&registry)?
+            )
+        }
+    }
 }
 
 /// Resolve a board without updating registry recency or migrating either DB.
 fn store_path_readonly(args: &Args) -> Result<PathBuf> {
-    if let Some(path) = direct_db(args) {
-        return Ok(path);
-    }
-    let registry = Registry::open_readonly()?;
-    let named = args.one("project").map(str::to_owned).or_else(|| {
-        env::var("KANBAN_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-    });
-    let path = if let Some(name) = named {
-        let matches = registry.by_name(&name)?;
-        match matches.as_slice() {
-            [project] => PathBuf::from(&project.board_path),
-            [] => bail!(
-                "no Kanban project named {name}{}",
-                known_projects(&registry)?
-            ),
-            many => bail!(
-                "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
-                many.len(),
-                project_candidates(many)
-            ),
+    let path = match board_selection(args) {
+        BoardSelection::Db { path, explicit } => {
+            // Nothing reached through here writes, so a missing file is
+            // reported whichever selector named it.
+            require_board_file(&path, explicit, BoardCreation::Refused)?;
+            return Ok(path);
         }
-    } else {
-        let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-        registry
-            .resolve_readonly(&workspace)?
-            .map(|record| PathBuf::from(record.board_path))
-            .with_context(|| {
-                format!(
-                    "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT{}",
-                    workspace.display(),
-                    known_projects(&registry).unwrap_or_default()
-                )
-            })?
+        BoardSelection::Project(name) => {
+            let registry = Registry::open_readonly()?;
+            let matches = registry.by_name(&name)?;
+            match matches.as_slice() {
+                [project] => PathBuf::from(&project.board_path),
+                [] => bail!(
+                    "no Kanban project named {name}{}",
+                    known_projects(&registry)?
+                ),
+                many => bail!(
+                    "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
+                    many.len(),
+                    project_candidates(many)
+                ),
+            }
+        }
+        BoardSelection::Workspace(workspace) => {
+            let registry = Registry::open_readonly()?;
+            let workspace = match workspace {
+                Some(path) => path,
+                None => cwd()?,
+            };
+            registry
+                .resolve_readonly(&workspace)?
+                .map(|record| PathBuf::from(record.board_path))
+                .with_context(|| {
+                    format!(
+                        "no Kanban project contains {}; address one from anywhere with --project NAME or KANBAN_PROJECT{}",
+                        workspace.display(),
+                        known_projects(&registry).unwrap_or_default()
+                    )
+                })?
+        }
     };
-    if !board_is_present(&path.to_string_lossy()) {
-        return Err(missing_board_error(&path.to_string_lossy()));
-    }
+    require_registered_board(&path.to_string_lossy())?;
     Ok(path)
 }
 
-/// Whether a registered board's file is still on disk.
+/// The 16 bytes every SQLite database begins with.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// What is actually at a board path.
 ///
-/// Opening a board creates it, which is right for `--db` — that is how a board
-/// is made — and wrong for one the registry already knows about. A registered
-/// board file that has gone missing was destroyed, and standing an empty one
-/// up in its place turns recoverable data loss into a board that reports
-/// itself fine. `doctor` did exactly that: it recreated the file it was asked
+/// Existence was the wrong question. `is_file` says yes to any file, and
+/// opening a board *migrates* it, so a path that named something else was
+/// rewritten into a database: `task list --db notes.txt` against a 0-byte file
+/// answered `[]` and left 372736 bytes of SQLite where the operator's file had
+/// been. Two harms in one command — a plausible wrong answer, and a file
+/// destroyed — and no way to tell it from the empty board they meant.
+///
+/// "Is this SQLite" was not enough either, and the gap was worse than the one
+/// it closed. `migrate` starts from the file's own `PRAGMA user_version`, so a
+/// stranger's database at version 0 gets the whole ladder run into it: an
+/// 8192-byte browser database came back at 376832 bytes, `user_version` 23,
+/// with 26 kanban tables grafted alongside its own. The question has to be "is
+/// this *our* board", so the last step looks for the schema.
+///
+/// The order is three widening steps, each cheaper than the next, so the common
+/// answers cost the least: stat, sixteen bytes, then SQLite.
+enum BoardFile {
+    /// Nothing there. For a `--db` path on a creating command this is the
+    /// ordinary way a new board starts, so it is not by itself an error.
+    Absent,
+    /// Something there that is not a Kanban board — a zero-length file, a
+    /// directory, a text file, or another application's database.
+    /// Never opened, never migrated, never overwritten.
+    Foreign,
+    /// Something there that cannot be read, carrying the reason.
+    ///
+    /// Distinct from `Foreign` because saying "this is not a Kanban board"
+    /// about an intact board at mode 000 — or about one whose WAL is being
+    /// checkpointed by another agent's exiting command — is simply a false
+    /// statement, and it points the operator at the wrong problem.
+    Unreadable(String),
+    /// A database with no tables: an interrupted board creation, and nothing
+    /// else. Safe to finish, because there is nothing in it to lose.
+    Unfinished,
+    /// A Kanban board.
+    Board,
+}
+
+fn board_file(board_path: &str) -> BoardFile {
+    let path = Path::new(board_path);
+    // stat before open. `open(O_RDONLY)` on a FIFO blocks until a writer
+    // appears and Rust passes no `O_NONBLOCK`, so one FIFO among the registered
+    // boards would hang `doctor`, `backup` and every other survey partway
+    // through, with no output and no timeout. `is_file` is false for a FIFO, a
+    // directory and a socket alike, and answers in microseconds.
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return BoardFile::Foreign,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return BoardFile::Absent,
+        Err(error) => return BoardFile::Unreadable(error.to_string()),
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return BoardFile::Unreadable(error.to_string()),
+    };
+    let mut header = [0u8; SQLITE_MAGIC.len()];
+    // A file shorter than the header cannot be a database, so an empty one is
+    // rejected here without a special case.
+    if file.read_exact(&mut header).is_err() || &header != SQLITE_MAGIC {
+        return BoardFile::Foreign;
+    }
+    match db::probe_board_schema(path) {
+        Ok(db::BoardSchema::Board) => BoardFile::Board,
+        Ok(db::BoardSchema::Unwritten) => BoardFile::Unfinished,
+        Ok(db::BoardSchema::Other) => BoardFile::Foreign,
+        // A SQLite failure is not evidence about what the file holds. Saying
+        // "not a board" here would be the `Unreadable` lie again, arriving
+        // through a lock rather than a permission bit — and transient, so it
+        // would read as a flake rather than as the false refusal it is.
+        Err(error) => BoardFile::Unreadable(error.to_string()),
+    }
+}
+
+/// Whether a registered board's file is still on disk, and still a board.
+///
+/// Opening a board creates it, which is right for `--db` on a creating command
+/// — that is how a board outside the registry is made — and wrong for one the
+/// registry already knows about. A registered board file that has gone missing
+/// was destroyed, and standing an empty one up in its place turns recoverable
+/// data loss into a board that reports itself fine. `board_is_present` was
+/// added because `doctor` did exactly that: it recreated the file it was asked
 /// to inspect, then certified the result healthy.
 ///
 /// Commands that do work on one board refuse. Commands that survey every board
 /// — `doctor`, `dashboard`, `backup` — report the gap and carry on, because
 /// dying on the first missing board is no use to whoever has to fix it, and
 /// `restore` would otherwise be unable to repair the very thing that stops it
-/// from running.
+/// from running. A registered path holding something that is not a database now
+/// counts as a gap for them too, which is the honest answer: it is not a board
+/// they can read, and a survey that dies on it helps nobody.
 fn board_is_present(board_path: &str) -> bool {
-    Path::new(board_path).is_file()
+    matches!(board_file(board_path), BoardFile::Board)
+}
+
+/// A registered board that is gone, no longer a board, or unreadable.
+fn require_registered_board(board_path: &str) -> Result<()> {
+    match board_file(board_path) {
+        BoardFile::Board => Ok(()),
+        // `init` commits the registry row before `Store::open` runs the
+        // migrations, so an interrupt in that window leaves a *registered*
+        // board with no tables in it. Refusing would strand it permanently, in
+        // the registry, with no command able to open it. The next ordinary
+        // command finishes the migrations, which is the recovery the registry
+        // is already assuming; `store_path_readonly` still declines, and says
+        // to run one ordinary command first.
+        BoardFile::Unfinished => Ok(()),
+        BoardFile::Absent => Err(missing_board_error(board_path)),
+        BoardFile::Foreign => Err(foreign_board_error(board_path)),
+        BoardFile::Unreadable(reason) => Err(unreadable_board_error(board_path, &reason)),
+    }
+}
+
+/// Report what was observed, and both things that produce it.
+///
+/// The earlier wording called this "what an interrupted board creation leaves
+/// behind" and offered "deleting it loses no work". Both sentences are false
+/// while another process is inside `migrate`'s first transaction: under WAL
+/// this probe sees last-committed state, so a creation happening right now
+/// presents exactly as one abandoned an hour ago. Nothing distinguishes them
+/// from here — not the table count, not the schema version, not a second look —
+/// and the second sentence is destructive advice stated as fact.
+///
+/// So this says what it saw and names both causes. Deleting is mentioned only
+/// with the condition that makes it safe, because the operator is the one who
+/// can check it and this process cannot.
+fn unfinished_board_error(board_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "board file {board_path} is a database with no tables in it.\n\
+         A board looks like this while it is being created, between the file appearing and its \
+         first migration committing — so this is either a creation that was interrupted, or one \
+         running in another process right now. From here the two are identical.\n\
+         If one is in progress:  it will finish on its own; run the command again.\n\
+         To finish it yourself:  kanban {} ... --db {board_path}\n\
+         Before removing the file, confirm no other process is creating it.",
+        board_creator_names()
+    )
+}
+
+fn foreign_board_error(board_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{board_path} exists but is not a Kanban board: it is not a SQLite database, or it is one \
+         that does not carry a board's tables.\n\
+         Opening it would migrate it into a board and leave its own contents inside the result, so \
+         this refuses instead.\n\
+         Name an existing board with --db, or a path that does not exist yet. (An empty file can \
+         also be a board creation caught before it wrote anything — if you remove it, confirm \
+         first that no other process is creating it.)"
+    )
+}
+
+/// Say the file cannot be read, rather than something false about what it holds.
+///
+/// A board at mode 000 is still a board. Reporting it as "not a Kanban board"
+/// is a false statement about intact data, and it sends the operator to look
+/// for a corrupt file instead of a permission bit.
+fn unreadable_board_error(board_path: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "board file {board_path} cannot be read: {reason}.\n\
+         Nothing is wrong with the file as far as this can tell — it could not be opened to look. \
+         Check its permissions and the directories above it."
+    )
 }
 
 fn missing_board_error(board_path: &str) -> anyhow::Error {
@@ -1433,8 +1826,8 @@ fn missing_board_error(board_path: &str) -> anyhow::Error {
     )
 }
 
-fn open_store(args: &Args) -> Result<Store> {
-    Store::open(&store_path(args)?)
+fn open_store(args: &Args, creation: BoardCreation) -> Result<Store> {
+    Store::open(&store_path(args, creation)?)
 }
 
 fn reject_all_boards_selector(args: &Args) -> Result<()> {
@@ -1505,7 +1898,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
     })
 }
 
-fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
+fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<SearchReceipt> {
     let options = search_options(args, query)?;
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
@@ -1540,7 +1933,7 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
 
     let registry = Registry::open()?;
     let board_name = selected_board_name(args)?;
-    let store = open_store(args)?;
+    let store = open_store(args, creation)?;
     let board = board_name
         .clone()
         .or(store.board_name()?)
@@ -1560,7 +1953,7 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
     ))
 }
 
-fn rebuild_search_command(args: &Args) -> Result<Value> {
+fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value> {
     let actor = args.require("as")?;
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
@@ -1577,7 +1970,7 @@ fn rebuild_search_command(args: &Args) -> Result<Value> {
         }
         return Ok(json!({"reports":reports,"missingBoards":missing}));
     }
-    let mut store = open_store(args)?;
+    let mut store = open_store(args, creation)?;
     let board = selected_board_name(args)?
         .or(store.board_name()?)
         .unwrap_or_else(|| "unregistered".to_owned());
@@ -1588,32 +1981,33 @@ fn rebuild_search_command(args: &Args) -> Result<Value> {
 /// applicable table of contents for the addressed board and optional task.
 fn selected_board_name(args: &Args) -> Result<Option<String>> {
     let mut registry = Registry::open()?;
-    if let Some(path) = direct_db(args) {
-        let resolved = path.canonicalize().unwrap_or(path);
-        let matches = registry
-            .projects()?
-            .into_iter()
-            .filter(|project| {
-                Path::new(&project.board_path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(&project.board_path))
-                    == resolved
+    match board_selection(args) {
+        BoardSelection::Db { path, .. } => {
+            let resolved = path.canonicalize().unwrap_or(path);
+            let matches = registry
+                .projects()?
+                .into_iter()
+                .filter(|project| {
+                    Path::new(&project.board_path)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(&project.board_path))
+                        == resolved
+                })
+                .collect::<Vec<_>>();
+            Ok(match matches.as_slice() {
+                [project] => Some(project.name.clone()),
+                _ => None,
             })
-            .collect::<Vec<_>>();
-        return Ok(match matches.as_slice() {
-            [project] => Some(project.name.clone()),
-            _ => None,
-        });
+        }
+        BoardSelection::Project(name) => Ok(Some(name)),
+        BoardSelection::Workspace(workspace) => {
+            let workspace = match workspace {
+                Some(path) => path,
+                None => cwd()?,
+            };
+            Ok(registry.resolve(&workspace)?.map(|record| record.name))
+        }
     }
-    if let Some(name) = args.one("project").map(str::to_owned).or_else(|| {
-        env::var("KANBAN_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-    }) {
-        return Ok(Some(name));
-    }
-    let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
-    Ok(registry.resolve(&workspace)?.map(|record| record.name))
 }
 
 fn effective_rule_summaries(
@@ -2175,11 +2569,17 @@ fn run() -> Result<()> {
     }
 
     let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
+    let creation = board_creation(command, spec_sub);
     match command_spec(command, spec_sub) {
         Some((allowed, positionals)) => {
             args.reject_unknown(allowed)?;
             args.reject_repeated_for(Some(command))?;
             args.reject_extra_positionals(arity(spec_sub, positionals))?;
+            // Before the data-root lock and before any store: a command that
+            // cannot run must not have created a board on its way to saying so.
+            let mut words = vec![command];
+            words.extend(spec_sub);
+            args.reject_missing_positionals(&words, positionals)?;
             args.reject_conflicting_board_selectors()?;
         }
         None => bail!("unknown command; run kanban --help"),
@@ -2637,10 +3037,10 @@ fn run() -> Result<()> {
             .positionals
             .get(1)
             .context("search query is required")?;
-        return print(&search_command(&args, query)?, args.has("json"));
+        return print(&search_command(&args, query, creation)?, args.has("json"));
     }
     if command == "search-rebuild" {
-        return print(&rebuild_search_command(&args)?, args.has("json"));
+        return print(&rebuild_search_command(&args, creation)?, args.has("json"));
     }
 
     if command == "claim" && args.has("candidates") {
@@ -2689,7 +3089,7 @@ fn run() -> Result<()> {
         );
     }
 
-    let mut store = open_store(&args)?;
+    let mut store = open_store(&args, creation)?;
     if command == "subscription" && sub == Some("add") {
         for required in [
             "consumer",
