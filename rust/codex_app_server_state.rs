@@ -50,6 +50,8 @@ pub(crate) struct StateMachine {
     required_version: String,
     expected_idempotency_key: String,
     phase: Phase,
+    thread_started_seen: bool,
+    turn_started_seen: bool,
     thread_id: Option<String>,
     turn_id: Option<String>,
     started_items: HashMap<String, ItemState>,
@@ -84,6 +86,8 @@ impl StateMachine {
             required_version,
             expected_idempotency_key,
             phase: Phase::AwaitInitResponse,
+            thread_started_seen: false,
+            turn_started_seen: false,
             thread_id: None,
             turn_id: None,
             started_items: HashMap::new(),
@@ -157,6 +161,9 @@ impl StateMachine {
                 if self.phase != Phase::AwaitTurnStartResponse && self.phase != Phase::Streaming {
                     bail!("thread/started is only accepted after thread/start response");
                 }
+                if self.thread_started_seen {
+                    bail!("thread/started is only accepted before turn/started");
+                }
                 let params = object_params(object, "thread/started")?;
                 validate_thread_started(
                     params,
@@ -164,20 +171,26 @@ impl StateMachine {
                     &self.canonical_cwd,
                     &self.required_version,
                 )?;
+                self.thread_started_seen = true;
                 Ok(Transition::Continue)
             }
             "turn/started" => {
                 if self.phase != Phase::Streaming {
                     bail!("turn/started is only accepted after turn/start response");
                 }
+                if !self.thread_started_seen {
+                    bail!("turn/started is only accepted after thread/started");
+                }
+                if self.turn_started_seen {
+                    bail!("turn/started is only accepted after thread/started");
+                }
                 let params = object_params(object, "turn/started")?;
                 validate_turn_started(params, self.thread_id.as_deref(), self.turn_id.as_deref())?;
+                self.turn_started_seen = true;
                 Ok(Transition::Continue)
             }
             "item/started" => {
-                if self.phase != Phase::Streaming {
-                    bail!("item/started is only accepted after turn start");
-                }
+                self.require_turn_started("item/started")?;
                 let params = object_params(object, "item/started")?;
                 let item = validate_item_started(params)?;
                 let thread_id = string_field(params, "threadId", "item/started")?;
@@ -196,9 +209,7 @@ impl StateMachine {
                 Ok(Transition::Continue)
             }
             "item/completed" => {
-                if self.phase != Phase::Streaming {
-                    bail!("item/completed is only accepted after turn start");
-                }
+                self.require_turn_started("item/completed")?;
                 let params = object_params(object, "item/completed")?;
                 let item = validate_item_completed(params)?;
                 let thread_id = string_field(params, "threadId", "item/completed")?;
@@ -213,9 +224,7 @@ impl StateMachine {
                 Ok(Transition::Continue)
             }
             "item/agentMessage/delta" => {
-                if self.phase != Phase::Streaming {
-                    bail!("item/agentMessage/delta is only accepted after turn start");
-                }
+                self.require_turn_started("item/agentMessage/delta")?;
                 let params = object_params(object, "item/agentMessage/delta")?;
                 let thread_id = string_field(params, "threadId", "item/agentMessage/delta")?;
                 let turn_id = string_field(params, "turnId", "item/agentMessage/delta")?;
@@ -231,9 +240,7 @@ impl StateMachine {
                 Ok(Transition::Continue)
             }
             "thread/tokenUsage/updated" => {
-                if self.phase != Phase::Streaming {
-                    bail!("thread/tokenUsage/updated is only accepted after turn start");
-                }
+                self.require_turn_started("thread/tokenUsage/updated")?;
                 let params = object_params(object, "thread/tokenUsage/updated")?;
                 let thread_id = string_field(params, "threadId", "thread/tokenUsage/updated")?;
                 let turn_id = string_field(params, "turnId", "thread/tokenUsage/updated")?;
@@ -250,9 +257,7 @@ impl StateMachine {
                 Ok(Transition::Continue)
             }
             "turn/completed" => {
-                if self.phase != Phase::Streaming {
-                    bail!("turn/completed is only accepted after turn start");
-                }
+                self.require_turn_started("turn/completed")?;
                 let params = object_params(object, "turn/completed")?;
                 let thread_id = string_field(params, "threadId", "turn/completed")?;
                 let turn = expect_object_field(params, "turn", "turn/completed")?;
@@ -283,6 +288,13 @@ impl StateMachine {
             }
             other => bail!("unsupported notification method {other}"),
         }
+    }
+
+    fn require_turn_started(&self, context: &str) -> Result<()> {
+        if !self.thread_started_seen || !self.turn_started_seen {
+            bail!("{context} is only accepted after turn/started");
+        }
+        Ok(())
     }
 
     fn complete_item(&mut self, item_id: &str, kind: ItemKind, text: Option<&str>) -> Result<()> {
@@ -1161,6 +1173,18 @@ mod tests {
         state
             .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
             .unwrap();
+        state.feed(&thread_started(THREAD_ID, CWD)).unwrap();
+        state.feed(&turn_started(THREAD_ID, TURN_ID)).unwrap();
+        state
+    }
+
+    fn pre_lifecycle_state() -> StateMachine {
+        let mut state = new_state();
+        state.feed(&init_response()).unwrap();
+        state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap();
+        state
+            .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+            .unwrap();
         state
     }
 
@@ -1721,6 +1745,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_thread_and_turn_started_notifications() {
+        let mut state = pre_lifecycle_state();
+        assert!(
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, user_item("u-1")))
+                .is_err()
+        );
+        assert!(state.feed(&delta(THREAD_ID, TURN_ID, "a-1")).is_err());
+        assert!(state.feed(&token_usage(THREAD_ID, TURN_ID)).is_err());
+        assert!(
+            state
+                .feed(&turn_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+
+        let mut state = pre_lifecycle_state();
+        assert!(state.feed(&turn_started(THREAD_ID, TURN_ID)).is_err());
+        assert!(matches!(
+            state.feed(&thread_started(THREAD_ID, CWD)).unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state.feed(&turn_started(THREAD_ID, TURN_ID)).unwrap(),
+            Transition::Continue
+        ));
+    }
+
+    #[test]
+    fn rejects_reversed_and_duplicate_lifecycle_notifications() {
+        let mut state = pre_lifecycle_state();
+        assert!(state.feed(&turn_started(THREAD_ID, TURN_ID)).is_err());
+        assert!(matches!(
+            state.feed(&thread_started(THREAD_ID, CWD)).unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state.feed(&turn_started(THREAD_ID, TURN_ID)).unwrap(),
+            Transition::Continue
+        ));
+
+        let mut state = streaming_state();
+        assert!(state.feed(&thread_started(THREAD_ID, CWD)).is_err());
+
+        let mut state = streaming_state();
+        assert!(state.feed(&turn_started(THREAD_ID, TURN_ID)).is_err());
+    }
+
+    #[test]
     fn rejects_wrong_notification_ids_for_each_family() {
         let mut state = new_state();
         assert!(matches!(
@@ -2151,21 +2232,7 @@ mod tests {
 
     #[test]
     fn rejects_item_types_ack_and_completion_rules() {
-        let mut state = new_state();
-        assert!(matches!(
-            state.feed(&init_response()).unwrap(),
-            Transition::SendThreadStart
-        ));
-        assert!(matches!(
-            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
-            Transition::SendTurnStart { .. }
-        ));
-        assert!(matches!(
-            state
-                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
-                .unwrap(),
-            Transition::Continue
-        ));
+        let mut state = streaming_state();
         assert!(
             state
                 .feed(&item_started(
@@ -2251,21 +2318,7 @@ mod tests {
         assert!(state.feed(b"{\"id\":1}{\"id\":2}").is_err());
         assert!(state.feed(b"not-json").is_err());
 
-        let mut state = new_state();
-        assert!(matches!(
-            state.feed(&init_response()).unwrap(),
-            Transition::SendThreadStart
-        ));
-        assert!(matches!(
-            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
-            Transition::SendTurnStart { .. }
-        ));
-        assert!(matches!(
-            state
-                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
-                .unwrap(),
-            Transition::Continue
-        ));
+        let mut state = streaming_state();
         assert!(matches!(
             state
                 .feed(&item_started(
@@ -2305,21 +2358,7 @@ mod tests {
                 ))
                 .is_err()
         );
-        let mut state = new_state();
-        assert!(matches!(
-            state.feed(&init_response()).unwrap(),
-            Transition::SendThreadStart
-        ));
-        assert!(matches!(
-            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
-            Transition::SendTurnStart { .. }
-        ));
-        assert!(matches!(
-            state
-                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
-                .unwrap(),
-            Transition::Continue
-        ));
+        let mut state = streaming_state();
         assert!(
             state
                 .feed(&turn_completed_with_status(

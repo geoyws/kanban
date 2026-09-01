@@ -1502,6 +1502,84 @@ fn compiled_process_turn_started_notification_items_fail_closed_exactly_at_notif
 }
 
 #[test]
+fn compiled_process_missing_thread_and_turn_started_notifications_fail_closed_after_requests() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cases: Vec<ProbeCase> = vec![
+        ("missing-thread-started", |scenario| {
+            scenario.listen.thread_started = Emit::None;
+        }),
+        ("missing-turn-started", |scenario| {
+            scenario.listen.posts[0] = Emit::None;
+        }),
+    ];
+
+    for (label, mutate) in cases {
+        let fixture = fixture_with_mutation(label, mutate);
+        let scenario = scenario_for_cwd(
+            &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+            &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+            &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+        );
+        let output = fixture.run(
+            &request(),
+            &schema_hash(&scenario.schema_client_request),
+            &schema_hash(&scenario.schema_protocol),
+            4000,
+        );
+        assert_failure(&output);
+        assert!(
+            matches!(output.status.code(), Some(code) if code != 0),
+            "{label}: {:?}",
+            output.status
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{label}: unexpected stdout: {:?}",
+            output.stdout
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("AdapterResponse"),
+            "{label}: unexpected AdapterResponse stdout: {:?}",
+            output.stdout
+        );
+
+        let records = fixture.capture_records();
+        assert!(
+            records.iter().any(|record| {
+                record["mode"] == "listen-stage"
+                    && record["stage"] == "thread/start"
+                    && record["phase"] == "received"
+            }),
+            "{label}: {records:?}"
+        );
+        assert!(
+            records.iter().any(|record| {
+                record["mode"] == "listen-stage"
+                    && record["stage"] == "turn/start"
+                    && record["phase"] == "received"
+            }),
+            "{label}: {records:?}"
+        );
+
+        let omitted_stage = match label {
+            "missing-thread-started" => "thread/started",
+            "missing-turn-started" => "turn/started",
+            _ => unreachable!(),
+        };
+        assert!(
+            !records.iter().any(|record| {
+                record["mode"] == "listen-stage"
+                    && record["stage"] == omitted_stage
+                    && record["phase"] == "emitted"
+            }),
+            "{label}: {records:?}"
+        );
+    }
+}
+
+#[test]
 fn compiled_process_initialize_response_failures_are_fail_closed() {
     let _test_guard = process_test_mutex()
         .lock()
