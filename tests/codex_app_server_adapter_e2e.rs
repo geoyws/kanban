@@ -216,6 +216,63 @@ fn agent_ack_text(event_idempotency_key: &str) -> String {
     .to_string()
 }
 
+/// The `optOutNotificationMethods` the adapter is expected to send at
+/// `initialize`. Held here so this test can assert the wire bytes without
+/// reaching into the crate, the way `CLIENT_NAME` and `BASE_INSTRUCTIONS`
+/// already are.
+const OPT_OUT_NOTIFICATION_METHODS: [&str; 8] = [
+    "configWarning",
+    "remoteControl/status/changed",
+    "mcpServer/startupStatus/updated",
+    "thread/status/changed",
+    "account/rateLimits/updated",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/textDelta",
+];
+
+/// Notifications the fake codex's generated schema declares beyond the opt-out
+/// list, so the happy path exercises a subset check rather than an equality.
+const EXTRA_NOTIFICATION_METHODS: [&str; 3] = ["thread/started", "turn/completed", "error"];
+
+fn declared_notification_methods() -> Vec<&'static str> {
+    OPT_OUT_NOTIFICATION_METHODS
+        .into_iter()
+        .chain(EXTRA_NOTIFICATION_METHODS)
+        .collect()
+}
+
+/// A test double for the `codex_app_server_protocol.v2.schemas.json` that
+/// `codex app-server generate-json-schema` writes, trimmed to the
+/// `definitions.ServerNotification.oneOf` shape the adapter reads. It is a
+/// stub for the fake codex, not a protocol reference: the binding pin is the
+/// adapter checking the schema the installed codex generates at run time.
+fn protocol_schema(methods: &[&str]) -> Vec<u8> {
+    let variants: Vec<Value> = methods
+        .iter()
+        .map(|method| {
+            json!({
+                "properties": {
+                    "method": {"enum": [method], "type": "string"},
+                    "params": {"$ref": "#/definitions/Notification"},
+                },
+                "required": ["method", "params"],
+                "type": "object",
+            })
+        })
+        .collect();
+    json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "CodexAppServerProtocolV2",
+        "type": "object",
+        "definitions": {
+            "ServerNotification": {"title": "ServerNotification", "oneOf": variants},
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
 fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
     let thread = thread_object(cwd, THREAD_ID);
     let response2 = json!({
@@ -253,7 +310,7 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
         schema_stderr: Emit::None,
         schema_exit_code: 0,
         schema_client_request: b"{\"kind\":\"client-request\"}".to_vec(),
-        schema_protocol: b"{\"kind\":\"protocol-schema\"}".to_vec(),
+        schema_protocol: protocol_schema(&declared_notification_methods()),
         listen: ListenScenario {
             response1: Emit::text(json!({
                 "id": 1,
@@ -849,16 +906,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     );
     assert_eq!(
         initialize["params"]["capabilities"]["optOutNotificationMethods"],
-        json!([
-            "configWarning",
-            "remoteControl/status/changed",
-            "mcpServer/startupStatus/updated",
-            "thread/status/changed",
-            "account/rateLimits/updated",
-            "item/reasoning/summaryTextDelta",
-            "item/reasoning/summaryPartAdded",
-            "item/reasoning/textDelta",
-        ])
+        json!(OPT_OUT_NOTIFICATION_METHODS)
     );
 
     let initialized = parse_line(stdin_lines[1]);
@@ -1337,6 +1385,94 @@ fn compiled_process_probe_failures_stay_out_of_interactive_mode() {
                 .collect::<Vec<_>>()
                 .starts_with(&["version-stage", "version-stage", "version"]),
             "{records:?}"
+        );
+    }
+}
+
+/// The server accepts `optOutNotificationMethods` free-form, so a misspelled
+/// name is not rejected at the handshake - the notification it was meant to
+/// suppress keeps arriving and the state machine's fail-closed arm aborts much
+/// later. The adapter therefore checks the names against the
+/// `ServerNotification` variants of the schema the codex it is about to run
+/// generates, before it opens a session.
+#[test]
+fn compiled_process_opt_out_methods_must_be_declared_by_the_generated_schema() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let happy = scenario_for_cwd(
+        "/tmp/cwd",
+        "/private/tmp/kanban-codex-home",
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let good_client_request_hash = schema_hash(&happy.schema_client_request);
+
+    let without = |missing: &str| {
+        protocol_schema(
+            &declared_notification_methods()
+                .into_iter()
+                .filter(|method| *method != missing)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "missing-config-warning",
+            without("configWarning"),
+            "opt-out notification method configWarning is not declared as a ServerNotification method by the generated protocol schema",
+        ),
+        (
+            "missing-reasoning-text-delta",
+            without("item/reasoning/textDelta"),
+            "opt-out notification method item/reasoning/textDelta is not declared as a ServerNotification method by the generated protocol schema",
+        ),
+        (
+            "no-server-notification",
+            json!({"definitions": {}}).to_string().into_bytes(),
+            "protocol schema declares no ServerNotification oneOf variants",
+        ),
+    ];
+
+    for (label, schema, expected) in cases {
+        let schema_for_fixture = schema.clone();
+        let fixture = fixture_with_mutation(label, move |scenario| {
+            scenario.schema_protocol = schema_for_fixture;
+        });
+        // The hash matches, so the sha256 gate passes and the name check is
+        // what fails.
+        let output = fixture.run(
+            &request(),
+            &good_client_request_hash,
+            &schema_hash(&schema),
+            4000,
+        );
+        assert_failure(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+        let records = fixture.capture_records();
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["mode"] == "listen" || record["mode"] == "listen-stage"),
+            "{label}: {records:?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["mode"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "version-stage",
+                "version-stage",
+                "version",
+                "help-stage",
+                "help-stage",
+                "help",
+                "schema-stage",
+                "schema-stage",
+                "schema",
+            ],
+            "{label}: {records:?}"
         );
     }
 }

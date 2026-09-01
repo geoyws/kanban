@@ -34,11 +34,20 @@ pub fn file_sha256(path: &Path) -> Result<String> {
         }
         hash.update(&buffer[..read]);
     }
-    Ok(hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(render_hex(&hash.finalize()))
+}
+
+/// sha256 of bytes already in memory. Callers that must parse what they hashed
+/// read the file once and hash the buffer, so the bytes they verified are the
+/// bytes they go on to use.
+pub fn bytes_sha256(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    render_hex(&hash.finalize())
+}
+
+fn render_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn field(hash: &mut Sha256, value: &[u8]) {
@@ -584,5 +593,33 @@ mod tests {
         .expect_err("uninitialized head must be rejected")
         .to_string();
         assert!(head.contains("uninitialized at its current head"), "{head}");
+    }
+
+    #[test]
+    fn bytes_and_file_sha256_agree_on_the_same_content() {
+        let root = std::env::temp_dir().join(format!(
+            "kanban-audit-sha256-{}-{}",
+            std::process::id(),
+            crate::registry::now_ms()
+        ));
+        fs::create_dir_all(&root).expect("create temp sha256 dir");
+        let guard = TempRoot(root.clone());
+
+        // Spans the 64 KiB read buffer `file_sha256` streams with, so the two
+        // agree across a chunk boundary and not only on short inputs.
+        for content in [
+            Vec::new(),
+            b"{\"kind\":\"protocol-schema\"}".to_vec(),
+            vec![0xab_u8; 64 * 1024 + 7],
+        ] {
+            let path = guard.0.join("payload.bin");
+            fs::write(&path, &content).expect("write payload");
+            assert_eq!(bytes_sha256(&content), file_sha256(&path).unwrap());
+        }
+
+        assert_eq!(
+            bytes_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

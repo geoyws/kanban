@@ -2,7 +2,8 @@ use crate::adapter_process::{child_exited_unreaped, terminate_and_reap};
 use crate::adapter_protocol::{AdapterRequest, AdapterResponse, decode_request};
 use crate::audit;
 use crate::codex_app_server_messages::{
-    initialize_line, initialized_line, thread_start_line, turn_start_line,
+    OPT_OUT_NOTIFICATION_METHODS, initialize_line, initialized_line, thread_start_line,
+    turn_start_line,
 };
 use crate::codex_app_server_state::{StateMachine, Transition};
 use anyhow::{Context, Result, bail};
@@ -1177,11 +1178,80 @@ fn verify_generated_schema(validated: &Validated, deadline: Instant) -> Result<(
     if client_sha != validated.client_request_sha256 {
         bail!("ClientRequest.json sha256 does not match");
     }
-    let protocol_sha = audit::file_sha256(&protocol)?;
+    // One read, hashed in memory: the name check below parses the same bytes
+    // the sha256 comparison accepted, rather than reopening a path that could
+    // have changed in between.
+    let protocol_bytes =
+        fs::read(&protocol).with_context(|| format!("read {}", protocol.display()))?;
+    let protocol_sha = audit::bytes_sha256(&protocol_bytes);
     if protocol_sha != validated.protocol_schema_sha256 {
         bail!("codex_app_server_protocol.v2.schemas.json sha256 does not match");
     }
+    verify_opt_out_methods_are_declared(&protocol_bytes)?;
     temp.cleanup()?;
+    Ok(())
+}
+
+/// Enumerate the method names the generated protocol schema declares as
+/// server-to-client notifications.
+///
+/// The schema is JSON Schema draft-07: `definitions.ServerNotification.oneOf`
+/// holds one variant per notification, and each variant pins its own method
+/// with a single-element `properties.method.enum`. That is the declaration
+/// itself, not a string scraped out of the document, so the walk below is
+/// exact - anything that does not match the shape is an error rather than a
+/// skipped entry.
+fn server_notification_methods(schema: &serde_json::Value) -> Result<Vec<&str>> {
+    let variants = schema
+        .get("definitions")
+        .and_then(|definitions| definitions.get("ServerNotification"))
+        .and_then(|notification| notification.get("oneOf"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("protocol schema declares no ServerNotification oneOf variants")
+        })?;
+    let mut methods = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let enumerated = variant
+            .get("properties")
+            .and_then(|properties| properties.get("method"))
+            .and_then(|method| method.get("enum"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "protocol schema ServerNotification variant declares no method enum"
+                )
+            })?;
+        let [name] = enumerated.as_slice() else {
+            bail!("protocol schema ServerNotification method enum is not a single name");
+        };
+        let name = name.as_str().ok_or_else(|| {
+            anyhow::anyhow!("protocol schema ServerNotification method name is not a string")
+        })?;
+        methods.push(name);
+    }
+    Ok(methods)
+}
+
+/// Pin every `initialize` opt-out method name to the protocol the installed
+/// codex actually speaks.
+///
+/// The server accepts `optOutNotificationMethods` free-form, so a misspelling
+/// is silent at the handshake and only surfaces later, when the notification
+/// that should have been suppressed reaches the fail-closed arm of the state
+/// machine. Checking the names against the generated schema moves that failure
+/// to startup and names the offending method.
+fn verify_opt_out_methods_are_declared(schema_bytes: &[u8]) -> Result<()> {
+    let schema: serde_json::Value = serde_json::from_slice(schema_bytes)
+        .context("parse codex_app_server_protocol.v2.schemas.json")?;
+    let declared = server_notification_methods(&schema)?;
+    for method in OPT_OUT_NOTIFICATION_METHODS {
+        if !declared.contains(&method) {
+            bail!(
+                "opt-out notification method {method} is not declared as a ServerNotification method by the generated protocol schema"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1715,7 +1785,7 @@ pub(crate) fn render_response_bytes(response: &AdapterResponse) -> Result<Vec<u8
 mod tests {
     use super::*;
     use crate::adapter_protocol::{AdapterDelivery, AdapterTarget};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::fs;
     use std::io::Cursor;
     use std::os::unix::fs::symlink;
@@ -2107,6 +2177,141 @@ mod tests {
         let writable = root.join("writable.json");
         write_file(&writable, 0o666, b"{}");
         assert!(validate_schema_file(&writable).is_err());
+    }
+
+    /// A stand-in for one `definitions.ServerNotification.oneOf` entry, in the
+    /// shape `codex app-server generate-json-schema` emits.
+    fn notification_variant(method: Value) -> Value {
+        json!({
+            "properties": {
+                "method": {"enum": method, "title": "NotificationMethod", "type": "string"},
+                "params": {"$ref": "#/definitions/Notification"},
+            },
+            "required": ["method", "params"],
+            "type": "object",
+        })
+    }
+
+    fn protocol_schema(variants: Vec<Value>) -> Vec<u8> {
+        json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "CodexAppServerProtocolV2",
+            "type": "object",
+            "definitions": {
+                "ServerNotification": {
+                    "title": "ServerNotification",
+                    "oneOf": variants,
+                },
+            },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn schema_declaring(methods: &[&str]) -> Vec<u8> {
+        protocol_schema(
+            methods
+                .iter()
+                .map(|method| notification_variant(json!([method])))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn server_notification_methods_reads_every_declared_variant() {
+        let schema: Value =
+            serde_json::from_slice(&schema_declaring(&["thread/started", "turn/completed"]))
+                .unwrap();
+        assert_eq!(
+            server_notification_methods(&schema).unwrap(),
+            vec!["thread/started", "turn/completed"]
+        );
+    }
+
+    #[test]
+    fn server_notification_methods_rejects_every_shape_it_cannot_read() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "no ServerNotification oneOf variants",
+                json!({"definitions": {"ServerNotification": {"title": "ServerNotification"}}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            (
+                "no ServerNotification oneOf variants",
+                json!({"definitions": {}}).to_string().into_bytes(),
+            ),
+            (
+                "declares no method enum",
+                protocol_schema(vec![json!({"properties": {}, "type": "object"})]),
+            ),
+            (
+                "is not a single name",
+                protocol_schema(vec![notification_variant(json!(["one", "two"]))]),
+            ),
+            (
+                "is not a string",
+                protocol_schema(vec![notification_variant(json!([7]))]),
+            ),
+        ];
+        for (expected, bytes) in cases {
+            let schema: Value = serde_json::from_slice(&bytes).unwrap();
+            let error = server_notification_methods(&schema)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn opt_out_methods_pass_only_when_the_schema_declares_every_one() {
+        let declared = schema_declaring(&OPT_OUT_NOTIFICATION_METHODS);
+        verify_opt_out_methods_are_declared(&declared).unwrap();
+
+        // Extra notifications the adapter does not opt out of are irrelevant:
+        // the check is a subset, not an equality.
+        let mut with_extras = OPT_OUT_NOTIFICATION_METHODS.to_vec();
+        with_extras.push("thread/started");
+        with_extras.push("turn/completed");
+        verify_opt_out_methods_are_declared(&schema_declaring(&with_extras)).unwrap();
+
+        // An empty `oneOf` parses as a valid, empty declaration list rather
+        // than a malformed one, so it fails on the first opt-out name instead
+        // of on the shape. Still closed, and the message is still true.
+        let empty = verify_opt_out_methods_are_declared(&schema_declaring(&[]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            empty,
+            "opt-out notification method configWarning is not declared as a ServerNotification method by the generated protocol schema"
+        );
+
+        for missing in OPT_OUT_NOTIFICATION_METHODS {
+            let remaining: Vec<&str> = OPT_OUT_NOTIFICATION_METHODS
+                .into_iter()
+                .filter(|method| *method != missing)
+                .collect();
+            let error = verify_opt_out_methods_are_declared(&schema_declaring(&remaining))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "opt-out notification method {missing} is not declared as a ServerNotification method by the generated protocol schema"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn opt_out_method_check_rejects_a_schema_it_cannot_parse() {
+        let error = verify_opt_out_methods_are_declared(b"{not-json")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "parse codex_app_server_protocol.v2.schemas.json".to_owned()
+        );
     }
 
     #[test]

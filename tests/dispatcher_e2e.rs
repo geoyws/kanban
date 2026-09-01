@@ -90,6 +90,47 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The app-server adapter checks the `optOutNotificationMethods` it sends at
+/// `initialize` against the `ServerNotification` variants of the schema the
+/// codex it is about to run generates, so the fake codex driven here has to
+/// generate one that declares them. Mirrors `protocol_schema` in
+/// `codex_app_server_adapter_e2e.rs`; it is a stub for the fake codex, not a
+/// protocol reference.
+fn protocol_schema() -> Vec<u8> {
+    let variants: Vec<Value> = [
+        "configWarning",
+        "remoteControl/status/changed",
+        "mcpServer/startupStatus/updated",
+        "thread/status/changed",
+        "account/rateLimits/updated",
+        "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded",
+        "item/reasoning/textDelta",
+    ]
+    .into_iter()
+    .map(|method| {
+        json!({
+            "properties": {
+                "method": {"enum": [method], "type": "string"},
+                "params": {"$ref": "#/definitions/Notification"},
+            },
+            "required": ["method", "params"],
+            "type": "object",
+        })
+    })
+    .collect();
+    json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "CodexAppServerProtocolV2",
+        "type": "object",
+        "definitions": {
+            "ServerNotification": {"title": "ServerNotification", "oneOf": variants},
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
 struct Fixture {
     root: PathBuf,
     data: PathBuf,
@@ -288,10 +329,12 @@ impl Fixture {
             }
         })
         .to_string();
+        let protocol_schema = protocol_schema();
         let scenario = format!(
-            "version.stdout=hex:{}\nhelp.stdout=hex:{}\nlisten.response1=hex:{}\nlisten.stubborn_after_stage=1\nlisten.adapter_pid_file={}\nlisten.pid_file={}\nlisten.grandchild_pid_file={}\n",
+            "version.stdout=hex:{}\nhelp.stdout=hex:{}\nschema.protocol=hex:{}\nlisten.response1=hex:{}\nlisten.stubborn_after_stage=1\nlisten.adapter_pid_file={}\nlisten.pid_file={}\nlisten.grandchild_pid_file={}\n",
             hex_encode(format!("codex-cli {}\n", env!("CARGO_PKG_VERSION")).as_bytes()),
             hex_encode(b"Usage: codex app-server\n--listen <URL>\ngenerate-json-schema\n"),
+            hex_encode(&protocol_schema),
             hex_encode(initialize_response.as_bytes()),
             adapter_pid.display(),
             child_pid.display(),
@@ -300,7 +343,7 @@ impl Fixture {
         fs::write(self.root.join("scenario.txt"), scenario).unwrap();
 
         let client_hash = sha256(b"{\"kind\":\"client-request\"}");
-        let protocol_hash = sha256(b"{\"kind\":\"protocol-schema\"}");
+        let protocol_hash = sha256(&protocol_schema);
         let args = vec![
             "--codex".to_owned(),
             codex.to_string_lossy().into_owned(),

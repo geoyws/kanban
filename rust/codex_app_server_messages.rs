@@ -12,6 +12,34 @@ const DEVELOPER_INSTRUCTIONS: &str =
     "Do not use tools, files, network, or commands. Return only the JSON acknowledgement.";
 const AT_LEAST_ONCE_INSTRUCTION: &str = "At-least-once delivery; deduplicate by idempotency key.";
 
+/// The exact `ServerNotification` method names this adapter opts out of at
+/// `initialize`. The server accepts this array free-form, so a misspelling is
+/// not rejected at the handshake: the notification simply keeps arriving and
+/// the fail-closed arm in `codex_app_server_state::feed_notification` aborts
+/// the first real handshake with `unsupported notification method ...`.
+///
+/// `configWarning` is the notification the server emits when the adapter's cwd
+/// is an untrusted project directory. It is sent after `initialize` is
+/// processed, which is why opting out suppresses it at all. Verified by
+/// negative control against installed codex-cli 0.150.1 on 2026-09-01, 3 runs
+/// each: spelled `configWarnings` the notification still arrives unsuppressed;
+/// spelled `configWarning` it is absent.
+///
+/// Nothing here is vendored. Every name is checked at adapter startup against
+/// the `ServerNotification` variants of the protocol schema the installed
+/// codex generates, by
+/// `codex_app_server_adapter::verify_opt_out_methods_are_declared`.
+pub(crate) const OPT_OUT_NOTIFICATION_METHODS: [&str; 8] = [
+    "configWarning",
+    "remoteControl/status/changed",
+    "mcpServer/startupStatus/updated",
+    "thread/status/changed",
+    "account/rateLimits/updated",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/textDelta",
+];
+
 #[derive(Serialize)]
 struct RequestLine<P> {
     id: u64,
@@ -218,36 +246,7 @@ pub(crate) fn initialize_line() -> Result<String> {
             },
             capabilities: InitializeCapabilities {
                 experimental_api: false,
-                opt_out_notification_methods: [
-                    // Suppresses the notification the server emits when the
-                    // adapter's cwd is an untrusted project directory. It is
-                    // sent after `initialize` is processed, which is why
-                    // opting out suppresses it at all; the state machine stays
-                    // fail-closed on unknown methods, so without this the
-                    // handshake aborts.
-                    //
-                    // The exact spelling is a measured protocol fact, not a
-                    // compile-time pin - no protocol schema is vendored here,
-                    // only sha256 hashes of one the server generates at
-                    // runtime. Verified by negative control against installed
-                    // codex-cli 0.150.1 on 2026-09-01, 3 runs each: spelled
-                    // `configWarnings` the notification still arrives
-                    // unsuppressed; spelled `configWarning` it is absent. The
-                    // server accepts this free-form array either way, so a
-                    // wrong spelling does not fail silently - the notification
-                    // keeps arriving and the fail-closed arm in
-                    // `codex_app_server_state::feed_notification` aborts the
-                    // first real handshake with `unsupported notification
-                    // method configWarning`.
-                    "configWarning",
-                    "remoteControl/status/changed",
-                    "mcpServer/startupStatus/updated",
-                    "thread/status/changed",
-                    "account/rateLimits/updated",
-                    "item/reasoning/summaryTextDelta",
-                    "item/reasoning/summaryPartAdded",
-                    "item/reasoning/textDelta",
-                ],
+                opt_out_notification_methods: OPT_OUT_NOTIFICATION_METHODS,
             },
         },
     })
