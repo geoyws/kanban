@@ -45,6 +45,7 @@ pub(crate) enum Transition {
 pub(crate) struct StateMachine {
     canonical_cwd: String,
     canonical_codex_home: String,
+    required_version: String,
     expected_idempotency_key: String,
     phase: Phase,
     thread_id: Option<String>,
@@ -64,17 +65,21 @@ impl StateMachine {
     pub(crate) fn new(
         canonical_cwd: impl Into<String>,
         canonical_codex_home: impl Into<String>,
+        required_version: impl Into<String>,
         idempotency_key: impl Into<String>,
     ) -> Result<Self> {
         let canonical_cwd = canonical_cwd.into();
         let canonical_codex_home = canonical_codex_home.into();
+        let required_version = required_version.into();
         let expected_idempotency_key = idempotency_key.into();
         validate_cwd(&canonical_cwd)?;
         validate_absolute_path(&canonical_codex_home, "codex home")?;
+        validate_required_version(&required_version)?;
         validate_key(&expected_idempotency_key, "idempotency key")?;
         Ok(Self {
             canonical_cwd,
             canonical_codex_home,
+            required_version,
             expected_idempotency_key,
             phase: Phase::AwaitInitResponse,
             thread_id: None,
@@ -110,14 +115,22 @@ impl StateMachine {
             Phase::AwaitInitResponse => {
                 expect_response_id(object, 1)?;
                 let result = expect_success_response(object)?;
-                validate_initialize_response(result, &self.canonical_codex_home)?;
+                validate_initialize_response(
+                    result,
+                    &self.canonical_codex_home,
+                    &self.required_version,
+                )?;
                 self.phase = Phase::AwaitThreadStartResponse;
                 Ok(Transition::SendThreadStart)
             }
             Phase::AwaitThreadStartResponse => {
                 expect_response_id(object, 2)?;
                 let result = expect_success_response(object)?;
-                let thread_id = validate_thread_start_response(result, &self.canonical_cwd)?;
+                let thread_id = validate_thread_start_response(
+                    result,
+                    &self.canonical_cwd,
+                    &self.required_version,
+                )?;
                 self.thread_id = Some(thread_id.clone());
                 self.phase = Phase::AwaitTurnStartResponse;
                 Ok(Transition::SendTurnStart { thread_id })
@@ -143,7 +156,12 @@ impl StateMachine {
                     bail!("thread/started is only accepted after thread/start response");
                 }
                 let params = object_params(object, "thread/started")?;
-                validate_thread_started(params, self.thread_id.as_deref(), &self.canonical_cwd)?;
+                validate_thread_started(
+                    params,
+                    self.thread_id.as_deref(),
+                    &self.canonical_cwd,
+                    &self.required_version,
+                )?;
                 Ok(Transition::Continue)
             }
             "turn/started" => {
@@ -423,6 +441,7 @@ fn expect_object_field<'a>(
 fn validate_thread_start_response(
     result: &Map<String, Value>,
     expected_cwd: &str,
+    required_version: &str,
 ) -> Result<String> {
     if string_field(result, "approvalPolicy", "thread/start response")? != EXPECTED_APPROVAL_POLICY
     {
@@ -446,7 +465,13 @@ fn validate_thread_start_response(
         other => bail!("thread/start response approvalsReviewer {other} is not accepted"),
     }
     let thread = expect_object_field(result, "thread", "thread/start response")?;
-    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true), true)?;
+    let thread_id = validate_thread_object(
+        thread,
+        Some(expected_cwd),
+        Some(true),
+        true,
+        required_version,
+    )?;
     if let Some(approval_policy) = result.get("approvalPolicy")
         && !approval_policy.is_string()
     {
@@ -459,9 +484,16 @@ fn validate_thread_started(
     params: &Map<String, Value>,
     expected_thread_id: Option<&str>,
     expected_cwd: &str,
+    required_version: &str,
 ) -> Result<()> {
     let thread = expect_object_field(params, "thread", "thread/started")?;
-    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true), true)?;
+    let thread_id = validate_thread_object(
+        thread,
+        Some(expected_cwd),
+        Some(true),
+        true,
+        required_version,
+    )?;
     if let Some(expected_thread_id) = expected_thread_id
         && thread_id != expected_thread_id
     {
@@ -482,6 +514,7 @@ fn validate_turn_start_response(
         false,
         "",
     )?;
+    validate_empty_turn_items(turn, "turn/start response")?;
     Ok(string_field(turn, "id", "turn/start response turn")?.to_owned())
 }
 
@@ -500,6 +533,7 @@ fn validate_turn_started(
         false,
         "",
     )?;
+    validate_empty_turn_items(turn, "turn/started")?;
     if let Some(expected_turn_id) = expected_turn_id
         && turn_id != expected_turn_id
     {
@@ -674,10 +708,14 @@ fn validate_thread_object(
     expected_cwd: Option<&str>,
     expect_ephemeral: Option<bool>,
     require_idle_status: bool,
+    required_version: &str,
 ) -> Result<String> {
     let thread_id = string_field(thread, "id", "thread")?;
     validate_uuid_v7(thread_id, "thread id")?;
-    nonempty_string_field(thread, "cliVersion", "thread")?;
+    let cli_version = nonempty_string_field(thread, "cliVersion", "thread")?;
+    if cli_version != required_version {
+        bail!("thread cliVersion does not match");
+    }
     nonempty_string_field(thread, "modelProvider", "thread")?;
     string_field(thread, "preview", "thread")?;
     nonempty_string_field(thread, "sessionId", "thread")?;
@@ -713,6 +751,17 @@ fn validate_thread_object(
     Ok(thread_id.to_owned())
 }
 
+fn validate_empty_turn_items(turn: &Map<String, Value>, context: &str) -> Result<()> {
+    let items = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{context} items must be an array"))?;
+    if !items.is_empty() {
+        bail!("{context} items must be empty");
+    }
+    Ok(())
+}
+
 fn validate_key(value: &str, label: &str) -> Result<()> {
     if value.is_empty() {
         bail!("{label} must be nonempty");
@@ -728,6 +777,10 @@ fn validate_key(value: &str, label: &str) -> Result<()> {
 
 fn validate_cwd(value: &str) -> Result<()> {
     validate_absolute_path(value, "cwd")
+}
+
+fn validate_required_version(value: &str) -> Result<()> {
+    validate_key(value, "required version")
 }
 
 fn validate_absolute_path(value: &str, label: &str) -> Result<()> {
@@ -749,6 +802,7 @@ fn validate_absolute_path(value: &str, label: &str) -> Result<()> {
 fn validate_initialize_response(
     result: &Map<String, Value>,
     expected_codex_home: &str,
+    required_version: &str,
 ) -> Result<()> {
     let codex_home = nonempty_string_field(result, "codexHome", "initialize response")?;
     if !Path::new(codex_home).is_absolute() {
@@ -759,7 +813,10 @@ fn validate_initialize_response(
     }
     nonempty_string_field(result, "platformFamily", "initialize response")?;
     nonempty_string_field(result, "platformOs", "initialize response")?;
-    nonempty_string_field(result, "userAgent", "initialize response")?;
+    let user_agent = nonempty_string_field(result, "userAgent", "initialize response")?;
+    if user_agent != format!("codex-cli/{required_version}") {
+        bail!("initialize response userAgent does not match");
+    }
     Ok(())
 }
 
@@ -831,12 +888,13 @@ mod tests {
 
     const CWD: &str = "/private/tmp/kanban-app-messages";
     const CODEX_HOME: &str = "/private/tmp/kanban-codex-home";
+    const TEST_CODEX_VERSION: &str = "0.150.1";
     const ID_KEY: &str = "ack-key-1";
     const THREAD_ID: &str = "01890f3b-2c3d-7abc-8def-0123456789ab";
     const TURN_ID: &str = "01890f3b-2c3d-7abc-8def-0123456789ac";
 
     fn new_state() -> StateMachine {
-        StateMachine::new(CWD, CODEX_HOME, ID_KEY).unwrap()
+        StateMachine::new(CWD, CODEX_HOME, TEST_CODEX_VERSION, ID_KEY).unwrap()
     }
 
     fn line(value: Value) -> Vec<u8> {
@@ -846,7 +904,12 @@ mod tests {
     }
 
     fn init_response() -> Vec<u8> {
-        initialize_response(CODEX_HOME, "codex-cli/0.150.1", "unix", "linux")
+        initialize_response(
+            CODEX_HOME,
+            &format!("codex-cli/{TEST_CODEX_VERSION}"),
+            "unix",
+            "linux",
+        )
     }
 
     fn initialize_response(
@@ -879,8 +942,8 @@ mod tests {
                     "type": "readOnly",
                     "networkAccess": false
                 },
-                "thread": {
-                    "cliVersion": "0.150.1",
+                    "thread": {
+                    "cliVersion": TEST_CODEX_VERSION,
                     "id": thread_id,
                     "cwd": cwd,
                     "ephemeral": true,
@@ -915,8 +978,8 @@ mod tests {
         line(json!({
             "method": "thread/started",
             "params": {
-                "thread": {
-                    "cliVersion": "0.150.1",
+                    "thread": {
+                    "cliVersion": TEST_CODEX_VERSION,
                     "id": thread_id,
                     "cwd": cwd,
                     "ephemeral": true,
@@ -1374,7 +1437,7 @@ mod tests {
                 "result": {
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": "codex-cli/0.150.1"
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
                 }
             })),
             line(json!({
@@ -1383,7 +1446,7 @@ mod tests {
                     "codexHome": 7,
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": "codex-cli/0.150.1"
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
                 }
             })),
             line(json!({
@@ -1392,7 +1455,7 @@ mod tests {
                     "codexHome": "relative/codex-home",
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": "codex-cli/0.150.1"
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
                 }
             })),
             line(json!({
@@ -1401,7 +1464,7 @@ mod tests {
                     "codexHome": "/private/tmp/kanban-codex-home-mismatch",
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": "codex-cli/0.150.1"
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
                 }
             })),
             line(json!({
@@ -1410,7 +1473,7 @@ mod tests {
                     "codexHome": CODEX_HOME,
                     "platformFamily": "",
                     "platformOs": "linux",
-                    "userAgent": "codex-cli/0.150.1"
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
                 }
             })),
             line(json!({
@@ -1419,7 +1482,7 @@ mod tests {
                     "codexHome": CODEX_HOME,
                     "platformFamily": "unix",
                     "platformOs": "",
-                    "userAgent": "codex-cli/0.150.1"
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}")
                 }
             })),
             line(json!({
@@ -1431,10 +1494,136 @@ mod tests {
                     "userAgent": ""
                 }
             })),
+            line(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": CODEX_HOME,
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}.1")
+                }
+            })),
         ] {
             let mut state = new_state();
             assert!(state.feed(&response).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_thread_version_drift_and_nonempty_start_items() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "never",
+                            "approvalsReviewer": "user",
+                            "cwd": CWD,
+                            "model": "codex-1",
+                            "modelProvider": "openai",
+                            "sandbox": {
+                                "type": "readOnly",
+                                "networkAccess": false
+                            },
+                            "thread": {
+                                "cliVersion": format!("{TEST_CODEX_VERSION}.1"),
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "session-1",
+                                "createdAt": 1,
+                                "updatedAt": 2,
+                                "projectId": null,
+                                "source": "cli",
+                                "status": {"type": "idle"},
+                                "turns": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 3,
+                        "result": {
+                            "turn": {
+                                "id": TURN_ID,
+                                "status": "inProgress",
+                                "items": [json!({
+                                    "id": "u-1",
+                                    "type": "userMessage",
+                                    "content": [{"type": "text", "text": "hi"}]
+                                })]
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": THREAD_ID,
+                            "turn": {
+                                "id": TURN_ID,
+                                "status": "inProgress",
+                                "items": [json!({
+                                    "id": "u-1",
+                                    "type": "userMessage",
+                                    "content": [{"type": "text", "text": "hi"}]
+                                })]
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1774,7 +1963,7 @@ mod tests {
                                 "networkAccess": false
                             },
                             "thread": {
-                                "cliVersion": "0.150.1",
+                                "cliVersion": TEST_CODEX_VERSION,
                                 "id": THREAD_ID,
                                 "cwd": CWD,
                                 "ephemeral": true,
@@ -1811,7 +2000,7 @@ mod tests {
                                 "networkAccess": false
                             },
                             "thread": {
-                                "cliVersion": "0.150.1",
+                                "cliVersion": TEST_CODEX_VERSION,
                                 "id": THREAD_ID,
                                 "cwd": CWD,
                                 "ephemeral": true,

@@ -679,6 +679,14 @@ fn validate_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_private_dir_empty(path: &Path, label: &str) -> Result<()> {
+    let mut entries = fs::read_dir(path)?;
+    if entries.next().transpose()?.is_some() {
+        bail!("{label} must be empty");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_paths(args: &Args) -> Result<Validated> {
     let codex_lstat = fs::symlink_metadata(&args.codex)?;
     if !(codex_lstat.file_type().is_file() || codex_lstat.file_type().is_symlink()) {
@@ -757,6 +765,7 @@ pub(crate) fn validate_paths(args: &Args) -> Result<Validated> {
     if canonical_cwd_identity != file_identity(&cwd_stat) {
         bail!("--cwd must resolve to a directory");
     }
+    validate_private_dir_empty(&canonical_cwd, "--cwd")?;
 
     let validated = Validated {
         canonical_codex,
@@ -886,6 +895,7 @@ fn validate_cwd_identity(validated: &Validated) -> Result<()> {
     {
         bail!("cwd is no longer trusted");
     }
+    validate_private_dir_empty(&validated.canonical_cwd, "cwd")?;
     Ok(())
 }
 
@@ -1566,7 +1576,12 @@ fn drive_app_server(
         "{}:{}",
         request.delivery.subscription_id, request.delivery.event_id
     );
-    let mut state = StateMachine::new(cwd, codex_home, idempotency_key.clone())?;
+    let mut state = StateMachine::new(
+        cwd,
+        codex_home,
+        validated.required_version.clone(),
+        idempotency_key.clone(),
+    )?;
 
     let mut command = app_server_command(validated);
     let mut child = spawn_active_codex(&mut command).context("spawn codex app-server")?;
@@ -1689,9 +1704,10 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock, mpsc};
 
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    const TEST_CODEX_VERSION: &str = "0.150.1";
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1701,6 +1717,11 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn process_group_test_mutex() -> &'static Mutex<()> {
+        static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        MUTEX.get_or_init(|| Mutex::new(()))
     }
 
     fn write_file(path: &Path, mode: u32, content: &[u8]) {
@@ -1804,7 +1825,7 @@ mod tests {
             canonical_cwd,
             canonical_cwd_file,
             canonical_cwd_identity,
-            required_version: "0.150.1".to_owned(),
+            required_version: TEST_CODEX_VERSION.to_owned(),
             client_request_sha256: "a".repeat(64),
             protocol_schema_sha256: "b".repeat(64),
             protocol_timeout_ms: 1_000,
@@ -1857,12 +1878,30 @@ mod tests {
     #[test]
     fn version_and_help_probe_parsers_are_exact() {
         validate_version_probe(&output(true, "codex-cli 1.2.3\n", ""), "1.2.3").unwrap();
+        // Additive prose and extra options are tolerated; the probe stays
+        // marker-exact on usage, one listen flag, and one schema generator.
         validate_app_server_help_probe(&output(
             true,
-            "Usage: codex app-server\n--listen <URL>\ngenerate-json-schema\n",
+            "Usage: codex app-server\n--listen <URL>\ngenerate-json-schema\nextra prose\n--debug <LEVEL>\n",
             "",
         ))
         .unwrap();
+        assert!(
+            validate_app_server_help_probe(&output(
+                true,
+                "Usage: codex app-server\n--listen <URL>\nextra prose\n",
+                "",
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_app_server_help_probe(&output(
+                true,
+                "Usage: codex app-server\n--listen <URL>\n--listen <URL>\ngenerate-json-schema\n",
+                "",
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1893,7 +1932,48 @@ mod tests {
     }
 
     #[test]
+    fn validate_paths_rejects_nonempty_cwd_entries() {
+        let root = temp_dir("cwd-entry");
+        let codex = root.join("codex.sh");
+        write_file(&codex, 0o755, b"#!/bin/sh\nexit 0\n");
+        let codex_home = root.join("codex-home");
+        write_dir(&codex_home, 0o700);
+        let cwd = root.join("cwd");
+        write_dir(&cwd, 0o700);
+        fs::write(cwd.join("marker"), b"seed").unwrap();
+
+        let args = Args {
+            codex,
+            codex_home,
+            cwd,
+            required_version: TEST_CODEX_VERSION.to_owned(),
+            client_request_sha256: "a".repeat(64),
+            protocol_schema_sha256: "b".repeat(64),
+            protocol_timeout_ms: 1_000,
+        };
+
+        let err = validate_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("--cwd must be empty"), "{err}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_cwd_identity_rejects_entries_added_after_initial_validation() {
+        let validated = validated_for_script("cwd-dirty", "#!/bin/sh\nexit 0\n");
+        fs::write(validated.canonical_cwd.join("marker"), b"seed").unwrap();
+
+        let err = validate_cwd_identity(&validated).unwrap_err().to_string();
+        assert!(err.contains("cwd must be empty"), "{err}");
+
+        let _ = fs::remove_dir_all(validated.canonical_cwd.parent().unwrap());
+    }
+
+    #[test]
     fn shared_process_group_cleanup_removes_app_server_descendants() {
+        let _guard = process_group_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let marker = std::env::temp_dir().join(format!(
             "kanban-app-server-descendant-{}-{}",
             std::process::id(),
@@ -1930,6 +2010,9 @@ mod tests {
 
     #[test]
     fn app_server_spawn_uses_a_private_process_group() {
+        let _guard = process_group_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let validated = spawnable_validated();
         let mut child = app_server_command(&validated).spawn().unwrap();
         let pid = child.id() as i32;
@@ -1939,6 +2022,9 @@ mod tests {
 
     #[test]
     fn run_codex_command_times_out_and_reaps_descendants() {
+        let _guard = process_group_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         SPAWN_REGISTRATION_MASK_OBSERVED.store(false, Ordering::SeqCst);
         CLEANUP_SIGNAL_BEFORE_CLEAR_TARGET.store(0, Ordering::SeqCst);
         CLEANUP_SIGNAL_AFTER_CLEAR_TARGET.store(-1, Ordering::SeqCst);

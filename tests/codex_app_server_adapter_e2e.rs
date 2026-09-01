@@ -14,7 +14,7 @@ const TURN_ID: &str = "01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6c";
 const SUBSCRIPTION_ID: &str = "sub-test";
 const EVENT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const EVENT_HASH: &str = EVENT_ID;
-const REQUIRED_VERSION: &str = env!("CARGO_PKG_VERSION");
+const TEST_CODEX_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BASE_INSTRUCTIONS: &str = "Return only the JSON acknowledgement.";
 const DEVELOPER_INSTRUCTIONS: &str =
     "Do not use tools, files, network, or commands. Return only the JSON acknowledgement.";
@@ -172,7 +172,7 @@ fn process_test_mutex() -> &'static Mutex<()> {
 
 fn thread_object(cwd: &str, thread_id: &str) -> Value {
     json!({
-        "cliVersion": "0.150.1",
+        "cliVersion": TEST_CODEX_VERSION,
         "id": thread_id,
         "cwd": cwd,
         "ephemeral": true,
@@ -218,7 +218,7 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
     ];
     Scenario {
         version: CommandScenario {
-            stdout: Emit::plain(format!("codex-cli {REQUIRED_VERSION}\n")),
+            stdout: Emit::plain(format!("codex-cli {TEST_CODEX_VERSION}\n")),
             stderr: Emit::None,
             exit_code: 0,
         },
@@ -239,7 +239,7 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
                     "codexHome": codex_home,
                     "platformFamily": "unix",
                     "platformOs": "linux",
-                    "userAgent": format!("codex-cli/{REQUIRED_VERSION}"),
+                    "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}"),
                 }
             })),
             response2: Emit::plain(response2),
@@ -505,7 +505,7 @@ impl Fixture {
             .arg("--cwd")
             .arg(&self.cwd)
             .arg("--required-version")
-            .arg(REQUIRED_VERSION)
+            .arg(TEST_CODEX_VERSION)
             .arg("--client-request-sha256")
             .arg(client_request_hash)
             .arg("--protocol-schema-sha256")
@@ -649,6 +649,23 @@ where
     })
 }
 
+fn fixture_with_path_mutation<F>(label: &str, mutate: F) -> Fixture
+where
+    F: FnOnce(&FixturePaths, &mut Scenario),
+{
+    Fixture::new(label, |paths| {
+        let cwd = paths.cwd.canonicalize().unwrap();
+        let codex_home = paths.codex_home.canonicalize().unwrap();
+        let mut scenario = scenario_for_cwd(
+            &cwd.to_string_lossy(),
+            &codex_home.to_string_lossy(),
+            &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+        );
+        mutate(paths, &mut scenario);
+        scenario
+    })
+}
+
 #[test]
 fn compiled_process_happy_path_reaches_the_exact_transcript() {
     let _test_guard = process_test_mutex()
@@ -736,7 +753,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     assert_eq!(version["cwd"], json!(cwd));
     assert_eq!(
         version["stdout"].as_str().unwrap().trim_end_matches('\n'),
-        format!("codex-cli {REQUIRED_VERSION}")
+        format!("codex-cli {TEST_CODEX_VERSION}")
     );
 
     let help = parse_invocation(&records, "help");
@@ -788,7 +805,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         initialize["params"]["clientInfo"],
         json!({
             "name": "kanban-codex-app-server-adapter",
-            "version": REQUIRED_VERSION,
+            "version": TEST_CODEX_VERSION,
         })
     );
     assert_eq!(
@@ -879,7 +896,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     assert_eq!(initialize_response["result"]["platformOs"], "linux");
     assert_eq!(
         initialize_response["result"]["userAgent"],
-        format!("codex-cli/{REQUIRED_VERSION}")
+        format!("codex-cli/{TEST_CODEX_VERSION}")
     );
     assert_eq!(
         parse_line(&format!("{}\n", listen_stdout_lines[1]))["id"],
@@ -898,6 +915,226 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         "turn/completed"
     );
     assert!(listen["stderr"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn compiled_process_rechecks_that_cwd_stays_empty_before_each_spawn() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = fixture_with_mutation("cwd-dirty-after-validate", |scenario| {
+        scenario.version.stdout = Emit::Sleep(1_000);
+    });
+    let dirty_path = fixture.cwd.join("marker");
+    let writer = std::thread::spawn({
+        let dirty_path = dirty_path.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            fs::write(dirty_path, b"seed").unwrap();
+        }
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let mut command = fixture.adapter_command(
+        &schema_hash(&scenario.schema_client_request),
+        &schema_hash(&scenario.schema_protocol),
+        4_000,
+    );
+    let request = serde_json::to_vec(&request()).unwrap();
+    let mut child = command.spawn().unwrap();
+    child.stdin.as_mut().unwrap().write_all(&request).unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert_failure(&output);
+    let records = fixture.capture_records();
+    let modes = records
+        .iter()
+        .map(|record| record["mode"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(modes, vec!["version-stage", "version-stage", "version"]);
+    assert!(!records.iter().any(|record| record["mode"] == "help-stage"));
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["mode"] == "listen-stage")
+    );
+    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+}
+
+#[test]
+fn compiled_process_initialize_response_user_agent_drift_is_fail_closed() {
+    let fixture = fixture_with_path_mutation("init-user-agent-wrong", |paths, scenario| {
+        let codex_home = paths.codex_home.canonicalize().unwrap();
+        scenario.listen.response1 = Emit::text(json!({
+            "id": 1,
+            "result": {
+                "codexHome": codex_home.to_string_lossy().into_owned(),
+                "platformFamily": "unix",
+                "platformOs": "linux",
+                "userAgent": format!("codex-cli/{TEST_CODEX_VERSION}.1"),
+            }
+        }));
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let output = fixture.run(
+        &request(),
+        &schema_hash(&scenario.schema_client_request),
+        &schema_hash(&scenario.schema_protocol),
+        4_000,
+    );
+    assert_failure(&output);
+    let records = fixture.capture_records();
+    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+}
+
+#[test]
+fn compiled_process_thread_cli_version_drift_is_fail_closed() {
+    let fixture = fixture_with_path_mutation("thread-cli-version-wrong", |paths, scenario| {
+        let cwd = paths.cwd.canonicalize().unwrap();
+        scenario.listen.response2 = Emit::text(json!({
+            "id": 2,
+            "result": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "cwd": cwd.to_string_lossy().into_owned(),
+                "model": "codex-1",
+                "modelProvider": "openai",
+                "sandbox": {"type": "readOnly", "networkAccess": false},
+                "thread": {
+                    "cliVersion": format!("{TEST_CODEX_VERSION}.1"),
+                    "id": THREAD_ID,
+                    "cwd": cwd.to_string_lossy().into_owned(),
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "preview": "",
+                    "sessionId": "session-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "projectId": null,
+                    "source": "cli",
+                    "status": {"type": "idle"},
+                    "turns": []
+                }
+            }
+        }));
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let output = fixture.run(
+        &request(),
+        &schema_hash(&scenario.schema_client_request),
+        &schema_hash(&scenario.schema_protocol),
+        4_000,
+    );
+    assert_failure(&output);
+    let records = fixture.capture_records();
+    assert!(!records.iter().any(|record| record["mode"] == "listen"));
+}
+
+#[test]
+fn compiled_process_cwd_and_thread_identity_drift_are_independent() {
+    let cwd_fixture = fixture_with_path_mutation("cwd-mismatch", |paths, scenario| {
+        let cwd = paths.cwd.canonicalize().unwrap();
+        scenario.listen.response2 = Emit::text(json!({
+            "id": 2,
+            "result": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "cwd": "/wrong",
+                "model": "codex-1",
+                "modelProvider": "openai",
+                "sandbox": {"type": "readOnly", "networkAccess": false},
+                "thread": {
+                    "cliVersion": TEST_CODEX_VERSION,
+                    "id": THREAD_ID,
+                    "cwd": cwd.to_string_lossy().into_owned(),
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "preview": "",
+                    "sessionId": "session-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "projectId": null,
+                    "source": "cli",
+                    "status": {"type": "idle"},
+                    "turns": []
+                }
+            }
+        }));
+    });
+    let cwd_scenario = scenario_for_cwd(
+        &cwd_fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &cwd_fixture
+            .codex_home
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let cwd_output = cwd_fixture.run(
+        &request(),
+        &schema_hash(&cwd_scenario.schema_client_request),
+        &schema_hash(&cwd_scenario.schema_protocol),
+        4_000,
+    );
+    assert_failure(&cwd_output);
+
+    let thread_fixture = fixture_with_path_mutation("thread-id-mismatch", |paths, scenario| {
+        let cwd = paths.cwd.canonicalize().unwrap();
+        scenario.listen.response2 = Emit::text(json!({
+            "id": 2,
+            "result": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "cwd": cwd.to_string_lossy().into_owned(),
+                "model": "codex-1",
+                "modelProvider": "openai",
+                "sandbox": {"type": "readOnly", "networkAccess": false},
+                "thread": {
+                    "cliVersion": TEST_CODEX_VERSION,
+                    "id": "wrong-thread",
+                    "cwd": cwd.to_string_lossy().into_owned(),
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "preview": "",
+                    "sessionId": "session-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "projectId": null,
+                    "source": "cli",
+                    "status": {"type": "idle"},
+                    "turns": []
+                }
+            }
+        }));
+    });
+    let thread_scenario = scenario_for_cwd(
+        &thread_fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &thread_fixture
+            .codex_home
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let thread_output = thread_fixture.run(
+        &request(),
+        &schema_hash(&thread_scenario.schema_client_request),
+        &schema_hash(&thread_scenario.schema_protocol),
+        4_000,
+    );
+    assert_failure(&thread_output);
 }
 
 #[test]
@@ -980,11 +1217,6 @@ fn compiled_process_protocol_and_policy_failures_are_sanitized() {
             scenario.listen.response2 =
                 Emit::plain("{\"id\":2,\"result\":{\"approvalPolicy\":\"on-request\"}}");
         }),
-        ("cwd-thread-identity", |scenario| {
-            scenario.listen.response2 = Emit::plain(
-                "{\"id\":2,\"result\":{\"approvalPolicy\":\"never\",\"approvalsReviewer\":\"user\",\"cwd\":\"/wrong\",\"model\":\"codex-1\",\"modelProvider\":\"openai\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"thread\":{\"cliVersion\":\"0.150.1\",\"id\":\"wrong-thread\",\"cwd\":\"/wrong\",\"ephemeral\":true,\"modelProvider\":\"openai\",\"preview\":\"\",\"sessionId\":\"session-1\",\"createdAt\":1,\"updatedAt\":2,\"projectId\":null,\"source\":\"cli\",\"status\":{\"type\":\"idle\"},\"turns\":[]}}}",
-            );
-        }),
         ("turn-status", |scenario| {
             scenario.listen.response3 = Emit::plain(
                 "{\"id\":3,\"result\":{\"turn\":{\"id\":\"wrong-turn\",\"status\":\"failed\",\"items\":[]}}}",
@@ -1060,10 +1292,87 @@ fn compiled_process_protocol_and_policy_failures_are_sanitized() {
                 .iter()
                 .any(|record| record["mode"] == "listen-stage")
         );
-        assert!(!records.iter().any(|record| record["mode"] == "listen"));
+        let received_stage = |stage: &str| {
+            records.iter().any(|record| {
+                record["mode"] == "listen-stage"
+                    && record["phase"] == "received"
+                    && record["stage"] == stage
+            })
+        };
+        let (expected_thread_start, expected_turn_start) = match label {
+            "wrong-response-ids" => (false, false),
+            "wrong-approval" | "malformed-json" => (true, false),
+            _ => (true, true),
+        };
+        assert_eq!(
+            received_stage("thread/start"),
+            expected_thread_start,
+            "{label}: {records:?}"
+        );
+        assert_eq!(
+            received_stage("turn/start"),
+            expected_turn_start,
+            "{label}: {records:?}"
+        );
         assert!(output.stdout.is_empty());
         assert!(output.status.code().is_some());
     }
+}
+
+#[test]
+fn compiled_process_turn_start_items_fail_closed_exactly_at_turn_start() {
+    let fixture = fixture_with_mutation("turn-start-items", |scenario| {
+        scenario.listen.response3 = Emit::plain(
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6c\",\"status\":\"inProgress\",\"items\":[{\"id\":\"u-1\",\"type\":\"userMessage\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]}}}",
+        );
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let output = fixture.run(
+        &request(),
+        &schema_hash(&scenario.schema_client_request),
+        &schema_hash(&scenario.schema_protocol),
+        4000,
+    );
+    assert_failure(&output);
+    let records = fixture.capture_records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["mode"] == "listen-stage" && record["stage"] == "turn/start"),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn compiled_process_turn_started_notification_items_fail_closed_exactly_at_notification() {
+    let fixture = fixture_with_mutation("turn-start-notification-items", |scenario| {
+        scenario.listen.posts[0] = Emit::plain(
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6b\",\"turn\":{\"id\":\"01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6c\",\"status\":\"inProgress\",\"items\":[{\"id\":\"u-1\",\"type\":\"userMessage\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]}}}",
+        );
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let output = fixture.run(
+        &request(),
+        &schema_hash(&scenario.schema_client_request),
+        &schema_hash(&scenario.schema_protocol),
+        4000,
+    );
+    assert_failure(&output);
+    let records = fixture.capture_records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["mode"] == "listen-stage" && record["stage"] == "turn/start"),
+        "{records:?}"
+    );
 }
 
 #[test]
@@ -1082,7 +1391,7 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
     let cases: Vec<ProbeCase> = vec![
         ("init-codex-home-mismatch", |scenario| {
             scenario.listen.response1 = Emit::plain(
-                "{\"id\":1,\"result\":{\"codexHome\":\"/wrong\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"codex-cli/0.150.1\"}}",
+                "{\"id\":1,\"result\":{\"codexHome\":\"/wrong\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"codex-cli/0.150.1.1\"}}",
             );
         }),
         ("init-user-agent-missing", |scenario| {
@@ -1311,6 +1620,12 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
             &good_client_request_hash,
             &good_protocol_schema_hash,
             timeout_ms,
+        );
+        eprintln!(
+            "timed_failure_case={label} exit={:?} stdout={:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
         let elapsed = start.elapsed();
         assert_failure(&output);
