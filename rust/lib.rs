@@ -3,6 +3,8 @@ mod adapter_protocol;
 mod audit;
 #[allow(dead_code)]
 mod codex_app_server_messages;
+#[allow(dead_code)]
+mod codex_app_server_state;
 mod codex_queue_adapter;
 mod context;
 mod db;

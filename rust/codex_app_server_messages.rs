@@ -43,6 +43,7 @@ struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 struct InitializeCapabilities {
     experimental_api: bool,
+    opt_out_notification_methods: [&'static str; 4],
 }
 
 #[derive(Serialize)]
@@ -109,12 +110,16 @@ struct AcknowledgementProperties {
 
 #[derive(Serialize)]
 struct AcceptedProperty {
+    #[serde(rename = "type")]
+    kind: &'static str,
     #[serde(rename = "const")]
     value: bool,
 }
 
 #[derive(Serialize)]
 struct IdempotencyKeyProperty {
+    #[serde(rename = "type")]
+    kind: &'static str,
     #[serde(rename = "const")]
     value: String,
 }
@@ -189,8 +194,12 @@ fn acknowledgement_schema(idempotency_key: &str) -> AcknowledgementSchema {
         kind: "object",
         additional_properties: false,
         properties: AcknowledgementProperties {
-            accepted: AcceptedProperty { value: true },
+            accepted: AcceptedProperty {
+                kind: "boolean",
+                value: true,
+            },
             idempotency_key: IdempotencyKeyProperty {
+                kind: "string",
                 value: idempotency_key.to_owned(),
             },
         },
@@ -209,6 +218,12 @@ pub(crate) fn initialize_line() -> Result<String> {
             },
             capabilities: InitializeCapabilities {
                 experimental_api: false,
+                opt_out_notification_methods: [
+                    "remoteControl/status/changed",
+                    "mcpServer/startupStatus/updated",
+                    "thread/status/changed",
+                    "account/rateLimits/updated",
+                ],
             },
         },
     })
@@ -301,6 +316,12 @@ mod tests {
                     },
                     "capabilities": {
                         "experimentalApi": false,
+                        "optOutNotificationMethods": [
+                            "remoteControl/status/changed",
+                            "mcpServer/startupStatus/updated",
+                            "thread/status/changed",
+                            "account/rateLimits/updated",
+                        ]
                     }
                 }
             })
@@ -366,9 +387,11 @@ mod tests {
                         "additionalProperties": false,
                         "properties": {
                             "accepted": {
+                                "type": "boolean",
                                 "const": true,
                             },
                             "idempotencyKey": {
+                                "type": "string",
                                 "const": "key-1",
                             },
                         },

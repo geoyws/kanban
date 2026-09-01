@@ -1,0 +1,1722 @@
+use anyhow::{Result, bail};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use std::collections::HashMap;
+
+const MAX_LINE_BYTES: usize = 64 * 1024;
+const EXPECTED_APPROVAL_POLICY: &str = "never";
+const EXPECTED_SANDBOX_TYPE: &str = "readOnly";
+const EXPECTED_THREAD_STATUS: &str = "inProgress";
+const EXPECTED_TURN_COMPLETED_STATUS: &str = "completed";
+const EXPECTED_TURN_ID: u64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    AwaitInitResponse,
+    AwaitThreadStartResponse,
+    AwaitTurnStartResponse,
+    Streaming,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    UserMessage,
+    Reasoning,
+    AgentMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemState {
+    Started(ItemKind),
+    Completed(ItemKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Transition {
+    Continue,
+    SendThreadStart,
+    SendTurnStart { thread_id: String },
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StateMachine {
+    canonical_cwd: String,
+    expected_idempotency_key: String,
+    phase: Phase,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    started_items: HashMap<String, ItemState>,
+    ack_completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AckPayload {
+    accepted: bool,
+    idempotency_key: String,
+}
+
+impl StateMachine {
+    pub(crate) fn new(
+        canonical_cwd: impl Into<String>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Self> {
+        let canonical_cwd = canonical_cwd.into();
+        let expected_idempotency_key = idempotency_key.into();
+        validate_cwd(&canonical_cwd)?;
+        validate_key(&expected_idempotency_key, "idempotency key")?;
+        Ok(Self {
+            canonical_cwd,
+            expected_idempotency_key,
+            phase: Phase::AwaitInitResponse,
+            thread_id: None,
+            turn_id: None,
+            started_items: HashMap::new(),
+            ack_completed: false,
+        })
+    }
+
+    pub(crate) fn feed(&mut self, line: &[u8]) -> Result<Transition> {
+        if self.phase == Phase::Completed {
+            bail!("state machine is already completed");
+        }
+        let value = parse_line(line)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("app server line must be a JSON object"))?;
+        if object.contains_key("id") && object.contains_key("method") {
+            bail!("server requests are not accepted on this input");
+        }
+
+        if object.contains_key("method") {
+            return self.feed_notification(object);
+        }
+        if object.contains_key("id") {
+            return self.feed_response(object);
+        }
+        bail!("app server line must be a response or notification");
+    }
+
+    fn feed_response(&mut self, object: &Map<String, Value>) -> Result<Transition> {
+        match self.phase {
+            Phase::AwaitInitResponse => {
+                expect_response_id(object, 1)?;
+                expect_success_response(object)?;
+                self.phase = Phase::AwaitThreadStartResponse;
+                Ok(Transition::SendThreadStart)
+            }
+            Phase::AwaitThreadStartResponse => {
+                expect_response_id(object, 2)?;
+                let result = expect_success_response(object)?;
+                let thread_id = validate_thread_start_response(result, &self.canonical_cwd)?;
+                self.thread_id = Some(thread_id.clone());
+                self.phase = Phase::AwaitTurnStartResponse;
+                Ok(Transition::SendTurnStart { thread_id })
+            }
+            Phase::AwaitTurnStartResponse => {
+                expect_response_id(object, EXPECTED_TURN_ID)?;
+                let result = expect_success_response(object)?;
+                let turn_id = validate_turn_start_response(result, self.thread_id.as_deref())?;
+                self.turn_id = Some(turn_id);
+                self.phase = Phase::Streaming;
+                Ok(Transition::Continue)
+            }
+            Phase::Streaming => bail!("out-of-order response id"),
+            Phase::Completed => unreachable!(),
+        }
+    }
+
+    fn feed_notification(&mut self, object: &Map<String, Value>) -> Result<Transition> {
+        let method = string_field(object, "method", "notification")?;
+        match method {
+            "thread/started" => {
+                if self.phase != Phase::AwaitTurnStartResponse && self.phase != Phase::Streaming {
+                    bail!("thread/started is only accepted after thread/start response");
+                }
+                let params = object_params(object, "thread/started")?;
+                validate_thread_started(params, self.thread_id.as_deref(), &self.canonical_cwd)?;
+                Ok(Transition::Continue)
+            }
+            "turn/started" => {
+                if self.phase != Phase::Streaming {
+                    bail!("turn/started is only accepted after turn/start response");
+                }
+                let params = object_params(object, "turn/started")?;
+                validate_turn_started(params, self.thread_id.as_deref(), self.turn_id.as_deref())?;
+                Ok(Transition::Continue)
+            }
+            "item/started" => {
+                if self.phase != Phase::Streaming {
+                    bail!("item/started is only accepted after turn start");
+                }
+                let params = object_params(object, "item/started")?;
+                let item = validate_item_started(params)?;
+                let thread_id = string_field(params, "threadId", "item/started")?;
+                let turn_id = string_field(params, "turnId", "item/started")?;
+                validate_matching_ids(
+                    thread_id,
+                    turn_id,
+                    self.thread_id.as_deref(),
+                    self.turn_id.as_deref(),
+                )?;
+                if self.started_items.contains_key(&item.id) {
+                    bail!("duplicate item/started for {}", item.id);
+                }
+                self.started_items
+                    .insert(item.id, ItemState::Started(item.kind));
+                Ok(Transition::Continue)
+            }
+            "item/completed" => {
+                if self.phase != Phase::Streaming {
+                    bail!("item/completed is only accepted after turn start");
+                }
+                let params = object_params(object, "item/completed")?;
+                let item = validate_item_completed(params)?;
+                let thread_id = string_field(params, "threadId", "item/completed")?;
+                let turn_id = string_field(params, "turnId", "item/completed")?;
+                validate_matching_ids(
+                    thread_id,
+                    turn_id,
+                    self.thread_id.as_deref(),
+                    self.turn_id.as_deref(),
+                )?;
+                self.complete_item(&item.id, item.kind, item.text.as_deref())?;
+                Ok(Transition::Continue)
+            }
+            "item/agentMessage/delta" => {
+                if self.phase != Phase::Streaming {
+                    bail!("item/agentMessage/delta is only accepted after turn start");
+                }
+                let params = object_params(object, "item/agentMessage/delta")?;
+                let thread_id = string_field(params, "threadId", "item/agentMessage/delta")?;
+                let turn_id = string_field(params, "turnId", "item/agentMessage/delta")?;
+                validate_matching_ids(
+                    thread_id,
+                    turn_id,
+                    self.thread_id.as_deref(),
+                    self.turn_id.as_deref(),
+                )?;
+                let item_id = string_field(params, "itemId", "item/agentMessage/delta")?;
+                self.expect_started_agent_message(item_id)?;
+                string_field(params, "delta", "item/agentMessage/delta")?;
+                Ok(Transition::Continue)
+            }
+            "thread/tokenUsage/updated" => {
+                if self.phase != Phase::Streaming {
+                    bail!("thread/tokenUsage/updated is only accepted after turn start");
+                }
+                let params = object_params(object, "thread/tokenUsage/updated")?;
+                let thread_id = string_field(params, "threadId", "thread/tokenUsage/updated")?;
+                let turn_id = string_field(params, "turnId", "thread/tokenUsage/updated")?;
+                validate_matching_ids(
+                    thread_id,
+                    turn_id,
+                    self.thread_id.as_deref(),
+                    self.turn_id.as_deref(),
+                )?;
+                expect_object_field(params, "tokenUsage", "thread/tokenUsage/updated")?;
+                Ok(Transition::Continue)
+            }
+            "turn/completed" => {
+                if self.phase != Phase::Streaming {
+                    bail!("turn/completed is only accepted after turn start");
+                }
+                let params = object_params(object, "turn/completed")?;
+                let thread_id = string_field(params, "threadId", "turn/completed")?;
+                let turn = expect_object_field(params, "turn", "turn/completed")?;
+                validate_matching_thread_id(
+                    thread_id,
+                    self.thread_id.as_deref(),
+                    "turn/completed",
+                )?;
+                let turn_id = validate_turn_object(
+                    turn,
+                    self.thread_id.as_deref(),
+                    Some(EXPECTED_TURN_COMPLETED_STATUS),
+                    true,
+                    &self.expected_idempotency_key,
+                )?;
+                if let Some(expected_turn_id) = self.turn_id.as_deref()
+                    && turn_id != expected_turn_id
+                {
+                    bail!("turn/completed turn id does not match");
+                }
+                if !self.ack_completed || !self.turn_contains_ack(turn) {
+                    bail!("turn/completed must follow the exact ack");
+                }
+                self.phase = Phase::Completed;
+                self.turn_id = Some(turn_id);
+                Ok(Transition::Completed)
+            }
+            other => bail!("unsupported notification method {other}"),
+        }
+    }
+
+    fn complete_item(&mut self, item_id: &str, kind: ItemKind, text: Option<&str>) -> Result<()> {
+        match self.started_items.get(item_id) {
+            Some(ItemState::Started(seen_kind)) if *seen_kind == kind => {}
+            Some(ItemState::Completed(_)) => bail!("duplicate item/completed for {item_id}"),
+            Some(ItemState::Started(_)) => {
+                bail!("item/completed type does not match item/started for {item_id}")
+            }
+            None => bail!("item/completed arrived before item/started for {item_id}"),
+        }
+        if let ItemKind::AgentMessage = kind {
+            if self.ack_completed {
+                bail!("duplicate agentMessage ack");
+            }
+            let text = text.ok_or_else(|| anyhow::anyhow!("agentMessage item must carry text"))?;
+            validate_ack_text(text, &self.expected_idempotency_key)?;
+            self.ack_completed = true;
+        }
+        self.started_items
+            .insert(item_id.to_owned(), ItemState::Completed(kind));
+        Ok(())
+    }
+
+    fn expect_started_agent_message(&self, item_id: &str) -> Result<()> {
+        match self.started_items.get(item_id) {
+            Some(ItemState::Started(ItemKind::AgentMessage)) => Ok(()),
+            Some(ItemState::Started(_)) => bail!("item {item_id} is not an agentMessage"),
+            Some(ItemState::Completed(_)) => bail!("item {item_id} is already completed"),
+            None => bail!("item/agentMessage/delta arrived before item/started for {item_id}"),
+        }
+    }
+
+    fn turn_contains_ack(&self, turn: &Map<String, Value>) -> bool {
+        turn.get("items")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.as_object()
+                        .and_then(|object| object.get("type").and_then(Value::as_str))
+                        == Some("agentMessage")
+                        && item
+                            .as_object()
+                            .and_then(|object| object.get("text").and_then(Value::as_str))
+                            .is_some_and(|text| {
+                                validate_ack_text(text, &self.expected_idempotency_key).is_ok()
+                            })
+                })
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn parse_line(line: &[u8]) -> Result<Value> {
+    if line.is_empty() {
+        bail!("app server line is empty");
+    }
+    if line.len() > MAX_LINE_BYTES {
+        bail!("app server line exceeds {MAX_LINE_BYTES} bytes");
+    }
+    let text = std::str::from_utf8(line)?;
+    if text.trim().is_empty() {
+        bail!("app server line is empty");
+    }
+    let mut de = serde_json::Deserializer::from_str(text);
+    let value = Value::deserialize(&mut de)?;
+    de.end()?;
+    Ok(value)
+}
+
+fn expect_response_id(object: &Map<String, Value>, expected: u64) -> Result<()> {
+    match object.get("id") {
+        Some(Value::Number(number)) if number.as_u64() == Some(expected) => Ok(()),
+        Some(value) => bail!("expected response id {expected}, got {value}"),
+        None => bail!("missing response id {expected}"),
+    }
+}
+
+fn expect_success_response(object: &Map<String, Value>) -> Result<&Map<String, Value>> {
+    if object.contains_key("error") {
+        bail!("error responses are rejected");
+    }
+    object
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("successful response must carry a result object"))
+}
+
+fn object_params<'a>(
+    object: &'a Map<String, Value>,
+    method: &str,
+) -> Result<&'a Map<String, Value>> {
+    object
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("{method} params must be an object"))
+}
+
+fn string_field<'a>(object: &'a Map<String, Value>, key: &str, context: &str) -> Result<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{context} field {key} must be a string"))
+}
+
+fn bool_field(object: &Map<String, Value>, key: &str, context: &str) -> Result<bool> {
+    object
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("{context} field {key} must be a boolean"))
+}
+
+fn expect_object_field<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<&'a Map<String, Value>> {
+    object
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("{context} field {key} must be an object"))
+}
+
+fn validate_thread_start_response(
+    result: &Map<String, Value>,
+    expected_cwd: &str,
+) -> Result<String> {
+    if string_field(result, "approvalPolicy", "thread/start response")? != EXPECTED_APPROVAL_POLICY
+    {
+        bail!("thread/start response approvalPolicy must be never");
+    }
+    let cwd = string_field(result, "cwd", "thread/start response")?;
+    if cwd != expected_cwd {
+        bail!("thread/start response cwd does not match");
+    }
+    let sandbox = expect_object_field(result, "sandbox", "thread/start response")?;
+    if string_field(sandbox, "type", "thread/start response sandbox")? != EXPECTED_SANDBOX_TYPE {
+        bail!("thread/start response sandbox must be readOnly");
+    }
+    if bool_field(sandbox, "networkAccess", "thread/start response sandbox")? {
+        bail!("thread/start response sandbox networkAccess must be false");
+    }
+    let thread = expect_object_field(result, "thread", "thread/start response")?;
+    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true))?;
+    if let Some(approval_policy) = result.get("approvalPolicy")
+        && !approval_policy.is_string()
+    {
+        bail!("thread/start response approvalPolicy must be a string");
+    }
+    Ok(thread_id)
+}
+
+fn validate_thread_started(
+    params: &Map<String, Value>,
+    expected_thread_id: Option<&str>,
+    expected_cwd: &str,
+) -> Result<()> {
+    let thread = expect_object_field(params, "thread", "thread/started")?;
+    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true))?;
+    if let Some(expected_thread_id) = expected_thread_id
+        && thread_id != expected_thread_id
+    {
+        bail!("thread/started thread id does not match");
+    }
+    Ok(())
+}
+
+fn validate_turn_start_response(
+    result: &Map<String, Value>,
+    expected_thread_id: Option<&str>,
+) -> Result<String> {
+    let turn = expect_object_field(result, "turn", "turn/start response")?;
+    validate_turn_object(
+        turn,
+        expected_thread_id,
+        Some(EXPECTED_THREAD_STATUS),
+        false,
+        "",
+    )?;
+    Ok(string_field(turn, "id", "turn/start response turn")?.to_owned())
+}
+
+fn validate_turn_started(
+    params: &Map<String, Value>,
+    expected_thread_id: Option<&str>,
+    expected_turn_id: Option<&str>,
+) -> Result<()> {
+    let thread_id = string_field(params, "threadId", "turn/started")?;
+    validate_matching_thread_id(thread_id, expected_thread_id, "turn/started")?;
+    let turn = expect_object_field(params, "turn", "turn/started")?;
+    let turn_id = validate_turn_object(
+        turn,
+        expected_thread_id,
+        Some(EXPECTED_THREAD_STATUS),
+        false,
+        "",
+    )?;
+    if let Some(expected_turn_id) = expected_turn_id
+        && turn_id != expected_turn_id
+    {
+        bail!("turn/started turn id does not match");
+    }
+    if string_field(turn, "status", "turn/started")? != EXPECTED_THREAD_STATUS {
+        bail!("turn/started status must be inProgress");
+    }
+    Ok(())
+}
+
+fn validate_turn_object(
+    turn: &Map<String, Value>,
+    expected_thread_id: Option<&str>,
+    expected_status: Option<&str>,
+    require_completed_ack: bool,
+    expected_idempotency_key: &str,
+) -> Result<String> {
+    let turn_id = string_field(turn, "id", "turn")?;
+    validate_uuid_v7(turn_id, "turn id")?;
+    if let Some(expected_thread_id) = expected_thread_id
+        && turn_id == expected_thread_id
+    {
+        bail!("turn id must differ from thread id");
+    }
+    let status = string_field(turn, "status", "turn")?;
+    if Some(status) != expected_status {
+        bail!("turn status {status} is not accepted");
+    }
+    if require_completed_ack
+        && let Some(error) = turn.get("error")
+        && !error.is_null()
+    {
+        bail!("turn/completed error must be null or absent");
+    }
+    let items = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("turn.items must be an array"))?;
+    validate_turn_items(items, require_completed_ack, expected_idempotency_key)?;
+    Ok(turn_id.to_owned())
+}
+
+fn validate_turn_items(
+    items: &[Value],
+    require_completed_ack: bool,
+    expected_idempotency_key: &str,
+) -> Result<()> {
+    let mut agent_message_count = 0usize;
+    let mut ack_seen = false;
+    for item in items {
+        let item = validate_thread_item(item)?;
+        if item.kind == ItemKind::AgentMessage {
+            agent_message_count += 1;
+            if let Some(text) = item.text.as_deref() {
+                if require_completed_ack {
+                    validate_ack_text(text, expected_idempotency_key)?;
+                    ack_seen = true;
+                }
+            } else {
+                bail!("agentMessage items must carry text");
+            }
+        }
+    }
+    if require_completed_ack && (!ack_seen || agent_message_count != 1) {
+        bail!("turn/completed must follow the exact ack");
+    }
+    Ok(())
+}
+
+struct ValidatedItem {
+    id: String,
+    kind: ItemKind,
+    text: Option<String>,
+}
+
+fn validate_thread_item(value: &Value) -> Result<ValidatedItem> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("item must be an object"))?;
+    let id = string_field(object, "id", "item")?;
+    validate_item_id(id)?;
+    let kind = match string_field(object, "type", "item")? {
+        "userMessage" => {
+            expect_array_field(object, "content", "userMessage item")?;
+            ItemKind::UserMessage
+        }
+        "reasoning" => {
+            if let Some(content) = object.get("content")
+                && !content.is_array()
+            {
+                bail!("reasoning item content must be an array");
+            }
+            if let Some(summary) = object.get("summary")
+                && !summary.is_array()
+            {
+                bail!("reasoning item summary must be an array");
+            }
+            ItemKind::Reasoning
+        }
+        "agentMessage" => ItemKind::AgentMessage,
+        other => bail!("unsupported item type {other}"),
+    };
+    let text = if kind == ItemKind::AgentMessage {
+        Some(string_field(object, "text", "agentMessage item")?.to_owned())
+    } else {
+        None
+    };
+    Ok(ValidatedItem {
+        id: id.to_owned(),
+        kind,
+        text,
+    })
+}
+
+fn validate_item_started(params: &Map<String, Value>) -> Result<ValidatedItem> {
+    expect_integer_field(params, "startedAtMs", "item/started")?;
+    let item = expect_object_field(params, "item", "item/started")?;
+    validate_thread_item(&Value::Object(item.clone()))
+}
+
+fn validate_item_completed(params: &Map<String, Value>) -> Result<ValidatedItem> {
+    expect_integer_field(params, "completedAtMs", "item/completed")?;
+    let item = expect_object_field(params, "item", "item/completed")?;
+    validate_thread_item(&Value::Object(item.clone()))
+}
+
+fn expect_array_field<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<&'a Vec<Value>> {
+    object
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{context} field {key} must be an array"))
+}
+
+fn expect_integer_field(object: &Map<String, Value>, key: &str, context: &str) -> Result<i64> {
+    object
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("{context} field {key} must be an integer"))
+}
+
+fn validate_matching_ids(
+    thread_id: &str,
+    turn_id: &str,
+    expected_thread_id: Option<&str>,
+    expected_turn_id: Option<&str>,
+) -> Result<()> {
+    validate_matching_thread_id(thread_id, expected_thread_id, "notification")?;
+    if let Some(expected_turn_id) = expected_turn_id
+        && turn_id != expected_turn_id
+    {
+        bail!("turn id does not match");
+    }
+    Ok(())
+}
+
+fn validate_matching_thread_id(actual: &str, expected: Option<&str>, context: &str) -> Result<()> {
+    if let Some(expected) = expected
+        && actual != expected
+    {
+        bail!("{context} thread id does not match");
+    }
+    Ok(())
+}
+
+fn validate_thread_object(
+    thread: &Map<String, Value>,
+    expected_cwd: Option<&str>,
+    expect_ephemeral: Option<bool>,
+) -> Result<String> {
+    let thread_id = string_field(thread, "id", "thread")?;
+    validate_uuid_v7(thread_id, "thread id")?;
+    if let Some(expected_cwd) = expected_cwd {
+        let cwd = string_field(thread, "cwd", "thread")?;
+        if cwd != expected_cwd {
+            bail!("thread cwd does not match");
+        }
+    }
+    if let Some(expected_ephemeral) = expect_ephemeral
+        && bool_field(thread, "ephemeral", "thread")? != expected_ephemeral
+    {
+        bail!("thread ephemeral flag does not match");
+    }
+    Ok(thread_id.to_owned())
+}
+
+fn validate_key(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{label} must be nonempty");
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        bail!("{label} must not contain control characters");
+    }
+    if value.len() > MAX_LINE_BYTES {
+        bail!("{label} exceeds {MAX_LINE_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn validate_cwd(value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("cwd must be a nonempty absolute path");
+    }
+    if !std::path::Path::new(value).is_absolute() {
+        bail!("cwd must be a nonempty absolute path");
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        bail!("cwd must not contain control characters");
+    }
+    if value.len() > MAX_LINE_BYTES {
+        bail!("cwd exceeds {MAX_LINE_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn validate_uuid_v7(value: &str, label: &str) -> Result<()> {
+    if !is_uuid_v7(value) {
+        bail!("{label} must be a UUIDv7");
+    }
+    Ok(())
+}
+
+fn is_uuid_v7(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for &idx in &[8usize, 13, 18, 23] {
+        if bytes[idx] != b'-' {
+            return false;
+        }
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
+        if [8usize, 13, 18, 23].contains(&idx) {
+            continue;
+        }
+        if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    matches!(bytes[14], b'7') && matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+}
+
+fn validate_ack_text(text: &str, expected_idempotency_key: &str) -> Result<()> {
+    let ack: AckPayload = serde_json::from_str(text)?;
+    if !ack.accepted || ack.idempotency_key != expected_idempotency_key {
+        bail!("turn ack does not match the expected idempotency key");
+    }
+    Ok(())
+}
+
+fn validate_item_id(value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("item id must be nonempty");
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        bail!("item id must not contain control characters");
+    }
+    if value.len() > MAX_LINE_BYTES {
+        bail!("item id exceeds {MAX_LINE_BYTES} bytes");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const CWD: &str = "/private/tmp/kanban-app-messages";
+    const ID_KEY: &str = "ack-key-1";
+    const THREAD_ID: &str = "01890f3b-2c3d-7abc-8def-0123456789ab";
+    const TURN_ID: &str = "01890f3b-2c3d-7abc-8def-0123456789ac";
+
+    fn new_state() -> StateMachine {
+        StateMachine::new(CWD, ID_KEY).unwrap()
+    }
+
+    fn line(value: Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn init_response() -> Vec<u8> {
+        line(json!({"id": 1, "result": {}}))
+    }
+
+    fn thread_start_response(cwd: &str, thread_id: &str) -> Vec<u8> {
+        line(json!({
+            "id": 2,
+            "result": {
+                "approvalPolicy": "never",
+                "cwd": cwd,
+                "sandbox": {
+                    "type": "readOnly",
+                    "networkAccess": false
+                },
+                "thread": {
+                    "id": thread_id,
+                    "cwd": cwd,
+                    "ephemeral": true
+                }
+            }
+        }))
+    }
+
+    fn turn_start_response(_thread_id: &str, turn_id: &str, status: &str) -> Vec<u8> {
+        line(json!({
+            "id": 3,
+            "result": {
+                "turn": {
+                    "id": turn_id,
+                    "status": status,
+                    "items": []
+                }
+            }
+        }))
+    }
+
+    fn thread_started(thread_id: &str, cwd: &str) -> Vec<u8> {
+        line(json!({
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": thread_id,
+                    "cwd": cwd,
+                    "ephemeral": true
+                }
+            }
+        }))
+    }
+
+    fn turn_started(thread_id: &str, turn_id: &str) -> Vec<u8> {
+        turn_started_with_status(thread_id, turn_id, "inProgress")
+    }
+
+    fn turn_started_with_status(thread_id: &str, turn_id: &str, status: &str) -> Vec<u8> {
+        line(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turn": {
+                    "id": turn_id,
+                    "status": status,
+                    "items": []
+                }
+            }
+        }))
+    }
+
+    fn item_started(thread_id: &str, turn_id: &str, item: Value) -> Vec<u8> {
+        line(json!({
+            "method": "item/started",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "startedAtMs": 1,
+                "item": item
+            }
+        }))
+    }
+
+    fn item_completed(thread_id: &str, turn_id: &str, item: Value) -> Vec<u8> {
+        line(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "completedAtMs": 2,
+                "item": item
+            }
+        }))
+    }
+
+    fn delta(thread_id: &str, turn_id: &str, item_id: &str) -> Vec<u8> {
+        line(json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "delta": "hello"
+            }
+        }))
+    }
+
+    fn token_usage(thread_id: &str, turn_id: &str) -> Vec<u8> {
+        line(json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "tokenUsage": {"input": 1, "output": 2}
+            }
+        }))
+    }
+
+    fn turn_completed(thread_id: &str, turn_id: &str, items: Vec<Value>) -> Vec<u8> {
+        line(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": {
+                    "id": turn_id,
+                    "status": "completed",
+                    "error": null,
+                    "items": items
+                }
+            }
+        }))
+    }
+
+    fn turn_completed_with_status(
+        thread_id: &str,
+        turn_id: &str,
+        status: &str,
+        error: Value,
+        items: Vec<Value>,
+    ) -> Vec<u8> {
+        line(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": {
+                    "id": turn_id,
+                    "status": status,
+                    "error": error,
+                    "items": items
+                }
+            }
+        }))
+    }
+
+    fn user_item(id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "userMessage",
+            "content": [{"type": "text", "text": "hi"}]
+        })
+    }
+
+    fn reasoning_item(id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "reasoning",
+            "content": ["reason"],
+            "summary": ["summary"]
+        })
+    }
+
+    fn agent_item(id: &str, text: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "agentMessage",
+            "text": text
+        })
+    }
+
+    fn item_with_type(id: &str, ty: &str) -> Value {
+        json!({
+            "id": id,
+            "type": ty
+        })
+    }
+
+    fn ack_text() -> String {
+        serde_json::to_string(&json!({
+            "accepted": true,
+            "idempotencyKey": ID_KEY
+        }))
+        .unwrap()
+    }
+
+    fn malformed_ack_text() -> String {
+        serde_json::to_string(&json!({
+            "accepted": true,
+            "idempotencyKey": ID_KEY,
+            "extra": 1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn happy_sequence_reaches_completion() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { ref thread_id } if thread_id == THREAD_ID
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state.feed(&thread_started(THREAD_ID, CWD)).unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state.feed(&turn_started(THREAD_ID, TURN_ID)).unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, user_item("u-1")))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state.feed(&delta(THREAD_ID, TURN_ID, "a-1")).unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state.feed(&token_usage(THREAD_ID, TURN_ID)).unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    vec![
+                        user_item("u-1"),
+                        reasoning_item("r-1"),
+                        agent_item("a-1", &ack_text())
+                    ],
+                ))
+                .unwrap(),
+            Transition::Completed
+        ));
+        assert!(state.feed(&token_usage(THREAD_ID, TURN_ID)).is_err());
+    }
+
+    #[test]
+    fn rejects_pre_stream_notifications() {
+        let mut state = new_state();
+        assert!(state.feed(&thread_started(THREAD_ID, CWD)).is_err());
+        assert!(state.feed(&turn_started(THREAD_ID, TURN_ID)).is_err());
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(state.feed(&thread_started(THREAD_ID, CWD)).is_err());
+        assert!(state.feed(&turn_started(THREAD_ID, TURN_ID)).is_err());
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state.feed(&thread_started(THREAD_ID, CWD)).unwrap(),
+            Transition::Continue
+        ));
+        assert!(state.feed(&thread_started("bad-thread", CWD)).is_err());
+        assert!(state.feed(&thread_started(THREAD_ID, "/wrong")).is_err());
+        assert!(state.feed(&turn_started(THREAD_ID, TURN_ID)).is_err());
+        assert!(
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, agent_item("a-1", "ok")))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, agent_item("a-1", "ok")))
+                .is_err()
+        );
+        assert!(state.feed(&delta(THREAD_ID, TURN_ID, "a-1")).is_err());
+        assert!(state.feed(&token_usage(THREAD_ID, TURN_ID)).is_err());
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "completed",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_notification_ids_for_each_family() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+
+        assert!(state.feed(&thread_started("bad-thread", CWD)).is_err());
+        assert!(state.feed(&thread_started(THREAD_ID, "/wrong")).is_err());
+        assert!(state.feed(&turn_started("bad-thread", TURN_ID)).is_err());
+        assert!(state.feed(&turn_started(THREAD_ID, "bad-turn")).is_err());
+        assert!(
+            state
+                .feed(&item_started(
+                    "bad-thread",
+                    TURN_ID,
+                    agent_item("a-1", "ok")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    "bad-turn",
+                    agent_item("a-1", "ok")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    "bad-thread",
+                    TURN_ID,
+                    agent_item("a-1", "ok")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    "bad-turn",
+                    agent_item("a-1", "ok")
+                ))
+                .is_err()
+        );
+        assert!(state.feed(&delta("bad-thread", TURN_ID, "a-1")).is_err());
+        assert!(state.feed(&delta(THREAD_ID, "bad-turn", "a-1")).is_err());
+        assert!(state.feed(&token_usage("bad-thread", TURN_ID)).is_err());
+        assert!(state.feed(&token_usage(THREAD_ID, "bad-turn")).is_err());
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    "bad-thread",
+                    TURN_ID,
+                    "completed",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    "bad-turn",
+                    "completed",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_ids_and_server_requests() {
+        let mut state = new_state();
+        assert!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&json!({"id": 1, "error": {}}).to_string().into_bytes())
+                .is_err()
+        );
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(
+            state
+                .feed(&json!({"id": 1, "result": {}}).to_string().into_bytes())
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({"id": 2, "method": "thread/started", "params": {}})
+                        .to_string()
+                        .into_bytes()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_identity_policy_and_uuid_drift() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "on-request",
+                            "cwd": CWD,
+                            "sandbox": {
+                                "type": "readOnly",
+                                "networkAccess": false
+                            },
+                            "thread": {
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "never",
+                            "cwd": CWD,
+                            "sandbox": {
+                                "type": "writeThrough",
+                                "networkAccess": false
+                            },
+                            "thread": {
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "never",
+                            "cwd": CWD,
+                            "sandbox": {
+                                "type": "readOnly",
+                                "networkAccess": true
+                            },
+                            "thread": {
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&thread_start_response("/wrong", THREAD_ID))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&thread_start_response(CWD, "bad-thread-id"))
+                .is_err()
+        );
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { ref thread_id } if thread_id == THREAD_ID
+        ));
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(
+            state
+                .feed(&turn_start_response(THREAD_ID, THREAD_ID, "inProgress"))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "completed"))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_started_with_status(THREAD_ID, TURN_ID, "completed"))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 3,
+                        "result": {
+                            "turn": {
+                                "id": THREAD_ID,
+                                "status": "inProgress",
+                                "items": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_item_types_ack_and_completion_rules() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    json!({"id": "x", "type": "commandExecution"})
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    json!({"id": "x", "type": "userMessage"})
+                ))
+                .is_err()
+        );
+        for ty in [
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+            "webSearch",
+            "imageGeneration",
+        ] {
+            assert!(
+                state
+                    .feed(&item_started(THREAD_ID, TURN_ID, item_with_type("x", ty)))
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", "wrong")
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, agent_item("", "wrong")))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("bad\nid", "wrong")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", "wrong")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &malformed_ack_text())
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_nonutf8_empty_oversize_trailing_json_and_post_complete() {
+        let mut state = new_state();
+        assert!(state.feed(&[]).is_err());
+        assert!(state.feed(&[0xff]).is_err());
+        let oversized = vec![b' '; MAX_LINE_BYTES + 1];
+        assert!(state.feed(&oversized).is_err());
+        assert!(state.feed(b"{\"id\":1}{\"id\":2}").is_err());
+        assert!(state.feed(b"not-json").is_err());
+
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    vec![agent_item("a-1", &ack_text())],
+                ))
+                .unwrap(),
+            Transition::Completed
+        ));
+        assert!(
+            state
+                .feed(&turn_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "completed",
+                    json!(null),
+                    vec![]
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "completed",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "inProgress",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "completed",
+                    json!({"message": "nope"}),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        assert!(matches!(
+            state
+                .feed(&item_started(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", "false")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item(
+                        "a-1",
+                        "{\"accepted\":false,\"idempotencyKey\":\"ack-key-1\"}"
+                    )
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", "{\"accepted\":true,\"idempotencyKey\":\"wrong\"}")
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item(
+                        "a-1",
+                        &format!(
+                            "{{\"accepted\":true,\"idempotencyKey\":\"{}\",\"extra\":1}}",
+                            ID_KEY
+                        )
+                    )
+                ))
+                .is_err()
+        );
+        assert!(matches!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&item_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    agent_item("a-1", &ack_text())
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_out_of_order_responses() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(state.feed(&init_response()).is_err());
+
+        let mut state = new_state();
+        assert!(state.feed(&thread_start_response(CWD, THREAD_ID)).is_err());
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(state.feed(&thread_start_response(CWD, THREAD_ID)).is_err());
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_status_and_id_drift_on_completion_path() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "failed",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    TURN_ID,
+                    "interrupted",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(&turn_completed_with_status(
+                    THREAD_ID,
+                    THREAD_ID,
+                    "completed",
+                    json!(null),
+                    vec![agent_item("a-1", &ack_text())]
+                ))
+                .is_err()
+        );
+    }
+}
