@@ -67,6 +67,9 @@ struct ListenScenario {
     exit_code: i32,
     exit_after_stage: u8,
     wait_for_eof: bool,
+    stubborn_after_stage: u8,
+    pid_file: Option<PathBuf>,
+    grandchild_pid_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -355,6 +358,9 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
             exit_code: 0,
             exit_after_stage: 0,
             wait_for_eof: true,
+            stubborn_after_stage: 0,
+            pid_file: None,
+            grandchild_pid_file: None,
         },
     }
 }
@@ -410,6 +416,22 @@ impl Scenario {
                 "false".to_owned()
             },
         ));
+        lines.push((
+            "listen.stubborn_after_stage".to_owned(),
+            self.listen.stubborn_after_stage.to_string(),
+        ));
+        if let Some(path) = &self.listen.pid_file {
+            lines.push((
+                "listen.pid_file".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(path) = &self.listen.grandchild_pid_file {
+            lines.push((
+                "listen.grandchild_pid_file".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
         scenario_text(&lines)
     }
 }
@@ -582,6 +604,20 @@ fn assert_failure(output: &Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("Error:"));
     assert!(stderr.len() < 8192, "stderr too long: {}", stderr.len());
+}
+
+fn pid_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks process existence/permission.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn assert_pid_disappears(pid: i32, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pid_exists(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!pid_exists(pid), "{label} process {pid} survived cleanup");
 }
 
 fn happy_fixture(label: &str) -> Fixture {
@@ -1338,4 +1374,62 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
             }
         }
     }
+}
+
+#[test]
+fn compiled_process_blocked_protocol_write_uses_the_shared_deadline_and_reaps_the_group() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new("blocked-write", |paths| {
+        let cwd = paths.cwd.canonicalize().unwrap();
+        let codex_home = paths.codex_home.canonicalize().unwrap();
+        let root = paths.cwd.parent().unwrap();
+        let mut scenario = scenario_for_cwd(
+            &cwd.to_string_lossy(),
+            &codex_home.to_string_lossy(),
+            &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+        );
+        scenario.listen.stubborn_after_stage = 2;
+        scenario.listen.pid_file = Some(root.join("stubborn.pid"));
+        scenario.listen.grandchild_pid_file = Some(root.join("grandchild.pid"));
+        scenario
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let mut large_request = request();
+    large_request["event"]["padding"] = Value::String("x".repeat(58_000));
+    let start = Instant::now();
+    let output = fixture.run(
+        &large_request,
+        &schema_hash(&scenario.schema_client_request),
+        &schema_hash(&scenario.schema_protocol),
+        1_500,
+    );
+    let elapsed = start.elapsed();
+    eprintln!("blocked_write_elapsed_ms={}", elapsed.as_millis());
+    assert_failure(&output);
+    assert!(
+        elapsed >= Duration::from_millis(1_300),
+        "elapsed={elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(4), "elapsed={elapsed:?}");
+
+    let child_pid: i32 = fs::read_to_string(fixture.root.join("stubborn.pid"))
+        .expect("fake must reach the thread-start stage")
+        .parse()
+        .unwrap();
+    let grandchild_pid: i32 = fs::read_to_string(fixture.root.join("grandchild.pid"))
+        .expect("fake must spawn its stubborn grandchild")
+        .parse()
+        .unwrap();
+    assert_pid_disappears(child_pid, "app-server");
+    assert_pid_disappears(grandchild_pid, "app-server grandchild");
+    let records = fixture.capture_records();
+    assert!(records.iter().any(|record| {
+        record["mode"] == "listen-stage" && record["stage"] == "2" && record["phase"] == "stubborn"
+    }));
 }

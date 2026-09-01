@@ -4,9 +4,22 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
+
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
+    fn getppid() -> i32;
+    #[cfg(target_os = "linux")]
+    fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+}
+
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIG_IGN: usize = 1;
+#[cfg(target_os = "linux")]
+const F_SETPIPE_SZ: i32 = 1031;
 
 #[derive(Clone, Debug)]
 enum Emit {
@@ -208,6 +221,75 @@ fn command_stderr(map: &HashMap<String, String>, prefix: &str) -> Emit {
     get_spec(map, &format!("{prefix}.stderr"))
 }
 
+fn ignore_termination() {
+    // SAFETY: signal(2) receives the portable SIG_IGN sentinel and fixed
+    // SIGINT/SIGTERM values shared by the supported macOS and Linux targets.
+    unsafe {
+        signal(SIGINT, SIG_IGN);
+        signal(SIGTERM, SIG_IGN);
+    }
+}
+
+fn stubborn_loop(pid_file: &Path) -> ! {
+    ignore_termination();
+    fs::write(pid_file, process::id().to_string()).unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn become_stubborn(map: &HashMap<String, String>, argv: &[String], stage: u8) -> ! {
+    ignore_termination();
+    // SAFETY: getppid(2) has no preconditions.
+    let adapter_pid = unsafe { getppid() };
+    if let Some(path) = map.get("listen.adapter_pid_file") {
+        fs::write(path, adapter_pid.to_string()).unwrap();
+    }
+    let pid_file = PathBuf::from(map.get("listen.pid_file").expect("listen.pid_file"));
+    let grandchild_pid_file = PathBuf::from(
+        map.get("listen.grandchild_pid_file")
+            .expect("listen.grandchild_pid_file"),
+    );
+    fs::write(&pid_file, process::id().to_string()).unwrap();
+    let child = Command::new(env::current_exe().unwrap())
+        .arg("--stubborn-grandchild")
+        .arg(&grandchild_pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    drop(child);
+    capture_record(
+        "listen-stage",
+        argv,
+        "",
+        "",
+        "",
+        &[
+            ("stage", stage.to_string()),
+            ("phase", "stubborn".to_owned()),
+            ("pid", process::id().to_string()),
+            ("adapter_pid", adapter_pid.to_string()),
+            ("grandchild_pid", child_pid.to_string()),
+        ],
+    );
+    loop {
+        thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn maybe_become_stubborn(map: &HashMap<String, String>, argv: &[String], stage: u8) {
+    let configured = map
+        .get("listen.stubborn_after_stage")
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0);
+    if configured == stage {
+        become_stubborn(map, argv, stage);
+    }
+}
+
 fn schema_client_request(map: &HashMap<String, String>) -> Vec<u8> {
     match map.get("schema.client_request") {
         Some(value) if value.starts_with("hex:") => hex_decode(&value[4..]),
@@ -312,6 +394,12 @@ fn run_schema(map: &HashMap<String, String>, argv: &[String], out_dir: &str) -> 
 }
 
 fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
+    #[cfg(target_os = "linux")]
+    // SAFETY: fd 0 is the inherited app-server stdin pipe. Reducing its
+    // capacity makes the blocked-write regression deterministic.
+    unsafe {
+        fcntl(0, F_SETPIPE_SZ, 4096);
+    }
     let mut stdin = io::stdin().lock();
     let mut line = String::new();
     let mut captured_stdin = String::new();
@@ -375,6 +463,7 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
                 &captured_stderr,
                 &[("stage", "initialize".to_owned()), ("phase", "emitted".to_owned())],
             );
+            maybe_become_stubborn(map, argv, stage);
             if exit_after_stage == stage {
                 break;
             }
@@ -421,6 +510,7 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
                 &captured_stderr,
                 &[("stage", "thread/start".to_owned()), ("phase", "emitted".to_owned())],
             );
+            maybe_become_stubborn(map, argv, stage);
             if exit_after_stage == stage {
                 break;
             }
@@ -477,8 +567,13 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
 }
 
 fn main() {
-    let map = load_scenario();
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [flag, pid_file] = args.as_slice()
+        && flag == "--stubborn-grandchild"
+    {
+        stubborn_loop(Path::new(pid_file));
+    }
+    let map = load_scenario();
     let exit_code = match args.as_slice() {
         [flag] if flag == "--version" => run_version_or_help("version", &map, &args),
         [command, flag] if command == "app-server" && flag == "--help" => {

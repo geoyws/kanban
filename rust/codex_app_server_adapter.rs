@@ -14,6 +14,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,6 +32,347 @@ const APP_SERVER_HELP_SCHEMA: &str = "generate-json-schema";
 const MIN_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 const CLEANUP_WINDOW: Duration = Duration::from_secs(2);
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_CODEX_PGID: AtomicI32 = AtomicI32::new(0);
+#[cfg(test)]
+static SPAWN_REGISTRATION_MASK_OBSERVED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static CLEANUP_TRANSITION_SEAM_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static CLEANUP_SIGNAL_BEFORE_CLEAR_TARGET: AtomicI32 = AtomicI32::new(0);
+#[cfg(test)]
+static CLEANUP_SIGNAL_AFTER_CLEAR_TARGET: AtomicI32 = AtomicI32::new(-1);
+#[cfg(test)]
+static CLEANUP_RESERVED_AFTER_CLEAR_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+fn relay_signal_to_active() -> i32 {
+    let pgid = ACTIVE_CODEX_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        // SAFETY: `kill` is async-signal-safe. The active id remains reserved
+        // through process-group termination. Its exact owner clears it before
+        // final reap, so the numeric group cannot be recycled while visible.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    pgid
+}
+
+extern "C" fn handle_signal(_signal: libc::c_int) {
+    CANCELLED.store(true, Ordering::SeqCst);
+    relay_signal_to_active();
+}
+
+fn install_signal_handlers() -> Result<()> {
+    // SAFETY: sigaction is fully initialized before installation. The handler
+    // performs only lock-free atomic operations and async-signal-safe kill(2).
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_signal as *const () as libc::sighandler_t;
+        action.sa_flags = 0;
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            return Err(io::Error::last_os_error()).context("initialize adapter signals");
+        }
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error())
+                    .with_context(|| format!("install adapter signal {signal}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_cancelled() -> Result<()> {
+    if CANCELLED.load(Ordering::SeqCst) {
+        bail!("adapter cancelled");
+    }
+    Ok(())
+}
+
+fn termination_signal_set() -> io::Result<libc::sigset_t> {
+    // SAFETY: the set is initialized before it is returned, and sigaddset
+    // receives only the supported SIGINT/SIGTERM constants.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut set) != 0
+            || libc::sigaddset(&mut set, libc::SIGINT) != 0
+            || libc::sigaddset(&mut set, libc::SIGTERM) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(set)
+    }
+}
+
+struct TerminationSignalMask {
+    previous: libc::sigset_t,
+    restored: bool,
+}
+
+impl TerminationSignalMask {
+    fn block() -> io::Result<Self> {
+        let set = termination_signal_set()?;
+        // SAFETY: pthread_sigmask receives initialized sets owned by this
+        // thread. The previous mask is captured for exact restoration.
+        unsafe {
+            let mut previous: libc::sigset_t = std::mem::zeroed();
+            let result = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result));
+            }
+            Ok(Self {
+                previous,
+                restored: false,
+            })
+        }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        // SAFETY: previous is the exact mask captured by block() for this
+        // thread and remains initialized for the guard's lifetime.
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminationSignalMask {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn termination_signals_blocked() -> io::Result<bool> {
+    // Supplying a null set queries this thread's current mask without changing
+    // it on both macOS and Linux.
+    unsafe {
+        let mut current: libc::sigset_t = std::mem::zeroed();
+        let result = libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current);
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        Ok(libc::sigismember(&current, libc::SIGINT) == 1
+            && libc::sigismember(&current, libc::SIGTERM) == 1)
+    }
+}
+
+fn reset_child_termination_signals() -> io::Result<()> {
+    let set = termination_signal_set()?;
+    // SAFETY: this runs after fork and before exec. sigaction and
+    // pthread_sigmask are async-signal-safe and receive initialized values.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn signal_codex_group(pid: i32, signal: i32) -> io::Result<bool> {
+    loop {
+        // SAFETY: pid is the positive process-group leader owned by the
+        // ActiveCodexChild, and no pointer crosses the FFI boundary.
+        let result = unsafe { libc::kill(-pid, signal) };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ESRCH) => return Ok(false),
+            _ => return Err(error),
+        }
+    }
+}
+
+fn child_exited_reserved(pid: u32) -> io::Result<bool> {
+    loop {
+        match child_exited_unreaped(pid) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn wait_child_retry(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    loop {
+        match child.wait() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+struct ActiveCodexChild {
+    child: Child,
+    pid: i32,
+    reaped: bool,
+}
+
+impl ActiveCodexChild {
+    fn new(mut child: Child) -> Result<Self> {
+        let pid = match i32::try_from(child.id()) {
+            Ok(pid) if pid > 0 => pid,
+            _ => {
+                let _ = terminate_and_reap(&mut child);
+                bail!("codex child pid exceeds i32");
+            }
+        };
+        if ACTIVE_CODEX_PGID
+            .compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            let _ = terminate_and_reap(&mut child);
+            bail!("another codex process group is already active");
+        }
+        let mut active = Self {
+            child,
+            pid,
+            reaped: false,
+        };
+        if let Err(error) = check_cancelled() {
+            active.terminate_and_reap();
+            return Err(error);
+        }
+        Ok(active)
+    }
+
+    fn child(&self) -> &Child {
+        &self.child
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn deactivate(&self) {
+        let _ = ACTIVE_CODEX_PGID.compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn force_kill_clear_reap(&mut self) -> Option<std::process::ExitStatus> {
+        // Observation failed, so do not risk a wait that reaps before the
+        // active owner is cleared. First make continued execution impossible,
+        // then clear the exact owner, then reap.
+        let _ = signal_codex_group(self.pid, libc::SIGKILL);
+        let _ = self.child.kill();
+        self.deactivate();
+        let _ = wait_child_retry(&mut self.child);
+        self.reaped = true;
+        None
+    }
+
+    fn finish_reserved_exit(
+        &mut self,
+        signal_owned_outcome: bool,
+    ) -> Option<std::process::ExitStatus> {
+        // The WNOWAIT observation keeps the leader PID reserved. Kill the
+        // complete group one final time before ending global ownership so no
+        // descendant can escape between the ownership clear and final reap.
+        let _ = signal_codex_group(self.pid, libc::SIGKILL);
+
+        #[cfg(test)]
+        if CLEANUP_TRANSITION_SEAM_ENABLED.load(Ordering::SeqCst) {
+            CLEANUP_SIGNAL_BEFORE_CLEAR_TARGET.store(relay_signal_to_active(), Ordering::SeqCst);
+        }
+
+        self.deactivate();
+
+        #[cfg(test)]
+        if CLEANUP_TRANSITION_SEAM_ENABLED.load(Ordering::SeqCst) {
+            CLEANUP_SIGNAL_AFTER_CLEAR_TARGET.store(relay_signal_to_active(), Ordering::SeqCst);
+            CLEANUP_RESERVED_AFTER_CLEAR_OBSERVED.store(
+                child_exited_reserved(self.child.id()).unwrap_or(false),
+                Ordering::SeqCst,
+            );
+        }
+
+        let status = wait_child_retry(&mut self.child).ok();
+        self.reaped = true;
+        if signal_owned_outcome { None } else { status }
+    }
+
+    fn terminate_and_reap(&mut self) -> Option<std::process::ExitStatus> {
+        if self.reaped {
+            return None;
+        }
+        match child_exited_reserved(self.child.id()) {
+            Ok(true) => return self.finish_reserved_exit(false),
+            Ok(false) => {}
+            Err(_) => return self.force_kill_clear_reap(),
+        }
+
+        let term_sent = match signal_codex_group(self.pid, libc::SIGTERM) {
+            Ok(sent) => sent,
+            Err(_) => return self.force_kill_clear_reap(),
+        };
+        if !term_sent {
+            match child_exited_reserved(self.child.id()) {
+                Ok(true) => return self.finish_reserved_exit(false),
+                Ok(false) => {}
+                Err(_) => return self.force_kill_clear_reap(),
+            }
+        }
+
+        if term_sent {
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < deadline {
+                match child_exited_reserved(self.child.id()) {
+                    Ok(true) => return self.finish_reserved_exit(true),
+                    Ok(false) => {}
+                    Err(_) => return self.force_kill_clear_reap(),
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // Escalation owns the outcome. Keep observing with WNOWAIT after
+        // SIGKILL so the leader remains reserved until final group kill and
+        // ownership clear are complete.
+        let _ = signal_codex_group(self.pid, libc::SIGKILL);
+        let _ = self.child.kill();
+        loop {
+            match child_exited_reserved(self.child.id()) {
+                Ok(true) => return self.finish_reserved_exit(true),
+                Ok(false) => {}
+                Err(_) => return self.force_kill_clear_reap(),
+            }
+            let _ = signal_codex_group(self.pid, libc::SIGKILL);
+            let _ = self.child.kill();
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ActiveCodexChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.terminate_and_reap();
+        } else {
+            self.deactivate();
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Args {
@@ -164,6 +506,8 @@ pub(crate) fn entrypoint() -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
+    install_signal_handlers()?;
+    check_cancelled()?;
     let validated = validate_paths(&args)?;
     let deadline = Instant::now() + Duration::from_millis(validated.protocol_timeout_ms);
     probe_codex_version(&validated, deadline)?;
@@ -561,15 +905,42 @@ fn codex_command(validated: &Validated, args: &[OsString]) -> Command {
         .env("CODEX_HOME", &validated.canonical_codex_home)
         .args(args)
         .process_group(0);
+    // SAFETY: the hook invokes only async-signal-safe libc operations. It
+    // resets inherited handlers and unblocks termination signals before exec.
+    unsafe {
+        command.pre_exec(reset_child_termination_signals);
+    }
     command
 }
 
-fn capture_output(mut child: Child, label: &str, deadline: Instant) -> Result<Output> {
+fn spawn_active_codex(command: &mut Command) -> Result<ActiveCodexChild> {
+    let mut mask = TerminationSignalMask::block().context("block adapter termination signals")?;
+    let child = command.spawn()?;
+    let mut child = ActiveCodexChild::new(child)?;
+    let registration_masked = termination_signals_blocked()?;
+    #[cfg(test)]
+    SPAWN_REGISTRATION_MASK_OBSERVED.store(registration_masked, Ordering::SeqCst);
+    if !registration_masked {
+        child.terminate_and_reap();
+        bail!("termination signals were not blocked during child registration");
+    }
+    mask.restore()
+        .context("restore adapter termination signals")?;
+    if let Err(error) = check_cancelled() {
+        child.terminate_and_reap();
+        return Err(error);
+    }
+    Ok(child)
+}
+
+fn capture_output(mut child: ActiveCodexChild, label: &str, deadline: Instant) -> Result<Output> {
     let stdout = child
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing stdout pipe for {label}"))?;
     let stderr = child
+        .child_mut()
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing stderr pipe for {label}"))?;
@@ -580,24 +951,30 @@ fn capture_output(mut child: Child, label: &str, deadline: Instant) -> Result<Ou
     enum Outcome {
         Exited(std::process::ExitStatus),
         TimedOut,
+        Cancelled,
         WaitFailed,
     }
 
     let outcome = loop {
-        match child_exited_unreaped(child.id()) {
+        match child_exited_unreaped(child.child().id()) {
             Ok(true) => {
-                let status = terminate_and_reap(&mut child)
+                let status = child
+                    .terminate_and_reap()
                     .ok_or_else(|| anyhow::anyhow!("{label} exited without a reaped status"))?;
                 break Outcome::Exited(status);
             }
             Ok(false) => {}
             Err(_) => {
-                let _ = terminate_and_reap(&mut child);
+                let _ = child.terminate_and_reap();
                 break Outcome::WaitFailed;
             }
         }
+        if CANCELLED.load(Ordering::SeqCst) {
+            let _ = child.terminate_and_reap();
+            break Outcome::Cancelled;
+        }
         if Instant::now() >= deadline {
-            break match terminate_and_reap(&mut child) {
+            break match child.terminate_and_reap() {
                 Some(status) => Outcome::Exited(status),
                 None => Outcome::TimedOut,
             };
@@ -626,6 +1003,7 @@ fn capture_output(mut child: Child, label: &str, deadline: Instant) -> Result<Ou
             stderr,
         }),
         Outcome::TimedOut => bail!("{label} timed out before the deadline"),
+        Outcome::Cancelled => bail!("adapter cancelled"),
         Outcome::WaitFailed => bail!("{label} wait failed"),
     }
 }
@@ -659,12 +1037,15 @@ fn run_codex_command(
     label: &str,
     deadline: Instant,
 ) -> Result<Output> {
+    check_cancelled()?;
     validate_identities_before_spawn(validated)?;
-    let child = codex_command(validated, args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut command = codex_command(validated, args);
+    let child = spawn_active_codex(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
     capture_output(child, label, deadline)
 }
 
@@ -959,17 +1340,101 @@ fn spawn_stderr_reader(
     })
 }
 
-fn write_line(stdin: &mut impl io::Write, line: &str) -> Result<()> {
-    stdin.write_all(line.as_bytes())?;
-    stdin.flush()?;
-    Ok(())
+struct WriteRequest {
+    bytes: Vec<u8>,
+    result: mpsc::SyncSender<io::Result<()>>,
 }
 
-fn wait_for_clean_exit(child: &mut Child) -> Result<Output> {
+struct StdinWriter {
+    sender: Option<mpsc::Sender<WriteRequest>>,
+    handle: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl StdinWriter {
+    fn new(mut stdin: ChildStdin) -> Self {
+        let (sender, receiver) = mpsc::channel::<WriteRequest>();
+        let handle = thread::spawn(move || {
+            for request in receiver {
+                let result = stdin.write_all(&request.bytes).and_then(|()| stdin.flush());
+                match result {
+                    Ok(()) => {
+                        let _ = request.result.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let kind = error.kind();
+                        let message = error.to_string();
+                        let _ = request
+                            .result
+                            .send(Err(io::Error::new(kind, message.clone())));
+                        return Err(io::Error::new(kind, message));
+                    }
+                }
+            }
+            Ok(())
+        });
+        Self {
+            sender: Some(sender),
+            handle: Some(handle),
+        }
+    }
+
+    fn write_line(&self, line: &str, deadline: Instant) -> Result<()> {
+        check_cancelled()?;
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("protocol timed out");
+        }
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("app-server stdin is closed"))?
+            .send(WriteRequest {
+                bytes: line.as_bytes().to_vec(),
+                result: result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("app-server stdin writer disconnected"))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("protocol timed out");
+        }
+        match result_rx.recv_timeout(remaining) {
+            Ok(Ok(())) => {
+                check_cancelled()?;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                check_cancelled()?;
+                Err(error).context("write app-server protocol line")
+            }
+            Err(RecvTimeoutError::Timeout) => bail!("protocol timed out during stdin write"),
+            Err(RecvTimeoutError::Disconnected) => {
+                check_cancelled()?;
+                bail!("app-server stdin writer disconnected")
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.sender.take();
+    }
+
+    fn join(&mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("app-server stdin writer panicked"))??;
+        Ok(())
+    }
+}
+
+fn wait_for_clean_exit(child: &mut ActiveCodexChild) -> Result<Output> {
     let deadline = Instant::now() + CLEANUP_WINDOW;
     loop {
-        if child_exited_unreaped(child.id())? {
-            let status = terminate_and_reap(child)
+        if child_exited_unreaped(child.child().id())? {
+            let status = child
+                .terminate_and_reap()
                 .ok_or_else(|| anyhow::anyhow!("app-server exited without a reaped status"))?;
             return Ok(Output {
                 status,
@@ -982,46 +1447,46 @@ fn wait_for_clean_exit(child: &mut Child) -> Result<Output> {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let _ = terminate_and_reap(child);
+    let _ = child.terminate_and_reap();
     bail!("app-server did not exit cleanly within the cleanup window");
 }
 
-fn abort_child(child: &mut Child) {
-    let _ = terminate_and_reap(child);
+fn abort_child(child: &mut ActiveCodexChild) {
+    let _ = child.terminate_and_reap();
 }
 
 struct AppServerCleanup {
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: ActiveCodexChild,
+    stdin_writer: StdinWriter,
     stdout_handle: Option<thread::JoinHandle<Result<()>>>,
     stderr_handle: Option<thread::JoinHandle<Result<Vec<u8>>>>,
     completed: bool,
+    cleaned: bool,
 }
 
 impl AppServerCleanup {
     fn new(
-        child: Child,
+        child: ActiveCodexChild,
         stdin: ChildStdin,
         stdout_handle: thread::JoinHandle<Result<()>>,
         stderr_handle: thread::JoinHandle<Result<Vec<u8>>>,
     ) -> Self {
         Self {
             child,
-            stdin: Some(stdin),
+            stdin_writer: StdinWriter::new(stdin),
             stdout_handle: Some(stdout_handle),
             stderr_handle: Some(stderr_handle),
             completed: false,
+            cleaned: false,
         }
     }
 
-    fn stdin_mut(&mut self) -> Result<&mut ChildStdin> {
-        self.stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("stdin already closed"))
+    fn write_line(&self, line: &str, deadline: Instant) -> Result<()> {
+        self.stdin_writer.write_line(line, deadline)
     }
 
     fn close_stdin(&mut self) {
-        let _ = self.stdin.take();
+        self.stdin_writer.close();
     }
 
     fn join_stdout(&mut self) -> Result<()> {
@@ -1047,6 +1512,7 @@ impl AppServerCleanup {
     fn finish(&mut self) -> Result<()> {
         self.close_stdin();
         let status = wait_for_clean_exit(&mut self.child)?.status;
+        self.stdin_writer.join()?;
         self.join_stdout()?;
         let stderr_bytes = self.join_stderr()?;
         if !stderr_bytes.is_empty() {
@@ -1058,14 +1524,26 @@ impl AppServerCleanup {
         if !self.completed {
             bail!("app-server exited before protocol completion");
         }
+        self.cleaned = true;
         Ok(())
     }
 
     fn abort(&mut self) {
+        if self.cleaned {
+            return;
+        }
         self.close_stdin();
         abort_child(&mut self.child);
+        let _ = self.stdin_writer.join();
         let _ = self.join_stdout();
         let _ = self.join_stderr();
+        self.cleaned = true;
+    }
+}
+
+impl Drop for AppServerCleanup {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -1074,6 +1552,7 @@ fn drive_app_server(
     request: &AdapterRequest,
     deadline: Instant,
 ) -> Result<AdapterResponse> {
+    check_cancelled()?;
     validate_identities_before_spawn(validated)?;
     let cwd = validated
         .canonical_cwd
@@ -1089,19 +1568,21 @@ fn drive_app_server(
     );
     let mut state = StateMachine::new(cwd, codex_home, idempotency_key.clone())?;
 
-    let mut child = app_server_command(validated)
-        .spawn()
-        .context("spawn codex app-server")?;
+    let mut command = app_server_command(validated);
+    let mut child = spawn_active_codex(&mut command).context("spawn codex app-server")?;
     let pipes = (|| -> Result<(ChildStdin, std::process::ChildStdout, std::process::ChildStderr)> {
         let stdin = child
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing stdin pipe for app-server"))?;
         let stdout = child
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing stdout pipe for app-server"))?;
         let stderr = child
+            .child_mut()
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing stderr pipe for app-server"))?;
@@ -1120,7 +1601,7 @@ fn drive_app_server(
     let mut cleanup = AppServerCleanup::new(child, stdin, stdout_handle, stderr_handle);
 
     let result = (|| -> Result<AdapterResponse> {
-        write_line(cleanup.stdin_mut()?, &initialize_line()?)?;
+        cleanup.write_line(&initialize_line()?, deadline)?;
 
         loop {
             let now = Instant::now();
@@ -1144,13 +1625,13 @@ fn drive_app_server(
                     match transition {
                         Transition::Continue => {}
                         Transition::SendThreadStart => {
-                            write_line(cleanup.stdin_mut()?, &initialized_line()?)?;
-                            write_line(cleanup.stdin_mut()?, &thread_start_line(cwd)?)?;
+                            cleanup.write_line(&initialized_line()?, deadline)?;
+                            cleanup.write_line(&thread_start_line(cwd)?, deadline)?;
                         }
                         Transition::SendTurnStart { thread_id } => {
-                            write_line(
-                                cleanup.stdin_mut()?,
+                            cleanup.write_line(
                                 &turn_start_line(&thread_id, &idempotency_key, &request.event)?,
+                                deadline,
                             )?;
                         }
                         Transition::Completed => {
@@ -1458,11 +1939,34 @@ mod tests {
 
     #[test]
     fn run_codex_command_times_out_and_reaps_descendants() {
+        SPAWN_REGISTRATION_MASK_OBSERVED.store(false, Ordering::SeqCst);
+        CLEANUP_SIGNAL_BEFORE_CLEAR_TARGET.store(0, Ordering::SeqCst);
+        CLEANUP_SIGNAL_AFTER_CLEAR_TARGET.store(-1, Ordering::SeqCst);
+        CLEANUP_RESERVED_AFTER_CLEAR_OBSERVED.store(false, Ordering::SeqCst);
+        CLEANUP_TRANSITION_SEAM_ENABLED.store(true, Ordering::SeqCst);
         let validated = descendant_timeout_validated();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let error = run_codex_command(&validated, &version_args(), "codex version probe", deadline)
             .unwrap_err();
+        CLEANUP_TRANSITION_SEAM_ENABLED.store(false, Ordering::SeqCst);
         assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(
+            SPAWN_REGISTRATION_MASK_OBSERVED.load(Ordering::SeqCst),
+            "SIGINT/SIGTERM were not masked across spawn and PGID registration"
+        );
+        assert!(
+            CLEANUP_SIGNAL_BEFORE_CLEAR_TARGET.load(Ordering::SeqCst) > 0,
+            "the signal relay did not target the still-reserved owned group"
+        );
+        assert_eq!(
+            CLEANUP_SIGNAL_AFTER_CLEAR_TARGET.load(Ordering::SeqCst),
+            0,
+            "the signal relay retained a target after ownership clear"
+        );
+        assert!(
+            CLEANUP_RESERVED_AFTER_CLEAR_OBSERVED.load(Ordering::SeqCst),
+            "the leader was reaped before exact PGID ownership was cleared"
+        );
     }
 
     #[test]
