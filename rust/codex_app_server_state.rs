@@ -7,6 +7,8 @@ use std::path::Path;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const EXPECTED_APPROVAL_POLICY: &str = "never";
 const EXPECTED_SANDBOX_TYPE: &str = "readOnly";
+const EXPECTED_MODEL_PROVIDER: &str = "openai";
+const EXPECTED_THREAD_SOURCE: &str = "cli";
 const EXPECTED_THREAD_STATUS: &str = "inProgress";
 const EXPECTED_TURN_COMPLETED_STATUS: &str = "completed";
 const EXPECTED_TURN_ID: u64 = 3;
@@ -459,7 +461,9 @@ fn validate_thread_start_response(
         bail!("thread/start response sandbox networkAccess must be false");
     }
     nonempty_string_field(result, "model", "thread/start response")?;
-    nonempty_string_field(result, "modelProvider", "thread/start response")?;
+    if string_field(result, "modelProvider", "thread/start response")? != EXPECTED_MODEL_PROVIDER {
+        bail!("thread/start response modelProvider does not match");
+    }
     match string_field(result, "approvalsReviewer", "thread/start response")? {
         "user" | "auto_review" | "guardian_subagent" => {}
         other => bail!("thread/start response approvalsReviewer {other} is not accepted"),
@@ -716,7 +720,9 @@ fn validate_thread_object(
     if cli_version != required_version {
         bail!("thread cliVersion does not match");
     }
-    nonempty_string_field(thread, "modelProvider", "thread")?;
+    if string_field(thread, "modelProvider", "thread")? != EXPECTED_MODEL_PROVIDER {
+        bail!("thread modelProvider does not match");
+    }
     string_field(thread, "preview", "thread")?;
     nonempty_string_field(thread, "sessionId", "thread")?;
     expect_integer_field(thread, "createdAt", "thread")?;
@@ -726,10 +732,8 @@ fn validate_thread_object(
         Some(_) => bail!("thread field projectId must be a string or null"),
         None => bail!("thread field projectId is required"),
     }
-    match thread.get("source") {
-        Some(Value::String(_)) | Some(Value::Object(_)) => {}
-        Some(_) => bail!("thread field source must be a string or an object"),
-        None => bail!("thread field source is required"),
+    if string_field(thread, "source", "thread")? != EXPECTED_THREAD_SOURCE {
+        bail!("thread source does not match");
     }
     let status = expect_object_field(thread, "status", "thread")?;
     let status_type = nonempty_string_field(status, "type", "thread status")?;
@@ -1506,6 +1510,41 @@ mod tests {
         ] {
             let mut state = new_state();
             assert!(state.feed(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_model_provider_and_source_drift_at_response_and_notification() {
+        for pointer in [
+            "/result/modelProvider",
+            "/result/thread/modelProvider",
+            "/result/thread/source",
+        ] {
+            let mut state = new_state();
+            assert!(matches!(
+                state.feed(&init_response()).unwrap(),
+                Transition::SendThreadStart
+            ));
+            let mut response: Value =
+                serde_json::from_slice(&thread_start_response(CWD, THREAD_ID)).unwrap();
+            *response.pointer_mut(pointer).unwrap() = json!("drifted");
+            assert!(state.feed(&line(response)).is_err(), "{pointer}");
+        }
+
+        for pointer in ["/params/thread/modelProvider", "/params/thread/source"] {
+            let mut state = new_state();
+            assert!(matches!(
+                state.feed(&init_response()).unwrap(),
+                Transition::SendThreadStart
+            ));
+            assert!(matches!(
+                state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+                Transition::SendTurnStart { .. }
+            ));
+            let mut notification: Value =
+                serde_json::from_slice(&thread_started(THREAD_ID, CWD)).unwrap();
+            *notification.pointer_mut(pointer).unwrap() = json!("drifted");
+            assert!(state.feed(&line(notification)).is_err(), "{pointer}");
         }
     }
 

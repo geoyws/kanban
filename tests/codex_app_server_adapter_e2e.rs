@@ -49,6 +49,15 @@ impl Emit {
     }
 }
 
+fn mutate_emit_json(emit: &mut Emit, pointer: &str, value: Value) {
+    let Emit::Text(text) = emit else {
+        panic!("JSON mutation requires a text emission");
+    };
+    let mut parsed: Value = serde_json::from_str(text).unwrap();
+    *parsed.pointer_mut(pointer).unwrap() = value;
+    *text = parsed.to_string();
+}
+
 #[derive(Clone)]
 struct CommandScenario {
     stdout: Emit,
@@ -992,6 +1001,9 @@ fn compiled_process_rechecks_that_cwd_stays_empty_before_each_spawn() {
 
 #[test]
 fn compiled_process_initialize_response_user_agent_drift_is_fail_closed() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = fixture_with_path_mutation("init-user-agent-wrong", |paths, scenario| {
         let codex_home = paths.codex_home.canonicalize().unwrap();
         scenario.listen.response1 = Emit::text(json!({
@@ -1022,6 +1034,9 @@ fn compiled_process_initialize_response_user_agent_drift_is_fail_closed() {
 
 #[test]
 fn compiled_process_thread_cli_version_drift_is_fail_closed() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = fixture_with_path_mutation("thread-cli-version-wrong", |paths, scenario| {
         let cwd = paths.cwd.canonicalize().unwrap();
         scenario.listen.response2 = Emit::text(json!({
@@ -1068,7 +1083,87 @@ fn compiled_process_thread_cli_version_drift_is_fail_closed() {
 }
 
 #[test]
+fn compiled_process_thread_provider_and_source_drift_fail_closed() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for (label, pointer) in [
+        ("response-model-provider", "/result/modelProvider"),
+        (
+            "response-thread-model-provider",
+            "/result/thread/modelProvider",
+        ),
+        ("response-thread-source", "/result/thread/source"),
+    ] {
+        let fixture = fixture_with_mutation(label, |scenario| {
+            mutate_emit_json(&mut scenario.listen.response2, pointer, json!("drifted"));
+        });
+        let scenario = scenario_for_cwd(
+            &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+            &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+            &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+        );
+        let output = fixture.run(
+            &request(),
+            &schema_hash(&scenario.schema_client_request),
+            &schema_hash(&scenario.schema_protocol),
+            4_000,
+        );
+        assert_failure(&output);
+        let records = fixture.capture_records();
+        assert!(records.iter().any(|record| {
+            record["mode"] == "listen-stage"
+                && record["stage"] == "thread/start"
+                && record["phase"] == "received"
+        }));
+        assert!(!records.iter().any(|record| {
+            record["mode"] == "listen-stage"
+                && record["stage"] == "turn/start"
+                && record["phase"] == "received"
+        }));
+    }
+
+    for (label, pointer) in [
+        (
+            "notification-thread-model-provider",
+            "/params/thread/modelProvider",
+        ),
+        ("notification-thread-source", "/params/thread/source"),
+    ] {
+        let fixture = fixture_with_mutation(label, |scenario| {
+            mutate_emit_json(
+                &mut scenario.listen.thread_started,
+                pointer,
+                json!("drifted"),
+            );
+        });
+        let scenario = scenario_for_cwd(
+            &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+            &fixture.codex_home.canonicalize().unwrap().to_string_lossy(),
+            &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+        );
+        let output = fixture.run(
+            &request(),
+            &schema_hash(&scenario.schema_client_request),
+            &schema_hash(&scenario.schema_protocol),
+            4_000,
+        );
+        assert_failure(&output);
+        let records = fixture.capture_records();
+        assert!(records.iter().any(|record| {
+            record["mode"] == "listen-stage"
+                && record["stage"] == "thread/start"
+                && record["phase"] == "received"
+        }));
+    }
+}
+
+#[test]
 fn compiled_process_cwd_and_thread_identity_drift_are_independent() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cwd_fixture = fixture_with_path_mutation("cwd-mismatch", |paths, scenario| {
         let cwd = paths.cwd.canonicalize().unwrap();
         scenario.listen.response2 = Emit::text(json!({
@@ -1346,6 +1441,9 @@ fn compiled_process_protocol_and_policy_failures_are_sanitized() {
 
 #[test]
 fn compiled_process_turn_start_items_fail_closed_exactly_at_turn_start() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = fixture_with_mutation("turn-start-items", |scenario| {
         scenario.listen.response3 = Emit::plain(
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6c\",\"status\":\"inProgress\",\"items\":[{\"id\":\"u-1\",\"type\":\"userMessage\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]}}}",
@@ -1374,6 +1472,9 @@ fn compiled_process_turn_start_items_fail_closed_exactly_at_turn_start() {
 
 #[test]
 fn compiled_process_turn_started_notification_items_fail_closed_exactly_at_notification() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = fixture_with_mutation("turn-start-notification-items", |scenario| {
         scenario.listen.posts[0] = Emit::plain(
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6b\",\"turn\":{\"id\":\"01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6c\",\"status\":\"inProgress\",\"items\":[{\"id\":\"u-1\",\"type\":\"userMessage\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]}}}",
