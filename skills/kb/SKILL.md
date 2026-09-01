@@ -435,6 +435,22 @@ ornamental epics.
 kilobytes. Passing `--body` and `--body-file` together is refused — two answers
 to one question.
 
+**`--body-file` resolves on HAX, not where you typed it.** `hax-kb` and
+`kb-board` relay argv to the remote binary, so a path that exists on your
+machine and not on HAX fails with a bare `No such file or directory` naming the
+path, with no hint that the wrong host looked for it. Write the file locally,
+copy it over, then pass the remote path:
+
+```bash
+cat /tmp/plan.md | ssh hax 'cat > /tmp/plan.md'
+<skill-dir>/scripts/hax-kb t new "Title" --project NAME --body-file /tmp/plan.md --json
+```
+
+**`kb note` takes its body as a positional, not `--body`.** Unlike `task add`
+and `task update`, a note is written `kb n <task-id> "the note text" --as
+"$AGENT"`. Passing `--body` is refused as an unknown flag, and the refusal
+lists what is accepted — read it rather than guessing a second time.
+
 **Revising a plan keeps the old one.** `task update --body-file` records the
 previous body on the event trail, so the plan's history is
 `kb ev --task <epic-id> --json` and needs nobody to have kept a copy:
