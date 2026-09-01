@@ -1,7 +1,7 @@
 use crate::WATCH_BATCH_LIMIT;
 use crate::db::{
-    checkpoint, create_backup_target, integrity, open_board, open_registry, open_registry_readonly,
-    own_private_dir,
+    SnapshotSource, checkpoint, create_backup_target, integrity, open_board, open_registry,
+    open_registry_readonly, own_private_dir,
 };
 use crate::model::{
     Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, UnreachableRoot, WorkspaceRecord,
@@ -258,6 +258,12 @@ pub struct Registry {
     root: PathBuf,
 }
 
+impl SnapshotSource for Registry {
+    fn snapshot_connection(&self) -> &Connection {
+        &self.connection
+    }
+}
+
 impl Registry {
     pub fn open() -> Result<Self> {
         let root = data_root()?;
@@ -267,9 +273,21 @@ impl Registry {
     }
 
     pub fn open_readonly() -> Result<Self> {
-        let root = data_root()?;
+        Self::open_readonly_at(&data_root()?)
+    }
+
+    /// Open a named registry root read-only, without consulting the environment.
+    ///
+    /// `open_readonly` re-resolves `data_root()` on every call, which is wrong
+    /// for anything that polls: a watcher would re-read the environment four
+    /// times a second and could silently repoint mid-stream. Callers that
+    /// resolved their root once should keep using the root they resolved.
+    pub(crate) fn open_readonly_at(root: &Path) -> Result<Self> {
         let connection = open_registry_readonly(&root.join("registry.db"))?;
-        Ok(Self { connection, root })
+        Ok(Self {
+            connection,
+            root: root.to_path_buf(),
+        })
     }
 
     fn project_for_board_path(&self, board_path: &str) -> Result<ProjectRecord> {

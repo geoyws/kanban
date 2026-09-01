@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde_json::json;
 use std::cell::Cell;
 use std::fs::{self, Permissions};
@@ -1764,6 +1766,70 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// A reader whose queries all run on one SQLite connection.
+///
+/// Snapshotting one connection while reading from another is the defect
+/// `read_snapshot` exists to prevent. Be precise about how much of that the
+/// compiler actually holds, because the rest is convention:
+///
+/// Enforced — the value `read_snapshot` hands the closure is, by construction,
+/// the same value it opened the transaction on. There is no second parameter
+/// that could disagree with the first.
+///
+/// Enforced — `snapshot_connection` returns a borrow tied to `&self`, so an
+/// impl cannot open a connection inside the method and return it; that does not
+/// borrow-check. The connection has to be one the value already holds.
+///
+/// NOT enforced — that the closure body reads through the value it was handed.
+/// `read_snapshot(&store, |_| other.events_since(..))` compiles, and so does a
+/// body that opens its own reader and queries that. Nothing there is inside the
+/// transaction, and nothing says so. The convention is to shadow the parameter
+/// (`|store| ..`) so the outer handle is out of scope for the body; that is a
+/// habit, not a guarantee, and a reviewer still has to read the body.
+///
+/// Forward hazard — the property holds because every impl is a single-connection
+/// type: `Store` and `Registry` each own exactly one `connection`. A type
+/// holding two would satisfy this trait while its other connection stayed
+/// outside every snapshot, silently. Nothing here prevents that.
+pub trait SnapshotSource {
+    fn snapshot_connection(&self) -> &Connection;
+}
+
+impl SnapshotSource for Connection {
+    fn snapshot_connection(&self) -> &Connection {
+        self
+    }
+}
+
+/// Run `read` inside one deferred read transaction on `source`.
+///
+/// In WAL a deferred transaction takes its snapshot at the first read and
+/// holds it until the transaction ends, so every query `read` issues on this
+/// source observes one database state. A reader that decides something from
+/// two queries needs exactly that: run them on two snapshots and a commit
+/// landing between them lets the second query see a row the first never had a
+/// chance to reject, with nothing in either result to say so. Watch polls
+/// depend on this — see `watch::poll_once`.
+///
+/// Nothing is committed. Readers open with `query_only`, so the transaction
+/// exists only to pin the snapshot and is rolled back on the way out — and on
+/// the error path too, since `Transaction` drops with `DropBehavior::Rollback`.
+pub fn read_snapshot<S: SnapshotSource, T>(
+    source: &S,
+    read: impl FnOnce(&S) -> Result<T>,
+) -> Result<T> {
+    // Deferred is named, not inherited. `unchecked_transaction` reads the
+    // connection's mutable `transaction_behavior`, and BEGIN IMMEDIATE against
+    // a read-only `query_only` connection errors, which would propagate out of
+    // a poll and end the follow loop. The snapshot semantics are the whole
+    // correctness argument here, so the behavior is stated rather than assumed.
+    let snapshot =
+        Transaction::new_unchecked(source.snapshot_connection(), TransactionBehavior::Deferred)?;
+    let value = read(source)?;
+    snapshot.finish()?;
+    Ok(value)
+}
+
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
     migrate(&mut connection, REGISTRY_MIGRATIONS)?;
@@ -1933,6 +1999,50 @@ pub fn replace_database(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A held read snapshot hides commits that land while it is open.
+    ///
+    /// This is the guarantee `read_snapshot` sells and that `watch` spends, so
+    /// it is measured against a real WAL board opened exactly the way readers
+    /// open one — `SQLITE_OPEN_READ_ONLY`, `query_only`, no shared cache —
+    /// rather than assumed from the SQLite documentation.
+    #[test]
+    fn a_read_snapshot_hides_commits_that_land_while_it_is_open() {
+        let root =
+            std::env::temp_dir().join(format!("kanban-read-snapshot-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp snapshot dir");
+        let path = root.join("board.db");
+        let writer = open_board(&path).expect("open writable board");
+        crate::audit::append_board_event(&writer, None, "board_changed", "codex", "{}", 1)
+            .expect("append the seed event");
+        let reader = open_board_readonly(&path).expect("open read-only board");
+        let head = |connection: &Connection| -> i64 {
+            connection
+                .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
+                    row.get(0)
+                })
+                .expect("read ledger head")
+        };
+
+        read_snapshot(&reader, |reader| {
+            assert_eq!(head(reader), 1);
+            crate::audit::append_board_event(&writer, None, "board_changed", "codex", "{}", 2)
+                .expect("commit while the snapshot is held");
+            assert_eq!(
+                head(reader),
+                1,
+                "a held snapshot saw a commit that landed after it opened"
+            );
+            Ok(())
+        })
+        .expect("run the snapshot body");
+
+        assert_eq!(
+            head(&reader),
+            2,
+            "the snapshot outlived its read transaction"
+        );
+    }
+
     /// Every migration that exists is in the ladder that runs it.
     ///
     /// A migration can be written, reviewed and committed without ever being

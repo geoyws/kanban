@@ -1,9 +1,11 @@
 use crate::WATCH_BATCH_LIMIT;
+use crate::db::read_snapshot;
 use crate::model::{BOARD_EVENT_KINDS, Event, TASK_STATUSES};
 use crate::registry::{Registry, data_root};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -99,7 +101,9 @@ enum Source {
         path: PathBuf,
         board_name: Option<String>,
     },
-    Registry,
+    Registry {
+        root: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -161,8 +165,9 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
                 "--project, --workspace and --db address boards; registry watch uses the registry trail"
             );
         }
-        let registry_path = registry_source()?;
-        let registry_reader = Registry::open_readonly()?;
+        let registry_root = data_root()?;
+        let registry_path = registry_source(&registry_root)?;
+        let registry_reader = Registry::open_readonly_at(&registry_root)?;
         validate_kinds(&kinds, REGISTRY_EVENT_KINDS, |kind| {
             registry_reader.event_kind_exists(kind)
         })?;
@@ -188,7 +193,9 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
                 archived: false,
             },
         )?;
-        let source = Source::Registry;
+        let source = Source::Registry {
+            root: registry_root,
+        };
         ensure_cursor_within_head(&source, cursor)?;
         return Ok(WatchSpec {
             source,
@@ -299,14 +306,33 @@ fn resolve_with_source(args: &super::Args, direct_db: Option<PathBuf>) -> Result
     })
 }
 
-fn watch(spec: WatchSpec) -> Result<()> {
-    let mut cursor = spec.cursor;
-    let mut cursor_token = encode_cursor(&spec.key, cursor)?;
-    loop {
-        let batch = match &spec.source {
-            Source::Board { path, .. } => {
-                let store = Store::open_readonly(path)?;
-                store.events_since_filtered(
+/// What one poll observed, taken from a single database snapshot.
+///
+/// `tail_seq` is the highest sequence the unfiltered tail saw in the same
+/// snapshot that produced `batch`, so every row up to it was offered to the
+/// filtered scan and rejected. That is what makes it safe to move the cursor
+/// there: the rows being stepped over are known non-matches, not rows that
+/// arrived after the filtered scan had already run.
+struct Poll {
+    batch: Vec<Event>,
+    tail_seq: Option<i64>,
+}
+
+/// Read one poll's batch and tail from one snapshot of one connection.
+///
+/// The two reads used to run on two connections opened moments apart, which is
+/// two snapshots. A matching event committing between them was invisible to
+/// the filtered scan and visible to the tail, so the tail advanced the cursor
+/// past it and the next poll started after it. The event was never delivered
+/// and never reported missing. Both reads now sit inside one deferred read
+/// transaction, so a commit landing mid-poll is invisible to both and is
+/// picked up whole by the next poll.
+fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
+    match &spec.source {
+        Source::Board { path, .. } => {
+            let store = Store::open_readonly(path)?;
+            read_snapshot(&store, |store| {
+                let batch = store.events_since_filtered(
                     spec.key.selector_value.as_deref(),
                     &spec.key.kinds,
                     &spec.key.relations,
@@ -316,43 +342,150 @@ fn watch(spec: WatchSpec) -> Result<()> {
                     cursor,
                     spec.limit,
                     spec.key.archived,
-                )?
-            }
-            Source::Registry => {
-                let registry = Registry::open_readonly()?;
-                registry.rule_events_since_filtered(
+                )?;
+                let tail_seq = if batch.is_empty() && spec.follow {
+                    store
+                        .events_since(
+                            None,
+                            between_scans(&store.connection, cursor),
+                            spec.limit,
+                            spec.key.archived,
+                        )?
+                        .last()
+                        .map(|event| event.seq)
+                } else {
+                    None
+                };
+                Ok(Poll { batch, tail_seq })
+            })
+        }
+        Source::Registry { root } => {
+            let registry = Registry::open_readonly_at(root)?;
+            read_snapshot(&registry, |registry| {
+                let batch = registry.rule_events_since_filtered(
                     spec.key.selector_value.as_deref(),
                     &spec.key.kinds,
                     cursor,
                     spec.limit,
-                )?
-            }
-        };
-        if batch.is_empty() {
+                )?;
+                let tail_seq = if batch.is_empty() && spec.follow {
+                    registry
+                        .rule_events_since(
+                            spec.key.selector_value.as_deref(),
+                            None,
+                            between_scans(&registry.connection, cursor),
+                            spec.limit,
+                        )?
+                        .last()
+                        .map(|event| event.seq)
+                } else {
+                    None
+                };
+                Ok(Poll { batch, tail_seq })
+            })
+        }
+    }
+}
+
+/// Runs after a poll's filtered scan and before its tail scan, inside the
+/// poll's snapshot. Empty in every build but the unit tests, which use it to
+/// commit an event into exactly the window a two-snapshot poll used to leak.
+///
+/// It returns the cursor the tail scan reads from, and is `#[must_use]`, so the
+/// tail scan consumes its result and the seam cannot drift after the tail scan
+/// without the build going red. A seam that silently slid out of the window
+/// would leave the race test asserting nothing while still passing.
+#[must_use]
+#[cfg(not(test))]
+fn between_scans(_connection: &Connection, cursor: i64) -> i64 {
+    cursor
+}
+
+/// Fires inside a poll's snapshot, between the two scans, and returns the
+/// cursor the tail scan then reads from.
+#[cfg(test)]
+type BetweenScansHook = Box<dyn FnMut(&Connection, i64) -> i64>;
+
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_SCANS: std::cell::RefCell<Option<BetweenScansHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[must_use]
+#[cfg(test)]
+fn between_scans(connection: &Connection, cursor: i64) -> i64 {
+    let hook = BETWEEN_SCANS.with(|slot| slot.borrow_mut().take());
+    match hook {
+        Some(mut hook) => {
+            let cursor = hook(connection, cursor);
+            BETWEEN_SCANS.with(|slot| *slot.borrow_mut() = Some(hook));
+            cursor
+        }
+        None => cursor,
+    }
+}
+
+/// Install (or clear) the hook a poll runs between its two scans.
+///
+/// The hook is handed the reader connection, so a test can measure what the
+/// poll's snapshot exposes while the window is open, and it returns the cursor
+/// the tail scan then reads from, so a test can prove the tail really does read
+/// through this point rather than around it.
+#[cfg(test)]
+fn set_between_scans(hook: Option<BetweenScansHook>) {
+    BETWEEN_SCANS.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Uninstalls the hook when it drops, including on the way out of a panic.
+///
+/// The hook lives in a thread-local, and the test harness reuses threads under
+/// `--test-threads=1`, so a panicking test that cleared the hook on its last
+/// line would leave it installed for whatever ran next.
+#[cfg(test)]
+struct BetweenScans;
+
+#[cfg(test)]
+impl Drop for BetweenScans {
+    fn drop(&mut self) {
+        set_between_scans(None);
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn install_between_scans(hook: BetweenScansHook) -> BetweenScans {
+    set_between_scans(Some(hook));
+    BetweenScans
+}
+
+fn watch(spec: WatchSpec) -> Result<()> {
+    stream(&spec, &mut emit)
+}
+
+/// The follow loop, with its output behind a sink.
+///
+/// Split from `watch` so the cursor this loop publishes is measurable. The
+/// `advanced` heartbeat is the only place a cursor moves without an event being
+/// delivered, so if it encodes the wrong sequence a consumer either re-reads
+/// rows forever or steps over rows it never saw — and stdout is the only place
+/// that is visible. A sink that returns `Err` ends the stream, which is the
+/// same path a closed pipe already takes in production.
+fn stream(spec: &WatchSpec, sink: &mut dyn FnMut(&WatchEnvelope) -> Result<()>) -> Result<()> {
+    let mut cursor = spec.cursor;
+    let mut cursor_token = encode_cursor(&spec.key, cursor)?;
+    loop {
+        let poll = poll_once(spec, cursor)?;
+        if poll.batch.is_empty() {
             if !spec.follow {
                 return Ok(());
             }
-            let tail = match &spec.source {
-                Source::Board { path, .. } => Store::open_readonly(path)?.events_since(
-                    spec.key.selector_value.as_deref(),
-                    None,
-                    cursor,
-                    spec.limit,
-                    spec.key.archived,
-                )?,
-                Source::Registry => Registry::open_readonly()?.rule_events_since(
-                    spec.key.selector_value.as_deref(),
-                    None,
-                    cursor,
-                    spec.limit,
-                )?,
-            };
-            if let Some(event) = tail.last()
-                && needs_advanced_heartbeat(Some(cursor), event.seq)
+            if let Some(tail_seq) = poll.tail_seq
+                && needs_advanced_heartbeat(Some(cursor), tail_seq)
             {
-                cursor = event.seq;
+                cursor = tail_seq;
                 cursor_token = encode_cursor(&spec.key, cursor)?;
-                emit(&WatchEnvelope {
+                sink(&WatchEnvelope {
                     version: PROTOCOL_VERSION,
                     scope: scope_envelope(&spec.key, board_name(&spec.source)),
                     cursor: cursor_token.clone(),
@@ -362,7 +495,7 @@ fn watch(spec: WatchSpec) -> Result<()> {
                 sleep(POLL_INTERVAL);
                 continue;
             }
-            emit(&WatchEnvelope {
+            sink(&WatchEnvelope {
                 version: PROTOCOL_VERSION,
                 scope: scope_envelope(&spec.key, board_name(&spec.source)),
                 cursor: cursor_token.clone(),
@@ -372,10 +505,10 @@ fn watch(spec: WatchSpec) -> Result<()> {
             sleep(POLL_INTERVAL);
             continue;
         }
-        for event in batch {
+        for event in poll.batch {
             cursor = event.seq;
             cursor_token = encode_cursor(&spec.key, cursor)?;
-            emit(&WatchEnvelope {
+            sink(&WatchEnvelope {
                 version: PROTOCOL_VERSION,
                 scope: scope_envelope(&spec.key, board_name(&spec.source)),
                 cursor: cursor_token.clone(),
@@ -396,7 +529,7 @@ fn needs_advanced_heartbeat(emitted_cursor: Option<i64>, scan_cursor: i64) -> bo
 fn board_name(source: &Source) -> Option<String> {
     match source {
         Source::Board { board_name, .. } => board_name.clone(),
-        Source::Registry => None,
+        Source::Registry { .. } => None,
     }
 }
 
@@ -422,7 +555,7 @@ fn event_payload(event: Event, source: &Source) -> Result<Value> {
         Source::Board { path, board_name } => {
             project_board_event(event, path, board_name.as_deref())
         }
-        Source::Registry => project_event(event, None),
+        Source::Registry { .. } => project_event(event, None),
     }
 }
 
@@ -755,7 +888,7 @@ fn decode_cursor(raw: &str, expected: &StreamKey) -> Result<i64> {
 fn ensure_cursor_within_head(source: &Source, cursor: i64) -> Result<()> {
     let head = match source {
         Source::Board { path, .. } => board_head(path)?,
-        Source::Registry => registry_head()?,
+        Source::Registry { root } => registry_head(root)?,
     };
     if cursor > head {
         bail!("--cursor {cursor} is ahead of the current ledger head {head}");
@@ -772,8 +905,8 @@ fn board_head(path: &Path) -> Result<i64> {
         })?)
 }
 
-fn registry_head() -> Result<i64> {
-    let registry = Registry::open_readonly()?;
+fn registry_head(root: &Path) -> Result<i64> {
+    let registry = Registry::open_readonly_at(root)?;
     Ok(registry.connection.query_row(
         "SELECT COALESCE(MAX(seq),0) FROM rule_events",
         [],
@@ -789,8 +922,8 @@ fn canonical_source_path(path: &Path) -> Result<String> {
         .into_owned())
 }
 
-fn registry_source() -> Result<String> {
-    canonical_source_path(&data_root()?.join("registry.db"))
+fn registry_source(root: &Path) -> Result<String> {
+    canonical_source_path(&root.join("registry.db"))
 }
 
 fn board_name_for_path(path: &Path) -> Result<Option<String>> {
@@ -813,7 +946,9 @@ fn emit(envelope: &WatchEnvelope) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn identity() -> StreamKey {
@@ -829,6 +964,48 @@ mod tests {
             current_statuses: Vec::new(),
             tags: Vec::new(),
             archived: true,
+        }
+    }
+
+    fn ledger_head(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .expect("read board ledger head")
+    }
+
+    fn rule_ledger_head(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM rule_events", [], |row| {
+                row.get(0)
+            })
+            .expect("read registry ledger head")
+    }
+
+    /// A board watch that follows, matching only `task_moved`.
+    fn follow_spec(path: &Path, cursor: i64) -> WatchSpec {
+        WatchSpec {
+            source: Source::Board {
+                path: path.to_path_buf(),
+                board_name: None,
+            },
+            key: StreamKey {
+                source_kind: "board".to_owned(),
+                source: canonical_source_path(path).expect("canonical source"),
+                selector_kind: "board".to_owned(),
+                selector_value: None,
+                kind: Some("task_moved".to_owned()),
+                kinds: vec!["task_moved".to_owned()],
+                relations: Vec::new(),
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                archived: false,
+            },
+            cursor,
+            limit: 32,
+            follow: true,
         }
     }
 
@@ -1014,7 +1191,7 @@ mod tests {
             Source::Board { path, board_name } => {
                 project_board_event(fixture, path, board_name.as_deref()).unwrap()
             }
-            Source::Registry => unreachable!(),
+            Source::Registry { .. } => unreachable!(),
         };
         assert_eq!(projected, direct);
         assert_eq!(projected["schemaVersion"], 1);
@@ -1044,7 +1221,9 @@ mod tests {
                 "token": "private",
                 "rule": "visible"
             })),
-            &Source::Registry,
+            &Source::Registry {
+                root: PathBuf::from("/tmp/kanban-watch-registry"),
+            },
         )
         .unwrap();
         assert_eq!(projected["board"], Value::Null);
@@ -1231,7 +1410,7 @@ mod tests {
         let spec = resolve_with_source(&args, Some(path)).expect("resolve direct db");
         match spec.source {
             Source::Board { board_name, .. } => assert!(board_name.is_none()),
-            Source::Registry => panic!("expected board source"),
+            Source::Registry { .. } => panic!("expected board source"),
         }
     }
 
@@ -1346,6 +1525,409 @@ mod tests {
         assert!(
             error.contains("ahead of the current ledger head"),
             "{error}"
+        );
+    }
+
+    /// A poll must never step its cursor over an event its own filtered scan
+    /// could not have seen.
+    ///
+    /// The board is driven at exactly the interleaving that used to lose the
+    /// event: the filtered scan runs, a matching event commits, then the tail
+    /// scan runs. With the two scans on separate connections the tail saw the
+    /// new event, `watch` moved the cursor onto it, and the next poll started
+    /// after it — permanent, silent loss. With both scans inside one read
+    /// snapshot the commit is invisible to the poll that raced it and the next
+    /// poll delivers it.
+    #[test]
+    fn a_poll_never_advances_past_an_event_that_commits_between_its_two_scans() {
+        let root = temp_watch_dir("single-snapshot-poll");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "board_changed",
+            "codex",
+            "{}",
+            1,
+        )
+        .expect("append the seed event");
+
+        let spec = follow_spec(&path, 1);
+
+        let writer_path = path.clone();
+        let committed = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&committed);
+        // What the poll's own reader can see at the instant the window is open.
+        // Pinned at the pre-commit head, this proves the seam fires inside a
+        // live snapshot rather than before one was taken.
+        let observed = Rc::new(Cell::new(-1_i64));
+        let seen = Rc::clone(&observed);
+        let raced = {
+            let _seam = install_between_scans(Box::new(move |reader: &Connection, cursor: i64| {
+                if fired.replace(true) {
+                    return cursor;
+                }
+                let writer = crate::db::open_board(&writer_path).expect("open interposing writer");
+                crate::audit::append_board_event(
+                    &writer,
+                    Some("t-1"),
+                    "task_moved",
+                    "codex",
+                    "{}",
+                    2,
+                )
+                .expect("commit a matching event inside the poll window");
+                assert_eq!(
+                    ledger_head(&writer),
+                    2,
+                    "the interposed commit did not land"
+                );
+                seen.set(ledger_head(reader));
+                cursor
+            }));
+            poll_once(&spec, 1).expect("poll across the commit window")
+        };
+
+        assert!(committed.get(), "the interposing commit never ran");
+        assert_eq!(
+            observed.get(),
+            1,
+            "the seam fired outside the poll's snapshot: the reader saw head {} while the \
+             committed head was 2, so this test is no longer measuring the race window",
+            observed.get()
+        );
+        assert!(
+            raced.batch.is_empty(),
+            "the snapshot predates the commit, so the filtered scan cannot hold it"
+        );
+        assert_eq!(
+            raced.tail_seq, None,
+            "the poll moved its cursor onto an event its filtered scan never saw; \
+             that event is dropped and no consumer is told"
+        );
+
+        let delivered = poll_once(&spec, 1).expect("poll after the commit window");
+        assert_eq!(
+            delivered
+                .batch
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the next poll must deliver the event the raced poll declined to skip"
+        );
+        assert_eq!(delivered.batch[0].kind, "task_moved");
+
+        // The tail still has to advance past rows the filters reject, or the
+        // cursor would freeze behind unrelated board traffic.
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "board_changed",
+            "codex",
+            "{}",
+            3,
+        )
+        .expect("append an unmatched event");
+        let advanced = poll_once(&spec, 2).expect("poll past an unmatched event");
+        assert!(advanced.batch.is_empty());
+        assert_eq!(
+            advanced.tail_seq,
+            Some(3),
+            "an event already committed before the poll must still move the cursor"
+        );
+    }
+
+    #[test]
+    fn the_between_scans_hook_is_reusable_and_clears_and_passes_the_cursor_through() {
+        let root = temp_watch_dir("seam-reuse");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        let calls = Rc::new(RefCell::new(0_usize));
+        let counter = Rc::clone(&calls);
+        let _seam = install_between_scans(Box::new(move |_, cursor| {
+            *counter.borrow_mut() += 1;
+            cursor
+        }));
+        assert_eq!(between_scans(&store.connection, 41), 41);
+        assert_eq!(between_scans(&store.connection, 42), 42);
+        set_between_scans(None);
+        assert_eq!(between_scans(&store.connection, 43), 43);
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    /// Collect the envelopes a follow stream emits, stopping after `take`.
+    ///
+    /// The sink returning `Err` is how the loop ends here, which is the same
+    /// path a closed pipe takes in production (`reader_left` in `lib.rs`), so
+    /// this drives the real loop rather than a test-only variant of it.
+    fn collect_stream(spec: &WatchSpec, take: usize) -> Vec<WatchEnvelope> {
+        let mut captured: Vec<WatchEnvelope> = Vec::new();
+        let result = stream(spec, &mut |envelope| {
+            captured.push(envelope.clone());
+            if captured.len() >= take {
+                bail!("sink is done");
+            }
+            Ok(())
+        });
+        if captured.len() < take {
+            result.expect("stream ended before the sink had enough envelopes");
+        }
+        captured
+    }
+
+    fn envelope_state(envelope: &WatchEnvelope) -> String {
+        envelope
+            .payload
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The `advanced` heartbeat must publish the sequence the tail reached.
+    ///
+    /// This is the one place a cursor moves with no event delivered, so an
+    /// off-by-one here is invisible in the batch path and shows up only as a
+    /// consumer that re-reads the same rows forever. The two envelopes matter
+    /// jointly: the first pins the token the loop publishes, the second proves
+    /// the loop carried that cursor into the next iteration instead of
+    /// re-advancing over ground it had already covered.
+    #[test]
+    fn the_advanced_heartbeat_publishes_the_tail_sequence_and_the_loop_keeps_it() {
+        let root = temp_watch_dir("advanced-heartbeat");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "board_changed",
+            "codex",
+            "{}",
+            1,
+        )
+        .expect("append an unmatched event");
+
+        let spec = follow_spec(&path, 0);
+        let envelopes = collect_stream(&spec, 2);
+
+        assert_eq!(envelopes[0].kind, "heartbeat");
+        assert_eq!(envelope_state(&envelopes[0]), "advanced");
+        assert_eq!(
+            decode_cursor(&envelopes[0].cursor, &spec.key).expect("decode advanced cursor"),
+            1,
+            "the advanced heartbeat published a cursor that is not the sequence the tail reached"
+        );
+
+        assert_eq!(envelopes[1].kind, "heartbeat");
+        assert_eq!(
+            envelope_state(&envelopes[1]),
+            "idle",
+            "the loop re-advanced over ground it had already covered, so a follower \
+             never makes progress"
+        );
+        assert_eq!(
+            decode_cursor(&envelopes[1].cursor, &spec.key).expect("decode idle cursor"),
+            1,
+            "the loop did not carry the advanced cursor into the next iteration"
+        );
+    }
+
+    /// Matched events are delivered with their own sequence, and a non-follow
+    /// watch terminates on its own.
+    #[test]
+    fn a_bounded_watch_delivers_matched_events_with_their_cursors_and_then_stops() {
+        let root = temp_watch_dir("bounded-delivery");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        for (seq, kind) in [(1, "board_changed"), (2, "task_moved"), (3, "task_moved")] {
+            crate::audit::append_board_event(
+                &store.connection,
+                None,
+                kind,
+                "codex",
+                "{}",
+                seq as i64,
+            )
+            .expect("append event");
+        }
+
+        let mut spec = follow_spec(&path, 0);
+        spec.follow = false;
+        let mut captured = Vec::new();
+        stream(&spec, &mut |envelope| {
+            captured.push(envelope.clone());
+            Ok(())
+        })
+        .expect("a bounded watch must terminate on its own");
+        assert_eq!(captured.len(), 2);
+        for (envelope, seq) in captured.iter().zip([2, 3]) {
+            assert_eq!(envelope.kind, "event");
+            assert_eq!(
+                decode_cursor(&envelope.cursor, &spec.key).expect("decode event cursor"),
+                seq
+            );
+        }
+
+        // An empty bounded watch returns without emitting anything at all.
+        let mut empty = follow_spec(&path, 3);
+        empty.follow = false;
+        let mut nothing = Vec::new();
+        stream(&empty, &mut |envelope| {
+            nothing.push(envelope.clone());
+            Ok(())
+        })
+        .expect("an empty bounded watch must terminate");
+        assert!(nothing.is_empty());
+    }
+
+    /// The tail scan must read its cursor through the seam.
+    ///
+    /// Without this, a seam that drifts to *after* the tail scan is invisible:
+    /// inside a held snapshot no data a hook can observe distinguishes "before
+    /// the tail scan" from "after" it — that indistinguishability is precisely
+    /// the property the fix establishes. So the seam is made load-bearing
+    /// instead. The hook shifts the cursor the tail reads from, and the tail's
+    /// answer has to move with it; if the tail already ran, it answers from the
+    /// unshifted cursor and this fails.
+    #[test]
+    fn the_tail_scan_reads_its_cursor_through_the_seam() {
+        let root = temp_watch_dir("seam-placement");
+        let path = root.join("board.db");
+        let store = Store::open(&path).expect("open test board");
+        for seq in 1..=3 {
+            crate::audit::append_board_event(
+                &store.connection,
+                None,
+                "board_changed",
+                "codex",
+                "{}",
+                seq,
+            )
+            .expect("append an unmatched event");
+        }
+
+        let mut spec = follow_spec(&path, 0);
+        spec.limit = 1;
+
+        // No hook: the tail steps to the first row after cursor 0.
+        assert_eq!(
+            poll_once(&spec, 0).expect("unshifted poll").tail_seq,
+            Some(1)
+        );
+
+        // Hook shifts the tail's cursor forward by one, so the tail must answer
+        // from sequence 2 instead. A seam sitting after the tail scan cannot
+        // move this number.
+        let shifted = {
+            let _seam = install_between_scans(Box::new(|_, cursor| cursor + 1));
+            poll_once(&spec, 0).expect("shifted poll")
+        };
+        assert_eq!(
+            shifted.tail_seq,
+            Some(2),
+            "the tail scan did not read its cursor through the seam, so the seam is no \
+             longer sitting between the two scans and every race test using it is vacuous"
+        );
+    }
+
+    /// The registry arm loses events across a two-snapshot poll exactly as the
+    /// board arm did, so it gets the same proof rather than an argument that it
+    /// shares a helper.
+    #[test]
+    fn a_registry_poll_never_advances_past_a_rule_event_committed_between_its_scans() {
+        let root = temp_watch_dir("registry-single-snapshot");
+        let registry_db = root.join("registry.db");
+        let writer = crate::db::open_registry(&registry_db).expect("create the test registry");
+        crate::audit::append_registry_event(&writer, "rule-1", "rule_updated", "codex", "{}", 1)
+            .expect("append an unmatched rule event");
+
+        let spec = WatchSpec {
+            source: Source::Registry { root: root.clone() },
+            key: StreamKey {
+                source_kind: "registry".to_owned(),
+                source: registry_source(&root).expect("registry source"),
+                selector_kind: "registry".to_owned(),
+                selector_value: None,
+                kind: Some("rule_added".to_owned()),
+                kinds: vec!["rule_added".to_owned()],
+                relations: Vec::new(),
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                archived: false,
+            },
+            cursor: 1,
+            limit: 32,
+            follow: true,
+        };
+
+        let registry_path = registry_db.clone();
+        let committed = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&committed);
+        let observed = Rc::new(Cell::new(-1_i64));
+        let seen = Rc::clone(&observed);
+        let raced = {
+            let _seam = install_between_scans(Box::new(move |reader: &Connection, cursor: i64| {
+                if fired.replace(true) {
+                    return cursor;
+                }
+                let writer = crate::db::open_registry(&registry_path)
+                    .expect("open interposing registry writer");
+                crate::audit::append_registry_event(
+                    &writer,
+                    "rule-2",
+                    "rule_added",
+                    "codex",
+                    "{}",
+                    2,
+                )
+                .expect("commit a matching rule event inside the poll window");
+                assert_eq!(
+                    rule_ledger_head(&writer),
+                    2,
+                    "the interposed commit did not land"
+                );
+                seen.set(rule_ledger_head(reader));
+                cursor
+            }));
+            poll_once(&spec, 1).expect("poll across the commit window")
+        };
+
+        assert!(committed.get(), "the interposing commit never ran");
+        assert_eq!(
+            observed.get(),
+            1,
+            "the seam fired outside the registry poll's snapshot, so this test is no \
+             longer measuring the race window"
+        );
+        assert!(raced.batch.is_empty());
+        assert_eq!(
+            raced.tail_seq, None,
+            "the registry poll moved its cursor onto a rule event its filtered scan \
+             never saw; that event is dropped and no consumer is told"
+        );
+
+        let delivered = poll_once(&spec, 1).expect("poll after the commit window");
+        assert_eq!(
+            delivered
+                .batch
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(delivered.batch[0].kind, "rule_added");
+
+        crate::audit::append_registry_event(&writer, "rule-3", "rule_updated", "codex", "{}", 3)
+            .expect("append another unmatched rule event");
+        let advanced = poll_once(&spec, 2).expect("poll past an unmatched rule event");
+        assert!(advanced.batch.is_empty());
+        assert_eq!(
+            advanced.tail_seq,
+            Some(3),
+            "a rule event committed before the poll must still move the cursor"
         );
     }
 }

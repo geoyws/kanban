@@ -1,6 +1,7 @@
 use crate::WATCH_BATCH_LIMIT;
 use crate::db::{
-    checkpoint as wal_checkpoint, create_backup_target, integrity, open_board, open_board_readonly,
+    SnapshotSource, checkpoint as wal_checkpoint, create_backup_target, integrity, open_board,
+    open_board_readonly,
 };
 use crate::model::*;
 use crate::registry::now_ms;
@@ -1654,6 +1655,12 @@ fn eligible_claim_candidates(
     })
 }
 
+impl SnapshotSource for Store {
+    fn snapshot_connection(&self) -> &Connection {
+        &self.connection
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut store = Self {
@@ -2524,10 +2531,24 @@ impl Store {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)]
+    /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
+    ///
+    /// Deliberately board-wide: watch reads this as the tail that lets a cursor
+    /// move past rows its filtered scan rejected, so it has to see the rows
+    /// that do not match. It used to take a `task` parameter the SQL never
+    /// bound, so a caller could pass a selector and silently receive board-wide
+    /// rows anyway; the parameter is removed rather than honoured, because a
+    /// task-scoped board tail would stall the cursor behind other tasks'
+    /// traffic. Subject-scoped reads belong in `events_since_filtered`.
+    ///
+    /// This reasoning is about the board tail only. The registry twin,
+    /// `Registry::rule_events_since`, does bind its selector, so a
+    /// `--rule R --follow` watch has exactly the rule-scoped tail argued
+    /// against here. That asymmetry is deliberate and pre-existing: rule trails
+    /// are sparse enough that a stalled cursor costs little, and narrowing a
+    /// tail is always safe. Do not "fix" the registry to match this one.
     pub fn events_since(
         &self,
-        _task: Option<&str>,
         kind: Option<&str>,
         cursor: i64,
         limit: i64,
@@ -7504,7 +7525,7 @@ mod tests {
             .unwrap();
         store.remove_task("t-removed", "test", false).unwrap();
         let events = store
-            .events_since(Some("t-removed"), Some("task_removed"), 0, 10, true)
+            .events_since(Some("task_removed"), 0, 10, true)
             .unwrap();
         assert_eq!(events.len(), 1);
         let filtered = store
@@ -8068,17 +8089,17 @@ mod tests {
         .expect("append fifth event");
 
         let all = store
-            .events_since(None, None, 0, 10, true)
+            .events_since(None, 0, 10, true)
             .expect("read all board events");
         assert_eq!(board_event_seqs(&all), vec![1, 2, 3, 4, 5]);
 
         let active = store
-            .events_since(None, None, 0, 10, false)
+            .events_since(None, 0, 10, false)
             .expect("read active board events");
         assert_eq!(board_event_seqs(&active), vec![1, 2, 4, 5]);
 
         let empty = store
-            .events_since(None, None, 0, 0, true)
+            .events_since(None, 0, 0, true)
             .expect("zero limit is allowed");
         assert!(empty.is_empty());
 
@@ -8138,13 +8159,13 @@ mod tests {
         assert_eq!(board_event_seqs(&third_batch), vec![4]);
 
         let negative = store
-            .events_since(None, None, 0, -1, true)
+            .events_since(None, 0, -1, true)
             .expect_err("negative limits must be rejected")
             .to_string();
         assert!(negative.contains("1000"), "{negative}");
 
         let over = store
-            .events_since(None, None, 0, crate::WATCH_BATCH_LIMIT + 1, true)
+            .events_since(None, 0, crate::WATCH_BATCH_LIMIT + 1, true)
             .expect_err("over-cap limits must be rejected")
             .to_string();
         assert!(over.contains("1000"), "{over}");
