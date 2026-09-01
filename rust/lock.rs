@@ -19,6 +19,7 @@ use crate::db::own_private_dir;
 use crate::registry::data_root;
 use anyhow::{Context, Result, bail};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -146,15 +147,65 @@ pub fn touches_data_root(direct_db: Option<&Path>) -> bool {
 }
 
 /// Whether `board` resolves to somewhere under `root`.
+///
+/// Asked of three spellings, because a symlink decides it the wrong way in
+/// every direction and no one spelling catches them all.
+///
+/// Lexically alone, a board at `<root>/boards/x.db` reached through a symlink
+/// somewhere else compared as *outside* the root and took no lock at all, so a
+/// `restore` holding the root exclusively did not exclude the process mutating
+/// a database file it was about to rename over; a symlinked root has the mirror
+/// problem, where a board genuinely inside it compares as outside.
+///
+/// Resolved alone, a link that lives *inside* the root but points out of it
+/// would stop being locked, and that link is itself a name inside the root that
+/// a restore replaces.
+///
+/// Resolved after [`absolute`] alone still misses the traversal that runs the
+/// other way. `absolute` collapses `..` first, so `/outside/link/../a.db` with
+/// `link -> <root>/boards` becomes `/outside/a.db` and the component that put
+/// the board inside the root is gone before anything is resolved — while the
+/// kernel follows `link` first and opens `<root>/a.db`. So the third spelling
+/// hands the path over exactly as written and lets `canonicalize` order the
+/// `..` against the symlinks around it.
+///
+/// Any spelling landing inside is enough. That is what keeps this additive: the
+/// first disjunct is the whole of the comparison this replaced, so resolving
+/// can only ever add locks, never remove one.
 fn contains(root: &Path, board: &Path) -> bool {
-    absolute(board).starts_with(absolute(root))
+    let lexical_root = absolute(root);
+    let lexical_board = absolute(board);
+    // The board most invocations name is plainly inside the root, and this
+    // answers those without touching the filesystem at all.
+    lexical_board.starts_with(&lexical_root)
+        || resolves_inside(&lexical_root, &lexical_board)
+        || resolves_inside(&uncollapsed(root), &uncollapsed(board))
+}
+
+/// The same question asked of the paths the kernel would actually follow.
+///
+/// Unresolvable on either side answers "inside", matching
+/// `touches_data_root(None)`: there is no half-resolved pair worth comparing,
+/// and a shared lock nothing needed costs a syscall where a missing one is the
+/// race this module exists to close. Each side is resolved only if the one
+/// before it answered, so an unresolvable root costs one walk rather than two.
+fn resolves_inside(root: &Path, board: &Path) -> bool {
+    let Some(root) = real_path(root) else {
+        return true;
+    };
+    let Some(board) = real_path(board) else {
+        return true;
+    };
+    board.starts_with(root)
 }
 
 /// Absolute, with `.` and `..` resolved lexically.
 ///
-/// `fs::canonicalize` is not usable here: the board file often does not exist
-/// yet, and whether a path is inside the data root must not depend on whether
-/// it has been created.
+/// Lexically, and before [`real_path`] rather than after: `..` past a symlink
+/// names two different directories depending on which is applied first, and the
+/// lexical reading is the one that keeps `<root>/link/../x` inside the root.
+/// Following `link` out of the tree first would call that same path outside and
+/// drop the lock.
 fn absolute(path: &Path) -> PathBuf {
     let mut out = if path.is_absolute() {
         PathBuf::new()
@@ -173,9 +224,97 @@ fn absolute(path: &Path) -> PathBuf {
     out
 }
 
+/// Absolute with nothing collapsed, so `..` is left for the kernel to order
+/// against the symlinks around it.
+///
+/// The counterpart to [`absolute`] rather than a replacement for it, because
+/// the two disagree exactly where it matters and [`contains`] wants a lock if
+/// either says inside: `<root>/link/../x` is inside the root under the lexical
+/// reading and outside it under this one, and `/outside/link/../x` with `link`
+/// pointing into the root is the reverse.
+fn uncollapsed(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_default().join(path)
+    }
+}
+
+/// `path` with symlinks resolved as far as the filesystem allows.
+///
+/// `fs::canonicalize` on its own is not usable here: the board file often does
+/// not exist yet, and whether a path is inside the data root must not depend on
+/// whether it has been created. So this canonicalizes the deepest ancestor that
+/// does exist and rejoins the rest lexically. A `--db` target's parent
+/// directory exists in every case that matters, which is what makes the
+/// symlinks that decide the answer resolvable while a board yet to be created
+/// still compares correctly.
+///
+/// An ancestor that exists but will not resolve — an unreadable directory, a
+/// symlink loop — simply ends the resolution there and keeps its lexical
+/// spelling, which leaves a board inside the root inside it. `None` is the
+/// narrower case of nothing resolving at all, the filesystem root included; a
+/// relative path whose working directory has been deleted is the one that
+/// happens.
+fn real_path(path: &Path) -> Option<PathBuf> {
+    let mut trailing: Vec<&OsStr> = Vec::new();
+    let mut probe = path;
+    loop {
+        if let Ok(resolved) = probe.canonicalize() {
+            let mut out = resolved;
+            for part in trailing.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        trailing.push(probe.file_name()?);
+        probe = probe.parent()?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock moved backwards")
+            .as_nanos()
+    }
+
+    /// Real directories on a real filesystem, because every case below turns on
+    /// what the kernel does with a symlink. String fixtures would pass against
+    /// the lexical comparison these tests exist to rule out.
+    fn temp_root(label: &str) -> TempRoot {
+        let root = env::temp_dir().join(format!(
+            "kanban-lock-{label}-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        fs::create_dir_all(&root).expect("create temp lock dir");
+        TempRoot(root)
+    }
+
+    /// A board file where the registry would put one.
+    fn board_in(root: &Path) -> PathBuf {
+        let boards = root.join("boards");
+        fs::create_dir_all(&boards).expect("create boards dir");
+        let board = boards.join("a.db");
+        fs::write(&board, b"").expect("create board file");
+        board
+    }
 
     #[test]
     fn absolute_resolves_traversal_without_touching_the_filesystem() {
@@ -205,5 +344,156 @@ mod tests {
     #[test]
     fn a_registry_resolved_command_always_takes_the_lock() {
         assert!(touches_data_root(None));
+    }
+
+    #[test]
+    fn a_symlink_from_outside_the_root_to_a_board_inside_it_is_inside() {
+        let temp = temp_root("symlinked-board");
+        let root = temp.0.join("root");
+        let board = board_in(&root);
+        let link = temp.0.join("link.db");
+        symlink(&board, &link).expect("symlink the board");
+        assert!(
+            contains(&root, &link),
+            "a symlink is another name for the board it points at, and writing \
+             through it mutates the very file restore renames"
+        );
+    }
+
+    #[test]
+    fn a_board_under_a_symlinked_data_root_is_inside_it() {
+        let temp = temp_root("symlinked-root");
+        let real = temp.0.join("real-root");
+        let board = board_in(&real);
+        let root = temp.0.join("root-link");
+        symlink(&real, &root).expect("symlink the root");
+        assert!(
+            contains(&root, &board),
+            "a symlinked root must not put its own boards outside itself"
+        );
+        assert!(
+            contains(&root, &real.join("boards/not-created-yet.db")),
+            "and a board that root has yet to create is inside it too"
+        );
+    }
+
+    #[test]
+    fn a_board_that_does_not_exist_yet_is_placed_by_the_ancestors_that_do() {
+        let temp = temp_root("absent-board");
+        let root = temp.0.join("root");
+        fs::create_dir_all(root.join("boards")).expect("create boards dir");
+        assert!(
+            contains(&root, &root.join("boards/new.db")),
+            "the board an init is about to create is data-root state already"
+        );
+        assert!(
+            contains(&root, &root.join("does/not/exist/yet.db")),
+            "a whole missing subtree still hangs under the root"
+        );
+        assert!(
+            !contains(&root, &temp.0.join("outside.db")),
+            "resolving what exists must not drag an unrelated path inside"
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_the_root_pointing_out_of_it_is_still_locked() {
+        let temp = temp_root("escaping-symlink");
+        let root = temp.0.join("root");
+        fs::create_dir_all(&root).expect("create root");
+        let outside = temp.0.join("outside.db");
+        fs::write(&outside, b"").expect("create the outside board");
+        let link = root.join("link.db");
+        symlink(&outside, &link).expect("symlink out of the root");
+        assert!(
+            contains(&root, &link),
+            "the link is a name inside the root and restore replaces names, so \
+             resolving must only ever add locks"
+        );
+    }
+
+    #[test]
+    fn resolution_stops_at_the_deepest_ancestor_that_exists() {
+        let temp = temp_root("deepest-ancestor");
+        let real = temp.0.join("real");
+        fs::create_dir_all(&real).expect("create real dir");
+        let link = temp.0.join("link");
+        symlink(&real, &link).expect("symlink the dir");
+        let resolved = real
+            .canonicalize()
+            .expect("canonicalize real dir")
+            .join("absent/board.db");
+        assert_eq!(
+            real_path(&link.join("absent/board.db")),
+            Some(resolved),
+            "the symlinked prefix resolves and the missing tail is rejoined"
+        );
+    }
+
+    #[test]
+    fn a_board_reached_through_a_symlink_into_the_root_is_inside_it() {
+        let temp = temp_root("traversal-through-symlink");
+        let root = temp.0.join("root");
+        fs::create_dir_all(root.join("boards")).expect("create boards dir");
+        let board = root.join("a.db");
+        fs::write(&board, b"").expect("create board file");
+        let outside = temp.0.join("outside");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        let link = outside.join("link");
+        symlink(root.join("boards"), &link).expect("symlink into the root");
+
+        // The premise, from the kernel rather than from this module: following
+        // `link` before `..` lands on a board inside the root.
+        let spelled = link.join("../a.db");
+        assert_eq!(
+            spelled.canonicalize().expect("resolve the spelling"),
+            board.canonicalize().expect("resolve the board"),
+            "the kernel opens this path inside the root"
+        );
+        assert!(
+            contains(&root, &spelled),
+            "collapsing `..` first destroys the symlink that put this board \
+             inside the root"
+        );
+        assert!(
+            contains(&root, &link.join("../not-created-yet.db")),
+            "and the same for a board that root has yet to create"
+        );
+    }
+
+    #[test]
+    fn an_uncollapsed_path_keeps_its_traversal_and_gains_a_root() {
+        assert_eq!(
+            uncollapsed(Path::new("/a/link/../b")),
+            PathBuf::from("/a/link/../b"),
+            "`..` is left for the kernel, not collapsed away from it"
+        );
+        let relative = uncollapsed(Path::new("boards/../a.db"));
+        assert!(relative.is_absolute());
+        assert!(
+            relative.ends_with("boards/../a.db"),
+            "the working directory is prepended and nothing else changes"
+        );
+    }
+
+    #[test]
+    fn a_path_that_will_not_resolve_at_all_fails_closed() {
+        assert!(
+            real_path(Path::new(".")).is_some(),
+            "an ordinary relative path resolves through the working directory"
+        );
+        // What `absolute` hands over when `current_dir` fails, which is what a
+        // deleted working directory does to a relative `--db`.
+        let nowhere = PathBuf::from(format!("kanban-lock-nowhere-{}", unique()));
+        assert!(real_path(&nowhere).is_none());
+        assert!(
+            resolves_inside(Path::new("/var/lib/kanban"), &nowhere),
+            "nothing resolved, so take the lock: the same direction as \
+             touches_data_root(None)"
+        );
+        assert!(
+            resolves_inside(&nowhere, Path::new("/var/lib/kanban")),
+            "and the same when it is the root that will not resolve"
+        );
     }
 }

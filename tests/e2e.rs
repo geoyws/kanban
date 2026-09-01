@@ -4227,6 +4227,99 @@ fn compiled_binary_locks_the_data_root_even_when_the_environment_names_a_board()
     );
 }
 
+/// A `--db` that reaches a data-root board through a symlink still locks it.
+///
+/// `lock::contains` compared lexically absolute paths, resolving `.` and `..`
+/// textually and symlinks not at all. A board at `<data root>/boards/<uuid>.db`
+/// addressed as `/tmp/link.db` therefore compared as *outside* the root and took
+/// no lock, so `kanban task add --db /tmp/link.db` mutated a database file while
+/// a `restore` holding the root exclusively believed it had every writer
+/// excluded — and that restore renames whole files into place behind SQLite's
+/// back, which is the one thing no transaction can protect against.
+///
+/// A symlink is one `ln -s` away in an agent cage, and the lock lives in the
+/// kernel, so this can only be measured across a real process boundary: the
+/// test holds the flock itself and watches the compiled binary contend.
+#[test]
+fn compiled_binary_locks_the_data_root_for_a_board_reached_through_a_symlink() {
+    let fixture = Fixture::new("lock-vs-symlinked-board");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let board = board_path_for_project(&fixture, &fixture.main, "Alpha");
+    assert!(
+        board
+            .canonicalize()
+            .unwrap()
+            .starts_with(fixture.data.canonicalize().unwrap()),
+        "the registry put the board somewhere other than the data root: {}",
+        board.display()
+    );
+    // The board is inside the data root. This name for it is not.
+    let link = fixture.root.join("link.db");
+    std::os::unix::fs::symlink(&board, &link).unwrap();
+    let link_arg = link.to_str().unwrap().to_owned();
+    let through_link = |args: &[&str]| -> Output {
+        fixture
+            .command(&fixture.main)
+            .args(args)
+            .args(["--db", &link_arg, "--json"])
+            .output()
+            .unwrap()
+    };
+
+    // A restore holds the root exclusively. Writing through the symlink is
+    // writing to a file that restore is about to rename over, so it must queue
+    // behind it rather than walk straight past.
+    let held = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(fixture.data.join(".lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let blocked = through_link(&["task", "add", "written under a restore"]);
+    assert!(
+        !blocked.status.success(),
+        "a symlinked --db wrote to a data-root board through a restore's \
+         exclusive lock"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr).into_owned();
+    assert!(
+        stderr.contains("restore is replacing"),
+        "the symlinked --db did not wait on the shared lock: {stderr}"
+    );
+    drop(held);
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["task", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the refused write landed on the board anyway"
+    );
+
+    // And nothing else changed: with the root free the same command works, and
+    // it works on the board the symlink points at.
+    let added = through_link(&[
+        "task",
+        "add",
+        "written with the root free",
+        "--id",
+        "t-through-link",
+    ]);
+    assert!(
+        added.status.success(),
+        "the symlinked --db stopped working: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert_eq!(
+        listed[0]["id"].as_str(),
+        Some("t-through-link"),
+        "the write did not land on the registered board: {listed}"
+    );
+}
+
 /// A selector the manifest says an operation accepts actually works on it.
 ///
 /// The mirror of the refusal sweep, and the one that is not self-referential.
