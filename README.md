@@ -256,6 +256,23 @@ reads alpha. Two flags are a different thing: `--project alpha --db /tmp/x.db`
 is refused rather than resolved, because the values disagree and nothing in the
 receipt would say which one was used.
 
+A selector applies only to a command that resolves one board. `doctor`,
+`dashboard`, `backup`, `restore`, `audit verify`, `serve`, `schema`, `mcp` and
+the `workspace` and `rule` subcommands address the registry instead, so they
+refuse a selector by name rather than accepting and discarding it:
+`doctor --db PATH` used to answer `healthy: true` about every registered board,
+which is the wrong answer in the one shape an operator believes. `init` and
+`workspace attach` honour `--workspace`, which names a tree rather than a board,
+and refuse the other two. `events --registry` and `events --rule` read the
+registry trail and refuse all three, as `watch` already did.
+
+Refusing is also what keeps the data-root lock honest. The lock decides its
+scope from the board an invocation addresses, so while these commands accepted a
+`--db` they ignored, that flag's only effect was to *suppress* the lock:
+`KANBAN_DB=/tmp/elsewhere.db kanban restore --force` replaced the whole data
+root with no exclusive lock at all. A command that discards a selector now locks
+as though none were given.
+
 ```bash
 kanban task list --project my-project          # from any directory
 export KANBAN_PROJECT=my-project               # or once per shell or agent cage
@@ -283,9 +300,11 @@ path that does not exist and `task add` will start a board there, because that
 is indistinguishable from asking for one.
 
 `kanban schema --json` publishes this: each operation carries `readOnly` (writes
-nothing anywhere) and `createsBoard` (may bring a board file into existence).
-They are different questions — `todo` writes a file, so it is not read-only, and
-it still may not create a board — and adapters can rely on both.
+nothing anywhere), `createsBoard` (may bring a board file into existence) and
+`ignoredSelectors` (the board selectors it refuses). The first two are different
+questions — `todo` writes a file, so it is not read-only, and it still may not
+create a board — and adapters can rely on all three: the MCP tool builder reads
+`ignoredSelectors` so no tool offers an input the CLI would reject.
 
 Project names are not unique. If two boards share one, `--project` refuses and
 names every candidate, including rootless boards; use `--workspace PATH` or a

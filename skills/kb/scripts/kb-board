@@ -20,6 +20,16 @@ for arg in "$@"; do
         die 'kb-board is for board-owned commands only; use hax-kb directly for registry rules (for example: hax-kb r ls --json).'
       fi
       ;;
+    # Registry-wide commands answer about every board, so a project selector
+    # names a subject they do not address. Kanban refuses it rather than
+    # discarding it, because a receipt computed about something else reads as
+    # an answer about the board you named. Refuse here too, so the wrapper
+    # that injects the selector is what explains it.
+    init|serve|schema|mcp|doctor|backup|restore|audit|dashboard|dash|w|ws|workspace)
+      if [ "$arg" = "$kb_command" ]; then
+        die "kb-board injects --project, and '$kb_command' addresses the registry and every board in it, not one board; use hax-kb directly (for example: hax-kb $kb_command --json)."
+      fi
+      ;;
     --project|--project=*|--workspace|--workspace=*|--db|--db=*)
       die "kb-board injects exactly one project selector; remove '$arg' and retry."
       ;;

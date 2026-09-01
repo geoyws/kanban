@@ -3822,6 +3822,475 @@ fn compiled_binary_lets_a_typed_selector_override_its_environment_default() {
     );
 }
 
+/// A board selector a command cannot honour is refused by name, not discarded.
+///
+/// `--db`, `--project` and `--workspace` are global flags, so every command
+/// parses them and `reject_unknown` exempts them. A command that surveys the
+/// registry instead of resolving one board therefore took a selector and threw
+/// it away. `doctor --db /nowhere/absent.db --json` answered
+/// `{"healthy": true, "projects": [...]}` — a survey of every registered board,
+/// handed to an operator who had pointed the health check at one file that was
+/// not even there. That is the worst shape a wrong answer can take: green, and
+/// about a different subject. `backup --db` was the same defect with a quieter
+/// receipt, and both skipped the data-root lock on the way, because
+/// `lock::touches_data_root` asks whether the `--db` path lies inside the data
+/// root and the command then ignored that path entirely — so
+/// `restore --db /tmp/elsewhere.db --force` replaced the whole data root
+/// without the exclusive lock that exists to keep readers off it.
+///
+/// This has to cross a real process boundary. The discard happens in argument
+/// dispatch, above every resolver, so an in-process test of a resolver never
+/// sees the command line that produced it.
+#[test]
+fn compiled_binary_refuses_a_board_selector_the_command_would_discard() {
+    let fixture = Fixture::new("ignored-selectors");
+    let alpha = fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let alpha_board = alpha["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "Beta", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "alpha work", "--id", "t-alpha", "--json"],
+    );
+    // Absent throughout: a refusal must not stand a board up on its way out.
+    let ghost = fixture.root.join("ghost.db");
+    let ghost_path = ghost.to_str().unwrap().to_owned();
+    let worktree_path = fixture.worktree.to_str().unwrap().to_owned();
+
+    // (1) The headline case, in both the shape that made it dangerous and the
+    // shape that made it plausible: a path that is not there, and a real board.
+    for path in [&ghost_path, &alpha_board] {
+        let output = fixture.run(&fixture.main, &["doctor", "--db", path, "--json"]);
+        assert!(
+            !output.status.success(),
+            "doctor --db {path} reported on every board and exited zero"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            !stdout.contains("healthy"),
+            "the refusal still printed a health receipt: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("--db"),
+            "the refusal does not name --db: {stderr}"
+        );
+        assert!(stderr.contains("doctor"), "{stderr}");
+        assert!(
+            stderr.contains("checks the registry and every board in it"),
+            "the refusal does not say what doctor addresses instead: {stderr}"
+        );
+    }
+    assert!(
+        !ghost.exists(),
+        "a refused doctor conjured the board it refused"
+    );
+
+    // (2) `backup` next, because its receipt is quiet enough to be believed:
+    // `{"boards": []}` for a board that was never inspected. Nothing may be
+    // written either — the refusal has to land before the snapshot starts.
+    let output = fixture.run(&fixture.main, &["backup", "--db", &ghost_path, "--json"]);
+    assert!(
+        !output.status.success(),
+        "backup --db snapshotted every board"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("--db"), "{stderr}");
+    assert!(
+        stderr.contains("snapshots the registry and every board in it"),
+        "{stderr}"
+    );
+    assert!(
+        !fixture.data.join("backups").exists(),
+        "the refused backup wrote a snapshot anyway"
+    );
+
+    // (3) Every selector every command declares it discards, driven from the
+    // manifest rather than restated here, and with values that are otherwise
+    // perfectly good: `--project Beta` names a real project, and it is still
+    // refused, because this command was never going to read it.
+    let manifest = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let mut checked = 0;
+    for operation in manifest["operations"].as_array().unwrap() {
+        let ignored = operation["ignoredSelectors"].as_array().unwrap();
+        if ignored.is_empty() {
+            continue;
+        }
+        let command = operation["command"].as_str().unwrap();
+        let sub = operation["subcommand"].as_str();
+        for selector in ignored {
+            let selector = selector.as_str().unwrap();
+            let value = match selector {
+                "db" => ghost_path.as_str(),
+                "project" => "Beta",
+                "workspace" => worktree_path.as_str(),
+                other => panic!("unexpected selector {other}"),
+            };
+            let flag = format!("--{selector}");
+            let mut args = vec![command];
+            args.extend(sub);
+            args.extend([flag.as_str(), value, "--json"]);
+            let output = fixture.run(&fixture.main, &args);
+            assert!(
+                !output.status.success(),
+                "{args:?} accepted a selector the manifest says it discards"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                stderr.contains(&flag),
+                "{args:?} was refused without naming {flag}: {stderr}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 30,
+        "the manifest declared only {checked} ignored selectors; the table shrank"
+    );
+    assert!(!ghost.exists());
+
+    // (4) `events --registry` and `events --rule` read the registry trail, and
+    // `watch` has refused a board selector on that trail since it was written.
+    // The two spoke differently about the same command line.
+    for args in [
+        vec![
+            "events",
+            "--registry",
+            "--db",
+            ghost_path.as_str(),
+            "--json",
+        ],
+        vec![
+            "events",
+            "--rule",
+            "r-nothing",
+            "--project",
+            "Beta",
+            "--json",
+        ],
+    ] {
+        let output = fixture.run(&fixture.main, &args);
+        assert!(!output.status.success(), "{args:?} took a board selector");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("read the registry trail"),
+            "{args:?}: {stderr}"
+        );
+    }
+
+    // (5) Nothing that worked stopped working. The selectors these commands do
+    // honour are the whole reason this is a per-command list.
+    let attached = fixture.root.join("attached");
+    fs::create_dir_all(&attached).unwrap();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "attach",
+            "--workspace",
+            attached.to_str().unwrap(),
+            "--to",
+            "Alpha",
+            "--json",
+        ],
+    );
+    let fresh = fixture.root.join("fresh");
+    fs::create_dir_all(&fresh).unwrap();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "init",
+            "--name",
+            "Gamma",
+            "--workspace",
+            fresh.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    for args in [
+        vec!["task", "list", "--db", alpha_board.as_str(), "--json"],
+        vec!["task", "list", "--project", "Beta", "--json"],
+        vec![
+            "task",
+            "list",
+            "--workspace",
+            worktree_path.as_str(),
+            "--json",
+        ],
+        vec!["events", "--db", alpha_board.as_str(), "--json"],
+    ] {
+        fixture.ok_json(&fixture.main, &args);
+    }
+    // And every command that refuses a selector still answers without one.
+    for args in [
+        vec!["doctor", "--json"],
+        vec!["dashboard", "--json"],
+        vec!["audit", "verify", "--json"],
+        vec!["workspace", "list", "--json"],
+        vec!["schema", "--json"],
+        vec!["backup", "--json"],
+        vec!["rule", "list", "--json"],
+    ] {
+        fixture.ok_json(&fixture.main, &args);
+    }
+
+    // (6) Ordering, which a table-driven guard placed early is easy to get
+    // wrong: a flag that no longer exists outranks one that is merely
+    // inapplicable, because "this flag was removed" is the more actionable
+    // complaint about the same command line.
+    let both = fixture.run(
+        &fixture.main,
+        &["rule", "list", "--global", "--project", "Beta", "--json"],
+    );
+    assert!(!both.status.success());
+    let stderr = String::from_utf8_lossy(&both.stderr).into_owned();
+    assert!(
+        stderr.contains("superseded"),
+        "the inapplicable --project outranked the superseded --global: {stderr}"
+    );
+    let only_selector = fixture.run(
+        &fixture.main,
+        &["rule", "list", "--project", "Beta", "--json"],
+    );
+    assert!(!only_selector.status.success());
+    assert!(
+        String::from_utf8_lossy(&only_selector.stderr).contains("--project"),
+        "{}",
+        String::from_utf8_lossy(&only_selector.stderr)
+    );
+}
+
+/// No operation takes a board selector and answers without it.
+///
+/// The net behind the table: a command either resolves the board it was given —
+/// and a board that is not there is an error — or refuses the flag. Neither
+/// exits zero. A command added to neither list fails here rather than reaching
+/// an operator with a confident answer about a board nobody named.
+#[test]
+fn compiled_binary_lets_no_operation_succeed_while_discarding_a_selector() {
+    let fixture = Fixture::new("selector-net");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    // Inside a directory that does not exist, so even the one operation
+    // permitted to create a board cannot bring this one into being.
+    let absent = fixture.root.join("no-such-directory").join("absent.db");
+    let absent_path = absent.to_str().unwrap().to_owned();
+    let nowhere = fixture.root.join("no-such-tree");
+    let nowhere_path = nowhere.to_str().unwrap().to_owned();
+
+    let manifest = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    for operation in manifest["operations"].as_array().unwrap() {
+        // `serve`, `mcp` and `watch` block until killed. The first two refuse
+        // every selector before they start and are covered by the manifest
+        // sweep above; `watch` resolves one, and its own tests cover it.
+        if operation["longRunning"].as_bool().unwrap() {
+            continue;
+        }
+        let command = operation["command"].as_str().unwrap();
+        let sub = operation["subcommand"].as_str();
+        for (flag, value) in [
+            ("--db", absent_path.as_str()),
+            ("--project", "no-such-project"),
+            ("--workspace", nowhere_path.as_str()),
+        ] {
+            let mut args = vec![command];
+            args.extend(sub);
+            args.extend([flag, value, "--json"]);
+            let output = fixture.run(&fixture.main, &args);
+            assert!(
+                !output.status.success(),
+                "{args:?} exited zero: it neither resolved {flag} nor refused it\nstdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+    assert!(!absent.exists(), "the sweep created a board");
+}
+
+/// A command that discards `--db` locks the data root whatever `KANBAN_DB` says.
+///
+/// Refusing the flag narrowed this defect; it did not close it.
+/// `reject_ignored_selectors` counts typed flags only — correctly, because every
+/// agent cage exports `KANBAN_DB` and an exported default must not break
+/// `doctor` — so the environment still reached `board_selection`, and
+/// `touches_data_root` still decided the lock from a `--db` value the command
+/// went on to ignore. `KANBAN_DB=/tmp/elsewhere.db kanban restore --from SNAP
+/// --force` therefore replaced the entire data root with **no exclusive lock**,
+/// the flag's only effect being to suppress the lock. On a box running many
+/// agents against one data root that is a corruption route.
+///
+/// The lock lives in the kernel and the environment is read by the process
+/// under test, so this can only be measured across a real process boundary:
+/// the test holds the flock itself and watches the compiled binary contend.
+#[test]
+fn compiled_binary_locks_the_data_root_even_when_the_environment_names_a_board() {
+    let fixture = Fixture::new("lock-vs-ignored-selector");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "survives", "--id", "t-keep", "--json"],
+    );
+    let snapshot = fixture.root.join("snap");
+    fixture.ok_json(
+        &fixture.main,
+        &["backup", "--output", snapshot.to_str().unwrap(), "--json"],
+    );
+    // Outside the data root, which is what made `touches_data_root` answer
+    // "this invocation touches nothing of mine".
+    let elsewhere = fixture.root.join("elsewhere.db");
+    let elsewhere_path = elsewhere.to_str().unwrap().to_owned();
+    let with_env_db = |args: &[&str]| -> Output {
+        fixture
+            .command(&fixture.main)
+            .env("KANBAN_DB", &elsewhere_path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let lock_file = || {
+        fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture.data.join(".lock"))
+            .unwrap()
+    };
+
+    // (1) One live board command holds the root shared. `restore` takes it
+    // exclusively and refuses immediately, so it must not get past this.
+    let held = lock_file();
+    held.lock_shared().unwrap();
+    let restore = with_env_db(&[
+        "restore",
+        "--from",
+        snapshot.to_str().unwrap(),
+        "--force",
+        "--json",
+    ]);
+    assert!(
+        !restore.status.success(),
+        "restore replaced the data root with no exclusive lock, because KANBAN_DB \
+         named a board it then ignored"
+    );
+    let stderr = String::from_utf8_lossy(&restore.stderr).into_owned();
+    assert!(
+        stderr.contains("another kanban process is using"),
+        "restore did not contend for the exclusive lock: {stderr}"
+    );
+    drop(held);
+    // The work state is still the live one, not the snapshot's.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"])[0]["id"],
+        "t-keep"
+    );
+
+    // (2) The other direction: a restore holds the root exclusively, and the
+    // surveying commands must queue behind it rather than read through it.
+    // Each waits out `lock::WAIT` before refusing.
+    let held = lock_file();
+    held.lock().unwrap();
+    for command in ["doctor", "backup"] {
+        let output = with_env_db(&[command, "--json"]);
+        assert!(
+            !output.status.success(),
+            "{command} read the data root through a restore's exclusive lock"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("restore is replacing"),
+            "{command} did not wait on the shared lock: {stderr}"
+        );
+    }
+    drop(held);
+
+    // (3) And none of this broke restore. With nothing holding the root it
+    // still runs to completion under the same environment.
+    let restored = with_env_db(&[
+        "restore",
+        "--from",
+        snapshot.to_str().unwrap(),
+        "--force",
+        "--json",
+    ]);
+    assert!(
+        restored.status.success(),
+        "restore stopped working: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"])[0]["id"],
+        "t-keep"
+    );
+    assert!(
+        !elsewhere.exists(),
+        "the ignored KANBAN_DB path was conjured into existence"
+    );
+}
+
+/// A selector the manifest says an operation accepts actually works on it.
+///
+/// The mirror of the refusal sweep, and the one that is not self-referential.
+/// Every other guard reads `IGNORED_SELECTORS` and checks something against it,
+/// so a command missing from the table looks consistent to all of them: `rule`
+/// refused all three selectors from two inline loops in the dispatcher while
+/// declaring nothing, and the MCP tool builder — which withholds exactly what
+/// the table names — went on advertising `project` on `rule_list`. An agent
+/// could read the schema, send the argument it was offered, and be told
+/// `--project does not select a rule collection`.
+///
+/// This asks the binary instead of the table: for every read-only operation
+/// that needs no positional, each selector the manifest leaves out of
+/// `ignoredSelectors` is passed a valid value and must be honoured. A command
+/// that refuses a selector it never declared fails here.
+#[test]
+fn compiled_binary_honours_every_selector_the_manifest_says_it_accepts() {
+    let fixture = Fixture::new("selector-applicability");
+    let alpha = fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let board = alpha["boardPath"].as_str().unwrap().to_owned();
+    let main = fixture.main.to_str().unwrap().to_owned();
+
+    let manifest = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let mut checked = 0;
+    for operation in manifest["operations"].as_array().unwrap() {
+        // Read-only and positional-free, so a valid selector is the only input
+        // the command needs and success is the whole assertion.
+        if !operation["readOnly"].as_bool().unwrap()
+            || operation["longRunning"].as_bool().unwrap()
+            || !operation["positionals"].as_array().unwrap().is_empty()
+        {
+            continue;
+        }
+        let ignored = operation["ignoredSelectors"].as_array().unwrap();
+        let command = operation["command"].as_str().unwrap();
+        let sub = operation["subcommand"].as_str();
+        for (selector, value) in [
+            ("db", board.as_str()),
+            ("project", "Alpha"),
+            ("workspace", main.as_str()),
+        ] {
+            if ignored.iter().any(|declared| declared == selector) {
+                continue;
+            }
+            let flag = format!("--{selector}");
+            let mut args = vec![command];
+            args.extend(sub);
+            args.extend([flag.as_str(), value, "--json"]);
+            let output = fixture.run(&fixture.main, &args);
+            assert!(
+                output.status.success(),
+                "{args:?} refused a selector the manifest does not list as ignored\n\
+                 stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 27,
+        "only {checked} applicable selectors were exercised; the set shrank"
+    );
+}
+
 /// A board file comes into existence only where creating one is the point.
 ///
 /// Permission to create was derived from the `readOnly` bit in `COMMANDS`, and

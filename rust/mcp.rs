@@ -244,7 +244,16 @@ fn tools() -> Vec<Value> {
                     required.push(name.to_owned());
                 }
             }
-            for flag in flags.iter().chain(TOOL_GLOBALS.iter()) {
+            // A selector the CLI refuses on this operation must not be
+            // offered as an input: the tool would take it, the binary would
+            // reject it, and the agent would read a refusal for an argument
+            // this schema told it to send.
+            let ignored = crate::ignored_selectors(command, *sub).0;
+            for flag in flags
+                .iter()
+                .chain(TOOL_GLOBALS.iter())
+                .filter(|flag| !ignored.contains(*flag))
+            {
                 let (kind, description): (Value, String) = if crate::REPEATABLE.contains(flag) {
                     (
                         json!({ "type": "array", "items": { "type": "string" } }),
@@ -314,10 +323,12 @@ fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
             Some(value) => argv.push(scalar(key, value)?),
         }
     }
+    let ignored = crate::ignored_selectors(command, *sub).0;
     let allowed = flags
         .iter()
         .copied()
         .chain(TOOL_GLOBALS.iter().copied())
+        .filter(|flag| !ignored.contains(flag))
         .collect::<Vec<_>>();
     for (key, value) in supplied {
         if positionals
@@ -534,6 +545,47 @@ mod tests {
                 "{excluded} is excluded from a set it was never in"
             );
         }
+    }
+
+    #[test]
+    fn a_tool_offers_no_selector_the_cli_refuses_for_that_operation() {
+        // The CLI refuses `doctor --db`; advertising `db` on the doctor tool
+        // would have an agent send an argument the binary then rejects, and
+        // the agent would read the refusal as its own mistake.
+        for (command, sub, ..) in COMMANDS {
+            if crate::LONG_RUNNING.contains(command) {
+                continue;
+            }
+            let ignored = crate::ignored_selectors(command, *sub).0;
+            let properties = tool(&tool_name(command, *sub))["inputSchema"]["properties"].clone();
+            for flag in TOOL_GLOBALS {
+                assert_eq!(
+                    properties.get(flag).is_some(),
+                    !ignored.contains(&flag),
+                    "{command} {sub:?} offers or withholds {flag} against what the CLI does"
+                );
+            }
+        }
+        // And a call that sends one anyway is refused here rather than
+        // relocated into the child process.
+        let error = arguments_for("doctor", &json!({ "db": "/tmp/somewhere.db" }))
+            .expect_err("doctor has no db argument")
+            .to_string();
+        assert!(error.contains("doctor has no argument db"), "{error}");
+        // A selector the operation honours still travels.
+        assert!(
+            arguments_for(
+                "workspace_attach",
+                &json!({ "workspace": "/tmp/tree", "to": "Alpha" })
+            )
+            .unwrap()
+            .contains(&"--workspace".to_owned())
+        );
+        assert!(
+            arguments_for("task_list", &json!({ "db": "/tmp/b.db" }))
+                .unwrap()
+                .contains(&"--db".to_owned())
+        );
     }
 
     #[test]

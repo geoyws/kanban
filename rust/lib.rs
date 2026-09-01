@@ -138,7 +138,9 @@ Usage:
   kanban schema [--json]
   kanban mcp
 
-Global options (accepted by every board command):
+Global options (accepted by every board command; a command that addresses the
+registry instead — doctor, dashboard, backup, restore, audit verify, serve,
+schema, mcp, workspace, rule — refuses the ones it would discard):
   --project NAME     address a registered project by name, from any directory
   --workspace PATH   use the project containing PATH instead of the cwd
   --db PATH          operate on a board file directly
@@ -247,6 +249,174 @@ pub(crate) const WATCH_BATCH_LIMIT: i64 = 1_000;
 
 /// The flags that each select a board. At most one may be given explicitly.
 const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
+
+/// One command, and the board selectors it never consults.
+///
+/// Name, subcommand, the selectors it discards, and what it addresses instead.
+pub(crate) type IgnoredSelectorRow = (
+    &'static str,
+    Option<&'static str>,
+    &'static [&'static str],
+    &'static str,
+);
+
+/// The commands that survey the registry instead of resolving one board.
+///
+/// `--db`, `--project` and `--workspace` are in [`GLOBAL_FLAGS`], so every
+/// command parses them and `reject_unknown` exempts them. A command that never
+/// asks the resolver for a board therefore accepted a selector and threw it
+/// away. `doctor --db /nowhere/absent.db --json` answered
+/// `{"healthy": true, ...}` — computed over every registered board, about a
+/// file that was not there — and a health check that returns green about a
+/// different subject is worse than one that refuses. `backup --db` was the
+/// same shape, and both skipped the data-root lock on the way, because
+/// `lock::touches_data_root` reads the very `--db` path the command then
+/// ignored: `restore --db /tmp/elsewhere.db` replaced the whole data root
+/// without the exclusive lock that exists to keep a concurrent reader off it.
+///
+/// Refusing is the whole fix. None of these grows a per-board mode here; they
+/// say the flag does not apply and name what they do address, the way `rule`
+/// and `watch --registry` already do.
+///
+/// Listed per command, and only the selectors actually discarded: `init` and
+/// `workspace attach` both honour `--workspace` and ignore the other two, so a
+/// blanket rule would break the two uses that work.
+///
+/// Every row here is unconditional — the command discards the selector on every
+/// invocation, so the manifest and the MCP tool builder can read it and be
+/// right every time. Three refusals elsewhere are deliberately *not* rows and
+/// must stay inline, because they depend on another flag rather than on the
+/// command: `events --registry` / `events --rule` and `watch --registry` /
+/// `watch --rule` read the registry trail only when that flag is present
+/// (`events --db` addresses a board and is honoured), and
+/// `search --all-boards` / `search-rebuild --all-boards` refuse a selector only
+/// in their all-boards mode. Tabling any of those would refuse a selector the
+/// command honours the rest of the time, which is the mirror image of the
+/// defect this table exists to fix.
+pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
+    (
+        "init",
+        None,
+        &["db", "project"],
+        "creates its own board under the data root, with --workspace naming the tree it belongs to",
+    ),
+    (
+        "workspace",
+        Some("list"),
+        &["db", "project", "workspace"],
+        "lists every registered project",
+    ),
+    (
+        "workspace",
+        Some("attach"),
+        &["db", "project"],
+        "attaches the tree named by --workspace to the project named by --to",
+    ),
+    (
+        "workspace",
+        Some("detach"),
+        &["db", "project", "workspace"],
+        "detaches the registered root named by --root",
+    ),
+    (
+        "workspace",
+        Some("repoint"),
+        &["db", "project", "workspace"],
+        "repairs registered roots, named by --root or taken from the registry",
+    ),
+    (
+        "dashboard",
+        None,
+        &["db", "project", "workspace"],
+        "summarizes every registered board",
+    ),
+    (
+        "doctor",
+        None,
+        &["db", "project", "workspace"],
+        "checks the registry and every board in it",
+    ),
+    (
+        "audit",
+        Some("verify"),
+        &["db", "project", "workspace"],
+        "verifies the registry and every board in it",
+    ),
+    (
+        "backup",
+        None,
+        &["db", "project", "workspace"],
+        "snapshots the registry and every board in it",
+    ),
+    (
+        "restore",
+        None,
+        &["db", "project", "workspace"],
+        "replaces the whole data root from the snapshot named by --from",
+    ),
+    (
+        "serve",
+        None,
+        &["db", "project", "workspace"],
+        "serves every registered board",
+    ),
+    (
+        "schema",
+        None,
+        &["db", "project", "workspace"],
+        "describes this binary, not a board",
+    ),
+    (
+        "mcp",
+        None,
+        &["db", "project", "workspace"],
+        "resolves a board per tool call, not once for the server",
+    ),
+    // Rules refused these before this table existed, from two inline loops in
+    // the dispatcher. Refusing there and declaring nothing here left the rest
+    // of the surface reading the wrong answer: `schema --json` published
+    // `ignoredSelectors: []` for all six rows, and the MCP tool builder — which
+    // withholds exactly what this table names — went on advertising `project`
+    // on `rule_list`, so an agent could read the schema, send the argument it
+    // was offered, and get back "--project does not select a rule collection".
+    // The refusal is unconditional, so it belongs here and the loops are gone.
+    (
+        "rule",
+        Some("add"),
+        &["db", "project", "workspace"],
+        "writes to the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("list"),
+        &["db", "project", "workspace"],
+        "reads the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("show"),
+        &["db", "project", "workspace"],
+        "reads the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("update"),
+        &["db", "project", "workspace"],
+        "writes to the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("retire"),
+        &["db", "project", "workspace"],
+        "writes to the one registry-owned, tag-scoped rule collection",
+    ),
+    (
+        "rule",
+        Some("consolidate"),
+        &["db", "project", "workspace"],
+        "migrates every registered board, so naming one would imply a partial migration",
+    ),
+];
 
 /// Every command, and every flag it accepts.
 ///
@@ -1089,12 +1259,21 @@ impl Args {
     }
 
     /// Fail on any flag this command does not define, naming the nearest match.
-    fn reject_unknown(&self, allowed: &[&str]) -> Result<()> {
+    ///
+    /// `ignored` is the board selectors this command discards, from
+    /// [`IGNORED_SELECTORS`]. They are global flags, so the exemption above
+    /// would otherwise wave them through and — worse — the "accepted here" line
+    /// would advertise `--db` on a `doctor` that refuses it.
+    /// `reject_ignored_selectors` reaches them first with the better message;
+    /// subtracting them here is the second lock, so a selector cannot be
+    /// refused by one guard and offered by the other.
+    fn reject_unknown(&self, allowed: &[&str], ignored: &[&str]) -> Result<()> {
         let mut unknown = self
             .flags
             .keys()
             .filter(|name| {
-                !allowed.contains(&name.as_str()) && !GLOBAL_FLAGS.contains(&name.as_str())
+                !allowed.contains(&name.as_str())
+                    && (!GLOBAL_FLAGS.contains(&name.as_str()) || ignored.contains(&name.as_str()))
             })
             .map(String::as_str)
             .collect::<Vec<_>>();
@@ -1106,6 +1285,7 @@ impl Args {
             .iter()
             .chain(GLOBAL_FLAGS.iter())
             .copied()
+            .filter(|name| !ignored.contains(name))
             .collect::<Vec<_>>();
         known.sort_unstable();
         let suggestion = nearest(unknown[0], &known)
@@ -1330,6 +1510,10 @@ pub(crate) fn schema() -> Value {
                 // board resolver actually needs: may naming a `--db` path that
                 // is not there bring one into existence.
                 "createsBoard": board_creation(command, *sub) == BoardCreation::Permitted,
+                // The board selectors this operation refuses. Every other
+                // command honours all three, so an adapter can offer them
+                // everywhere this list is empty and nowhere it is not.
+                "ignoredSelectors": ignored_selectors(command, *sub).0,
             })
         })
         .collect::<Vec<_>>();
@@ -1828,6 +2012,57 @@ fn missing_board_error(board_path: &str) -> anyhow::Error {
 
 fn open_store(args: &Args, creation: BoardCreation) -> Result<Store> {
     Store::open(&store_path(args, creation)?)
+}
+
+/// The board selectors this command discards, and what it addresses instead.
+///
+/// Empty for every command that resolves a board, which is the whole rest of
+/// the surface. Read from one table by the refusal, by `reject_unknown`, by the
+/// manifest and by the MCP tool builder, so a flag cannot be refused by the CLI
+/// and advertised by an adapter.
+pub(crate) fn ignored_selectors(
+    command: &str,
+    sub: Option<&str>,
+) -> (&'static [&'static str], &'static str) {
+    IGNORED_SELECTORS
+        .iter()
+        .find(|(name, expected, ..)| *name == command && *expected == sub)
+        .map(|(_, _, ignored, subject)| (*ignored, *subject))
+        .unwrap_or((&[], ""))
+}
+
+/// Fail when a command line names a board the command will never look at.
+///
+/// `reject_unknown` already refuses a flag a command does not define. This is
+/// the same refusal for one it defines and cannot honour: inapplicable rather
+/// than unknown, and silently discarded rather than reported, which is the
+/// worse of the two because the command then answers about something else and
+/// exits zero. See [`IGNORED_SELECTORS`] for the measured `doctor` case.
+///
+/// Runs before the `version`, `schema` and `mcp` early returns and before the
+/// data-root lock, because two of those answer without validating anything and
+/// the lock itself reads the `--db` path being refused.
+fn reject_ignored_selectors(args: &Args, command: &str, sub: Option<&str>) -> Result<()> {
+    let (ignored, subject) = ignored_selectors(command, sub);
+    let given = ignored
+        .iter()
+        .filter(|flag| args.flags.contains_key(**flag))
+        .map(|flag| format!("--{flag}"))
+        .collect::<Vec<_>>();
+    if given.is_empty() {
+        return Ok(());
+    }
+    let words = match sub {
+        Some(sub) => format!("{command} {sub}"),
+        None => command.to_owned(),
+    };
+    bail!(
+        "{} {} a board, and `{words}` {subject}; remove it rather than have it \
+         discarded, because a receipt computed about something else is read as an \
+         answer about the board you named",
+        given.join(" and "),
+        if given.len() == 1 { "names" } else { "name" }
+    )
 }
 
 fn reject_all_boards_selector(args: &Args) -> Result<()> {
@@ -2547,6 +2782,22 @@ fn run() -> Result<()> {
         .map(String::as_str)
         .map(|value| canonical_sub(command, value));
     let rest = args.positionals.get(2..).unwrap_or(&[]);
+    let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
+
+    // Ahead of the selector refusal below, because a flag that no longer
+    // exists is the more actionable complaint about the same command line:
+    // `rule list --global --project ONE` must still say `--global` was
+    // superseded rather than start with the `--project` that is merely
+    // inapplicable.
+    if args.has("global") && (command == "rule" || command == "events") {
+        bail!("--global is superseded; all /kb rules are one tag-scoped collection");
+    }
+
+    // Ahead of everything else, including the three commands below that answer
+    // without validating anything and the data-root lock that reads `--db`
+    // itself: a selector this command cannot honour is a refusal, not
+    // something to discard on the way to a confident answer.
+    reject_ignored_selectors(&args, command, spec_sub)?;
 
     if command == "version" {
         emit(&version_string())?;
@@ -2564,15 +2815,10 @@ fn run() -> Result<()> {
         return mcp::serve();
     }
 
-    if args.has("global") && (command == "rule" || command == "events") {
-        bail!("--global is superseded; all /kb rules are one tag-scoped collection");
-    }
-
-    let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
     let creation = board_creation(command, spec_sub);
     match command_spec(command, spec_sub) {
         Some((allowed, positionals)) => {
-            args.reject_unknown(allowed)?;
+            args.reject_unknown(allowed, ignored_selectors(command, spec_sub).0)?;
             args.reject_repeated_for(Some(command))?;
             args.reject_extra_positionals(arity(spec_sub, positionals))?;
             // Before the data-root lock and before any store: a command that
@@ -2594,7 +2840,26 @@ fn run() -> Result<()> {
     // itself calls to write its rescue snapshot — an flock conflicts with a
     // second descriptor in the same process, so a lower-level acquire would
     // deadlock restore against itself.
-    let _data_root = if lock::touches_data_root(direct_db(&args).as_deref()) {
+    // A command that discards `--db` must not have its locking decided by one.
+    // `touches_data_root` asks whether the board this invocation addresses lies
+    // outside the data root, and for these commands the answer is that they
+    // address the data root itself whatever any `--db` says. Reading the
+    // discarded selector anyway made the flag's *only* effect the suppression
+    // of the lock: `KANBAN_DB=/tmp/elsewhere.db kanban restore --from SNAP
+    // --force` replaced the entire data root with no exclusive lock, and
+    // `backup`, `init` and `doctor` skipped the shared one the same way.
+    //
+    // Refusing the flag cannot close this. `reject_ignored_selectors` counts
+    // typed flags only — correctly, because every agent cage exports
+    // `KANBAN_DB` and an exported default must not break `doctor` — so the
+    // environment reaches `board_selection` untouched. The lock decision is
+    // where it has to be fixed, and `None` is the fail-closed answer:
+    // `touches_data_root(None)` is true, so the lock is taken.
+    let addressed_board = match ignored_selectors(command, spec_sub).0.contains(&"db") {
+        true => None,
+        false => direct_db(&args),
+    };
+    let _data_root = if lock::touches_data_root(addressed_board.as_deref()) {
         Some(if command == "restore" {
             lock::exclusive()?
         } else {
@@ -2919,13 +3184,10 @@ fn run() -> Result<()> {
     }
 
     if command == "rule" && sub == Some("consolidate") {
-        for flag in ["project", "workspace", "db", "global"] {
-            if args.has(flag) {
-                bail!(
-                    "rule consolidate addresses every registered board; --{flag} would imply a partial migration"
-                );
-            }
-        }
+        // The board selectors are refused by `reject_ignored_selectors` from
+        // the table, before this branch is reached. `--global` needs no loop
+        // here either: it is refused for every `rule` and `events` invocation
+        // above, as superseded rather than inapplicable.
         return print(
             &Registry::open()?.consolidate_board_rules(args.require("as")?)?,
             args.has("json"),
@@ -2939,6 +3201,14 @@ fn run() -> Result<()> {
         if args.has("after") || args.has("before") {
             bail!("--after and --before only apply to board events");
         }
+        // `watch --registry` has refused these since it was written; `events`
+        // read the same registry trail and accepted them, so the two disagreed
+        // about the same command line.
+        if args.has("project") || args.has("workspace") || args.has("db") {
+            bail!(
+                "--project, --workspace and --db address boards; --registry and --rule read the registry trail"
+            );
+        }
         return print(
             &Registry::open_readonly()?.rule_events(
                 args.one("rule"),
@@ -2950,13 +3220,7 @@ fn run() -> Result<()> {
     }
 
     if command == "rule" {
-        for flag in ["project", "workspace", "db"] {
-            if args.has(flag) {
-                bail!(
-                    "rules are registry-owned and tag-scoped; --{flag} does not select a rule collection"
-                );
-            }
-        }
+        // Board selectors are refused from the table, before dispatch.
         let mut registry = Registry::open()?;
         if sub == Some("add") {
             let flagged = args.body()?;
@@ -3931,21 +4195,141 @@ mod tests {
     #[test]
     fn unknown_flags_are_rejected_and_globals_are_not() {
         let allowed = ["status", "with-relations"];
-        assert!(args(&["--status", "todo"]).reject_unknown(&allowed).is_ok());
+        assert!(
+            args(&["--status", "todo"])
+                .reject_unknown(&allowed, &[])
+                .is_ok()
+        );
         for global in GLOBAL_FLAGS {
             assert!(
                 args(&[&format!("--{global}"), "x"])
-                    .reject_unknown(&allowed)
+                    .reject_unknown(&allowed, &[])
                     .is_ok(),
                 "--{global} must be accepted everywhere"
             );
         }
         let error = args(&["--projct", "x"])
-            .reject_unknown(&allowed)
+            .reject_unknown(&allowed, &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown flag --projct"), "{error}");
         assert!(error.contains("did you mean --project?"), "{error}");
+    }
+
+    #[test]
+    fn a_selector_a_command_ignores_is_neither_exempt_nor_advertised() {
+        // Second lock behind `reject_ignored_selectors`, which reaches these
+        // command lines first with a better message. If it is ever bypassed,
+        // an ignored selector must still not be waved through as a global.
+        let allowed: [&str; 0] = [];
+        let error = args(&["--db", "/tmp/somewhere.db"])
+            .reject_unknown(&allowed, &["db", "project", "workspace"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown flag --db"), "{error}");
+        // And the "accepted here" line must not offer what was just refused.
+        for selector in BOARD_SELECTORS {
+            assert!(
+                !error.contains(&format!("--{selector},")),
+                "the refusal still advertises --{selector}: {error}"
+            );
+        }
+        assert!(error.contains("--help"), "{error}");
+        assert!(error.contains("--json"), "{error}");
+        // A selector this command does honour stays exempt.
+        assert!(
+            args(&["--project", "Alpha"])
+                .reject_unknown(&allowed, &["db"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_ignored_selector_row_names_a_real_command_and_a_real_selector() {
+        for (command, sub, ignored, subject) in IGNORED_SELECTORS {
+            assert!(
+                command_spec(command, *sub).is_some(),
+                "{command} {sub:?} is declared selector-blind but is not a command"
+            );
+            assert!(
+                !ignored.is_empty(),
+                "{command} {sub:?} declares an empty ignored-selector list"
+            );
+            assert!(
+                !subject.is_empty(),
+                "{command} {sub:?} does not say what it addresses instead"
+            );
+            let mut seen = ignored.to_vec();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(
+                before,
+                seen.len(),
+                "{command} {sub:?} lists a selector twice"
+            );
+            for flag in *ignored {
+                assert!(
+                    BOARD_SELECTORS.contains(flag),
+                    "{command} {sub:?} ignores --{flag}, which is not a board selector"
+                );
+            }
+        }
+        // No row is declared twice, which would make the second one dead.
+        let mut keys = IGNORED_SELECTORS
+            .iter()
+            .map(|(command, sub, ..)| (*command, *sub))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(
+            unique,
+            keys.len(),
+            "a command is declared twice in IGNORED_SELECTORS"
+        );
+        // The two commands that honour one selector and discard the others are
+        // the reason this is a per-command list rather than a set of names.
+        assert_eq!(ignored_selectors("init", None).0, ["db", "project"]);
+        assert_eq!(
+            ignored_selectors("workspace", Some("attach")).0,
+            ["db", "project"]
+        );
+        // And a command that resolves a board declares nothing.
+        assert_eq!(ignored_selectors("task", Some("list")).0, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn an_ignored_selector_is_refused_by_name() {
+        let error = reject_ignored_selectors(&args(&["--db", "/tmp/somewhere.db"]), "doctor", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--db"), "{error}");
+        assert!(error.contains("doctor"), "{error}");
+        assert!(
+            error.contains("checks the registry and every board in it"),
+            "the refusal does not say what doctor addresses instead: {error}"
+        );
+        // Both, when both were given. `reject_conflicting_board_selectors`
+        // refuses that pair too, but this guard runs first and must not name
+        // only half of what it is refusing.
+        let error = reject_ignored_selectors(
+            &args(&["--db", "/tmp/somewhere.db", "--project", "Alpha"]),
+            "doctor",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--db and --project"), "{error}");
+        // The selector it honours is not refused.
+        assert!(
+            reject_ignored_selectors(&args(&["--workspace", "/tmp/tree"]), "init", None).is_ok()
+        );
+        assert!(reject_ignored_selectors(&args(&["--db", "/tmp/b.db"]), "init", None).is_err());
+        // A command with no row is untouched.
+        assert!(
+            reject_ignored_selectors(&args(&["--db", "/tmp/b.db"]), "task", Some("list")).is_ok()
+        );
     }
 
     #[test]
