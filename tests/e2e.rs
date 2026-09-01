@@ -178,6 +178,12 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Mirrors `POLL_INTERVAL` in `rust/watch.rs`: how long `watch --follow` waits
+/// between keep-alive heartbeats while it has no matching batch. Only used to
+/// size a deliberate delay, so a drift between the two costs test time rather
+/// than correctness.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 struct WatchSession {
     child: Option<std::process::Child>,
     stdout_rx: mpsc::Receiver<String>,
@@ -240,12 +246,72 @@ impl WatchSession {
         serde_json::from_str(&self.next_stdout_line(timeout)).unwrap()
     }
 
-    #[allow(dead_code)]
     fn try_next_stdout_json(&self, timeout: Duration) -> Option<Value> {
         match self.stdout_rx.recv_timeout(timeout) {
             Ok(line) => Some(serde_json::from_str(&line).unwrap()),
             Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 None
+            }
+        }
+    }
+
+    /// Returns the next `event` envelope, discarding keep-alive heartbeats.
+    ///
+    /// `watch --follow` emits a heartbeat every poll interval while it has no
+    /// matching batch, so any number of them can land between a mutation and
+    /// the event that mutation produces. `timeout` stays a hard deadline for
+    /// the event itself: heartbeats never extend it, so an event that never
+    /// arrives fails instead of looping forever.
+    fn next_stdout_event_json(&self, timeout: Duration) -> Value {
+        self.next_stdout_event_json_with_drain_count(timeout).0
+    }
+
+    /// [`Self::next_stdout_event_json`], plus how many heartbeats it discarded.
+    ///
+    /// The count is what proves the drain actually ran, so a test that means to
+    /// exercise the interleaved-heartbeat path can assert on it instead of
+    /// silently degrading to the pass-through case.
+    ///
+    /// On timeout the panic reports what was seen rather than naming a cause:
+    /// an event can be missing because stdout stalled, because the child died,
+    /// or because the event was never delivered at all. The drained count and
+    /// the last heartbeat's `state` and `cursor` are the evidence that tells
+    /// those apart -- in particular a cursor that has moved past the awaited
+    /// event distinguishes a lost event from a quiet stream.
+    fn next_stdout_event_json_with_drain_count(&self, timeout: Duration) -> (Value, usize) {
+        let deadline = Instant::now() + timeout;
+        let mut drained = 0_usize;
+        let mut last_heartbeat: Option<Value> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(envelope) = self.try_next_stdout_json(remaining) else {
+                let seen = match &last_heartbeat {
+                    Some(heartbeat) => {
+                        let cursor = heartbeat["cursor"].as_str().unwrap_or_default();
+                        // Decode leniently: this runs on the failure path, so a
+                        // malformed cursor must still be reported, not panic.
+                        let seq = URL_SAFE_NO_PAD
+                            .decode(cursor)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .map(|decoded| decoded["seq"].to_string())
+                            .unwrap_or_else(|| format!("<undecodable {cursor}>"));
+                        format!(
+                            "drained {drained} heartbeat(s), last was state {} at cursor seq {seq}",
+                            heartbeat["payload"]["state"]
+                        )
+                    }
+                    None => "no heartbeat arrived either".to_owned(),
+                };
+                panic!("watch delivered no event within {timeout:?}: {seen}");
+            };
+            match envelope["type"].as_str().unwrap() {
+                "event" => return (envelope, drained),
+                "heartbeat" => {
+                    drained += 1;
+                    last_heartbeat = Some(envelope);
+                }
+                other => panic!("unexpected watch envelope type {other}"),
             }
         }
     }
@@ -7434,7 +7500,7 @@ fn watch_follow_streams_new_events_and_keeps_outputs_separated() {
             }
         }),
     );
-    let next_event = watch.next_stdout_json(Duration::from_secs(10));
+    let next_event = watch.next_stdout_event_json(Duration::from_secs(10));
     assert_eq!(next_event["type"], "event");
     let next_cursor = decode_watch_cursor(next_event["cursor"].as_str().unwrap());
     assert_eq!(next_cursor["seq"].as_i64().unwrap(), raw_secret_seq);
@@ -7977,6 +8043,102 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
 }
 
 #[test]
+fn watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats() {
+    let fixture = Fixture::new("watch-heartbeat-interleave");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WATCH-INTERLEAVE", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Queued behind heartbeats",
+            "--id",
+            "t-interleaved",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let preflight = fixture.run(
+        &fixture.main,
+        &[
+            "watch",
+            "--task",
+            "t-interleaved",
+            "--cursor",
+            "0",
+            "--limit",
+            "16",
+            "--json",
+        ],
+    );
+    assert!(preflight.status.success());
+    let preflight_rows = ndjson_values(&preflight);
+    let start_cursor = preflight_rows.last().unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let watcher = WatchSession::start(
+        &fixture,
+        &fixture.main,
+        &fixture.data,
+        &[
+            "--task",
+            "t-interleaved",
+            "--cursor",
+            &start_cursor,
+            "--follow",
+            "--limit",
+            "8",
+            "--json",
+        ],
+    );
+    let idle = watcher.next_stdout_json(Duration::from_secs(5));
+    assert_eq!(idle["type"], "heartbeat");
+    assert_eq!(idle["payload"]["state"], "idle");
+
+    // Hold the mutation back for several poll intervals so the follow loop
+    // queues keep-alive heartbeats ahead of the event. Under real load the
+    // same interleaving happens on its own but far too rarely to rely on, so
+    // the delay is what makes the window deterministic. It constructs the
+    // condition; the drained-count assertion below is what proves the reader
+    // handled it.
+    std::thread::sleep(WATCH_POLL_INTERVAL * 6);
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-interleaved",
+            "in_progress",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let (moved, drained) = watcher.next_stdout_event_json_with_drain_count(Duration::from_secs(10));
+    assert!(
+        drained >= 1,
+        "no heartbeat interleaved, so the drain never ran and this test silently \
+         degraded to the pass-through case"
+    );
+    assert_eq!(moved["type"], "event");
+    assert_eq!(moved["payload"]["kind"], "task_moved");
+    assert_eq!(
+        moved["payload"]["subject"],
+        json!({"type":"task","id":"t-interleaved"})
+    );
+    assert_eq!(moved["payload"]["actor"], "geo");
+    assert_eq!(moved["payload"]["priorStatus"], "todo");
+    assert_eq!(moved["payload"]["currentStatus"], "in_progress");
+    assert!(watcher.finish().is_empty());
+}
+
+#[test]
 fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
     let fixture = Fixture::new("watch-removed-and-registry");
     fixture.ok_json(
@@ -8073,7 +8235,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
         &fixture.main,
         &["task", "remove", "t-removed", "--as", "geo", "--json"],
     );
-    let removed = watcher.next_stdout_json(Duration::from_secs(10));
+    let removed = watcher.next_stdout_event_json(Duration::from_secs(10));
     assert_eq!(removed["type"], "event");
     assert_eq!(removed["payload"]["kind"], "task_removed");
     assert_eq!(
