@@ -423,7 +423,8 @@ mod tests {
     }
 
     fn spawn_child_fixture(mode: &str) -> std::process::Child {
-        Command::new(env::current_exe().unwrap())
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "adapter_process::tests::child_fixture",
@@ -434,9 +435,12 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap()
+            .process_group(0);
+        #[cfg(coverage)]
+        if let Some(value) = inherited_llvm_profile_file() {
+            command.env("LLVM_PROFILE_FILE", value);
+        }
+        command.spawn().unwrap()
     }
 
     struct ChildReaper(Option<std::process::Child>);
@@ -696,20 +700,7 @@ mod tests {
 
     #[test]
     fn termination_preserves_an_exit_observed_before_any_signal() {
-        let mut child = Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "adapter_process::tests::child_fixture",
-                "--nocapture",
-            ])
-            .env_clear()
-            .env("KANBAN_TEST_ADAPTER", "exit-ok")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let mut child = spawn_child_fixture("exit-ok");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !child_exited_unreaped(child.id()).unwrap() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
