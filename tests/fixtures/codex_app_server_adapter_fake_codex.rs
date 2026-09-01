@@ -237,12 +237,30 @@ fn write_schema_files(out_dir: &Path, map: &HashMap<String, String>) {
 fn run_version_or_help(mode: &str, map: &HashMap<String, String>, argv: &[String]) -> i32 {
     let mut stdin = String::new();
     io::stdin().read_to_string(&mut stdin).unwrap();
+    let stdout_emit = command_stdout(map, mode);
+    let stderr_emit = command_stderr(map, mode);
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     let mut captured_stdout = String::new();
     let mut captured_stderr = String::new();
-    emit(&mut stdout, &command_stdout(map, mode), &mut captured_stdout);
-    emit(&mut stderr, &command_stderr(map, mode), &mut captured_stderr);
+    capture_record(
+        &format!("{mode}-stage"),
+        argv,
+        &stdin,
+        "",
+        "",
+        &[("phase", "entered".to_owned())],
+    );
+    emit(&mut stdout, &stdout_emit, &mut captured_stdout);
+    emit(&mut stderr, &stderr_emit, &mut captured_stderr);
+    capture_record(
+        &format!("{mode}-stage"),
+        argv,
+        &stdin,
+        &captured_stdout,
+        &captured_stderr,
+        &[("phase", "emitted".to_owned())],
+    );
     capture_record(mode, argv, &stdin, &captured_stdout, &captured_stderr, &[]);
     command_exit(map, mode)
 }
@@ -252,19 +270,35 @@ fn run_schema(map: &HashMap<String, String>, argv: &[String], out_dir: &str) -> 
     io::stdin().read_to_string(&mut stdin).unwrap();
     let out_dir = PathBuf::from(out_dir);
     write_schema_files(&out_dir, map);
+    let stdout_emit = command_stdout(map, "schema");
+    let stderr_emit = command_stderr(map, "schema");
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     let mut captured_stdout = String::new();
     let mut captured_stderr = String::new();
-    emit(
-        &mut stdout,
-        &command_stdout(map, "schema"),
-        &mut captured_stdout,
+    capture_record(
+        "schema-stage",
+        argv,
+        &stdin,
+        "",
+        "",
+        &[
+            ("phase", "entered".to_owned()),
+            ("out_dir", out_dir.to_string_lossy().into_owned()),
+        ],
     );
-    emit(
-        &mut stderr,
-        &command_stderr(map, "schema"),
-        &mut captured_stderr,
+    emit(&mut stdout, &stdout_emit, &mut captured_stdout);
+    emit(&mut stderr, &stderr_emit, &mut captured_stderr);
+    capture_record(
+        "schema-stage",
+        argv,
+        &stdin,
+        &captured_stdout,
+        &captured_stderr,
+        &[
+            ("phase", "emitted".to_owned()),
+            ("out_dir", out_dir.to_string_lossy().into_owned()),
+        ],
     );
     capture_record(
         "schema",
@@ -286,6 +320,14 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     let mut stage = 0u8;
+    capture_record(
+        "listen-stage",
+        argv,
+        "",
+        "",
+        "",
+        &[("stage", "listen".to_owned()), ("phase", "entered".to_owned())],
+    );
     let exit_code = map
         .get("listen.exit")
         .and_then(|value| value.parse::<i32>().ok())
@@ -312,18 +354,50 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
         captured_stdin.push_str(&line);
         if line.contains("\"method\":\"initialize\"") {
             stage = 1;
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "initialize".to_owned()), ("phase", "received".to_owned())],
+            );
             emit(
                 &mut stdout,
                 &get_spec(map, "listen.response1"),
                 &mut captured_stdout,
             );
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "initialize".to_owned()), ("phase", "emitted".to_owned())],
+            );
             if exit_after_stage == stage {
                 break;
             }
         } else if line.contains("\"method\":\"initialized\"") {
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "initialized".to_owned()), ("phase", "received".to_owned())],
+            );
             continue;
         } else if line.contains("\"method\":\"thread/start\"") {
             stage = 2;
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "thread/start".to_owned()), ("phase", "received".to_owned())],
+            );
             emit(
                 &mut stdout,
                 &get_spec(map, "listen.response2"),
@@ -339,11 +413,27 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
                 &get_spec(map, "listen.stderr"),
                 &mut captured_stderr,
             );
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "thread/start".to_owned()), ("phase", "emitted".to_owned())],
+            );
             if exit_after_stage == stage {
                 break;
             }
         } else if line.contains("\"method\":\"turn/start\"") {
             stage = 3;
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "turn/start".to_owned()), ("phase", "received".to_owned())],
+            );
             emit(
                 &mut stdout,
                 &get_spec(map, "listen.response3"),
@@ -357,6 +447,14 @@ fn run_listen(map: &HashMap<String, String>, argv: &[String]) -> i32 {
                 &mut stderr,
                 &get_spec(map, "listen.stderr"),
                 &mut captured_stderr,
+            );
+            capture_record(
+                "listen-stage",
+                argv,
+                &captured_stdin,
+                &captured_stdout,
+                &captured_stderr,
+                &[("stage", "turn/start".to_owned()), ("phase", "emitted".to_owned())],
             );
             if exit_after_stage == stage {
                 break;

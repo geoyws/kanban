@@ -85,6 +85,7 @@ type TimedCase = (&'static str, ScenarioMutator, u64, bool);
 
 struct FixturePaths {
     cwd: PathBuf,
+    codex_home: PathBuf,
 }
 
 #[derive(Clone)]
@@ -185,7 +186,7 @@ fn agent_ack_text(event_idempotency_key: &str) -> String {
     .to_string()
 }
 
-fn scenario_for_cwd(cwd: &str, ack_key: &str) -> Scenario {
+fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
     let thread = thread_object(cwd, THREAD_ID);
     let response2 = json!({
         "id": 2,
@@ -222,7 +223,15 @@ fn scenario_for_cwd(cwd: &str, ack_key: &str) -> Scenario {
         schema_client_request: b"{\"kind\":\"client-request\"}".to_vec(),
         schema_protocol: b"{\"kind\":\"protocol-schema\"}".to_vec(),
         listen: ListenScenario {
-            response1: Emit::text(json!({"id": 1, "result": {}})),
+            response1: Emit::text(json!({
+                "id": 1,
+                "result": {
+                    "codexHome": codex_home,
+                    "platformFamily": "unix",
+                    "platformOs": "linux",
+                    "userAgent": format!("codex-cli/{REQUIRED_VERSION}"),
+                }
+            })),
             response2: Emit::plain(response2),
             thread_started: Emit::text(json!({
                 "method": "thread/started",
@@ -428,13 +437,17 @@ impl Fixture {
             permissions.set_mode(0o700);
             fs::set_permissions(path, permissions).unwrap();
         }
+        let codex_home = codex_home.canonicalize().unwrap();
 
         fs::copy(compile_fake_codex(), &codex).unwrap();
         let mut permissions = fs::metadata(&codex).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&codex, permissions).unwrap();
 
-        let paths = FixturePaths { cwd: cwd.clone() };
+        let paths = FixturePaths {
+            cwd: cwd.clone(),
+            codex_home: codex_home.clone(),
+        };
         let scenario_value = build(&paths);
         fs::write(&scenario, scenario_value.serialize()).unwrap();
 
@@ -483,6 +496,7 @@ impl Fixture {
         protocol_schema_hash: &str,
         timeout_ms: u64,
     ) -> Output {
+        let before = self.cwd_entries();
         let mut child = self
             .adapter_command(client_request_hash, protocol_schema_hash, timeout_ms)
             .spawn()
@@ -494,7 +508,9 @@ impl Fixture {
             .write_all(serde_json::to_string(request).unwrap().as_bytes())
             .unwrap();
         drop(child.stdin.take());
-        child.wait_with_output().unwrap()
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(self.cwd_entries(), before);
+        output
     }
 
     fn capture_records(&self) -> Vec<Value> {
@@ -564,8 +580,10 @@ fn assert_failure(output: &Output) {
 fn happy_fixture(label: &str) -> Fixture {
     Fixture::new(label, |paths| {
         let cwd = paths.cwd.canonicalize().unwrap();
+        let codex_home = paths.codex_home.canonicalize().unwrap();
         scenario_for_cwd(
             &cwd.to_string_lossy(),
+            &codex_home.to_string_lossy(),
             &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
         )
     })
@@ -577,8 +595,10 @@ where
 {
     Fixture::new(label, |paths| {
         let cwd = paths.cwd.canonicalize().unwrap();
+        let codex_home = paths.codex_home.canonicalize().unwrap();
         let mut scenario = scenario_for_cwd(
             &cwd.to_string_lossy(),
+            &codex_home.to_string_lossy(),
             &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
         );
         mutate(&mut scenario);
@@ -590,8 +610,10 @@ where
 fn compiled_process_happy_path_reaches_the_exact_transcript() {
     let fixture = happy_fixture("happy");
     let fixture_cwd = fixture.cwd.canonicalize().unwrap();
+    let fixture_codex_home = fixture.codex_home.canonicalize().unwrap();
     let scenario = scenario_for_cwd(
         &fixture_cwd.to_string_lossy(),
+        &fixture_codex_home.to_string_lossy(),
         &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
     );
     let client_request_hash = schema_hash(&scenario.schema_client_request);
@@ -600,7 +622,7 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         &request(),
         &client_request_hash,
         &protocol_schema_hash,
-        1000,
+        4000,
     );
     assert!(
         output.status.success(),
@@ -621,15 +643,33 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     );
     assert!(output.stderr.is_empty());
 
-    let before = fixture.cwd_entries();
     let records = fixture.capture_records();
-    assert_eq!(records.len(), 4, "{records:?}");
+    assert_eq!(records.len(), 18, "{records:?}");
     assert_eq!(
         records
             .iter()
             .map(|value| value["mode"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["version", "help", "schema", "listen"]
+        vec![
+            "version-stage",
+            "version-stage",
+            "version",
+            "help-stage",
+            "help-stage",
+            "help",
+            "schema-stage",
+            "schema-stage",
+            "schema",
+            "listen-stage",
+            "listen-stage",
+            "listen-stage",
+            "listen-stage",
+            "listen-stage",
+            "listen-stage",
+            "listen-stage",
+            "listen-stage",
+            "listen"
+        ]
     );
 
     let version = parse_invocation(&records, "version");
@@ -664,6 +704,28 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
     let out_dir = PathBuf::from(schema["out_dir"].as_str().unwrap());
     assert!(!out_dir.starts_with(&fixture.cwd));
     assert!(!out_dir.exists());
+
+    let listen_stages = records
+        .iter()
+        .filter(|record| record["mode"] == "listen-stage")
+        .collect::<Vec<_>>();
+    assert_eq!(listen_stages.len(), 8, "{listen_stages:?}");
+    assert_eq!(listen_stages[0]["stage"], "listen");
+    assert_eq!(listen_stages[0]["phase"], "entered");
+    assert_eq!(listen_stages[1]["stage"], "initialize");
+    assert_eq!(listen_stages[1]["phase"], "received");
+    assert_eq!(listen_stages[2]["stage"], "initialize");
+    assert_eq!(listen_stages[2]["phase"], "emitted");
+    assert_eq!(listen_stages[3]["stage"], "initialized");
+    assert_eq!(listen_stages[3]["phase"], "received");
+    assert_eq!(listen_stages[4]["stage"], "thread/start");
+    assert_eq!(listen_stages[4]["phase"], "received");
+    assert_eq!(listen_stages[5]["stage"], "thread/start");
+    assert_eq!(listen_stages[5]["phase"], "emitted");
+    assert_eq!(listen_stages[6]["stage"], "turn/start");
+    assert_eq!(listen_stages[6]["phase"], "received");
+    assert_eq!(listen_stages[7]["stage"], "turn/start");
+    assert_eq!(listen_stages[7]["phase"], "emitted");
 
     let listen = parse_invocation(&records, "listen");
     let stdin_lines = listen["stdin"]
@@ -762,7 +824,17 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         .lines()
         .collect::<Vec<_>>();
     assert_eq!(listen_stdout_lines.len(), 14);
-    assert_eq!(listen_stdout_lines[0], "{\"id\":1,\"result\":{}}");
+    let initialize_response = parse_line(listen_stdout_lines[0]);
+    assert_eq!(
+        initialize_response["result"]["codexHome"],
+        json!(fixture_codex_home.to_string_lossy().into_owned())
+    );
+    assert_eq!(initialize_response["result"]["platformFamily"], "unix");
+    assert_eq!(initialize_response["result"]["platformOs"], "linux");
+    assert_eq!(
+        initialize_response["result"]["userAgent"],
+        format!("codex-cli/{REQUIRED_VERSION}")
+    );
     assert_eq!(
         parse_line(&format!("{}\n", listen_stdout_lines[1]))["id"],
         2
@@ -780,13 +852,15 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
         "turn/completed"
     );
     assert!(listen["stderr"].as_str().unwrap().is_empty());
-
-    assert_eq!(fixture.cwd_entries(), before);
 }
 
 #[test]
 fn compiled_process_probe_failures_stay_out_of_interactive_mode() {
-    let happy = scenario_for_cwd("/tmp/cwd", &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"));
+    let happy = scenario_for_cwd(
+        "/tmp/cwd",
+        "/private/tmp/kanban-codex-home",
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
     let good_client_request_hash = schema_hash(&happy.schema_client_request);
     let good_protocol_schema_hash = schema_hash(&happy.schema_protocol);
 
@@ -814,12 +888,23 @@ fn compiled_process_probe_failures_stay_out_of_interactive_mode() {
             &request(),
             &good_client_request_hash,
             &good_protocol_schema_hash,
-            1000,
+            4000,
         );
         assert_failure(&output);
         let records = fixture.capture_records();
         assert!(
-            !records.iter().any(|record| record["mode"] == "listen"),
+            !records
+                .iter()
+                .any(|record| record["mode"] == "listen" || record["mode"] == "listen-stage"),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .map(|record| record["mode"].as_str().unwrap())
+                .take(3)
+                .collect::<Vec<_>>()
+                .starts_with(&["version-stage", "version-stage", "version"]),
             "{records:?}"
         );
     }
@@ -827,7 +912,11 @@ fn compiled_process_probe_failures_stay_out_of_interactive_mode() {
 
 #[test]
 fn compiled_process_protocol_and_policy_failures_are_sanitized() {
-    let happy = scenario_for_cwd("/tmp/cwd", &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"));
+    let happy = scenario_for_cwd(
+        "/tmp/cwd",
+        "/private/tmp/kanban-codex-home",
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
     let good_client_request_hash = schema_hash(&happy.schema_client_request);
     let good_protocol_schema_hash = schema_hash(&happy.schema_protocol);
 
@@ -890,7 +979,7 @@ fn compiled_process_protocol_and_policy_failures_are_sanitized() {
             &request(),
             &good_client_request_hash,
             &good_protocol_schema_hash,
-            1000,
+            4000,
         );
         assert_failure(&output);
         let records = fixture.capture_records();
@@ -898,22 +987,198 @@ fn compiled_process_protocol_and_policy_failures_are_sanitized() {
             records
                 .iter()
                 .map(|record| record["mode"].as_str().unwrap())
+                .take(10)
                 .collect::<Vec<_>>(),
-            vec!["version", "help", "schema"],
+            vec![
+                "version-stage",
+                "version-stage",
+                "version",
+                "help-stage",
+                "help-stage",
+                "help",
+                "schema-stage",
+                "schema-stage",
+                "schema",
+                "listen-stage",
+            ],
             "{records:?}"
         );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["mode"] == "listen-stage")
+        );
+        assert!(!records.iter().any(|record| record["mode"] == "listen"));
         assert!(output.stdout.is_empty());
         assert!(output.status.code().is_some());
     }
 }
 
 #[test]
+fn compiled_process_initialize_response_failures_are_fail_closed() {
+    let happy = scenario_for_cwd(
+        "/tmp/cwd",
+        "/private/tmp/kanban-codex-home",
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let good_client_request_hash = schema_hash(&happy.schema_client_request);
+    let good_protocol_schema_hash = schema_hash(&happy.schema_protocol);
+
+    let cases: Vec<ProbeCase> = vec![
+        ("init-codex-home-mismatch", |scenario| {
+            scenario.listen.response1 = Emit::plain(
+                "{\"id\":1,\"result\":{\"codexHome\":\"/wrong\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"codex-cli/0.150.1\"}}",
+            );
+        }),
+        ("init-user-agent-missing", |scenario| {
+            scenario.listen.response1 = Emit::plain(
+                "{\"id\":1,\"result\":{\"codexHome\":\"/private/tmp/kanban-codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}",
+            );
+        }),
+    ];
+
+    for (label, mutate) in cases {
+        let fixture = fixture_with_mutation(label, mutate);
+        let output = fixture.run(
+            &request(),
+            &good_client_request_hash,
+            &good_protocol_schema_hash,
+            4000,
+        );
+        assert_failure(&output);
+        let records = fixture.capture_records();
+        let listen_stage = records
+            .iter()
+            .filter(|record| record["mode"] == "listen-stage")
+            .collect::<Vec<_>>();
+        match label {
+            "init-codex-home-mismatch" => {
+                let modes = records
+                    .iter()
+                    .map(|record| record["mode"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(
+                    matches!(
+                        modes.as_slice(),
+                        [
+                            "version-stage",
+                            "version-stage",
+                            "version",
+                            "help-stage",
+                            "help-stage",
+                            "help",
+                            "schema-stage",
+                            "schema-stage",
+                            "schema",
+                            "listen-stage",
+                            "listen-stage",
+                        ] | [
+                            "version-stage",
+                            "version-stage",
+                            "version",
+                            "help-stage",
+                            "help-stage",
+                            "help",
+                            "schema-stage",
+                            "schema-stage",
+                            "schema",
+                            "listen-stage",
+                            "listen-stage",
+                            "listen-stage",
+                        ]
+                    ),
+                    "{records:?}"
+                );
+                assert_eq!(
+                    listen_stage.len(),
+                    2 + usize::from(modes.len() == 12),
+                    "{listen_stage:?}"
+                );
+                assert_eq!(listen_stage[0]["stage"], "listen");
+                assert_eq!(listen_stage[0]["phase"], "entered");
+                assert_eq!(listen_stage[1]["stage"], "initialize");
+                assert_eq!(listen_stage[1]["phase"], "received");
+                if listen_stage.len() == 3 {
+                    assert_eq!(listen_stage[2]["stage"], "initialize");
+                    assert_eq!(listen_stage[2]["phase"], "emitted");
+                }
+            }
+            "init-user-agent-missing" => {
+                let modes = records
+                    .iter()
+                    .map(|record| record["mode"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(
+                    matches!(
+                        modes.as_slice(),
+                        [
+                            "version-stage",
+                            "version-stage",
+                            "version",
+                            "help-stage",
+                            "help-stage",
+                            "help",
+                            "schema-stage",
+                            "schema-stage",
+                            "schema",
+                            "listen-stage",
+                            "listen-stage",
+                        ] | [
+                            "version-stage",
+                            "version-stage",
+                            "version",
+                            "help-stage",
+                            "help-stage",
+                            "help",
+                            "schema-stage",
+                            "schema-stage",
+                            "schema",
+                            "listen-stage",
+                            "listen-stage",
+                            "listen-stage",
+                        ]
+                    ),
+                    "{records:?}"
+                );
+                assert_eq!(
+                    listen_stage.len(),
+                    2 + usize::from(modes.len() == 12),
+                    "{listen_stage:?}"
+                );
+                assert_eq!(listen_stage[0]["stage"], "listen");
+                assert_eq!(listen_stage[0]["phase"], "entered");
+                assert_eq!(listen_stage[1]["stage"], "initialize");
+                assert_eq!(listen_stage[1]["phase"], "received");
+                if listen_stage.len() == 3 {
+                    assert_eq!(listen_stage[2]["stage"], "initialize");
+                    assert_eq!(listen_stage[2]["phase"], "emitted");
+                }
+            }
+            _ => unreachable!("unexpected case label {label}"),
+        }
+        assert!(!records.iter().any(|record| record["mode"] == "listen"));
+    }
+}
+
+#[test]
 fn compiled_process_stream_and_cleanup_failures_are_bounded() {
-    let happy = scenario_for_cwd("/tmp/cwd", &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"));
+    let happy = scenario_for_cwd(
+        "/tmp/cwd",
+        "/private/tmp/kanban-codex-home",
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
     let good_client_request_hash = schema_hash(&happy.schema_client_request);
     let good_protocol_schema_hash = schema_hash(&happy.schema_protocol);
 
     let cases: Vec<TimedCase> = vec![
+        (
+            "slow-probe",
+            |scenario| {
+                scenario.version.stdout = Emit::Sleep(1500);
+            },
+            1000,
+            true,
+        ),
         (
             "oversized-stdout-line",
             |scenario| {
@@ -922,7 +1187,7 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
                     count: 65_537,
                 };
             },
-            1000,
+            4000,
             false,
         ),
         (
@@ -939,7 +1204,7 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
                     },
                 ];
             },
-            1000,
+            4000,
             false,
         ),
         (
@@ -947,7 +1212,7 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
             |scenario| {
                 scenario.listen.stderr = Emit::plain("app-server stderr\n");
             },
-            1000,
+            4000,
             false,
         ),
         (
@@ -957,11 +1222,11 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
                 scenario.listen.exit_code = 7;
                 scenario.listen.wait_for_eof = false;
             },
-            1000,
+            4000,
             false,
         ),
         (
-            "timeout",
+            "slow-interactive",
             |scenario| {
                 scenario.listen.response3 = Emit::Sleep(1500);
             },
@@ -975,7 +1240,7 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
                     "{\"method\":\"post-completion/changed\",\"params\":{}}",
                 ));
             },
-            1000,
+            4000,
             false,
         ),
     ];
@@ -996,14 +1261,56 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
             assert!(elapsed < Duration::from_secs(6), "elapsed={elapsed:?}");
         }
         let records = fixture.capture_records();
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record["mode"].as_str().unwrap())
-                .take(3)
-                .collect::<Vec<_>>(),
-            vec!["version", "help", "schema"],
-            "{records:?}"
-        );
+        let modes = records
+            .iter()
+            .map(|record| record["mode"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        match label {
+            "slow-probe" => {
+                assert_eq!(modes, vec!["version-stage"], "{records:?}");
+            }
+            "slow-interactive" => {
+                assert_eq!(
+                    modes,
+                    vec![
+                        "version-stage",
+                        "version-stage",
+                        "version",
+                        "help-stage",
+                        "help-stage",
+                        "help",
+                        "schema-stage",
+                        "schema-stage",
+                        "schema",
+                        "listen-stage",
+                        "listen-stage",
+                        "listen-stage",
+                        "listen-stage",
+                        "listen-stage",
+                        "listen-stage",
+                        "listen-stage",
+                    ],
+                    "{records:?}"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    &modes[..9],
+                    &[
+                        "version-stage",
+                        "version-stage",
+                        "version",
+                        "help-stage",
+                        "help-stage",
+                        "help",
+                        "schema-stage",
+                        "schema-stage",
+                        "schema",
+                    ],
+                    "{records:?}"
+                );
+                assert!(modes.contains(&"listen-stage"), "{records:?}");
+            }
+        }
     }
 }
