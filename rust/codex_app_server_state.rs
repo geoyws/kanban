@@ -1528,6 +1528,14 @@ mod tests {
         ));
     }
 
+    /// Every case here must be rejected by `validate_user_agent` specifically.
+    /// `validate_initialize_response` can bail on `userAgent` two ways - `does
+    /// not match` from `validate_user_agent`, `must be nonempty` from
+    /// `nonempty_string_field` - so matching merely on "userAgent" would let a
+    /// case silently degrade from a drift rejection to a shape rejection and
+    /// still pass. Matching on "does not match" is not enough either, since
+    /// `codexHome` bails with that same phrase. The assertion below pins the
+    /// exact drift message, which admits neither degradation.
     #[test]
     fn rejects_initialize_response_user_agent_drift() {
         let package_version = env!("CARGO_PKG_VERSION");
@@ -1548,6 +1556,11 @@ mod tests {
             ),
             format!(
                 "{CLIENT_NAME}/0.150 (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
+            ),
+            // A longer version that starts with the pinned one must not be
+            // swallowed by the prefix; only the trailing space rejects this.
+            format!(
+                "{CLIENT_NAME}/0.150.10 (Ubuntu 24.4.0; x86_64) unknown ({CLIENT_NAME}; {package_version})"
             ),
             // The version must be delimited by a space, not run into the rest.
             format!(
@@ -1599,9 +1612,11 @@ mod tests {
         }
     }
 
-    /// An empty `userAgent` is rejected one step earlier, by the shared
-    /// nonempty-field check rather than by `validate_user_agent`. It is
-    /// asserted on its own message so it cannot stand in for a shape case.
+    /// An empty `userAgent` is a genuine shape case but NOT a drift case: it
+    /// is rejected one step earlier, by `nonempty_string_field`, and never
+    /// reaches `validate_user_agent`. Kept here rather than in the drift loop,
+    /// and asserted on its own distinct message, so it can neither stand in
+    /// for a drift case nor be satisfied by the drift rejection.
     #[test]
     fn rejects_an_empty_initialize_response_user_agent() {
         let mut state = new_state();

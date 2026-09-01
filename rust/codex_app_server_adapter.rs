@@ -24,8 +24,21 @@ const HELP: &str = "kanban-codex-app-server-adapter --codex PATH --codex-home PA
 const MAX_STDIN_BYTES: usize = 1 << 16;
 const MAX_STREAM_BYTES: usize = 1 << 16;
 const CLIENT_NAME: &str = crate::codex_app_server_messages::CLIENT_NAME;
-// Fixed, never inherited: without a PATH the app server cannot find the
-// system bubblewrap and falls back to its bundled copy.
+// Fixed, and never inherited from this adapter's own environment. It exists so
+// the child resolves the root-owned system `/usr/bin/bwrap`: with no PATH the
+// app server logs `Codex could not find bubblewrap on PATH`, falls back to its
+// bundled bubblewrap, and emits an extra notification (measured 3/3 against
+// installed codex-cli 0.150.1 on 2026-09-01).
+//
+// Deliberate asymmetry, accepted 2026-09-01: binaries the child reaches through
+// this PATH are NOT identity-checked the way `--codex` is by
+// `validate_codex_identity`. The constant is a compile-time literal naming only
+// standard root-owned system directories, and the intended target
+// `/usr/bin/bwrap` was verified on HAX as `root:root` mode 755 - root-owned
+// with no group or other write bit, the same property enforced on `--codex`.
+// That is a fact about the one binary measured, not a guarantee about every
+// binary reachable through this PATH; the adapter never execs it directly and
+// so cannot honestly pin its identity.
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
 const CODEX_APP_SERVER_CONSUMER_ID: &str = "codex.app-server";
 const START_READONLY_TURN_ACTION_ID: &str = "start-readonly-turn";

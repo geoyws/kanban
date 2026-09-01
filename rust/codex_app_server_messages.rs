@@ -220,16 +220,25 @@ pub(crate) fn initialize_line() -> Result<String> {
                 experimental_api: false,
                 opt_out_notification_methods: [
                     // Suppresses the notification the server emits when the
-                    // adapter's cwd is an untrusted project directory; the
-                    // state machine stays fail-closed on unknown methods, so
-                    // without this the handshake aborts.
+                    // adapter's cwd is an untrusted project directory. It is
+                    // sent after `initialize` is processed, which is why
+                    // opting out suppresses it at all; the state machine stays
+                    // fail-closed on unknown methods, so without this the
+                    // handshake aborts.
                     //
-                    // NOT PINNED LOCALLY. This spelling was measured against
-                    // installed codex-cli 0.150.1 on 2026-09-01; no protocol
-                    // schema is vendored here (only sha256 hashes are checked,
-                    // against a schema the server generates at runtime), so a
-                    // typo would keep this suite green and fail only at the
-                    // HAX live smoke. The live smoke is its only true pin.
+                    // The exact spelling is a measured protocol fact, not a
+                    // compile-time pin - no protocol schema is vendored here,
+                    // only sha256 hashes of one the server generates at
+                    // runtime. Verified by negative control against installed
+                    // codex-cli 0.150.1 on 2026-09-01, 3 runs each: spelled
+                    // `configWarnings` the notification still arrives
+                    // unsuppressed; spelled `configWarning` it is absent. The
+                    // server accepts this free-form array either way, so a
+                    // wrong spelling does not fail silently - the notification
+                    // keeps arriving and the fail-closed arm in
+                    // `codex_app_server_state::feed_notification` aborts the
+                    // first real handshake with `unsupported notification
+                    // method configWarning`.
                     "configWarning",
                     "remoteControl/status/changed",
                     "mcpServer/startupStatus/updated",
