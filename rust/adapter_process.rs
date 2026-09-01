@@ -71,6 +71,11 @@ fn failure(code: &'static str, timed_out: bool) -> ProcessFailure {
     ProcessFailure { code, timed_out }
 }
 
+#[cfg(coverage)]
+fn inherited_llvm_profile_file() -> Option<OsString> {
+    std::env::var_os("LLVM_PROFILE_FILE")
+}
+
 pub(crate) fn drain_bounded<R: Read>(mut reader: R) -> io::Result<BoundedOutput> {
     let mut bytes = Vec::new();
     let mut overflowed = false;
@@ -232,6 +237,8 @@ pub(crate) fn run_process(
         return Err(failure("adapter_target_invalid", false));
     }
 
+    #[cfg(coverage)]
+    let llvm_profile_file = inherited_llvm_profile_file();
     let mut command = Command::new(&spec.executable);
     command
         .args(&spec.args)
@@ -240,6 +247,10 @@ pub(crate) fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    #[cfg(coverage)]
+    if let Some(value) = llvm_profile_file {
+        command.env("LLVM_PROFILE_FILE", value);
+    }
     if let Some((name, value)) = &spec.secret {
         command.env(name, value);
     }
@@ -467,6 +478,16 @@ mod tests {
                 }
                 io::stdout().write_all(b"isolated").unwrap();
             }
+            #[cfg(coverage)]
+            "coverage-profile" => {
+                use std::os::unix::ffi::OsStrExt;
+
+                let value = env::var_os("LLVM_PROFILE_FILE")
+                    .expect("coverage builds must preserve LLVM_PROFILE_FILE");
+                io::stdout()
+                    .write_all(value.as_os_str().as_bytes())
+                    .unwrap();
+            }
             "exit" => std::process::exit(7),
             "exit-ok" => {}
             "stdout-overflow" => {
@@ -615,6 +636,21 @@ mod tests {
         let result = run_fixture("env", b"", 5_000, &AtomicBool::new(false));
         unsafe { env::remove_var("KANBAN_PROCESS_LEAK") };
         assert!(result.is_ok());
+    }
+
+    #[cfg(coverage)]
+    #[test]
+    fn process_runner_preserves_llvm_profile_file_under_coverage() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let expected = env::var_os("LLVM_PROFILE_FILE")
+            .expect("llvm-cov must set LLVM_PROFILE_FILE for coverage builds");
+        let output = run_fixture("coverage-profile", b"", 5_000, &AtomicBool::new(false)).unwrap();
+        assert_eq!(output.bytes, expected.as_os_str().as_bytes());
     }
 
     #[test]
