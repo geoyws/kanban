@@ -2,6 +2,8 @@ mod adapter_process;
 mod adapter_protocol;
 mod audit;
 #[allow(dead_code)]
+mod codex_app_server_adapter;
+#[allow(dead_code)]
 mod codex_app_server_messages;
 #[allow(dead_code)]
 mod codex_app_server_state;
@@ -2111,6 +2113,18 @@ pub fn dispatcher_entrypoint() -> ! {
 /// Entry point for the Codex queue adapter binary.
 pub fn codex_queue_adapter_entrypoint() -> ! {
     match codex_queue_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        Err(error) if reader_left(&error) => std::process::exit(0),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the Codex app-server adapter binary.
+pub fn codex_app_server_adapter_entrypoint() -> ! {
+    match codex_app_server_adapter::entrypoint() {
         Ok(()) => std::process::exit(0),
         Err(error) if reader_left(&error) => std::process::exit(0),
         Err(error) => {

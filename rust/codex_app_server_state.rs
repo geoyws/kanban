@@ -216,7 +216,10 @@ impl StateMachine {
                     self.thread_id.as_deref(),
                     self.turn_id.as_deref(),
                 )?;
-                expect_object_field(params, "tokenUsage", "thread/tokenUsage/updated")?;
+                let token_usage =
+                    expect_object_field(params, "tokenUsage", "thread/tokenUsage/updated")?;
+                expect_object_field(token_usage, "last", "thread/tokenUsage/updated tokenUsage")?;
+                expect_object_field(token_usage, "total", "thread/tokenUsage/updated tokenUsage")?;
                 Ok(Transition::Continue)
             }
             "turn/completed" => {
@@ -394,8 +397,14 @@ fn validate_thread_start_response(
     if bool_field(sandbox, "networkAccess", "thread/start response sandbox")? {
         bail!("thread/start response sandbox networkAccess must be false");
     }
+    nonempty_string_field(result, "model", "thread/start response")?;
+    nonempty_string_field(result, "modelProvider", "thread/start response")?;
+    match string_field(result, "approvalsReviewer", "thread/start response")? {
+        "user" | "auto_review" | "guardian_subagent" => {}
+        other => bail!("thread/start response approvalsReviewer {other} is not accepted"),
+    }
     let thread = expect_object_field(result, "thread", "thread/start response")?;
-    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true))?;
+    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true), true)?;
     if let Some(approval_policy) = result.get("approvalPolicy")
         && !approval_policy.is_string()
     {
@@ -410,7 +419,7 @@ fn validate_thread_started(
     expected_cwd: &str,
 ) -> Result<()> {
     let thread = expect_object_field(params, "thread", "thread/started")?;
-    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true))?;
+    let thread_id = validate_thread_object(thread, Some(expected_cwd), Some(true), true)?;
     if let Some(expected_thread_id) = expected_thread_id
         && thread_id != expected_thread_id
     {
@@ -622,9 +631,32 @@ fn validate_thread_object(
     thread: &Map<String, Value>,
     expected_cwd: Option<&str>,
     expect_ephemeral: Option<bool>,
+    require_idle_status: bool,
 ) -> Result<String> {
     let thread_id = string_field(thread, "id", "thread")?;
     validate_uuid_v7(thread_id, "thread id")?;
+    nonempty_string_field(thread, "cliVersion", "thread")?;
+    nonempty_string_field(thread, "modelProvider", "thread")?;
+    string_field(thread, "preview", "thread")?;
+    nonempty_string_field(thread, "sessionId", "thread")?;
+    expect_integer_field(thread, "createdAt", "thread")?;
+    expect_integer_field(thread, "updatedAt", "thread")?;
+    match thread.get("projectId") {
+        Some(Value::String(_)) | Some(Value::Null) => {}
+        Some(_) => bail!("thread field projectId must be a string or null"),
+        None => bail!("thread field projectId is required"),
+    }
+    match thread.get("source") {
+        Some(Value::String(_)) | Some(Value::Object(_)) => {}
+        Some(_) => bail!("thread field source must be a string or an object"),
+        None => bail!("thread field source is required"),
+    }
+    let status = expect_object_field(thread, "status", "thread")?;
+    let status_type = nonempty_string_field(status, "type", "thread status")?;
+    if require_idle_status && status_type != "idle" {
+        bail!("thread status type must be idle");
+    }
+    expect_array_field(thread, "turns", "thread")?;
     if let Some(expected_cwd) = expected_cwd {
         let cwd = string_field(thread, "cwd", "thread")?;
         if cwd != expected_cwd {
@@ -717,6 +749,18 @@ fn validate_item_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn nonempty_string_field<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<&'a str> {
+    let value = string_field(object, key, context)?;
+    if value.is_empty() {
+        bail!("{context} field {key} must be nonempty");
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,15 +790,28 @@ mod tests {
             "id": 2,
             "result": {
                 "approvalPolicy": "never",
+                "approvalsReviewer": "user",
                 "cwd": cwd,
+                "model": "codex-1",
+                "modelProvider": "openai",
                 "sandbox": {
                     "type": "readOnly",
                     "networkAccess": false
                 },
                 "thread": {
+                    "cliVersion": "0.150.1",
                     "id": thread_id,
                     "cwd": cwd,
-                    "ephemeral": true
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "preview": "",
+                    "sessionId": "session-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "projectId": null,
+                    "source": "cli",
+                    "status": {"type": "idle"},
+                    "turns": []
                 }
             }
         }))
@@ -778,9 +835,19 @@ mod tests {
             "method": "thread/started",
             "params": {
                 "thread": {
+                    "cliVersion": "0.150.1",
                     "id": thread_id,
                     "cwd": cwd,
-                    "ephemeral": true
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "preview": "",
+                    "sessionId": "session-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "projectId": null,
+                    "source": "cli",
+                    "status": {"type": "idle"},
+                    "turns": []
                 }
             }
         }))
@@ -846,7 +913,10 @@ mod tests {
             "params": {
                 "threadId": thread_id,
                 "turnId": turn_id,
-                "tokenUsage": {"input": 1, "output": 2}
+                "tokenUsage": {
+                    "last": {"input": 1, "output": 2},
+                    "total": {"input": 1, "output": 2}
+                }
             }
         }))
     }
@@ -1335,6 +1405,176 @@ mod tests {
                                 "status": "inProgress",
                                 "items": []
                             }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_thread_structure_drift() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "never",
+                            "approvalsReviewer": "user",
+                            "cwd": CWD,
+                            "model": "codex-1",
+                            "modelProvider": "openai",
+                            "sandbox": {
+                                "type": "readOnly",
+                                "networkAccess": false
+                            },
+                            "thread": {
+                                "cliVersion": "0.150.1",
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "session-1",
+                                "createdAt": 1,
+                                "updatedAt": 2,
+                                "projectId": null,
+                                "source": "cli",
+                                "status": {"type": "active"},
+                                "turns": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "never",
+                            "approvalsReviewer": "user",
+                            "cwd": CWD,
+                            "model": "codex-1",
+                            "modelProvider": "openai",
+                            "sandbox": {
+                                "type": "readOnly",
+                                "networkAccess": false
+                            },
+                            "thread": {
+                                "cliVersion": "0.150.1",
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "session-1",
+                                "createdAt": 1,
+                                "updatedAt": 2,
+                                "projectId": null,
+                                "source": 7,
+                                "status": {"type": "idle"},
+                                "turns": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "id": 2,
+                        "result": {
+                            "approvalPolicy": "never",
+                            "approvalsReviewer": "user",
+                            "cwd": CWD,
+                            "model": "codex-1",
+                            "modelProvider": "openai",
+                            "sandbox": {
+                                "type": "readOnly",
+                                "networkAccess": false
+                            },
+                            "thread": {
+                                "id": THREAD_ID,
+                                "cwd": CWD,
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "preview": "",
+                                "sessionId": "session-1",
+                                "createdAt": 1,
+                                "updatedAt": 2,
+                                "projectId": null,
+                                "source": "cli",
+                                "status": {"type": "idle"},
+                                "turns": []
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_token_usage_shape_drift() {
+        let mut state = new_state();
+        assert!(matches!(
+            state.feed(&init_response()).unwrap(),
+            Transition::SendThreadStart
+        ));
+        assert!(matches!(
+            state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap(),
+            Transition::SendTurnStart { .. }
+        ));
+        assert!(matches!(
+            state
+                .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+                .unwrap(),
+            Transition::Continue
+        ));
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": THREAD_ID,
+                            "turnId": TURN_ID,
+                            "tokenUsage": {"last": {"input": 1, "output": 2}}
+                        }
+                    })
+                    .to_string()
+                    .into_bytes()
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .feed(
+                    &json!({
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": THREAD_ID,
+                            "turnId": TURN_ID,
+                            "tokenUsage": {"last": 7, "total": {"input": 1, "output": 2}}
                         }
                     })
                     .to_string()

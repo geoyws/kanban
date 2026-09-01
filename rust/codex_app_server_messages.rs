@@ -43,7 +43,7 @@ struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 struct InitializeCapabilities {
     experimental_api: bool,
-    opt_out_notification_methods: [&'static str; 4],
+    opt_out_notification_methods: [&'static str; 7],
 }
 
 #[derive(Serialize)]
@@ -223,6 +223,9 @@ pub(crate) fn initialize_line() -> Result<String> {
                     "mcpServer/startupStatus/updated",
                     "thread/status/changed",
                     "account/rateLimits/updated",
+                    "item/reasoning/summaryTextDelta",
+                    "item/reasoning/summaryPartAdded",
+                    "item/reasoning/textDelta",
                 ],
             },
         },
@@ -321,6 +324,9 @@ mod tests {
                             "mcpServer/startupStatus/updated",
                             "thread/status/changed",
                             "account/rateLimits/updated",
+                            "item/reasoning/summaryTextDelta",
+                            "item/reasoning/summaryPartAdded",
+                            "item/reasoning/textDelta",
                         ]
                     }
                 }
