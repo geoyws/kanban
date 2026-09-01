@@ -256,6 +256,7 @@ impl StateMachine {
                 if !self.ack_completed || !self.turn_contains_ack(turn) {
                     bail!("turn/completed must follow the exact ack");
                 }
+                self.reconcile_completed_turn(turn)?;
                 self.phase = Phase::Completed;
                 self.turn_id = Some(turn_id);
                 Ok(Transition::Completed)
@@ -312,6 +313,40 @@ impl StateMachine {
                 })
             })
             .unwrap_or(false)
+    }
+
+    fn reconcile_completed_turn(&self, turn: &Map<String, Value>) -> Result<()> {
+        for (item_id, state) in &self.started_items {
+            if matches!(state, ItemState::Started(_)) {
+                bail!("turn/completed has incomplete tracked item {item_id}");
+            }
+        }
+
+        let items = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("turn.items must be an array"))?;
+        let mut final_items = HashMap::with_capacity(items.len());
+        for value in items {
+            let item = validate_thread_item(value)?;
+            if final_items.insert(item.id.clone(), item.kind).is_some() {
+                bail!("turn/completed has duplicate item id {}", item.id);
+            }
+            match self.started_items.get(&item.id) {
+                Some(ItemState::Completed(kind)) if *kind == item.kind => {}
+                Some(ItemState::Completed(_)) => {
+                    bail!("turn/completed item {} kind does not match", item.id)
+                }
+                Some(ItemState::Started(_)) => unreachable!(),
+                None => bail!("turn/completed item {} was not tracked", item.id),
+            }
+        }
+        for item_id in self.started_items.keys() {
+            if !final_items.contains_key(item_id) {
+                bail!("turn/completed is missing tracked item {item_id}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1052,6 +1087,40 @@ mod tests {
         .unwrap()
     }
 
+    fn streaming_state() -> StateMachine {
+        let mut state = new_state();
+        state.feed(&init_response()).unwrap();
+        state.feed(&thread_start_response(CWD, THREAD_ID)).unwrap();
+        state
+            .feed(&turn_start_response(THREAD_ID, TURN_ID, "inProgress"))
+            .unwrap();
+        state
+    }
+
+    fn complete_ack(state: &mut StateMachine) {
+        state
+            .feed(&item_started(
+                THREAD_ID,
+                TURN_ID,
+                agent_item("a-1", &ack_text()),
+            ))
+            .unwrap();
+        state
+            .feed(&item_completed(
+                THREAD_ID,
+                TURN_ID,
+                agent_item("a-1", &ack_text()),
+            ))
+            .unwrap();
+    }
+
+    fn completion_error(state: &mut StateMachine, items: Vec<Value>) -> String {
+        state
+            .feed(&turn_completed(THREAD_ID, TURN_ID, items))
+            .unwrap_err()
+            .to_string()
+    }
+
     #[test]
     fn happy_sequence_reaches_completion() {
         let mut state = new_state();
@@ -1144,6 +1213,157 @@ mod tests {
             Transition::Completed
         ));
         assert!(state.feed(&token_usage(THREAD_ID, TURN_ID)).is_err());
+    }
+
+    #[test]
+    fn reconciles_exact_completed_item_set() {
+        let mut state = streaming_state();
+        for item in [user_item("u-1"), reasoning_item("r-1")] {
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, item.clone()))
+                .unwrap();
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, item))
+                .unwrap();
+        }
+        complete_ack(&mut state);
+
+        assert!(matches!(
+            state
+                .feed(&turn_completed(
+                    THREAD_ID,
+                    TURN_ID,
+                    vec![
+                        user_item("u-1"),
+                        reasoning_item("r-1"),
+                        agent_item("a-1", &ack_text()),
+                    ],
+                ))
+                .unwrap(),
+            Transition::Completed
+        ));
+    }
+
+    #[test]
+    fn rejects_turn_completion_with_dangling_user_item() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(
+            &mut state,
+            vec![user_item("u-1"), agent_item("a-1", &ack_text())],
+        );
+        assert!(error.contains("incomplete tracked item u-1"));
+    }
+
+    #[test]
+    fn rejects_turn_completion_with_dangling_reasoning_item() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(
+            &mut state,
+            vec![reasoning_item("r-1"), agent_item("a-1", &ack_text())],
+        );
+        assert!(error.contains("incomplete tracked item r-1"));
+    }
+
+    #[test]
+    fn rejects_turn_completion_with_dangling_agent_item() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(
+                THREAD_ID,
+                TURN_ID,
+                agent_item("a-dangling", "not completed"),
+            ))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(&mut state, vec![agent_item("a-1", &ack_text())]);
+        assert!(error.contains("incomplete tracked item a-dangling"));
+    }
+
+    #[test]
+    fn rejects_turn_completion_missing_a_tracked_item() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        state
+            .feed(&item_completed(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(&mut state, vec![agent_item("a-1", &ack_text())]);
+        assert!(error.contains("missing tracked item u-1"));
+    }
+
+    #[test]
+    fn rejects_turn_completion_with_an_extra_item() {
+        let mut state = streaming_state();
+        complete_ack(&mut state);
+
+        let error = completion_error(
+            &mut state,
+            vec![user_item("u-extra"), agent_item("a-1", &ack_text())],
+        );
+        assert!(error.contains("item u-extra was not tracked"));
+    }
+
+    #[test]
+    fn rejects_untracked_exact_ack_lookalike() {
+        let mut state = streaming_state();
+        complete_ack(&mut state);
+
+        let error = completion_error(&mut state, vec![agent_item("a-lookalike", &ack_text())]);
+        assert!(error.contains("item a-lookalike was not tracked"));
+    }
+
+    #[test]
+    fn rejects_turn_completion_with_a_duplicate_item_id() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        state
+            .feed(&item_completed(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(
+            &mut state,
+            vec![
+                user_item("u-1"),
+                user_item("u-1"),
+                agent_item("a-1", &ack_text()),
+            ],
+        );
+        assert!(error.contains("duplicate item id u-1"));
+    }
+
+    #[test]
+    fn rejects_turn_completion_with_an_item_kind_mismatch() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, user_item("shared-id")))
+            .unwrap();
+        state
+            .feed(&item_completed(THREAD_ID, TURN_ID, user_item("shared-id")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(
+            &mut state,
+            vec![reasoning_item("shared-id"), agent_item("a-1", &ack_text())],
+        );
+        assert!(error.contains("item shared-id kind does not match"));
     }
 
     #[test]
