@@ -6,7 +6,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const THREAD_ID: &str = "01890f47-2f88-7b8f-9b2c-1c2d3e4f5a6b";
@@ -19,6 +19,8 @@ const BASE_INSTRUCTIONS: &str = "Return only the JSON acknowledgement.";
 const DEVELOPER_INSTRUCTIONS: &str =
     "Do not use tools, files, network, or commands. Return only the JSON acknowledgement.";
 const AT_LEAST_ONCE_INSTRUCTION: &str = "At-least-once delivery; deduplicate by idempotency key.";
+const TIMED_FAILURE_TIMEOUT_MS: u64 = 2_500;
+const TIMED_FAILURE_SLEEP_MS: u64 = 4_000;
 
 #[derive(Clone)]
 enum Emit {
@@ -158,6 +160,11 @@ fn compile_fake_codex() -> &'static Path {
         binary
     })
     .as_path()
+}
+
+fn process_test_mutex() -> &'static Mutex<()> {
+    static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    MUTEX.get_or_init(|| Mutex::new(()))
 }
 
 fn thread_object(cwd: &str, thread_id: &str) -> Value {
@@ -608,6 +615,9 @@ where
 
 #[test]
 fn compiled_process_happy_path_reaches_the_exact_transcript() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = happy_fixture("happy");
     let fixture_cwd = fixture.cwd.canonicalize().unwrap();
     let fixture_codex_home = fixture.codex_home.canonicalize().unwrap();
@@ -856,6 +866,9 @@ fn compiled_process_happy_path_reaches_the_exact_transcript() {
 
 #[test]
 fn compiled_process_probe_failures_stay_out_of_interactive_mode() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let happy = scenario_for_cwd(
         "/tmp/cwd",
         "/private/tmp/kanban-codex-home",
@@ -912,6 +925,9 @@ fn compiled_process_probe_failures_stay_out_of_interactive_mode() {
 
 #[test]
 fn compiled_process_protocol_and_policy_failures_are_sanitized() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let happy = scenario_for_cwd(
         "/tmp/cwd",
         "/private/tmp/kanban-codex-home",
@@ -1016,6 +1032,9 @@ fn compiled_process_protocol_and_policy_failures_are_sanitized() {
 
 #[test]
 fn compiled_process_initialize_response_failures_are_fail_closed() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let happy = scenario_for_cwd(
         "/tmp/cwd",
         "/private/tmp/kanban-codex-home",
@@ -1162,6 +1181,9 @@ fn compiled_process_initialize_response_failures_are_fail_closed() {
 
 #[test]
 fn compiled_process_stream_and_cleanup_failures_are_bounded() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let happy = scenario_for_cwd(
         "/tmp/cwd",
         "/private/tmp/kanban-codex-home",
@@ -1174,9 +1196,9 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
         (
             "slow-probe",
             |scenario| {
-                scenario.version.stdout = Emit::Sleep(1500);
+                scenario.version.stdout = Emit::Sleep(TIMED_FAILURE_SLEEP_MS);
             },
-            1000,
+            TIMED_FAILURE_TIMEOUT_MS,
             true,
         ),
         (
@@ -1228,9 +1250,9 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
         (
             "slow-interactive",
             |scenario| {
-                scenario.listen.response3 = Emit::Sleep(1500);
+                scenario.listen.response3 = Emit::Sleep(TIMED_FAILURE_SLEEP_MS);
             },
-            1000,
+            TIMED_FAILURE_TIMEOUT_MS,
             true,
         ),
         (
@@ -1257,8 +1279,11 @@ fn compiled_process_stream_and_cleanup_failures_are_bounded() {
         let elapsed = start.elapsed();
         assert_failure(&output);
         if measure_elapsed {
-            assert!(elapsed >= Duration::from_millis(1000));
-            assert!(elapsed < Duration::from_secs(6), "elapsed={elapsed:?}");
+            assert!(elapsed >= Duration::from_millis(timeout_ms));
+            assert!(
+                elapsed < Duration::from_millis(timeout_ms + 5_000),
+                "elapsed={elapsed:?}"
+            );
         }
         let records = fixture.capture_records();
         let modes = records
