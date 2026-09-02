@@ -202,7 +202,7 @@ fn thread_object(cwd: &str, thread_id: &str) -> Value {
         "createdAt": 1,
         "updatedAt": 2,
         "projectId": null,
-        "source": "cli",
+        "source": "vscode",
         "status": {"type": "idle"},
         "turns": []
     })
@@ -1132,7 +1132,7 @@ fn compiled_process_thread_cli_version_drift_is_fail_closed() {
                     "createdAt": 1,
                     "updatedAt": 2,
                     "projectId": null,
-                    "source": "cli",
+                    "source": "vscode",
                     "status": {"type": "idle"},
                     "turns": []
                 }
@@ -1259,7 +1259,7 @@ fn compiled_process_cwd_and_thread_identity_drift_are_independent() {
                     "createdAt": 1,
                     "updatedAt": 2,
                     "projectId": null,
-                    "source": "cli",
+                    "source": "vscode",
                     "status": {"type": "idle"},
                     "turns": []
                 }
@@ -1305,7 +1305,7 @@ fn compiled_process_cwd_and_thread_identity_drift_are_independent() {
                     "createdAt": 1,
                     "updatedAt": 2,
                     "projectId": null,
-                    "source": "cli",
+                    "source": "vscode",
                     "status": {"type": "idle"},
                     "turns": []
                 }
