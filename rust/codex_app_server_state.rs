@@ -9,7 +9,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 const EXPECTED_APPROVAL_POLICY: &str = "never";
 const EXPECTED_SANDBOX_TYPE: &str = "readOnly";
 const EXPECTED_MODEL_PROVIDER: &str = "openai";
-const EXPECTED_THREAD_SOURCE: &str = "cli";
+const EXPECTED_THREAD_SOURCE: &str = "vscode";
 const EXPECTED_THREAD_STATUS: &str = "inProgress";
 const EXPECTED_TURN_COMPLETED_STATUS: &str = "completed";
 const EXPECTED_TURN_ID: u64 = 3;
@@ -1000,7 +1000,7 @@ mod tests {
                     "createdAt": 1,
                     "updatedAt": 2,
                     "projectId": null,
-                    "source": "cli",
+                    "source": "vscode",
                     "status": {"type": "idle"},
                     "turns": []
                 }
@@ -1036,7 +1036,7 @@ mod tests {
                     "createdAt": 1,
                     "updatedAt": 2,
                     "projectId": null,
-                    "source": "cli",
+                    "source": "vscode",
                     "status": {"type": "idle"},
                     "turns": []
                 }
@@ -1760,7 +1760,7 @@ mod tests {
                                 "createdAt": 1,
                                 "updatedAt": 2,
                                 "projectId": null,
-                                "source": "cli",
+                                "source": "vscode",
                                 "status": {"type": "idle"},
                                 "turns": []
                             }
@@ -2248,7 +2248,7 @@ mod tests {
                                 "createdAt": 1,
                                 "updatedAt": 2,
                                 "projectId": null,
-                                "source": "cli",
+                                "source": "vscode",
                                 "status": {"type": "active"},
                                 "turns": []
                             }
@@ -2321,7 +2321,7 @@ mod tests {
                                 "createdAt": 1,
                                 "updatedAt": 2,
                                 "projectId": null,
-                                "source": "cli",
+                                "source": "vscode",
                                 "status": {"type": "idle"},
                                 "turns": []
                             }
