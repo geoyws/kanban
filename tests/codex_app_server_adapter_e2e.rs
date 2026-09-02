@@ -289,10 +289,16 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
     })
     .to_string();
     let turn_items = vec![
-        json!({"id":"u-1","type":"userMessage","content":[{"type":"text","text":"hi"}]}),
         json!({"id":"r-1","type":"reasoning","content":["reason"],"summary":["summary"]}),
         json!({"id":"a-1","type":"agentMessage","text":agent_ack_text(ack_key)}),
     ];
+    let turn = json!({
+        "id": TURN_ID,
+        "status": "completed",
+        "error": null,
+        "items": turn_items,
+        "itemsView": "summary",
+    });
     Scenario {
         version: CommandScenario {
             stdout: Emit::plain(format!("codex-cli {TEST_CODEX_VERSION}\n")),
@@ -424,12 +430,7 @@ fn scenario_for_cwd(cwd: &str, codex_home: &str, ack_key: &str) -> Scenario {
                     "method": "turn/completed",
                     "params": {
                         "threadId": THREAD_ID,
-                        "turn": {
-                            "id": TURN_ID,
-                            "status": "completed",
-                            "error": null,
-                            "items": turn_items,
-                        }
+                        "turn": turn,
                     }
                 })),
             ],
