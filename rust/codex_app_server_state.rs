@@ -348,6 +348,10 @@ impl StateMachine {
             .unwrap_or(false)
     }
 
+    fn turn_items_view_is_summary(turn: &Map<String, Value>) -> bool {
+        turn.get("itemsView").and_then(Value::as_str) == Some("summary")
+    }
+
     fn reconcile_completed_turn(&self, turn: &Map<String, Value>) -> Result<()> {
         for (item_id, state) in &self.started_items {
             if matches!(state, ItemState::Started(_)) {
@@ -359,6 +363,7 @@ impl StateMachine {
             .get("items")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow::anyhow!("turn.items must be an array"))?;
+        let summary_items_view = Self::turn_items_view_is_summary(turn);
         let mut final_items = HashMap::with_capacity(items.len());
         for value in items {
             let item = validate_thread_item(value)?;
@@ -376,7 +381,10 @@ impl StateMachine {
         }
         for item_id in self.started_items.keys() {
             if !final_items.contains_key(item_id) {
-                bail!("turn/completed is missing tracked item {item_id}");
+                match self.started_items.get(item_id) {
+                    Some(ItemState::Completed(ItemKind::UserMessage)) if summary_items_view => {}
+                    _ => bail!("turn/completed is missing tracked item {item_id}"),
+                }
             }
         }
         Ok(())
@@ -1113,16 +1121,31 @@ mod tests {
     }
 
     fn turn_completed(thread_id: &str, turn_id: &str, items: Vec<Value>) -> Vec<u8> {
+        turn_completed_with_items_view(thread_id, turn_id, items, None)
+    }
+
+    fn turn_completed_with_items_view(
+        thread_id: &str,
+        turn_id: &str,
+        items: Vec<Value>,
+        items_view: Option<&str>,
+    ) -> Vec<u8> {
+        let mut turn = json!({
+            "id": turn_id,
+            "status": "completed",
+            "error": null,
+            "items": items
+        });
+        if let Some(items_view) = items_view {
+            turn.as_object_mut()
+                .unwrap()
+                .insert("itemsView".to_owned(), Value::String(items_view.to_owned()));
+        }
         line(json!({
             "method": "turn/completed",
             "params": {
                 "threadId": thread_id,
-                "turn": {
-                    "id": turn_id,
-                    "status": "completed",
-                    "error": null,
-                    "items": items
-                }
+                "turn": turn
             }
         }))
     }
@@ -1367,6 +1390,32 @@ mod tests {
     }
 
     #[test]
+    fn reconciles_summary_completed_turn_allows_missing_completed_user_item() {
+        let mut state = streaming_state();
+        for item in [user_item("u-1"), reasoning_item("r-1")] {
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, item.clone()))
+                .unwrap();
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, item))
+                .unwrap();
+        }
+        complete_ack(&mut state);
+
+        assert!(matches!(
+            state
+                .feed(&turn_completed_with_items_view(
+                    THREAD_ID,
+                    TURN_ID,
+                    vec![reasoning_item("r-1"), agent_item("a-1", &ack_text())],
+                    Some("summary"),
+                ))
+                .unwrap(),
+            Transition::Completed
+        ));
+    }
+
+    #[test]
     fn rejects_turn_completion_with_dangling_user_item() {
         let mut state = streaming_state();
         state
@@ -1382,6 +1431,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_summary_turn_without_items_view_for_missing_completed_user_item() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        state
+            .feed(&item_completed(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+            .unwrap();
+        state
+            .feed(&item_completed(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = completion_error(
+            &mut state,
+            vec![reasoning_item("r-1"), agent_item("a-1", &ack_text())],
+        );
+        assert!(error.contains("missing tracked item u-1"));
+    }
+
+    #[test]
     fn rejects_turn_completion_with_dangling_reasoning_item() {
         let mut state = streaming_state();
         state
@@ -1394,6 +1467,107 @@ mod tests {
             vec![reasoning_item("r-1"), agent_item("a-1", &ack_text())],
         );
         assert!(error.contains("incomplete tracked item r-1"));
+    }
+
+    #[test]
+    fn rejects_summary_turn_missing_reasoning_item() {
+        let mut state = streaming_state();
+        for item in [user_item("u-1"), reasoning_item("r-1")] {
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, item.clone()))
+                .unwrap();
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, item))
+                .unwrap();
+        }
+        complete_ack(&mut state);
+
+        let error = state
+            .feed(&turn_completed_with_items_view(
+                THREAD_ID,
+                TURN_ID,
+                vec![user_item("u-1"), agent_item("a-1", &ack_text())],
+                Some("summary"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing tracked item r-1"));
+    }
+
+    #[test]
+    fn rejects_missing_exact_ack_even_when_items_view_is_summary() {
+        let mut state = streaming_state();
+        for item in [user_item("u-1"), reasoning_item("r-1")] {
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, item.clone()))
+                .unwrap();
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, item))
+                .unwrap();
+        }
+        complete_ack(&mut state);
+
+        let error = state
+            .feed(&turn_completed_with_items_view(
+                THREAD_ID,
+                TURN_ID,
+                vec![user_item("u-1"), reasoning_item("r-1")],
+                Some("summary"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("turn/completed must follow the exact ack"));
+    }
+
+    #[test]
+    fn rejects_summary_mode_missing_incomplete_user_item() {
+        let mut state = streaming_state();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, user_item("u-1")))
+            .unwrap();
+        state
+            .feed(&item_started(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+            .unwrap();
+        state
+            .feed(&item_completed(THREAD_ID, TURN_ID, reasoning_item("r-1")))
+            .unwrap();
+        complete_ack(&mut state);
+
+        let error = state
+            .feed(&turn_completed_with_items_view(
+                THREAD_ID,
+                TURN_ID,
+                vec![reasoning_item("r-1"), agent_item("a-1", &ack_text())],
+                Some("summary"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete tracked item u-1"));
+    }
+
+    #[test]
+    fn rejects_non_summary_items_view_for_missing_completed_user_item() {
+        let mut state = streaming_state();
+        for item in [user_item("u-1"), reasoning_item("r-1")] {
+            state
+                .feed(&item_started(THREAD_ID, TURN_ID, item.clone()))
+                .unwrap();
+            state
+                .feed(&item_completed(THREAD_ID, TURN_ID, item))
+                .unwrap();
+        }
+        complete_ack(&mut state);
+
+        let error = state
+            .feed(&turn_completed_with_items_view(
+                THREAD_ID,
+                TURN_ID,
+                vec![reasoning_item("r-1"), agent_item("a-1", &ack_text())],
+                Some("full"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing tracked item u-1"));
     }
 
     #[test]

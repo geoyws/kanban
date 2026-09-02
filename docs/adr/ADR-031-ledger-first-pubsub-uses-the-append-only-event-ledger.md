@@ -511,7 +511,9 @@ closed. Success stdout is only `AdapterResponse` after one accepted
 `(subscriptionID,eventID)` completion. The acceptance matrix for this bridge
 is separate: focused unit protocol/runtime coverage, compiled-process
 adapter-contract coverage against a dependency-free fake Codex, and a distinct
-HAX live smoke against installed Codex/model.
+HAX live smoke against installed Codex/model. In the summary-view final turn,
+only a completed `userMessage` may be omitted from `turn/completed.items`;
+`reasoning` and `agentMessage` items remain exact and fail closed.
 
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:
