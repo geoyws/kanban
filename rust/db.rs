@@ -1735,6 +1735,22 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// Turn a private online-backup target into a normal current board without
+/// reopening its path. Adoption uses this so migration, validation, hashing,
+/// and publication all remain tied to the one destination inode it created.
+pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+    )?;
+    connection.busy_handler(Some(busy_backoff))?;
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let outcome = migrate(connection, BOARD_MIGRATIONS);
+    connection.pragma_update(None, "foreign_keys", true)?;
+    outcome?;
+    crate::audit::initialize_board_chain(connection)?;
+    Ok(())
+}
+
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,

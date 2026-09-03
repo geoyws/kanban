@@ -1,19 +1,37 @@
 use crate::WATCH_BATCH_LIMIT;
 use crate::db::{
-    SnapshotSource, checkpoint, create_backup_target, integrity, open_board, open_registry,
-    open_registry_readonly, own_private_dir,
+    SnapshotSource, checkpoint, create_backup_target, create_private_dir_all,
+    finalize_adopted_board, foreign_key_violations, integrity, open_board, open_registry,
+    open_registry_readonly, own_private_dir, read_snapshot,
 };
 use crate::model::{
-    Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, UnreachableRoot, WorkspaceRecord,
+    Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, UnreachableRoot,
+    WorkspaceAdoptReceipt, WorkspaceRecord,
 };
 use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, params, params_from_iter,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write as _};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use uuid::Uuid;
+
+pub(crate) const WORKSPACE_ADOPT_HELPER_COMMAND: &str = "__workspace-adopt-helper";
+const WORKSPACE_ADOPT_HELPER_ROOT_FD: i32 = 37;
+const WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD: i32 = 38;
 
 fn validate_rule_body(value: &str) -> Result<()> {
     if value.trim().is_empty() {
@@ -172,6 +190,43 @@ pub fn data_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/share/kanban"))
 }
 
+pub(crate) fn prepare_live_root_for_adoption() -> Result<()> {
+    pin_live_root_for_adoption().map(|_| ())
+}
+
+pub(crate) fn preflight_live_root_for_adoption() -> Result<()> {
+    let root = data_root()?;
+    if let Err(error) = secure_registry_dirs(&root, false) {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        }) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) struct PinnedAdoptionRoot {
+    pub(crate) root: PathBuf,
+    pub(crate) root_dir: File,
+    pub(crate) boards: File,
+}
+
+pub(crate) fn pin_live_root_for_adoption() -> Result<PinnedAdoptionRoot> {
+    let root = data_root()?;
+    let (root_dir, boards) = secure_registry_dirs(&root, true)?;
+    verify_pinned_dir(&root, &root_dir, "registry data root")?;
+    verify_registry_chain(&root, &boards)?;
+    Ok(PinnedAdoptionRoot {
+        root,
+        root_dir,
+        boards,
+    })
+}
+
 fn row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
         root_path: record.get("root_path")?,
@@ -253,9 +308,1027 @@ fn target_looks_like_path(target: &str) -> bool {
         })
 }
 
+fn read_only_busy_backoff(count: i32) -> bool {
+    let pause = 1_u64 << (count.clamp(0, 7) as u32);
+    std::thread::sleep(std::time::Duration::from_millis(pause));
+    count < 8
+}
+
+fn open_staged_snapshot_readonly(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open staged source snapshot {}", path.display()))?;
+    connection.busy_handler(Some(read_only_busy_backoff))?;
+    connection.pragma_update(None, "query_only", true)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    Ok(connection)
+}
+
+fn pinned_regular_file(path: &Path, label: &str) -> Result<(File, fs::Metadata)> {
+    let before = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if before.file_type().is_symlink() {
+        bail!(
+            "{label} {} is a symlink; pass the exact non-symlink path",
+            path.display()
+        );
+    }
+    if !before.file_type().is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {label} {} without following links", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect opened {label} {}", path.display()))?;
+    if !opened.file_type().is_file() || before.dev() != opened.dev() || before.ino() != opened.ino()
+    {
+        bail!(
+            "{label} {} changed identity while it was opened",
+            path.display()
+        );
+    }
+    Ok((file, opened))
+}
+
+fn canonical_regular_source_path(path: &Path) -> Result<(PathBuf, File, fs::Metadata)> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        bail!(
+            "source board path {} contains parent traversal; pass the exact board path",
+            path.display()
+        );
+    }
+    let (file, metadata) = pinned_regular_file(path, "source board path")?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve source board {}", path.display()))?;
+    let resolved = fs::symlink_metadata(&canonical)
+        .with_context(|| format!("inspect resolved source board {}", canonical.display()))?;
+    if !resolved.file_type().is_file()
+        || resolved.dev() != metadata.dev()
+        || resolved.ino() != metadata.ino()
+    {
+        bail!(
+            "source board {} changed identity while it was resolved",
+            path.display()
+        );
+    }
+    Ok((canonical, file, metadata))
+}
+
+fn require_foreign_key_clean(connection: &Connection, label: &str) -> Result<()> {
+    let violations = foreign_key_violations(connection)?;
+    if !violations.is_empty() {
+        bail!(
+            "{label} has foreign key violations: {}",
+            violations.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn board_meta_value(connection: &Connection, key: &str) -> Result<Option<String>> {
+    connection
+        .query_row("SELECT value FROM board_meta WHERE key=?", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(Into::into)
+}
+
+fn exact_on(connection: &Connection, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
+    let text = workspace.to_string_lossy();
+    connection
+        .query_row(
+            "SELECT workspace_roots.root_path AS root_path,\
+                    boards.name AS name,\
+                    workspace_roots.board_path AS board_path,\
+                    workspace_roots.created_at AS created_at,\
+                    workspace_roots.last_used_at AS last_used_at,\
+                    0 AS archived,\
+                    NULL AS archived_at,\
+                    NULL AS archived_by,\
+                    0 AS rootless \
+             FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
+             WHERE workspace_roots.root_path=?",
+            [text.as_ref()],
+            row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn enclosing_on(connection: &Connection, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
+    let mut cursor = workspace.to_path_buf();
+    while cursor.pop() {
+        if let Some(found) = exact_on(connection, &cursor)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn database_artifact_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut artifact = path.as_os_str().to_owned();
+    artifact.push(suffix);
+    PathBuf::from(artifact)
+}
+
+fn adoption_marker_path(root: &Path) -> PathBuf {
+    root.join(".workspace-adopt.json")
+}
+
+fn adoption_staging_root(root: &Path) -> PathBuf {
+    root.join(".workspace-adopt-staging")
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("open directory {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptionMarker {
+    board_name: String,
+    board_path: String,
+    root_path: Option<String>,
+    source_board_path: String,
+    staging_dir: String,
+    created_at: i64,
+}
+
+fn write_adoption_marker(path: &Path, marker: &AdoptionMarker) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create adoption marker {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, marker)
+        .with_context(|| format!("write adoption marker {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync adoption marker {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn read_adoption_marker(path: &Path) -> Result<AdoptionMarker> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read adoption marker {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse adoption marker {}", path.display()))
+}
+
+fn adoption_path_within_root(root: &Path, path: &Path) -> bool {
+    path.starts_with(root)
+}
+
+fn cleanup_database_artifacts(path: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    for artifact in [
+        path.to_path_buf(),
+        database_artifact_path(path, "-wal"),
+        database_artifact_path(path, "-shm"),
+        database_artifact_path(path, "-journal"),
+    ] {
+        match fs::remove_file(&artifact) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{}: {error}", artifact.display())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to remove adoption artifacts; retained evidence: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn combine_cleanup<T>(result: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => {
+            let cleanup_text = format!("{cleanup:#}");
+            Err(cleanup.context(format!("adoption cleanup failed: {cleanup_text}")))
+        }
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("adoption cleanup also failed: {cleanup:#}")))
+        }
+    }
+}
+
+fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+fn metadata_stable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    metadata_identity(before) == metadata_identity(after)
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+}
+
+fn copy_pinned_prefix(source: &mut File, target: &Path, length: u64) -> Result<()> {
+    source.seek(SeekFrom::Start(0))?;
+    let mut target_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(target)
+        .with_context(|| format!("create private snapshot component {}", target.display()))?;
+    let mut limited = source.take(length);
+    let copied = std::io::copy(&mut limited, &mut target_file)?;
+    if copied != length {
+        bail!(
+            "source component changed length while capturing it: expected {length} bytes, copied {copied}"
+        );
+    }
+    target_file.sync_all()?;
+    Ok(())
+}
+
+fn create_staging_dir() -> Result<PathBuf> {
+    for _ in 0..8 {
+        let path = env::temp_dir().join(format!("kanban-adopt-{}", Uuid::new_v4()));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create adoption staging directory {}", path.display())
+                });
+            }
+        }
+    }
+    bail!("could not allocate a unique adoption staging directory")
+}
+
+fn cleanup_staging_dir(path: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => match fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        Err(error) => failures.push(format!("{}: {error}", entry.path().display())),
+                    },
+                    Err(error) => failures.push(format!("read {}: {error}", path.display())),
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => failures.push(format!("read {}: {error}", path.display())),
+    }
+    if failures.is_empty()
+        && let Err(error) = fs::remove_dir(path)
+    {
+        failures.push(format!("{}: {error}", path.display()));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to clean adoption staging; retained evidence: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn remove_optional_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn adoption_marker_matches_root(root: &Path, marker: &AdoptionMarker) -> bool {
+    let boards_root = root.join("boards");
+    let adoption_root = adoption_staging_root(root);
+    let Some(board_parent) = Path::new(&marker.board_path).parent() else {
+        return false;
+    };
+    adoption_path_within_root(&boards_root, board_parent)
+        && adoption_path_within_root(&adoption_root, Path::new(&marker.staging_dir))
+}
+
+fn reconcile_pending_adoption(root: &Path) -> Result<()> {
+    let marker_path = adoption_marker_path(root);
+    if !marker_path.exists() {
+        return Ok(());
+    }
+
+    let marker = read_adoption_marker(&marker_path)?;
+    if !adoption_marker_matches_root(root, &marker) {
+        bail!(
+            "adoption marker {} points outside registry-owned storage",
+            marker_path.display()
+        );
+    }
+
+    let board_path = PathBuf::from(&marker.board_path);
+    let staging_dir = PathBuf::from(&marker.staging_dir);
+    let registry_path = root.join("registry.db");
+    let committed = if registry_path.exists() {
+        let registry = open_registry_readonly(&registry_path).with_context(|| {
+            format!(
+                "reopen registry for adoption recovery {}",
+                registry_path.display()
+            )
+        })?;
+        registry
+            .query_row(
+                "SELECT 1 FROM boards WHERE board_path=? LIMIT 1",
+                [board_path.to_string_lossy().as_ref()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+    } else {
+        false
+    };
+
+    if !committed {
+        cleanup_database_artifacts(&board_path)?;
+    }
+    cleanup_staging_dir(&staging_dir)?;
+    remove_optional_file(&marker_path)?;
+    if let Some(parent) = staging_dir.parent()
+        && parent.exists()
+        && fs::read_dir(parent)
+            .with_context(|| format!("read adoption staging root {}", parent.display()))?
+            .next()
+            .is_none()
+    {
+        let _ = fs::remove_dir(parent);
+    }
+    sync_directory(root)?;
+    Ok(())
+}
+
+struct AdoptionRun {
+    root: PathBuf,
+    marker_path: PathBuf,
+    staging_dir: PathBuf,
+    adoption_root: PathBuf,
+    board_path: PathBuf,
+}
+
+impl AdoptionRun {
+    fn start(
+        root: &Path,
+        board_name: &str,
+        board_path: &Path,
+        source_board_path: &Path,
+        root_path: Option<String>,
+    ) -> Result<Self> {
+        let root = root.to_path_buf();
+        let marker_path = adoption_marker_path(&root);
+        let adoption_root = adoption_staging_root(&root);
+        let staging_dir = adoption_root.join(Uuid::new_v4().to_string());
+        let result = (|| {
+            create_private_dir_all(&adoption_root)?;
+            fs::DirBuilder::new().mode(0o700).create(&staging_dir)?;
+            let marker = AdoptionMarker {
+                board_name: board_name.to_owned(),
+                board_path: board_path.to_string_lossy().into_owned(),
+                root_path,
+                source_board_path: source_board_path.to_string_lossy().into_owned(),
+                staging_dir: staging_dir.to_string_lossy().into_owned(),
+                created_at: now_ms(),
+            };
+            write_adoption_marker(&marker_path, &marker)?;
+            sync_directory(&adoption_root)?;
+            sync_directory(&root)?;
+            Ok(Self {
+                root: root.clone(),
+                marker_path: marker_path.clone(),
+                staging_dir: staging_dir.clone(),
+                adoption_root: adoption_root.clone(),
+                board_path: board_path.to_path_buf(),
+            })
+        })();
+        match result {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                let cleanup = cleanup_staging_dir(&staging_dir)
+                    .and_then(|_| remove_optional_file(&marker_path))
+                    .and_then(|_| sync_directory(&root));
+                combine_cleanup(Err(error), cleanup)
+            }
+        }
+    }
+
+    fn cleanup_after_success(&self) -> Result<()> {
+        (|| {
+            cleanup_staging_dir(&self.staging_dir)?;
+            remove_optional_file(&self.marker_path)?;
+            if self.adoption_root.exists()
+                && fs::read_dir(&self.adoption_root)
+                    .with_context(|| {
+                        format!(
+                            "read adoption staging root {}",
+                            self.adoption_root.display()
+                        )
+                    })?
+                    .next()
+                    .is_none()
+            {
+                let _ = fs::remove_dir(&self.adoption_root);
+            }
+            sync_directory(&self.root)?;
+            Ok(())
+        })()
+    }
+
+    fn cleanup_after_failure(&self, published: bool) -> Result<()> {
+        (|| {
+            if published {
+                cleanup_database_artifacts(&self.board_path)?;
+            }
+            cleanup_staging_dir(&self.staging_dir)?;
+            remove_optional_file(&self.marker_path)?;
+            if self.adoption_root.exists()
+                && fs::read_dir(&self.adoption_root)
+                    .with_context(|| {
+                        format!(
+                            "read adoption staging root {}",
+                            self.adoption_root.display()
+                        )
+                    })?
+                    .next()
+                    .is_none()
+            {
+                let _ = fs::remove_dir(&self.adoption_root);
+            }
+            sync_directory(&self.root)?;
+            Ok(())
+        })()
+    }
+}
+
+fn hash_file(file: &mut File) -> Result<(String, u64)> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        bail!("adopted snapshot handle is not a regular file");
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    if bytes != metadata.len() {
+        bail!("adopted snapshot changed length while hashing it");
+    }
+    Ok((format!("{:x}", digest.finalize()), bytes))
+}
+
+fn c_name(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).context("path contains a NUL byte")
+}
+
+fn open_dir_at(parent: &File, name: &Path, create: bool) -> Result<File> {
+    let name = c_name(name)?;
+    let mut fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 && create && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+        let made = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if made < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(std::io::Error::last_os_error())
+                .context("create registry directory component");
+        }
+        fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("registry path component is a symlink or non-directory");
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn secure_registry_dirs(root: &Path, create: bool) -> Result<(File, File)> {
+    if root
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        bail!(
+            "registry data root {} contains parent traversal",
+            root.display()
+        );
+    }
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        env::current_dir()?.join(root)
+    };
+    if let Ok(metadata) = fs::symlink_metadata(&absolute)
+        && metadata.file_type().is_symlink()
+    {
+        bail!("registry data root {} is a symlink", root.display());
+    }
+    // macOS publishes /var as a stable operating-system alias. Normalize that
+    // one platform path before the no-follow walk; no caller-controlled
+    // component is canonicalized or followed.
+    #[cfg(target_os = "macos")]
+    let secure_absolute = absolute
+        .strip_prefix("/var")
+        .map(|rest| Path::new("/private/var").join(rest))
+        .unwrap_or(absolute);
+    #[cfg(not(target_os = "macos"))]
+    let secure_absolute = absolute;
+    let mut current = File::open("/").context("open filesystem root")?;
+    for component in secure_absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                current = open_dir_at(&current, Path::new(name), create).with_context(|| {
+                    format!("open registry path component {}", name.to_string_lossy())
+                })?
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                bail!("unsupported registry data root {}", root.display())
+            }
+        }
+    }
+    let mode = current.metadata()?.permissions().mode();
+    if mode & 0o077 != 0 {
+        let rc = unsafe { libc::fchmod(current.as_raw_fd(), 0o700) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("secure registry data root");
+        }
+    }
+    let boards = open_dir_at(&current, Path::new("boards"), create)
+        .context("open registry boards directory")?;
+    Ok((current, boards))
+}
+
+fn verify_registry_chain(root: &Path, pinned_boards: &File) -> Result<()> {
+    let (_root, current_boards) = secure_registry_dirs(root, false)?;
+    if metadata_identity(&current_boards.metadata()?)
+        != metadata_identity(&pinned_boards.metadata()?)
+    {
+        bail!(
+            "registry boards directory {} changed identity",
+            root.join("boards").display()
+        );
+    }
+    Ok(())
+}
+
+fn verify_pinned_dir(path: &Path, pinned: &File, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    let opened = pinned.metadata()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata_identity(&metadata) != metadata_identity(&opened)
+    {
+        bail!(
+            "{label} {} changed identity or became a symlink",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn rename_into_dir(
+    source_dir: &File,
+    source_name: &Path,
+    destination_dir: &File,
+    destination_name: &Path,
+) -> Result<()> {
+    let source_name = c_name(source_name)?;
+    let destination_name = c_name(destination_name)?;
+    let rc = unsafe {
+        libc::renameat(
+            source_dir.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_dir.as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("atomically publish adopted board");
+    }
+    Ok(())
+}
+
+pub(crate) struct PreparedAdoption {
+    source_board_path: PathBuf,
+    staging_dir: PathBuf,
+    snapshot: Option<Connection>,
+    name: String,
+    cleanup_attempted: bool,
+}
+
+impl PreparedAdoption {
+    pub(crate) fn prepare(source_path: &Path, name: &str) -> Result<Self> {
+        Self::prepare_with_hook(source_path, name, || Ok(()))
+    }
+
+    fn prepare_with_hook<Hook: FnOnce() -> Result<()>>(
+        source_path: &Path,
+        name: &str,
+        after_capture: Hook,
+    ) -> Result<Self> {
+        let staging_dir = create_staging_dir()?;
+        let result = (|| {
+            let (source_board_path, mut source_file, source_metadata) =
+                canonical_regular_source_path(source_path)?;
+            let captured_path = staging_dir.join("captured.db");
+            copy_pinned_prefix(&mut source_file, &captured_path, source_metadata.len())?;
+
+            let wal_path = database_artifact_path(&source_board_path, "-wal");
+            let wal_capture = match pinned_regular_file(&wal_path, "source WAL") {
+                Ok((mut wal, before)) => {
+                    let mut header_before = [0_u8; 32];
+                    if before.len() >= 32 {
+                        wal.read_exact(&mut header_before)?;
+                    }
+                    copy_pinned_prefix(
+                        &mut wal,
+                        &database_artifact_path(&captured_path, "-wal"),
+                        before.len(),
+                    )?;
+                    let after = wal.metadata()?;
+                    let mut header_after = [0_u8; 32];
+                    wal.seek(SeekFrom::Start(0))?;
+                    if after.len() >= 32 {
+                        wal.read_exact(&mut header_after)?;
+                    }
+                    Some((before, after, header_before, header_after))
+                }
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    }) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let source_after = source_file.metadata()?;
+            let source_path_after =
+                fs::symlink_metadata(&source_board_path).with_context(|| {
+                    format!("recheck source identity {}", source_board_path.display())
+                })?;
+            if !metadata_stable(&source_metadata, &source_after)
+                || !source_path_after.file_type().is_file()
+                || metadata_identity(&source_path_after) != metadata_identity(&source_after)
+            {
+                bail!(
+                    "source board changed while its consistent snapshot was captured; retry adoption"
+                );
+            }
+            if let Some((before, after, header_before, header_after)) = &wal_capture
+                && (metadata_identity(before) != metadata_identity(after)
+                    || after.len() < before.len()
+                    || header_before != header_after)
+            {
+                bail!(
+                    "source WAL was reset while its consistent snapshot was captured; retry adoption"
+                );
+            }
+            if let Some((before, _, _, _)) = &wal_capture {
+                let wal_path_after = fs::symlink_metadata(&wal_path).with_context(|| {
+                    format!("recheck source WAL identity {}", wal_path.display())
+                })?;
+                if !wal_path_after.file_type().is_file()
+                    || metadata_identity(&wal_path_after) != metadata_identity(before)
+                {
+                    bail!(
+                        "source WAL changed identity while its snapshot was captured; retry adoption"
+                    );
+                }
+            }
+
+            after_capture()?;
+            let captured = open_staged_snapshot_readonly(&captured_path)?;
+            let snapshot_path = staging_dir.join("snapshot.db");
+            let snapshot = read_snapshot(&captured, |source| {
+                let integrity_rows = integrity(source)?;
+                if integrity_rows.as_slice() != ["ok"] {
+                    bail!(
+                        "source board {} failed integrity check: {}",
+                        source_board_path.display(),
+                        integrity_rows.join(", ")
+                    );
+                }
+                require_foreign_key_clean(source, "source board")?;
+                let source_schema = crate::db::schema_version(source)?;
+                if source_schema > crate::db::BOARD_SCHEMA_VERSION {
+                    bail!(
+                        "source board {} is schema version {source_schema}, newer than supported version {}",
+                        source_board_path.display(),
+                        crate::db::BOARD_SCHEMA_VERSION
+                    );
+                }
+                let audit = crate::audit::verify_board(source)?;
+                if !audit.healthy {
+                    bail!(
+                        "source board {} has an invalid audit chain: {}",
+                        source_board_path.display(),
+                        audit.errors.join("; ")
+                    );
+                }
+                let source_name = board_meta_value(source, "name")?
+                    .context("source board name metadata is missing")?;
+                if source_name != name {
+                    bail!("source board name is {source_name}, not {name}");
+                }
+                let mut target = create_backup_target(&snapshot_path)?;
+                let backup = rusqlite::backup::Backup::new(source, &mut target)?;
+                backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
+                drop(backup);
+                validate_board_snapshot(&target, "copied source snapshot", name, source_schema)?;
+                Ok(target)
+            })?;
+            cleanup_database_artifacts(&captured_path)?;
+            Ok(Self {
+                source_board_path,
+                staging_dir: staging_dir.clone(),
+                snapshot: Some(snapshot),
+                name: name.to_owned(),
+                cleanup_attempted: false,
+            })
+        })();
+        match result {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => combine_cleanup(Err(error), cleanup_staging_dir(&staging_dir)),
+        }
+    }
+
+    pub(crate) fn cleanup(mut self) -> Result<()> {
+        if self.cleanup_attempted {
+            return Ok(());
+        }
+        self.cleanup_attempted = true;
+        drop(self.snapshot.take());
+        cleanup_staging_dir(&self.staging_dir)
+    }
+
+    pub(crate) fn abort(self, error: anyhow::Error) -> anyhow::Error {
+        match self.cleanup() {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!("adoption cleanup also failed: {cleanup:#}")),
+        }
+    }
+}
+
+impl Drop for PreparedAdoption {
+    fn drop(&mut self) {
+        if !self.cleanup_attempted {
+            drop(self.snapshot.take());
+            let _ = cleanup_staging_dir(&self.staging_dir);
+        }
+    }
+}
+
+fn duplicate_workspace_adopt_fd(source_fd: i32) -> std::io::Result<i32> {
+    let fd = unsafe {
+        libc::fcntl(
+            source_fd,
+            libc::F_DUPFD_CLOEXEC,
+            WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD + 1,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn clear_workspace_adopt_cloexec(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let cleared = flags & !libc::FD_CLOEXEC;
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, cleared) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn remap_workspace_adopt_fd(source_fd: i32, target_fd: i32) -> std::io::Result<()> {
+    if source_fd == target_fd {
+        return clear_workspace_adopt_cloexec(target_fd);
+    }
+    if unsafe { libc::dup2(source_fd, target_fd) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    clear_workspace_adopt_cloexec(target_fd)
+}
+
+fn install_workspace_adopt_fds(root_fd: i32, snapshot_fd: i32) -> std::io::Result<()> {
+    let remapped_root = duplicate_workspace_adopt_fd(root_fd)?;
+    let remapped_snapshot = duplicate_workspace_adopt_fd(snapshot_fd)?;
+    let result = (|| {
+        remap_workspace_adopt_fd(remapped_root, WORKSPACE_ADOPT_HELPER_ROOT_FD)?;
+        remap_workspace_adopt_fd(remapped_snapshot, WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD)?;
+        Ok(())
+    })();
+    unsafe {
+        libc::close(remapped_root);
+        libc::close(remapped_snapshot);
+    }
+    result
+}
+
+#[cfg(debug_assertions)]
+fn workspace_adopt_test_hook(phase: &str) -> Result<()> {
+    if env::var("KANBAN_TEST_WORKSPACE_ADOPT_HOOK").ok().as_deref() == Some(phase) {
+        loop {
+            if unsafe { libc::getppid() } == 1 {
+                bail!("workspace adoption parent exited during debug pause");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn workspace_adopt_test_hook(_phase: &str) -> Result<()> {
+    Ok(())
+}
+
+fn workspace_adopt_snapshot_uri() -> String {
+    format!("file:/dev/fd/{WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD}?mode=ro&immutable=1")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAdoptHelperRequest {
+    name: String,
+    workspace: Option<String>,
+    rootless: bool,
+    actor: String,
+    source_board_path: String,
+}
+
+pub(crate) fn spawn_workspace_adopt_helper(
+    prepared: &PreparedAdoption,
+    workspace: Option<&Path>,
+    rootless: bool,
+    actor: &str,
+) -> Result<WorkspaceAdoptReceipt> {
+    let PinnedAdoptionRoot {
+        root: _root,
+        root_dir,
+        boards: _boards,
+    } = pin_live_root_for_adoption()?;
+    let snapshot_path = prepared.staging_dir.join("snapshot.db");
+    let snapshot = File::open(&snapshot_path)
+        .with_context(|| format!("open staged snapshot {}", snapshot_path.display()))?;
+    let request = WorkspaceAdoptHelperRequest {
+        name: prepared.name.clone(),
+        workspace: workspace.map(|path| path.to_string_lossy().into_owned()),
+        rootless,
+        actor: actor.to_owned(),
+        source_board_path: prepared.source_board_path.to_string_lossy().into_owned(),
+    };
+    let root_fd = root_dir.as_raw_fd();
+    let snapshot_fd = snapshot.as_raw_fd();
+    let mut command = Command::new(env::current_exe().context("resolve kanban executable")?);
+    unsafe {
+        command
+            .arg(WORKSPACE_ADOPT_HELPER_COMMAND)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .pre_exec(move || {
+                install_workspace_adopt_fds(root_fd, snapshot_fd)?;
+                if libc::fchdir(WORKSPACE_ADOPT_HELPER_ROOT_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+    }
+    let mut child = command.spawn().context("spawn workspace adoption helper")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("capture workspace adoption helper stdin")?;
+    serde_json::to_writer(&mut stdin, &request).context("write workspace adoption request")?;
+    stdin.write_all(b"\n")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .context("wait for workspace adoption helper")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("workspace adoption helper failed: {stderr}");
+    }
+    serde_json::from_slice(&output.stdout).context("decode workspace adoption receipt")
+}
+
+pub(crate) fn run_workspace_adopt_helper() -> Result<()> {
+    let request: WorkspaceAdoptHelperRequest = serde_json::from_reader(std::io::stdin().lock())
+        .context("read workspace adoption request")?;
+    if unsafe { libc::fchdir(WORKSPACE_ADOPT_HELPER_ROOT_FD) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("fchdir workspace adoption root");
+    }
+    let snapshot_uri = workspace_adopt_snapshot_uri();
+    let snapshot = Connection::open_with_flags(
+        &snapshot_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open staged snapshot {}", snapshot_uri))?;
+    snapshot.busy_handler(Some(read_only_busy_backoff))?;
+    snapshot.pragma_update(None, "query_only", true)?;
+    snapshot.pragma_update(None, "foreign_keys", true)?;
+    let mut registry = Registry::open_for_adoption()?;
+    let receipt = registry.adopt_snapshot(
+        &snapshot,
+        &PathBuf::from(request.source_board_path),
+        &request.name,
+        request.workspace.as_deref().map(Path::new),
+        request.rootless,
+        &request.actor,
+    )?;
+    serde_json::to_writer(std::io::stdout().lock(), &receipt)
+        .context("write workspace adoption receipt")?;
+    std::io::stdout().lock().write_all(b"\n")?;
+    Ok(())
+}
+
+fn validate_board_snapshot(
+    connection: &Connection,
+    label: &str,
+    name: &str,
+    expected_schema: usize,
+) -> Result<()> {
+    let integrity_rows = integrity(connection)?;
+    if integrity_rows.as_slice() != ["ok"] {
+        bail!(
+            "{label} failed integrity check: {}",
+            integrity_rows.join(", ")
+        );
+    }
+    require_foreign_key_clean(connection, label)?;
+    let schema = crate::db::schema_version(connection)?;
+    if schema != expected_schema {
+        bail!("{label} is schema version {schema}, expected {expected_schema}");
+    }
+    let actual_name = board_meta_value(connection, "name")?
+        .context(format!("{label} name metadata is missing"))?;
+    if actual_name != name {
+        bail!("{label} name is {actual_name}, not {name}");
+    }
+    let audit = crate::audit::verify_board(connection)?;
+    if !audit.healthy {
+        bail!(
+            "{label} has an invalid audit chain: {}",
+            audit.errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
 pub struct Registry {
     pub connection: Connection,
     root: PathBuf,
+    adoption_boards: Option<File>,
 }
 
 impl SnapshotSource for Registry {
@@ -268,8 +1341,29 @@ impl Registry {
     pub fn open() -> Result<Self> {
         let root = data_root()?;
         own_private_dir(&root)?;
+        reconcile_pending_adoption(&root)?;
         let connection = open_registry(&root.join("registry.db"))?;
-        Ok(Self { connection, root })
+        Ok(Self {
+            connection,
+            root,
+            adoption_boards: None,
+        })
+    }
+
+    pub(crate) fn open_for_adoption() -> Result<Self> {
+        let root = data_root()?;
+        let (root_dir, boards) = secure_registry_dirs(&root, true)?;
+        verify_pinned_dir(&root, &root_dir, "registry data root")?;
+        verify_registry_chain(&root, &boards)?;
+        reconcile_pending_adoption(&root)?;
+        let connection = open_registry(&root.join("registry.db"))?;
+        verify_pinned_dir(&root, &root_dir, "registry data root")?;
+        verify_registry_chain(&root, &boards)?;
+        Ok(Self {
+            connection,
+            root,
+            adoption_boards: Some(boards),
+        })
     }
 
     pub fn open_readonly() -> Result<Self> {
@@ -287,6 +1381,7 @@ impl Registry {
         Ok(Self {
             connection,
             root: root.to_path_buf(),
+            adoption_boards: None,
         })
     }
 
@@ -423,42 +1518,241 @@ impl Registry {
         self.project_for_board_path(&board_path.to_string_lossy())
     }
 
+    #[allow(dead_code)]
+    pub fn adopt(
+        &mut self,
+        source_path: &Path,
+        name: &str,
+        workspace: Option<&Path>,
+        rootless: bool,
+        actor: &str,
+    ) -> Result<WorkspaceAdoptReceipt> {
+        let prepared = PreparedAdoption::prepare(source_path, name)?;
+        self.adopt_prepared(prepared, workspace, rootless, actor)
+    }
+
+    pub(crate) fn adopt_prepared(
+        &mut self,
+        mut prepared: PreparedAdoption,
+        workspace: Option<&Path>,
+        rootless: bool,
+        actor: &str,
+    ) -> Result<WorkspaceAdoptReceipt> {
+        let result = self.adopt_prepared_inner(&mut prepared, workspace, rootless, actor);
+        let cleanup = prepared.cleanup();
+        combine_cleanup(result, cleanup)
+    }
+
+    fn adopt_prepared_inner(
+        &mut self,
+        prepared: &mut PreparedAdoption,
+        workspace: Option<&Path>,
+        rootless: bool,
+        actor: &str,
+    ) -> Result<WorkspaceAdoptReceipt> {
+        let snapshot = prepared
+            .snapshot
+            .as_ref()
+            .context("prepared source snapshot connection is unavailable")?;
+        self.adopt_snapshot(
+            snapshot,
+            &prepared.source_board_path,
+            &prepared.name,
+            workspace,
+            rootless,
+            actor,
+        )
+    }
+
+    fn adopt_snapshot(
+        &mut self,
+        snapshot: &Connection,
+        source_board_path: &Path,
+        name: &str,
+        workspace: Option<&Path>,
+        rootless: bool,
+        actor: &str,
+    ) -> Result<WorkspaceAdoptReceipt> {
+        let actor = validate_rule_actor(actor)?;
+        if rootless && workspace.is_some() {
+            bail!("--rootless cannot be combined with --workspace");
+        }
+        if !rootless && workspace.is_none() {
+            bail!("workspace adopt requires either --workspace PATH or --rootless");
+        }
+        let root_path = workspace
+            .map(|workspace| {
+                workspace
+                    .canonicalize()
+                    .with_context(|| format!("resolve workspace {}", workspace.display()))
+            })
+            .transpose()?;
+        let root_path_json = root_path
+            .as_ref()
+            .map(|root_path| root_path.to_string_lossy().to_string());
+        let board_name = format!("{}.db", Uuid::new_v4());
+        let board_path = self.root.join("boards").join(&board_name);
+
+        let (_root_dir, fallback_boards);
+        let boards = if let Some(boards) = &self.adoption_boards {
+            boards
+        } else {
+            (_root_dir, fallback_boards) = secure_registry_dirs(&self.root, true)?;
+            &fallback_boards
+        };
+        verify_registry_chain(&self.root, boards)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let adoption_run = AdoptionRun::start(
+            &self.root,
+            &board_name,
+            &board_path,
+            source_board_path,
+            root_path_json.clone(),
+        )?;
+        let mut published = false;
+        let mut committed = false;
+        let result = (|| {
+            workspace_adopt_test_hook("after_marker")?;
+            if let Some(root) = &root_path {
+                if let Some(existing) = exact_on(&transaction, root)? {
+                    bail!(
+                        "{} is already registered to board {}",
+                        root.display(),
+                        existing.name
+                    );
+                }
+                if let Some(enclosing) = enclosing_on(&transaction, root)? {
+                    bail!(
+                        "{} is already inside Kanban project {}.\n\
+                         To share that board:        kanban workspace attach --to {}\n\
+                         To create a separate board: use a different --workspace, or pass --rootless",
+                        root.display(),
+                        enclosing.name,
+                        enclosing.name,
+                    );
+                }
+            }
+            if active_named(&transaction, name, None)? {
+                bail!("a Kanban board is already named {name}");
+            }
+
+            let adopted_path = adoption_run.staging_dir.join("adopted.db");
+            let mut destination = create_backup_target(&adopted_path)?;
+            let mut adopted_file = pinned_regular_file(&adopted_path, "staged adopted board")?.0;
+            let backup = rusqlite::backup::Backup::new(snapshot, &mut destination)?;
+            backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
+            drop(backup);
+            finalize_adopted_board(&mut destination)?;
+            validate_board_snapshot(
+                &destination,
+                "adopted board",
+                name,
+                crate::db::BOARD_SCHEMA_VERSION,
+            )?;
+            checkpoint(&destination)?;
+            adopted_file
+                .sync_all()
+                .context("sync staged adopted board")?;
+            let staged_after = fs::symlink_metadata(&adopted_path)?;
+            if staged_after.file_type().is_symlink()
+                || metadata_identity(&staged_after) != metadata_identity(&adopted_file.metadata()?)
+            {
+                bail!("staged adopted board changed identity during migration or validation");
+            }
+            let (source_sha256, source_bytes) = hash_file(&mut adopted_file)?;
+            drop(adopted_file);
+            drop(destination);
+
+            // Remove sidecars explicitly while retaining the main database for
+            // the directory-relative atomic publish below.
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = database_artifact_path(&adopted_path, suffix);
+                match fs::remove_file(&sidecar) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("remove staged SQLite sidecar {}", sidecar.display())
+                        });
+                    }
+                }
+            }
+            let staging_dir = File::open(&adoption_run.staging_dir)?;
+            verify_registry_chain(&self.root, boards)?;
+            rename_into_dir(
+                &staging_dir,
+                Path::new("adopted.db"),
+                boards,
+                Path::new(&board_name),
+            )?;
+            published = true;
+            workspace_adopt_test_hook("after_publish")?;
+            boards
+                .sync_all()
+                .context("sync registry boards directory")?;
+            sync_directory(&adoption_run.adoption_root)?;
+
+            let now = now_ms();
+            transaction.execute(
+                "INSERT INTO boards(board_path,name,created_at,last_used_at) VALUES(?,?,?,?)",
+                params![board_path.to_string_lossy(), name, now, now],
+            )?;
+            if let Some(root_path) = &root_path {
+                transaction.execute(
+                    "INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at) VALUES(?,?,?,?)",
+                    params![root_path.to_string_lossy(), board_path.to_string_lossy(), now, now],
+                )?;
+            }
+            crate::audit::append_registry_event(
+                &transaction,
+                &format!("workspace:{}", board_path.to_string_lossy()),
+                "board_adopted",
+                actor,
+                &json!({
+                    "boardPath": board_path.to_string_lossy().to_string(),
+                    "name": name,
+                    "rootPath": root_path_json.clone(),
+                    "sourceBoardPath": source_board_path.to_string_lossy().to_string(),
+                    "sourceSha256": source_sha256,
+                    "sourceBytes": source_bytes,
+                })
+                .to_string(),
+                now,
+            )?;
+            verify_registry_chain(&self.root, boards)?;
+            transaction.commit()?;
+            committed = true;
+            adoption_run.cleanup_after_success()?;
+            Ok(WorkspaceAdoptReceipt {
+                project: ProjectRecord {
+                    name: name.to_owned(),
+                    board_path: board_path.to_string_lossy().into_owned(),
+                    workspace_roots: root_path_json.clone().into_iter().collect(),
+                    last_used_at: now,
+                },
+                root_path: root_path_json,
+                source_board_path: source_board_path.to_string_lossy().into_owned(),
+                source_sha256,
+                source_bytes,
+            })
+        })();
+        if result.is_err() && !committed {
+            let cleanup = adoption_run.cleanup_after_failure(published);
+            return combine_cleanup(result, cleanup);
+        }
+        result
+    }
+
     /// The nearest registered workspace strictly above `workspace`, if any.
     /// Read-only: unlike `resolve`, it does not touch `last_used_at`.
     fn enclosing(&self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
-        let mut cursor = workspace.to_path_buf();
-        while cursor.pop() {
-            if let Some(found) = self.exact(&cursor)? {
-                return Ok(Some(found));
-            }
-        }
-        Ok(None)
+        enclosing_on(&self.connection, workspace)
     }
 
     pub fn exact(&self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
-        let text = workspace.to_string_lossy();
-        let canonical = self
-            .connection
-            .query_row(
-                "SELECT workspace_roots.root_path AS root_path,\
-                        boards.name AS name,\
-                        workspace_roots.board_path AS board_path,\
-                        workspace_roots.created_at AS created_at,\
-                        workspace_roots.last_used_at AS last_used_at,\
-                        0 AS archived,\
-                        NULL AS archived_at,\
-                        NULL AS archived_by,\
-                        0 AS rootless \
-                 FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
-                 WHERE workspace_roots.root_path=?",
-                [text.as_ref()],
-                row,
-            )
-            .optional()?;
-        if canonical.is_some() {
-            return Ok(canonical);
-        }
-        Ok(None)
+        exact_on(&self.connection, workspace)
     }
 
     pub fn resolve(&mut self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
@@ -1678,7 +2972,11 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::AddTask;
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1696,6 +2994,7 @@ mod tests {
         Registry {
             connection: open_registry(&root.join("registry.db")).expect("open test registry"),
             root,
+            adoption_boards: None,
         }
     }
 
@@ -1720,6 +3019,213 @@ mod tests {
 
     fn rule_event_seqs(events: &[Event]) -> Vec<i64> {
         events.iter().map(|event| event.seq).collect()
+    }
+
+    fn source_board_path(registry: &Registry, name: &str) -> PathBuf {
+        registry.root.join(format!("{name}.db"))
+    }
+
+    fn make_source_board(registry: &Registry, name: &str) -> Store {
+        let path = source_board_path(registry, name);
+        let mut store = Store::open(&path).expect("open source board");
+        store
+            .initialize(name, "codex")
+            .expect("initialize source board");
+        store
+    }
+
+    fn add_source_task(store: &mut Store, id: &str) {
+        store
+            .add_task(AddTask {
+                id: Some(id.to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: None,
+                title: format!("Task {id}"),
+                body: Some("Body.".to_owned()),
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: json!({}),
+                actor: Some("codex".to_owned()),
+                tags: Vec::new(),
+            })
+            .expect("add source task");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SourceFileImage {
+        name: String,
+        bytes: Vec<u8>,
+        mode: u32,
+        device: u64,
+        inode: u64,
+        owner: u32,
+        group: u32,
+        length: u64,
+        accessed: (i64, i64),
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+
+    fn directory_image(path: &Path) -> Vec<SourceFileImage> {
+        let mut image = fs::read_dir(path)
+            .expect("read source directory")
+            .map(|entry| {
+                let entry = entry.expect("read source directory entry");
+                let bytes = fs::read(entry.path()).expect("read source directory file");
+                let metadata = entry.metadata().expect("stat source directory entry");
+                SourceFileImage {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    bytes,
+                    mode: metadata.permissions().mode(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    owner: metadata.uid(),
+                    group: metadata.gid(),
+                    length: metadata.len(),
+                    accessed: (metadata.atime(), metadata.atime_nsec()),
+                    modified: (metadata.mtime(), metadata.mtime_nsec()),
+                    changed: (metadata.ctime(), metadata.ctime_nsec()),
+                }
+            })
+            .collect::<Vec<_>>();
+        image.sort_by(|left, right| left.name.cmp(&right.name));
+        image
+    }
+
+    fn temp_rw_file(label: &str, contents: &[u8]) -> (PathBuf, i32) {
+        let path = std::env::temp_dir().join(format!("kanban-{label}-{}", Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create temp file");
+        file.write_all(contents).expect("seed temp file");
+        file.sync_all().expect("sync temp file");
+        file.seek(SeekFrom::Start(0)).expect("rewind temp file");
+        (path, file.into_raw_fd())
+    }
+
+    fn fd_cloexec(fd: i32) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    fn fd_identity(fd: i32) -> (u64, u64) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        unsafe {
+            assert!(libc::fstat(fd, stat.as_mut_ptr()) >= 0);
+            let stat = stat.assume_init();
+            (stat.st_dev as u64, stat.st_ino)
+        }
+    }
+
+    #[test]
+    #[ignore = "manipulates fixed helper fds and must be run in isolation"]
+    fn workspace_adopt_fd_remap_handles_source_fd_equal_to_target_and_clears_cloexec() {
+        let (root_path, root_fd) = temp_rw_file("workspace-adopt-remap-root", b"root");
+        let (snapshot_path, snapshot_fd) =
+            temp_rw_file("workspace-adopt-remap-snapshot", b"snapshot");
+        let root_identity = fd_identity(root_fd);
+        let snapshot_identity = fd_identity(snapshot_fd);
+        unsafe {
+            assert!(libc::dup2(root_fd, WORKSPACE_ADOPT_HELPER_ROOT_FD) >= 0);
+            assert!(libc::dup2(snapshot_fd, WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD + 1) >= 0);
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_ROOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD + 1,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+        }
+
+        install_workspace_adopt_fds(
+            WORKSPACE_ADOPT_HELPER_ROOT_FD,
+            WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD + 1,
+        )
+        .expect("remap source fd that equals the target");
+
+        assert_eq!(fd_identity(WORKSPACE_ADOPT_HELPER_ROOT_FD), root_identity);
+        assert_eq!(
+            fd_identity(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD),
+            snapshot_identity
+        );
+        assert!(!fd_cloexec(WORKSPACE_ADOPT_HELPER_ROOT_FD));
+        assert!(!fd_cloexec(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD));
+
+        unsafe {
+            libc::close(WORKSPACE_ADOPT_HELPER_ROOT_FD);
+            libc::close(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD);
+            libc::close(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD + 1);
+            libc::close(root_fd);
+            libc::close(snapshot_fd);
+        }
+        fs::remove_file(root_path).expect("remove root temp file");
+        fs::remove_file(snapshot_path).expect("remove snapshot temp file");
+    }
+
+    #[test]
+    #[ignore = "manipulates fixed helper fds and must be run in isolation"]
+    fn workspace_adopt_fd_remap_handles_crossed_sources_and_clears_cloexec() {
+        let (root_path, root_fd) = temp_rw_file("workspace-adopt-cross-root", b"root");
+        let (snapshot_path, snapshot_fd) =
+            temp_rw_file("workspace-adopt-cross-snapshot", b"snapshot");
+        let root_identity = fd_identity(root_fd);
+        let snapshot_identity = fd_identity(snapshot_fd);
+        unsafe {
+            assert!(libc::dup2(root_fd, WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD) >= 0);
+            assert!(libc::dup2(snapshot_fd, WORKSPACE_ADOPT_HELPER_ROOT_FD) >= 0);
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_ROOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+        }
+
+        install_workspace_adopt_fds(
+            WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+            WORKSPACE_ADOPT_HELPER_ROOT_FD,
+        )
+        .expect("remap crossed source fds");
+
+        assert_eq!(fd_identity(WORKSPACE_ADOPT_HELPER_ROOT_FD), root_identity);
+        assert_eq!(
+            fd_identity(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD),
+            snapshot_identity
+        );
+        assert!(!fd_cloexec(WORKSPACE_ADOPT_HELPER_ROOT_FD));
+        assert!(!fd_cloexec(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD));
+
+        unsafe {
+            libc::close(WORKSPACE_ADOPT_HELPER_ROOT_FD);
+            libc::close(WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD);
+            libc::close(root_fd);
+            libc::close(snapshot_fd);
+        }
+        fs::remove_file(root_path).expect("remove root temp file");
+        fs::remove_file(snapshot_path).expect("remove snapshot temp file");
     }
 
     #[test]
@@ -1927,5 +3433,504 @@ mod tests {
         assert_eq!(payload["existing"], true);
         assert_eq!(payload["name"], "Alpha");
         assert_eq!(payload["boardPath"], first.board_path);
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_a_duplicate_active_name() {
+        let mut registry = test_registry("adopt-duplicate-name");
+        registry
+            .register(None, "Alpha", false, "codex")
+            .expect("seed duplicate active board");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+
+        let err = registry
+            .adopt(
+                &source_board_path(&registry, "Alpha"),
+                "Alpha",
+                None,
+                true,
+                "codex",
+            )
+            .expect_err("duplicate active name must be refused")
+            .to_string();
+        assert!(err.contains("already named Alpha"), "{err}");
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_a_wrong_source_name() {
+        let mut registry = test_registry("adopt-wrong-name");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+
+        let err = registry
+            .adopt(
+                &source_board_path(&registry, "Alpha"),
+                "Beta",
+                None,
+                true,
+                "codex",
+            )
+            .expect_err("wrong source name must be refused")
+            .to_string();
+        assert!(
+            err.contains("source board name is Alpha, not Beta"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_a_corrupt_source_file() {
+        let mut registry = test_registry("adopt-corrupt-source");
+        let source = source_board_path(&registry, "corrupt");
+        fs::write(&source, b"not a sqlite database").expect("write corrupt source");
+
+        let err = registry
+            .adopt(&source, "corrupt", None, true, "codex")
+            .expect_err("corrupt source must be refused")
+            .to_string();
+        assert!(
+            err.contains("open source board")
+                || err.contains("readable Kanban board file")
+                || err.contains("file is not a database"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_an_audit_invalid_source() {
+        let mut registry = test_registry("adopt-invalid-audit");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        drop(source);
+
+        let source_path = source_board_path(&registry, "Alpha");
+        let connection = Connection::open(&source_path).expect("reopen source board");
+        connection
+            .execute(
+                "UPDATE events SET event_hash='bad' WHERE seq=(SELECT max(seq) FROM events)",
+                [],
+            )
+            .expect("tamper event hash");
+
+        let err = registry
+            .adopt(&source_path, "Alpha", None, true, "codex")
+            .expect_err("audit-invalid source must be refused")
+            .to_string();
+        assert!(err.contains("invalid audit chain"), "{err}");
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_a_newer_schema_source() {
+        let mut registry = test_registry("adopt-newer-schema");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        drop(source);
+
+        let source_path = source_board_path(&registry, "Alpha");
+        let connection = Connection::open(&source_path).expect("reopen source board");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                (crate::db::BOARD_SCHEMA_VERSION as i64) + 1,
+            )
+            .expect("bump schema version");
+
+        let err = registry
+            .adopt(&source_path, "Alpha", None, true, "codex")
+            .expect_err("newer schema source must be refused")
+            .to_string();
+        assert!(err.contains("newer than supported version"), "{err}");
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_a_symlink_source_path() {
+        let mut registry = test_registry("adopt-symlink-source");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        let source_path = source_board_path(&registry, "Alpha");
+        let source_link = registry.root.join("source-link.db");
+        symlink(&source_path, &source_link).expect("create source symlink");
+
+        let err = registry
+            .adopt(&source_link, "Alpha", None, true, "codex")
+            .expect_err("symlink source must be refused")
+            .to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+
+        let registered: i64 = registry
+            .connection
+            .query_row("SELECT count(*) FROM boards", [], |row| row.get(0))
+            .expect("count registered boards");
+        assert_eq!(registered, 0, "symlink refusal published a board row");
+    }
+
+    #[test]
+    fn source_preflight_does_not_create_or_modify_source_sidecars() {
+        let source_dir =
+            std::env::temp_dir().join(format!("kanban-adopt-source-{}", Uuid::new_v4()));
+        fs::create_dir(&source_dir).expect("create independent source directory");
+        let source_path = source_dir.join("Alpha.db");
+        let mut source = Store::open(&source_path).expect("open independent source board");
+        source
+            .initialize("Alpha", "codex")
+            .expect("initialize independent source board");
+        add_source_task(&mut source, "t-alpha");
+        assert!(
+            database_artifact_path(&source_path, "-wal").exists(),
+            "fixture did not exercise a live WAL"
+        );
+        assert!(
+            database_artifact_path(&source_path, "-shm").exists(),
+            "fixture did not exercise an existing SHM sidecar"
+        );
+        let before = directory_image(&source_dir);
+
+        let prepared = PreparedAdoption::prepare(&source_path, "Alpha").expect("preflight source");
+        let after = directory_image(&source_dir);
+        assert_eq!(after, before, "preflight mutated source files or sidecars");
+        prepared.cleanup().expect("cleanup prepared snapshot");
+        drop(source);
+        fs::remove_dir_all(&source_dir).expect("remove source fixture");
+    }
+
+    #[test]
+    fn adoption_rejects_registry_boards_symlink_without_external_write_or_event() {
+        let mut registry = test_registry("adopt-boards-symlink");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        drop(source);
+        let source_path = source_board_path(&registry, "Alpha");
+        let prepared = PreparedAdoption::prepare(&source_path, "Alpha").expect("preflight source");
+        let external =
+            std::env::temp_dir().join(format!("kanban-adopt-external-{}", Uuid::new_v4()));
+        fs::create_dir(&external).expect("create external target");
+        symlink(&external, registry.root.join("boards")).expect("plant boards symlink");
+
+        let error = registry
+            .adopt_prepared(prepared, None, true, "codex")
+            .expect_err("boards symlink must be refused")
+            .to_string();
+        assert!(
+            error.contains("registry boards directory")
+                || error.contains("symlink")
+                || error.contains("non-directory"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_dir(&external).unwrap().count(),
+            0,
+            "adoption wrote outside registry root"
+        );
+        let boards: i64 = registry
+            .connection
+            .query_row("SELECT count(*) FROM boards", [], |row| row.get(0))
+            .unwrap();
+        let events: i64 = registry
+            .connection
+            .query_row(
+                "SELECT count(*) FROM rule_events WHERE kind='board_adopted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(boards, 0);
+        assert_eq!(events, 0);
+        fs::remove_file(registry.root.join("boards")).expect("remove fixture symlink");
+        fs::remove_dir(&external).expect("remove external fixture");
+    }
+
+    #[test]
+    fn adoption_registry_walk_rejects_an_intermediate_symlink_without_external_creation() {
+        let base = std::env::temp_dir().join(format!("kanban-adopt-chain-{}", Uuid::new_v4()));
+        let external =
+            std::env::temp_dir().join(format!("kanban-adopt-chain-out-{}", Uuid::new_v4()));
+        fs::create_dir(&base).expect("create registry chain fixture");
+        fs::create_dir(&external).expect("create external chain target");
+        symlink(&external, base.join("redirect")).expect("plant intermediate symlink");
+        let escaped_root = base.join("redirect").join("live");
+
+        let error = secure_registry_dirs(&escaped_root, true)
+            .expect_err("intermediate registry symlink must be refused")
+            .to_string();
+        assert!(error.contains("registry path component"), "{error}");
+        assert!(
+            !external.join("live").exists(),
+            "registry walk created state beyond an intermediate symlink"
+        );
+        fs::remove_file(base.join("redirect")).expect("remove fixture symlink");
+        fs::remove_dir(&base).expect("remove registry chain fixture");
+        fs::remove_dir(&external).expect("remove external chain fixture");
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_parent_traversal_in_the_source_path() {
+        let mut registry = test_registry("adopt-parent-traversal-source");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        let child = registry.root.join("child");
+        fs::create_dir_all(&child).expect("create traversal fixture directory");
+        let traversing_source = child.join("..").join("Alpha.db");
+
+        let err = registry
+            .adopt(&traversing_source, "Alpha", None, true, "codex")
+            .expect_err("parent-traversing source must be refused")
+            .to_string();
+        assert!(err.contains("contains parent traversal"), "{err}");
+
+        let registered: i64 = registry
+            .connection
+            .query_row("SELECT count(*) FROM boards", [], |row| row.get(0))
+            .expect("count registered boards");
+        assert_eq!(registered, 0, "path refusal published a board row");
+    }
+
+    #[test]
+    fn adopting_a_board_rejects_foreign_key_corruption() {
+        let mut registry = test_registry("adopt-foreign-key-corruption");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        drop(source);
+
+        let source_path = source_board_path(&registry, "Alpha");
+        let connection = Connection::open(&source_path).expect("reopen source board");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable foreign keys for corruption fixture");
+        connection
+            .execute(
+                "UPDATE tasks SET parent_id='t-missing' WHERE id='t-alpha'",
+                [],
+            )
+            .expect("write orphaned parent reference");
+        drop(connection);
+
+        let err = registry
+            .adopt(&source_path, "Alpha", None, true, "codex")
+            .expect_err("foreign-key-invalid source must be refused")
+            .to_string();
+        assert!(err.contains("foreign key violations"), "{err}");
+
+        let registered: i64 = registry
+            .connection
+            .query_row("SELECT count(*) FROM boards", [], |row| row.get(0))
+            .expect("count registered boards");
+        assert_eq!(registered, 0, "foreign-key refusal published a board row");
+    }
+
+    #[test]
+    fn adopting_a_rootless_board_records_null_root_and_snapshot_provenance() {
+        let mut registry = test_registry("adopt-rootless");
+        let source_path = source_board_path(&registry, "Alpha");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        let source_path = source_path.canonicalize().expect("canonicalize source");
+
+        let receipt = registry
+            .adopt(&source_path, "Alpha", None, true, "codex")
+            .expect("rootless adopt");
+        assert!(receipt.root_path.is_none());
+        assert!(receipt.project.workspace_roots.is_empty());
+        assert_eq!(receipt.source_sha256.len(), 64);
+        assert!(receipt.source_bytes > 0);
+        assert_eq!(
+            receipt.source_board_path,
+            source_path.to_string_lossy().into_owned()
+        );
+
+        let payload: (String, String, String) = registry
+            .connection
+            .query_row(
+                "SELECT rule_id,kind,payload FROM rule_events ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read adoption event");
+        assert_eq!(
+            payload.0,
+            format!("workspace:{}", receipt.project.board_path)
+        );
+        assert_eq!(payload.1, "board_adopted");
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload.2).expect("parse adoption event payload");
+        assert_eq!(payload["rootPath"], serde_json::Value::Null);
+        assert_eq!(
+            payload["sourceBoardPath"],
+            serde_json::Value::String(source_path.to_string_lossy().into_owned())
+        );
+        assert_eq!(payload["sourceSha256"], receipt.source_sha256);
+        assert_eq!(payload["sourceBytes"], json!(receipt.source_bytes));
+    }
+
+    #[test]
+    fn adoption_pins_validation_and_backup_to_one_snapshot_during_a_concurrent_commit() {
+        let mut registry = test_registry("adopt-concurrent-source");
+        let workspace = registry.root.join("workspace");
+        fs::create_dir_all(&workspace).expect("create destination workspace");
+        let source_path = source_board_path(&registry, "Alpha");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-before-snapshot");
+        let source_path = source_path.canonicalize().expect("canonicalize source");
+        let prepared = PreparedAdoption::prepare_with_hook(&source_path, "Alpha", || {
+            add_source_task(&mut source, "t-after-snapshot");
+            Ok(())
+        })
+        .expect("prepare pinned source snapshot");
+        let receipt = registry
+            .adopt_prepared(prepared, Some(&workspace), false, "codex")
+            .expect("adopt pinned source snapshot");
+
+        assert_eq!(
+            receipt.source_sha256,
+            crate::audit::file_sha256(Path::new(&receipt.project.board_path)).unwrap()
+        );
+        assert_eq!(
+            receipt.source_bytes,
+            fs::metadata(&receipt.project.board_path).unwrap().len()
+        );
+        assert!(
+            source.require_task("t-after-snapshot").is_ok(),
+            "the concurrent source commit did not land"
+        );
+        let adopted = Store::open(Path::new(&receipt.project.board_path)).expect("open adopted");
+        assert!(adopted.require_task("t-before-snapshot").is_ok());
+        assert!(
+            adopted.require_task("t-after-snapshot").is_err(),
+            "adopted board included a commit outside the validated snapshot"
+        );
+    }
+
+    #[test]
+    fn adoption_does_not_reopen_a_replaced_source_path_after_preflight() {
+        let mut registry = test_registry("adopt-replaced-source");
+        let source_path = source_board_path(&registry, "Alpha");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-pinned");
+        drop(source);
+        let prepared = PreparedAdoption::prepare(&source_path, "Alpha").expect("preflight source");
+        let original = registry.root.join("original-source.db");
+        fs::rename(&source_path, &original).expect("move checked source inode");
+        fs::write(&source_path, b"replacement is not sqlite").expect("replace source path");
+
+        let receipt = registry
+            .adopt_prepared(prepared, None, true, "codex")
+            .expect("publish the already prepared inode snapshot");
+        let adopted =
+            Store::open(Path::new(&receipt.project.board_path)).expect("open adopted board");
+        assert!(
+            adopted.require_task("t-pinned").is_ok(),
+            "adoption reopened and followed the replacement source path"
+        );
+        assert_eq!(
+            fs::read(&source_path).unwrap(),
+            b"replacement is not sqlite"
+        );
+    }
+
+    #[test]
+    fn adoption_failure_removes_database_wal_shm_and_rollback_journal() {
+        let staging = create_staging_dir().expect("create cleanup fixture");
+        let attempted_path = staging.join("partial.db");
+        for artifact in [
+            attempted_path.clone(),
+            database_artifact_path(&attempted_path, "-wal"),
+            database_artifact_path(&attempted_path, "-shm"),
+            database_artifact_path(&attempted_path, "-journal"),
+        ] {
+            fs::write(&artifact, b"partial").expect("write partial artifact");
+        }
+        cleanup_database_artifacts(&attempted_path).expect("cleanup every SQLite artifact");
+        for artifact in [
+            attempted_path.clone(),
+            database_artifact_path(&attempted_path, "-wal"),
+            database_artifact_path(&attempted_path, "-shm"),
+            database_artifact_path(&attempted_path, "-journal"),
+        ] {
+            assert!(
+                !artifact.exists(),
+                "failed adoption left {} behind",
+                artifact.display()
+            );
+        }
+        fs::remove_dir(&staging).expect("remove empty staging fixture");
+    }
+
+    #[test]
+    fn adoption_cleanup_failure_is_reported_and_retains_evidence() {
+        let mut registry = test_registry("adopt-cleanup-failure");
+        let mut source = make_source_board(&registry, "Alpha");
+        add_source_task(&mut source, "t-alpha");
+        drop(source);
+        let prepared = PreparedAdoption::prepare(&source_board_path(&registry, "Alpha"), "Alpha")
+            .expect("prepare adoption");
+        let staging = prepared.staging_dir.clone();
+        let evidence = staging.join("cannot-remove-as-file");
+        fs::create_dir(&evidence).expect("create unremovable entry fixture");
+        let error = registry
+            .adopt_prepared(prepared, None, true, "codex")
+            .expect_err("cleanup failure must abort publication")
+            .to_string();
+        assert!(error.contains("adoption cleanup failed"), "{error}");
+        assert!(evidence.is_dir(), "cleanup failure erased its evidence");
+        let registered: i64 = registry
+            .connection
+            .query_row("SELECT count(*) FROM boards", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            registered, 1,
+            "cleanup failure rolled back the registry row"
+        );
+        assert_eq!(
+            fs::read_dir(registry.root.join("boards")).unwrap().count(),
+            1,
+            "cleanup failure left the published destination in place"
+        );
+        fs::remove_dir(&evidence).expect("remove fixture evidence");
+        fs::remove_dir(&staging).expect("remove fixture staging");
+    }
+
+    #[test]
+    fn reconciling_a_pending_adoption_marker_removes_the_orphan_board_and_staging() {
+        let registry = test_registry("adopt-reconcile-marker");
+        let board_name = format!("{}.db", Uuid::new_v4());
+        let board_path = registry.root.join("boards").join(&board_name);
+        let staging_dir = adoption_staging_root(&registry.root).join(Uuid::new_v4().to_string());
+        create_private_dir_all(&staging_dir).expect("create adoption staging");
+        fs::create_dir_all(board_path.parent().unwrap()).expect("create boards dir");
+        fs::write(&board_path, b"orphan board").expect("write orphan board");
+        fs::write(database_artifact_path(&board_path, "-wal"), b"wal").expect("write wal");
+        fs::write(database_artifact_path(&board_path, "-shm"), b"shm").expect("write shm");
+        fs::write(database_artifact_path(&board_path, "-journal"), b"journal")
+            .expect("write journal");
+        let marker = AdoptionMarker {
+            board_name: "Alpha".to_owned(),
+            board_path: board_path.to_string_lossy().into_owned(),
+            root_path: None,
+            source_board_path: registry
+                .root
+                .join("source.db")
+                .to_string_lossy()
+                .into_owned(),
+            staging_dir: staging_dir.to_string_lossy().into_owned(),
+            created_at: now_ms(),
+        };
+        write_adoption_marker(&adoption_marker_path(&registry.root), &marker)
+            .expect("write adoption marker");
+
+        reconcile_pending_adoption(&registry.root).expect("reconcile pending adoption");
+
+        assert!(
+            !adoption_marker_path(&registry.root).exists(),
+            "reconciliation left the marker behind"
+        );
+        assert!(
+            !board_path.exists(),
+            "reconciliation left the orphan board behind"
+        );
+        assert!(
+            !staging_dir.exists(),
+            "reconciliation left the staging directory behind"
+        );
     }
 }

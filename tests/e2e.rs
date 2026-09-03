@@ -2,13 +2,15 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use syn::parse::Parser;
 use syn::{
@@ -105,6 +107,122 @@ fn board_path_for_project(fixture: &Fixture, cwd: &Path, project_name: &str) -> 
         .as_str()
         .unwrap()
         .into()
+}
+
+fn external_source_board(fixture: &Fixture, label: &str, name: &str) -> PathBuf {
+    let data = fixture.root.join(format!("{label}-data"));
+    let cwd = fixture.root.join(format!("{label}-cwd"));
+    fs::create_dir_all(&cwd).unwrap();
+    let output = fixture
+        .command_with_data_dir(&cwd, &data)
+        .args(["init", "--name", name, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    PathBuf::from(value["boardPath"].as_str().unwrap())
+}
+
+fn adoption_marker_path(fixture: &Fixture) -> PathBuf {
+    fixture.data.join(".workspace-adopt.json")
+}
+
+static WORKSPACE_ADOPT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn workspace_adopt_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    WORKSPACE_ADOPT_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
+static DB_LOCK_CONTENTION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn db_lock_contention_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    DB_LOCK_CONTENTION_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
+const WORKSPACE_ADOPT_HELPER_ROOT_FD: i32 = 37;
+const WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD: i32 = 38;
+
+struct OccupiedFdsGuard {
+    fds: [i32; 2],
+}
+
+impl OccupiedFdsGuard {
+    fn occupy() -> Self {
+        let root = fs::File::open("/dev/null").unwrap();
+        let snapshot = fs::File::open("/dev/null").unwrap();
+        unsafe {
+            let root_source = libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100);
+            assert!(root_source >= 0);
+            let snapshot_source = libc::fcntl(snapshot.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100);
+            assert!(snapshot_source >= 0);
+            assert!(libc::dup2(root_source, WORKSPACE_ADOPT_HELPER_ROOT_FD) >= 0);
+            assert!(libc::dup2(snapshot_source, WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD) >= 0);
+            assert!(libc::close(root_source) >= 0);
+            assert!(libc::close(snapshot_source) >= 0);
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_ROOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+        }
+        Self {
+            fds: [
+                WORKSPACE_ADOPT_HELPER_ROOT_FD,
+                WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+            ],
+        }
+    }
+}
+
+impl Drop for OccupiedFdsGuard {
+    fn drop(&mut self) {
+        for fd in self.fds {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+fn wait_for_json_file(path: &Path) -> Value {
+    for _ in 0..200 {
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str(&text)
+        {
+            return value;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for valid JSON in {}", path.display());
 }
 
 fn insert_raw_board_event(
@@ -4523,6 +4641,7 @@ fn compiled_binary_lets_no_operation_succeed_while_discarding_a_selector() {
 /// the test holds the flock itself and watches the compiled binary contend.
 #[test]
 fn compiled_binary_locks_the_data_root_even_when_the_environment_names_a_board() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock-vs-ignored-selector");
     fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
     fixture.ok_json(
@@ -4643,6 +4762,7 @@ fn compiled_binary_locks_the_data_root_even_when_the_environment_names_a_board()
 /// test holds the flock itself and watches the compiled binary contend.
 #[test]
 fn compiled_binary_locks_the_data_root_for_a_board_reached_through_a_symlink() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock-vs-symlinked-board");
     fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
     let board = board_path_for_project(&fixture, &fixture.main, "Alpha");
@@ -6549,6 +6669,7 @@ fn compiled_binary_prunes_only_the_backups_directory_it_manages() {
 
 #[test]
 fn compiled_binary_locks_the_data_root_against_a_concurrent_restore() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock");
     fixture.ok_json(&fixture.main, &["init", "--name", "Locked", "--json"]);
     fixture.ok_json(
@@ -6629,6 +6750,7 @@ fn compiled_binary_locks_the_data_root_against_a_concurrent_restore() {
 
 #[test]
 fn compiled_binary_locks_only_the_data_root_it_was_asked_to_touch() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock-scope");
     let outside = fixture.root.join("outside.db");
 
@@ -6869,6 +6991,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
 
 #[test]
 fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("busy");
     let project = fixture.ok_json(&fixture.main, &["init", "--name", "Busy", "--json"]);
     let board = project["boardPath"].as_str().unwrap().to_owned();
@@ -6877,6 +7000,7 @@ fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
     // swarm write that loses the race has to queue, not fail: an agent reads
     // an exit status and moves on, so a dropped write is lost work that
     // nothing downstream will notice is missing.
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let holder = std::thread::spawn(move || {
         let connection = Connection::open(&board).unwrap();
         connection
@@ -6886,10 +7010,11 @@ fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
             }))
             .unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        started_tx.send(()).unwrap();
         std::thread::sleep(Duration::from_millis(7_500));
         connection.execute_batch("COMMIT").unwrap();
     });
-    std::thread::sleep(Duration::from_millis(250));
+    started_rx.recv().unwrap();
 
     let started = Instant::now();
     fixture.ok_json(
@@ -13569,6 +13694,671 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     );
 }
 
+#[test]
+fn workspace_adopt_copies_a_source_board_from_another_registry_and_preserves_it() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt");
+    let source_data = fixture.root.join("source-data");
+    let source_cwd = fixture.root.join("source-cwd");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&source_data).unwrap();
+
+    let source_init = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["init", "--name", "Alpha", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_init.status.success(),
+        "source init failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&source_init.stdout),
+        String::from_utf8_lossy(&source_init.stderr)
+    );
+    let source_init_json: Value = serde_json::from_slice(&source_init.stdout).unwrap();
+    let source_board = PathBuf::from(source_init_json["boardPath"].as_str().unwrap());
+
+    let source_task = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["task", "add", "keep this state", "--id", "t-live", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_task.status.success(),
+        "source task add failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&source_task.stdout),
+        String::from_utf8_lossy(&source_task.stderr)
+    );
+
+    let source_board = source_board.canonicalize().unwrap();
+    let source_bytes = fs::read(&source_board).unwrap();
+
+    let adopt_root = fixture.root.join("adopted");
+    fs::create_dir_all(&adopt_root).unwrap();
+    let receipt = fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source_board.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--workspace",
+            adopt_root.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+
+    let adopt_root = adopt_root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(receipt["name"], "Alpha");
+    assert_eq!(receipt["rootPath"], adopt_root.as_str());
+    assert_eq!(
+        receipt["sourceBoardPath"],
+        source_board.to_string_lossy().as_ref()
+    );
+    assert_eq!(receipt["workspaceRoots"], json!([adopt_root.clone()]));
+    let adopted_board = PathBuf::from(receipt["boardPath"].as_str().unwrap());
+    assert_eq!(
+        adopted_board.parent(),
+        Some(fixture.data.join("boards").as_path()),
+        "adopted destination escaped registry-owned boards storage"
+    );
+    assert_eq!(
+        adopted_board.extension().and_then(|value| value.to_str()),
+        Some("db")
+    );
+    assert!(
+        adopted_board
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
+        "adopted destination is not UUID-named: {}",
+        adopted_board.display()
+    );
+    let adopted_bytes = fs::read(&adopted_board).unwrap();
+    assert_eq!(
+        receipt["sourceSha256"],
+        format!("{:x}", Sha256::digest(&adopted_bytes)),
+        "receipt hash did not describe the exact registered bytes"
+    );
+    assert_eq!(receipt["sourceBytes"], json!(adopted_bytes.len() as u64));
+
+    let adopted_task = fixture.ok_json(
+        Path::new(&adopt_root),
+        &["task", "show", "t-live", "--json"],
+    );
+    assert_eq!(adopted_task["title"], "keep this state");
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0].clone();
+    assert_eq!(board["name"], "Alpha");
+    assert_eq!(board["rootPath"], adopt_root.as_str());
+
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--registry", "--kind", "board_adopted", "--json"],
+    );
+    assert_eq!(events[0]["actor"], "geo");
+    assert_eq!(events[0]["payload"]["name"], "Alpha");
+    assert_eq!(events[0]["payload"]["rootPath"], adopt_root.as_str());
+    assert_eq!(
+        events[0]["payload"]["sourceBoardPath"],
+        source_board.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        events[0]["payload"]["sourceSha256"],
+        receipt["sourceSha256"]
+    );
+    assert_eq!(events[0]["payload"]["sourceBytes"], receipt["sourceBytes"]);
+    assert_eq!(fs::read(&source_board).unwrap(), source_bytes);
+    assert!(!fixture.data.join(".workspace-adopt.json").exists());
+}
+
+#[test]
+fn workspace_adopt_requires_an_explicit_actor_before_opening_registry_state() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-missing-actor");
+    let source_data = fixture.root.join("source-data");
+    let source_cwd = fixture.root.join("source-cwd");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&source_data).unwrap();
+    let source_init = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["init", "--name", "Alpha", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&source_init.stderr)
+    );
+    let source_init_json: Value = serde_json::from_slice(&source_init.stdout).unwrap();
+    let source_board = source_init_json["boardPath"].as_str().unwrap();
+
+    let adopt = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source_board,
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--json",
+        ],
+    );
+    assert!(!adopt.status.success(), "adopt without --as succeeded");
+    assert!(
+        String::from_utf8_lossy(&adopt.stderr).contains("--as is required"),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    assert!(
+        !fixture.data.join("registry.db").exists(),
+        "missing-actor refusal opened or created the registry database"
+    );
+    assert!(
+        !fixture.data.join("boards").exists(),
+        "missing-actor refusal created registry-owned board storage"
+    );
+}
+
+#[test]
+fn workspace_adopt_missing_or_invalid_source_creates_no_live_registry_state() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    for (label, source) in [
+        ("missing", None),
+        ("invalid", Some(b"not a sqlite database".as_slice())),
+        ("large", Some(vec![b'x'; 2 * 1024 * 1024].leak())),
+    ] {
+        let fixture = Fixture::new(&format!("workspace-adopt-preflight-{label}"));
+        let source_path = fixture.root.join(format!("{label}.db"));
+        if let Some(bytes) = source {
+            fs::write(&source_path, bytes).unwrap();
+        }
+        let output = fixture.run(
+            &fixture.main,
+            &[
+                "workspace",
+                "adopt",
+                "--from-board",
+                source_path.to_str().unwrap(),
+                "--name",
+                "Alpha",
+                "--rootless",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "{label} source unexpectedly adopted"
+        );
+        assert!(
+            !fixture.data.exists(),
+            "{label} source created live registry root before preflight refusal"
+        );
+    }
+}
+
+#[test]
+fn workspace_adopt_helper_stays_hidden_from_help_schema_and_mcp() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-helper-hidden");
+    let help = fixture.run(&fixture.main, &["--help"]);
+    assert!(help.status.success());
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        !help_text.contains("__workspace-adopt-helper"),
+        "helper leaked into the public help surface: {help_text}"
+    );
+
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operations = schema["operations"].as_array().unwrap();
+    assert!(
+        operations
+            .iter()
+            .all(|operation| operation["name"] != "__workspace_adopt_helper"),
+        "helper leaked into the generated schema: {schema}"
+    );
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool["name"] != "__workspace_adopt_helper"),
+        "helper leaked into the MCP tool list: {listed}"
+    );
+}
+
+#[test]
+fn workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_crash() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-crash-before-commit");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+    let mut first = fixture.command(&fixture.main);
+    first
+        .args([
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
+    let mut first = first.spawn().unwrap();
+    wait_for_path(&marker);
+    let marker_json: Value = wait_for_json_file(&marker);
+    let staging_dir = PathBuf::from(marker_json["stagingDir"].as_str().unwrap());
+
+    let second = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !second.status.success(),
+        "concurrent adopt unexpectedly won"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("another kanban process is using"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    first.kill().unwrap();
+    let first = first.wait_with_output().unwrap();
+    assert!(
+        !first.status.success(),
+        "paused adopt unexpectedly completed"
+    );
+
+    let boards = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        boards
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "Alpha"),
+        "crash recovery left a board registered unexpectedly: {boards}"
+    );
+    assert!(!marker.exists());
+    assert!(!staging_dir.exists());
+    assert_eq!(
+        fs::read_dir(fixture.data.join("boards")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn workspace_adopt_handles_helper_fd_collisions_and_cloexec() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-helper-fd-collision");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let _fds = OccupiedFdsGuard::occupy();
+
+    let output = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "fd collision and cloexec handoff failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-lock-held");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+
+    let mut holder = fixture.command(&fixture.main);
+    holder
+        .args([
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
+    let mut holder = holder.spawn().unwrap();
+
+    wait_for_path(&marker);
+
+    let blocked = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !blocked.status.success(),
+        "second adopt unexpectedly succeeded while the canonical data-root lock was held"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("another kanban process is using"),
+        "canonical lock refusal missing from stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("database is locked"),
+        "raw SQLite contention leaked through instead of the canonical lock refusal: {stderr}"
+    );
+
+    holder.kill().unwrap();
+    let holder = holder.wait_with_output().unwrap();
+    assert!(
+        !holder.status.success(),
+        "paused adopt unexpectedly completed while testing lock refusal"
+    );
+}
+
+#[test]
+fn workspace_adopt_recovers_after_publishing_before_commit() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-crash-after-rename");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+    let mut child = fixture.command(&fixture.main);
+    child
+        .args([
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_publish");
+    let mut child = child.spawn().unwrap();
+    wait_for_path(&marker);
+    let marker_json: Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+    let board_path = PathBuf::from(marker_json["boardPath"].as_str().unwrap());
+    wait_for_path(&board_path);
+
+    child.kill().unwrap();
+    let child = child.wait_with_output().unwrap();
+    assert!(
+        !child.status.success(),
+        "paused adopt unexpectedly completed"
+    );
+
+    let boards = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        boards
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "Alpha"),
+        "recovery left a board registered unexpectedly: {boards}"
+    );
+    assert!(!marker.exists());
+    assert!(!board_path.exists());
+    assert_eq!(
+        fs::read_dir(fixture.data.join("boards")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn workspace_adopt_rejects_boards_symlink_without_external_write_lock_or_event() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-boards-symlink");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let external = fixture.root.join("external");
+    fs::create_dir_all(&fixture.data).unwrap();
+    fs::create_dir(&external).unwrap();
+    symlink(&external, fixture.data.join("boards")).unwrap();
+
+    let output = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "boards symlink unexpectedly followed"
+    );
+    assert_eq!(
+        fs::read_dir(&external).unwrap().count(),
+        0,
+        "external target was written"
+    );
+    assert!(
+        !fixture.data.join(".lock").exists(),
+        "symlink refusal created the live lock"
+    );
+    assert!(
+        !fixture.data.join("registry.db").exists(),
+        "symlink refusal created registry state"
+    );
+    assert!(
+        fs::symlink_metadata(fixture.data.join("boards"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_and_newer_schema() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-fail-closed-sources");
+    let valid = external_source_board(&fixture, "valid", "Alpha");
+    let link = fixture.root.join("source-link.db");
+    symlink(&valid, &link).unwrap();
+    let traversal_dir = valid.parent().unwrap().join("traversal");
+    fs::create_dir(&traversal_dir).unwrap();
+    let traversal = traversal_dir.join("..").join(valid.file_name().unwrap());
+
+    let fk = external_source_board(&fixture, "fk", "Alpha");
+    let task = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "orphan",
+            "--id",
+            "t-orphan",
+            "--db",
+            fk.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        task.status.success(),
+        "failed to seed FK fixture: {}",
+        String::from_utf8_lossy(&task.stderr)
+    );
+    let fk_connection = Connection::open(&fk).unwrap();
+    fk_connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    fk_connection
+        .execute(
+            "UPDATE tasks SET parent_id='t-missing' WHERE id='t-orphan'",
+            [],
+        )
+        .unwrap();
+    drop(fk_connection);
+
+    let audit = external_source_board(&fixture, "audit", "Alpha");
+    let audit_connection = Connection::open(&audit).unwrap();
+    audit_connection
+        .execute(
+            "UPDATE events SET event_hash='bad' WHERE seq=(SELECT max(seq) FROM events)",
+            [],
+        )
+        .unwrap();
+    drop(audit_connection);
+
+    let newer = external_source_board(&fixture, "newer", "Alpha");
+    let newer_connection = Connection::open(&newer).unwrap();
+    newer_connection
+        .pragma_update(None, "user_version", 24_i64)
+        .unwrap();
+    drop(newer_connection);
+
+    for (label, path, expected) in [
+        ("symlink", link, "symlink"),
+        ("traversal", traversal, "parent traversal"),
+        ("foreign key", fk, "foreign key violations"),
+        ("audit", audit, "invalid audit chain"),
+        ("newer schema", newer, "newer than supported"),
+    ] {
+        let output = fixture.run(
+            &fixture.main,
+            &[
+                "workspace",
+                "adopt",
+                "--from-board",
+                path.to_str().unwrap(),
+                "--name",
+                "Alpha",
+                "--rootless",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "{label} source unexpectedly adopted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+        assert!(
+            !fixture.data.exists(),
+            "{label} refusal created live registry state"
+        );
+    }
+}
+
+#[test]
+fn workspace_adopt_rejects_a_duplicate_active_board_name_across_processes() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-duplicate");
+    let source_data = fixture.root.join("source-data");
+    let source_cwd = fixture.root.join("source-cwd");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&source_data).unwrap();
+
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let source_init = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["init", "--name", "Alpha", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&source_init.stderr)
+    );
+    let source_init_json: Value = serde_json::from_slice(&source_init.stdout).unwrap();
+    let source_board = source_init_json["boardPath"].as_str().unwrap();
+
+    let adopt = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source_board,
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(!adopt.status.success(), "adopt unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&adopt.stderr).contains("already named Alpha"),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+}
+
 /// One HTTP request to the running server, as a real socket conversation.
 ///
 /// Hand-rolled rather than reached for a client crate: this must exercise the
@@ -14244,7 +15034,7 @@ struct ActorHeaderFixture {
 fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixture {
     fixture.ok_json(
         &fixture.main,
-        &["init", "--name", board, "--rootless", "true", "--json"],
+        &["init", "--name", board, "--rootless", "--json"],
     );
 
     project_ok_json(

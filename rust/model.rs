@@ -506,6 +506,21 @@ pub struct ProjectRecord {
     pub last_used_at: i64,
 }
 
+/// Receipt for adopting an existing board file into the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAdoptReceipt {
+    #[serde(flatten)]
+    pub project: ProjectRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+    pub source_board_path: String,
+    /// SHA-256 of the exact migrated snapshot inode published to the registry.
+    pub source_sha256: String,
+    /// Byte count of the exact migrated snapshot inode published to the registry.
+    pub source_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextPacket {

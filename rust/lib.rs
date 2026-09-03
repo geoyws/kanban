@@ -26,7 +26,11 @@ mod watch;
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
-use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
+use crate::registry::{
+    PreparedAdoption, Registry, WORKSPACE_ADOPT_HELPER_COMMAND, data_root, now_ms,
+    preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
+    run_workspace_adopt_helper, spawn_workspace_adopt_helper,
+};
 use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,8 @@ Usage:
   kanban init --name NAME [--workspace PATH] [--rootless] [--force] [--as ACTOR]
   kanban workspace list [--all] [--json]
   kanban workspace attach --to NAME|REGISTERED_PATH [--workspace PATH] [--as ACTOR]
+  kanban workspace adopt --from-board PATH --name NAME (--workspace PATH | --rootless)
+             --as ACTOR [--json]
   kanban workspace detach --root REGISTERED_PATH --as ACTOR
   kanban workspace repoint [--root PATH] [--as ACTOR] [--json]
   kanban dashboard [--json]
@@ -168,11 +174,12 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 26] = [
+pub(crate) const BOOLEAN: [&str; 27] = [
     "help",
     "json",
     "version",
     "force",
+    "rootless",
     "next",
     "candidates",
     "keep-status",
@@ -314,6 +321,12 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
     ),
     (
         "workspace",
+        Some("adopt"),
+        &["db", "project"],
+        "copies a source board into registry-owned storage under --name",
+    ),
+    (
+        "workspace",
         Some("detach"),
         &["db", "project", "workspace"],
         "detaches the registered root named by --root",
@@ -450,6 +463,13 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("workspace", Some("list"), &["all"], &[], true),
     ("workspace", Some("attach"), &["to", "as"], &[], false),
+    (
+        "workspace",
+        Some("adopt"),
+        &["from-board", "name", "rootless", "as"],
+        &[],
+        false,
+    ),
     ("workspace", Some("detach"), &["root", "as"], &[], false),
     ("workspace", Some("repoint"), &["root", "as"], &[], false),
     ("dashboard", None, &[], &[], true),
@@ -947,6 +967,7 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("handoff", "acc") => "accept",
         ("workspace", "ls") => "list",
         ("workspace", "att") => "attach",
+        ("workspace", "adopt") => "adopt",
         ("workspace", "det") => "detach",
         ("tag", "ls") => "list",
         ("tag", "new") => "add",
@@ -3152,6 +3173,11 @@ fn run() -> Result<()> {
         emit(&version_string())?;
         return Ok(());
     }
+    if !args.positionals.is_empty()
+        && canonical_command(args.positionals[0].as_str()) == WORKSPACE_ADOPT_HELPER_COMMAND
+    {
+        return run_workspace_adopt_helper();
+    }
     if args.positionals.is_empty() || args.has("help") {
         emit(HELP)?;
         return Ok(());
@@ -3214,6 +3240,31 @@ fn run() -> Result<()> {
 
     require_sane_clock()?;
 
+    let adopt_request = if command == "workspace" && sub == Some("adopt") {
+        let source = PathBuf::from(args.require("from-board")?);
+        let name = args.require("name")?;
+        let actor = args.require("as")?.to_owned();
+        let rootless = args.has("rootless");
+        let workspace = args.one("workspace").map(PathBuf::from);
+        if rootless && workspace.is_some() {
+            bail!("--rootless cannot be combined with --workspace");
+        }
+        if !rootless && workspace.is_none() {
+            bail!("workspace adopt requires either --workspace PATH or --rootless");
+        }
+        Some((
+            PreparedAdoption::prepare(&source, name)?,
+            workspace,
+            rootless,
+            actor,
+        ))
+    } else {
+        None
+    };
+    if adopt_request.is_some() {
+        preflight_live_root_for_adoption()?;
+    }
+
     // Held until `run` returns. `restore` replaces database files behind
     // SQLite's back, so it needs the data root to itself; everything else
     // only needs the assurance that no restore is doing so underneath it.
@@ -3241,14 +3292,32 @@ fn run() -> Result<()> {
         false => direct_db(&args),
     };
     let _data_root = if lock::touches_data_root(addressed_board.as_deref()) {
-        Some(if command == "restore" {
-            lock::exclusive()?
-        } else {
-            lock::shared()?
-        })
+        Some(
+            if command == "restore" || (command == "workspace" && sub == Some("adopt")) {
+                lock::exclusive()?
+            } else {
+                lock::shared()?
+            },
+        )
     } else {
         None
     };
+
+    // Adoption validates and snapshots the source before any live write. Once
+    // the source is pinned, the exclusive data-root lock above stays in force
+    // across root preparation, helper execution, registry commit, and cleanup.
+    if let Some((prepared, workspace, rootless, actor)) = adopt_request {
+        if let Err(error) = prepare_live_root_for_adoption() {
+            return Err(prepared.abort(error));
+        }
+        let record =
+            match spawn_workspace_adopt_helper(&prepared, workspace.as_deref(), rootless, &actor) {
+                Ok(record) => record,
+                Err(error) => return Err(prepared.abort(error)),
+            };
+        prepared.cleanup()?;
+        return print(&record, args.has("json"));
+    }
 
     if command == "init" {
         if args.has("rootless") && args.one("workspace").is_some() {

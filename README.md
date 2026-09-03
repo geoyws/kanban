@@ -317,6 +317,7 @@ when needed:
 ```bash
 kanban init --name my-project --workspace /path/to/main-worktree
 kanban init --name scratchboard --rootless
+kanban workspace adopt --from-board /path/to/existing-board.db --name imported --workspace /path/to/adopted-root --as geo
 cd /path/to/another-worktree
 kanban workspace attach --to my-project
 kanban workspace detach --root /path/to/retired-worktree --as geo
@@ -327,6 +328,25 @@ chooses that unique rootless board. The registry refuses to create a second
 active board with the same name, and `workspace detach` refuses a last-root
 retirement only when it would create a second active board with that name, so
 the ambiguous state is blocked instead of becoming a dead end.
+
+`workspace adopt` is for a board file that already exists outside the registry
+and needs to become registry-owned storage. The source argument must identify
+the exact regular board file: a symlink `--from-board` path and `..` parent
+traversal are refused rather than silently changing source identity. Adoption
+opens the source and any WAL with no-follow handles, verifies their device and
+inode identities, and captures a stable WAL-aware snapshot without opening
+SQLite on or creating a sidecar beside the source. Source integrity,
+foreign-key integrity, audit, schema, and name preflight completes before the
+live registry path or lock can be created.
+
+Migration and final validation happen in a private staging directory. Kanban
+hashes the pinned final database handle and atomically publishes that same inode
+with a directory-relative rename into a freshly UUID-named file. Every
+registry path component is opened without following symlinks, and the pinned
+`boards/` identity is reverified before the registry transaction commits. The
+receipt and immutable `board_adopted` event therefore describe the exact bytes
+registered, not a later path reopen. Use `--rootless` when the adopted board
+should have no registered root; otherwise pass the exact root you want recorded.
 
 If a registered tree is later moved and a symlink left where it was, the root
 row is now only a hint. `doctor` reports that stale root and where it leads
