@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+die() {
+  printf '%s\n' "$1" >&2
+  exit 64
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+root_dir=${1:-$(CDPATH= cd -- "$script_dir/.." && pwd)}
+denylist_file=${2:-${KB_DENYLIST_FILE:-}}
+
+[[ -n "$denylist_file" ]] || die 'denylist-check: missing denylist file path'
+[[ -r "$denylist_file" ]] || die "denylist-check: denylist is not readable: $denylist_file"
+
+tmp_list=$(mktemp "${TMPDIR:-/tmp}/public-kb-skill-denylist.XXXXXX")
+trap 'rm -f "$tmp_list"' EXIT
+
+awk '
+  /^[[:space:]]*$/ { next }
+  /^[[:space:]]*#/ { next }
+  { print }
+' "$denylist_file" >"$tmp_list"
+[[ -s "$tmp_list" ]] || die "denylist-check: denylist is empty: $denylist_file"
+
+found=0
+
+while IFS= read -r -d '' file; do
+  [[ "$file" = "$denylist_file" ]] && continue
+  if grep -n -F -f "$tmp_list" -- "$file" >/dev/null; then
+    printf 'denylist-check: match in %s\n' "$file" >&2
+    grep -n -F -f "$tmp_list" -- "$file" >&2
+    found=1
+  fi
+  done < <(find "$root_dir" -path '*/.git' -prune -o -type f -print0)
+
+if [[ "$found" -ne 0 ]]; then
+  exit 70
+fi
+
+printf 'denylist-check: ok\n'

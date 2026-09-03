@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+root_dir=${1:-$(CDPATH= cd -- "$script_dir/.." && pwd)}
+denylist_file=${2:-${KB_DENYLIST_FILE:-}}
+
+[[ -n "$denylist_file" ]] || {
+  printf '%s\n' 'leak-gate: missing denylist file path' >&2
+  exit 64
+}
+
+"$script_dir/denylist-check" "$root_dir" "$denylist_file"
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  printf '%s\n' 'leak-gate: gitleaks unavailable' >&2
+  exit 69
+fi
+
+gitleaks dir --no-banner "$root_dir"
+printf 'leak-gate: gitleaks completed\n'
