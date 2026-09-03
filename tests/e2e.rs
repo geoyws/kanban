@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use syn::parse::Parser;
+use syn::{
+    Attribute, Expr, ExprLit, ExprMethodCall, ForeignItemFn, ImplItemFn, Item, Lit, Meta,
+    Path as SynPath, Token, TraitItemFn, Variant,
+    punctuated::Punctuated,
+    visit::{self, Visit},
+};
+
+const MAX_CFG_ATOMS: usize = 12;
 
 struct Fixture {
     root: PathBuf,
@@ -624,6 +633,338 @@ fn browser_loopback_reservation_supported() -> Result<(), String> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .map(drop)
         .map_err(|error| format!("reserve loopback port for browser tests: {error}"))
+}
+
+fn rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let metadata = fs::metadata(&path).unwrap();
+        if metadata.is_dir() {
+            let mut entries: Vec<_> = fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            stack.extend(entries.into_iter().rev());
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            sources.push(path);
+        }
+    }
+    sources.sort();
+    sources
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymbolReferenceKind {
+    Definition,
+    Use,
+}
+
+fn symbol_references_in_source(source: &str, symbol: &str) -> Vec<SymbolReferenceKind> {
+    let file = syn::parse_file(source).unwrap();
+    struct Finder<'a> {
+        symbol: &'a str,
+        references: Vec<SymbolReferenceKind>,
+    }
+
+    #[derive(Clone)]
+    enum CfgExpr {
+        Atom(String),
+        All(Vec<CfgExpr>),
+        Any(Vec<CfgExpr>),
+        Not(Box<CfgExpr>),
+    }
+
+    fn meta_path_to_string(path: &syn::Path) -> String {
+        path.segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+
+    fn expr_to_cfg_string(expr: &Expr) -> String {
+        match expr {
+            Expr::Lit(ExprLit { lit, .. }) => match lit {
+                Lit::Str(value) => format!("{:?}", value.value()),
+                Lit::ByteStr(value) => format!("{:?}", value.value()),
+                Lit::Byte(value) => value.value().to_string(),
+                Lit::Char(value) => value.value().to_string(),
+                Lit::Int(value) => value.base10_digits().to_owned(),
+                Lit::Float(value) => value.base10_digits().to_owned(),
+                Lit::Bool(value) => value.value.to_string(),
+                _ => "lit".to_owned(),
+            },
+            Expr::Path(expr_path) => meta_path_to_string(&expr_path.path),
+            Expr::Paren(expr_paren) => expr_to_cfg_string(&expr_paren.expr),
+            Expr::Group(expr_group) => expr_to_cfg_string(&expr_group.expr),
+            Expr::Unary(expr_unary) => match &expr_unary.op {
+                syn::UnOp::Neg(_) => format!("-{}", expr_to_cfg_string(&expr_unary.expr)),
+                syn::UnOp::Not(_) => format!("!{}", expr_to_cfg_string(&expr_unary.expr)),
+                _ => "unary".to_owned(),
+            },
+            Expr::Macro(expr_macro) => expr_macro.mac.tokens.to_string(),
+            _ => "expr".to_owned(),
+        }
+    }
+
+    fn meta_to_cfg_expr(meta: Meta) -> Option<CfgExpr> {
+        match meta {
+            Meta::Path(path) => Some(CfgExpr::Atom(meta_path_to_string(&path))),
+            Meta::NameValue(name_value) => Some(CfgExpr::Atom(format!(
+                "{}={}",
+                meta_path_to_string(&name_value.path),
+                expr_to_cfg_string(&name_value.value)
+            ))),
+            Meta::List(list) => {
+                let tokens = list.tokens.clone();
+                let items = Punctuated::<Meta, Token![,]>::parse_terminated
+                    .parse2(tokens.clone())
+                    .ok()?;
+                let nested = items
+                    .into_iter()
+                    .map(meta_to_cfg_expr)
+                    .collect::<Option<Vec<_>>>()?;
+                match meta_path_to_string(&list.path).as_str() {
+                    "all" => Some(CfgExpr::All(nested)),
+                    "any" => Some(CfgExpr::Any(nested)),
+                    "not" => {
+                        if nested.len() != 1 {
+                            return None;
+                        }
+                        Some(CfgExpr::Not(Box::new(nested.into_iter().next().unwrap())))
+                    }
+                    _ => Some(CfgExpr::Atom(format!(
+                        "{}({})",
+                        meta_path_to_string(&list.path),
+                        tokens
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn cfg_expr_atoms(expr: &CfgExpr, atoms: &mut Vec<String>) {
+        match expr {
+            CfgExpr::Atom(atom) => atoms.push(atom.clone()),
+            CfgExpr::All(children) | CfgExpr::Any(children) => {
+                for child in children {
+                    cfg_expr_atoms(child, atoms);
+                }
+            }
+            CfgExpr::Not(child) => cfg_expr_atoms(child, atoms),
+        }
+    }
+
+    fn cfg_expr_matches(
+        expr: &CfgExpr,
+        assignment: &std::collections::HashMap<String, bool>,
+    ) -> bool {
+        match expr {
+            CfgExpr::Atom(atom) => assignment.get(atom).copied().unwrap_or(false),
+            CfgExpr::All(children) => children
+                .iter()
+                .all(|child| cfg_expr_matches(child, assignment)),
+            CfgExpr::Any(children) => children
+                .iter()
+                .any(|child| cfg_expr_matches(child, assignment)),
+            CfgExpr::Not(child) => !cfg_expr_matches(child, assignment),
+        }
+    }
+
+    fn has_test_only_cfg(attrs: &[Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            if !attr.path().is_ident("cfg") {
+                return false;
+            }
+            let Meta::List(list) = &attr.meta else {
+                return false;
+            };
+            let Ok(items) =
+                Punctuated::<Meta, Token![,]>::parse_terminated.parse2(list.tokens.clone())
+            else {
+                return false;
+            };
+            let Some(expr) = items
+                .into_iter()
+                .map(meta_to_cfg_expr)
+                .collect::<Option<Vec<_>>>()
+                .map(CfgExpr::All)
+            else {
+                return false;
+            };
+            let mut atoms = Vec::new();
+            cfg_expr_atoms(&expr, &mut atoms);
+            atoms.sort();
+            atoms.dedup();
+            atoms.retain(|atom| atom != "test");
+            if atoms.len() > MAX_CFG_ATOMS {
+                return false;
+            }
+            let mut assignment = std::collections::HashMap::new();
+            let Some(limit) = 1usize.checked_shl(atoms.len() as u32) else {
+                return false;
+            };
+            for mask in 0..limit {
+                assignment.clear();
+                assignment.insert("test".to_owned(), false);
+                for (index, atom) in atoms.iter().enumerate() {
+                    assignment.insert(atom.clone(), (mask & (1usize << index)) != 0);
+                }
+                if cfg_expr_matches(&expr, &assignment) {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    trait HasAttrs {
+        fn attrs(&self) -> &[Attribute];
+    }
+
+    impl HasAttrs for Item {
+        fn attrs(&self) -> &[Attribute] {
+            match self {
+                Item::Const(item) => &item.attrs,
+                Item::Enum(item) => &item.attrs,
+                Item::ExternCrate(item) => &item.attrs,
+                Item::Fn(item) => &item.attrs,
+                Item::ForeignMod(item) => &item.attrs,
+                Item::Impl(item) => &item.attrs,
+                Item::Macro(item) => &item.attrs,
+                Item::Mod(item) => &item.attrs,
+                Item::Static(item) => &item.attrs,
+                Item::Struct(item) => &item.attrs,
+                Item::Trait(item) => &item.attrs,
+                Item::TraitAlias(item) => &item.attrs,
+                Item::Type(item) => &item.attrs,
+                Item::Union(item) => &item.attrs,
+                Item::Use(item) => &item.attrs,
+                Item::Verbatim(_) => &[],
+                _ => &[],
+            }
+        }
+    }
+
+    impl HasAttrs for Variant {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl HasAttrs for TraitItemFn {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl HasAttrs for ForeignItemFn {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl HasAttrs for ImplItemFn {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl Visit<'_> for Finder<'_> {
+        fn visit_item(&mut self, node: &Item) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if let Item::Fn(item_fn) = node
+                && item_fn.sig.ident == self.symbol
+            {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_item(self, node);
+        }
+
+        fn visit_trait_item_fn(&mut self, node: &TraitItemFn) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.sig.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_trait_item_fn(self, node);
+        }
+
+        fn visit_foreign_item_fn(&mut self, node: &ForeignItemFn) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.sig.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_foreign_item_fn(self, node);
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &ImplItemFn) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.sig.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_impl_item_fn(self, node);
+        }
+
+        fn visit_field(&mut self, node: &syn::Field) {
+            if has_test_only_cfg(&node.attrs) {
+                return;
+            }
+            visit::visit_field(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &ExprMethodCall) {
+            if node.method == self.symbol {
+                self.references.push(SymbolReferenceKind::Use);
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_path(&mut self, node: &SynPath) {
+            if node
+                .segments
+                .iter()
+                .any(|segment| segment.ident == self.symbol)
+            {
+                self.references.push(SymbolReferenceKind::Use);
+            }
+            visit::visit_path(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &syn::Macro) {
+            if node.tokens.to_string().contains(self.symbol) {
+                self.references.push(SymbolReferenceKind::Use);
+            }
+            visit::visit_macro(self, node);
+        }
+
+        fn visit_variant(&mut self, node: &Variant) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_variant(self, node);
+        }
+    }
+    let mut finder = Finder {
+        symbol,
+        references: Vec::new(),
+    };
+    finder.visit_file(&file);
+    finder.references
 }
 
 fn server_ready_banner(port: u16) -> String {
@@ -13920,7 +14261,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--status",
             "todo",
             "--as",
-            "ifca-sso",
+            "geo",
             "--json",
         ],
     );
@@ -13936,7 +14277,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--kind",
             "decision",
             "--as",
-            "ifca-sso",
+            "geo",
             "--json",
         ],
     );
@@ -14134,6 +14475,31 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
     let (status, response) = http_post_with_headers(
         port,
         &format!("/attention/{board}/{}/reply", seeded.success_attention_id),
+        &[
+            ("Origin", "https://hostile.example"),
+            ("X-Kanban-Actor", "ifca-sso"),
+        ],
+        b"decision=approve&reply=done",
+    );
+    assert_eq!(status, 403, "{response}");
+    let still_open = project_ok_json(
+        &fixture,
+        board,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "open",
+            "--task",
+            &seeded.success_task_id,
+            "--json",
+        ],
+    );
+    assert_eq!(still_open.as_array().unwrap().len(), 1);
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.success_attention_id),
         &[("Origin", &origin), ("X-Kanban-Actor", "ifca-sso")],
         b"decision=approve&reply=done",
     );
@@ -14192,6 +14558,23 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
     );
     assert_eq!(status, 403, "{response}");
 
+    let oversized = "x".repeat(300);
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", &oversized)],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 400, "{response}");
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", "bad\tactor")],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 400, "{response}");
+
     let negative = project_ok_json(
         &fixture,
         board,
@@ -14206,6 +14589,29 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
         ],
     );
     assert_eq!(negative.as_array().unwrap().len(), 1);
+
+    let unauthorized_cli = project_command(&fixture, board)
+        .args([
+            "attention",
+            "resolve",
+            &seeded.default_attention_id,
+            "--as",
+            "ifca-sso",
+            "--note",
+            "still blocked",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !unauthorized_cli.status.success(),
+        "CLI resolve by non-geo/non-raiser actor was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&unauthorized_cli.stderr);
+    assert!(
+        stderr.contains("only geo or that same raiser may resolve"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -14225,6 +14631,209 @@ fn serve_actor_header_defaults_to_geo_when_flag_is_absent() {
     );
     assert_eq!(status, 303, "{response}");
     assert_attention_resolution(&fixture, board, &seeded.default_task_id, "geo");
+}
+
+#[test]
+fn trusted_edge_resolution_stays_on_the_single_web_call_site() {
+    let rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("rust")
+        .canonicalize()
+        .unwrap();
+    let serve_path = rust_dir.join("serve.rs");
+    let store_path = rust_dir.join("store.rs");
+    let mut definitions = Vec::new();
+    let mut uses = Vec::new();
+    for path in rust_sources(&rust_dir) {
+        let path = path.canonicalize().unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        for reference in symbol_references_in_source(&source, "resolve_attention_from_trusted_edge")
+        {
+            match reference {
+                SymbolReferenceKind::Definition => definitions.push(path.clone()),
+                SymbolReferenceKind::Use => uses.push(path.clone()),
+            }
+        }
+    }
+    assert_eq!(definitions, vec![store_path]);
+    assert_eq!(uses, vec![serve_path]);
+}
+
+#[test]
+fn rust_sources_walk_nested_directories() {
+    let root = std::env::temp_dir().join(format!("kanban-rust-source-walk-{}", std::process::id()));
+    let nested = root.join("bin");
+    fs::create_dir_all(&nested).unwrap();
+    let nested_file = nested.join("tool.rs");
+    fs::write(&nested_file, "fn main() {}\n").unwrap();
+
+    let sources = rust_sources(&root);
+    assert_eq!(sources, vec![nested_file]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn symbol_inventory_counts_associated_function_and_function_pointer_uses() {
+    let associated_function = r#"
+        struct Store;
+        impl Store {
+            fn resolve_attention_from_trusted_edge() {}
+        }
+
+        fn exercise() {
+            let _ = Store::resolve_attention_from_trusted_edge;
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(associated_function, "resolve_attention_from_trusted_edge"),
+        vec![SymbolReferenceKind::Definition, SymbolReferenceKind::Use]
+    );
+
+    let function_pointer = r#"
+        fn resolve_attention_from_trusted_edge() {}
+
+        fn exercise() {
+            let _handler = resolve_attention_from_trusted_edge;
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(function_pointer, "resolve_attention_from_trusted_edge"),
+        vec![SymbolReferenceKind::Definition, SymbolReferenceKind::Use]
+    );
+}
+
+#[test]
+fn symbol_inventory_skips_test_only_struct_type_and_static_items() {
+    let source = r#"
+        mod helper {
+            pub struct resolve_attention_from_trusted_edge;
+        }
+
+        fn resolve_attention_from_trusted_edge() {}
+
+        fn exercise() {
+            let _ = resolve_attention_from_trusted_edge;
+        }
+
+        #[cfg(test)]
+        struct TestOnlyStruct {
+            field: helper::resolve_attention_from_trusted_edge,
+        }
+
+        #[cfg(all(test, feature = "inventory"))]
+        type TestOnlyType = helper::resolve_attention_from_trusted_edge;
+
+        #[cfg(any(
+            all(test, feature = "inventory"),
+            all(test, feature = "alternate")
+        ))]
+        static TEST_ONLY_STATIC: helper::resolve_attention_from_trusted_edge =
+            helper::resolve_attention_from_trusted_edge;
+
+        #[cfg(test)]
+        struct TestOnlyStructField {
+            field: helper::resolve_attention_from_trusted_edge,
+        }
+
+        #[cfg(test)]
+        enum TestOnlyVariant {
+            Hidden(helper::resolve_attention_from_trusted_edge),
+        }
+
+        #[cfg(all(feature = "alpha", not(feature = "beta")))]
+        struct LiveFeatureField {
+            field: helper::resolve_attention_from_trusted_edge,
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(source, "resolve_attention_from_trusted_edge"),
+        vec![
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Use,
+            SymbolReferenceKind::Use,
+        ]
+    );
+}
+
+#[test]
+fn symbol_inventory_keeps_malformed_not_cfg_live() {
+    let source = r#"
+        fn resolve_attention_from_trusted_edge() {}
+
+        #[cfg(not(test, feature = "inventory"))]
+        struct MalformedNotField {
+            field: resolve_attention_from_trusted_edge,
+        }
+
+        #[cfg(not())]
+        enum EmptyNotVariant {
+            Visible(resolve_attention_from_trusted_edge),
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(source, "resolve_attention_from_trusted_edge"),
+        vec![
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Use,
+            SymbolReferenceKind::Use,
+        ]
+    );
+}
+
+#[test]
+fn symbol_inventory_treats_over_cap_cfg_as_live() {
+    let cfg_atoms = (0..=MAX_CFG_ATOMS)
+        .map(|index| format!("atom{index}"))
+        .collect::<Vec<_>>();
+    let source = format!(
+        r#"
+        fn resolve_attention_from_trusted_edge() {{}}
+
+        #[cfg(all({cfg}))]
+        struct OverCapLiveField {{
+            field: resolve_attention_from_trusted_edge,
+        }}
+    "#,
+        cfg = cfg_atoms.join(", ")
+    );
+    assert_eq!(
+        symbol_references_in_source(&source, "resolve_attention_from_trusted_edge"),
+        vec![SymbolReferenceKind::Definition, SymbolReferenceKind::Use]
+    );
+}
+
+#[test]
+fn symbol_inventory_catches_trait_foreign_and_macro_token_references() {
+    let source = r#"
+        trait Audit {
+            fn resolve_attention_from_trusted_edge();
+        }
+
+        extern "C" {
+            fn resolve_attention_from_trusted_edge();
+        }
+
+        macro_rules! capture {
+            ($name:ident) => {
+                $name
+            };
+        }
+
+        fn resolve_attention_from_trusted_edge() {}
+
+        fn exercise() {
+            capture!(resolve_attention_from_trusted_edge);
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(source, "resolve_attention_from_trusted_edge"),
+        vec![
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Use,
+        ]
+    );
 }
 
 #[test]

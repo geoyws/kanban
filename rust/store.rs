@@ -3967,7 +3967,32 @@ impl Store {
         actor: &str,
         resolution: Option<&str>,
     ) -> Result<Attention> {
-        let actor = nonempty(actor, "actor")?.to_owned();
+        self.resolve_attention_with_authorization(id, actor, actor, resolution, false)
+    }
+
+    /// Settle an item from the trusted web edge.
+    ///
+    /// The edge identity is the audit actor, and the web route is the only
+    /// caller that may opt into this broader authorization model.
+    pub(crate) fn resolve_attention_from_trusted_edge(
+        &mut self,
+        id: &str,
+        actor: &str,
+        resolution: Option<&str>,
+    ) -> Result<Attention> {
+        self.resolve_attention_with_authorization(id, actor, actor, resolution, true)
+    }
+
+    fn resolve_attention_with_authorization(
+        &mut self,
+        id: &str,
+        authorization_actor: &str,
+        audit_actor: &str,
+        resolution: Option<&str>,
+        trusted_edge: bool,
+    ) -> Result<Attention> {
+        let authorization_actor = nonempty(authorization_actor, "actor")?.to_owned();
+        let audit_actor = nonempty(audit_actor, "actor")?.to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3983,7 +4008,10 @@ impl Store {
                 existing.resolved_by.unwrap_or_else(|| "someone".into())
             );
         }
-        if actor != "geo" && actor != existing.raised_by {
+        if !trusted_edge
+            && authorization_actor != "geo"
+            && authorization_actor != existing.raised_by
+        {
             bail!(
                 "attention {id} was raised by {}; only geo or that same raiser may resolve it — \
                  use attention update to correct it without closing George's queue",
@@ -3999,13 +4027,13 @@ impl Store {
         transaction.execute(
             "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=?,\
              reopened_at=NULL,reopened_by=NULL,reopen_note=NULL WHERE id=?",
-            params![now, actor, resolution, id],
+            params![now, audit_actor, resolution, id],
         )?;
         event(
             &transaction,
             existing.task_id.as_deref(),
             "attention_resolved",
-            Some(&actor),
+            Some(&audit_actor),
             json!({
                 "attentionID": id,
                 "kind": existing.kind,
@@ -5276,6 +5304,77 @@ mod tests {
             .expect_err("reversed bounds must be rejected")
             .to_string();
         assert_eq!(reversed, "--after must not be later than --before");
+    }
+
+    #[test]
+    fn trusted_edge_resolution_records_the_edge_actor_without_changing_cli_rules() {
+        let mut store = test_store("trusted-edge-resolution");
+        store.initialize("TRUSTED", "geo").unwrap();
+        insert_task(&store, "t-web");
+        insert_task(&store, "t-cli");
+        insert_task(&store, "t-forbidden");
+
+        let web_attention = store
+            .raise_attention(
+                "Resolve from the trusted edge.",
+                "decision",
+                "geo",
+                Some("t-web"),
+                0,
+                &[],
+            )
+            .expect("raise web attention");
+        let cli_attention = store
+            .raise_attention(
+                "CLI still owns this one.",
+                "decision",
+                "ifca-sso",
+                Some("t-cli"),
+                0,
+                &[],
+            )
+            .expect("raise cli attention");
+        let forbidden_attention = store
+            .raise_attention(
+                "Geo still owns this other one.",
+                "decision",
+                "geo",
+                Some("t-forbidden"),
+                0,
+                &[],
+            )
+            .expect("raise forbidden attention");
+
+        let resolved = store
+            .resolve_attention_from_trusted_edge(&web_attention.id, "ifca-sso", Some("done"))
+            .expect("trusted edge resolution");
+        assert_eq!(resolved.resolved_by.as_deref(), Some("ifca-sso"));
+
+        let resolved_events = store
+            .events(Some("t-web"), Some("attention_resolved"), 10, true)
+            .expect("read resolved web event");
+        assert_eq!(resolved_events.len(), 1);
+        assert_eq!(resolved_events[0].actor.as_deref(), Some("ifca-sso"));
+
+        let cli_resolved = store
+            .resolve_attention(&cli_attention.id, "ifca-sso", Some("done"))
+            .expect("ordinary cli resolution");
+        assert_eq!(cli_resolved.resolved_by.as_deref(), Some("ifca-sso"));
+
+        let cli_events = store
+            .events(Some("t-cli"), Some("attention_resolved"), 10, true)
+            .expect("read resolved cli event");
+        assert_eq!(cli_events.len(), 1);
+        assert_eq!(cli_events[0].actor.as_deref(), Some("ifca-sso"));
+
+        let forbidden = store
+            .resolve_attention(&forbidden_attention.id, "ifca-sso", Some("not allowed"))
+            .expect_err("CLI resolve must still reject a non-geo, non-raiser actor")
+            .to_string();
+        assert!(
+            forbidden.contains("only geo or that same raiser may resolve"),
+            "{forbidden}"
+        );
     }
 
     #[test]

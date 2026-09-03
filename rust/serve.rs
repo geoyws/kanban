@@ -329,7 +329,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
             page("Board not found", "<h1>Board not found</h1>"),
         ));
     };
-    if let Err(error) = store.resolve_attention(id, &actor, Some(&reply)) {
+    if let Err(error) = store.resolve_attention_from_trusted_edge(id, &actor, Some(&reply)) {
         return Ok(WebResponse::Html(
             409,
             page(
@@ -2247,7 +2247,6 @@ mod tests {
         assert!(normalize_actor_bytes(b" ifca-sso").is_err());
         assert!(normalize_actor_bytes(b"ifca sso").is_err());
         assert!(normalize_actor_bytes(b"ifca-sso\n").is_err());
-        assert!(normalize_actor_bytes(&vec![b'a'; MAX_ACTOR_BYTES + 1]).is_err());
     }
 
     #[test]
@@ -2451,7 +2450,11 @@ mod tests {
         // The Needs-you reply form resolves exactly one attention item through
         // the same audited Store operation as `kb att resolve`. No other web
         // route is allowed a mutator.
-        const ALLOWED: [&str; 2] = ["move_task", "resolve_attention"];
+        const ALLOWED: [&str; 3] = [
+            "move_task",
+            "resolve_attention",
+            "resolve_attention_from_trusted_edge",
+        ];
         let shipped = SOURCE
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)
@@ -2543,6 +2546,27 @@ mod tests {
         );
         assert!(strict_form_value("reply=bad%2", "reply").is_err());
         assert!(strict_form_value("reply=bad%XX", "reply").is_err());
+    }
+
+    #[test]
+    fn actor_header_validation_fails_closed() {
+        assert_eq!(
+            normalize_actor_header_name("X-Auth-Request-Email").unwrap(),
+            "X-Auth-Request-Email"
+        );
+        assert!(normalize_actor_header_name(" ").is_err());
+        assert!(normalize_actor_header_name("X Auth").is_err());
+        assert!(normalize_actor_header_name("X-Auth-Request-Email:bad").is_err());
+
+        assert_eq!(
+            normalize_actor_bytes(b"ifca-sso").unwrap(),
+            "ifca-sso".to_owned()
+        );
+        assert!(normalize_actor_bytes(b"  ").is_err());
+        assert!(normalize_actor_bytes(b"bad actor").is_err());
+        assert!(normalize_actor_bytes(b"bad\tactor").is_err());
+        assert!(normalize_actor_bytes("x".repeat(MAX_ACTOR_BYTES + 1).as_bytes()).is_err());
+        assert!(normalize_actor_bytes(&[0xf0, 0x28, 0x8c, 0x28]).is_err());
     }
 
     #[test]
