@@ -522,6 +522,7 @@ test_skill_parity_sections_are_present() {
     '## Aliases'
     '## Addressing a board'
     '## Tag-scoped rules — what frames work'
+    '## Workspace adoption and rule transfer'
     '## Attention — anything that needs the owner'
     '## Search and bounded RAG context'
     '## Sitreps — where a lane stands, cheaply'
@@ -556,6 +557,9 @@ test_skill_parity_sections_are_present() {
     'kb t new "Title"'
     'kb att raise "<verdict-first'
     'kb r new "Universal rule."'
+    'kb workspace adopt --from-board PATH --name NAME (--workspace ROOT | --rootless) --as ACTOR'
+    'kb rule export --board NAME ... --as ACTOR [--output PATH]'
+    'kb rule import PATH --as ACTOR'
     'kb watch --project NAME'
     'kb subscription add --project NAME'
     'kb archive --older-than-days'
@@ -583,6 +587,35 @@ test_skill_parity_sections_are_present() {
   local token_snippet
   for token_snippet in "${required_public_tokens[@]}"; do
     assert_contains "$text" "$token_snippet" "skill public token $token_snippet"
+  done
+}
+
+test_public_readme_contract_snippets_are_present() {
+  local text
+  text=$(/bin/cat "$package_dir/README.md")
+
+  local -a required_headings=(
+    '## Workspace adoption and rule transfer'
+    '## Routing model'
+  )
+
+  local heading
+  for heading in "${required_headings[@]}"; do
+    assert_contains "$text" "$heading" "readme heading $heading"
+  done
+
+  local -a required_snippets=(
+    'kb workspace adopt --from-board PATH --name NAME (--workspace ROOT | --rootless) --as ACTOR'
+    'kb rule export --board NAME ... --as ACTOR [--output PATH]'
+    'kb rule import PATH --as ACTOR'
+    'It is a copy into the registry, not a rename, and it leaves the source board file unchanged.'
+    'Route those verbs through `kb-host`'
+    'or the raw registry path, not `kb-board`.'
+  )
+
+  local snippet
+  for snippet in "${required_snippets[@]}"; do
+    assert_contains "$text" "$snippet" "readme snippet $snippet"
   done
 }
 
@@ -1684,6 +1717,7 @@ assert_test_wiring() {
     test_adjacent_hosts_table_is_used
     test_readme_example_table_is_accepted
     test_skill_parity_sections_are_present
+    test_public_readme_contract_snippets_are_present
     test_host_surface_matches_source_allowlist
     test_host_surface_external_source_override_is_accepted
     test_host_surface_missing_command_drift_is_fail_closed
@@ -1754,6 +1788,7 @@ main() {
     test_adjacent_hosts_table_is_used
     test_readme_example_table_is_accepted
     test_skill_parity_sections_are_present
+    test_public_readme_contract_snippets_are_present
     test_host_surface_matches_source_allowlist
     test_host_surface_external_source_override_is_accepted
     test_host_surface_missing_command_drift_is_fail_closed
@@ -1784,6 +1819,7 @@ main() {
     test_host_remote_hostname_mismatch_is_fail_closed
     test_binary_path_rules_are_enforced
     test_board_remote_hostname_mismatch_is_fail_closed
+    test_public_readme_contract_snippets_are_present
     test_denylist_and_hook_behaviour
     test_content_audit
   )

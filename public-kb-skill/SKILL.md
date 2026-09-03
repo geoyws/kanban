@@ -76,7 +76,8 @@ Outside the board home host, do not call `kb` directly.
 - Use `skills/kb/scripts/kb-host BOARD_HOME_HOST KB_COMMAND [ARGS...]` for raw
   registry-owned or non-board operations only. It resolves the host identity
   from the consumer table, verifies the routed SSH target and remote hostname,
-  and preserves argv literally.
+  and preserves argv literally. Registry rule verbs stay on the raw registry
+  routing path rather than `kb-board`.
 
 ```bash
 <skill-dir>/scripts/kb-board BOARD_ID t ls --status todo --json
@@ -97,6 +98,26 @@ and `attention` should normally use `--project NAME` remotely. Registry-owned
 live once in the registry and select boards through `ALL`, `ONLY:<board>`, and
 `EXCEPT:<board>` tags. Registry watch helpers also reject board selectors and
 `--all`. In particular, use `kb-host BOARD_HOME_HOST r ls --json`, never `kb-host BOARD_HOME_HOST r ls --project kanban`.
+
+## Workspace adoption and rule transfer
+
+`workspace adopt` copies an existing board into registry-owned storage. Use it
+when the source board already exists and you want the registry to own the copy;
+it is not a rename, and it does not mutate the source board file.
+
+```bash
+kb workspace adopt --from-board PATH --name NAME (--workspace ROOT | --rootless) --as ACTOR
+```
+
+Rule transfer stays on the registry side. `rule export` produces a bundle for a
+named source board, and `rule import` consumes that bundle into the destination
+registry with fresh destination rule IDs. These are registry rule verbs, so use
+`kb-host` or the raw registry routing path rather than `kb-board`.
+
+```bash
+kb rule export --board NAME ... --as ACTOR [--output PATH]
+kb rule import PATH --as ACTOR
+```
 
 ## Aliases
 

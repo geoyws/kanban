@@ -32,6 +32,24 @@ selector for board-owned commands; `kb-host` preserves registry commands
 without a board selector. Remote execution uses the board home host identity,
 the SSH target, and the remote hostname check is fail-closed.
 
+## Workspace adoption and rule transfer
+
+`workspace adopt` copies an existing board into registry-owned storage. It is a copy into the registry, not a rename, and it leaves the source board file unchanged.
+
+```bash
+kb workspace adopt --from-board PATH --name NAME (--workspace ROOT | --rootless) --as ACTOR
+```
+
+Rule transfer stays on the registry side. `rule export` writes a bundle for a
+named source board, and `rule import` consumes that bundle into the destination
+registry with fresh destination rule IDs. Route those verbs through `kb-host`
+or the raw registry path, not `kb-board`.
+
+```bash
+kb rule export --board NAME ... --as ACTOR [--output PATH]
+kb rule import PATH --as ACTOR
+```
+
 Example row copied into a TSV table:
 
 ```tsv
