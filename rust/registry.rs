@@ -5,8 +5,8 @@ use crate::db::{
     open_registry_readonly, own_private_dir, read_snapshot,
 };
 use crate::model::{
-    Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, UnreachableRoot,
-    WorkspaceAdoptReceipt, WorkspaceRecord,
+    Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, RuleTransferBundle,
+    RuleTransferItem, RuleTransferReport, UnreachableRoot, WorkspaceAdoptReceipt, WorkspaceRecord,
 };
 use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
@@ -55,6 +55,94 @@ fn validate_rule_actor(value: &str) -> Result<&str> {
     Ok(actor)
 }
 
+fn validate_registry_uuid(value: &str) -> Result<&str> {
+    let uuid = value.trim();
+    if uuid.is_empty() {
+        bail!("rule transfer bundle is missing sourceRegistryUuid");
+    }
+    Uuid::parse_str(uuid)
+        .with_context(|| format!("rule transfer bundle sourceRegistryUuid {uuid} is invalid"))?;
+    Ok(uuid)
+}
+
+#[allow(dead_code)]
+fn deny_secret_material(body: &str) -> Result<()> {
+    const DENYLIST: &[&str] = &[
+        "BEGIN PRIVATE KEY",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "BEGIN RSA PRIVATE KEY",
+        "PRIVATE KEY-----",
+        "client_secret",
+        "credential",
+        "credentials",
+        "password",
+        "secret",
+        "token",
+    ];
+    let lower = body.to_lowercase();
+    if DENYLIST
+        .iter()
+        .any(|needle| lower.contains(&needle.to_lowercase()))
+    {
+        bail!("rule body contains secret material");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rule_fingerprint(
+    source_registry_uuid: &str,
+    source_rule_id: &str,
+    body: &str,
+    author: &str,
+    archived: bool,
+    created_at: i64,
+    updated_at: i64,
+    tags: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source_registry_uuid.as_bytes());
+    hasher.update([0]);
+    hasher.update(source_rule_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(body.as_bytes());
+    hasher.update([0]);
+    hasher.update(author.as_bytes());
+    hasher.update([0]);
+    hasher.update([archived as u8]);
+    hasher.update([0]);
+    hasher.update(created_at.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(updated_at.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(tags.join("\u{1f}").as_bytes());
+    crate::audit::bytes_sha256(&hasher.finalize())
+}
+
+fn parse_json_string_array(encoded: &str) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            encoded.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn sorted_unique_boards(boards: &[String]) -> Result<Vec<String>> {
+    if boards.is_empty() {
+        bail!("rule transfer bundle is missing sourceBoards");
+    }
+    let sorted = boards.to_vec();
+    let mut dedup = sorted.clone();
+    dedup.sort();
+    dedup.dedup();
+    if dedup.len() != sorted.len() || dedup != sorted {
+        bail!("rule transfer bundle sourceBoards must be sorted and unique");
+    }
+    Ok(sorted)
+}
+
 fn rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
     let encoded: String = record.get("tags")?;
     let tags = serde_json::from_str(&encoded).map_err(|error| {
@@ -74,6 +162,12 @@ fn rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
         tags,
         source_board: record.get("source_board")?,
         source_rule_id: record.get("source_rule_id")?,
+        source_registry_uuid: record.get::<_, Option<String>>("source_registry_uuid")?,
+        source_boards: record
+            .get::<_, Option<String>>("source_boards")?
+            .map(|encoded| parse_json_string_array(&encoded))
+            .transpose()?,
+        source_content_sha256: record.get::<_, Option<String>>("source_content_sha256")?,
     })
 }
 
@@ -2417,6 +2511,490 @@ impl Registry {
         )?;
         report.legacy_registry_migrated = true;
         Ok(())
+    }
+
+    fn transfer_rule_boards(&self, requested_boards: &[String]) -> Result<Vec<(String, String)>> {
+        let mut seen = HashSet::new();
+        let mut selected = Vec::new();
+        for name in requested_boards {
+            if !seen.insert(name) {
+                bail!("board {name:?} was given more than once");
+            }
+            let boards = self.by_name(name)?;
+            match boards.as_slice() {
+                [project] => {
+                    let board_path = project.board_path.clone();
+                    if !Path::new(&board_path).is_file() {
+                        bail!(
+                            "cannot transfer rules for board {name}: {board_path} is not a readable board file"
+                        );
+                    }
+                    selected.push((name.clone(), board_path));
+                }
+                [] => {
+                    bail!(
+                        "cannot transfer rules for board {name}: it is not registered in this registry"
+                    )
+                }
+                many => bail!(
+                    "cannot transfer rules for board {name}: {} active boards share that name",
+                    many.len()
+                ),
+            }
+        }
+        selected.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        Ok(selected)
+    }
+
+    fn registry_uuid(&self) -> Result<String> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT value FROM registry_meta WHERE key='registry_uuid'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .context("registry_uuid metadata is missing")?;
+        validate_registry_uuid(&value)?;
+        Ok(value.trim().to_owned())
+    }
+
+    pub fn export_rules(
+        &self,
+        actor: &str,
+        requested_boards: &[String],
+    ) -> Result<RuleTransferBundle> {
+        let exported_by = validate_rule_actor(actor)?.to_owned();
+        let source_boards = self.transfer_rule_boards(requested_boards)?;
+        let source_board_names = source_boards
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let allowed_boards = source_board_names.iter().cloned().collect::<HashSet<_>>();
+        let bundle_source_registry_uuid = self.registry_uuid()?;
+        let source_registry_audit = self.audit()?;
+        if !source_registry_audit.healthy {
+            bail!(
+                "source registry audit is unhealthy: {:?}",
+                source_registry_audit.errors
+            );
+        }
+        let exported_at = now_ms();
+        let mut rules = Vec::new();
+        for rule in self.rules(false)? {
+            deny_secret_material(&rule.body)?;
+            if rule
+                .tags
+                .iter()
+                .any(|tag| tag == "ALL" || tag.starts_with("EXCEPT:"))
+            {
+                bail!(
+                    "rule {} has selectors outside the allowlisted board set",
+                    rule.id
+                );
+            }
+            let selected_board = source_boards
+                .iter()
+                .map(|(name, _)| name)
+                .find(|name| selector_tags_apply(&rule.tags, Some(name.as_str())));
+            let Some(selected_board) = selected_board else {
+                let only_boards = rule
+                    .tags
+                    .iter()
+                    .filter_map(|tag| tag.strip_prefix("ONLY:"))
+                    .collect::<Vec<_>>();
+                if only_boards
+                    .iter()
+                    .any(|board| !allowed_boards.contains(*board))
+                {
+                    bail!(
+                        "rule {} reaches outside the requested board allowlist",
+                        rule.id
+                    );
+                }
+                continue;
+            };
+            let only_boards = rule
+                .tags
+                .iter()
+                .filter_map(|tag| tag.strip_prefix("ONLY:"))
+                .collect::<Vec<_>>();
+            if only_boards
+                .iter()
+                .any(|board| !allowed_boards.contains(*board))
+            {
+                bail!(
+                    "rule {} reaches outside the requested board allowlist",
+                    rule.id
+                );
+            }
+            let selected_board = selected_board.to_string();
+            let source_registry_uuid = rule
+                .source_registry_uuid
+                .clone()
+                .unwrap_or_else(|| bundle_source_registry_uuid.clone());
+            validate_registry_uuid(&source_registry_uuid)?;
+            let source_rule_id = rule
+                .source_rule_id
+                .clone()
+                .unwrap_or_else(|| rule.id.clone());
+            let source_content_sha256 = rule.source_content_sha256.clone().unwrap_or_else(|| {
+                rule_fingerprint(
+                    &source_registry_uuid,
+                    &source_rule_id,
+                    &rule.body,
+                    &rule.author,
+                    rule.archived,
+                    rule.created_at,
+                    rule.updated_at,
+                    &rule.tags,
+                )
+            });
+            let expected_content_sha256 = rule_fingerprint(
+                &source_registry_uuid,
+                &source_rule_id,
+                &rule.body,
+                &rule.author,
+                rule.archived,
+                rule.created_at,
+                rule.updated_at,
+                &rule.tags,
+            );
+            if source_content_sha256 != expected_content_sha256 {
+                bail!(
+                    "rule {} source content hash does not match its canonical fingerprint",
+                    rule.id
+                );
+            }
+            rules.push(RuleTransferItem {
+                source_board: Some(selected_board),
+                source_registry_uuid,
+                source_rule_id,
+                source_boards: source_board_names.clone(),
+                source_content_sha256,
+                body: rule.body,
+                author: rule.author,
+                archived: rule.archived,
+                created_at: rule.created_at,
+                updated_at: rule.updated_at,
+                tags: rule.tags,
+            });
+        }
+        rules.sort_by(|left, right| {
+            left.source_board
+                .cmp(&right.source_board)
+                .then(left.source_rule_id.cmp(&right.source_rule_id))
+                .then(left.source_content_sha256.cmp(&right.source_content_sha256))
+        });
+        Ok(RuleTransferBundle {
+            format_version: 1,
+            exported_by,
+            exported_at,
+            source_registry_uuid: bundle_source_registry_uuid,
+            source_registry_audit,
+            source_boards: source_board_names,
+            rules,
+        })
+    }
+
+    pub fn import_rules(
+        &mut self,
+        actor: &str,
+        bundle: RuleTransferBundle,
+    ) -> Result<RuleTransferReport> {
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let RuleTransferBundle {
+            format_version,
+            exported_by,
+            exported_at,
+            source_registry_uuid,
+            source_registry_audit,
+            source_boards,
+            rules,
+        } = bundle;
+        if format_version != 1 {
+            bail!(
+                "rule transfer bundle version {} is not supported",
+                format_version
+            );
+        }
+        if exported_by.trim().is_empty() {
+            bail!("rule transfer bundle is missing exportedBy");
+        }
+        validate_registry_uuid(&source_registry_uuid)?;
+        if !source_registry_audit.healthy {
+            bail!(
+                "rule transfer bundle source registry audit is unhealthy: {:?}",
+                source_registry_audit.errors
+            );
+        }
+        let source_boards = sorted_unique_boards(&source_boards)?;
+        let source_registry_audit_head = source_registry_audit.head.clone();
+        let verified_boards = self.transfer_rule_boards(&source_boards)?;
+        let verified_names = verified_boards
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>();
+        let allowed_boards = source_boards.iter().cloned().collect::<HashSet<_>>();
+        for rule in &rules {
+            validate_registry_uuid(&rule.source_registry_uuid)?;
+            if rule.source_registry_uuid != source_registry_uuid {
+                bail!(
+                    "rule transfer bundle item {} claims source registry {} but the bundle sourceRegistryUuid is {}",
+                    rule.source_rule_id,
+                    rule.source_registry_uuid,
+                    source_registry_uuid
+                );
+            }
+            deny_secret_material(&rule.body)?;
+            if rule.source_boards != source_boards {
+                bail!(
+                    "rule transfer bundle item {} does not carry the full source board selector set",
+                    rule.source_rule_id
+                );
+            }
+            let rule_source_board = rule
+                .source_board
+                .clone()
+                .context("rule transfer bundle item is missing sourceBoard")?;
+            if !allowed_boards.contains(&rule_source_board) {
+                bail!(
+                    "rule transfer bundle references board {} that was not exported",
+                    rule_source_board
+                );
+            }
+            if !selector_tags_apply(&rule.tags, Some(&rule_source_board)) {
+                bail!(
+                    "rule transfer bundle item {} does not apply to source board {}",
+                    rule.source_rule_id,
+                    rule_source_board
+                );
+            }
+            if rule
+                .tags
+                .iter()
+                .any(|tag| tag == "ALL" || tag.starts_with("EXCEPT:"))
+            {
+                bail!(
+                    "rule transfer bundle item {} contains forbidden selector tags",
+                    rule.source_rule_id
+                );
+            }
+            let expected_content_sha256 = rule_fingerprint(
+                &rule.source_registry_uuid,
+                &rule.source_rule_id,
+                &rule.body,
+                &rule.author,
+                rule.archived,
+                rule.created_at,
+                rule.updated_at,
+                &rule.tags,
+            );
+            if rule.source_content_sha256 != expected_content_sha256 {
+                bail!(
+                    "rule transfer bundle item {} has a content hash mismatch",
+                    rule.source_rule_id
+                );
+            }
+            if rule.archived {
+                bail!(
+                    "rule transfer bundle contains archived rule {} from {}",
+                    rule.source_rule_id,
+                    rule_source_board
+                );
+            }
+        }
+
+        let mut seen_sources = HashSet::new();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut imported_rules = 0usize;
+        let mut already_imported_rules = 0usize;
+        for rule in rules {
+            let rule_source_board = rule
+                .source_board
+                .clone()
+                .context("rule transfer bundle item is missing sourceBoard")?;
+            let source_key = (
+                rule.source_registry_uuid.clone(),
+                rule.source_rule_id.clone(),
+            );
+            if !seen_sources.insert(source_key.clone()) {
+                bail!(
+                    "rule transfer bundle contains duplicate source rule {} from registry {}",
+                    rule.source_rule_id,
+                    rule.source_registry_uuid
+                );
+            }
+            if !verified_names.contains(&rule_source_board) {
+                bail!(
+                    "cannot import rule {} from {}: it is not registered in the destination registry",
+                    rule.source_rule_id,
+                    rule_source_board
+                );
+            }
+            let existing = transaction
+                .query_row(
+                    "SELECT id,body,author,archived,created_at,updated_at,tags,source_board,source_boards,source_content_sha256,source_registry_uuid FROM rules WHERE source_registry_uuid=? AND source_rule_id=?",
+                    params![rule.source_registry_uuid, rule.source_rule_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)? != 0,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<String>>(9)?,
+                            row.get::<_, Option<String>>(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((
+                existing_id,
+                body,
+                author,
+                archived,
+                created_at,
+                updated_at,
+                tags,
+                stored_source_board,
+                stored_source_boards,
+                stored_source_content_sha256,
+                stored_source_registry_uuid,
+            )) = existing
+            {
+                if body != rule.body
+                    || author != rule.author
+                    || archived != rule.archived
+                    || created_at != rule.created_at
+                    || updated_at != rule.updated_at
+                    || serde_json::from_str::<Vec<String>>(&tags)? != rule.tags
+                    || stored_source_board.as_deref() != Some(rule_source_board.as_str())
+                    || stored_source_registry_uuid.as_deref()
+                        != Some(rule.source_registry_uuid.as_str())
+                    || stored_source_content_sha256.as_deref()
+                        != Some(rule.source_content_sha256.as_str())
+                    || stored_source_boards
+                        .map(|encoded| parse_json_string_array(&encoded))
+                        .transpose()?
+                        .unwrap_or_default()
+                        != rule.source_boards
+                {
+                    bail!(
+                        "destination already has source rule {} from registry {} with different content",
+                        rule.source_rule_id,
+                        rule.source_registry_uuid
+                    );
+                }
+                let existing_ledger = transaction
+                    .query_row(
+                        "SELECT destination_rule_id,source_content_sha256 FROM rule_import_ledger WHERE source_registry_uuid=? AND source_rule_id=?",
+                        params![rule.source_registry_uuid, rule.source_rule_id],
+                        |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        },
+                    )
+                    .optional()?;
+                if let Some((destination_rule_id, source_content_sha256)) = existing_ledger {
+                    if destination_rule_id != existing_id
+                        || source_content_sha256 != rule.source_content_sha256
+                    {
+                        bail!(
+                            "destination already has source rule {} from registry {} with different ledger content",
+                            rule.source_rule_id,
+                            rule.source_registry_uuid
+                        );
+                    }
+                } else {
+                    transaction.execute(
+                        "INSERT INTO rule_import_ledger(source_registry_uuid,source_rule_id,source_content_sha256,destination_rule_id,imported_at,imported_by) VALUES(?,?,?,?,?,?)",
+                        params![
+                            rule.source_registry_uuid,
+                            rule.source_rule_id,
+                            rule.source_content_sha256,
+                            existing_id,
+                            now_ms(),
+                            &actor,
+                        ],
+                    )?;
+                }
+                already_imported_rules += 1;
+                continue;
+            }
+
+            let mut id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            while transaction
+                .query_row("SELECT 1 FROM rules WHERE id=?", [&id], |_| Ok(()))
+                .optional()?
+                .is_some()
+            {
+                id = format!("r-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            }
+            transaction.execute(
+                "INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags,source_board,source_rule_id,source_registry_uuid,source_boards,source_content_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    rule.body,
+                    rule.author,
+                    rule.archived,
+                    rule.created_at,
+                    rule.updated_at,
+                    serde_json::to_string(&rule.tags)?,
+                    rule_source_board,
+                    rule.source_rule_id,
+                    rule.source_registry_uuid,
+                    serde_json::to_string(&rule.source_boards)?,
+                    rule.source_content_sha256,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO rule_import_ledger(source_registry_uuid,source_rule_id,source_content_sha256,destination_rule_id,imported_at,imported_by) VALUES(?,?,?,?,?,?)",
+                params![
+                    rule.source_registry_uuid,
+                    rule.source_rule_id,
+                    rule.source_content_sha256,
+                    id,
+                    now_ms(),
+                    &actor,
+                ],
+            )?;
+            crate::audit::append_registry_event(
+                &transaction,
+                &id,
+                "rule_imported",
+                &actor,
+                &json!({
+                    "ruleID": id,
+                    "sourceBoard": source_key.0,
+                    "sourceRuleID": source_key.1,
+                    "sourceRegistryUUID": rule.source_registry_uuid,
+                    "sourceContentSHA256": rule.source_content_sha256,
+                    "sourceBoards": rule.source_boards,
+                    "sourceRegistryAuditHead": source_registry_audit_head,
+                    "exportedBy": exported_by.clone(),
+                    "exportedAt": exported_at,
+                    "tags": rule.tags,
+                })
+                .to_string(),
+                now_ms(),
+            )?;
+            imported_rules += 1;
+        }
+        transaction.commit()?;
+
+        Ok(RuleTransferReport {
+            imported_rules,
+            already_imported_rules,
+            destination_boards_verified: verified_boards.len(),
+            source_registry_uuid,
+            source_registry_audit_head,
+        })
     }
 
     pub fn canonical_rule_tags(

@@ -126,6 +126,8 @@ Usage:
              [--board NAME ... | --except-board NAME ...] [--tag NAME ... | --clear-tags]
              --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
+  kanban rule export --board NAME ... --as ACTOR [--output PATH] [--json]
+  kanban rule import PATH --as ACTOR [--json]
   kanban rule consolidate --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--priority P0|P1|P2|0-9]
@@ -805,6 +807,14 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("rule", Some("retire"), &["as"], &["id"], false),
+    (
+        "rule",
+        Some("export"),
+        &["as", "board", "output"],
+        &[],
+        false,
+    ),
+    ("rule", Some("import"), &["as"], &["path"], false),
     ("rule", Some("consolidate"), &["as"], &[], false),
     (
         "attention",
@@ -3167,6 +3177,32 @@ pub fn codex_app_server_adapter_entrypoint() -> ! {
     }
 }
 
+fn read_transfer_bundle(path: &Path) -> Result<Vec<u8>> {
+    const MAX_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read rule transfer bundle {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("rule transfer bundle must be a regular file");
+    }
+    if metadata.len() > MAX_BUNDLE_BYTES {
+        bail!(
+            "rule transfer bundle is too large: {} bytes",
+            metadata.len()
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open rule transfer bundle {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        bail!("rule transfer bundle changed while reading");
+    }
+    Ok(bytes)
+}
+
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
     if args.has("version") {
@@ -3717,6 +3753,42 @@ fn run() -> Result<()> {
     }
     if command == "restore" {
         return restore(&args);
+    }
+
+    if command == "rule" && sub == Some("export") {
+        let boards = args.many("board");
+        if boards.is_empty() {
+            bail!("rule export requires at least one --board");
+        }
+        let bundle = Registry::open_readonly()?.export_rules(args.require("as")?, &boards)?;
+        if let Some(output) = args.one("output") {
+            let source_boards = bundle.source_boards.clone();
+            let rules_exported = bundle.rules.len();
+            let source_registry_audit_head = bundle.source_registry_audit.head.clone();
+            fs::write(output, serde_json::to_vec_pretty(&bundle)?)?;
+            return print(
+                &json!({
+                    "written": output,
+                    "sourceBoards": source_boards,
+                    "rulesExported": rules_exported,
+                    "sourceRegistryAuditHead": source_registry_audit_head,
+                }),
+                args.has("json"),
+            );
+        }
+        return print(&bundle, args.has("json"));
+    }
+
+    if command == "rule" && sub == Some("import") {
+        let path = rest
+            .first()
+            .context("rule transfer bundle path is required")?;
+        let bundle: crate::model::RuleTransferBundle =
+            serde_json::from_slice(&read_transfer_bundle(Path::new(path))?)?;
+        return print(
+            &Registry::open()?.import_rules(args.require("as")?, bundle)?,
+            args.has("json"),
+        );
     }
 
     if command == "rule" && sub == Some("consolidate") {

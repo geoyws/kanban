@@ -849,6 +849,9 @@ fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
         tags: parse_strings(row.get("task_tags")?),
         source_board: None,
         source_rule_id: None,
+        source_registry_uuid: None,
+        source_boards: None,
+        source_content_sha256: None,
     })
 }
 

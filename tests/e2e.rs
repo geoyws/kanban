@@ -3,6 +3,7 @@ use headless_chrome::{Browser, LaunchOptionsBuilder};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -19,6 +20,7 @@ use syn::{
     punctuated::Punctuated,
     visit::{self, Visit},
 };
+use uuid::Uuid;
 
 const MAX_CFG_ATOMS: usize = 12;
 
@@ -1847,8 +1849,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 11);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 11);
+    assert_eq!(doctor["registrySchemaVersion"], 12);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 12);
     assert_eq!(doctor["supportedBoardSchemaVersion"], 23);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 23);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 23);
@@ -5598,7 +5600,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 11"),
+        version.contains("registry schema 12"),
         "version output: {version}"
     );
 }
@@ -11265,6 +11267,288 @@ fn copy_executable(source: &Path, target: &Path) {
     fs::copy(source, &staging).unwrap();
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
     fs::rename(&staging, target).unwrap();
+}
+
+fn file_sha256(path: &Path) -> String {
+    let mut file = fs::File::open(path).unwrap();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn clone_release_package(source: &Path, target: &Path, source_commit: &str) {
+    fs::create_dir_all(target).unwrap();
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        fs::copy(source.join(name), target.join(name)).unwrap();
+    }
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(source.join("manifest.json")).unwrap()).unwrap();
+    manifest["sourceCommit"] = json!(source_commit);
+    fs::write(
+        target.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut receipt: Value =
+        serde_json::from_slice(&fs::read(source.with_extension("receipt.json")).unwrap()).unwrap();
+    receipt["sourceCommit"] = json!(source_commit);
+    receipt["manifestSha256"] = json!(file_sha256(&target.join("manifest.json")));
+    fs::write(
+        target.with_extension("receipt.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+struct HaxInstallContext<'a> {
+    fixture: &'a Fixture,
+    script: &'a Path,
+    path: &'a str,
+    hostname_bin: &'a Path,
+    fake_repo_root: &'a Path,
+    remote_root: &'a Path,
+}
+
+fn install_matching_hax_package(
+    ctx: &HaxInstallContext<'_>,
+    package_dir: &Path,
+    commit: &str,
+    label: &str,
+) -> PathBuf {
+    let hax_install_root = ctx.fixture.root.join(format!("{label}-install-hax"));
+    let hax_bin_dir = ctx.fixture.root.join(format!("{label}-bin-hax"));
+    let installed = Command::new("bash")
+        .current_dir(&ctx.fixture.main)
+        .env("PATH", ctx.path)
+        .env("HOSTNAME_BIN", ctx.hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", ctx.fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit)
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", ctx.remote_root)
+        .arg(ctx.script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            package_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "HAX install for {label} failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(
+        PathBuf::from(installed_json["installRoot"].as_str().unwrap()),
+        hax_install_root
+    );
+    hax_install_root
+}
+
+fn release_id_from_package(package_dir: &Path) -> String {
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(package_dir.with_extension("receipt.json")).unwrap())
+            .unwrap();
+    format!(
+        "{}-{}",
+        receipt["sourceCommit"].as_str().unwrap(),
+        receipt["manifestSha256"].as_str().unwrap()
+    )
+}
+
+fn capture_release_links(install_root: &Path, bin_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut links = BTreeMap::new();
+    links.insert(
+        "current".to_string(),
+        fs::read_link(install_root.join("current")).unwrap(),
+    );
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        links.insert(name.to_string(), fs::read_link(bin_dir.join(name)).unwrap());
+    }
+    links
+}
+
+fn assert_release_view(install_root: &Path, bin_dir: &Path, release_dir: &Path) {
+    let current_link = install_root.join("current");
+    assert!(current_link.is_symlink(), "current symlink missing");
+    assert_eq!(fs::read_link(&current_link).unwrap(), release_dir);
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        let symlink = bin_dir.join(name);
+        assert!(symlink.is_symlink(), "missing bin symlink {name}");
+        assert_eq!(fs::read_link(&symlink).unwrap(), current_link.join(name));
+    }
+}
+
+fn write_release_tool_stubs(
+    fixture: &Fixture,
+    fake_repo_root: &Path,
+    fake_git_head: &str,
+    fake_release_binary: &str,
+    fake_host: &str,
+) -> PathBuf {
+    let stubs = fixture.root.join("release-stubs");
+    fs::create_dir_all(&stubs).unwrap();
+    write_executable(
+        &stubs.join("hostname"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "${FAKE_HOST:?}"
+"#,
+    );
+    write_executable(
+        &stubs.join("git"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "-C" ]; then
+  shift 2
+fi
+case "${1:-}" in
+  status)
+    exit 0
+    ;;
+  rev-parse)
+    case "${2:-}" in
+      --show-toplevel)
+        printf '%s\n' "${FAKE_REPO_ROOT:?}"
+        ;;
+      HEAD)
+        printf '%s\n' "${FAKE_GIT_HEAD:?}"
+        ;;
+      *)
+        printf 'unexpected git rev-parse %s\n' "$*" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected git %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_executable(
+        &stubs.join("cargo"),
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  build)
+    ;;
+  *)
+    printf 'unexpected cargo %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+target_root="${CARGO_TARGET_DIR:?}/release"
+mkdir -p "$target_root"
+for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+  cp "${FAKE_RELEASE_BINARY:?}" "$target_root/$binary"
+chmod 0755 "$target_root/$binary"
+done
+"#,
+    );
+    write_executable(
+        &stubs.join("date"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_RELEASE_DATE_SECONDS:-}" ]; then
+  printf '%s\n' "$FAKE_RELEASE_DATE_SECONDS"
+  exit 0
+fi
+command -p date "$@"
+"#,
+    );
+    write_executable(
+        &stubs.join("install"),
+        r#"#!/bin/sh
+set -eu
+mode=0755
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m)
+      mode="$2"
+      shift 2
+      ;;
+    -*)
+      printf 'unexpected install flag %s\n' "$1" >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+src="$1"
+dest="$2"
+mkdir -p "$(dirname "$dest")"
+cp "$src" "$dest"
+chmod "$mode" "$dest"
+"#,
+    );
+    write_executable(
+        &stubs.join("ssh"),
+        r#"#!/bin/sh
+set -eu
+host="$1"
+shift
+case "${1:-}" in
+  hostname)
+    printf '%s\n' "$host"
+    ;;
+  mktemp\ -d*)
+    mktemp -d "${FAKE_REMOTE_ROOT:?}/$host.XXXXXX"
+    ;;
+  bash)
+    shift 3
+    FAKE_HOST="$host" bash -s -- "$@"
+    ;;
+  *)
+    FAKE_HOST="$host" bash -lc "$*"
+    ;;
+esac
+"#,
+    );
+    let _ = (
+        fake_repo_root,
+        fake_git_head,
+        fake_release_binary,
+        fake_host,
+    );
+    stubs
 }
 
 #[test]
@@ -17117,7 +17401,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
 }
 
@@ -17176,7 +17460,7 @@ fn registry_v10_migration_records_discarded_alias_names() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let (kind, actor, payload): (String, String, String) = registry
         .query_row(
@@ -17846,6 +18130,1793 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "accepted {args:?}"
         );
     }
+}
+
+#[test]
+fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source() {
+    let source = Fixture::new("rule-transfer-source");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "alpha", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "beta", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--tag",
+            "alpha",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source_second,
+        &[
+            "rule",
+            "add",
+            "Beta source rule.",
+            "--board",
+            "BETA",
+            "--tag",
+            "beta",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let source_before =
+        source.ok_json(&source.main, &["rule", "list", "--all", "--full", "--json"]);
+    let bundle_path = source.root.join("rule-transfer.json");
+    let export = source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(export["written"], json!(bundle_path.to_str().unwrap()));
+    assert_eq!(export["sourceBoards"], json!(["ALPHA", "BETA"]));
+    assert_eq!(export["rulesExported"], 2);
+
+    let bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    assert_eq!(bundle["formatVersion"], 1);
+    assert_eq!(bundle["exportedBy"], "geo");
+    assert_eq!(bundle["sourceBoards"], json!(["ALPHA", "BETA"]));
+    assert_eq!(bundle["rules"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        source.ok_json(&source.main, &["rule", "list", "--all", "--full", "--json"]),
+        source_before,
+        "export mutated the source registry"
+    );
+
+    let destination = Fixture::new("rule-transfer-destination");
+    let destination_second = destination.root.join("second");
+    fs::create_dir_all(&destination_second).unwrap();
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    destination.ok_json(&destination_second, &["init", "--name", "BETA", "--json"]);
+
+    let imported = destination.ok_json(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(imported["importedRules"], 2);
+    assert_eq!(imported["alreadyImportedRules"], 0);
+    assert_eq!(imported["destinationBoardsVerified"], 2);
+
+    let imported_rules = destination.ok_json(
+        &destination.main,
+        &["rule", "list", "--all", "--full", "--json"],
+    );
+    let mut imported_by_source = BTreeMap::new();
+    for rule in imported_rules.as_array().unwrap() {
+        imported_by_source.insert(
+            (
+                rule["sourceBoard"].as_str().unwrap().to_owned(),
+                rule["sourceRuleId"].as_str().unwrap().to_owned(),
+            ),
+            rule.clone(),
+        );
+    }
+    for rule in bundle["rules"].as_array().unwrap() {
+        let source_board = rule["sourceBoard"].as_str().unwrap().to_owned();
+        let source_rule_id = rule["sourceRuleId"].as_str().unwrap().to_owned();
+        let imported_rule = imported_by_source
+            .get(&(source_board.clone(), source_rule_id.clone()))
+            .unwrap_or_else(|| panic!("missing imported rule {source_board}/{source_rule_id}"));
+        assert_ne!(imported_rule["id"], rule["sourceRuleId"]);
+        assert_eq!(imported_rule["body"], rule["body"]);
+        assert_eq!(imported_rule["author"], rule["author"]);
+        assert_eq!(imported_rule["tags"], rule["tags"]);
+        assert_eq!(imported_rule["sourceBoard"], rule["sourceBoard"]);
+        assert_eq!(imported_rule["sourceRuleId"], rule["sourceRuleId"]);
+    }
+
+    let imported_again = destination.ok_json(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(imported_again["importedRules"], 0);
+    assert_eq!(imported_again["alreadyImportedRules"], 2);
+    assert_eq!(
+        destination.ok_json(
+            &destination.main,
+            &["rule", "list", "--all", "--full", "--json"],
+        ),
+        imported_rules,
+        "import was not idempotent"
+    );
+}
+
+#[test]
+fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_differs() {
+    let source = Fixture::new("rule-transfer-source-tamper");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "alpha", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "beta", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--tag",
+            "alpha",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source_second,
+        &[
+            "rule",
+            "add",
+            "Beta source rule.",
+            "--board",
+            "BETA",
+            "--tag",
+            "beta",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let bundle_path = source.root.join("rule-transfer.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let mut bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    bundle["rules"][0]["sourceRegistryUuid"] = json!(Uuid::new_v4().to_string());
+    fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+    let destination = Fixture::new("rule-transfer-destination-tamper");
+    let destination_second = destination.root.join("second");
+    fs::create_dir_all(&destination_second).unwrap();
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    destination.ok_json(&destination_second, &["init", "--name", "BETA", "--json"]);
+
+    let failed = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !failed.status.success(),
+        "tampered bundle unexpectedly imported"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+    assert!(
+        stderr.contains("claims source registry") || stderr.contains("sourceRegistryUuid"),
+        "{stderr}"
+    );
+    assert!(
+        destination
+            .ok_json(
+                &destination.main,
+                &["rule", "list", "--all", "--full", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused import mutated the destination registry"
+    );
+    let registry = Connection::open(destination.data.join("registry.db")).unwrap();
+    let rule_count: i64 = registry
+        .query_row("SELECT count(*) FROM rules", [], |row| row.get(0))
+        .unwrap();
+    let ledger_count: i64 = registry
+        .query_row("SELECT count(*) FROM rule_import_ledger", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rule_count, 0, "a refused import wrote destination rules");
+    assert_eq!(ledger_count, 0, "a refused import left ledger residue");
+}
+
+#[test]
+fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board() {
+    let source = Fixture::new("rule-transfer-missing-destination");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source_second,
+        &[
+            "rule",
+            "add",
+            "Beta source rule.",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let bundle_path = source.root.join("rule-transfer.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    let destination = Fixture::new("rule-transfer-missing-destination-target");
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    let failed = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !failed.status.success(),
+        "import without BETA unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+    assert!(
+        stderr.contains("not registered in this registry"),
+        "{stderr}"
+    );
+    assert!(
+        destination
+            .ok_json(
+                &destination.main,
+                &["rule", "list", "--all", "--full", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused import mutated the destination registry"
+    );
+}
+
+#[test]
+fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() {
+    let fixture = Fixture::new("rule-export-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ALPHA", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let duplicate_bundle = fixture.root.join("duplicate-bundle.json");
+
+    let duplicate = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--output",
+            duplicate_bundle.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("given more than once"),
+        "{:?}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+
+    let missing_bundle = fixture.root.join("missing-bundle.json");
+    let missing = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "MISSING",
+            "--as",
+            "geo",
+            "--output",
+            missing_bundle.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("not registered in this registry"),
+        "{:?}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
+    let fixture = Fixture::new("hig-release");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let broken_install_root = fixture.root.join("broken-install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "package failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let manifest_path = output_dir.join("manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["formatVersion"], 1);
+    assert_eq!(manifest["targets"], json!(["hax", "hig"]));
+    assert_eq!(
+        manifest["sourceCommit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(manifest["sourceTreeClean"], true);
+    assert_eq!(
+        manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "kanban",
+            "kb",
+            "kanban-dispatcher",
+            "kanban-codex-queue-adapter",
+            "kanban-codex-app-server-adapter",
+        ]
+    );
+    let receipt_path = output_dir.with_extension("receipt.json");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["host"], "hax");
+    assert_eq!(receipt["targets"], json!(["hax", "hig"]));
+    assert_eq!(
+        receipt["manifestSha256"],
+        json!(file_sha256(&manifest_path))
+    );
+    assert_eq!(
+        receipt["sourceCommit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        assert!(
+            output_dir.join(name).is_file(),
+            "missing package binary {name}"
+        );
+    }
+
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "HAX install failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&hax_installed.stdout),
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let hax_installed_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+    let hax_release_dir = PathBuf::from(hax_installed_json["releaseDir"].as_str().unwrap());
+    assert!(hax_release_dir.is_dir(), "HAX release dir missing");
+    assert!(
+        hax_release_dir.join("manifest.json").is_file(),
+        "HAX release manifest missing"
+    );
+    let hax_release_receipt = PathBuf::from(hax_installed_json["receipt"].as_str().unwrap());
+    let hax_release_receipt_json: Value =
+        serde_json::from_slice(&fs::read(&hax_release_receipt).unwrap()).unwrap();
+    assert_eq!(
+        hax_release_receipt_json["releaseDir"],
+        json!(hax_release_dir.to_str().unwrap())
+    );
+    assert_eq!(hax_release_receipt_json["target"], "hax");
+    assert_eq!(hax_release_receipt_json["targets"], json!(["hax", "hig"]));
+    assert_eq!(
+        hax_release_receipt_json["manifestSha256"],
+        json!(file_sha256(&manifest_path))
+    );
+    let hax_release_receipt_bytes = fs::read(&hax_release_receipt).unwrap();
+    let hax_installed_again = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed_again.status.success(),
+        "HAX reinstall failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&hax_installed_again.stdout),
+        String::from_utf8_lossy(&hax_installed_again.stderr)
+    );
+    assert_eq!(
+        fs::read(&hax_release_receipt).unwrap(),
+        hax_release_receipt_bytes,
+        "HAX receipt bytes changed on reactivation"
+    );
+    assert_release_view(&hax_install_root, &hax_bin_dir, &hax_release_dir);
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+        "manifest.json",
+    ] {
+        assert!(
+            hax_release_dir.join(name).exists(),
+            "missing HAX installed file {name}"
+        );
+    }
+
+    let installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "HIG install failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
+        "HIG install wrote unexpected stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    let release_dir = PathBuf::from(installed_json["releaseDir"].as_str().unwrap());
+    assert!(release_dir.is_dir(), "release dir missing");
+    assert!(
+        release_dir.join("manifest.json").is_file(),
+        "release manifest missing"
+    );
+    let release_receipt = PathBuf::from(installed_json["receipt"].as_str().unwrap());
+    let release_receipt_json: Value =
+        serde_json::from_slice(&fs::read(&release_receipt).unwrap()).unwrap();
+    assert_eq!(
+        release_receipt_json["releaseDir"],
+        json!(release_dir.to_str().unwrap())
+    );
+    assert_eq!(release_receipt_json["target"], "hig");
+    assert_eq!(
+        release_receipt_json["manifestSha256"],
+        hax_release_receipt_json["manifestSha256"]
+    );
+    assert_release_view(&install_root, &bin_dir, &release_dir);
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+        "manifest.json",
+    ] {
+        assert!(
+            release_dir.join(name).exists(),
+            "missing installed file {name}"
+        );
+    }
+
+    let installed_again = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed_again.status.success(),
+        "idempotent install failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed_again.stdout),
+        String::from_utf8_lossy(&installed_again.stderr)
+    );
+
+    let partial_package = fixture.root.join("partial-package");
+    fs::create_dir_all(&partial_package).unwrap();
+    for entry in fs::read_dir(&output_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("kb") {
+            continue;
+        }
+        fs::copy(&path, partial_package.join(path.file_name().unwrap())).unwrap();
+    }
+    fs::copy(
+        &receipt_path,
+        partial_package.with_extension("receipt.json"),
+    )
+    .unwrap();
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            partial_package.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            broken_install_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "partial package activated successfully"
+    );
+    assert!(
+        !broken_install_root.exists(),
+        "partial package left an activated install root behind"
+    );
+}
+
+#[test]
+fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_current() {
+    let fixture = Fixture::new("hig-release-reactivation-failure");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+
+    let installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
+        "HIG install wrote unexpected stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    let release_dir = PathBuf::from(installed_json["releaseDir"].as_str().unwrap());
+    let release_receipt = PathBuf::from(installed_json["receipt"].as_str().unwrap());
+    let release_receipt_bytes = fs::read(&release_receipt).unwrap();
+    let stable_links = capture_release_links(&install_root, &bin_dir);
+
+    let failed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("HIG_RELEASE_FAIL_AFTER_CURRENT", "1")
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !failed.status.success(),
+        "reactivation failure unexpectedly succeeded"
+    );
+    assert_eq!(
+        capture_release_links(&install_root, &bin_dir),
+        stable_links,
+        "reactivation failure changed the public release view"
+    );
+    assert!(
+        release_dir.is_dir(),
+        "reactivation failure removed the release tree"
+    );
+    assert_eq!(
+        fs::read(&release_receipt).unwrap(),
+        release_receipt_bytes,
+        "reactivation failure rewrote the release receipt"
+    );
+    let receipt_count = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(
+        receipt_count, 1,
+        "reactivation failure left receipt residue"
+    );
+}
+
+#[test]
+fn hig_release_script_usage_refuses_missing_and_unknown_commands_with_exit_64() {
+    let fixture = Fixture::new("hig-release-usage");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+
+    for args in [Vec::<&str>::new(), vec!["bogus", "hax"]] {
+        let output = Command::new("bash")
+            .current_dir(&fixture.main)
+            .arg(&script)
+            .args(args.iter().copied())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "unexpected exit code for {:?}",
+            args
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("usage:"), "{stderr}");
+        assert!(
+            stderr.contains("hig-release.sh package hax [--output DIR]"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("package <hax|hig>"),
+            "stale usage text leaked into stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn hig_release_script_rejects_package_target_hig() {
+    let fixture = Fixture::new("hig-release-package-hig");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hig", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !packaged.status.success(),
+        "package hig unexpectedly succeeded"
+    );
+    assert_eq!(packaged.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&packaged.stderr).contains("package target must be hax"),
+        "stderr: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_rejects_hig_install_without_hax_install_root() {
+    let fixture = Fixture::new("hig-release-hig-before-hax");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "HIG install without hax install root succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("--hax-install-root is required for hig installs"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_rejects_the_build_provenance_receipt_for_hig_install() {
+    let fixture = Fixture::new("hig-release-build-receipt");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let build_receipt = output_dir.with_extension("receipt.json");
+    let fake_hax_install_root = fixture.root.join("fake-hax-install");
+    let fake_release_dir = fake_hax_install_root
+        .join("releases")
+        .join(release_id_from_package(&output_dir));
+    fs::create_dir_all(&fake_release_dir).unwrap();
+    for entry in fs::read_dir(&output_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        fs::copy(&path, fake_release_dir.join(path.file_name().unwrap())).unwrap();
+    }
+    fs::copy(
+        &build_receipt,
+        fake_release_dir.with_extension("receipt.json"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&fake_release_dir, fake_hax_install_root.join("current")).unwrap();
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            fake_hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "build provenance receipt unexpectedly authorized HIG install"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("hax activation receipt is incomplete or mismatched")
+            || String::from_utf8_lossy(&refused.stderr)
+                .contains("hax activation receipt is missing"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_rejects_a_mismatched_hax_install_receipt() {
+    let fixture = Fixture::new("hig-release-hax-receipt-mismatch");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let hax_install_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+    let hax_receipt_path = PathBuf::from(hax_install_json["receipt"].as_str().unwrap());
+    let mut forged: Value = serde_json::from_slice(&fs::read(&hax_receipt_path).unwrap()).unwrap();
+    forged["releaseId"] = json!("mismatched-release-id");
+    fs::write(
+        &hax_receipt_path,
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "mismatched hax receipt unexpectedly authorized HIG install"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("hax activation receipt is incomplete or mismatched"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
+    let fixture = Fixture::new("hig-release-rollback");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef00000000",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let release_second = "1700000000";
+    let commit = |index: usize| format!("0123456789abcdef0123456789abcdef{:08x}", index);
+    let hax_ctx = HaxInstallContext {
+        fixture: &fixture,
+        script: &script,
+        path: &path,
+        hostname_bin: &hostname_bin,
+        fake_repo_root: &fake_repo_root,
+        remote_root: &remote_root,
+    };
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let mut release_dirs = Vec::new();
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let _hax_install_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+
+    for index in 0..5 {
+        let package_dir = if index == 0 {
+            output_dir.clone()
+        } else {
+            let cloned = fixture.root.join(format!("package-{index:02}"));
+            clone_release_package(&output_dir, &cloned, &commit(index));
+            cloned
+        };
+        let hax_install_root = if index == 0 {
+            hax_install_root.clone()
+        } else {
+            install_matching_hax_package(
+                &hax_ctx,
+                &package_dir,
+                &commit(index),
+                &format!("rollback-hax-{index:02}"),
+            )
+        };
+        let installed = Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", commit(index))
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+            .arg(&script)
+            .args([
+                "install",
+                "hig",
+                "--package",
+                package_dir.to_str().unwrap(),
+                "--hax-install-root",
+                hax_install_root.to_str().unwrap(),
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "install {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        release_dirs.push(PathBuf::from(
+            installed_json["releaseDir"].as_str().unwrap(),
+        ));
+    }
+
+    let failed_package = fixture.root.join("package-failed");
+    clone_release_package(&output_dir, &failed_package, &commit(99));
+    let failed_hax_install_root = install_matching_hax_package(
+        &hax_ctx,
+        &failed_package,
+        &commit(99),
+        "rollback-hax-failed",
+    );
+    let stable_links = capture_release_links(&install_root, &bin_dir);
+    let failed_release_dir = install_root.join(format!(
+        "releases/{}",
+        release_id_from_package(&failed_package)
+    ));
+    let failed_install = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(99))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .env("HIG_RELEASE_FAIL_AFTER_CURRENT", "1")
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            failed_package.to_str().unwrap(),
+            "--hax-install-root",
+            failed_hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !failed_install.status.success(),
+        "failed activation unexpectedly succeeded"
+    );
+    assert_eq!(
+        capture_release_links(&install_root, &bin_dir),
+        stable_links,
+        "failed activation changed the public release view"
+    );
+    assert!(
+        !failed_release_dir.exists(),
+        "failed release directory was retained"
+    );
+    assert!(
+        !failed_release_dir.with_extension("receipt.json").exists(),
+        "failed release receipt was retained"
+    );
+    let release_receipts_after_failure = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(
+        release_receipts_after_failure, 5,
+        "failed release counted toward retention"
+    );
+
+    for index in 5..11 {
+        let cloned = fixture.root.join(format!("package-{index:02}"));
+        clone_release_package(&output_dir, &cloned, &commit(index));
+        let hax_install_root = install_matching_hax_package(
+            &hax_ctx,
+            &cloned,
+            &commit(index),
+            &format!("rollback-hax-{index:02}"),
+        );
+        let installed = Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", commit(index))
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+            .arg(&script)
+            .args([
+                "install",
+                "hig",
+                "--package",
+                cloned.to_str().unwrap(),
+                "--hax-install-root",
+                hax_install_root.to_str().unwrap(),
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "install {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        release_dirs.push(PathBuf::from(
+            installed_json["releaseDir"].as_str().unwrap(),
+        ));
+    }
+
+    let release_receipts = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(
+        release_receipts, 10,
+        "retention did not stop at ten releases"
+    );
+
+    let rollback = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(10))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .arg(&script)
+        .args([
+            "rollback",
+            "hig",
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+            "--steps",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rollback.status.success(),
+        "rollback failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&rollback.stdout),
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    let rollback_json: Value = serde_json::from_slice(&rollback.stdout).unwrap();
+    assert_eq!(
+        PathBuf::from(rollback_json["releaseDir"].as_str().unwrap()),
+        release_dirs[9]
+    );
+    let current_link = install_root.join("current");
+    assert_eq!(fs::read_link(&current_link).unwrap(), release_dirs[9]);
+    assert_release_view(&install_root, &bin_dir, &release_dirs[9]);
+}
+
+#[test]
+fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover() {
+    let fixture = Fixture::new("hig-release-rollback-fail");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef11111111",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let commit = |index: usize| format!("0123456789abcdef0123456789abcdef{:08x}", index);
+    let hax_ctx = HaxInstallContext {
+        fixture: &fixture,
+        script: &script,
+        path: &path,
+        hostname_bin: &hostname_bin,
+        fake_repo_root: &fake_repo_root,
+        remote_root: &remote_root,
+    };
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let mut release_dirs = Vec::new();
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let _hax_install_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+
+    for index in 1..3 {
+        let package_dir = if index == 0 {
+            output_dir.clone()
+        } else {
+            let cloned = fixture.root.join(format!("rollback-package-{index:02}"));
+            clone_release_package(&output_dir, &cloned, &commit(index));
+            cloned
+        };
+        let hax_install_root = if index == 0 {
+            hax_install_root.clone()
+        } else {
+            install_matching_hax_package(
+                &hax_ctx,
+                &package_dir,
+                &commit(index),
+                &format!("rollback-fail-hax-{index:02}"),
+            )
+        };
+        let installed = Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", commit(index))
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .arg(&script)
+            .args([
+                "install",
+                "hig",
+                "--package",
+                package_dir.to_str().unwrap(),
+                "--hax-install-root",
+                hax_install_root.to_str().unwrap(),
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "install {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        release_dirs.push(PathBuf::from(
+            installed_json["releaseDir"].as_str().unwrap(),
+        ));
+    }
+
+    let stable_links = capture_release_links(&install_root, &bin_dir);
+    let failed_rollback = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(1))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("HIG_RELEASE_FAIL_AFTER_CURRENT", "1")
+        .arg(&script)
+        .args([
+            "rollback",
+            "hig",
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+            "--steps",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !failed_rollback.status.success(),
+        "injected rollback failure unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&failed_rollback.stdout),
+        String::from_utf8_lossy(&failed_rollback.stderr)
+    );
+    assert_eq!(
+        capture_release_links(&install_root, &bin_dir),
+        stable_links,
+        "rollback failure changed the public release view"
+    );
+    assert_eq!(
+        fs::read_link(install_root.join("current")).unwrap(),
+        release_dirs[1],
+        "rollback failure changed current\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&failed_rollback.stdout),
+        String::from_utf8_lossy(&failed_rollback.stderr)
+    );
+    let release_receipts = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(release_receipts, 2, "rollback failure altered retention");
 }
 
 #[test]

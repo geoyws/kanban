@@ -1530,8 +1530,12 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
+const REGISTRY_V12: &str = r#"
+SELECT 1;
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 23;
-pub const REGISTRY_SCHEMA_VERSION: usize = 11;
+pub const REGISTRY_SCHEMA_VERSION: usize = 12;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -1958,12 +1962,193 @@ pub fn read_snapshot<S: SnapshotSource, T>(
     Ok(value)
 }
 
+fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn sqlite_table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
+    let sql = match table {
+        "rules" => "SELECT name FROM pragma_table_info('rules')",
+        "rule_events" => "SELECT name FROM pragma_table_info('rule_events')",
+        "global_rules" => "SELECT name FROM pragma_table_info('global_rules')",
+        "global_rule_events" => "SELECT name FROM pragma_table_info('global_rule_events')",
+        other => bail!("unsupported table for column inspection: {other}"),
+    };
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .context("collect table columns")
+}
+
+fn ensure_registry_v12_rules(connection: &Connection) -> Result<()> {
+    let rules_exists = sqlite_table_exists(connection, "rules")?;
+    let global_rules_exists = sqlite_table_exists(connection, "global_rules")?;
+    let rule_events_exists = sqlite_table_exists(connection, "rule_events")?;
+    let global_rule_events_exists = sqlite_table_exists(connection, "global_rule_events")?;
+
+    if !rules_exists {
+        connection.execute_batch(
+            r#"
+            CREATE TABLE rules (
+             id TEXT PRIMARY KEY NOT NULL,
+             body TEXT NOT NULL,
+             author TEXT NOT NULL,
+             archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             tags TEXT NOT NULL DEFAULT '["ALL"]'
+              CHECK(json_valid(tags) AND json_type(tags) = 'array'),
+             source_board TEXT,
+             source_rule_id TEXT,
+             source_registry_uuid TEXT,
+             source_boards TEXT NOT NULL DEFAULT '[]'
+              CHECK(json_valid(source_boards) AND json_type(source_boards) = 'array'),
+             source_content_sha256 TEXT,
+             CHECK((source_board IS NULL) = (source_rule_id IS NULL)),
+             UNIQUE(source_board,source_rule_id)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_registry_rules_active ON rules(created_at,id) WHERE archived=0;
+            "#,
+        )?;
+        if global_rules_exists {
+            connection.execute_batch(
+                r#"
+                INSERT INTO rules(id,body,author,archived,created_at,updated_at,tags)
+                SELECT id,body,author,archived,created_at,updated_at,
+                       (SELECT json_group_array(value)
+                          FROM (SELECT value,0 AS family,CAST(key AS INTEGER) AS position
+                                  FROM json_each(global_rules.board_tags)
+                                UNION ALL
+                                SELECT value,1 AS family,CAST(key AS INTEGER) AS position
+                                  FROM json_each(global_rules.task_tags)
+                                ORDER BY family,position))
+                  FROM global_rules;
+                "#,
+            )?;
+        }
+    } else {
+        let columns = sqlite_table_columns(connection, "rules")?;
+        for (column, ddl) in [
+            (
+                "source_registry_uuid",
+                "ALTER TABLE rules ADD COLUMN source_registry_uuid TEXT;",
+            ),
+            (
+                "source_boards",
+                r#"ALTER TABLE rules ADD COLUMN source_boards TEXT NOT NULL DEFAULT '[]'
+ CHECK(json_valid(source_boards) AND json_type(source_boards) = 'array');"#,
+            ),
+            (
+                "source_content_sha256",
+                "ALTER TABLE rules ADD COLUMN source_content_sha256 TEXT;",
+            ),
+        ] {
+            if !columns.iter().any(|name| name == column) {
+                connection.execute_batch(ddl)?;
+            }
+        }
+        connection.execute_batch(
+            r#"
+            UPDATE rules
+            SET source_boards = json_array(source_board)
+            WHERE source_board IS NOT NULL
+              AND (source_boards IS NULL OR source_boards = '[]');
+            "#,
+        )?;
+    }
+
+    if !rule_events_exists && global_rule_events_exists {
+        connection.execute_batch(
+            r#"
+            CREATE TABLE rule_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             actor TEXT NOT NULL,
+             payload TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload)),
+             created_at INTEGER NOT NULL,
+             prev_hash TEXT,
+             event_hash TEXT
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_registry_rule_events_rule_seq ON rule_events(rule_id,seq);
+            INSERT INTO rule_events(rule_id,kind,actor,payload,created_at)
+            SELECT rule_id,kind,actor,payload,created_at FROM global_rule_events ORDER BY seq;
+            "#,
+        )?;
+    }
+
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS rule_import_ledger (
+         source_registry_uuid TEXT NOT NULL,
+         source_rule_id TEXT NOT NULL,
+         source_content_sha256 TEXT NOT NULL,
+         destination_rule_id TEXT NOT NULL,
+         imported_at INTEGER NOT NULL,
+         imported_by TEXT NOT NULL,
+         PRIMARY KEY(source_registry_uuid,source_rule_id)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_rule_import_ledger_destination ON rule_import_ledger(destination_rule_id);
+        "#,
+    )?;
+
+    Ok(())
+}
+
 pub fn open_registry(path: &Path) -> Result<Connection> {
     let mut connection = open(path)?;
     migrate(&mut connection, REGISTRY_MIGRATIONS)?;
+    {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_registry_v12_rules(&transaction)?;
+        transaction.commit()?;
+    }
     crate::audit::initialize_registry_chain(&mut connection)?;
     record_workspace_name_drift(&mut connection)?;
+    ensure_registry_uuid(&mut connection)?;
     Ok(connection)
+}
+
+fn ensure_registry_uuid(connection: &mut Connection) -> Result<()> {
+    let existing = connection
+        .query_row(
+            "SELECT value FROM registry_meta WHERE key='registry_uuid'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(value) = existing {
+        uuid::Uuid::parse_str(value.trim())
+            .with_context(|| format!("invalid registry_uuid metadata: {value}"))?;
+        return Ok(());
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = transaction
+        .query_row(
+            "SELECT value FROM registry_meta WHERE key='registry_uuid'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(value) = existing {
+        uuid::Uuid::parse_str(value.trim())
+            .with_context(|| format!("invalid registry_uuid metadata: {value}"))?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO registry_meta(key,value) VALUES(?,?)",
+        params!["registry_uuid", uuid::Uuid::new_v4().to_string()],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn record_workspace_name_drift(connection: &mut Connection) -> Result<()> {
@@ -2031,6 +2216,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V9,
     REGISTRY_V10,
     REGISTRY_V11,
+    REGISTRY_V12,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
