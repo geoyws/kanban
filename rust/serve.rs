@@ -21,6 +21,12 @@
 //! reply to and resolve an attention item, or open a draft epic. WebSockets
 //! carry revision notices, never ledger content or capabilities; the browser
 //! fetches the canonical server-rendered projection after a notice.
+//!
+//! In opt-in deployments, `--actor-header NAME` threads one trusted edge
+//! header into the audit actor for the write surface. The proxy in front of
+//! Kanban must strip any client-supplied copy and set that header from a
+//! successful auth_request; same-origin still gates the POSTs and the header
+//! does not relax it.
 
 use crate::model::{Attention, DeploymentAttempt, ProjectRecord, SearchOptions, Sitrep, Task};
 use crate::registry::{Registry, now_ms};
@@ -52,6 +58,8 @@ const DETAIL_ROWS: i64 = 50;
 
 /// A browser reply is a decision note, not a document upload.
 const MAX_REPLY_BYTES: usize = 4_096;
+/// The configured actor header is an email-sized audit identity, not a blob.
+const MAX_ACTOR_BYTES: usize = 254;
 const COMMENT_RESOLVE_LABEL: &str = "Comment and Resolve";
 
 enum WebResponse {
@@ -59,8 +67,29 @@ enum WebResponse {
     Redirect(String),
 }
 
+struct ServeConfig {
+    actor_header: Option<String>,
+}
+
+impl ServeConfig {
+    fn new(actor_header: Option<String>) -> Result<Self> {
+        let actor_header = actor_header
+            .map(|value| normalize_actor_header_name(&value).map(str::to_owned))
+            .transpose()?;
+        Ok(Self { actor_header })
+    }
+
+    fn actor_for_write(&self, request: &Request) -> Result<String> {
+        match self.actor_header.as_deref() {
+            None => Ok("geo".to_owned()),
+            Some(name) => configured_actor(request, name),
+        }
+    }
+}
+
 /// Serve until killed. Never returns `Ok`.
-pub fn serve(port: u16) -> Result<()> {
+pub fn serve(port: u16, actor_header: Option<String>) -> Result<()> {
+    let config = ServeConfig::new(actor_header)?;
     let address = format!("127.0.0.1:{port}");
     let server = Server::http(&address)
         .map_err(|error| anyhow::anyhow!("bind {address}: {error}"))
@@ -73,7 +102,7 @@ pub fn serve(port: u16) -> Result<()> {
             thread::spawn(move || websocket(request));
             continue;
         }
-        handle(request);
+        handle(request, &config);
     }
     anyhow::bail!("the listener stopped accepting connections")
 }
@@ -81,9 +110,10 @@ pub fn serve(port: u16) -> Result<()> {
 /// Answer one request, turning an error into a page rather than a dropped
 /// connection: a browser given nothing shows its own error, which tells the
 /// reader nothing about what went wrong here.
-fn handle(mut request: Request) {
-    let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(&mut request)))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("the page renderer panicked")));
+fn handle(mut request: Request, config: &ServeConfig) {
+    let response =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(&mut request, config)))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the page renderer panicked")));
     let (status, html, location) = match response {
         Ok(WebResponse::Html(status, html)) => (status, html, None),
         Ok(WebResponse::Redirect(location)) => (
@@ -122,10 +152,10 @@ fn handle(mut request: Request) {
     let _ = request.respond(response);
 }
 
-fn route(request: &mut Request) -> Result<WebResponse> {
+fn route(request: &mut Request, config: &ServeConfig) -> Result<WebResponse> {
     let url = request.url().to_owned();
     if request.method() == &Method::Post {
-        return post(request, &url);
+        return post(request, &url, config);
     }
     if request.method() != &Method::Get {
         return Ok(WebResponse::Html(
@@ -163,7 +193,7 @@ fn render(url: &str) -> Result<String> {
     }
 }
 
-fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
+fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebResponse> {
     let path = url.split('?').next().unwrap_or(url);
     let segments = path
         .split('/')
@@ -189,6 +219,21 @@ fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
             ),
         ));
     }
+    let actor = match config.actor_for_write(request) {
+        Ok(actor) => actor,
+        Err(error) => {
+            return Ok(WebResponse::Html(
+                400,
+                page(
+                    "Invalid actor",
+                    &format!(
+                        "<h1>Invalid actor</h1><p class=error>{}</p>",
+                        escape(&error.to_string())
+                    ),
+                ),
+            ));
+        }
+    };
     if let ["plan", project, id, "open"] = parts.as_slice() {
         let Ok((_, mut store)) = project_named(project) else {
             return Ok(WebResponse::Html(
@@ -209,7 +254,7 @@ fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
                 ),
             ));
         }
-        if let Err(error) = store.move_task(id, "todo", "geo", serde_json::json!({}), false) {
+        if let Err(error) = store.move_task(id, "todo", &actor, serde_json::json!({}), false) {
             return Ok(WebResponse::Html(
                 409,
                 page(
@@ -284,7 +329,7 @@ fn post(request: &mut Request, url: &str) -> Result<WebResponse> {
             page("Board not found", "<h1>Board not found</h1>"),
         ));
     };
-    if let Err(error) = store.resolve_attention(id, "geo", Some(&reply)) {
+    if let Err(error) = store.resolve_attention(id, &actor, Some(&reply)) {
         return Ok(WebResponse::Html(
             409,
             page(
@@ -315,6 +360,73 @@ fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
         .iter()
         .find(|candidate| candidate.field.to_string().eq_ignore_ascii_case(name))
         .map(|candidate| candidate.value.as_str())
+}
+
+fn configured_actor(request: &Request, name: &str) -> Result<String> {
+    let mut values = request
+        .headers()
+        .iter()
+        .filter(|candidate| candidate.field.to_string().eq_ignore_ascii_case(name))
+        .map(|candidate| candidate.value.as_str());
+    let Some(first) = values.next() else {
+        anyhow::bail!("actor header {name} is required");
+    };
+    if values.next().is_some() {
+        anyhow::bail!("actor header {name} must appear exactly once");
+    }
+    normalize_actor_bytes(first.as_bytes())
+}
+
+fn normalize_actor_header_name(value: &str) -> Result<&str> {
+    if value.is_empty() {
+        anyhow::bail!("actor header name is required");
+    }
+    if !value.is_ascii() || !value.bytes().all(is_http_token) {
+        anyhow::bail!("actor header name must be a valid HTTP token");
+    }
+    Ok(value)
+}
+
+fn normalize_actor_bytes(bytes: &[u8]) -> Result<String> {
+    let value = std::str::from_utf8(bytes).context("actor header contains invalid UTF-8")?;
+    if value.is_empty() {
+        anyhow::bail!("actor header is required");
+    }
+    if value.len() > MAX_ACTOR_BYTES {
+        anyhow::bail!("actor header must be at most {MAX_ACTOR_BYTES} bytes");
+    }
+    if !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        anyhow::bail!("actor header must be ASCII without whitespace or control characters");
+    }
+    Ok(value.to_owned())
+}
+
+fn is_http_token(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
 }
 
 /// Browser writes are accepted only from the authority they are addressed to.
@@ -2110,6 +2222,40 @@ mod tests {
         );
         assert!(compose_resolution_note("reply", Some("   ")).is_err());
         assert!(compose_resolution_note("banana", Some("nope")).is_err());
+    }
+
+    #[test]
+    fn configured_actor_header_name_follows_http_token_grammar() {
+        assert_eq!(
+            normalize_actor_header_name("X-Kanban-Actor").unwrap(),
+            "X-Kanban-Actor"
+        );
+        assert_eq!(
+            normalize_actor_header_name("x_kanban_actor").unwrap(),
+            "x_kanban_actor"
+        );
+        assert!(normalize_actor_header_name("").is_err());
+        assert!(normalize_actor_header_name("X Kanban Actor").is_err());
+        assert!(normalize_actor_header_name("X:Kanban:Actor").is_err());
+        assert!(normalize_actor_header_name("X-Kanban-Actor ").is_err());
+    }
+
+    #[test]
+    fn actor_bytes_must_be_present_and_untrimmed() {
+        assert_eq!(normalize_actor_bytes(b"ifca-sso").unwrap(), "ifca-sso");
+        assert!(normalize_actor_bytes(b"").is_err());
+        assert!(normalize_actor_bytes(b" ifca-sso").is_err());
+        assert!(normalize_actor_bytes(b"ifca sso").is_err());
+        assert!(normalize_actor_bytes(b"ifca-sso\n").is_err());
+        assert!(normalize_actor_bytes(&vec![b'a'; MAX_ACTOR_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn invalid_actor_header_configuration_fails_closed_at_startup() {
+        assert!(ServeConfig::new(Some("X Kanban".to_owned())).is_err());
+        let config =
+            ServeConfig::new(Some("X-Kanban-Actor".to_owned())).expect("valid actor header name");
+        assert_eq!(config.actor_header.as_deref(), Some("X-Kanban-Actor"));
     }
 
     #[test]

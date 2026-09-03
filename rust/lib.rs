@@ -54,7 +54,7 @@ Usage:
              [--after MS] [--before MS] [--all] [--all-boards]
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
-  kanban serve [--port N]
+  kanban serve [--port N] [--actor-header NAME]
   kanban events [--task ID | --rule ID | --registry] [--kind KIND]
              [--after MS] [--before MS] [--limit N] [--all] [--json]
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
@@ -474,7 +474,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         true,
     ),
     ("search-rebuild", None, &["as", "all-boards"], &[], false),
-    ("serve", None, &["port"], &[], true),
+    ("serve", None, &["port", "actor-header"], &[], true),
     ("backup", None, &["output", "keep"], &[], false),
     (
         "archive",
@@ -1011,6 +1011,13 @@ impl Args {
             .get(name)
             .and_then(|v| v.last())
             .map(String::as_str)
+    }
+    fn single(&self, name: &str) -> Result<Option<&str>> {
+        match self.flags.get(name) {
+            None => Ok(None),
+            Some(values) if values.len() == 1 => Ok(values.first().map(String::as_str)),
+            Some(_) => bail!("--{name} may be given at most once"),
+        }
     }
     fn many(&self, name: &str) -> Vec<String> {
         self.flags.get(name).cloned().unwrap_or_default()
@@ -3562,7 +3569,10 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if command == "serve" {
-        return serve::serve(args.port(serve::DEFAULT_PORT)?);
+        return serve::serve(
+            args.port(serve::DEFAULT_PORT)?,
+            args.single("actor-header")?.map(str::to_owned),
+        );
     }
     if command == "watch" {
         return watch::run(&args);
@@ -4647,6 +4657,27 @@ mod tests {
                 "a flag value is parsed by `{pattern}`, which reports no flag name"
             );
         }
+    }
+
+    #[test]
+    fn actor_header_is_single_valued_at_startup() {
+        assert_eq!(
+            args(&["serve", "--actor-header", "X-Kanban-Actor"])
+                .single("actor-header")
+                .unwrap(),
+            Some("X-Kanban-Actor")
+        );
+        assert!(
+            args(&[
+                "serve",
+                "--actor-header",
+                "X-Kanban-Actor",
+                "--actor-header",
+                "X-Other"
+            ])
+            .single("actor-header")
+            .is_err()
+        );
     }
 
     #[test]

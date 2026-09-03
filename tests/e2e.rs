@@ -635,6 +635,10 @@ fn line_is_server_ready_banner(expected_banner: &str, line: &str) -> bool {
 }
 
 fn spawn_server(fixture: &Fixture) -> ServerGuard {
+    spawn_server_with_actor_header(fixture, None)
+}
+
+fn spawn_server_with_actor_header(fixture: &Fixture, actor_header: Option<&str>) -> ServerGuard {
     let mut failures = Vec::new();
     for attempt in 0..16_u16 {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|error| {
@@ -647,9 +651,13 @@ fn spawn_server(fixture: &Fixture) -> ServerGuard {
             })
             .port();
         drop(listener);
-        let mut child = fixture
-            .command(&fixture.main)
-            .args(["serve", "--port", &port.to_string()])
+        let port_arg = port.to_string();
+        let mut command = fixture.command(&fixture.main);
+        command.args(["serve", "--port", &port_arg]);
+        if let Some(name) = actor_header {
+            command.args(["--actor-header", name]);
+        }
+        let mut child = command
             .spawn()
             .unwrap_or_else(|error| panic!("spawn kanban serve on {port}: {error}"));
         let stderr = child.stderr.take().unwrap();
@@ -747,6 +755,58 @@ fn spawn_server(fixture: &Fixture) -> ServerGuard {
         failures.len(),
         failures.join("\n---\n")
     );
+}
+
+fn project_command(fixture: &Fixture, board: &str) -> Command {
+    let mut command = fixture.command(&fixture.main);
+    command.env("KANBAN_PROJECT", board);
+    command
+}
+
+fn project_ok_json(fixture: &Fixture, board: &str, args: &[&str]) -> Value {
+    let output = project_command(fixture, board).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed: {:?}\nstdout: {}\nstderr: {}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn http_post_with_headers(
+    port: u16,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String) {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )
+    .unwrap();
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n").unwrap();
+    }
+    write!(stream, "\r\n").unwrap();
+    stream.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, text)
 }
 
 #[test]
@@ -13828,6 +13888,370 @@ fn served_board_pages_fail_closed_on_duplicate_names() {
     assert_eq!(status, 500, "{page}");
     assert!(page.contains("2 Kanban projects are named Alpha"), "{page}");
     assert!(page.contains("Alpha (rootless)"), "{page}");
+}
+
+struct ActorHeaderFixture {
+    success_task_id: String,
+    success_attention_id: String,
+    negative_task_id: String,
+    negative_attention_id: String,
+    open_epic_id: String,
+    default_task_id: String,
+    default_attention_id: String,
+}
+
+fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixture {
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", board, "--rootless", "true", "--json"],
+    );
+
+    project_ok_json(
+        fixture,
+        board,
+        &[
+            "task",
+            "add",
+            "Custom resolve target",
+            "--id",
+            "t-custom-resolve",
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--as",
+            "ifca-sso",
+            "--json",
+        ],
+    );
+    let success_attention = project_ok_json(
+        fixture,
+        board,
+        &[
+            "attention",
+            "raise",
+            "Custom resolve needed",
+            "--task",
+            "t-custom-resolve",
+            "--kind",
+            "decision",
+            "--as",
+            "ifca-sso",
+            "--json",
+        ],
+    );
+
+    project_ok_json(
+        fixture,
+        board,
+        &[
+            "task",
+            "add",
+            "Negative resolve target",
+            "--id",
+            "t-negative-resolve",
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--as",
+            "ifca-sso",
+            "--json",
+        ],
+    );
+    let negative_attention = project_ok_json(
+        fixture,
+        board,
+        &[
+            "attention",
+            "raise",
+            "Negative resolve target",
+            "--task",
+            "t-negative-resolve",
+            "--kind",
+            "decision",
+            "--as",
+            "ifca-sso",
+            "--json",
+        ],
+    );
+
+    project_ok_json(
+        fixture,
+        board,
+        &[
+            "task",
+            "add",
+            "Custom open target",
+            "--id",
+            "e-custom-open",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--as",
+            "ifca-sso",
+            "--json",
+        ],
+    );
+
+    project_ok_json(
+        fixture,
+        board,
+        &[
+            "task",
+            "add",
+            "Default resolve target",
+            "--id",
+            "t-default-resolve",
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let default_attention = project_ok_json(
+        fixture,
+        board,
+        &[
+            "attention",
+            "raise",
+            "Default resolve target",
+            "--task",
+            "t-default-resolve",
+            "--kind",
+            "decision",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+
+    ActorHeaderFixture {
+        success_task_id: "t-custom-resolve".to_owned(),
+        success_attention_id: success_attention["id"].as_str().unwrap().to_owned(),
+        negative_task_id: "t-negative-resolve".to_owned(),
+        negative_attention_id: negative_attention["id"].as_str().unwrap().to_owned(),
+        open_epic_id: "e-custom-open".to_owned(),
+        default_task_id: "t-default-resolve".to_owned(),
+        default_attention_id: default_attention["id"].as_str().unwrap().to_owned(),
+    }
+}
+
+fn assert_attention_resolution(
+    fixture: &Fixture,
+    board: &str,
+    task_id: &str,
+    expected_actor: &str,
+) {
+    let board_path = board_path_for_project(fixture, &fixture.main, board);
+    let rows = project_ok_json(
+        fixture,
+        board,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "resolved",
+            "--task",
+            task_id,
+            "--all",
+            "--json",
+        ],
+    );
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "expected one resolved attention row");
+    assert_eq!(rows[0]["resolvedBy"].as_str(), Some(expected_actor));
+    assert!(rows[0]["resolution"].as_str().is_some());
+    let events = project_ok_json(
+        fixture,
+        board,
+        &[
+            "events",
+            "--task",
+            task_id,
+            "--kind",
+            "attention_resolved",
+            "--all",
+            "--json",
+        ],
+    );
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["actor"].as_str(), Some(expected_actor));
+    let connection = Connection::open(board_path).unwrap();
+    let resolved_by: String = connection
+        .query_row(
+            "SELECT resolved_by FROM attention WHERE task_id=? AND status='resolved'",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(resolved_by, expected_actor);
+}
+
+fn assert_task_moved_by(fixture: &Fixture, board: &str, id: &str, expected_actor: &str) {
+    let board_path = board_path_for_project(fixture, &fixture.main, board);
+    let task = project_ok_json(fixture, board, &["task", "show", id, "--json"]);
+    assert_eq!(task["status"].as_str(), Some("todo"));
+    let events = project_ok_json(
+        fixture,
+        board,
+        &[
+            "events",
+            "--task",
+            id,
+            "--kind",
+            "task_moved",
+            "--all",
+            "--json",
+        ],
+    );
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["actor"].as_str(), Some(expected_actor));
+    let connection = Connection::open(board_path).unwrap();
+    let status: String = connection
+        .query_row("SELECT status FROM tasks WHERE id=?", params![id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "todo");
+}
+
+#[test]
+fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
+    let fixture = Fixture::new("serve-actor-header");
+    let board = "SERVE-ACTOR";
+    let seeded = seed_actor_header_fixture(&fixture, board);
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Kanban-Actor"));
+    let port = server.port;
+    let origin = server.origin();
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.success_attention_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", "ifca-sso")],
+        b"decision=approve&reply=done",
+    );
+    assert_eq!(status, 303, "{response}");
+    assert_attention_resolution(&fixture, board, &seeded.success_task_id, "ifca-sso");
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/plan/{board}/{}/open", seeded.open_epic_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", "ifca-sso")],
+        b"",
+    );
+    assert_eq!(status, 303, "{response}");
+    assert_task_moved_by(&fixture, board, &seeded.open_epic_id, "ifca-sso");
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("Origin", &origin)],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 400, "{response}");
+
+    let negative = project_ok_json(
+        &fixture,
+        board,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "open",
+            "--task",
+            &seeded.negative_task_id,
+            "--json",
+        ],
+    );
+    assert_eq!(negative.as_array().unwrap().len(), 1);
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[
+            ("Origin", &origin),
+            ("X-Kanban-Actor", "ifca-sso"),
+            ("X-Kanban-Actor", "spoofed-second-copy"),
+        ],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 400, "{response}");
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("X-Kanban-Actor", "ifca-sso")],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 403, "{response}");
+
+    let negative = project_ok_json(
+        &fixture,
+        board,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "open",
+            "--task",
+            &seeded.negative_task_id,
+            "--json",
+        ],
+    );
+    assert_eq!(negative.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn serve_actor_header_defaults_to_geo_when_flag_is_absent() {
+    let fixture = Fixture::new("serve-actor-default");
+    let board = "SERVE-DEFAULT";
+    let seeded = seed_actor_header_fixture(&fixture, board);
+    let server = spawn_server_with_actor_header(&fixture, None);
+    let port = server.port;
+    let origin = server.origin();
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.default_attention_id),
+        &[("Origin", &origin)],
+        b"decision=approve&reply=done",
+    );
+    assert_eq!(status, 303, "{response}");
+    assert_attention_resolution(&fixture, board, &seeded.default_task_id, "geo");
+}
+
+#[test]
+fn serve_actor_header_duplicate_cli_flags_fail_closed() {
+    let fixture = Fixture::new("serve-actor-duplicate-cli");
+    let output = fixture
+        .command(&fixture.main)
+        .args([
+            "serve",
+            "--port",
+            "14200",
+            "--actor-header",
+            "X-Kanban-Actor",
+            "--actor-header",
+            "X-Other",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "duplicate actor header was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("given more than once") || stderr.contains("takes a single value"),
+        "{stderr}"
+    );
 }
 
 #[test]

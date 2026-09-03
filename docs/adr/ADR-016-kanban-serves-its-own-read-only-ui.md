@@ -89,8 +89,13 @@ control would be a much larger surface to build, design and secure, and every
 verb in it becomes reachable with the password.
 
 The actor for a UI write is `geo`. There is one person behind that password, so
-the attribution is honest. If this ever has a second user that stops being
-true, and it needs revisiting before then rather than after.
+the attribution is honest. An opt-in `--actor-header NAME` path can replace
+that default only while the server remains loopback-only behind an
+authenticated edge that strips every client-supplied copy before injecting
+one verified actor value. If the header name or value is invalid, missing,
+duplicated, empty, contains control characters, or exceeds the size limit, the
+write fails closed. Same-origin still applies. If this ever has a second user
+that stops being true, it needs revisiting before then rather than after.
 
 ### Needs you is live, but WebSockets are not a second ledger
 
