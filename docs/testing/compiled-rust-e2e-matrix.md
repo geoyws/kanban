@@ -1,16 +1,41 @@
 # Compiled Rust E2E matrix
 
-The release gate runs `cargo test --test e2e` and
-`cargo test --test dispatcher_e2e` after Cargo builds the production
-executables. Each test invokes its `CARGO_BIN_EXE_*` binary through
-`std::process::Command`; no test calls Kanban domain functions in-process.
+The full Rust test gate is
+`cargo test --all-targets --all-features --locked`. It runs in-process unit
+tests and all five integration targets: `e2e`, `dispatcher_e2e`,
+`claude_print_adapter_e2e`, `codex_app_server_adapter_e2e`, and
+`codex_queue_adapter_e2e`. The integration targets invoke the relevant
+production `CARGO_BIN_EXE_*` binaries through `std::process::Command`; those
+process-boundary assertions are compiled-process evidence. The command as a
+whole is a unit/integration/process gate, not compiled-process E2E.
+
+The two fixed-descriptor remap unit tests are run serially and in isolation:
+
+```bash
+cargo test --lib --all-features --locked workspace_adopt_fd_remap_handles_ -- --ignored --test-threads=1
+```
+
+They are isolated unit evidence, not compiled-process E2E. The separately
+ignored `serve_render_fixture_child_process` is still exercised: its non-ignored
+parent starts the current unit-test executable with `--exact --ignored`, the
+exact child test name, and the required marker environment.
+That parent/child pair is isolated unit-test-process evidence, not
+production-binary E2E.
+
+Coverage for the full all-targets gate is collected with:
+
+```bash
+rustup run stable cargo llvm-cov --all-targets --all-features --locked --summary-only
+```
+
+Instrumentation does not change any test's evidence layer.
 
 | Requirement | Process-boundary evidence |
 | --- | --- |
 | SQLite persistence and restart | Separate `init`, `task add`, `note`, `claim`, `handoff`, `context`, and `checkpoint` processes reopen the same board. |
 | Multiple worktrees | A second directory attaches to a named board and reads/writes the same board; `workspace list` includes rootless boards and dashboard reports the roots as hints. |
 | Root-resolution parity | Compiled processes prove one resolver order across mutating and read-only commands: typed `--db` / `--project` / `--workspace`, then `KANBAN_DB` / `KANBAN_PROJECT`, then cwd. Filesystem roots are canonicalized and the nearest active registered ancestor wins; rootless boards refuse cwd and `--workspace` discovery and remain reachable only by explicit identity. Adopted multi-root boards retain one board path and shared reads/writes without leaking into a registered neighbor. Repoint preserves board identity while replacing exactly the moved canonical roots; detach immediately removes discovery even when the old directory is recreated, and the final detach leaves only explicit project-name access. Retired boards refuse path, name, environment, watch, mutating, and read-only subscription selectors with the recorded retirement note instead of falling through to an active cwd board. A real local Git repository, linked sibling worktree, and local submodule prove Git topology affects provenance only: an unattached linked worktree refuses until explicitly attached, while an unregistered submodule beneath an active root resolves upward to that root. Git-specific legs emit an explicit skip note only when local Git topology setup is unavailable; the core filesystem parity assertions always run. |
-| Native board adoption | Compiled processes adopt a handle-pinned, WAL-aware external snapshot into a pinned registry-owned directory, read it back through the CLI, and verify exact registered-byte hash/count, exact-root visibility, and `board_adopted` provenance. Process tests also prove missing/invalid/large source preflight creates no live root/lock/database/boards, `--as` is mandatory, a boards symlink cannot write externally, source symlink/traversal, foreign-key corruption, audit corruption, newer schema, duplicate name, concurrent live adoption, and an externally held canonical data-root lock all fail closed, with fd-collision coverage proving the helper remap clears `FD_CLOEXEC` after source/target crossings and source-fd-equals-target cases; crash recovery reconciles both pre-commit and post-publish interruptions. |
+| Native board adoption | Compiled processes adopt a handle-pinned, WAL-aware external snapshot into a pinned registry-owned directory, read it back through the CLI, and verify exact registered-byte hash/count, exact-root visibility, and `board_adopted` provenance. Process tests also prove missing/invalid/large source preflight creates no live root/lock/database/boards, `--as` is mandatory, a boards symlink cannot write externally, source symlink/traversal, foreign-key corruption, audit corruption, newer schema, duplicate name, concurrent live adoption, and an externally held canonical data-root lock all fail closed. Compiled-process coverage proves helper-process adoption succeeds when the reserved target descriptors are already occupied. The two serial isolated unit tests prove source-fd-equals-target and crossed-source remaps preserve the intended descriptor identities and clear `FD_CLOEXEC`; crash recovery reconciles both pre-commit and post-publish interruptions. |
 | Atomic ownership | Two compiled processes race to claim one task; exactly one exit status may succeed. |
 | Token-pressure handoff | The outgoing process creates the structured handoff, releases its lease, and an incoming process accepts with a different token. |
 | Stale-token exclusion | The outgoing token is used for a post-handoff heartbeat and must fail. |
