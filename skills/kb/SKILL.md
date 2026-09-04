@@ -423,6 +423,11 @@ machine's, since the lease was issued there.
 
 Verified 2026-09-04 on `px` against a task holding a live lease.
 
+**This note is a stopgap.** `task list` omitting the claim is filed as a
+defect on the `kanban` board, `t-5ce56794` — a listing that structurally
+cannot show a lease is the same absence-reads-as-a-finding trap the tag
+filter already refuses. Delete this subsection when that lands.
+
 `--state done` or `blocked` on a checkpoint **releases the lease in the same
 transaction** that records it — there is no window where the work reads finished
 but the lease is still held.
@@ -856,7 +861,14 @@ once a silent wrong answer.
 - A single-valued flag given twice is refused — last-wins is how the wrong board
   gets written.
 - `--force` is required to override a live lease or nest a board inside a
-  registered tree, and every override is recorded.
+  registered tree, and every override is recorded. It lives on `task move` and
+  `task remove` — **`claim` has no `--force` at all**, and `--allow-reassign`
+  belongs to the read-only `claim --candidates` inspector, so neither takes a
+  task off a holder. To recover a task whose agent died still holding the lease:
+  `task move <id> todo --as <lane> --force`, then `claim <id> --as <lane>`
+  normally for a fresh token. `handoff accept` also seizes a lease, but only
+  where a pending handoff exists — a session that dies without `handoff create`
+  leaves none.
 - A diagnostic never modifies what it diagnoses; a missing registered board is
   reported, never silently recreated.
 - `restore` takes the data root exclusively and refuses while anything else
@@ -873,7 +885,10 @@ once a silent wrong answer.
   passing `--limit` to `t ls` is a hard error you cannot miss, while omitting it
   from `att list` silently caps at 100 and quietly under-reports. Pass
   `--limit 500` to `att list` before counting or duplicate-checking; never add it
-  to `t ls`. Verified 2026-09-04.
+  to `t ls`. Verified 2026-09-04. The silent half is filed as `t-5d3c540c` on
+  the `kanban` board: `attention list` should emit a computed `truncated`
+  marker the way `watch` and `ctx` already do, rather than relying on every
+  caller remembering a flag. Drop this bullet's workaround when that lands.
 
 ## Reference
 
