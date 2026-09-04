@@ -3242,8 +3242,19 @@ impl Store {
                 unmet.join(", ")
             );
         }
-        if active_claim(&transaction, &task.id, now)?.is_some() {
-            bail!("task {} is already claimed", task.id);
+        if let Some(held) = active_claim(&transaction, &task.id, now)? {
+            // Name the holder and the way out. `claim` has no --force, and
+            // --allow-reassign only filters `claim --candidates`, so a caller
+            // whose agent died still holding the lease has no route from here
+            // and reasonably concludes there is none. There is: --force on
+            // `task move` overrides a live lease, and the move is audited.
+            bail!(
+                "task {} is already claimed by {} until {} (epoch ms) — `claim` has no --force, and --allow-reassign only filters `claim --candidates`. To take it from a holder that is gone: `task move {} todo --as ACTOR --force`, then claim it again",
+                task.id,
+                held.agent_id,
+                held.expires_at,
+                task.id
+            );
         }
         if task.driver_only && options.caller_scope.as_deref() != Some("driver") {
             bail!("task {} is driver-only", task.id);
@@ -4332,8 +4343,19 @@ impl Store {
                 unmet.join(", ")
             );
         }
-        if active_claim(&transaction, &task.id, now)?.is_some() {
-            bail!("task {} is already claimed", task.id);
+        if let Some(held) = active_claim(&transaction, &task.id, now)? {
+            // Name the holder and the way out. `claim` has no --force, and
+            // --allow-reassign only filters `claim --candidates`, so a caller
+            // whose agent died still holding the lease has no route from here
+            // and reasonably concludes there is none. There is: --force on
+            // `task move` overrides a live lease, and the move is audited.
+            bail!(
+                "task {} is already claimed by {} until {} (epoch ms) — `claim` has no --force, and --allow-reassign only filters `claim --candidates`. To take it from a holder that is gone: `task move {} todo --as ACTOR --force`, then claim it again",
+                task.id,
+                held.agent_id,
+                held.expires_at,
+                task.id
+            );
         }
         let token = Uuid::new_v4().to_string();
         transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![

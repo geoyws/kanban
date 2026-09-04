@@ -172,7 +172,10 @@ Aliases (the binary installs as both `kanban` and `kb`):
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
 --force is required to override a live lease (task move/remove) or to nest a
-second board inside a registered project tree (init). Unknown flags are errors.
+second board inside a registered project tree (init). claim has no --force, and
+--allow-reassign only filters claim --candidates: to take a task off an agent
+that died holding the lease, task move ID todo --as ACTOR --force, then claim it
+again for a fresh token. Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
