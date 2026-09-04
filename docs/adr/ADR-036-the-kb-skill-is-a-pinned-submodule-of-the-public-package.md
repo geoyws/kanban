@@ -19,10 +19,16 @@ share no infrastructure with this one, which an in-repo copy cannot serve: the
 document named a specific host wrapper (`hax-kb`, 8 times), and a second copy
 elsewhere is the drift ADR-010 exists to prevent.
 
-The drift already happened. At the time of this decision three copies existed
-and disagreed: `skills/kb`, the dotfiles tree's `agents/skills/kb` — a real
-directory, not the relative symlink ADR-014 describes — and the written package.
-Their `SKILL.md` and `kb-board` differed.
+ADR-014's own mechanism held. The dotfiles tree's `agents/skills/kb` is the
+relative symlink into `../../kanban/skills/kb` that ADR-014 describes, and it
+resolves through the `kanban` submodule pinned there. An earlier revision of
+this ADR claimed the symlink had decayed into a divergent third copy; that was
+wrong. The file seen through the dotfiles pin differs from this lane only
+because the pin names an older commit, which is what a pinned submodule is for.
+
+So this decision is not repair work. It is scope: one estate's in-repo document
+cannot serve estates that share no infrastructure with it, because it named a
+specific host wrapper.
 
 ## Decision
 
