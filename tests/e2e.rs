@@ -11136,7 +11136,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         &[
             "attention",
             "raise",
-            "Staging push needs your call <b>now</b>",
+            "Production push needs your call <b>now</b>",
             "--as",
             "claude@driver-1",
             "--kind",
