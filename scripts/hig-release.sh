@@ -300,11 +300,11 @@ validate_hax_activation_receipt() {
   [[ "$(readlink "$current_path")" == "$release_dir" ]] || die "hax current pointer does not match the installed release"
   [[ -f "$release_dir/manifest.json" ]] || die "hax release manifest is missing: $release_dir/manifest.json"
   while IFS=$'\t' read -r name sha256 size version; do
-    path="$release_dir/$name"
+    local path="$release_dir/$name"
     [[ -f "$path" ]] || die "hax release directory is missing binary $name"
     [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "hax release binary $name has the wrong size"
     [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "hax release binary $name hash mismatch"
-    [[ "$("$path" version | tr -d '\r' | sed 's/[[:space:]]*$//')" == "$version" ]] || die "hax release binary $name version mismatch"
+    [[ "$(file_version "$path")" == "$version" ]] || die "hax release binary $name version mismatch"
   done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$package_dir/manifest.json")
 }
 
@@ -620,14 +620,9 @@ install_release_tree() {
   local receipt="$3"
   local install_root="$4"
   local bin_dir="$5"
-  local hax_install_root="${6:-}"
 
   validate_package "$package_dir" "$target"
   validate_receipt "$receipt" "$target" "$package_dir"
-  if [[ "$target" == hig ]]; then
-    [[ -n "$hax_install_root" ]] || die "--hax-install-root is required for hig installs"
-    validate_hax_activation_receipt "$hax_install_root" "$target" "$package_dir"
-  fi
 
   [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
   mkdir -p "$install_root/releases"
@@ -731,7 +726,6 @@ install_local() {
   local package_dir=""
   local install_root=""
   local bin_dir="$BIN_DIR_DEFAULT"
-  local hax_install_root=""
   while (($#)); do
     case "$1" in
       --package)
@@ -758,14 +752,6 @@ install_local() {
         bin_dir="${1#*=}"
         shift
         ;;
-      --hax-install-root)
-        hax_install_root="${2:?--hax-install-root requires a directory}"
-        shift 2
-        ;;
-      --hax-install-root=*)
-        hax_install_root="${1#*=}"
-        shift
-        ;;
       *)
         die "unknown install flag $1"
         ;;
@@ -778,7 +764,7 @@ install_local() {
   local receipt
   receipt="$(receipt_path "$package_dir")"
   [[ -f "$receipt" ]] || die "package receipt is required: $receipt"
-  install_release_tree "$target" "$package_dir" "$receipt" "$install_root" "$bin_dir" "$hax_install_root"
+  install_release_tree "$target" "$package_dir" "$receipt" "$install_root" "$bin_dir"
 }
 
 install_remote() {
@@ -836,10 +822,9 @@ install_remote() {
   [[ -f "$receipt" ]] || die "package receipt is required: $receipt"
   package_validate "$package_dir" "$target"
   validate_receipt "$receipt" "$target" "$package_dir"
-  if [[ "$target" == hig ]]; then
-    [[ -n "$hax_install_root" ]] || die "--hax-install-root is required for hig installs"
-    [[ -d "$hax_install_root" ]] || die "hax install root does not exist: $hax_install_root"
-  fi
+  [[ -n "$hax_install_root" ]] || die "--hax-install-root is required for hig installs"
+  [[ -d "$hax_install_root" ]] || die "hax install root does not exist: $hax_install_root"
+  validate_hax_activation_receipt "$hax_install_root" "$target" "$package_dir"
   local release_id release_dir release_meta
   release_id="$(release_id_from_receipt "$receipt")"
   release_dir="$(release_dir "$install_root" "$release_id")"
@@ -849,7 +834,7 @@ install_remote() {
   remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
   tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
   ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
-  HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "$hax_install_root" <<'REMOTE'
+  HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" <<'REMOTE'
 set -Eeuo pipefail
 
 stage_root="$1"
@@ -859,11 +844,25 @@ install_root="$4"
 target="$5"
 bin_dir="$6"
 keep="$7"
-hax_install_root="$8"
 
 die() {
   printf 'hig-release: %s\n' "$*" >&2
   exit 1
+}
+
+file_version() {
+  local binary="$1"
+  case "${binary##*/}" in
+    kanban | kb)
+      "$binary" version
+      ;;
+    kanban-dispatcher | kanban-codex-queue-adapter | kanban-codex-app-server-adapter | kanban-claude-print-adapter)
+      "$binary" --version
+      ;;
+    *)
+      die "unknown release binary ${binary##*/}"
+      ;;
+  esac | tr -d '\r' | sed 's/[[:space:]]*$//'
 }
 
 cleanup_remote() {
@@ -871,63 +870,6 @@ cleanup_remote() {
 }
 
 trap cleanup_remote EXIT
-
-validate_hax_activation_receipt() {
-  local hax_install_root="$1"
-  local target="$2"
-  local package_dir="$3"
-  local manifest
-  local manifest_sha
-  local manifest_commit
-  local release_id
-  local receipt
-  local release_dir
-  local current_path
-  manifest="$package_dir/manifest.json"
-  manifest_sha="$(sha256sum "$manifest" | awk '{print $1}')" || return 1
-  manifest_commit="$(jq -r '.sourceCommit' "$manifest")"
-  release_id="${manifest_commit}-${manifest_sha}"
-  receipt="$hax_install_root/releases/$release_id.receipt.json"
-  release_dir="$hax_install_root/releases/$release_id"
-  current_path="$hax_install_root/current"
-  [[ -d "$hax_install_root" ]] || die "hax install root does not exist: $hax_install_root"
-  [[ ! -L "$hax_install_root" ]] || die "hax install root must not be a symlink: $hax_install_root"
-  [[ -f "$receipt" ]] || die "hax activation receipt is missing: $receipt"
-  [[ ! -L "$receipt" ]] || die "hax activation receipt must not be a symlink: $receipt"
-  [[ -d "$release_dir" ]] || die "hax release directory is missing: $release_dir"
-  [[ ! -L "$release_dir" ]] || die "hax release directory must not be a symlink: $release_dir"
-  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --arg manifest_commit "$manifest_commit" --arg release_id "$release_id" --arg release_dir "$release_dir" --arg current_path "$current_path" '
-    (.formatVersion == 1) and
-    (.host == "hax") and
-    (.target == "hax") and
-    (.installerHost == "hax") and
-    (.targets | type == "array") and
-    (.targets | length == 2) and
-    (.targets | index("hax") != null) and
-    (.targets | index("hig") != null) and
-    (.targets | index($target) != null) and
-    (.sourceTreeClean == true) and
-    (.sourceCommit == $manifest_commit) and
-    (.manifestSha256 == $manifest_sha) and
-    (.releaseId == $release_id) and
-    (.releaseDir == $release_dir) and
-    (.currentLink == $current_path) and
-    ((.releaseDir | type) == "string") and
-    ((.currentLink | type) == "string") and
-    ((.binDir | type) == "string") and
-    ((.installedAt | type) == "number") and
-    ((.installedAt > 0) == true)
-  ' "$receipt" >/dev/null || die "hax activation receipt is incomplete or mismatched"
-  [[ -f "$release_dir/manifest.json" ]] || die "hax release manifest is missing: $release_dir/manifest.json"
-  while IFS=$'\t' read -r name sha256 size version; do
-    path="$release_dir/$name"
-    [[ -f "$path" ]] || die "hax release directory is missing binary $name"
-    [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "hax release binary $name has the wrong size"
-    [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "hax release binary $name hash mismatch"
-    [[ "$("$path" version | tr -d '\r' | sed 's/[[:space:]]*$//')" == "$version" ]] || die "hax release binary $name version mismatch"
-  done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$package_dir/manifest.json")
-  [[ "$(readlink "$current_path")" == "$release_dir" ]] || die "hax current pointer does not match the installed release"
-}
 
 atomic_symlink() {
   local target="$1"
@@ -1054,8 +996,8 @@ prune_releases() {
   for release in "${releases[@]}"; do
     (( index += 1 ))
     if (( index > keep )); then
-      rm -rf -- "$(release_dir "$root" "$release")"
-      rm -f -- "$(release_receipt "$root" "$release")"
+      rm -rf -- "$root/releases/$release"
+      rm -f -- "$root/releases/$release.receipt.json"
     fi
   done
 }
@@ -1090,16 +1032,12 @@ manifest="$package_dir/manifest.json"
   ])
 ' "$receipt" >/dev/null || die "remote package receipt is incomplete or mismatched"
 
-if [[ "$target" == hig ]]; then
-  validate_hax_activation_receipt "$hax_install_root" "$target" "$package_dir"
-fi
-
 while IFS=$'\t' read -r name sha256 size version; do
   path="$package_dir/$name"
   [[ -f "$path" ]] || die "remote package is missing binary $name"
   [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "remote binary $name has the wrong size"
   [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "remote binary $name hash mismatch"
-  [[ "$("$path" version | tr -d '\r' | sed 's/[[:space:]]*$//')" == "$version" ]] || die "remote binary $name version mismatch"
+  [[ "$(file_version "$path")" == "$version" ]] || die "remote binary $name version mismatch"
 done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$receipt")
 
 [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"

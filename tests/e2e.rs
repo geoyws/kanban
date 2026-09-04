@@ -11785,6 +11785,9 @@ chmod "$mode" "$dest"
 set -eu
 host="$1"
 shift
+if [ -n "${FAKE_SSH_INVOCATION_LOG:-}" ]; then
+  printf '%s\n' "$host $*" >> "$FAKE_SSH_INVOCATION_LOG"
+fi
 case "${1:-}" in
   hostname)
     printf '%s\n' "$host"
@@ -11794,6 +11797,20 @@ case "${1:-}" in
     ;;
   bash)
     shift 3
+    hidden_path=""
+    restore_hidden_path() {
+      if [ -n "$hidden_path" ]; then
+        mv "$hidden_path" "${FAKE_SSH_HIDE_PATH:?}"
+        hidden_path=""
+      fi
+    }
+    if [ -n "${FAKE_SSH_HIDE_PATH:-}" ]; then
+      hidden_path="${FAKE_SSH_HIDE_PATH}.fake-ssh-hidden"
+      [ ! -e "$hidden_path" ]
+      mv "$FAKE_SSH_HIDE_PATH" "$hidden_path"
+      [ ! -e "$FAKE_SSH_HIDE_PATH" ]
+      trap restore_hidden_path EXIT HUP INT TERM
+    fi
     FAKE_HOST="$host" bash -s -- "$@"
     ;;
   *)
@@ -19127,7 +19144,8 @@ fn hig_release_script_requires_the_initialized_kb_skill_submodule() {
 }
 
 #[test]
-fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
+fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_refuses_partial_activation()
+ {
     let fixture = Fixture::new("hig-release");
     let fake_repo_root = fixture.root.join("fake-repo");
     fs::create_dir_all(&fake_repo_root).unwrap();
@@ -19149,6 +19167,27 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
     let broken_install_root = fixture.root.join("broken-install");
     let bin_dir = fixture.root.join("bin");
     let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let release_binaries = [
+        ("kanban", Path::new(env!("CARGO_BIN_EXE_kanban"))),
+        ("kb", Path::new(env!("CARGO_BIN_EXE_kb"))),
+        (
+            "kanban-dispatcher",
+            Path::new(env!("CARGO_BIN_EXE_kanban-dispatcher")),
+        ),
+        (
+            "kanban-codex-queue-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-codex-queue-adapter")),
+        ),
+        (
+            "kanban-codex-app-server-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-codex-app-server-adapter")),
+        ),
+        (
+            "kanban-claude-print-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-claude-print-adapter")),
+        ),
+    ];
+    let release_binary_dir = release_binaries[0].1.parent().unwrap();
 
     let packaged = Command::new("bash")
         .current_dir(&fixture.main)
@@ -19158,6 +19197,7 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_RELEASE_BINARY_DIR", release_binary_dir)
         .env("FAKE_REMOTE_ROOT", &remote_root)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
@@ -19206,17 +19246,13 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
         receipt["sourceCommit"],
         "0123456789abcdef0123456789abcdef01234567"
     );
-    for name in [
-        "kanban",
-        "kb",
-        "kanban-dispatcher",
-        "kanban-codex-queue-adapter",
-        "kanban-codex-app-server-adapter",
-        "kanban-claude-print-adapter",
-    ] {
-        assert!(
-            output_dir.join(name).is_file(),
-            "missing package binary {name}"
+    for (name, source) in &release_binaries {
+        let packaged_binary = output_dir.join(name);
+        assert!(packaged_binary.is_file(), "missing package binary {name}");
+        assert_eq!(
+            fs::read(&packaged_binary).unwrap(),
+            fs::read(source).unwrap(),
+            "package binary {name} did not come from its Cargo binary target"
         );
     }
 
@@ -19327,6 +19363,7 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_SSH_HIDE_PATH", &hax_install_root)
         .arg(&script)
         .args([
             "install",
@@ -19347,6 +19384,10 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
         "HIG install failed: {}\nstderr: {}",
         String::from_utf8_lossy(&installed.stdout),
         String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        hax_install_root.is_dir(),
+        "fake SSH did not restore the hidden HAX install root"
     );
     assert!(
         String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
@@ -19372,6 +19413,20 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
         release_receipt_json["manifestSha256"],
         hax_release_receipt_json["manifestSha256"]
     );
+    for field in [
+        "formatVersion",
+        "host",
+        "targets",
+        "manifestSha256",
+        "sourceCommit",
+        "sourceTreeClean",
+        "files",
+    ] {
+        assert_eq!(
+            release_receipt_json[field], hax_release_receipt_json[field],
+            "HIG release receipt changed canonical field {field}"
+        );
+    }
     assert_release_view(&install_root, &bin_dir, &release_dir);
     for name in [
         "kanban",
@@ -19385,6 +19440,11 @@ fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
         assert!(
             release_dir.join(name).exists(),
             "missing installed file {name}"
+        );
+        assert_eq!(
+            fs::read(release_dir.join(name)).unwrap(),
+            fs::read(hax_release_dir.join(name)).unwrap(),
+            "HIG installed bytes differ from the HAX release for {name}"
         );
     }
 
@@ -19882,7 +19942,7 @@ fn hig_release_script_rejects_the_build_provenance_receipt_for_hig_install() {
 }
 
 #[test]
-fn hig_release_script_rejects_a_mismatched_hax_install_receipt() {
+fn hig_release_script_rejects_a_mismatched_hax_install_receipt_before_ssh() {
     let fixture = Fixture::new("hig-release-hax-receipt-mismatch");
     let fake_repo_root = fixture.root.join("fake-repo");
     fs::create_dir_all(&fake_repo_root).unwrap();
@@ -19903,6 +19963,7 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt() {
     let install_root = fixture.root.join("install");
     let bin_dir = fixture.root.join("bin");
     let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let ssh_invocation_log = fixture.root.join("unexpected-ssh-invocation.log");
 
     let packaged = Command::new("bash")
         .current_dir(&fixture.main)
@@ -19969,6 +20030,7 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt() {
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_SSH_INVOCATION_LOG", &ssh_invocation_log)
         .arg(&script)
         .args([
             "install",
@@ -19993,6 +20055,10 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt() {
             .contains("hax activation receipt is incomplete or mismatched"),
         "stderr: {}",
         String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !ssh_invocation_log.exists(),
+        "HIG staging began before local HAX activation validation"
     );
 }
 
