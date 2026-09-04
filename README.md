@@ -331,6 +331,8 @@ kanban workspace adopt --from-board /path/to/existing-board.db --name imported -
 cd /path/to/another-worktree
 kanban workspace attach --to my-project
 kanban workspace detach --root /path/to/retired-worktree --as geo
+kanban workspace retire NAME --as ACTOR --note TEXT
+kanban workspace unretire NAME --as ACTOR
 ```
 
 If a name is reused and one candidate is rootless, `workspace attach --to NAME`
@@ -603,10 +605,11 @@ loss of the machine the backups are taken from.
 kanban serve --port 14200      # loopback only; no --bind flag exists
 ```
 
-Eight server-rendered views over every registered board: open attention items
+Nine server-rendered views over every registered board: open attention items
 across all of them by priority then age, the dashboard projection, draft plans
 with the work each holds back, the verified deployment matrix and attempt
-detail, cross-board cited search, one board's rows, and one task in full.
+detail, `/lanes` lane sitreps, cross-board cited search, one board's rows, and
+one task in full.
 Priority badges use P0/P1/P2 everywhere a queued row appears.
 Every read goes through the same `Store` methods the CLI calls, so there is no
 second implementation to keep in step.

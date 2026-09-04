@@ -72,11 +72,12 @@ mutating call that happens to be a no-op on the day leaves the bytes identical
 and the capability in place — which was demonstrated, not assumed, by injecting
 a `sweep_expired_claims` call that the byte comparison passed straight over.
 
-So a second guard reads the module back and asserts it names none of `Store`'s
-twenty `&mut self` methods except `resolve_attention` and `move_task`, the two
-explicitly accepted browser capabilities. The compiled-binary E2E separately
-proves that cross-origin, malformed and duplicate submissions do not mutate a
-board.
+So a second guard reads the module back and checks all 23 of `Store`'s
+`&mut self` methods. It allowlists three method names — `resolve_attention`,
+`resolve_attention_from_trusted_edge`, and `move_task` — while the two shipped
+browser capabilities are trusted-edge attention resolution and draft opening.
+The compiled-binary E2E separately proves that cross-origin, malformed and
+duplicate submissions do not mutate a board.
 
 ### Write scope, decided 2026-08-24: two verbs, both approval-shaped
 
@@ -112,10 +113,11 @@ agent update cannot erase text George is typing. This preserves one read path
 and makes the socket a notification channel rather than replicated state.
 
 Reply forms are bounded and strictly decoded. Browser POSTs require the Origin
-authority to equal Host, resolve through `Store::resolve_attention` by
-default, and use `Store::resolve_attention_from_trusted_edge` in opt-in actor
-header mode. Empty, oversized, malformed, cross-origin, unknown-board and
-already-resolved submissions fail without a partial write.
+authority to equal Host and all browser attention resolution calls
+`Store::resolve_attention_from_trusted_edge`: default mode supplies `geo`, while
+opt-in actor-header mode supplies the trusted edge value. The CLI uses
+`Store::resolve_attention`. Empty, oversized, malformed, cross-origin,
+unknown-board and already-resolved submissions fail without a partial write.
 
 ### No hot reload
 

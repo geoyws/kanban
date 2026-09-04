@@ -1,6 +1,6 @@
 # ADR-035: Workspace retire and unretire
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-03
 **Deciders:** Team
 
