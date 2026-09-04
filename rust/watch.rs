@@ -1,7 +1,7 @@
 use crate::WATCH_BATCH_LIMIT;
 use crate::db::read_snapshot;
 use crate::model::{BOARD_EVENT_KINDS, Event, TASK_STATUSES};
-use crate::registry::{Registry, data_root};
+use crate::registry::{BoardPathState, Registry, data_root, retired_board_message};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -24,8 +24,10 @@ const REGISTRY_EVENT_KINDS: &[&str] = &[
     "workspace_alias_name_discarded",
     "workspace_attached",
     "workspace_detached",
+    "workspace_retired",
     "workspace_registered",
     "workspace_repointed",
+    "workspace_unretired",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +232,15 @@ fn resolve_with_source(
         // so with a raw `Error code 14`. The guard makes the safety deliberate
         // and the diagnosis the same one every other board path gives.
         super::require_board_file(&path, explicit, super::BoardCreation::Refused)?;
+        if path.exists()
+            && let Some(BoardPathState::Retired { name, note }) =
+                Registry::board_path_state_if_available(&path)?
+        {
+            bail!(
+                "{}",
+                retired_board_message(&name, note.as_deref(), "addressing it")
+            );
+        }
         (path, None)
     } else {
         let path = super::store_path_readonly(args)?;
@@ -938,12 +949,15 @@ fn registry_source(root: &Path) -> Result<String> {
 }
 
 fn board_name_for_path(path: &Path) -> Result<Option<String>> {
-    let registry = Registry::open_readonly()?;
-    let source = canonical_source_path(path)?;
-    for project in registry.projects()? {
-        if canonical_source_path(Path::new(&project.board_path))? == source {
-            return Ok(Some(project.name));
+    match Registry::board_path_state_if_available(path)? {
+        Some(BoardPathState::Active(name)) => return Ok(Some(name)),
+        Some(BoardPathState::Retired { name, note }) => {
+            bail!(
+                "{}",
+                retired_board_message(&name, note.as_deref(), "addressing it")
+            )
         }
+        Some(BoardPathState::External) | None => {}
     }
     Ok(None)
 }

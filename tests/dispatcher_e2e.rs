@@ -584,6 +584,36 @@ fn dispatcher_success_targets_one_consumer_and_resolves_every_explicit_selector(
 }
 
 #[test]
+fn dispatcher_rejects_retired_board_paths_before_it_can_claim() {
+    let fixture = Fixture::new("retired-db");
+    let board_path = fixture.board.to_str().unwrap().to_owned();
+    let retired = fixture.kanban(&[
+        "workspace",
+        "retire",
+        "DISPATCH-E2E",
+        "--as",
+        "test@dispatcher",
+        "--note",
+        "retire dispatcher board",
+        "--json",
+    ]);
+    assert_success(&retired, "retire dispatcher board");
+
+    let output = fixture
+        .dispatcher()
+        .args(["--db", &board_path, "--once", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "dispatcher accepted a retired board path"
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("retire dispatcher board"), "{stderr}");
+}
+
+#[test]
 fn dispatcher_failure_modes_are_safe_and_durable() {
     for (mode, expected, timeout) in [
         ("exit", "adapter_exit", "5000"),

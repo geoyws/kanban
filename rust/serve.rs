@@ -29,7 +29,7 @@
 //! does not relax it.
 
 use crate::model::{Attention, DeploymentAttempt, ProjectRecord, SearchOptions, Sitrep, Task};
-use crate::registry::{Registry, now_ms};
+use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -529,7 +529,7 @@ fn decode(segment: &str) -> String {
 fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
     let registry = Registry::open()?;
     let mut out = Vec::new();
-    for project in registry.projects()? {
+    for project in registry.projects_active()? {
         let path = Path::new(&project.board_path);
         if !path.exists() {
             continue;
@@ -547,7 +547,22 @@ fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
         .collect::<Vec<_>>();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
-        0 => Err(anyhow::anyhow!("no board named {name}")),
+        0 => {
+            let retired = Registry::open()?.by_name_all(name)?;
+            match retired.as_slice() {
+                [] => Err(anyhow::anyhow!("no board named {name}")),
+                [project] => Err(anyhow::anyhow!(retired_board_message(
+                    &project.name,
+                    project.archived_note.as_deref(),
+                    "opening it"
+                ))),
+                many => Err(anyhow::anyhow!(
+                    "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                    many.len(),
+                    crate::project_candidates(many)
+                )),
+            }
+        }
         _ => Err(anyhow::anyhow!(
             "{} Kanban projects are named {name}; choose a unique board name before using /board: {}",
             matches.len(),
@@ -678,7 +693,7 @@ fn write_ws_text(stream: &mut (impl Write + ?Sized), text: &str) -> std::io::Res
 fn ledger_revision() -> Result<u64> {
     let registry = Registry::open()?;
     let mut hasher = DefaultHasher::new();
-    for project in registry.projects()? {
+    for project in registry.projects_active()? {
         project.name.hash(&mut hasher);
         project.board_path.hash(&mut hasher);
         let board = PathBuf::from(&project.board_path);
@@ -939,7 +954,7 @@ fn search_page(query: &str) -> Result<String> {
     let mut results = Vec::new();
     let mut boards = Vec::new();
     let mut missing = Vec::new();
-    for project in registry.projects()? {
+    for project in registry.projects_active()? {
         if !Path::new(&project.board_path).is_file() {
             missing.push(project.name);
             continue;

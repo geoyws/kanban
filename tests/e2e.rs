@@ -1388,8 +1388,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 11);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 11);
+    assert_eq!(doctor["registrySchemaVersion"], 12);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 12);
     assert_eq!(doctor["supportedBoardSchemaVersion"], 23);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 23);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 23);
@@ -5045,6 +5045,220 @@ fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
     );
 }
 
+#[test]
+fn compiled_binary_lists_retired_rootless_boards_once_in_workspace_list_all() {
+    let fixture = Fixture::new("rootless-retire-list");
+    let rootless = fixture.root.join("rootless");
+    fs::create_dir_all(&rootless).unwrap();
+
+    let created = fixture.ok_json(
+        &rootless,
+        &["init", "--name", "ROOTLESS", "--rootless", "--json"],
+    );
+    let rootless_path = created["boardPath"].as_str().unwrap().to_owned();
+
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ROOTLESS",
+            "--as",
+            "geo",
+            "--note",
+            "retire rootless board",
+            "--json",
+        ],
+    );
+    assert_eq!(retired["archived"], true);
+
+    let active_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ROOTLESS"),
+        "the retired rootless board leaked into the default inventory: {active_list}"
+    );
+
+    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
+    let rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "ROOTLESS")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        1,
+        "retired rootless board duplicated in all inventory"
+    );
+    let row = rows[0];
+    assert_eq!(row["archived"], true);
+    assert_eq!(row["rootless"], true);
+    assert_eq!(row["rootPath"], "");
+    assert_eq!(row["boardPath"], rootless_path);
+
+    let restored = fixture.ok_json(
+        &fixture.root,
+        &["workspace", "unretire", "ROOTLESS", "--as", "geo", "--json"],
+    );
+    assert_eq!(restored["archived"], false);
+    assert!(
+        restored["workspaceRoots"].as_array().unwrap().is_empty(),
+        "unretiring a rootless board should not fabricate roots"
+    );
+
+    let restored_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        restored_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "ROOTLESS" && row["rootless"] == true),
+        "unretiring the rootless board did not restore the active inventory: {restored_list}"
+    );
+}
+
+#[test]
+fn compiled_binary_keeps_rootless_retired_boards_visible_after_previous_detach_history() {
+    let fixture = Fixture::new("rootless-retire-history");
+    let project = fixture.root.join("project");
+    fs::create_dir_all(&project).unwrap();
+
+    let created = fixture.ok_json(&project, &["init", "--name", "ROOTLESS-HISTORY", "--json"]);
+    let board_path = created["boardPath"].as_str().unwrap().to_owned();
+    let root_path = created["workspaceRoots"][0]
+        .as_str()
+        .expect("rootless history root")
+        .to_owned();
+
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            &root_path,
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ROOTLESS-HISTORY",
+            "--as",
+            "geo",
+            "--note",
+            "retire after detach",
+            "--json",
+        ],
+    );
+    assert_eq!(retired["archived"], true);
+    assert!(
+        retired["workspaceRoots"].as_array().unwrap().is_empty(),
+        "retiring a rootless board must not invent roots"
+    );
+
+    let active_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ROOTLESS-HISTORY"),
+        "the retired rootless board leaked into the default inventory"
+    );
+
+    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
+    let rootless_rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["boardPath"] == board_path && row["rootless"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rootless_rows.len(),
+        1,
+        "retired rootless board with prior history disappeared from all inventory"
+    );
+    let row = rootless_rows[0];
+    assert_eq!(row["archived"], true);
+    assert_eq!(row["rootPath"], "");
+    assert_eq!(row["boardPath"], board_path);
+}
+
+#[test]
+fn compiled_binary_keeps_same_name_retired_boards_distinct_by_path() {
+    let fixture = Fixture::new("retired-same-name");
+    let first = fixture.root.join("first");
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+
+    let first_created = fixture.ok_json(&first, &["init", "--name", "SAME", "--json"]);
+    let first_path = first_created["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "SAME",
+            "--as",
+            "geo",
+            "--note",
+            "retire first same-name board",
+            "--json",
+        ],
+    );
+
+    let second_created = fixture.ok_json(&second, &["init", "--name", "SAME", "--json"]);
+    let second_path = second_created["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "SAME",
+            "--as",
+            "geo",
+            "--note",
+            "retire second same-name board",
+            "--json",
+        ],
+    );
+
+    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
+    let same_name_rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "SAME")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_name_rows.len(),
+        2,
+        "same-name retired boards were deduped"
+    );
+    let mut paths = same_name_rows
+        .iter()
+        .map(|row| row["boardPath"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut expected = vec![first_path, second_path];
+    expected.sort();
+    assert_eq!(paths, expected);
+    assert!(
+        same_name_rows.iter().all(|row| row["archived"] == true),
+        "retired same-name boards must remain archived in the all inventory"
+    );
+}
+
 /// Every fix below has a probe on the pre-fix binary behind it. These assert the
 /// dangerous behaviour is gone, not merely that the happy path still works.
 #[test]
@@ -5137,7 +5351,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 11"),
+        version.contains("registry schema 12"),
         "version output: {version}"
     );
 }
@@ -11016,6 +11230,47 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
 }
 
 #[test]
+fn the_mcp_server_rejects_retired_direct_board_paths_over_stdio() {
+    let fixture = Fixture::new("mcp-retired-db");
+    let active = fixture.root.join("active");
+    let retired = fixture.root.join("retired");
+    fs::create_dir_all(&active).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+
+    fixture.ok_json(&active, &["init", "--name", "MCP", "--json"]);
+    let retired_board = fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
+    let retired_path = retired_board["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "retire",
+            "RETIRED",
+            "--as",
+            "geo",
+            "--note",
+            "retire MCP board",
+            "--json",
+        ],
+    );
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let refused = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "task_list", "arguments": { "db": retired_path } }
+    }));
+    assert_eq!(refused["result"]["isError"], true);
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("retire MCP board"), "{text}");
+
+    session.finish();
+}
+
+#[test]
 fn the_mcp_server_reports_protocol_edges_over_stdio() {
     let fixture = Fixture::new("mcp-protocol-edge");
     fixture.ok_json(&fixture.main, &["init", "--name", "EDGE", "--json"]);
@@ -13228,6 +13483,556 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
     );
 }
 
+#[test]
+fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_conflicts() {
+    let fixture = Fixture::new("workspace-retire-unretire");
+    let alpha = fixture.root.join("alpha");
+    let alpha_spare = fixture.root.join("alpha-spare");
+    let beta = fixture.root.join("beta");
+    let alpha_nested = alpha.join("nested");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::create_dir_all(&alpha_spare).unwrap();
+    fs::create_dir_all(&beta).unwrap();
+    fs::create_dir_all(&alpha_nested).unwrap();
+    let alpha_spare = alpha_spare.canonicalize().unwrap();
+
+    let alpha_registered = fixture.ok_json(&alpha, &["init", "--name", "ALPHA", "--json"]);
+    let alpha_root = alpha_registered["workspaceRoots"][0]
+        .as_str()
+        .expect("alpha root")
+        .to_owned();
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            "ALPHA",
+            "--workspace",
+            alpha_spare.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            alpha_spare.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &alpha,
+        &[
+            "task",
+            "add",
+            "Retired needle 77",
+            "--id",
+            "t-retired-77",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(&beta, &["init", "--name", "BETA", "--json"]);
+    let retirement_note = "moved-to-hig";
+
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--note",
+            retirement_note,
+            "--json",
+        ],
+    );
+    assert_eq!(retired["name"], "ALPHA");
+    assert_eq!(retired["archivedBy"], "geo");
+    assert_eq!(retired["archivedNote"], retirement_note);
+    assert_eq!(retired["workspaceRoots"], json!([alpha_root.clone()]));
+    assert!(retired["archivedAt"].as_i64().is_some());
+    let retired_path = retired["boardPath"].as_str().unwrap().to_owned();
+
+    let with_env = |key: &str, value: &str, args: &[&str]| -> Output {
+        fixture
+            .command(&fixture.root)
+            .env(key, value)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let direct_write = fixture.run(
+        &fixture.root,
+        &[
+            "task",
+            "add",
+            "Blocked by retirement",
+            "--db",
+            &retired_path,
+            "--json",
+        ],
+    );
+    assert!(
+        !direct_write.status.success(),
+        "a retired board path still answered writes"
+    );
+    let direct_write_stderr = String::from_utf8_lossy(&direct_write.stderr).into_owned();
+    assert!(
+        direct_write_stderr.contains(retirement_note),
+        "{direct_write_stderr}"
+    );
+
+    let direct_watch = fixture.run(
+        &fixture.root,
+        &["watch", "--db", &retired_path, "--limit", "0", "--json"],
+    );
+    assert!(
+        !direct_watch.status.success(),
+        "a retired board path still answered watch"
+    );
+    let direct_watch_stderr = String::from_utf8_lossy(&direct_watch.stderr).into_owned();
+    assert!(
+        direct_watch_stderr.contains(retirement_note),
+        "{direct_watch_stderr}"
+    );
+
+    let env_list = with_env("KANBAN_DB", &retired_path, &["task", "list", "--json"]);
+    assert!(
+        !env_list.status.success(),
+        "KANBAN_DB still answered from a retired board"
+    );
+    let env_list_stderr = String::from_utf8_lossy(&env_list.stderr).into_owned();
+    assert!(
+        env_list_stderr.contains(retirement_note),
+        "{env_list_stderr}"
+    );
+
+    let active_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ALPHA"),
+        "retired board leaked into the default workspace list"
+    );
+    let all_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
+    let retired_rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["boardPath"] == retired_path && row["rootless"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retired_rows.len(),
+        0,
+        "retired rooted board still gained a rootless summary row"
+    );
+    let retired_row = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["boardPath"] == retired_path && row["rootPath"] == alpha_root)
+        .expect("archived ALPHA retirement row");
+    assert_eq!(retired_row["archived"], true);
+    assert_eq!(retired_row["archivedBy"], "geo");
+    assert_eq!(retired_row["archivedNote"], retirement_note);
+    assert_eq!(retired_row["rootless"], false);
+
+    let dashboard = fixture.ok_json(&fixture.root, &["dashboard", "--json"]);
+    assert!(
+        dashboard
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ALPHA"),
+        "retired board leaked into the default dashboard"
+    );
+    let dashboard_all = fixture.ok_json(&fixture.root, &["dashboard", "--all", "--json"]);
+    let dashboard_alpha = dashboard_all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ALPHA")
+        .expect("archived ALPHA dashboard row");
+    assert_eq!(dashboard_alpha["archived"], true);
+    assert_eq!(dashboard_alpha["archivedNote"], retirement_note);
+
+    let doctor = fixture.ok_json(&fixture.root, &["doctor", "--json"]);
+    assert!(
+        doctor["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ALPHA"),
+        "retired board leaked into the default doctor report"
+    );
+    let doctor_all = fixture.ok_json(&fixture.root, &["doctor", "--all", "--json"]);
+    let doctor_alpha = doctor_all["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ALPHA")
+        .expect("archived ALPHA doctor row");
+    assert_eq!(doctor_alpha["archived"], true);
+    assert_eq!(doctor_alpha["archivedBy"], "geo");
+    assert_eq!(doctor_alpha["archivedNote"], retirement_note);
+
+    let search_default = fixture.ok_json(
+        &fixture.root,
+        &["search", "Retired needle 77", "--all-boards", "--json"],
+    );
+    assert!(
+        search_default["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["board"] != "ALPHA"),
+        "default all-board search inspected a retired board"
+    );
+    let rebuilt_default = fixture.ok_json(
+        &fixture.root,
+        &["search-rebuild", "--all-boards", "--as", "geo", "--json"],
+    );
+    assert!(
+        rebuilt_default["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["board"] != "ALPHA"),
+        "default all-board search rebuild inspected a retired board"
+    );
+    let search_all = fixture.ok_json(
+        &fixture.root,
+        &[
+            "search",
+            "Retired needle 77",
+            "--all-boards",
+            "--all",
+            "--json",
+        ],
+    );
+    let search_alpha = search_all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["board"] == "ALPHA")
+        .expect("archived ALPHA search result");
+    assert_eq!(search_alpha["board"], "ALPHA");
+
+    let denied_name = fixture.run(
+        &fixture.root,
+        &[
+            "task",
+            "add",
+            "Blocked by retirement",
+            "--project",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !denied_name.status.success(),
+        "a retired board name was still writable"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_name.stderr).contains(retirement_note),
+        "{}",
+        String::from_utf8_lossy(&denied_name.stderr)
+    );
+
+    let denied_root = fixture.run(&alpha_nested, &["task", "show", "t-retired-77", "--json"]);
+    assert!(
+        !denied_root.status.success(),
+        "a retired root still resolved"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_root.stderr).contains(retirement_note),
+        "{}",
+        String::from_utf8_lossy(&denied_root.stderr)
+    );
+
+    fixture.ok_json(
+        &beta,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            "BETA",
+            "--workspace",
+            &alpha_root,
+            "--json",
+        ],
+    );
+    let conflict = fixture.run(
+        &fixture.root,
+        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+    );
+    assert!(
+        !conflict.status.success(),
+        "a conflicting unretire was accepted"
+    );
+    let conflict_stderr = String::from_utf8_lossy(&conflict.stderr).into_owned();
+    assert!(
+        conflict_stderr.contains("cannot be unretired"),
+        "{conflict_stderr}"
+    );
+    let failed_unretire_events = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_unretired",
+            "--json",
+        ],
+    );
+    assert!(
+        failed_unretire_events.as_array().unwrap().is_empty(),
+        "a failed unretire wrote an audit event"
+    );
+
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            &alpha_root,
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let restored = fixture.ok_json(
+        &fixture.root,
+        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+    );
+    assert_eq!(restored["name"], "ALPHA");
+    assert_eq!(restored["workspaceRoots"], json!([alpha_root.clone()]));
+    assert!(restored.get("archivedAt").is_none());
+    assert!(restored.get("archivedBy").is_none());
+    assert!(restored.get("archivedNote").is_none());
+
+    let restored_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        restored_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "ALPHA" && row["archived"] == false),
+        "unretire did not restore the default workspace list"
+    );
+    let restored_search = fixture.ok_json(
+        &fixture.root,
+        &["search", "Retired needle 77", "--all-boards", "--json"],
+    );
+    assert!(
+        restored_search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["board"] == "ALPHA" && row["archived"] == false),
+        "unretire did not restore all-board search access"
+    );
+    assert_eq!(
+        fixture.ok_json(&alpha_nested, &["task", "show", "t-retired-77", "--json"])["id"],
+        "t-retired-77",
+        "unretire did not restore the retired workspace path"
+    );
+
+    let retired_events = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_retired",
+            "--json",
+        ],
+    );
+    assert_eq!(retired_events.as_array().unwrap().len(), 1);
+    assert_eq!(retired_events[0]["actor"], "geo");
+    assert!(
+        !retired_events[0]["payload"]["retirementId"]
+            .as_str()
+            .expect("retirement id")
+            .is_empty()
+    );
+    assert_eq!(
+        retired_events[0]["payload"]["archivedNote"],
+        retirement_note
+    );
+    let unretired_events = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_unretired",
+            "--json",
+        ],
+    );
+    assert_eq!(unretired_events.as_array().unwrap().len(), 1);
+    assert_eq!(unretired_events[0]["actor"], "geo");
+    assert_eq!(
+        retired_events[0]["payload"]["retirementId"],
+        unretired_events[0]["payload"]["retirementId"]
+    );
+    assert_eq!(
+        unretired_events[0]["payload"]["restoredRoots"],
+        json!([alpha_root])
+    );
+}
+
+#[test]
+fn retired_direct_db_refuses_when_registry_is_corrupt_or_stale_but_external_db_without_registry_still_works()
+ {
+    let fixture = Fixture::new("retired-direct-db-boundary");
+    let managed = fixture.root.join("managed");
+    let workspace = managed.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let created = fixture.ok_json(&workspace, &["init", "--name", "ALPHA", "--json"]);
+    assert_eq!(created["name"], "ALPHA");
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--note",
+            "moved-to-hig",
+            "--json",
+        ],
+    );
+    let retired_path = retired["boardPath"].as_str().unwrap().to_owned();
+    let registry_source = fixture.data.join("registry.db");
+
+    let corrupt_root = fixture.root.join("corrupt-data");
+    fs::create_dir_all(&corrupt_root).unwrap();
+    let corrupt_registry = corrupt_root.join("registry.db");
+    fs::copy(&registry_source, &corrupt_registry).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&corrupt_registry)
+        .unwrap()
+        .set_len(32)
+        .unwrap();
+
+    let corrupt_flag = fixture
+        .command_with_data_dir(&fixture.root, &corrupt_root)
+        .args(["task", "list", "--db", &retired_path, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !corrupt_flag.status.success(),
+        "a corrupt registry still allowed a retired direct board path"
+    );
+
+    let corrupt_env = fixture
+        .command_with_data_dir(&fixture.root, &corrupt_root)
+        .env("KANBAN_DB", &retired_path)
+        .args(["task", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !corrupt_env.status.success(),
+        "a corrupt registry still allowed KANBAN_DB on a retired board"
+    );
+
+    let stale_root = fixture.root.join("stale-data");
+    fs::create_dir_all(&stale_root).unwrap();
+    let stale_registry = stale_root.join("registry.db");
+    fs::copy(&registry_source, &stale_registry).unwrap();
+    let connection = Connection::open(&stale_registry).unwrap();
+    connection.execute_batch("PRAGMA user_version=11;").unwrap();
+
+    let stale_flag = fixture
+        .command_with_data_dir(&fixture.root, &stale_root)
+        .args(["task", "list", "--db", &retired_path, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !stale_flag.status.success(),
+        "a stale registry still allowed a retired direct board path"
+    );
+
+    let stale_env = fixture
+        .command_with_data_dir(&fixture.root, &stale_root)
+        .env("KANBAN_DB", &retired_path)
+        .args(["task", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !stale_env.status.success(),
+        "a stale registry still allowed KANBAN_DB on a retired board"
+    );
+
+    let external_root = fixture.root.join("external-data");
+    fs::create_dir_all(&external_root).unwrap();
+    let external_db = fixture.root.join("external.db");
+    let external_added = fixture
+        .command_with_data_dir(&fixture.root, &external_root)
+        .args([
+            "task",
+            "add",
+            "External control task",
+            "--id",
+            "t-external",
+            "--db",
+            external_db.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        external_added.status.success(),
+        "a truly external direct board file should stay usable without a registry"
+    );
+    let external_added_json: Value = serde_json::from_slice(&external_added.stdout).unwrap();
+    assert_eq!(external_added_json["id"], "t-external");
+
+    let external_list = fixture
+        .command_with_data_dir(&fixture.root, &external_root)
+        .args([
+            "task",
+            "list",
+            "--db",
+            external_db.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        external_list.status.success(),
+        "a truly external direct board file should stay usable without a registry"
+    );
+    let external_list_json: Value = serde_json::from_slice(&external_list.stdout).unwrap();
+    assert!(
+        external_list_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "t-external"),
+        "the external control board lost its task after a successful list"
+    );
+}
+
 /// One HTTP request to the running server, as a real socket conversation.
 ///
 /// Hand-rolled rather than reached for a client crate: this must exercise the
@@ -14251,6 +15056,52 @@ fn serve_actor_header_duplicate_cli_flags_fail_closed() {
     assert!(
         stderr.contains("given more than once") || stderr.contains("takes a single value"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
+    let fixture = Fixture::new("serve-retired-board");
+    let active = fixture.root.join("active");
+    let retired = fixture.root.join("retired");
+    fs::create_dir_all(&active).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+
+    fixture.ok_json(&active, &["init", "--name", "ACTIVE", "--json"]);
+    fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "RETIRED",
+            "--as",
+            "geo",
+            "--note",
+            "retire served board",
+            "--json",
+        ],
+    );
+
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let (status, boards) = http_get(port, "/boards");
+    assert_eq!(status, 200, "{boards}");
+    assert!(
+        boards.contains("ACTIVE"),
+        "the active board disappeared from the board index: {boards}"
+    );
+    assert!(
+        !boards.contains("RETIRED"),
+        "the retired board leaked into the board index: {boards}"
+    );
+
+    let (status, retired_page) = http_get(port, "/board/RETIRED");
+    assert_eq!(status, 500, "{retired_page}");
+    assert!(
+        retired_page.contains("retire served board"),
+        "{retired_page}"
     );
 }
 
@@ -15718,7 +16569,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
 }
 
@@ -15777,7 +16628,7 @@ fn registry_v10_migration_records_discarded_alias_names() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let (kind, actor, payload): (String, String, String) = registry
         .query_row(

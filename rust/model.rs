@@ -494,6 +494,8 @@ pub struct WorkspaceRecord {
     pub archived: bool,
     pub archived_at: Option<i64>,
     pub archived_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_note: Option<String>,
     pub rootless: bool,
 }
 
@@ -504,6 +506,13 @@ pub struct ProjectRecord {
     pub board_path: String,
     pub workspace_roots: Vec<String>,
     pub last_used_at: i64,
+    pub archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

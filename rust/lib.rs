@@ -26,7 +26,9 @@ mod watch;
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
-use crate::registry::{Registry, data_root, now_ms, require_sane_clock};
+use crate::registry::{
+    BoardPathState, Registry, data_root, now_ms, require_sane_clock, retired_board_message,
+};
 use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -46,9 +48,11 @@ Usage:
   kanban workspace list [--all] [--json]
   kanban workspace attach --to NAME|REGISTERED_PATH [--workspace PATH] [--as ACTOR]
   kanban workspace detach --root REGISTERED_PATH --as ACTOR
+  kanban workspace retire NAME --as ACTOR --note TEXT
+  kanban workspace unretire NAME --as ACTOR
   kanban workspace repoint [--root PATH] [--as ACTOR] [--json]
-  kanban dashboard [--json]
-  kanban doctor [--json]
+  kanban dashboard [--all] [--json]
+  kanban doctor [--all] [--json]
   kanban audit verify [--against MANIFEST] [--json]
   kanban search QUERY [--source KIND] [--status STATUS] [--tag NAME] [--lane LANE]
              [--after MS] [--before MS] [--all] [--all-boards]
@@ -320,6 +324,18 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
     ),
     (
         "workspace",
+        Some("retire"),
+        &["db", "project", "workspace"],
+        "retires one named board, not a board selector",
+    ),
+    (
+        "workspace",
+        Some("unretire"),
+        &["db", "project", "workspace"],
+        "restores one named board, not a board selector",
+    ),
+    (
+        "workspace",
         Some("repoint"),
         &["db", "project", "workspace"],
         "repairs registered roots, named by --root or taken from the registry",
@@ -451,9 +467,17 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("workspace", Some("list"), &["all"], &[], true),
     ("workspace", Some("attach"), &["to", "as"], &[], false),
     ("workspace", Some("detach"), &["root", "as"], &[], false),
+    (
+        "workspace",
+        Some("retire"),
+        &["as", "note"],
+        &["name"],
+        false,
+    ),
+    ("workspace", Some("unretire"), &["as"], &["name"], false),
     ("workspace", Some("repoint"), &["root", "as"], &[], false),
-    ("dashboard", None, &[], &[], true),
-    ("doctor", None, &[], &[], true),
+    ("dashboard", None, &["all"], &[], true),
+    ("doctor", None, &["all"], &[], true),
     ("audit", Some("verify"), &["against"], &[], true),
     (
         "search",
@@ -1413,7 +1437,7 @@ fn cwd() -> Result<PathBuf> {
 /// empty, so a first-run error is not padded with a pointless "known projects:".
 fn known_projects(registry: &Registry) -> Result<String> {
     let names = registry
-        .projects()?
+        .projects_active()?
         .into_iter()
         .map(|project| project.name)
         .collect::<Vec<_>>();
@@ -1424,14 +1448,31 @@ fn known_projects(registry: &Registry) -> Result<String> {
     })
 }
 
-fn project_candidates(projects: &[ProjectRecord]) -> String {
+pub(crate) fn project_candidates(projects: &[ProjectRecord]) -> String {
     projects
         .iter()
         .map(|project| {
-            if project.workspace_roots.is_empty() {
-                format!("{} (rootless)", project.name)
+            let retired = if project.archived {
+                match project
+                    .archived_note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|note| !note.is_empty())
+                {
+                    Some(note) => format!(" (retired: {note})"),
+                    None => " (retired)".to_owned(),
+                }
             } else {
-                format!("{} [{}]", project.name, project.workspace_roots.join(", "))
+                String::new()
+            };
+            if project.workspace_roots.is_empty() {
+                format!("{} (rootless){retired}", project.name)
+            } else {
+                format!(
+                    "{} [{}]{retired}",
+                    project.name,
+                    project.workspace_roots.join(", ")
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -1448,12 +1489,30 @@ fn board_by_name(registry: &Registry, name: &str) -> Result<PathBuf> {
             registry.touch_board(&project.board_path)?;
             Ok(PathBuf::from(&project.board_path))
         }
-        [] => bail!(
-            "no Kanban project named {name}{}",
-            known_projects(registry)?
-        ),
+        [] => {
+            let retired = registry.by_name_all(name)?;
+            match retired.as_slice() {
+                [] => bail!(
+                    "no Kanban project named {name}{}",
+                    known_projects(registry)?
+                ),
+                [project] => bail!(
+                    "{}",
+                    retired_board_message(
+                        &project.name,
+                        project.archived_note.as_deref(),
+                        "addressing it"
+                    )
+                ),
+                many => bail!(
+                    "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                    many.len(),
+                    project_candidates(many)
+                ),
+            }
+        }
         many => bail!(
-            "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
+            "{} Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
             many.len(),
             project_candidates(many)
         ),
@@ -1767,6 +1826,15 @@ fn store_path(args: &Args, creation: BoardCreation) -> Result<PathBuf> {
     match board_selection(args) {
         BoardSelection::Db { path, explicit } => {
             require_board_file(&path, explicit, creation)?;
+            if path.exists()
+                && let Some(BoardPathState::Retired { name, note }) =
+                    Registry::board_path_state_if_available(&path)?
+            {
+                bail!(
+                    "{}",
+                    retired_board_message(&name, note.as_deref(), "addressing it")
+                );
+            }
             Ok(path)
         }
         BoardSelection::Project(name) => {
@@ -1801,6 +1869,15 @@ fn store_path_readonly(args: &Args) -> Result<PathBuf> {
             // Nothing reached through here writes, so a missing file is
             // reported whichever selector named it.
             require_board_file(&path, explicit, BoardCreation::Refused)?;
+            if path.exists()
+                && let Some(BoardPathState::Retired { name, note }) =
+                    Registry::board_path_state_if_available(&path)?
+            {
+                bail!(
+                    "{}",
+                    retired_board_message(&name, note.as_deref(), "addressing it")
+                );
+            }
             return Ok(path);
         }
         BoardSelection::Project(name) => {
@@ -1808,12 +1885,30 @@ fn store_path_readonly(args: &Args) -> Result<PathBuf> {
             let matches = registry.by_name(&name)?;
             match matches.as_slice() {
                 [project] => PathBuf::from(&project.board_path),
-                [] => bail!(
-                    "no Kanban project named {name}{}",
-                    known_projects(&registry)?
-                ),
+                [] => {
+                    let retired = registry.by_name_all(&name)?;
+                    match retired.as_slice() {
+                        [] => bail!(
+                            "no Kanban project named {name}{}",
+                            known_projects(&registry)?
+                        ),
+                        [project] => bail!(
+                            "{}",
+                            retired_board_message(
+                                &project.name,
+                                project.archived_note.as_deref(),
+                                "addressing it"
+                            )
+                        ),
+                        many => bail!(
+                            "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                            many.len(),
+                            project_candidates(many)
+                        ),
+                    }
+                }
                 many => bail!(
-                    "{} Kanban projects are named {name}; disambiguate with --workspace PATH: {}",
+                    "{} Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
                     many.len(),
                     project_candidates(many)
                 ),
@@ -2249,11 +2344,16 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
         let registry = Registry::open_readonly()?;
+        let projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
         let mut results = Vec::new();
         let mut boards = Vec::new();
         let mut missing = Vec::new();
         let mut unreadable = Vec::new();
-        for project in registry.projects()? {
+        for project in projects {
             match survey_board(&project.board_path) {
                 SurveyBoard::Readable => {}
                 SurveyBoard::Unreadable(reason) => {
@@ -2319,7 +2419,7 @@ fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value>
         let mut reports = Vec::new();
         let mut missing = Vec::new();
         let mut unreadable = Vec::new();
-        for project in registry.projects()? {
+        for project in registry.projects_active()? {
             match survey_board(&project.board_path) {
                 SurveyBoard::Readable => {}
                 SurveyBoard::Unreadable(reason) => {
@@ -2350,27 +2450,18 @@ fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value>
 /// Rules are one registry-owned document. Bodies remain lazy; this is only the
 /// applicable table of contents for the addressed board and optional task.
 fn selected_board_name(args: &Args) -> Result<Option<String>> {
-    let mut registry = Registry::open()?;
     match board_selection(args) {
-        BoardSelection::Db { path, .. } => {
-            let resolved = path.canonicalize().unwrap_or(path);
-            let matches = registry
-                .projects()?
-                .into_iter()
-                .filter(|project| {
-                    Path::new(&project.board_path)
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(&project.board_path))
-                        == resolved
-                })
-                .collect::<Vec<_>>();
-            Ok(match matches.as_slice() {
-                [project] => Some(project.name.clone()),
-                _ => None,
-            })
-        }
+        BoardSelection::Db { path, .. } => match Registry::board_path_state_if_available(&path)? {
+            Some(BoardPathState::Active(name)) => Ok(Some(name)),
+            Some(BoardPathState::Retired { name, note }) => bail!(
+                "{}",
+                retired_board_message(&name, note.as_deref(), "addressing it")
+            ),
+            Some(BoardPathState::External) | None => Ok(None),
+        },
         BoardSelection::Project(name) => Ok(Some(name)),
         BoardSelection::Workspace(workspace) => {
+            let mut registry = Registry::open()?;
             let workspace = match workspace {
                 Some(path) => path,
                 None => cwd()?,
@@ -3289,6 +3380,18 @@ fn run() -> Result<()> {
         let record = registry.detach(args.require("root")?, args.require("as")?)?;
         return print(&record, args.has("json"));
     }
+    if command == "workspace" && sub == Some("retire") {
+        let mut registry = Registry::open()?;
+        let name = rest.first().context("workspace name is required")?;
+        let record = registry.retire(name, args.require("as")?, args.require("note")?)?;
+        return print(&record, args.has("json"));
+    }
+    if command == "workspace" && sub == Some("unretire") {
+        let mut registry = Registry::open()?;
+        let name = rest.first().context("workspace name is required")?;
+        let record = registry.unretire(name, args.require("as")?)?;
+        return print(&record, args.has("json"));
+    }
     if command == "workspace" && sub == Some("repoint") {
         let mut registry = Registry::open()?;
         // Without --root, repoint every broken row: the usual cause is one tree
@@ -3313,8 +3416,13 @@ fn run() -> Result<()> {
     }
     if command == "dashboard" {
         let registry = Registry::open()?;
+        let projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
         let mut output = Vec::new();
-        for project in registry.projects()? {
+        for project in projects {
             let mut value = object_of(&project)?;
             match survey_board(&project.board_path) {
                 SurveyBoard::Readable => {
@@ -3476,13 +3584,18 @@ fn run() -> Result<()> {
         let registry_check = registry.integrity()?;
         let registry_audit = registry.audit()?;
         let registry_schema = db::schema_version(&registry.connection)?;
+        let registry_projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
         let mut projects = Vec::new();
         // Roots are discovery hints, not board identity (ADR-028). Keep stale
         // hints visible so an operator can repoint or retire them, but do not
         // fail an otherwise healthy board that remains reachable by name.
         let unreachable = registry.unreachable_roots()?;
         let mut healthy = registry_check == vec!["ok"] && registry_audit.healthy;
-        for project in registry.projects()? {
+        for project in registry_projects {
             // Checked before opening, because opening would create it.
             //
             // `present` keeps the value it has always carried: true exactly

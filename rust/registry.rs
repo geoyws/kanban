@@ -182,6 +182,7 @@ fn row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
         archived: record.get::<_, i64>("archived")? != 0,
         archived_at: record.get("archived_at")?,
         archived_by: record.get("archived_by")?,
+        archived_note: record.get("archived_note")?,
         rootless: record.get::<_, i64>("rootless")? != 0,
     })
 }
@@ -196,6 +197,7 @@ fn history_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> 
         archived: true,
         archived_at: record.get("archived_at")?,
         archived_by: record.get("archived_by")?,
+        archived_note: record.get("archived_note")?,
         rootless: false,
     })
 }
@@ -210,8 +212,121 @@ fn rootless_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord>
         archived: record.get::<_, i64>("archived")? != 0,
         archived_at: record.get("archived_at")?,
         archived_by: record.get("archived_by")?,
+        archived_note: record.get("archived_note")?,
         rootless: record.get::<_, i64>("rootless")? != 0,
     })
+}
+
+fn push_unique_root(roots: &mut Vec<String>, seen: &mut HashSet<String>, root: String) {
+    if seen.insert(root.clone()) {
+        roots.push(root);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoardPathState {
+    Active(String),
+    Retired { name: String, note: Option<String> },
+    External,
+}
+
+pub(crate) fn retired_board_message(name: &str, note: Option<&str>, action: &str) -> String {
+    let note = note.map(str::trim).filter(|note| !note.is_empty());
+    match note {
+        Some(note) => format!(
+            "Kanban project {name} is retired (retirement note: {note}); use `kanban workspace unretire {name} --as ACTOR` before {action}"
+        ),
+        None => format!(
+            "Kanban project {name} is retired; use `kanban workspace unretire {name} --as ACTOR` before {action}"
+        ),
+    }
+}
+
+type BoardRow = (
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn board_roots(
+    connection: &Connection,
+    board_path: &str,
+    retirement_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(retirement_id) = retirement_id {
+        let mut statement = connection.prepare(
+            "SELECT root_path FROM workspace_alias_history WHERE board_path=? AND retirement_id=? ORDER BY last_used_at DESC,root_path",
+        )?;
+        for root in statement.query_map(params![board_path, retirement_id], |row| {
+            row.get::<_, String>(0)
+        })? {
+            push_unique_root(&mut roots, &mut seen, root?);
+        }
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT root_path FROM workspace_roots WHERE board_path=? ORDER BY last_used_at DESC,root_path",
+        )?;
+        for root in statement.query_map([board_path], |row| row.get::<_, String>(0))? {
+            push_unique_root(&mut roots, &mut seen, root?);
+        }
+    }
+    Ok(roots)
+}
+
+fn latest_history_root(
+    connection: &Connection,
+    workspace: &Path,
+) -> Result<Option<WorkspaceRecord>> {
+    let text = workspace.to_string_lossy();
+    let latest = connection
+        .query_row(
+            "SELECT root_path,\
+                    name,\
+                    board_path,\
+                    created_at,\
+                    last_used_at,\
+                    archived_at,\
+                    archived_by,\
+                    archived_note \
+             FROM workspace_alias_history \
+             WHERE root_path=? \
+             ORDER BY archived_at DESC,seq DESC \
+             LIMIT 1",
+            [text.as_ref()],
+            |record| {
+                Ok(WorkspaceRecord {
+                    root_path: record.get("root_path")?,
+                    name: record.get("name")?,
+                    board_path: record.get("board_path")?,
+                    created_at: record.get("created_at")?,
+                    last_used_at: record.get("last_used_at")?,
+                    archived: true,
+                    archived_at: record.get("archived_at")?,
+                    archived_by: record.get("archived_by")?,
+                    archived_note: record.get("archived_note")?,
+                    rootless: false,
+                })
+            },
+        )
+        .optional()?;
+    Ok(latest)
+}
+
+fn board_archived(connection: &Connection, board_path: &str) -> Result<Option<bool>> {
+    connection
+        .query_row(
+            "SELECT archived FROM boards WHERE board_path=?",
+            [board_path],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn active_named(
@@ -219,7 +334,7 @@ fn active_named(
     name: &str,
     exclude_board_path: Option<&str>,
 ) -> Result<bool> {
-    let mut sql = String::from("SELECT 1 FROM boards WHERE name=?");
+    let mut sql = String::from("SELECT 1 FROM boards WHERE name=? AND archived=0");
     if exclude_board_path.is_some() {
         sql.push_str(" AND board_path<>?");
     }
@@ -290,24 +405,167 @@ impl Registry {
         })
     }
 
-    fn project_for_board_path(&self, board_path: &str) -> Result<ProjectRecord> {
-        let (name, board_path, last_used_at): (String, String, i64) = self.connection.query_row(
-            "SELECT name,board_path,last_used_at FROM boards WHERE board_path=?",
-            [board_path],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+    pub(crate) fn board_path_state(&self, path: &Path) -> Result<BoardPathState> {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let mut statement = self.connection.prepare(
-            "SELECT root_path FROM workspace_roots WHERE board_path=? ORDER BY last_used_at DESC,root_path",
+            "SELECT board_path,name,archived,archived_note FROM boards ORDER BY board_path",
         )?;
-        let workspace_roots = statement
-            .query_map([&board_path], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for row in statement.query_map([], |record| {
+            Ok((
+                record.get::<_, String>(0)?,
+                record.get::<_, String>(1)?,
+                record.get::<_, i64>(2)?,
+                record.get::<_, Option<String>>(3)?,
+            ))
+        })? {
+            let (board_path, name, archived, archived_note) = row?;
+            let project_path = Path::new(&board_path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&board_path));
+            if project_path == resolved {
+                if archived != 0 {
+                    return Ok(BoardPathState::Retired {
+                        name,
+                        note: archived_note,
+                    });
+                }
+                return Ok(BoardPathState::Active(name));
+            }
+        }
+        Ok(BoardPathState::External)
+    }
+
+    pub(crate) fn board_path_state_if_available(path: &Path) -> Result<Option<BoardPathState>> {
+        let root = data_root()?;
+        let registry_path = root.join("registry.db");
+        if !registry_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(
+            Registry::open_readonly_at(&root)?.board_path_state(path)?,
+        ))
+    }
+
+    fn project_for_board_path_internal(
+        &self,
+        board_path: &str,
+        include_archived: bool,
+    ) -> Result<ProjectRecord> {
+        let (
+            name,
+            board_path,
+            last_used_at,
+            archived_at,
+            archived_by,
+            archived_note,
+            retirement_id,
+        ): BoardRow = if include_archived {
+            self.connection.query_row(
+                "SELECT name,board_path,last_used_at,archived_at,archived_by,archived_note,retirement_id \
+                 FROM boards WHERE board_path=?",
+                [board_path],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?
+        } else {
+            self.connection.query_row(
+                "SELECT name,board_path,last_used_at,NULL AS archived_at,NULL AS archived_by,NULL AS archived_note,NULL AS retirement_id \
+                 FROM boards WHERE board_path=? AND archived=0",
+                [board_path],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?
+        };
+        let workspace_roots = board_roots(&self.connection, &board_path, retirement_id.as_deref())?;
         Ok(ProjectRecord {
             name,
             board_path,
             workspace_roots,
             last_used_at,
+            archived: archived_at.is_some(),
+            archived_at,
+            archived_by,
+            archived_note,
         })
+    }
+
+    fn projects_by_name(
+        connection: &Connection,
+        name: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ProjectRecord>> {
+        let mut sql = String::from(
+            "SELECT board_path,name,last_used_at,archived_at,archived_by,archived_note,retirement_id FROM boards WHERE name=?",
+        );
+        if !include_archived {
+            sql.push_str(" AND archived=0");
+        }
+        sql.push_str(" ORDER BY board_path");
+        let mut statement = connection.prepare(&sql)?;
+        let boards = statement
+            .query_map([name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut projects = Vec::with_capacity(boards.len());
+        for (
+            board_path,
+            name,
+            last_used_at,
+            archived_at,
+            archived_by,
+            archived_note,
+            retirement_id,
+        ) in boards
+        {
+            let workspace_roots = board_roots(connection, &board_path, retirement_id.as_deref())?;
+            projects.push(ProjectRecord {
+                name,
+                board_path,
+                workspace_roots,
+                last_used_at,
+                archived: archived_at.is_some(),
+                archived_at,
+                archived_by,
+                archived_note,
+            });
+        }
+        projects.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
+        Ok(projects)
+    }
+
+    fn project_for_board_path(&self, board_path: &str) -> Result<ProjectRecord> {
+        self.project_for_board_path_internal(board_path, false)
+    }
+
+    fn project_for_board_path_all(&self, board_path: &str) -> Result<ProjectRecord> {
+        self.project_for_board_path_internal(board_path, true)
     }
 
     pub fn register(
@@ -431,6 +689,19 @@ impl Registry {
             if let Some(found) = self.exact(&cursor)? {
                 return Ok(Some(found));
             }
+            if let Some(history) = latest_history_root(&self.connection, &cursor)?
+                && board_archived(&self.connection, &history.board_path)?.unwrap_or(false)
+            {
+                bail!(
+                    "{} belongs to {}",
+                    cursor.display(),
+                    retired_board_message(
+                        &history.name,
+                        history.archived_note.as_deref(),
+                        "addressing it"
+                    )
+                );
+            }
         }
         Ok(None)
     }
@@ -448,9 +719,10 @@ impl Registry {
                         0 AS archived,\
                         NULL AS archived_at,\
                         NULL AS archived_by,\
+                        NULL AS archived_note,\
                         0 AS rootless \
                  FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
-                 WHERE workspace_roots.root_path=?",
+                 WHERE workspace_roots.root_path=? AND boards.archived=0",
                 [text.as_ref()],
                 row,
             )
@@ -477,6 +749,19 @@ impl Registry {
                 )?;
                 return self.exact(&cursor);
             }
+            if let Some(history) = latest_history_root(&self.connection, &cursor)?
+                && board_archived(&self.connection, &history.board_path)?.unwrap_or(false)
+            {
+                bail!(
+                    "{} belongs to {}",
+                    cursor.display(),
+                    retired_board_message(
+                        &history.name,
+                        history.archived_note.as_deref(),
+                        "addressing it"
+                    )
+                );
+            }
             if !cursor.pop() {
                 return Ok(None);
             }
@@ -490,6 +775,19 @@ impl Registry {
         loop {
             if let Some(found) = self.exact(&cursor)? {
                 return Ok(Some(found));
+            }
+            if let Some(history) = latest_history_root(&self.connection, &cursor)?
+                && board_archived(&self.connection, &history.board_path)?.unwrap_or(false)
+            {
+                bail!(
+                    "{} belongs to {}",
+                    cursor.display(),
+                    retired_board_message(
+                        &history.name,
+                        history.archived_note.as_deref(),
+                        "addressing it"
+                    )
+                );
             }
             if !cursor.pop() {
                 return Ok(None);
@@ -515,7 +813,20 @@ impl Registry {
             let matches = self.by_name(target)?;
             match matches.as_slice() {
                 [project] => project.clone(),
-                [] => bail!("no Kanban project named {target}"),
+                [] => {
+                    let retired = self.by_name_all(target)?;
+                    match retired.as_slice() {
+                        [] => bail!("no Kanban project named {target}"),
+                        [_project] => bail!(
+                            "Kanban project {target} is retired; use `kanban workspace unretire {target} --as ACTOR` before attaching to it"
+                        ),
+                        many => bail!(
+                            "{} retired Kanban projects are named {target}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                            many.len(),
+                            crate::project_candidates(many)
+                        ),
+                    }
+                }
                 many => {
                     let rootless = many
                         .iter()
@@ -607,8 +918,10 @@ impl Registry {
                     0 AS archived,\
                     NULL AS archived_at,\
                     NULL AS archived_by,\
+                    NULL AS archived_note,\
                     0 AS rootless \
              FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
+             WHERE boards.archived=0 \
              ORDER BY workspace_roots.last_used_at DESC, workspace_roots.root_path";
         let mut statement = self.connection.prepare(active_sql)?;
         let mut active = statement
@@ -625,9 +938,11 @@ impl Registry {
                     0 AS archived,\
                     NULL AS archived_at,\
                     NULL AS archived_by,\
+                    NULL AS archived_note,\
                     1 AS rootless \
              FROM boards \
-             WHERE NOT EXISTS (SELECT 1 FROM workspace_roots WHERE workspace_roots.board_path=boards.board_path) \
+             WHERE boards.archived=0 \
+               AND NOT EXISTS (SELECT 1 FROM workspace_roots WHERE workspace_roots.board_path=boards.board_path) \
              ORDER BY boards.last_used_at DESC, boards.board_path",
         )?;
         let mut rootless = statement
@@ -636,6 +951,28 @@ impl Registry {
         rootless.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
         out.extend(rootless);
         if include_archived {
+            let mut statement = self.connection.prepare(
+                "SELECT '' AS root_path,\
+                        boards.name AS name,\
+                        boards.board_path AS board_path,\
+                        boards.created_at AS created_at,\
+                        boards.last_used_at AS last_used_at,\
+                        1 AS archived,\
+                        boards.archived_at AS archived_at,\
+                        boards.archived_by AS archived_by,\
+                        boards.archived_note AS archived_note,\
+                        1 AS rootless \
+                 FROM boards \
+                 WHERE boards.archived=1 \
+                   AND NOT EXISTS (SELECT 1 FROM workspace_roots WHERE workspace_roots.board_path=boards.board_path) \
+                   AND (boards.retirement_id IS NULL OR NOT EXISTS (SELECT 1 FROM workspace_alias_history WHERE workspace_alias_history.board_path=boards.board_path AND workspace_alias_history.retirement_id=boards.retirement_id)) \
+                 ORDER BY boards.last_used_at DESC, boards.board_path",
+            )?;
+            let mut archived_rootless = statement
+                .query_map([], rootless_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            archived_rootless.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
+            out.extend(archived_rootless);
             let mut statement = self.connection.prepare(
                 "SELECT * FROM workspace_alias_history ORDER BY archived_at DESC,seq DESC",
             )?;
@@ -669,9 +1006,10 @@ impl Registry {
                         0 AS archived,\
                         NULL AS archived_at,\
                         NULL AS archived_by,\
+                        NULL AS archived_note,\
                         0 AS rootless \
                  FROM workspace_roots JOIN boards ON boards.board_path=workspace_roots.board_path \
-                 WHERE workspace_roots.root_path=?",
+                 WHERE workspace_roots.root_path=? AND boards.archived=0",
                 [root_path],
                 row,
             )
@@ -715,8 +1053,8 @@ impl Registry {
         }
         let now = now_ms();
         transaction.execute(
-            "INSERT INTO workspace_alias_history(root_path,name,board_path,created_at,last_used_at,archived_at,archived_by) VALUES(?,?,?,?,?,?,?)",
-            params![alias.root_path,alias.name,alias.board_path,alias.created_at,alias.last_used_at,now,actor],
+            "INSERT INTO workspace_alias_history(root_path,name,board_path,created_at,last_used_at,archived_at,archived_by,archived_note,retirement_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            params![alias.root_path,alias.name,alias.board_path,alias.created_at,alias.last_used_at,now,actor,None::<String>,None::<String>],
         )?;
         transaction.execute("DELETE FROM workspace_roots WHERE root_path=?", [root_path])?;
         crate::audit::append_registry_event(
@@ -736,6 +1074,203 @@ impl Registry {
         };
         transaction.commit()?;
         Ok(retired)
+    }
+
+    pub fn retire(&mut self, name: &str, actor: &str, note: &str) -> Result<ProjectRecord> {
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let note = note.trim();
+        if note.is_empty() {
+            bail!("note is required");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = Self::projects_by_name(&transaction, name, false)?;
+        let project = match active.as_slice() {
+            [project] => project.clone(),
+            [] => {
+                let retired = Self::projects_by_name(&transaction, name, true)?;
+                match retired.as_slice() {
+                    [] => bail!("no Kanban project named {name}"),
+                    [project] => bail!(
+                        "{}",
+                        retired_board_message(
+                            &project.name,
+                            project.archived_note.as_deref(),
+                            "retiring it"
+                        )
+                    ),
+                    many => bail!(
+                        "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                        many.len(),
+                        crate::project_candidates(many)
+                    ),
+                }
+            }
+            many => bail!(
+                "{} active Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                many.len(),
+                crate::project_candidates(many)
+            ),
+        };
+        let board_path = project.board_path.clone();
+        let board_name = project.name.clone();
+        let retirement_id = Uuid::new_v4().simple().to_string();
+        {
+            let transaction = transaction;
+            let roots = {
+                let mut roots_statement = transaction.prepare(
+                    "SELECT root_path,created_at,last_used_at FROM workspace_roots WHERE board_path=? ORDER BY last_used_at DESC,root_path",
+                )?;
+                roots_statement
+                    .query_map([&board_path], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let now = now_ms();
+            transaction.execute(
+                "UPDATE boards SET archived=1,archived_at=?,archived_by=?,archived_note=?,retirement_id=? WHERE board_path=?",
+                params![now, actor, note, &retirement_id, board_path],
+            )?;
+            for (root_path, created_at, last_used_at) in &roots {
+                transaction.execute(
+                    "INSERT INTO workspace_alias_history(root_path,name,board_path,created_at,last_used_at,archived_at,archived_by,archived_note,retirement_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                    params![root_path, board_name, board_path, created_at, last_used_at, now, actor, note, &retirement_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM workspace_roots WHERE board_path=?",
+                [&board_path],
+            )?;
+            crate::audit::append_registry_event(
+                &transaction,
+                &board_path,
+                "workspace_retired",
+                &actor,
+                &json!({
+                    "boardPath": board_path,
+                    "name": board_name,
+                    "retirementId": &retirement_id,
+                    "workspaceRoots": roots.iter().map(|(root_path, _, _)| root_path).collect::<Vec<_>>(),
+                    "archivedNote": note,
+                })
+                .to_string(),
+                now,
+            )?;
+            transaction.commit()?;
+        }
+        self.project_for_board_path_all(&board_path)
+    }
+
+    pub fn unretire(&mut self, name: &str, actor: &str) -> Result<ProjectRecord> {
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = Self::projects_by_name(&transaction, name, false)?;
+        match active.as_slice() {
+            [project] => {
+                bail!("Kanban project {} is already active", project.name)
+            }
+            [] => {}
+            many => bail!(
+                "{} active Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                many.len(),
+                crate::project_candidates(many)
+            ),
+        }
+        let archived = Self::projects_by_name(&transaction, name, true)?;
+        let project = match archived.as_slice() {
+            [] => bail!("no retired Kanban project named {name}"),
+            [project] => project.clone(),
+            many => bail!(
+                "{} retired Kanban projects are named {name}; use `kanban workspace list --all --json` to inspect their board paths: {}",
+                many.len(),
+                crate::project_candidates(many)
+            ),
+        };
+        let board_path = project.board_path.clone();
+        let board_name = project.name.clone();
+        let retirement_id = transaction
+            .query_row(
+                "SELECT retirement_id FROM boards WHERE board_path=?",
+                [&board_path],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .context("retired board is missing retirement id")?;
+        {
+            let transaction = transaction;
+            let roots = {
+                let mut roots_statement = transaction.prepare(
+                    "SELECT root_path,created_at,last_used_at FROM workspace_alias_history WHERE board_path=? AND retirement_id=? ORDER BY last_used_at DESC,root_path",
+                )?;
+                roots_statement
+                    .query_map(params![&board_path, &retirement_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut conflicts = Vec::new();
+            let mut restored = Vec::new();
+            for (root_path, created_at, last_used_at) in roots {
+                let existing = transaction
+                    .query_row(
+                        "SELECT board_path FROM workspace_roots WHERE root_path=?",
+                        [&root_path],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                match existing {
+                    None => restored.push((root_path, created_at, last_used_at)),
+                    Some(active_board_path) if active_board_path == board_path => {}
+                    Some(active_board_path) => conflicts.push((root_path, active_board_path)),
+                }
+            }
+            if let Some((root_path, board_path)) = conflicts.first() {
+                bail!(
+                    "{} is already the active root of {}, so {} cannot be unretired",
+                    root_path,
+                    board_path,
+                    board_name
+                );
+            }
+            let now = now_ms();
+            transaction.execute(
+                "UPDATE boards SET archived=0,archived_at=NULL,archived_by=NULL,archived_note=NULL,retirement_id=NULL,last_used_at=? WHERE board_path=?",
+                params![now, board_path],
+            )?;
+            for (root_path, created_at, last_used_at) in &restored {
+                transaction.execute(
+                    "INSERT INTO workspace_roots(root_path,board_path,created_at,last_used_at) VALUES(?,?,?,?)",
+                    params![root_path, board_path, created_at, last_used_at],
+                )?;
+            }
+            crate::audit::append_registry_event(
+                &transaction,
+                &board_path,
+                "workspace_unretired",
+                &actor,
+                &json!({
+                    "boardPath": board_path,
+                    "name": board_name,
+                    "retirementId": &retirement_id,
+                    "restoredRoots": restored.iter().map(|(root_path, _, _)| root_path).collect::<Vec<_>>(),
+                })
+                .to_string(),
+                now,
+            )?;
+            transaction.commit()?;
+        }
+        self.project_for_board_path(&board_path)
     }
 
     /// Turn operator-facing include/exclude flags into the one canonical tag
@@ -771,7 +1306,7 @@ impl Registry {
             if name == "ALL" {
                 bail!("ALL is only valid as --board ALL, never --except-board ALL");
             }
-            match self.by_name(name)?.len() {
+            match self.by_name_active(name)?.len() {
                 1 => {}
                 0 => bail!("no registered Kanban board named {name}"),
                 count => bail!(
@@ -796,7 +1331,7 @@ impl Registry {
     /// board still owns its description and decides whether it registers it.
     pub fn canonical_rule_task_tags(&self, tags: &[String]) -> Result<Vec<String>> {
         let mut known = HashSet::new();
-        for project in self.projects()? {
+        for project in self.projects_active()? {
             let path = Path::new(&project.board_path);
             if !path.is_file() {
                 continue;
@@ -1498,43 +2033,81 @@ impl Registry {
         )? != 0)
     }
 
-    pub fn projects(&self) -> Result<Vec<ProjectRecord>> {
+    fn projects_internal(&self, include_archived: bool) -> Result<Vec<ProjectRecord>> {
         let boards = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT board_path,name,last_used_at FROM boards ORDER BY board_path")?;
+            let mut sql = String::from(
+                "SELECT board_path,name,last_used_at,archived_at,archived_by,archived_note,retirement_id FROM boards",
+            );
+            if !include_archived {
+                sql.push_str(" WHERE archived=0");
+            }
+            sql.push_str(" ORDER BY board_path");
+            let mut statement = self.connection.prepare(&sql)?;
             statement
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut projects = Vec::with_capacity(boards.len());
-        for (board_path, name, last_used_at) in boards {
-            let mut roots_statement = self.connection.prepare(
-                "SELECT root_path FROM workspace_roots WHERE board_path=? ORDER BY last_used_at DESC,root_path",
-            )?;
-            let workspace_roots = roots_statement
-                .query_map([&board_path], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (
+            board_path,
+            name,
+            last_used_at,
+            archived_at,
+            archived_by,
+            archived_note,
+            retirement_id,
+        ) in boards
+        {
+            let workspace_roots =
+                board_roots(&self.connection, &board_path, retirement_id.as_deref())?;
             projects.push(ProjectRecord {
                 name,
                 board_path,
                 workspace_roots,
                 last_used_at,
+                archived: archived_at.is_some(),
+                archived_at,
+                archived_by,
+                archived_note,
             });
         }
         projects.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
         Ok(projects)
     }
 
+    pub fn projects(&self) -> Result<Vec<ProjectRecord>> {
+        self.projects_internal(true)
+    }
+
+    pub fn projects_active(&self) -> Result<Vec<ProjectRecord>> {
+        self.projects_internal(false)
+    }
+
     /// Projects carrying `name`. Names are not unique in the registry, so
     /// callers must handle 0 and >1 rather than assume a single hit.
     pub fn by_name(&self, name: &str) -> Result<Vec<ProjectRecord>> {
+        Ok(self
+            .projects_active()?
+            .into_iter()
+            .filter(|project| project.name == name)
+            .collect())
+    }
+
+    pub fn by_name_active(&self, name: &str) -> Result<Vec<ProjectRecord>> {
+        self.by_name(name)
+    }
+
+    pub fn by_name_all(&self, name: &str) -> Result<Vec<ProjectRecord>> {
         Ok(self
             .projects()?
             .into_iter()
@@ -1927,5 +2500,77 @@ mod tests {
         assert_eq!(payload["existing"], true);
         assert_eq!(payload["name"], "Alpha");
         assert_eq!(payload["boardPath"], first.board_path);
+    }
+
+    #[test]
+    fn retiring_and_unretiring_a_project_preserves_identity_and_note() {
+        let mut registry = test_registry("registry-retire-unretire");
+        let root = registry.root.join("workspace");
+        let extra_root = registry.root.join("workspace-spare");
+        fs::create_dir_all(&root).expect("create workspace root");
+        fs::create_dir_all(&extra_root).expect("create spare workspace root");
+        let root = root.canonicalize().expect("canonicalize workspace root");
+        let extra_root = extra_root
+            .canonicalize()
+            .expect("canonicalize spare workspace root");
+        let root_text = root.to_string_lossy().into_owned();
+        let extra_text = extra_root.to_string_lossy().into_owned();
+
+        let created = registry
+            .register(Some(&root), "Alpha", false, "codex")
+            .expect("register project");
+        assert_eq!(created.name, "Alpha");
+        assert_eq!(created.workspace_roots, vec![root_text.clone()]);
+
+        let attached = registry
+            .attach(&extra_root, "Alpha", "geo")
+            .expect("attach spare root");
+        assert_eq!(attached.root_path, extra_text);
+        assert_eq!(attached.board_path, created.board_path);
+
+        let active = registry.by_name("Alpha").expect("active lookup");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].workspace_roots.len(), 2);
+        assert!(active[0].workspace_roots.contains(&root_text));
+        assert!(active[0].workspace_roots.contains(&extra_text));
+
+        let retired = registry
+            .retire("Alpha", "geo", "retire for test")
+            .expect("retire project");
+        assert_eq!(retired.name, "Alpha");
+        assert!(retired.archived_at.is_some());
+        assert_eq!(retired.archived_by.as_deref(), Some("geo"));
+        assert_eq!(retired.archived_note.as_deref(), Some("retire for test"));
+        assert_eq!(retired.workspace_roots.len(), 2);
+        assert!(retired.workspace_roots.contains(&root_text));
+        assert!(retired.workspace_roots.contains(&extra_text));
+        assert!(registry.by_name("Alpha").expect("active lookup").is_empty());
+
+        let archived = registry.by_name_all("Alpha").expect("archived lookup");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            archived[0].archived_note.as_deref(),
+            Some("retire for test")
+        );
+        assert_eq!(archived[0].workspace_roots.len(), 2);
+        assert!(archived[0].workspace_roots.contains(&root_text));
+        assert!(archived[0].workspace_roots.contains(&extra_text));
+
+        let restored = registry.unretire("Alpha", "geo").expect("unretire project");
+        assert_eq!(restored.name, "Alpha");
+        assert!(restored.archived_at.is_none());
+        assert!(restored.archived_by.is_none());
+        assert!(restored.archived_note.is_none());
+        assert_eq!(restored.workspace_roots.len(), 2);
+        assert!(restored.workspace_roots.contains(&root_text));
+        assert!(restored.workspace_roots.contains(&extra_text));
+        assert_eq!(registry.by_name("Alpha").expect("active lookup").len(), 1);
+        assert!(
+            registry
+                .by_name_all("Alpha")
+                .expect("all lookup")
+                .iter()
+                .any(|project| project.archived_at.is_none())
+        );
     }
 }

@@ -1530,8 +1530,21 @@ SET last_used_at = COALESCE((
 ), last_used_at);
 "#;
 
+/// Board retirement keeps the identity row, while making the lifecycle and
+/// operator note explicit so retired authority can be restored or audited
+/// without inventing a new board.
+const REGISTRY_V12: &str = r#"
+ALTER TABLE workspace_alias_history ADD COLUMN archived_note TEXT;
+ALTER TABLE workspace_alias_history ADD COLUMN retirement_id TEXT;
+ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+ALTER TABLE boards ADD COLUMN archived_at INTEGER;
+ALTER TABLE boards ADD COLUMN archived_by TEXT;
+ALTER TABLE boards ADD COLUMN archived_note TEXT;
+ALTER TABLE boards ADD COLUMN retirement_id TEXT;
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 23;
-pub const REGISTRY_SCHEMA_VERSION: usize = 11;
+pub const REGISTRY_SCHEMA_VERSION: usize = 12;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -2015,6 +2028,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V9,
     REGISTRY_V10,
     REGISTRY_V11,
+    REGISTRY_V12,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
