@@ -195,6 +195,16 @@ rules, and a stored claim does not pretend it re-read current rules.
 are `ALL, EXCEPT:<board>`. Operators use repeatable `--board` and
 `--except-board`, and the CLI validates exact registered board names. Lowercase
 `--tag` values are subsystem selectors registered on at least one active board.
+An active `ONLY:<board>` or `EXCEPT:<board>` reference is valid only while
+exactly one active board has that name. Rule add, active-rule update, and rule
+import recheck this invariant inside the write transaction. Workspace retirement
+refuses any active rule naming the board and lists the blocking rule IDs; update
+or retire those rules, then retry retirement. Retired rule bodies, tags, and
+events remain available through `rule list --all`, `rule show`, and rule events.
+`doctor --json` reports the complete check as
+`activeRuleSelectors: { healthy, errors }`; stale legacy or manually edited rows
+make top-level health false without blocking recovery reads, and `doctor --all`
+continues to inspect retired boards.
 Several subsystem tags are an OR set, intersected with the board selector.
 Task claim, context and task-handoff injection require a matching task tag;
 taskless session handoffs and web board projections omit subsystem-scoped rules.

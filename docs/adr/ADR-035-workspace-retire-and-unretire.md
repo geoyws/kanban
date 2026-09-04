@@ -24,6 +24,20 @@ Unretire restores exactly one retired board, rejects duplicate or conflicting
 name/root authority, and does so inside a single transaction so a conflict
 leaves the registry unchanged.
 
+Retirement must also preserve the active named-rule-selector invariant. Inside
+the same immediate transaction, it refuses when any active rule carries
+`ONLY:NAME` or `EXCEPT:NAME`, reports the blocking rule IDs in deterministic
+order, and makes no board or audit mutation. The recovery sequence is explicit:
+update or retire every listed rule, then run `workspace retire` again. Retirement
+never rewrites or silently retires rules.
+
+This guard applies only to active rules. Retired rule bodies, selector tags, and
+events remain inspectable after board retirement through `rule list --all`,
+`rule show`, and rule events. `doctor --json` reports stale legacy or manually
+edited active references under `activeRuleSelectors` and marks top-level health
+false without preventing registry open or recovery reads; `doctor --all`
+continues to inspect retired boards.
+
 Default `workspace list`, `dashboard`, `doctor`, `search --all-boards`, and
 `search-rebuild --all-boards` stay active-only. The `--all` opt-in exposes
 retired inspection where already supported by the command.

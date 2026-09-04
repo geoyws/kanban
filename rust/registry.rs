@@ -171,6 +171,115 @@ fn rule_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveRuleSelectorError {
+    pub rule_id: String,
+    pub selector: String,
+    pub active_board_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveRuleSelectorHealth {
+    pub healthy: bool,
+    pub errors: Vec<ActiveRuleSelectorError>,
+}
+
+fn named_selector_board(tag: &str) -> Option<&str> {
+    tag.strip_prefix("ONLY:")
+        .or_else(|| tag.strip_prefix("EXCEPT:"))
+}
+
+fn active_board_count(
+    connection: &Connection,
+    board_name: &str,
+    excluded_board_path: Option<&str>,
+) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT count(*) FROM boards WHERE name=? AND archived=0 AND (? IS NULL OR board_path != ?)",
+            params![board_name, excluded_board_path, excluded_board_path],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn active_named_selector_errors<'a>(
+    connection: &Connection,
+    rules: impl IntoIterator<Item = (&'a str, &'a [String])>,
+    selector_board: Option<&str>,
+    excluded_board_path: Option<&str>,
+) -> Result<Vec<ActiveRuleSelectorError>> {
+    let mut board_counts = HashMap::new();
+    let mut errors = Vec::new();
+    for (rule_id, tags) in rules {
+        for selector in tags {
+            let Some(board_name) = named_selector_board(selector) else {
+                continue;
+            };
+            if selector_board.is_some_and(|selected| selected != board_name) {
+                continue;
+            }
+            let active_board_count = if let Some(count) = board_counts.get(board_name) {
+                *count
+            } else {
+                let count = active_board_count(connection, board_name, excluded_board_path)?;
+                board_counts.insert(board_name.to_owned(), count);
+                count
+            };
+            if active_board_count != 1 {
+                errors.push(ActiveRuleSelectorError {
+                    rule_id: rule_id.to_owned(),
+                    selector: selector.clone(),
+                    active_board_count,
+                });
+            }
+        }
+    }
+    errors.sort_by(|left, right| {
+        left.rule_id
+            .cmp(&right.rule_id)
+            .then(left.selector.cmp(&right.selector))
+            .then(left.active_board_count.cmp(&right.active_board_count))
+    });
+    errors.dedup_by(|left, right| {
+        left.rule_id == right.rule_id
+            && left.selector == right.selector
+            && left.active_board_count == right.active_board_count
+    });
+    Ok(errors)
+}
+
+fn active_rule_tags(connection: &Connection) -> Result<Vec<(String, Vec<String>)>> {
+    let mut statement =
+        connection.prepare("SELECT id,tags FROM rules WHERE archived=0 ORDER BY id")?;
+    statement
+        .query_map([], |row| {
+            let encoded = row.get::<_, String>(1)?;
+            Ok((row.get::<_, String>(0)?, parse_json_string_array(&encoded)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn validate_active_rule_selectors(
+    connection: &Connection,
+    rule_id: &str,
+    tags: &[String],
+) -> Result<()> {
+    let errors = active_named_selector_errors(connection, [(rule_id, tags)], None, None)?;
+    if let Some(error) = errors.first() {
+        bail!(
+            "rule {} selector {} requires exactly one active board, but found {}",
+            error.rule_id,
+            error.selector,
+            error.active_board_count
+        );
+    }
+    Ok(())
+}
+
 fn selector_tags_apply(tags: &[String], board_name: Option<&str>) -> bool {
     if tags.iter().any(|tag| tag == "ALL") {
         return board_name.is_none_or(|name| {
@@ -2511,6 +2620,37 @@ impl Registry {
         };
         let board_path = project.board_path.clone();
         let board_name = project.name.clone();
+        let active_rules = active_rule_tags(&transaction)?;
+        let selector_errors = active_named_selector_errors(
+            &transaction,
+            active_rules
+                .iter()
+                .map(|(id, tags)| (id.as_str(), tags.as_slice())),
+            Some(&board_name),
+            Some(&board_path),
+        )?;
+        if !selector_errors.is_empty() {
+            let mut blocker_ids = selector_errors
+                .iter()
+                .map(|error| error.rule_id.as_str())
+                .collect::<Vec<_>>();
+            blocker_ids.sort_unstable();
+            blocker_ids.dedup();
+            let selector_counts = selector_errors
+                .iter()
+                .map(|error| {
+                    format!(
+                        "{} on {} -> {} active boards",
+                        error.selector, error.rule_id, error.active_board_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "cannot retire Kanban project {board_name}: active named rule selectors would become invalid ({selector_counts}); blocking rule IDs: {}; update or retire those rules before retiring the workspace",
+                blocker_ids.join(", ")
+            );
+        }
         let retirement_id = Uuid::new_v4().simple().to_string();
         {
             let transaction = transaction;
@@ -3370,6 +3510,7 @@ impl Registry {
                     rule.source_registry_uuid
                 );
             }
+            validate_active_rule_selectors(&transaction, &rule.source_rule_id, &rule.tags)?;
             if !verified_names.contains(&rule_source_board) {
                 bail!(
                     "cannot import rule {} from {}: it is not registered in the destination registry",
@@ -3558,6 +3699,7 @@ impl Registry {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_active_rule_selectors(&transaction, &id, tags)?;
         let previous: Option<i64> =
             transaction.query_row("SELECT max(created_at) FROM rules", [], |row| row.get(0))?;
         let now = now_ms().max(previous.unwrap_or(0).saturating_add(1));
@@ -3591,6 +3733,22 @@ impl Registry {
             .query_map([], rule_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn active_rule_selector_health(&self) -> Result<ActiveRuleSelectorHealth> {
+        let active_rules = active_rule_tags(&self.connection)?;
+        let errors = active_named_selector_errors(
+            &self.connection,
+            active_rules
+                .iter()
+                .map(|(id, tags)| (id.as_str(), tags.as_slice())),
+            None,
+            None,
+        )?;
+        Ok(ActiveRuleSelectorHealth {
+            healthy: errors.is_empty(),
+            errors,
+        })
     }
 
     pub fn rule_summaries(&self, include_archived: bool) -> Result<Vec<RuleSummary>> {
@@ -3712,6 +3870,9 @@ impl Registry {
                 .iter()
                 .cloned(),
         );
+        if !previous.archived {
+            validate_active_rule_selectors(&transaction, id, &tags)?;
+        }
         let now = now_ms();
         transaction.execute(
             "UPDATE rules SET body=?,tags=?,author=?,updated_at=? WHERE id=?",

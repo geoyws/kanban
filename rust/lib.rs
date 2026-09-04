@@ -3702,6 +3702,7 @@ fn run() -> Result<()> {
         let registry = Registry::open()?;
         let registry_check = registry.integrity()?;
         let registry_audit = registry.audit()?;
+        let active_rule_selectors = registry.active_rule_selector_health()?;
         let registry_schema = db::schema_version(&registry.connection)?;
         let registry_projects = if args.has("all") {
             registry.projects()?
@@ -3713,7 +3714,8 @@ fn run() -> Result<()> {
         // hints visible so an operator can repoint or retire them, but do not
         // fail an otherwise healthy board that remains reachable by name.
         let unreachable = registry.unreachable_roots()?;
-        let mut healthy = registry_check == vec!["ok"] && registry_audit.healthy;
+        let mut healthy =
+            registry_check == vec!["ok"] && registry_audit.healthy && active_rule_selectors.healthy;
         for project in registry_projects {
             // Checked before opening, because opening would create it.
             //
@@ -3788,6 +3790,7 @@ fn run() -> Result<()> {
             "healthy": healthy,
             "registry": registry_check,
             "registryAudit": registry_audit,
+            "activeRuleSelectors": active_rule_selectors,
             "registrySchemaVersion": registry_schema,
             "supportedRegistrySchemaVersion": db::REGISTRY_SCHEMA_VERSION,
             "supportedBoardSchemaVersion": db::BOARD_SCHEMA_VERSION,

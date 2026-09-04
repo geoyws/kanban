@@ -39,6 +39,22 @@ subsystem tags continue to be validated against the union of active board tag
 masters. `ALL` cannot coexist with `ONLY:*`; `EXCEPT:*` requires `ALL`; duplicate,
 unknown, or ambiguous selectors fail closed.
 
+Every named selector on an active rule is a live host-registry reference:
+`ONLY:<board>` and `EXCEPT:<board>` each require exactly one active board with
+that name. Add, active update, and transfer import validate against the registry
+inside their immediate write transaction. Workspace retirement is also an
+invariant transition: it refuses while any active rule names the retiring board,
+lists the blocking rule IDs, and tells the operator to update or retire those
+rules before retrying. It never silently rewrites or retires a rule.
+
+The invariant applies only to active rows. Retired rule bodies, tags, and events
+remain explicit historical evidence after their named board retires. A stale
+active selector introduced by legacy state or direct database mutation does not
+make the registry impossible to open: `doctor --json` reports it under
+`activeRuleSelectors` and fails top-level health, while `rule list --all`,
+`rule show`, rule events, and `doctor --all` remain available for inspection
+and recovery.
+
 The public model exposes `tags`, not separate `boardTags`, `taskTags`, or
 `scope`. Existing `g-*` identifiers remain valid historical identifiers but no
 longer imply global scope; newly created rules use `r-*`.

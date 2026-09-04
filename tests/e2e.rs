@@ -111,6 +111,36 @@ fn board_path_for_project(fixture: &Fixture, cwd: &Path, project_name: &str) -> 
         .into()
 }
 
+fn rule_transfer_item_fingerprint(rule: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(rule["sourceRegistryUuid"].as_str().unwrap().as_bytes());
+    hasher.update([0]);
+    hasher.update(rule["sourceRuleId"].as_str().unwrap().as_bytes());
+    hasher.update([0]);
+    hasher.update(rule["body"].as_str().unwrap().as_bytes());
+    hasher.update([0]);
+    hasher.update(rule["author"].as_str().unwrap().as_bytes());
+    hasher.update([0]);
+    hasher.update([rule["archived"].as_bool().unwrap() as u8]);
+    hasher.update([0]);
+    hasher.update(rule["createdAt"].as_i64().unwrap().to_le_bytes());
+    hasher.update([0]);
+    hasher.update(rule["updatedAt"].as_i64().unwrap().to_le_bytes());
+    hasher.update([0]);
+    let tags = rule["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tag| tag.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    hasher.update(tags.as_bytes());
+    Sha256::digest(hasher.finalize())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn external_source_board(fixture: &Fixture, label: &str, name: &str) -> PathBuf {
     let data = fixture.root.join(format!("{label}-data"));
     let cwd = fixture.root.join(format!("{label}-cwd"));
@@ -18496,6 +18526,111 @@ fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board(
 }
 
 #[test]
+fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import() {
+    let source = Fixture::new("rule-selector-source-px-only");
+    source.ok_json(&source.main, &["init", "--name", "px", "--json"]);
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "PX-only source rule.",
+            "--board",
+            "px",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let bundle_path = source.root.join("px-rules.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "px",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    let destination = Fixture::new("rule-selector-destination-px-only");
+    destination.ok_json(&destination.main, &["init", "--name", "px", "--json"]);
+    for board in ["kanban", "unum"] {
+        let refused = destination.run(
+            &destination.main,
+            &[
+                "rule",
+                "add",
+                "Wrong-host rule.",
+                "--board",
+                board,
+                "--as",
+                "geo",
+                "--json",
+            ],
+        );
+        assert!(
+            !refused.status.success(),
+            "a px-only registry accepted selector {board}"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains(&format!("no registered Kanban board named {board}")),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    let mut bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    bundle["rules"][0]["tags"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("ONLY:unum"));
+    let fingerprint = rule_transfer_item_fingerprint(&bundle["rules"][0]);
+    bundle["rules"][0]["sourceContentSha256"] = json!(fingerprint);
+    fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+    let refused = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a correctly re-fingerprinted absent selector was imported"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("selector ONLY:unum"), "{stderr}");
+    assert!(stderr.contains("found 0"), "{stderr}");
+
+    let registry = Connection::open(destination.data.join("registry.db")).unwrap();
+    let rule_count: i64 = registry
+        .query_row("SELECT count(*) FROM rules", [], |row| row.get(0))
+        .unwrap();
+    let ledger_count: i64 = registry
+        .query_row("SELECT count(*) FROM rule_import_ledger", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rule_count, 0, "a refused import wrote a destination rule");
+    assert_eq!(
+        ledger_count, 0,
+        "a refused import wrote an import-ledger row"
+    );
+}
+
+#[test]
 fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() {
     let fixture = Fixture::new("rule-export-refusals");
     fixture.ok_json(&fixture.main, &["init", "--name", "ALPHA", "--json"]);
@@ -20695,6 +20830,265 @@ fn the_mcp_server_rejects_retired_direct_board_paths_over_stdio() {
     assert!(text.contains("retire MCP board"), "{text}");
 
     session.finish();
+}
+
+#[test]
+fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
+    let fixture = Fixture::new("active-rule-selector-retirement");
+    let px = fixture.root.join("px");
+    let kanban = fixture.root.join("kanban");
+    fs::create_dir_all(&px).unwrap();
+    fs::create_dir_all(&kanban).unwrap();
+    fixture.ok_json(&px, &["init", "--name", "px", "--json"]);
+    fixture.ok_json(&kanban, &["init", "--name", "kanban", "--json"]);
+    let only = fixture.ok_json(
+        &fixture.root,
+        &[
+            "rule",
+            "add",
+            "PX host rule.",
+            "--board",
+            "px",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let except = fixture.ok_json(
+        &fixture.root,
+        &[
+            "rule",
+            "add",
+            "All hosts except PX.",
+            "--except-board",
+            "px",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "rule",
+            "add",
+            "Kanban host rule.",
+            "--board",
+            "kanban",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let only_id = only["id"].as_str().unwrap();
+    let except_id = except["id"].as_str().unwrap();
+    let mut blocker_ids = [only_id, except_id];
+    blocker_ids.sort_unstable();
+
+    let refused = fixture.run(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "px",
+            "--as",
+            "geo",
+            "--note",
+            "split host registries",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "workspace retirement left active named selectors behind"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("ONLY:px"), "{stderr}");
+    assert!(stderr.contains("EXCEPT:px"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "blocking rule IDs: {}, {}",
+            blocker_ids[0], blocker_ids[1]
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("update or retire those rules"), "{stderr}");
+    let still_active = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        still_active
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "px" && row["archived"] == false),
+        "refused retirement mutated the board"
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.root,
+                &[
+                    "events",
+                    "--registry",
+                    "--kind",
+                    "workspace_retired",
+                    "--json",
+                ],
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "refused retirement appended an audit event"
+    );
+
+    for id in [only_id, except_id] {
+        fixture.ok_json(
+            &fixture.root,
+            &["rule", "retire", id, "--as", "geo", "--json"],
+        );
+    }
+    let retired_board = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "px",
+            "--as",
+            "geo",
+            "--note",
+            "split host registries",
+            "--json",
+        ],
+    );
+    assert_eq!(retired_board["archived"], true);
+
+    let all_rules = fixture.ok_json(
+        &fixture.root,
+        &["rule", "list", "--all", "--full", "--json"],
+    );
+    assert!(all_rules.as_array().unwrap().iter().any(|rule| {
+        rule["id"] == only["id"]
+            && rule["archived"] == true
+            && rule["body"] == "PX host rule."
+            && rule["tags"] == json!(["ONLY:px"])
+    }));
+    let shown = fixture.ok_json(&fixture.root, &["rule", "show", only_id, "--json"]);
+    assert_eq!(shown["body"], "PX host rule.");
+    assert_eq!(shown["tags"], json!(["ONLY:px"]));
+    let rule_events = fixture.ok_json(&fixture.root, &["events", "--rule", only_id, "--json"]);
+    assert!(
+        rule_events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "rule_retired")
+    );
+
+    let all_workspaces = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
+    assert!(
+        all_workspaces
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "px" && row["archived"] == true)
+    );
+    let doctor = fixture.ok_json(&fixture.root, &["doctor", "--all", "--json"]);
+    assert_eq!(doctor["healthy"], true, "{doctor}");
+    assert_eq!(doctor["activeRuleSelectors"]["healthy"], true);
+    assert!(
+        doctor["activeRuleSelectors"]["errors"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        doctor["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "px" && row["archived"] == true)
+    );
+}
+
+#[test]
+fn doctor_reports_stale_active_selectors_without_blocking_rule_history() {
+    let fixture = Fixture::new("doctor-active-rule-selectors");
+    fixture.ok_json(&fixture.main, &["init", "--name", "px", "--json"]);
+    let rule = fixture.ok_json(
+        &fixture.main,
+        &["rule", "add", "Recoverable rule.", "--as", "geo", "--json"],
+    );
+    let rule_id = rule["id"].as_str().unwrap();
+    {
+        let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
+        registry
+            .execute(
+                "UPDATE rules SET tags='[\"ONLY:unum\",\"ONLY:unum\"]' WHERE id=?",
+                [rule_id],
+            )
+            .unwrap();
+    }
+
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        !checked.status.success(),
+        "doctor certified a stale active selector"
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["activeRuleSelectors"]["healthy"], false);
+    assert_eq!(
+        report["activeRuleSelectors"]["errors"],
+        json!([{
+            "ruleId": rule_id,
+            "selector": "ONLY:unum",
+            "activeBoardCount": 0
+        }])
+    );
+
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &["rule", "list", "--all", "--full", "--json"],
+    );
+    assert!(listed.as_array().unwrap().iter().any(|row| {
+        row["id"] == rule["id"] && row["tags"] == json!(["ONLY:unum", "ONLY:unum"])
+    }));
+    let shown = fixture.ok_json(&fixture.main, &["rule", "show", rule_id, "--json"]);
+    assert_eq!(shown["tags"], json!(["ONLY:unum", "ONLY:unum"]));
+
+    let update = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            rule_id,
+            "--body",
+            "An edit must not preserve a stale active selector.",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !update.status.success(),
+        "an active-rule edit retained a stale selector"
+    );
+    let stderr = String::from_utf8_lossy(&update.stderr);
+    assert!(stderr.contains(rule_id), "{stderr}");
+    assert!(stderr.contains("selector ONLY:unum"), "{stderr}");
+    assert!(stderr.contains("found 0"), "{stderr}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["rule", "show", rule_id, "--json"])["body"],
+        "Recoverable rule.",
+        "refused update changed the active rule"
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &["rule", "retire", rule_id, "--as", "geo", "--json"],
+    );
+    let recovered = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(recovered["healthy"], true, "{recovered}");
+    assert_eq!(recovered["activeRuleSelectors"]["healthy"], true);
 }
 
 #[test]

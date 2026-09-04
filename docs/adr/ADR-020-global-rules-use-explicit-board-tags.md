@@ -62,8 +62,12 @@ into project databases.
 
 - One audited rule can cover one board, a named set, or all but named boards.
 - Agents spend tokens only on global constraints that apply to their board.
-- Renaming or deleting a registered board can leave a tag that no longer
-  matches; existing tags remain auditable, while new mutations validate names.
+- Historical note: this ADR originally allowed board rename or deletion to
+  leave unmatched selector tags. ADR-027 now supersedes that operational
+  consequence: workspace retirement refuses active `ONLY:<board>` and
+  `EXCEPT:<board>` blockers. Legacy or manually introduced stale active rows
+  remain inspectable and make `doctor` unhealthy until the operator updates or
+  retires them.
 - Direct unregistered `--db` boards inherit `ALL` rules and cannot match
   `ONLY:<name>` because they have no registered name.
 
