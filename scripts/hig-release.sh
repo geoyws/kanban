@@ -8,6 +8,7 @@ BINARIES=(
   kanban-dispatcher
   kanban-codex-queue-adapter
   kanban-codex-app-server-adapter
+  kanban-claude-print-adapter
 )
 MAX_RELEASES=10
 HOSTNAME_BIN="${HOSTNAME_BIN:-/bin/hostname}"
@@ -70,7 +71,7 @@ file_version() {
     kanban | kb)
       "$binary" version
       ;;
-    kanban-dispatcher | kanban-codex-queue-adapter | kanban-codex-app-server-adapter)
+    kanban-dispatcher | kanban-codex-queue-adapter | kanban-codex-app-server-adapter | kanban-claude-print-adapter)
       "$binary" --version
       ;;
     *)
@@ -156,13 +157,14 @@ validate_release_files() {
     (.sourceTreeClean == true) and
     ((.sourceCommit | type) == "string") and
     ((.sourceCommit | length) == 40) and
-    ((.files | length) == 5) and
+    ((.files | length) == 6) and
     ([.files[].name] == [
       "kanban",
       "kb",
       "kanban-dispatcher",
       "kanban-codex-queue-adapter",
-      "kanban-codex-app-server-adapter"
+      "kanban-codex-app-server-adapter",
+      "kanban-claude-print-adapter"
     ])
   ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
 
@@ -210,13 +212,14 @@ validate_receipt() {
     ((.sourceCommit | type) == "string") and
     ((.sourceCommit | length) == 40) and
     (.manifestSha256 == $manifest_sha) and
-    ((.files | length) == 5) and
+    ((.files | length) == 6) and
     ([.files[].name] == [
       "kanban",
       "kb",
       "kanban-dispatcher",
       "kanban-codex-queue-adapter",
-      "kanban-codex-app-server-adapter"
+      "kanban-codex-app-server-adapter",
+      "kanban-claude-print-adapter"
     ])
   ' "$receipt" >/dev/null || die "package receipt is incomplete or mismatched"
   [[ "$(jq -r '.sourceCommit' "$receipt")" == "$manifest_commit" ]] || {
@@ -469,13 +472,14 @@ package_validate() {
     (.sourceTreeClean == true) and
     ((.sourceCommit | type) == "string") and
     ((.sourceCommit | length) == 40) and
-    ((.files | length) == 5) and
+    ((.files | length) == 6) and
     ([.files[].name] == [
       "kanban",
       "kb",
       "kanban-dispatcher",
       "kanban-codex-queue-adapter",
-      "kanban-codex-app-server-adapter"
+      "kanban-codex-app-server-adapter",
+      "kanban-claude-print-adapter"
     ])
   ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
 
@@ -944,7 +948,7 @@ ensure_public_binary_links() {
   local current_path
   current_path="$install_root/current"
   mkdir -p "$bin_dir"
-  for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+  for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
     local link_path target
     link_path="$bin_dir/$binary"
     target="$current_path/$binary"
@@ -981,7 +985,7 @@ rollback_activation_view() {
   fi
   if [[ -z "$previous_current" ]]; then
     local binary
-    for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+    for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
       rm -f -- "$bin_dir/$binary"
     done
   fi
@@ -1075,13 +1079,14 @@ manifest="$package_dir/manifest.json"
   ((.sourceCommit | length) == 40) and
   ((.manifestSha256 | type) == "string") and
   ((.manifestSha256 | length) == 64) and
-  ((.files | length) == 5) and
+  ((.files | length) == 6) and
   ([.files[].name] == [
     "kanban",
     "kb",
     "kanban-dispatcher",
     "kanban-codex-queue-adapter",
-    "kanban-codex-app-server-adapter"
+    "kanban-codex-app-server-adapter",
+    "kanban-claude-print-adapter"
   ])
 ' "$receipt" >/dev/null || die "remote package receipt is incomplete or mismatched"
 
@@ -1110,7 +1115,7 @@ if [[ -L "$install_root/current" ]]; then
 fi
 if [[ ! -d "$release_path" ]]; then
   staging="$(mktemp -d "$install_root/releases/.${release_id}.XXXXXX")"
-  for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+  for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
     install -m 0755 "$package_dir/$binary" "$staging/$binary"
   done
   cp "$package_dir/manifest.json" "$staging/manifest.json"
@@ -1165,7 +1170,7 @@ if (( activation_status != 0 )); then
     rm -f -- "$release_receipt"
   fi
   if [[ -z "$previous_current" ]]; then
-    for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+    for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
       rm -f -- "$bin_dir/$binary"
     done
   fi

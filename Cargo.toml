@@ -33,6 +33,10 @@ path = "rust/bin/kanban-codex-queue-adapter.rs"
 name = "kanban-codex-app-server-adapter"
 path = "rust/bin/kanban-codex-app-server-adapter.rs"
 
+[[bin]]
+name = "kanban-claude-print-adapter"
+path = "rust/bin/kanban-claude-print-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"

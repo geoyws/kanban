@@ -2,6 +2,8 @@ mod adapter_process;
 mod adapter_protocol;
 mod audit;
 #[allow(dead_code)]
+mod claude_print_adapter;
+#[allow(dead_code)]
 mod codex_app_server_adapter;
 #[allow(dead_code)]
 mod codex_app_server_messages;
@@ -3262,6 +3264,17 @@ pub fn codex_app_server_adapter_entrypoint() -> ! {
         // This structured adapter must not apply the human CLI's reader-left
         // exception: BrokenPipe can come from Codex child stdin, and a closed
         // response pipe means the delivery acknowledgement did not arrive.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the Claude Code print adapter binary.
+pub fn claude_print_adapter_entrypoint() -> ! {
+    match claude_print_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
         Err(error) => {
             let _ = writeln!(io::stderr(), "Error: {error:#}");
             std::process::exit(1)

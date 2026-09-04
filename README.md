@@ -677,6 +677,25 @@ combined v2 schema hash
 invocation clears child environment except `CODEX_HOME`, probes version/help,
 and emits only `AdapterResponse` on success.
 
+The third opt-in bridge uses consumer `claude.print`, action
+`start-readonly-turn`, and capability `start`, implemented by
+`kanban-claude-print-adapter`. No active declarative subscription ships.
+Host-local configuration pins the canonical Claude executable, private
+`HOME`, private cwd, and required Claude Code version (the HAX stable version
+is `2.1.236`). Every invocation revalidates those identities and ancestor
+chains, probes the exact version and required help surface, clears the child
+environment to exactly `HOME` and `PATH=/usr/bin:/bin`, and starts a fresh
+`--safe-mode --print` worker with no tools, MCP, persistence, or permission
+prompts. It never resumes a foreground session. Only bounded subscription and
+event IDs enter the exact acknowledgement prompt. Success requires strict
+object-or-array JSON whose final result is that exact acknowledgement, with no
+tool evidence, API error, stderr, trailing JSON, overflow, or mismatch; adapter
+stdout is then only `AdapterResponse`. Compiled adapter-contract coverage uses
+a dependency-free fake Claude. Installed-Claude support requires a separately
+named live smoke and is not established by that compiled test.
+The installed-Claude live smoke is currently blocked by revoked OAuth attention
+`a-347ff24c`; the adapter does not work around authentication.
+
 The declaration-only phase historically stopped there. The shipped delivery
 worker is now a separate compiled process with one explicit board selector:
 
@@ -725,10 +744,12 @@ Reasoning: `docs/adr/ADR-016-*`.
 
 ## Short names
 
-The crate installs `kanban` and `kb` as two names for the same operator CLI,
-plus the separate `kanban-dispatcher` worker. `kb` is a real binary rather than
-a shell alias because agents invoke it from non-interactive cages that never
-source a shell profile.
+The crate installs six executables: `kanban` and `kb` are two names for the
+same operator CLI, alongside `kanban-dispatcher`,
+`kanban-codex-queue-adapter`, `kanban-codex-app-server-adapter`, and
+`kanban-claude-print-adapter`. `kb` is a real binary rather than a shell alias
+because agents invoke it from non-interactive cages that never source a shell
+profile.
 
 Commands and subcommands have short forms:
 

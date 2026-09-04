@@ -515,6 +515,25 @@ HAX live smoke against installed Codex/model. In the summary-view final turn,
 only a completed `userMessage` may be omitted from `turn/completed.items`;
 `reasoning` and `agentMessage` items remain exact and fail closed.
 
+The third opt-in bridge is consumer `claude.print`, action
+`start-readonly-turn`, and capability `start`, via
+`kanban-claude-print-adapter`. The host allow-list binding is separate and no
+active declarative subscription ships. HAX pins stable Claude Code `2.1.236`,
+while the adapter keeps the required version configurable. It validates
+canonical executable, private `HOME`, private cwd, and every ancestor before
+each spawn; probes exact version and help markers; clears the child environment
+to exactly `HOME` and fixed `PATH=/usr/bin:/bin`; and starts a fresh safe-mode
+print worker rather than resuming a foreground session. The fixed child argv
+selects JSON output, empty tools, disallowed MCP, no persistence, and
+permission mode `dontAsk`; cwd is fixed and stdin is empty. Only bounded
+subscription/event IDs enter the exact acknowledgement prompt. The adapter
+accepts strict JSON object or array output only when the final result is the
+exact acknowledgement and there is no tool-use evidence, API/auth error,
+nonzero status, stderr, overflow, trailing JSON, or mismatch. Success stdout is
+only `AdapterResponse`. Its compiled-process adapter-contract test uses a
+dependency-free fake Claude and makes no installed-Claude claim; installed
+Claude requires a separately named live smoke.
+
 Operationally, `kb audit verify` remains the integrity gate for chain health,
 while `kb events` and `kb watch` serve different read patterns:
 

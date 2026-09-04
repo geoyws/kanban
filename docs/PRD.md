@@ -136,6 +136,26 @@ write domains.
   ack, errors, and post-completion output fail closed. Success stdout is only
   `AdapterResponse` after exactly one `{accepted:true,idempotencyKey:<subscriptionID:eventID>}`
   completion. Delivery remains at-least-once.
+- For the third opt-in bridge, host-local `dispatchers.json` binds consumer
+  `claude.print`, action `start-readonly-turn`, and capability `start` to
+  `kanban-claude-print-adapter`; no active declarative subscription ships.
+  Private configuration pins canonical Claude, private `HOME`, private cwd,
+  and an exact required version (HAX stable: `2.1.236`). The adapter validates
+  each identity and ancestor chain before every spawn, probes exact
+  `claude --version` and required help markers, and starts a fresh worker
+  rather than resuming a foreground session. Child argv is fixed to safe print
+  mode with JSON output, no tools or MCP, no session persistence, and
+  `dontAsk`; child environment is exactly `HOME` plus `PATH=/usr/bin:/bin`,
+  cwd is fixed, and stdin is empty. The prompt contains only bounded
+  subscription/event IDs and static acknowledgement text. Success requires a
+  strict JSON object or array whose final result object has the exact
+  acknowledgement and no error or tool-use evidence. Nonzero status, stderr,
+  API/auth errors, overflow, trailing JSON, and mismatches fail closed.
+  Success stdout is only `AdapterResponse`. Compiled adapter-contract tests
+  against the dependency-free fake Claude do not establish installed-Claude
+  support; that requires a distinct live smoke.
+  Live authentication is currently blocked by revoked OAuth attention
+  `a-347ff24c`; the adapter must not work around authentication.
 
 ### P0 — first usable slice
 

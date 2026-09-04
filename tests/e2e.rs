@@ -11291,6 +11291,7 @@ fn clone_release_package(source: &Path, target: &Path, source_commit: &str) {
         "kanban-dispatcher",
         "kanban-codex-queue-adapter",
         "kanban-codex-app-server-adapter",
+        "kanban-claude-print-adapter",
     ] {
         fs::copy(source.join(name), target.join(name)).unwrap();
     }
@@ -11390,6 +11391,7 @@ fn capture_release_links(install_root: &Path, bin_dir: &Path) -> BTreeMap<String
         "kanban-dispatcher",
         "kanban-codex-queue-adapter",
         "kanban-codex-app-server-adapter",
+        "kanban-claude-print-adapter",
     ] {
         links.insert(name.to_string(), fs::read_link(bin_dir.join(name)).unwrap());
     }
@@ -11406,6 +11408,7 @@ fn assert_release_view(install_root: &Path, bin_dir: &Path, release_dir: &Path) 
         "kanban-dispatcher",
         "kanban-codex-queue-adapter",
         "kanban-codex-app-server-adapter",
+        "kanban-claude-print-adapter",
     ] {
         let symlink = bin_dir.join(name);
         assert!(symlink.is_symlink(), "missing bin symlink {name}");
@@ -11478,7 +11481,7 @@ case "${1:-}" in
 esac
 target_root="${CARGO_TARGET_DIR:?}/release"
 mkdir -p "$target_root"
-for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
   source="${FAKE_RELEASE_BINARY:?}"
   if [ -n "${FAKE_RELEASE_BINARY_DIR:-}" ]; then
     source="$FAKE_RELEASE_BINARY_DIR/$binary"
@@ -18620,7 +18623,7 @@ fn hig_release_script_requires_the_initialized_kb_skill_submodule() {
 }
 
 #[test]
-fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
+fn hig_release_script_packages_six_binaries_and_refuses_partial_activation() {
     let fixture = Fixture::new("hig-release");
     let fake_repo_root = fixture.root.join("fake-repo");
     fs::create_dir_all(&fake_repo_root).unwrap();
@@ -18684,6 +18687,7 @@ fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
             "kanban-dispatcher",
             "kanban-codex-queue-adapter",
             "kanban-codex-app-server-adapter",
+            "kanban-claude-print-adapter",
         ]
     );
     let receipt_path = output_dir.with_extension("receipt.json");
@@ -18704,6 +18708,7 @@ fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
         "kanban-dispatcher",
         "kanban-codex-queue-adapter",
         "kanban-codex-app-server-adapter",
+        "kanban-claude-print-adapter",
     ] {
         assert!(
             output_dir.join(name).is_file(),
@@ -18800,6 +18805,7 @@ fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
         "kanban-dispatcher",
         "kanban-codex-queue-adapter",
         "kanban-codex-app-server-adapter",
+        "kanban-claude-print-adapter",
         "manifest.json",
     ] {
         assert!(
@@ -18869,6 +18875,7 @@ fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
         "kanban-dispatcher",
         "kanban-codex-queue-adapter",
         "kanban-codex-app-server-adapter",
+        "kanban-claude-print-adapter",
         "manifest.json",
     ] {
         assert!(
