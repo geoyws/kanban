@@ -66,7 +66,17 @@ sha256_of() {
 
 file_version() {
   local binary="$1"
-  "$binary" version | tr -d '\r' | sed 's/[[:space:]]*$//'
+  case "${binary##*/}" in
+    kanban | kb)
+      "$binary" version
+      ;;
+    kanban-dispatcher | kanban-codex-queue-adapter | kanban-codex-app-server-adapter)
+      "$binary" --version
+      ;;
+    *)
+      die "unknown release binary ${binary##*/}"
+      ;;
+  esac | tr -d '\r' | sed 's/[[:space:]]*$//'
 }
 
 ensure_regular_dir() {
@@ -534,6 +544,8 @@ package_create() {
 
   local root
   root="$(repo_root)"
+  [[ -f "$root/skills/kb/SKILL.md" ]] ||
+    die "skills/kb is not initialized; run: git submodule update --init skills/kb"
   local dirty_before
   dirty_before="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
   [[ -z "$dirty_before" ]] || die "worktree must be clean before release packaging"

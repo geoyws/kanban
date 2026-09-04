@@ -11422,6 +11422,9 @@ fn write_release_tool_stubs(
 ) -> PathBuf {
     let stubs = fixture.root.join("release-stubs");
     fs::create_dir_all(&stubs).unwrap();
+    let kb_skill = fake_repo_root.join("skills/kb/SKILL.md");
+    fs::create_dir_all(kb_skill.parent().unwrap()).unwrap();
+    fs::write(&kb_skill, "# kb skill fixture\n").unwrap();
     write_executable(
         &stubs.join("hostname"),
         r#"#!/bin/sh
@@ -11476,8 +11479,12 @@ esac
 target_root="${CARGO_TARGET_DIR:?}/release"
 mkdir -p "$target_root"
 for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
-  cp "${FAKE_RELEASE_BINARY:?}" "$target_root/$binary"
-chmod 0755 "$target_root/$binary"
+  source="${FAKE_RELEASE_BINARY:?}"
+  if [ -n "${FAKE_RELEASE_BINARY_DIR:-}" ]; then
+    source="$FAKE_RELEASE_BINARY_DIR/$binary"
+  fi
+  cp "$source" "$target_root/$binary"
+  chmod 0755 "$target_root/$binary"
 done
 "#,
     );
@@ -18547,6 +18554,68 @@ fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() 
         String::from_utf8_lossy(&missing.stderr).contains("not registered in this registry"),
         "{:?}",
         String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_requires_the_initialized_kb_skill_submodule() {
+    let fixture = Fixture::new("hig-release-kb-submodule");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let release_binary_dir = Path::new(env!("CARGO_BIN_EXE_kanban")).parent().unwrap();
+    let kb_skill = fake_repo_root.join("skills/kb/SKILL.md");
+    fs::remove_file(&kb_skill).unwrap();
+
+    let run_package = || {
+        Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_RELEASE_BINARY_DIR", release_binary_dir)
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .arg(&script)
+            .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
+
+    let refused = run_package();
+    assert!(
+        !refused.status.success(),
+        "package unexpectedly succeeded without skills/kb"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("skills/kb is not initialized"), "{stderr}");
+    assert!(
+        stderr.contains("git submodule update --init skills/kb"),
+        "{stderr}"
+    );
+    assert!(!output_dir.exists(), "refused package left output behind");
+
+    fs::write(&kb_skill, "# initialized kb skill\n").unwrap();
+    let packaged = run_package();
+    assert!(
+        packaged.status.success(),
+        "initialized package failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
     );
 }
 
