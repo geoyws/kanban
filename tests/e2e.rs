@@ -5466,6 +5466,7 @@ fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
     let fixture = Fixture::new("rootless-doctor-repoint");
     let rootless = fixture.root.join("rootless");
     fs::create_dir_all(&rootless).unwrap();
+    let rootless = rootless.canonicalize().unwrap();
 
     fixture.ok_json(
         &rootless,
@@ -5484,6 +5485,74 @@ fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
             "--json",
         ],
     );
+
+    // A rootless board deliberately has no filesystem discovery hint. Neither
+    // standing in the directory used to create it nor naming that directory
+    // as a workspace may make it reachable by accident.
+    for (label, output) in [
+        (
+            "bare cwd",
+            fixture.run(&rootless, &["task", "show", "t-rootless", "--json"]),
+        ),
+        (
+            "explicit --workspace",
+            fixture.run(
+                &fixture.main,
+                &[
+                    "task",
+                    "show",
+                    "t-rootless",
+                    "--workspace",
+                    rootless.to_str().unwrap(),
+                    "--json",
+                ],
+            ),
+        ),
+    ] {
+        assert!(
+            !output.status.success(),
+            "{label} reached a rootless board through its creation directory"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no Kanban project contains"),
+            "{label}: {stderr}"
+        );
+        assert!(
+            stderr.contains(rootless.to_str().unwrap()),
+            "{label} did not identify the unresolved directory: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("t-rootless"),
+            "{label} returned the rootless task while refusing"
+        );
+    }
+
+    let by_project = fixture.ok_json(
+        &rootless,
+        &[
+            "task",
+            "show",
+            "t-rootless",
+            "--project",
+            "ROOTLESS",
+            "--json",
+        ],
+    );
+    assert_eq!(by_project["id"], "t-rootless");
+    let by_env = fixture
+        .command(&rootless)
+        .env("KANBAN_PROJECT", "ROOTLESS")
+        .args(["task", "show", "t-rootless", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        by_env.status.success(),
+        "KANBAN_PROJECT did not reach the rootless board: {}",
+        String::from_utf8_lossy(&by_env.stderr)
+    );
+    let by_env: Value = serde_json::from_slice(&by_env.stdout).unwrap();
+    assert_eq!(by_env["id"], "t-rootless");
 
     let listed = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
     assert!(
@@ -5511,17 +5580,6 @@ fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
         project["workspaceRoots"].as_array().unwrap().is_empty(),
         "the rootless board should remain rootless in doctor output"
     );
-
-    let tasks = fixture.ok_json(
-        &fixture.root,
-        &["task", "list", "--project", "ROOTLESS", "--json"],
-    );
-    assert_eq!(
-        tasks.as_array().unwrap().len(),
-        1,
-        "the healthy rootless board should remain addressable by name"
-    );
-    assert_eq!(tasks[0]["id"], "t-rootless");
 
     let repoint = fixture.run(
         &fixture.main,
@@ -5938,6 +5996,168 @@ fn compiled_binary_refuses_to_shadow_an_enclosing_project() {
             .is_empty(),
         "a forced nested board must be its own board",
     );
+}
+
+#[test]
+fn compiled_binary_resolves_real_git_worktrees_and_submodules_by_registered_roots() {
+    let fixture = Fixture::new("git-root-resolution");
+    let neighbor = fixture.root.join("neighbor");
+    let ordinary_child = fixture.main.join("ordinary-child");
+    fs::create_dir_all(&neighbor).unwrap();
+    fs::create_dir_all(&ordinary_child).unwrap();
+
+    fixture.ok_json(&fixture.main, &["init", "--name", "GIT-MAIN", "--json"]);
+    fixture.ok_json(&neighbor, &["init", "--name", "NEIGHBOR", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "main topology sentinel",
+            "--id",
+            "t-topology-main",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &neighbor,
+        &[
+            "task",
+            "add",
+            "neighbor topology sentinel",
+            "--id",
+            "t-topology-neighbor",
+            "--json",
+        ],
+    );
+
+    // These filesystem assertions are the resolver contract and always run,
+    // even on a host where Git cannot construct the topology-specific legs.
+    let from_child = fixture.ok_json(
+        &ordinary_child,
+        &["task", "show", "t-topology-main", "--json"],
+    );
+    assert_eq!(from_child["title"], "main topology sentinel");
+    assert_eq!(from_child["id"], "t-topology-main");
+    let outside = fixture.run(
+        &fixture.root,
+        &["task", "show", "t-topology-main", "--json"],
+    );
+    assert!(
+        !outside.status.success(),
+        "an unattached sibling inherited a board below it"
+    );
+    let outside_stderr = String::from_utf8_lossy(&outside.stderr);
+    assert!(
+        outside_stderr.contains("no Kanban project contains"),
+        "{outside_stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&outside.stdout).contains("topology sentinel"));
+
+    let git_probe = match Command::new("git").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            eprintln!("git unavailable; skipping git topology assertions");
+            return;
+        }
+        Err(error) => panic!("failed to probe git availability: {error}"),
+    };
+    assert!(
+        git_probe.status.success(),
+        "git --version failed: {}",
+        String::from_utf8_lossy(&git_probe.stderr)
+    );
+    assert!(
+        make_repo(&fixture.main),
+        "git repository setup failed after git availability was proven"
+    );
+    let submodule_source = fixture.root.join("submodule-source");
+    fs::create_dir_all(&submodule_source).unwrap();
+    assert!(
+        make_repo(&submodule_source),
+        "local submodule repository setup failed after git availability was proven"
+    );
+    let submodule = Command::new("git")
+        .arg("-c")
+        .arg("protocol.file.allow=always")
+        .arg("-C")
+        .arg(&fixture.main)
+        .args([
+            "submodule",
+            "add",
+            "-q",
+            submodule_source.to_str().unwrap(),
+            "modules/local",
+        ])
+        .output()
+        .expect("spawn git submodule add");
+    assert!(
+        submodule.status.success(),
+        "git submodule add failed: {}",
+        String::from_utf8_lossy(&submodule.stderr)
+    );
+    assert!(
+        commit_all(&fixture.main, "add local submodule"),
+        "git commit failed after local submodule setup"
+    );
+
+    let linked = fixture.root.join("linked-worktree");
+    let worktree = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.main)
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "topology-linked",
+            linked.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn git worktree add");
+    assert!(
+        worktree.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&worktree.stderr)
+    );
+
+    let unattached = fixture.run(&linked, &["task", "show", "t-topology-main", "--json"]);
+    assert!(
+        !unattached.status.success(),
+        "an unattached linked worktree inherited the main worktree's board"
+    );
+    let unattached_stderr = String::from_utf8_lossy(&unattached.stderr);
+    assert!(
+        unattached_stderr.contains("no Kanban project contains"),
+        "{unattached_stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&unattached.stdout).contains("topology sentinel"));
+
+    fixture.ok_json(
+        &linked,
+        &["workspace", "attach", "--to", "GIT-MAIN", "--json"],
+    );
+    for root in [&fixture.main, &linked] {
+        let task = fixture.ok_json(root, &["task", "show", "t-topology-main", "--json"]);
+        assert_eq!(task["title"], "main topology sentinel");
+        assert_eq!(task["id"], "t-topology-main");
+    }
+
+    let local_submodule = fixture.main.join("modules/local");
+    let from_submodule = fixture.ok_json(&local_submodule, &["task", "list", "--json"]);
+    assert_eq!(from_submodule.as_array().unwrap().len(), 1);
+    assert_eq!(from_submodule[0]["id"], "t-topology-main");
+    assert!(
+        from_submodule
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["id"] != "t-topology-neighbor"),
+        "an unregistered submodule escaped to the neighbor board"
+    );
+    let neighbor_tasks = fixture.ok_json(&neighbor, &["task", "list", "--json"]);
+    assert_eq!(neighbor_tasks.as_array().unwrap().len(), 1);
+    assert_eq!(neighbor_tasks[0]["id"], "t-topology-neighbor");
 }
 
 #[test]
@@ -13819,6 +14039,36 @@ fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
     // breaks its root and each lane beneath it at once.
     let fixed = fixture.ok_json(&original, &["workspace", "repoint", "--json"]);
     assert_eq!(fixed.as_array().unwrap().len(), 2);
+    let active = fixture.ok_json(&original, &["workspace", "list", "--json"]);
+    let mut moved_roots = active
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "MOVED")
+        .map(|row| {
+            assert_eq!(
+                row["boardPath"], board_path,
+                "repoint changed board identity"
+            );
+            assert_eq!(row["archived"], false);
+            row["rootPath"].as_str().unwrap().to_owned()
+        })
+        .collect::<Vec<_>>();
+    moved_roots.sort();
+    let mut expected_roots = vec![
+        moved.canonicalize().unwrap().to_string_lossy().into_owned(),
+        moved
+            .join("lane")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected_roots.sort();
+    assert_eq!(
+        moved_roots, expected_roots,
+        "repoint did not preserve exactly the intended canonical roots"
+    );
 
     // The board is reachable from the inside again, and it is the same board --
     // repointing changes one path's spelling and nothing about identity.
@@ -13931,6 +14181,18 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             .iter()
             .any(|row| { row["rootPath"] == retired_root && row["archived"] == true })
     );
+    fs::create_dir_all(&retired).unwrap();
+    let recreated_alias = fixture.run(&retired, &["task", "show", "t-kept", "--json"]);
+    assert!(
+        !recreated_alias.status.success(),
+        "recreating a detached alias silently reattached it"
+    );
+    let recreated_stderr = String::from_utf8_lossy(&recreated_alias.stderr);
+    assert!(
+        recreated_stderr.contains("no Kanban project contains"),
+        "{recreated_stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&recreated_alias.stdout).contains("t-kept"));
     assert_eq!(
         fixture.ok_json(&project, &["task", "show", "t-kept", "--json"])["id"],
         "t-kept",
@@ -13972,6 +14234,21 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             .unwrap()
             .is_empty()
     );
+    for cwd in [&project, &retired] {
+        let bare = fixture.run(cwd, &["task", "show", "t-kept", "--json"]);
+        assert!(
+            !bare.status.success(),
+            "{} still resolved the board after its final root was detached",
+            cwd.display()
+        );
+        let stderr = String::from_utf8_lossy(&bare.stderr);
+        assert!(
+            stderr.contains("no Kanban project contains"),
+            "{}: {stderr}",
+            cwd.display()
+        );
+        assert!(!String::from_utf8_lossy(&bare.stdout).contains("t-kept"));
+    }
     assert_eq!(
         fixture.ok_json(
             &fixture.root,
@@ -14056,6 +14333,23 @@ fn workspace_adopt_copies_a_source_board_from_another_registry_and_preserves_it(
     let source_board = source_board.canonicalize().unwrap();
     let source_bytes = fs::read(&source_board).unwrap();
 
+    let second_root = fixture.root.join("adopted-sibling");
+    let neighbor = fixture.root.join("registered-neighbor");
+    fs::create_dir_all(&second_root).unwrap();
+    fs::create_dir_all(&neighbor).unwrap();
+    fixture.ok_json(&neighbor, &["init", "--name", "Neighbor", "--json"]);
+    fixture.ok_json(
+        &neighbor,
+        &[
+            "task",
+            "add",
+            "neighbor sentinel",
+            "--id",
+            "t-neighbor",
+            "--json",
+        ],
+    );
+
     let adopt_root = fixture.root.join("adopted");
     fs::create_dir_all(&adopt_root).unwrap();
     let receipt = fixture.ok_json(
@@ -14117,11 +14411,86 @@ fn workspace_adopt_copies_a_source_board_from_another_registry_and_preserves_it(
         Path::new(&adopt_root),
         &["task", "show", "t-live", "--json"],
     );
+    assert_eq!(adopted_task["id"], "t-live");
     assert_eq!(adopted_task["title"], "keep this state");
 
-    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0].clone();
-    assert_eq!(board["name"], "Alpha");
-    assert_eq!(board["rootPath"], adopt_root.as_str());
+    let attached = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            "Alpha",
+            "--workspace",
+            second_root.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        attached["boardPath"],
+        adopted_board.to_string_lossy().as_ref()
+    );
+    let second_root = second_root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let from_second = fixture.ok_json(
+        Path::new(&second_root),
+        &["task", "show", "t-live", "--json"],
+    );
+    assert_eq!(from_second["id"], "t-live");
+    assert_eq!(from_second["title"], "keep this state");
+    let by_project = fixture.ok_json(
+        &neighbor,
+        &["task", "show", "t-live", "--project", "Alpha", "--json"],
+    );
+    assert_eq!(by_project["id"], "t-live");
+    assert_eq!(by_project["title"], "keep this state");
+
+    fixture.ok_json(
+        Path::new(&second_root),
+        &[
+            "task",
+            "add",
+            "written from adopted sibling",
+            "--id",
+            "t-adopted-sibling",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(
+            Path::new(&adopt_root),
+            &["task", "show", "t-adopted-sibling", "--json"],
+        )["title"],
+        "written from adopted sibling"
+    );
+    let neighbor_tasks = fixture.ok_json(&neighbor, &["task", "list", "--json"]);
+    assert_eq!(neighbor_tasks.as_array().unwrap().len(), 1);
+    assert_eq!(neighbor_tasks[0]["id"], "t-neighbor");
+
+    let listed = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    let mut alpha_roots = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "Alpha")
+        .map(|row| {
+            assert_eq!(
+                row["boardPath"],
+                adopted_board.to_string_lossy().as_ref(),
+                "an adopted root points at a different board"
+            );
+            assert_eq!(row["archived"], false);
+            row["rootPath"].as_str().unwrap().to_owned()
+        })
+        .collect::<Vec<_>>();
+    alpha_roots.sort();
+    let mut expected_roots = vec![adopt_root.clone(), second_root.clone()];
+    expected_roots.sort();
+    assert_eq!(alpha_roots, expected_roots);
 
     let events = fixture.ok_json(
         &fixture.main,
@@ -21147,6 +21516,17 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         ],
     );
     fixture.ok_json(&beta, &["init", "--name", "BETA", "--json"]);
+    fixture.ok_json(
+        &beta,
+        &[
+            "task",
+            "add",
+            "BETA wrong-board sentinel",
+            "--id",
+            "t-retired-77",
+            "--json",
+        ],
+    );
     let retirement_note = "moved-to-hig";
 
     let retired = fixture.ok_json(
@@ -21223,6 +21603,60 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         env_list_stderr.contains(retirement_note),
         "{env_list_stderr}"
     );
+
+    let explicit_workspace = fixture.run(
+        &beta,
+        &[
+            "task",
+            "show",
+            "t-retired-77",
+            "--workspace",
+            &alpha_root,
+            "--json",
+        ],
+    );
+    let env_project = fixture
+        .command(&beta)
+        .env("KANBAN_PROJECT", "ALPHA")
+        .args(["task", "show", "t-retired-77", "--json"])
+        .output()
+        .unwrap();
+    let readonly_workspace = fixture.run(
+        &beta,
+        &["subscription", "list", "--workspace", &alpha_root, "--json"],
+    );
+    for (label, selector, output) in [
+        (
+            "explicit --workspace",
+            alpha_root.as_str(),
+            explicit_workspace,
+        ),
+        ("KANBAN_PROJECT", "ALPHA", env_project),
+        (
+            "read-only subscription --workspace",
+            alpha_root.as_str(),
+            readonly_workspace,
+        ),
+    ] {
+        assert!(
+            !output.status.success(),
+            "{label} fell through to the active BETA board"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(selector),
+            "{label} did not identify {selector}: {stderr}"
+        );
+        assert!(
+            stderr.contains(retirement_note),
+            "{label} omitted the recorded retirement note: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{label} returned a wrong-board answer while refusing: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     let active_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
     assert!(
@@ -21338,11 +21772,13 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
     assert_eq!(search_alpha["board"], "ALPHA");
 
     let denied_name = fixture.run(
-        &fixture.root,
+        &beta,
         &[
             "task",
             "add",
             "Blocked by retirement",
+            "--id",
+            "t-retired-write",
             "--project",
             "ALPHA",
             "--as",
@@ -21359,6 +21795,13 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         "{}",
         String::from_utf8_lossy(&denied_name.stderr)
     );
+    let denied_name_stderr = String::from_utf8_lossy(&denied_name.stderr);
+    assert!(denied_name_stderr.contains("ALPHA"), "{denied_name_stderr}");
+    assert!(denied_name.stdout.is_empty());
+    let beta_tasks = fixture.ok_json(&beta, &["task", "list", "--json"]);
+    assert_eq!(beta_tasks.as_array().unwrap().len(), 1);
+    assert_eq!(beta_tasks[0]["id"], "t-retired-77");
+    assert_eq!(beta_tasks[0]["title"], "BETA wrong-board sentinel");
 
     let denied_root = fixture.run(&alpha_nested, &["task", "show", "t-retired-77", "--json"]);
     assert!(
@@ -21370,6 +21813,9 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         "{}",
         String::from_utf8_lossy(&denied_root.stderr)
     );
+    let denied_root_stderr = String::from_utf8_lossy(&denied_root.stderr);
+    assert!(denied_root_stderr.contains("ALPHA"), "{denied_root_stderr}");
+    assert!(denied_root.stdout.is_empty());
 
     fixture.ok_json(
         &beta,
