@@ -9161,7 +9161,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         &[
             "attention",
             "raise",
-            "2 commits ready for a staging push, which is George-manual",
+            "2 commits ready for a production push, which needs George approval",
             "--as",
             "claude/driver-1",
             "--kind",
