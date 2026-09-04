@@ -1,0 +1,17 @@
+att	attention
+attn	attention
+cp	checkpoint
+ctx	context
+dash	dashboard
+ev	events
+h	handoff
+hb	heartbeat
+n	note
+r	rule
+rel	release
+s	story
+sr	sitrep
+t	task
+v	version
+w	workspace
+ws	workspace

@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+
+repo_root=${1:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
+expected=".githooks"
+actual=$(git -C "$repo_root" config --local --get core.hooksPath || true)
+
+if [[ "$actual" != "$expected" ]]; then
+  printf 'check-hooks: expected core.hooksPath=%s, got %s\n' "$expected" "${actual:-<unset>}" >&2
+  exit 64
+fi
+
+if [[ ! -x "$repo_root/.githooks/pre-commit" ]]; then
+  printf '%s\n' 'check-hooks: missing executable .githooks/pre-commit' >&2
+  exit 64
+fi
+
+printf 'check-hooks: ok\n'

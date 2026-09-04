@@ -47,6 +47,7 @@ uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]
 headless_chrome = "1"
+syn = { version = "2.0.119", features = ["full", "visit"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }

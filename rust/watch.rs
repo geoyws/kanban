@@ -18,6 +18,7 @@ const METADATA_LIMIT: usize = 16 * 1024;
 const REGISTRY_EVENT_KINDS: &[&str] = &[
     "rule_added",
     "rule_consolidated",
+    "rule_imported",
     "rule_retired",
     "rule_updated",
     "snapshot_restored",

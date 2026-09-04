@@ -27,7 +27,9 @@ use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
 use crate::registry::{
-    BoardPathState, Registry, data_root, now_ms, require_sane_clock, retired_board_message,
+    BoardPathState, PreparedAdoption, Registry, WORKSPACE_ADOPT_HELPER_COMMAND, data_root, now_ms,
+    preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
+    retired_board_message, run_workspace_adopt_helper, spawn_workspace_adopt_helper,
 };
 use crate::store::{ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
@@ -47,6 +49,8 @@ Usage:
   kanban init --name NAME [--workspace PATH] [--rootless] [--force] [--as ACTOR]
   kanban workspace list [--all] [--json]
   kanban workspace attach --to NAME|REGISTERED_PATH [--workspace PATH] [--as ACTOR]
+  kanban workspace adopt --from-board PATH --name NAME (--workspace PATH | --rootless)
+             --as ACTOR [--json]
   kanban workspace detach --root REGISTERED_PATH --as ACTOR
   kanban workspace retire NAME --as ACTOR --note TEXT
   kanban workspace unretire NAME --as ACTOR
@@ -124,6 +128,8 @@ Usage:
              [--board NAME ... | --except-board NAME ...] [--tag NAME ... | --clear-tags]
              --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
+  kanban rule export --board NAME ... --as ACTOR [--output PATH] [--json]
+  kanban rule import PATH --as ACTOR [--json]
   kanban rule consolidate --as ACTOR [--json]
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--priority P0|P1|P2|0-9]
@@ -172,11 +178,12 @@ second board inside a registered project tree (init). Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 26] = [
+pub(crate) const BOOLEAN: [&str; 27] = [
     "help",
     "json",
     "version",
     "force",
+    "rootless",
     "next",
     "candidates",
     "keep-status",
@@ -315,6 +322,12 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         Some("attach"),
         &["db", "project"],
         "attaches the tree named by --workspace to the project named by --to",
+    ),
+    (
+        "workspace",
+        Some("adopt"),
+        &["db", "project"],
+        "copies a source board into registry-owned storage under --name",
     ),
     (
         "workspace",
@@ -466,6 +479,13 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("workspace", Some("list"), &["all"], &[], true),
     ("workspace", Some("attach"), &["to", "as"], &[], false),
+    (
+        "workspace",
+        Some("adopt"),
+        &["from-board", "name", "rootless", "as"],
+        &[],
+        false,
+    ),
     ("workspace", Some("detach"), &["root", "as"], &[], false),
     (
         "workspace",
@@ -809,6 +829,14 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("rule", Some("retire"), &["as"], &["id"], false),
+    (
+        "rule",
+        Some("export"),
+        &["as", "board", "output"],
+        &[],
+        false,
+    ),
+    ("rule", Some("import"), &["as"], &["path"], false),
     ("rule", Some("consolidate"), &["as"], &[], false),
     (
         "attention",
@@ -971,6 +999,7 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
         ("handoff", "acc") => "accept",
         ("workspace", "ls") => "list",
         ("workspace", "att") => "attach",
+        ("workspace", "adopt") => "adopt",
         ("workspace", "det") => "detach",
         ("tag", "ls") => "list",
         ("tag", "new") => "add",
@@ -3237,11 +3266,42 @@ pub fn codex_app_server_adapter_entrypoint() -> ! {
     }
 }
 
+fn read_transfer_bundle(path: &Path) -> Result<Vec<u8>> {
+    const MAX_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read rule transfer bundle {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("rule transfer bundle must be a regular file");
+    }
+    if metadata.len() > MAX_BUNDLE_BYTES {
+        bail!(
+            "rule transfer bundle is too large: {} bytes",
+            metadata.len()
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open rule transfer bundle {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        bail!("rule transfer bundle changed while reading");
+    }
+    Ok(bytes)
+}
+
 fn run() -> Result<()> {
     let args = Args::parse(env::args().skip(1).collect())?;
     if args.has("version") {
         emit(&version_string())?;
         return Ok(());
+    }
+    if !args.positionals.is_empty()
+        && canonical_command(args.positionals[0].as_str()) == WORKSPACE_ADOPT_HELPER_COMMAND
+    {
+        return run_workspace_adopt_helper();
     }
     if args.positionals.is_empty() || args.has("help") {
         emit(HELP)?;
@@ -3305,6 +3365,31 @@ fn run() -> Result<()> {
 
     require_sane_clock()?;
 
+    let adopt_request = if command == "workspace" && sub == Some("adopt") {
+        let source = PathBuf::from(args.require("from-board")?);
+        let name = args.require("name")?;
+        let actor = args.require("as")?.to_owned();
+        let rootless = args.has("rootless");
+        let workspace = args.one("workspace").map(PathBuf::from);
+        if rootless && workspace.is_some() {
+            bail!("--rootless cannot be combined with --workspace");
+        }
+        if !rootless && workspace.is_none() {
+            bail!("workspace adopt requires either --workspace PATH or --rootless");
+        }
+        Some((
+            PreparedAdoption::prepare(&source, name)?,
+            workspace,
+            rootless,
+            actor,
+        ))
+    } else {
+        None
+    };
+    if adopt_request.is_some() {
+        preflight_live_root_for_adoption()?;
+    }
+
     // Held until `run` returns. `restore` replaces database files behind
     // SQLite's back, so it needs the data root to itself; everything else
     // only needs the assurance that no restore is doing so underneath it.
@@ -3332,14 +3417,32 @@ fn run() -> Result<()> {
         false => direct_db(&args),
     };
     let _data_root = if lock::touches_data_root(addressed_board.as_deref()) {
-        Some(if command == "restore" {
-            lock::exclusive()?
-        } else {
-            lock::shared()?
-        })
+        Some(
+            if command == "restore" || (command == "workspace" && sub == Some("adopt")) {
+                lock::exclusive()?
+            } else {
+                lock::shared()?
+            },
+        )
     } else {
         None
     };
+
+    // Adoption validates and snapshots the source before any live write. Once
+    // the source is pinned, the exclusive data-root lock above stays in force
+    // across root preparation, helper execution, registry commit, and cleanup.
+    if let Some((prepared, workspace, rootless, actor)) = adopt_request {
+        if let Err(error) = prepare_live_root_for_adoption() {
+            return Err(prepared.abort(error));
+        }
+        let record =
+            match spawn_workspace_adopt_helper(&prepared, workspace.as_deref(), rootless, &actor) {
+                Ok(record) => record,
+                Err(error) => return Err(prepared.abort(error)),
+            };
+        prepared.cleanup()?;
+        return print(&record, args.has("json"));
+    }
 
     if command == "init" {
         if args.has("rootless") && args.one("workspace").is_some() {
@@ -3761,6 +3864,42 @@ fn run() -> Result<()> {
     }
     if command == "restore" {
         return restore(&args);
+    }
+
+    if command == "rule" && sub == Some("export") {
+        let boards = args.many("board");
+        if boards.is_empty() {
+            bail!("rule export requires at least one --board");
+        }
+        let bundle = Registry::open_readonly()?.export_rules(args.require("as")?, &boards)?;
+        if let Some(output) = args.one("output") {
+            let source_boards = bundle.source_boards.clone();
+            let rules_exported = bundle.rules.len();
+            let source_registry_audit_head = bundle.source_registry_audit.head.clone();
+            fs::write(output, serde_json::to_vec_pretty(&bundle)?)?;
+            return print(
+                &json!({
+                    "written": output,
+                    "sourceBoards": source_boards,
+                    "rulesExported": rules_exported,
+                    "sourceRegistryAuditHead": source_registry_audit_head,
+                }),
+                args.has("json"),
+            );
+        }
+        return print(&bundle, args.has("json"));
+    }
+
+    if command == "rule" && sub == Some("import") {
+        let path = rest
+            .first()
+            .context("rule transfer bundle path is required")?;
+        let bundle: crate::model::RuleTransferBundle =
+            serde_json::from_slice(&read_transfer_bundle(Path::new(path))?)?;
+        return print(
+            &Registry::open()?.import_rules(args.require("as")?, bundle)?,
+            args.has("json"),
+        );
     }
 
     if command == "rule" && sub == Some("consolidate") {

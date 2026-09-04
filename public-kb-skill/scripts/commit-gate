@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+root_dir=${1:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
+denylist_file=${KB_DENYLIST_FILE:-}
+
+if [[ -z "$denylist_file" ]]; then
+  printf '%s\n' 'commit-gate: KB_DENYLIST_FILE is required' >&2
+  exit 64
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+"$script_dir/leak-gate" "$root_dir" "$denylist_file"

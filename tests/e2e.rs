@@ -2,14 +2,27 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use syn::parse::Parser;
+use syn::{
+    Attribute, Expr, ExprLit, ExprMethodCall, ForeignItemFn, ImplItemFn, Item, Lit, Meta,
+    Path as SynPath, Token, TraitItemFn, Variant,
+    punctuated::Punctuated,
+    visit::{self, Visit},
+};
+use uuid::Uuid;
+
+const MAX_CFG_ATOMS: usize = 12;
 
 struct Fixture {
     root: PathBuf,
@@ -96,6 +109,122 @@ fn board_path_for_project(fixture: &Fixture, cwd: &Path, project_name: &str) -> 
         .as_str()
         .unwrap()
         .into()
+}
+
+fn external_source_board(fixture: &Fixture, label: &str, name: &str) -> PathBuf {
+    let data = fixture.root.join(format!("{label}-data"));
+    let cwd = fixture.root.join(format!("{label}-cwd"));
+    fs::create_dir_all(&cwd).unwrap();
+    let output = fixture
+        .command_with_data_dir(&cwd, &data)
+        .args(["init", "--name", name, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    PathBuf::from(value["boardPath"].as_str().unwrap())
+}
+
+fn adoption_marker_path(fixture: &Fixture) -> PathBuf {
+    fixture.data.join(".workspace-adopt.json")
+}
+
+static WORKSPACE_ADOPT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn workspace_adopt_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    WORKSPACE_ADOPT_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
+static DB_LOCK_CONTENTION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn db_lock_contention_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    DB_LOCK_CONTENTION_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
+const WORKSPACE_ADOPT_HELPER_ROOT_FD: i32 = 37;
+const WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD: i32 = 38;
+
+struct OccupiedFdsGuard {
+    fds: [i32; 2],
+}
+
+impl OccupiedFdsGuard {
+    fn occupy() -> Self {
+        let root = fs::File::open("/dev/null").unwrap();
+        let snapshot = fs::File::open("/dev/null").unwrap();
+        unsafe {
+            let root_source = libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100);
+            assert!(root_source >= 0);
+            let snapshot_source = libc::fcntl(snapshot.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100);
+            assert!(snapshot_source >= 0);
+            assert!(libc::dup2(root_source, WORKSPACE_ADOPT_HELPER_ROOT_FD) >= 0);
+            assert!(libc::dup2(snapshot_source, WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD) >= 0);
+            assert!(libc::close(root_source) >= 0);
+            assert!(libc::close(snapshot_source) >= 0);
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_ROOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+            assert!(
+                libc::fcntl(
+                    WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+                    libc::F_SETFD,
+                    libc::FD_CLOEXEC,
+                ) >= 0
+            );
+        }
+        Self {
+            fds: [
+                WORKSPACE_ADOPT_HELPER_ROOT_FD,
+                WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+            ],
+        }
+    }
+}
+
+impl Drop for OccupiedFdsGuard {
+    fn drop(&mut self) {
+        for fd in self.fds {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+fn wait_for_json_file(path: &Path) -> Value {
+    for _ in 0..200 {
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str(&text)
+        {
+            return value;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for valid JSON in {}", path.display());
 }
 
 fn insert_raw_board_event(
@@ -624,6 +753,338 @@ fn browser_loopback_reservation_supported() -> Result<(), String> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .map(drop)
         .map_err(|error| format!("reserve loopback port for browser tests: {error}"))
+}
+
+fn rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let metadata = fs::metadata(&path).unwrap();
+        if metadata.is_dir() {
+            let mut entries: Vec<_> = fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            stack.extend(entries.into_iter().rev());
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            sources.push(path);
+        }
+    }
+    sources.sort();
+    sources
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymbolReferenceKind {
+    Definition,
+    Use,
+}
+
+fn symbol_references_in_source(source: &str, symbol: &str) -> Vec<SymbolReferenceKind> {
+    let file = syn::parse_file(source).unwrap();
+    struct Finder<'a> {
+        symbol: &'a str,
+        references: Vec<SymbolReferenceKind>,
+    }
+
+    #[derive(Clone)]
+    enum CfgExpr {
+        Atom(String),
+        All(Vec<CfgExpr>),
+        Any(Vec<CfgExpr>),
+        Not(Box<CfgExpr>),
+    }
+
+    fn meta_path_to_string(path: &syn::Path) -> String {
+        path.segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+
+    fn expr_to_cfg_string(expr: &Expr) -> String {
+        match expr {
+            Expr::Lit(ExprLit { lit, .. }) => match lit {
+                Lit::Str(value) => format!("{:?}", value.value()),
+                Lit::ByteStr(value) => format!("{:?}", value.value()),
+                Lit::Byte(value) => value.value().to_string(),
+                Lit::Char(value) => value.value().to_string(),
+                Lit::Int(value) => value.base10_digits().to_owned(),
+                Lit::Float(value) => value.base10_digits().to_owned(),
+                Lit::Bool(value) => value.value.to_string(),
+                _ => "lit".to_owned(),
+            },
+            Expr::Path(expr_path) => meta_path_to_string(&expr_path.path),
+            Expr::Paren(expr_paren) => expr_to_cfg_string(&expr_paren.expr),
+            Expr::Group(expr_group) => expr_to_cfg_string(&expr_group.expr),
+            Expr::Unary(expr_unary) => match &expr_unary.op {
+                syn::UnOp::Neg(_) => format!("-{}", expr_to_cfg_string(&expr_unary.expr)),
+                syn::UnOp::Not(_) => format!("!{}", expr_to_cfg_string(&expr_unary.expr)),
+                _ => "unary".to_owned(),
+            },
+            Expr::Macro(expr_macro) => expr_macro.mac.tokens.to_string(),
+            _ => "expr".to_owned(),
+        }
+    }
+
+    fn meta_to_cfg_expr(meta: Meta) -> Option<CfgExpr> {
+        match meta {
+            Meta::Path(path) => Some(CfgExpr::Atom(meta_path_to_string(&path))),
+            Meta::NameValue(name_value) => Some(CfgExpr::Atom(format!(
+                "{}={}",
+                meta_path_to_string(&name_value.path),
+                expr_to_cfg_string(&name_value.value)
+            ))),
+            Meta::List(list) => {
+                let tokens = list.tokens.clone();
+                let items = Punctuated::<Meta, Token![,]>::parse_terminated
+                    .parse2(tokens.clone())
+                    .ok()?;
+                let nested = items
+                    .into_iter()
+                    .map(meta_to_cfg_expr)
+                    .collect::<Option<Vec<_>>>()?;
+                match meta_path_to_string(&list.path).as_str() {
+                    "all" => Some(CfgExpr::All(nested)),
+                    "any" => Some(CfgExpr::Any(nested)),
+                    "not" => {
+                        if nested.len() != 1 {
+                            return None;
+                        }
+                        Some(CfgExpr::Not(Box::new(nested.into_iter().next().unwrap())))
+                    }
+                    _ => Some(CfgExpr::Atom(format!(
+                        "{}({})",
+                        meta_path_to_string(&list.path),
+                        tokens
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn cfg_expr_atoms(expr: &CfgExpr, atoms: &mut Vec<String>) {
+        match expr {
+            CfgExpr::Atom(atom) => atoms.push(atom.clone()),
+            CfgExpr::All(children) | CfgExpr::Any(children) => {
+                for child in children {
+                    cfg_expr_atoms(child, atoms);
+                }
+            }
+            CfgExpr::Not(child) => cfg_expr_atoms(child, atoms),
+        }
+    }
+
+    fn cfg_expr_matches(
+        expr: &CfgExpr,
+        assignment: &std::collections::HashMap<String, bool>,
+    ) -> bool {
+        match expr {
+            CfgExpr::Atom(atom) => assignment.get(atom).copied().unwrap_or(false),
+            CfgExpr::All(children) => children
+                .iter()
+                .all(|child| cfg_expr_matches(child, assignment)),
+            CfgExpr::Any(children) => children
+                .iter()
+                .any(|child| cfg_expr_matches(child, assignment)),
+            CfgExpr::Not(child) => !cfg_expr_matches(child, assignment),
+        }
+    }
+
+    fn has_test_only_cfg(attrs: &[Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            if !attr.path().is_ident("cfg") {
+                return false;
+            }
+            let Meta::List(list) = &attr.meta else {
+                return false;
+            };
+            let Ok(items) =
+                Punctuated::<Meta, Token![,]>::parse_terminated.parse2(list.tokens.clone())
+            else {
+                return false;
+            };
+            let Some(expr) = items
+                .into_iter()
+                .map(meta_to_cfg_expr)
+                .collect::<Option<Vec<_>>>()
+                .map(CfgExpr::All)
+            else {
+                return false;
+            };
+            let mut atoms = Vec::new();
+            cfg_expr_atoms(&expr, &mut atoms);
+            atoms.sort();
+            atoms.dedup();
+            atoms.retain(|atom| atom != "test");
+            if atoms.len() > MAX_CFG_ATOMS {
+                return false;
+            }
+            let mut assignment = std::collections::HashMap::new();
+            let Some(limit) = 1usize.checked_shl(atoms.len() as u32) else {
+                return false;
+            };
+            for mask in 0..limit {
+                assignment.clear();
+                assignment.insert("test".to_owned(), false);
+                for (index, atom) in atoms.iter().enumerate() {
+                    assignment.insert(atom.clone(), (mask & (1usize << index)) != 0);
+                }
+                if cfg_expr_matches(&expr, &assignment) {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    trait HasAttrs {
+        fn attrs(&self) -> &[Attribute];
+    }
+
+    impl HasAttrs for Item {
+        fn attrs(&self) -> &[Attribute] {
+            match self {
+                Item::Const(item) => &item.attrs,
+                Item::Enum(item) => &item.attrs,
+                Item::ExternCrate(item) => &item.attrs,
+                Item::Fn(item) => &item.attrs,
+                Item::ForeignMod(item) => &item.attrs,
+                Item::Impl(item) => &item.attrs,
+                Item::Macro(item) => &item.attrs,
+                Item::Mod(item) => &item.attrs,
+                Item::Static(item) => &item.attrs,
+                Item::Struct(item) => &item.attrs,
+                Item::Trait(item) => &item.attrs,
+                Item::TraitAlias(item) => &item.attrs,
+                Item::Type(item) => &item.attrs,
+                Item::Union(item) => &item.attrs,
+                Item::Use(item) => &item.attrs,
+                Item::Verbatim(_) => &[],
+                _ => &[],
+            }
+        }
+    }
+
+    impl HasAttrs for Variant {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl HasAttrs for TraitItemFn {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl HasAttrs for ForeignItemFn {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl HasAttrs for ImplItemFn {
+        fn attrs(&self) -> &[Attribute] {
+            &self.attrs
+        }
+    }
+
+    impl Visit<'_> for Finder<'_> {
+        fn visit_item(&mut self, node: &Item) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if let Item::Fn(item_fn) = node
+                && item_fn.sig.ident == self.symbol
+            {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_item(self, node);
+        }
+
+        fn visit_trait_item_fn(&mut self, node: &TraitItemFn) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.sig.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_trait_item_fn(self, node);
+        }
+
+        fn visit_foreign_item_fn(&mut self, node: &ForeignItemFn) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.sig.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_foreign_item_fn(self, node);
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &ImplItemFn) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.sig.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_impl_item_fn(self, node);
+        }
+
+        fn visit_field(&mut self, node: &syn::Field) {
+            if has_test_only_cfg(&node.attrs) {
+                return;
+            }
+            visit::visit_field(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &ExprMethodCall) {
+            if node.method == self.symbol {
+                self.references.push(SymbolReferenceKind::Use);
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_path(&mut self, node: &SynPath) {
+            if node
+                .segments
+                .iter()
+                .any(|segment| segment.ident == self.symbol)
+            {
+                self.references.push(SymbolReferenceKind::Use);
+            }
+            visit::visit_path(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &syn::Macro) {
+            if node.tokens.to_string().contains(self.symbol) {
+                self.references.push(SymbolReferenceKind::Use);
+            }
+            visit::visit_macro(self, node);
+        }
+
+        fn visit_variant(&mut self, node: &Variant) {
+            if has_test_only_cfg(node.attrs()) {
+                return;
+            }
+            if node.ident == self.symbol {
+                self.references.push(SymbolReferenceKind::Definition);
+            }
+            visit::visit_variant(self, node);
+        }
+    }
+    let mut finder = Finder {
+        symbol,
+        references: Vec::new(),
+    };
+    finder.visit_file(&file);
+    finder.references
 }
 
 fn server_ready_banner(port: u16) -> String {
@@ -1388,8 +1849,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 12);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 12);
+    assert_eq!(doctor["registrySchemaVersion"], 13);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 13);
     assert_eq!(doctor["supportedBoardSchemaVersion"], 23);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 23);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 23);
@@ -4182,6 +4643,7 @@ fn compiled_binary_lets_no_operation_succeed_while_discarding_a_selector() {
 /// the test holds the flock itself and watches the compiled binary contend.
 #[test]
 fn compiled_binary_locks_the_data_root_even_when_the_environment_names_a_board() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock-vs-ignored-selector");
     fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
     fixture.ok_json(
@@ -4302,6 +4764,7 @@ fn compiled_binary_locks_the_data_root_even_when_the_environment_names_a_board()
 /// test holds the flock itself and watches the compiled binary contend.
 #[test]
 fn compiled_binary_locks_the_data_root_for_a_board_reached_through_a_symlink() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock-vs-symlinked-board");
     fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
     let board = board_path_for_project(&fixture, &fixture.main, "Alpha");
@@ -5045,220 +5508,6 @@ fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
     );
 }
 
-#[test]
-fn compiled_binary_lists_retired_rootless_boards_once_in_workspace_list_all() {
-    let fixture = Fixture::new("rootless-retire-list");
-    let rootless = fixture.root.join("rootless");
-    fs::create_dir_all(&rootless).unwrap();
-
-    let created = fixture.ok_json(
-        &rootless,
-        &["init", "--name", "ROOTLESS", "--rootless", "--json"],
-    );
-    let rootless_path = created["boardPath"].as_str().unwrap().to_owned();
-
-    let retired = fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "retire",
-            "ROOTLESS",
-            "--as",
-            "geo",
-            "--note",
-            "retire rootless board",
-            "--json",
-        ],
-    );
-    assert_eq!(retired["archived"], true);
-
-    let active_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
-    assert!(
-        active_list
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["name"] != "ROOTLESS"),
-        "the retired rootless board leaked into the default inventory: {active_list}"
-    );
-
-    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
-    let rows = all_list
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["name"] == "ROOTLESS")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rows.len(),
-        1,
-        "retired rootless board duplicated in all inventory"
-    );
-    let row = rows[0];
-    assert_eq!(row["archived"], true);
-    assert_eq!(row["rootless"], true);
-    assert_eq!(row["rootPath"], "");
-    assert_eq!(row["boardPath"], rootless_path);
-
-    let restored = fixture.ok_json(
-        &fixture.root,
-        &["workspace", "unretire", "ROOTLESS", "--as", "geo", "--json"],
-    );
-    assert_eq!(restored["archived"], false);
-    assert!(
-        restored["workspaceRoots"].as_array().unwrap().is_empty(),
-        "unretiring a rootless board should not fabricate roots"
-    );
-
-    let restored_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
-    assert!(
-        restored_list
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["name"] == "ROOTLESS" && row["rootless"] == true),
-        "unretiring the rootless board did not restore the active inventory: {restored_list}"
-    );
-}
-
-#[test]
-fn compiled_binary_keeps_rootless_retired_boards_visible_after_previous_detach_history() {
-    let fixture = Fixture::new("rootless-retire-history");
-    let project = fixture.root.join("project");
-    fs::create_dir_all(&project).unwrap();
-
-    let created = fixture.ok_json(&project, &["init", "--name", "ROOTLESS-HISTORY", "--json"]);
-    let board_path = created["boardPath"].as_str().unwrap().to_owned();
-    let root_path = created["workspaceRoots"][0]
-        .as_str()
-        .expect("rootless history root")
-        .to_owned();
-
-    fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "detach",
-            "--root",
-            &root_path,
-            "--as",
-            "geo",
-            "--json",
-        ],
-    );
-    let retired = fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "retire",
-            "ROOTLESS-HISTORY",
-            "--as",
-            "geo",
-            "--note",
-            "retire after detach",
-            "--json",
-        ],
-    );
-    assert_eq!(retired["archived"], true);
-    assert!(
-        retired["workspaceRoots"].as_array().unwrap().is_empty(),
-        "retiring a rootless board must not invent roots"
-    );
-
-    let active_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
-    assert!(
-        active_list
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["name"] != "ROOTLESS-HISTORY"),
-        "the retired rootless board leaked into the default inventory"
-    );
-
-    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
-    let rootless_rows = all_list
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["boardPath"] == board_path && row["rootless"] == true)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rootless_rows.len(),
-        1,
-        "retired rootless board with prior history disappeared from all inventory"
-    );
-    let row = rootless_rows[0];
-    assert_eq!(row["archived"], true);
-    assert_eq!(row["rootPath"], "");
-    assert_eq!(row["boardPath"], board_path);
-}
-
-#[test]
-fn compiled_binary_keeps_same_name_retired_boards_distinct_by_path() {
-    let fixture = Fixture::new("retired-same-name");
-    let first = fixture.root.join("first");
-    let second = fixture.root.join("second");
-    fs::create_dir_all(&first).unwrap();
-    fs::create_dir_all(&second).unwrap();
-
-    let first_created = fixture.ok_json(&first, &["init", "--name", "SAME", "--json"]);
-    let first_path = first_created["boardPath"].as_str().unwrap().to_owned();
-    fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "retire",
-            "SAME",
-            "--as",
-            "geo",
-            "--note",
-            "retire first same-name board",
-            "--json",
-        ],
-    );
-
-    let second_created = fixture.ok_json(&second, &["init", "--name", "SAME", "--json"]);
-    let second_path = second_created["boardPath"].as_str().unwrap().to_owned();
-    fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "retire",
-            "SAME",
-            "--as",
-            "geo",
-            "--note",
-            "retire second same-name board",
-            "--json",
-        ],
-    );
-
-    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
-    let same_name_rows = all_list
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["name"] == "SAME")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        same_name_rows.len(),
-        2,
-        "same-name retired boards were deduped"
-    );
-    let mut paths = same_name_rows
-        .iter()
-        .map(|row| row["boardPath"].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
-    paths.sort();
-    let mut expected = vec![first_path, second_path];
-    expected.sort();
-    assert_eq!(paths, expected);
-    assert!(
-        same_name_rows.iter().all(|row| row["archived"] == true),
-        "retired same-name boards must remain archived in the all inventory"
-    );
-}
-
 /// Every fix below has a probe on the pre-fix binary behind it. These assert the
 /// dangerous behaviour is gone, not merely that the happy path still works.
 #[test]
@@ -5351,7 +5600,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 12"),
+        version.contains("registry schema 13"),
         "version output: {version}"
     );
 }
@@ -6422,6 +6671,7 @@ fn compiled_binary_prunes_only_the_backups_directory_it_manages() {
 
 #[test]
 fn compiled_binary_locks_the_data_root_against_a_concurrent_restore() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock");
     fixture.ok_json(&fixture.main, &["init", "--name", "Locked", "--json"]);
     fixture.ok_json(
@@ -6502,6 +6752,7 @@ fn compiled_binary_locks_the_data_root_against_a_concurrent_restore() {
 
 #[test]
 fn compiled_binary_locks_only_the_data_root_it_was_asked_to_touch() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("lock-scope");
     let outside = fixture.root.join("outside.db");
 
@@ -6742,6 +6993,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
 
 #[test]
 fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
+    let _db_lock_contention_test_guard = db_lock_contention_test_guard();
     let fixture = Fixture::new("busy");
     let project = fixture.ok_json(&fixture.main, &["init", "--name", "Busy", "--json"]);
     let board = project["boardPath"].as_str().unwrap().to_owned();
@@ -6750,6 +7002,7 @@ fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
     // swarm write that loses the race has to queue, not fail: an agent reads
     // an exit status and moves on, so a dropped write is lost work that
     // nothing downstream will notice is missing.
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let holder = std::thread::spawn(move || {
         let connection = Connection::open(&board).unwrap();
         connection
@@ -6759,10 +7012,11 @@ fn compiled_binary_waits_out_a_long_write_lock_instead_of_dropping_the_write() {
             }))
             .unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        started_tx.send(()).unwrap();
         std::thread::sleep(Duration::from_millis(7_500));
         connection.execute_batch("COMMIT").unwrap();
     });
-    std::thread::sleep(Duration::from_millis(250));
+    started_rx.recv().unwrap();
 
     let started = Instant::now();
     fixture.ok_json(
@@ -11015,6 +11269,288 @@ fn copy_executable(source: &Path, target: &Path) {
     fs::rename(&staging, target).unwrap();
 }
 
+fn file_sha256(path: &Path) -> String {
+    let mut file = fs::File::open(path).unwrap();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn clone_release_package(source: &Path, target: &Path, source_commit: &str) {
+    fs::create_dir_all(target).unwrap();
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        fs::copy(source.join(name), target.join(name)).unwrap();
+    }
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(source.join("manifest.json")).unwrap()).unwrap();
+    manifest["sourceCommit"] = json!(source_commit);
+    fs::write(
+        target.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let mut receipt: Value =
+        serde_json::from_slice(&fs::read(source.with_extension("receipt.json")).unwrap()).unwrap();
+    receipt["sourceCommit"] = json!(source_commit);
+    receipt["manifestSha256"] = json!(file_sha256(&target.join("manifest.json")));
+    fs::write(
+        target.with_extension("receipt.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+struct HaxInstallContext<'a> {
+    fixture: &'a Fixture,
+    script: &'a Path,
+    path: &'a str,
+    hostname_bin: &'a Path,
+    fake_repo_root: &'a Path,
+    remote_root: &'a Path,
+}
+
+fn install_matching_hax_package(
+    ctx: &HaxInstallContext<'_>,
+    package_dir: &Path,
+    commit: &str,
+    label: &str,
+) -> PathBuf {
+    let hax_install_root = ctx.fixture.root.join(format!("{label}-install-hax"));
+    let hax_bin_dir = ctx.fixture.root.join(format!("{label}-bin-hax"));
+    let installed = Command::new("bash")
+        .current_dir(&ctx.fixture.main)
+        .env("PATH", ctx.path)
+        .env("HOSTNAME_BIN", ctx.hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", ctx.fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit)
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", ctx.remote_root)
+        .arg(ctx.script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            package_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "HAX install for {label} failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(
+        PathBuf::from(installed_json["installRoot"].as_str().unwrap()),
+        hax_install_root
+    );
+    hax_install_root
+}
+
+fn release_id_from_package(package_dir: &Path) -> String {
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(package_dir.with_extension("receipt.json")).unwrap())
+            .unwrap();
+    format!(
+        "{}-{}",
+        receipt["sourceCommit"].as_str().unwrap(),
+        receipt["manifestSha256"].as_str().unwrap()
+    )
+}
+
+fn capture_release_links(install_root: &Path, bin_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut links = BTreeMap::new();
+    links.insert(
+        "current".to_string(),
+        fs::read_link(install_root.join("current")).unwrap(),
+    );
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        links.insert(name.to_string(), fs::read_link(bin_dir.join(name)).unwrap());
+    }
+    links
+}
+
+fn assert_release_view(install_root: &Path, bin_dir: &Path, release_dir: &Path) {
+    let current_link = install_root.join("current");
+    assert!(current_link.is_symlink(), "current symlink missing");
+    assert_eq!(fs::read_link(&current_link).unwrap(), release_dir);
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        let symlink = bin_dir.join(name);
+        assert!(symlink.is_symlink(), "missing bin symlink {name}");
+        assert_eq!(fs::read_link(&symlink).unwrap(), current_link.join(name));
+    }
+}
+
+fn write_release_tool_stubs(
+    fixture: &Fixture,
+    fake_repo_root: &Path,
+    fake_git_head: &str,
+    fake_release_binary: &str,
+    fake_host: &str,
+) -> PathBuf {
+    let stubs = fixture.root.join("release-stubs");
+    fs::create_dir_all(&stubs).unwrap();
+    write_executable(
+        &stubs.join("hostname"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "${FAKE_HOST:?}"
+"#,
+    );
+    write_executable(
+        &stubs.join("git"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "-C" ]; then
+  shift 2
+fi
+case "${1:-}" in
+  status)
+    exit 0
+    ;;
+  rev-parse)
+    case "${2:-}" in
+      --show-toplevel)
+        printf '%s\n' "${FAKE_REPO_ROOT:?}"
+        ;;
+      HEAD)
+        printf '%s\n' "${FAKE_GIT_HEAD:?}"
+        ;;
+      *)
+        printf 'unexpected git rev-parse %s\n' "$*" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected git %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_executable(
+        &stubs.join("cargo"),
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  build)
+    ;;
+  *)
+    printf 'unexpected cargo %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+target_root="${CARGO_TARGET_DIR:?}/release"
+mkdir -p "$target_root"
+for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter; do
+  cp "${FAKE_RELEASE_BINARY:?}" "$target_root/$binary"
+chmod 0755 "$target_root/$binary"
+done
+"#,
+    );
+    write_executable(
+        &stubs.join("date"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_RELEASE_DATE_SECONDS:-}" ]; then
+  printf '%s\n' "$FAKE_RELEASE_DATE_SECONDS"
+  exit 0
+fi
+command -p date "$@"
+"#,
+    );
+    write_executable(
+        &stubs.join("install"),
+        r#"#!/bin/sh
+set -eu
+mode=0755
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m)
+      mode="$2"
+      shift 2
+      ;;
+    -*)
+      printf 'unexpected install flag %s\n' "$1" >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+src="$1"
+dest="$2"
+mkdir -p "$(dirname "$dest")"
+cp "$src" "$dest"
+chmod "$mode" "$dest"
+"#,
+    );
+    write_executable(
+        &stubs.join("ssh"),
+        r#"#!/bin/sh
+set -eu
+host="$1"
+shift
+case "${1:-}" in
+  hostname)
+    printf '%s\n' "$host"
+    ;;
+  mktemp\ -d*)
+    mktemp -d "${FAKE_REMOTE_ROOT:?}/$host.XXXXXX"
+    ;;
+  bash)
+    shift 3
+    FAKE_HOST="$host" bash -s -- "$@"
+    ;;
+  *)
+    FAKE_HOST="$host" bash -lc "$*"
+    ;;
+esac
+"#,
+    );
+    let _ = (
+        fake_repo_root,
+        fake_git_head,
+        fake_release_binary,
+        fake_host,
+    );
+    stubs
+}
+
 #[test]
 fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     let fixture = Fixture::new("mcp");
@@ -11225,47 +11761,6 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
 
     let unknown_method = session.ask(json!({"jsonrpc": "2.0", "id": 12, "method": "no/such"}));
     assert_eq!(unknown_method["error"]["code"], -32601);
-
-    session.finish();
-}
-
-#[test]
-fn the_mcp_server_rejects_retired_direct_board_paths_over_stdio() {
-    let fixture = Fixture::new("mcp-retired-db");
-    let active = fixture.root.join("active");
-    let retired = fixture.root.join("retired");
-    fs::create_dir_all(&active).unwrap();
-    fs::create_dir_all(&retired).unwrap();
-
-    fixture.ok_json(&active, &["init", "--name", "MCP", "--json"]);
-    let retired_board = fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
-    let retired_path = retired_board["boardPath"].as_str().unwrap().to_owned();
-    fixture.ok_json(
-        &fixture.main,
-        &[
-            "workspace",
-            "retire",
-            "RETIRED",
-            "--as",
-            "geo",
-            "--note",
-            "retire MCP board",
-            "--json",
-        ],
-    );
-
-    let mut session = Session::start(
-        Path::new(env!("CARGO_BIN_EXE_kanban")),
-        &fixture.main,
-        &fixture.data,
-    );
-    let refused = session.ask(json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": { "name": "task_list", "arguments": { "db": retired_path } }
-    }));
-    assert_eq!(refused["result"]["isError"], true);
-    let text = refused["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("retire MCP board"), "{text}");
 
     session.finish();
 }
@@ -13484,552 +13979,667 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
 }
 
 #[test]
-fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_conflicts() {
-    let fixture = Fixture::new("workspace-retire-unretire");
-    let alpha = fixture.root.join("alpha");
-    let alpha_spare = fixture.root.join("alpha-spare");
-    let beta = fixture.root.join("beta");
-    let alpha_nested = alpha.join("nested");
-    fs::create_dir_all(&alpha).unwrap();
-    fs::create_dir_all(&alpha_spare).unwrap();
-    fs::create_dir_all(&beta).unwrap();
-    fs::create_dir_all(&alpha_nested).unwrap();
-    let alpha_spare = alpha_spare.canonicalize().unwrap();
+fn workspace_adopt_copies_a_source_board_from_another_registry_and_preserves_it() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt");
+    let source_data = fixture.root.join("source-data");
+    let source_cwd = fixture.root.join("source-cwd");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&source_data).unwrap();
 
-    let alpha_registered = fixture.ok_json(&alpha, &["init", "--name", "ALPHA", "--json"]);
-    let alpha_root = alpha_registered["workspaceRoots"][0]
-        .as_str()
-        .expect("alpha root")
-        .to_owned();
-    fixture.ok_json(
-        &fixture.root,
+    let source_init = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["init", "--name", "Alpha", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_init.status.success(),
+        "source init failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&source_init.stdout),
+        String::from_utf8_lossy(&source_init.stderr)
+    );
+    let source_init_json: Value = serde_json::from_slice(&source_init.stdout).unwrap();
+    let source_board = PathBuf::from(source_init_json["boardPath"].as_str().unwrap());
+
+    let source_task = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["task", "add", "keep this state", "--id", "t-live", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_task.status.success(),
+        "source task add failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&source_task.stdout),
+        String::from_utf8_lossy(&source_task.stderr)
+    );
+
+    let source_board = source_board.canonicalize().unwrap();
+    let source_bytes = fs::read(&source_board).unwrap();
+
+    let adopt_root = fixture.root.join("adopted");
+    fs::create_dir_all(&adopt_root).unwrap();
+    let receipt = fixture.ok_json(
+        &fixture.main,
         &[
             "workspace",
-            "attach",
-            "--to",
-            "ALPHA",
+            "adopt",
+            "--from-board",
+            source_board.to_str().unwrap(),
+            "--name",
+            "Alpha",
             "--workspace",
-            alpha_spare.to_str().unwrap(),
-            "--json",
-        ],
-    );
-    fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "detach",
-            "--root",
-            alpha_spare.to_str().unwrap(),
+            adopt_root.to_str().unwrap(),
             "--as",
             "geo",
             "--json",
         ],
     );
-    fixture.ok_json(
-        &alpha,
-        &[
-            "task",
-            "add",
-            "Retired needle 77",
-            "--id",
-            "t-retired-77",
-            "--as",
-            "geo",
-            "--json",
-        ],
-    );
-    fixture.ok_json(&beta, &["init", "--name", "BETA", "--json"]);
-    let retirement_note = "moved-to-hig";
 
-    let retired = fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "retire",
-            "ALPHA",
-            "--as",
-            "geo",
-            "--note",
-            retirement_note,
-            "--json",
-        ],
-    );
-    assert_eq!(retired["name"], "ALPHA");
-    assert_eq!(retired["archivedBy"], "geo");
-    assert_eq!(retired["archivedNote"], retirement_note);
-    assert_eq!(retired["workspaceRoots"], json!([alpha_root.clone()]));
-    assert!(retired["archivedAt"].as_i64().is_some());
-    let retired_path = retired["boardPath"].as_str().unwrap().to_owned();
-
-    let with_env = |key: &str, value: &str, args: &[&str]| -> Output {
-        fixture
-            .command(&fixture.root)
-            .env(key, value)
-            .args(args)
-            .output()
-            .unwrap()
-    };
-
-    let direct_write = fixture.run(
-        &fixture.root,
-        &[
-            "task",
-            "add",
-            "Blocked by retirement",
-            "--db",
-            &retired_path,
-            "--json",
-        ],
-    );
-    assert!(
-        !direct_write.status.success(),
-        "a retired board path still answered writes"
-    );
-    let direct_write_stderr = String::from_utf8_lossy(&direct_write.stderr).into_owned();
-    assert!(
-        direct_write_stderr.contains(retirement_note),
-        "{direct_write_stderr}"
-    );
-
-    let direct_watch = fixture.run(
-        &fixture.root,
-        &["watch", "--db", &retired_path, "--limit", "0", "--json"],
-    );
-    assert!(
-        !direct_watch.status.success(),
-        "a retired board path still answered watch"
-    );
-    let direct_watch_stderr = String::from_utf8_lossy(&direct_watch.stderr).into_owned();
-    assert!(
-        direct_watch_stderr.contains(retirement_note),
-        "{direct_watch_stderr}"
-    );
-
-    let env_list = with_env("KANBAN_DB", &retired_path, &["task", "list", "--json"]);
-    assert!(
-        !env_list.status.success(),
-        "KANBAN_DB still answered from a retired board"
-    );
-    let env_list_stderr = String::from_utf8_lossy(&env_list.stderr).into_owned();
-    assert!(
-        env_list_stderr.contains(retirement_note),
-        "{env_list_stderr}"
-    );
-
-    let active_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
-    assert!(
-        active_list
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["name"] != "ALPHA"),
-        "retired board leaked into the default workspace list"
-    );
-    let all_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
-    let retired_rows = all_list
-        .as_array()
+    let adopt_root = adopt_root
+        .canonicalize()
         .unwrap()
-        .iter()
-        .filter(|row| row["boardPath"] == retired_path && row["rootless"] == true)
-        .collect::<Vec<_>>();
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(receipt["name"], "Alpha");
+    assert_eq!(receipt["rootPath"], adopt_root.as_str());
     assert_eq!(
-        retired_rows.len(),
-        0,
-        "retired rooted board still gained a rootless summary row"
+        receipt["sourceBoardPath"],
+        source_board.to_string_lossy().as_ref()
     );
-    let retired_row = all_list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["boardPath"] == retired_path && row["rootPath"] == alpha_root)
-        .expect("archived ALPHA retirement row");
-    assert_eq!(retired_row["archived"], true);
-    assert_eq!(retired_row["archivedBy"], "geo");
-    assert_eq!(retired_row["archivedNote"], retirement_note);
-    assert_eq!(retired_row["rootless"], false);
+    assert_eq!(receipt["workspaceRoots"], json!([adopt_root.clone()]));
+    let adopted_board = PathBuf::from(receipt["boardPath"].as_str().unwrap());
+    assert_eq!(
+        adopted_board.parent(),
+        Some(fixture.data.join("boards").as_path()),
+        "adopted destination escaped registry-owned boards storage"
+    );
+    assert_eq!(
+        adopted_board.extension().and_then(|value| value.to_str()),
+        Some("db")
+    );
+    assert!(
+        adopted_board
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
+        "adopted destination is not UUID-named: {}",
+        adopted_board.display()
+    );
+    let adopted_bytes = fs::read(&adopted_board).unwrap();
+    assert_eq!(
+        receipt["sourceSha256"],
+        format!("{:x}", Sha256::digest(&adopted_bytes)),
+        "receipt hash did not describe the exact registered bytes"
+    );
+    assert_eq!(receipt["sourceBytes"], json!(adopted_bytes.len() as u64));
 
-    let dashboard = fixture.ok_json(&fixture.root, &["dashboard", "--json"]);
-    assert!(
-        dashboard
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["name"] != "ALPHA"),
-        "retired board leaked into the default dashboard"
+    let adopted_task = fixture.ok_json(
+        Path::new(&adopt_root),
+        &["task", "show", "t-live", "--json"],
     );
-    let dashboard_all = fixture.ok_json(&fixture.root, &["dashboard", "--all", "--json"]);
-    let dashboard_alpha = dashboard_all
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "ALPHA")
-        .expect("archived ALPHA dashboard row");
-    assert_eq!(dashboard_alpha["archived"], true);
-    assert_eq!(dashboard_alpha["archivedNote"], retirement_note);
+    assert_eq!(adopted_task["title"], "keep this state");
 
-    let doctor = fixture.ok_json(&fixture.root, &["doctor", "--json"]);
-    assert!(
-        doctor["projects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["name"] != "ALPHA"),
-        "retired board leaked into the default doctor report"
-    );
-    let doctor_all = fixture.ok_json(&fixture.root, &["doctor", "--all", "--json"]);
-    let doctor_alpha = doctor_all["projects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "ALPHA")
-        .expect("archived ALPHA doctor row");
-    assert_eq!(doctor_alpha["archived"], true);
-    assert_eq!(doctor_alpha["archivedBy"], "geo");
-    assert_eq!(doctor_alpha["archivedNote"], retirement_note);
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0].clone();
+    assert_eq!(board["name"], "Alpha");
+    assert_eq!(board["rootPath"], adopt_root.as_str());
 
-    let search_default = fixture.ok_json(
-        &fixture.root,
-        &["search", "Retired needle 77", "--all-boards", "--json"],
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--registry", "--kind", "board_adopted", "--json"],
     );
-    assert!(
-        search_default["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["board"] != "ALPHA"),
-        "default all-board search inspected a retired board"
+    assert_eq!(events[0]["actor"], "geo");
+    assert_eq!(events[0]["payload"]["name"], "Alpha");
+    assert_eq!(events[0]["payload"]["rootPath"], adopt_root.as_str());
+    assert_eq!(
+        events[0]["payload"]["sourceBoardPath"],
+        source_board.to_string_lossy().as_ref()
     );
-    let rebuilt_default = fixture.ok_json(
-        &fixture.root,
-        &["search-rebuild", "--all-boards", "--as", "geo", "--json"],
+    assert_eq!(
+        events[0]["payload"]["sourceSha256"],
+        receipt["sourceSha256"]
     );
-    assert!(
-        rebuilt_default["reports"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["board"] != "ALPHA"),
-        "default all-board search rebuild inspected a retired board"
-    );
-    let search_all = fixture.ok_json(
-        &fixture.root,
-        &[
-            "search",
-            "Retired needle 77",
-            "--all-boards",
-            "--all",
-            "--json",
-        ],
-    );
-    let search_alpha = search_all["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["board"] == "ALPHA")
-        .expect("archived ALPHA search result");
-    assert_eq!(search_alpha["board"], "ALPHA");
+    assert_eq!(events[0]["payload"]["sourceBytes"], receipt["sourceBytes"]);
+    assert_eq!(fs::read(&source_board).unwrap(), source_bytes);
+    assert!(!fixture.data.join(".workspace-adopt.json").exists());
+}
 
-    let denied_name = fixture.run(
-        &fixture.root,
-        &[
-            "task",
-            "add",
-            "Blocked by retirement",
-            "--project",
-            "ALPHA",
-            "--as",
-            "geo",
-            "--json",
-        ],
-    );
+#[test]
+fn workspace_adopt_requires_an_explicit_actor_before_opening_registry_state() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-missing-actor");
+    let source_data = fixture.root.join("source-data");
+    let source_cwd = fixture.root.join("source-cwd");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&source_data).unwrap();
+    let source_init = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["init", "--name", "Alpha", "--json"])
+        .output()
+        .unwrap();
     assert!(
-        !denied_name.status.success(),
-        "a retired board name was still writable"
-    );
-    assert!(
-        String::from_utf8_lossy(&denied_name.stderr).contains(retirement_note),
+        source_init.status.success(),
         "{}",
-        String::from_utf8_lossy(&denied_name.stderr)
+        String::from_utf8_lossy(&source_init.stderr)
     );
+    let source_init_json: Value = serde_json::from_slice(&source_init.stdout).unwrap();
+    let source_board = source_init_json["boardPath"].as_str().unwrap();
 
-    let denied_root = fixture.run(&alpha_nested, &["task", "show", "t-retired-77", "--json"]);
-    assert!(
-        !denied_root.status.success(),
-        "a retired root still resolved"
+    let adopt = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source_board,
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--json",
+        ],
     );
+    assert!(!adopt.status.success(), "adopt without --as succeeded");
     assert!(
-        String::from_utf8_lossy(&denied_root.stderr).contains(retirement_note),
+        String::from_utf8_lossy(&adopt.stderr).contains("--as is required"),
         "{}",
-        String::from_utf8_lossy(&denied_root.stderr)
-    );
-
-    fixture.ok_json(
-        &beta,
-        &[
-            "workspace",
-            "attach",
-            "--to",
-            "BETA",
-            "--workspace",
-            &alpha_root,
-            "--json",
-        ],
-    );
-    let conflict = fixture.run(
-        &fixture.root,
-        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+        String::from_utf8_lossy(&adopt.stderr)
     );
     assert!(
-        !conflict.status.success(),
-        "a conflicting unretire was accepted"
-    );
-    let conflict_stderr = String::from_utf8_lossy(&conflict.stderr).into_owned();
-    assert!(
-        conflict_stderr.contains("cannot be unretired"),
-        "{conflict_stderr}"
-    );
-    let failed_unretire_events = fixture.ok_json(
-        &fixture.root,
-        &[
-            "events",
-            "--registry",
-            "--kind",
-            "workspace_unretired",
-            "--json",
-        ],
+        !fixture.data.join("registry.db").exists(),
+        "missing-actor refusal opened or created the registry database"
     );
     assert!(
-        failed_unretire_events.as_array().unwrap().is_empty(),
-        "a failed unretire wrote an audit event"
-    );
-
-    fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "detach",
-            "--root",
-            &alpha_root,
-            "--as",
-            "geo",
-            "--json",
-        ],
-    );
-    let restored = fixture.ok_json(
-        &fixture.root,
-        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
-    );
-    assert_eq!(restored["name"], "ALPHA");
-    assert_eq!(restored["workspaceRoots"], json!([alpha_root.clone()]));
-    assert!(restored.get("archivedAt").is_none());
-    assert!(restored.get("archivedBy").is_none());
-    assert!(restored.get("archivedNote").is_none());
-
-    let restored_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
-    assert!(
-        restored_list
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["name"] == "ALPHA" && row["archived"] == false),
-        "unretire did not restore the default workspace list"
-    );
-    let restored_search = fixture.ok_json(
-        &fixture.root,
-        &["search", "Retired needle 77", "--all-boards", "--json"],
-    );
-    assert!(
-        restored_search["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["board"] == "ALPHA" && row["archived"] == false),
-        "unretire did not restore all-board search access"
-    );
-    assert_eq!(
-        fixture.ok_json(&alpha_nested, &["task", "show", "t-retired-77", "--json"])["id"],
-        "t-retired-77",
-        "unretire did not restore the retired workspace path"
-    );
-
-    let retired_events = fixture.ok_json(
-        &fixture.root,
-        &[
-            "events",
-            "--registry",
-            "--kind",
-            "workspace_retired",
-            "--json",
-        ],
-    );
-    assert_eq!(retired_events.as_array().unwrap().len(), 1);
-    assert_eq!(retired_events[0]["actor"], "geo");
-    assert!(
-        !retired_events[0]["payload"]["retirementId"]
-            .as_str()
-            .expect("retirement id")
-            .is_empty()
-    );
-    assert_eq!(
-        retired_events[0]["payload"]["archivedNote"],
-        retirement_note
-    );
-    let unretired_events = fixture.ok_json(
-        &fixture.root,
-        &[
-            "events",
-            "--registry",
-            "--kind",
-            "workspace_unretired",
-            "--json",
-        ],
-    );
-    assert_eq!(unretired_events.as_array().unwrap().len(), 1);
-    assert_eq!(unretired_events[0]["actor"], "geo");
-    assert_eq!(
-        retired_events[0]["payload"]["retirementId"],
-        unretired_events[0]["payload"]["retirementId"]
-    );
-    assert_eq!(
-        unretired_events[0]["payload"]["restoredRoots"],
-        json!([alpha_root])
+        !fixture.data.join("boards").exists(),
+        "missing-actor refusal created registry-owned board storage"
     );
 }
 
 #[test]
-fn retired_direct_db_refuses_when_registry_is_corrupt_or_stale_but_external_db_without_registry_still_works()
- {
-    let fixture = Fixture::new("retired-direct-db-boundary");
-    let managed = fixture.root.join("managed");
-    let workspace = managed.join("workspace");
-    fs::create_dir_all(&workspace).unwrap();
+fn workspace_adopt_missing_or_invalid_source_creates_no_live_registry_state() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    for (label, source) in [
+        ("missing", None),
+        ("invalid", Some(b"not a sqlite database".as_slice())),
+        ("large", Some(vec![b'x'; 2 * 1024 * 1024].leak())),
+    ] {
+        let fixture = Fixture::new(&format!("workspace-adopt-preflight-{label}"));
+        let source_path = fixture.root.join(format!("{label}.db"));
+        if let Some(bytes) = source {
+            fs::write(&source_path, bytes).unwrap();
+        }
+        let output = fixture.run(
+            &fixture.main,
+            &[
+                "workspace",
+                "adopt",
+                "--from-board",
+                source_path.to_str().unwrap(),
+                "--name",
+                "Alpha",
+                "--rootless",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "{label} source unexpectedly adopted"
+        );
+        assert!(
+            !fixture.data.exists(),
+            "{label} source created live registry root before preflight refusal"
+        );
+    }
+}
 
-    let created = fixture.ok_json(&workspace, &["init", "--name", "ALPHA", "--json"]);
-    assert_eq!(created["name"], "ALPHA");
-    let retired = fixture.ok_json(
-        &fixture.root,
-        &[
+#[test]
+fn workspace_adopt_helper_stays_hidden_from_help_schema_and_mcp() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-helper-hidden");
+    let help = fixture.run(&fixture.main, &["--help"]);
+    assert!(help.status.success());
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        !help_text.contains("__workspace-adopt-helper"),
+        "helper leaked into the public help surface: {help_text}"
+    );
+
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operations = schema["operations"].as_array().unwrap();
+    assert!(
+        operations
+            .iter()
+            .all(|operation| operation["name"] != "__workspace_adopt_helper"),
+        "helper leaked into the generated schema: {schema}"
+    );
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool["name"] != "__workspace_adopt_helper"),
+        "helper leaked into the MCP tool list: {listed}"
+    );
+}
+
+#[test]
+fn workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_crash() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-crash-before-commit");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+    let mut first = fixture.command(&fixture.main);
+    first
+        .args([
             "workspace",
-            "retire",
-            "ALPHA",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
             "--as",
             "geo",
-            "--note",
-            "moved-to-hig",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
+    let mut first = first.spawn().unwrap();
+    wait_for_path(&marker);
+    let marker_json: Value = wait_for_json_file(&marker);
+    let staging_dir = PathBuf::from(marker_json["stagingDir"].as_str().unwrap());
+
+    let second = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
             "--json",
         ],
     );
-    let retired_path = retired["boardPath"].as_str().unwrap().to_owned();
-    let registry_source = fixture.data.join("registry.db");
-
-    let corrupt_root = fixture.root.join("corrupt-data");
-    fs::create_dir_all(&corrupt_root).unwrap();
-    let corrupt_registry = corrupt_root.join("registry.db");
-    fs::copy(&registry_source, &corrupt_registry).unwrap();
-    fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&corrupt_registry)
-        .unwrap()
-        .set_len(32)
-        .unwrap();
-
-    let corrupt_flag = fixture
-        .command_with_data_dir(&fixture.root, &corrupt_root)
-        .args(["task", "list", "--db", &retired_path, "--json"])
-        .output()
-        .unwrap();
     assert!(
-        !corrupt_flag.status.success(),
-        "a corrupt registry still allowed a retired direct board path"
+        !second.status.success(),
+        "concurrent adopt unexpectedly won"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("another kanban process is using"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
     );
 
-    let corrupt_env = fixture
-        .command_with_data_dir(&fixture.root, &corrupt_root)
-        .env("KANBAN_DB", &retired_path)
-        .args(["task", "list", "--json"])
-        .output()
-        .unwrap();
+    first.kill().unwrap();
+    let first = first.wait_with_output().unwrap();
     assert!(
-        !corrupt_env.status.success(),
-        "a corrupt registry still allowed KANBAN_DB on a retired board"
+        !first.status.success(),
+        "paused adopt unexpectedly completed"
     );
 
-    let stale_root = fixture.root.join("stale-data");
-    fs::create_dir_all(&stale_root).unwrap();
-    let stale_registry = stale_root.join("registry.db");
-    fs::copy(&registry_source, &stale_registry).unwrap();
-    let connection = Connection::open(&stale_registry).unwrap();
-    connection.execute_batch("PRAGMA user_version=11;").unwrap();
-
-    let stale_flag = fixture
-        .command_with_data_dir(&fixture.root, &stale_root)
-        .args(["task", "list", "--db", &retired_path, "--json"])
-        .output()
-        .unwrap();
+    let boards = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
     assert!(
-        !stale_flag.status.success(),
-        "a stale registry still allowed a retired direct board path"
-    );
-
-    let stale_env = fixture
-        .command_with_data_dir(&fixture.root, &stale_root)
-        .env("KANBAN_DB", &retired_path)
-        .args(["task", "list", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        !stale_env.status.success(),
-        "a stale registry still allowed KANBAN_DB on a retired board"
-    );
-
-    let external_root = fixture.root.join("external-data");
-    fs::create_dir_all(&external_root).unwrap();
-    let external_db = fixture.root.join("external.db");
-    let external_added = fixture
-        .command_with_data_dir(&fixture.root, &external_root)
-        .args([
-            "task",
-            "add",
-            "External control task",
-            "--id",
-            "t-external",
-            "--db",
-            external_db.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        external_added.status.success(),
-        "a truly external direct board file should stay usable without a registry"
-    );
-    let external_added_json: Value = serde_json::from_slice(&external_added.stdout).unwrap();
-    assert_eq!(external_added_json["id"], "t-external");
-
-    let external_list = fixture
-        .command_with_data_dir(&fixture.root, &external_root)
-        .args([
-            "task",
-            "list",
-            "--db",
-            external_db.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        external_list.status.success(),
-        "a truly external direct board file should stay usable without a registry"
-    );
-    let external_list_json: Value = serde_json::from_slice(&external_list.stdout).unwrap();
-    assert!(
-        external_list_json
+        boards
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["id"] == "t-external"),
-        "the external control board lost its task after a successful list"
+            .all(|row| row["name"] != "Alpha"),
+        "crash recovery left a board registered unexpectedly: {boards}"
+    );
+    assert!(!marker.exists());
+    assert!(!staging_dir.exists());
+    assert_eq!(
+        fs::read_dir(fixture.data.join("boards")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn workspace_adopt_handles_helper_fd_collisions_and_cloexec() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-helper-fd-collision");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let _fds = OccupiedFdsGuard::occupy();
+
+    let output = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "fd collision and cloexec handoff failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-lock-held");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+
+    let mut holder = fixture.command(&fixture.main);
+    holder
+        .args([
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
+    let mut holder = holder.spawn().unwrap();
+
+    wait_for_path(&marker);
+
+    let blocked = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !blocked.status.success(),
+        "second adopt unexpectedly succeeded while the canonical data-root lock was held"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("another kanban process is using"),
+        "canonical lock refusal missing from stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("database is locked"),
+        "raw SQLite contention leaked through instead of the canonical lock refusal: {stderr}"
+    );
+
+    holder.kill().unwrap();
+    let holder = holder.wait_with_output().unwrap();
+    assert!(
+        !holder.status.success(),
+        "paused adopt unexpectedly completed while testing lock refusal"
+    );
+}
+
+#[test]
+fn workspace_adopt_recovers_after_publishing_before_commit() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-crash-after-rename");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+    let mut child = fixture.command(&fixture.main);
+    child
+        .args([
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_publish");
+    let mut child = child.spawn().unwrap();
+    wait_for_path(&marker);
+    let marker_json: Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+    let board_path = PathBuf::from(marker_json["boardPath"].as_str().unwrap());
+    wait_for_path(&board_path);
+
+    child.kill().unwrap();
+    let child = child.wait_with_output().unwrap();
+    assert!(
+        !child.status.success(),
+        "paused adopt unexpectedly completed"
+    );
+
+    let boards = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        boards
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "Alpha"),
+        "recovery left a board registered unexpectedly: {boards}"
+    );
+    assert!(!marker.exists());
+    assert!(!board_path.exists());
+    assert_eq!(
+        fs::read_dir(fixture.data.join("boards")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn workspace_adopt_rejects_boards_symlink_without_external_write_lock_or_event() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-boards-symlink");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let external = fixture.root.join("external");
+    fs::create_dir_all(&fixture.data).unwrap();
+    fs::create_dir(&external).unwrap();
+    symlink(&external, fixture.data.join("boards")).unwrap();
+
+    let output = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "boards symlink unexpectedly followed"
+    );
+    assert_eq!(
+        fs::read_dir(&external).unwrap().count(),
+        0,
+        "external target was written"
+    );
+    assert!(
+        !fixture.data.join(".lock").exists(),
+        "symlink refusal created the live lock"
+    );
+    assert!(
+        !fixture.data.join("registry.db").exists(),
+        "symlink refusal created registry state"
+    );
+    assert!(
+        fs::symlink_metadata(fixture.data.join("boards"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_and_newer_schema() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-fail-closed-sources");
+    let valid = external_source_board(&fixture, "valid", "Alpha");
+    let link = fixture.root.join("source-link.db");
+    symlink(&valid, &link).unwrap();
+    let traversal_dir = valid.parent().unwrap().join("traversal");
+    fs::create_dir(&traversal_dir).unwrap();
+    let traversal = traversal_dir.join("..").join(valid.file_name().unwrap());
+
+    let fk = external_source_board(&fixture, "fk", "Alpha");
+    let task = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "orphan",
+            "--id",
+            "t-orphan",
+            "--db",
+            fk.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        task.status.success(),
+        "failed to seed FK fixture: {}",
+        String::from_utf8_lossy(&task.stderr)
+    );
+    let fk_connection = Connection::open(&fk).unwrap();
+    fk_connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    fk_connection
+        .execute(
+            "UPDATE tasks SET parent_id='t-missing' WHERE id='t-orphan'",
+            [],
+        )
+        .unwrap();
+    drop(fk_connection);
+
+    let audit = external_source_board(&fixture, "audit", "Alpha");
+    let audit_connection = Connection::open(&audit).unwrap();
+    audit_connection
+        .execute(
+            "UPDATE events SET event_hash='bad' WHERE seq=(SELECT max(seq) FROM events)",
+            [],
+        )
+        .unwrap();
+    drop(audit_connection);
+
+    let newer = external_source_board(&fixture, "newer", "Alpha");
+    let newer_connection = Connection::open(&newer).unwrap();
+    newer_connection
+        .pragma_update(None, "user_version", 24_i64)
+        .unwrap();
+    drop(newer_connection);
+
+    for (label, path, expected) in [
+        ("symlink", link, "symlink"),
+        ("traversal", traversal, "parent traversal"),
+        ("foreign key", fk, "foreign key violations"),
+        ("audit", audit, "invalid audit chain"),
+        ("newer schema", newer, "newer than supported"),
+    ] {
+        let output = fixture.run(
+            &fixture.main,
+            &[
+                "workspace",
+                "adopt",
+                "--from-board",
+                path.to_str().unwrap(),
+                "--name",
+                "Alpha",
+                "--rootless",
+                "--as",
+                "geo",
+                "--json",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "{label} source unexpectedly adopted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+        assert!(
+            !fixture.data.exists(),
+            "{label} refusal created live registry state"
+        );
+    }
+}
+
+#[test]
+fn workspace_adopt_rejects_a_duplicate_active_board_name_across_processes() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-duplicate");
+    let source_data = fixture.root.join("source-data");
+    let source_cwd = fixture.root.join("source-cwd");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&source_data).unwrap();
+
+    fixture.ok_json(&fixture.main, &["init", "--name", "Alpha", "--json"]);
+    let source_init = fixture
+        .command_with_data_dir(&source_cwd, &source_data)
+        .args(["init", "--name", "Alpha", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        source_init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&source_init.stderr)
+    );
+    let source_init_json: Value = serde_json::from_slice(&source_init.stdout).unwrap();
+    let source_board = source_init_json["boardPath"].as_str().unwrap();
+
+    let adopt = fixture.run(
+        &fixture.main,
+        &[
+            "workspace",
+            "adopt",
+            "--from-board",
+            source_board,
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(!adopt.status.success(), "adopt unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&adopt.stderr).contains("already named Alpha"),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
     );
 }
 
@@ -14708,7 +15318,7 @@ struct ActorHeaderFixture {
 fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixture {
     fixture.ok_json(
         &fixture.main,
-        &["init", "--name", board, "--rootless", "true", "--json"],
+        &["init", "--name", board, "--rootless", "--json"],
     );
 
     project_ok_json(
@@ -14725,7 +15335,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--status",
             "todo",
             "--as",
-            "ifca-sso",
+            "geo",
             "--json",
         ],
     );
@@ -14741,7 +15351,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--kind",
             "decision",
             "--as",
-            "ifca-sso",
+            "geo",
             "--json",
         ],
     );
@@ -14939,6 +15549,31 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
     let (status, response) = http_post_with_headers(
         port,
         &format!("/attention/{board}/{}/reply", seeded.success_attention_id),
+        &[
+            ("Origin", "https://hostile.example"),
+            ("X-Kanban-Actor", "ifca-sso"),
+        ],
+        b"decision=approve&reply=done",
+    );
+    assert_eq!(status, 403, "{response}");
+    let still_open = project_ok_json(
+        &fixture,
+        board,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "open",
+            "--task",
+            &seeded.success_task_id,
+            "--json",
+        ],
+    );
+    assert_eq!(still_open.as_array().unwrap().len(), 1);
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.success_attention_id),
         &[("Origin", &origin), ("X-Kanban-Actor", "ifca-sso")],
         b"decision=approve&reply=done",
     );
@@ -14997,6 +15632,23 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
     );
     assert_eq!(status, 403, "{response}");
 
+    let oversized = "x".repeat(300);
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", &oversized)],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 400, "{response}");
+
+    let (status, response) = http_post_with_headers(
+        port,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", "bad\tactor")],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 400, "{response}");
+
     let negative = project_ok_json(
         &fixture,
         board,
@@ -15011,6 +15663,29 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
         ],
     );
     assert_eq!(negative.as_array().unwrap().len(), 1);
+
+    let unauthorized_cli = project_command(&fixture, board)
+        .args([
+            "attention",
+            "resolve",
+            &seeded.default_attention_id,
+            "--as",
+            "ifca-sso",
+            "--note",
+            "still blocked",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !unauthorized_cli.status.success(),
+        "CLI resolve by non-geo/non-raiser actor was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&unauthorized_cli.stderr);
+    assert!(
+        stderr.contains("only geo or that same raiser may resolve"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -15030,6 +15705,209 @@ fn serve_actor_header_defaults_to_geo_when_flag_is_absent() {
     );
     assert_eq!(status, 303, "{response}");
     assert_attention_resolution(&fixture, board, &seeded.default_task_id, "geo");
+}
+
+#[test]
+fn trusted_edge_resolution_stays_on_the_single_web_call_site() {
+    let rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("rust")
+        .canonicalize()
+        .unwrap();
+    let serve_path = rust_dir.join("serve.rs");
+    let store_path = rust_dir.join("store.rs");
+    let mut definitions = Vec::new();
+    let mut uses = Vec::new();
+    for path in rust_sources(&rust_dir) {
+        let path = path.canonicalize().unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        for reference in symbol_references_in_source(&source, "resolve_attention_from_trusted_edge")
+        {
+            match reference {
+                SymbolReferenceKind::Definition => definitions.push(path.clone()),
+                SymbolReferenceKind::Use => uses.push(path.clone()),
+            }
+        }
+    }
+    assert_eq!(definitions, vec![store_path]);
+    assert_eq!(uses, vec![serve_path]);
+}
+
+#[test]
+fn rust_sources_walk_nested_directories() {
+    let root = std::env::temp_dir().join(format!("kanban-rust-source-walk-{}", std::process::id()));
+    let nested = root.join("bin");
+    fs::create_dir_all(&nested).unwrap();
+    let nested_file = nested.join("tool.rs");
+    fs::write(&nested_file, "fn main() {}\n").unwrap();
+
+    let sources = rust_sources(&root);
+    assert_eq!(sources, vec![nested_file]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn symbol_inventory_counts_associated_function_and_function_pointer_uses() {
+    let associated_function = r#"
+        struct Store;
+        impl Store {
+            fn resolve_attention_from_trusted_edge() {}
+        }
+
+        fn exercise() {
+            let _ = Store::resolve_attention_from_trusted_edge;
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(associated_function, "resolve_attention_from_trusted_edge"),
+        vec![SymbolReferenceKind::Definition, SymbolReferenceKind::Use]
+    );
+
+    let function_pointer = r#"
+        fn resolve_attention_from_trusted_edge() {}
+
+        fn exercise() {
+            let _handler = resolve_attention_from_trusted_edge;
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(function_pointer, "resolve_attention_from_trusted_edge"),
+        vec![SymbolReferenceKind::Definition, SymbolReferenceKind::Use]
+    );
+}
+
+#[test]
+fn symbol_inventory_skips_test_only_struct_type_and_static_items() {
+    let source = r#"
+        mod helper {
+            pub struct resolve_attention_from_trusted_edge;
+        }
+
+        fn resolve_attention_from_trusted_edge() {}
+
+        fn exercise() {
+            let _ = resolve_attention_from_trusted_edge;
+        }
+
+        #[cfg(test)]
+        struct TestOnlyStruct {
+            field: helper::resolve_attention_from_trusted_edge,
+        }
+
+        #[cfg(all(test, feature = "inventory"))]
+        type TestOnlyType = helper::resolve_attention_from_trusted_edge;
+
+        #[cfg(any(
+            all(test, feature = "inventory"),
+            all(test, feature = "alternate")
+        ))]
+        static TEST_ONLY_STATIC: helper::resolve_attention_from_trusted_edge =
+            helper::resolve_attention_from_trusted_edge;
+
+        #[cfg(test)]
+        struct TestOnlyStructField {
+            field: helper::resolve_attention_from_trusted_edge,
+        }
+
+        #[cfg(test)]
+        enum TestOnlyVariant {
+            Hidden(helper::resolve_attention_from_trusted_edge),
+        }
+
+        #[cfg(all(feature = "alpha", not(feature = "beta")))]
+        struct LiveFeatureField {
+            field: helper::resolve_attention_from_trusted_edge,
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(source, "resolve_attention_from_trusted_edge"),
+        vec![
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Use,
+            SymbolReferenceKind::Use,
+        ]
+    );
+}
+
+#[test]
+fn symbol_inventory_keeps_malformed_not_cfg_live() {
+    let source = r#"
+        fn resolve_attention_from_trusted_edge() {}
+
+        #[cfg(not(test, feature = "inventory"))]
+        struct MalformedNotField {
+            field: resolve_attention_from_trusted_edge,
+        }
+
+        #[cfg(not())]
+        enum EmptyNotVariant {
+            Visible(resolve_attention_from_trusted_edge),
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(source, "resolve_attention_from_trusted_edge"),
+        vec![
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Use,
+            SymbolReferenceKind::Use,
+        ]
+    );
+}
+
+#[test]
+fn symbol_inventory_treats_over_cap_cfg_as_live() {
+    let cfg_atoms = (0..=MAX_CFG_ATOMS)
+        .map(|index| format!("atom{index}"))
+        .collect::<Vec<_>>();
+    let source = format!(
+        r#"
+        fn resolve_attention_from_trusted_edge() {{}}
+
+        #[cfg(all({cfg}))]
+        struct OverCapLiveField {{
+            field: resolve_attention_from_trusted_edge,
+        }}
+    "#,
+        cfg = cfg_atoms.join(", ")
+    );
+    assert_eq!(
+        symbol_references_in_source(&source, "resolve_attention_from_trusted_edge"),
+        vec![SymbolReferenceKind::Definition, SymbolReferenceKind::Use]
+    );
+}
+
+#[test]
+fn symbol_inventory_catches_trait_foreign_and_macro_token_references() {
+    let source = r#"
+        trait Audit {
+            fn resolve_attention_from_trusted_edge();
+        }
+
+        extern "C" {
+            fn resolve_attention_from_trusted_edge();
+        }
+
+        macro_rules! capture {
+            ($name:ident) => {
+                $name
+            };
+        }
+
+        fn resolve_attention_from_trusted_edge() {}
+
+        fn exercise() {
+            capture!(resolve_attention_from_trusted_edge);
+        }
+    "#;
+    assert_eq!(
+        symbol_references_in_source(source, "resolve_attention_from_trusted_edge"),
+        vec![
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Definition,
+            SymbolReferenceKind::Use,
+        ]
+    );
 }
 
 #[test]
@@ -15056,52 +15934,6 @@ fn serve_actor_header_duplicate_cli_flags_fail_closed() {
     assert!(
         stderr.contains("given more than once") || stderr.contains("takes a single value"),
         "{stderr}"
-    );
-}
-
-#[test]
-fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
-    let fixture = Fixture::new("serve-retired-board");
-    let active = fixture.root.join("active");
-    let retired = fixture.root.join("retired");
-    fs::create_dir_all(&active).unwrap();
-    fs::create_dir_all(&retired).unwrap();
-
-    fixture.ok_json(&active, &["init", "--name", "ACTIVE", "--json"]);
-    fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
-    fixture.ok_json(
-        &fixture.root,
-        &[
-            "workspace",
-            "retire",
-            "RETIRED",
-            "--as",
-            "geo",
-            "--note",
-            "retire served board",
-            "--json",
-        ],
-    );
-
-    let server = spawn_server(&fixture);
-    let port = server.port;
-
-    let (status, boards) = http_get(port, "/boards");
-    assert_eq!(status, 200, "{boards}");
-    assert!(
-        boards.contains("ACTIVE"),
-        "the active board disappeared from the board index: {boards}"
-    );
-    assert!(
-        !boards.contains("RETIRED"),
-        "the retired board leaked into the board index: {boards}"
-    );
-
-    let (status, retired_page) = http_get(port, "/board/RETIRED");
-    assert_eq!(status, 500, "{retired_page}");
-    assert!(
-        retired_page.contains("retire served board"),
-        "{retired_page}"
     );
 }
 
@@ -16569,7 +17401,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
 }
 
@@ -16628,7 +17460,7 @@ fn registry_v10_migration_records_discarded_alias_names() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     let (kind, actor, payload): (String, String, String) = registry
         .query_row(
@@ -17301,6 +18133,1793 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
 }
 
 #[test]
+fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source() {
+    let source = Fixture::new("rule-transfer-source");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "alpha", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "beta", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--tag",
+            "alpha",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source_second,
+        &[
+            "rule",
+            "add",
+            "Beta source rule.",
+            "--board",
+            "BETA",
+            "--tag",
+            "beta",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let source_before =
+        source.ok_json(&source.main, &["rule", "list", "--all", "--full", "--json"]);
+    let bundle_path = source.root.join("rule-transfer.json");
+    let export = source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(export["written"], json!(bundle_path.to_str().unwrap()));
+    assert_eq!(export["sourceBoards"], json!(["ALPHA", "BETA"]));
+    assert_eq!(export["rulesExported"], 2);
+
+    let bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    assert_eq!(bundle["formatVersion"], 1);
+    assert_eq!(bundle["exportedBy"], "geo");
+    assert_eq!(bundle["sourceBoards"], json!(["ALPHA", "BETA"]));
+    assert_eq!(bundle["rules"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        source.ok_json(&source.main, &["rule", "list", "--all", "--full", "--json"]),
+        source_before,
+        "export mutated the source registry"
+    );
+
+    let destination = Fixture::new("rule-transfer-destination");
+    let destination_second = destination.root.join("second");
+    fs::create_dir_all(&destination_second).unwrap();
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    destination.ok_json(&destination_second, &["init", "--name", "BETA", "--json"]);
+
+    let imported = destination.ok_json(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(imported["importedRules"], 2);
+    assert_eq!(imported["alreadyImportedRules"], 0);
+    assert_eq!(imported["destinationBoardsVerified"], 2);
+
+    let imported_rules = destination.ok_json(
+        &destination.main,
+        &["rule", "list", "--all", "--full", "--json"],
+    );
+    let mut imported_by_source = BTreeMap::new();
+    for rule in imported_rules.as_array().unwrap() {
+        imported_by_source.insert(
+            (
+                rule["sourceBoard"].as_str().unwrap().to_owned(),
+                rule["sourceRuleId"].as_str().unwrap().to_owned(),
+            ),
+            rule.clone(),
+        );
+    }
+    for rule in bundle["rules"].as_array().unwrap() {
+        let source_board = rule["sourceBoard"].as_str().unwrap().to_owned();
+        let source_rule_id = rule["sourceRuleId"].as_str().unwrap().to_owned();
+        let imported_rule = imported_by_source
+            .get(&(source_board.clone(), source_rule_id.clone()))
+            .unwrap_or_else(|| panic!("missing imported rule {source_board}/{source_rule_id}"));
+        assert_ne!(imported_rule["id"], rule["sourceRuleId"]);
+        assert_eq!(imported_rule["body"], rule["body"]);
+        assert_eq!(imported_rule["author"], rule["author"]);
+        assert_eq!(imported_rule["tags"], rule["tags"]);
+        assert_eq!(imported_rule["sourceBoard"], rule["sourceBoard"]);
+        assert_eq!(imported_rule["sourceRuleId"], rule["sourceRuleId"]);
+    }
+
+    let imported_again = destination.ok_json(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert_eq!(imported_again["importedRules"], 0);
+    assert_eq!(imported_again["alreadyImportedRules"], 2);
+    assert_eq!(
+        destination.ok_json(
+            &destination.main,
+            &["rule", "list", "--all", "--full", "--json"],
+        ),
+        imported_rules,
+        "import was not idempotent"
+    );
+}
+
+#[test]
+fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_differs() {
+    let source = Fixture::new("rule-transfer-source-tamper");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "alpha", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &["tag", "add", "beta", "--as", "geo", "--json"],
+    );
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--tag",
+            "alpha",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source_second,
+        &[
+            "rule",
+            "add",
+            "Beta source rule.",
+            "--board",
+            "BETA",
+            "--tag",
+            "beta",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let bundle_path = source.root.join("rule-transfer.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let mut bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    bundle["rules"][0]["sourceRegistryUuid"] = json!(Uuid::new_v4().to_string());
+    fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+    let destination = Fixture::new("rule-transfer-destination-tamper");
+    let destination_second = destination.root.join("second");
+    fs::create_dir_all(&destination_second).unwrap();
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    destination.ok_json(&destination_second, &["init", "--name", "BETA", "--json"]);
+
+    let failed = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !failed.status.success(),
+        "tampered bundle unexpectedly imported"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+    assert!(
+        stderr.contains("claims source registry") || stderr.contains("sourceRegistryUuid"),
+        "{stderr}"
+    );
+    assert!(
+        destination
+            .ok_json(
+                &destination.main,
+                &["rule", "list", "--all", "--full", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused import mutated the destination registry"
+    );
+    let registry = Connection::open(destination.data.join("registry.db")).unwrap();
+    let rule_count: i64 = registry
+        .query_row("SELECT count(*) FROM rules", [], |row| row.get(0))
+        .unwrap();
+    let ledger_count: i64 = registry
+        .query_row("SELECT count(*) FROM rule_import_ledger", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rule_count, 0, "a refused import wrote destination rules");
+    assert_eq!(ledger_count, 0, "a refused import left ledger residue");
+}
+
+#[test]
+fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board() {
+    let source = Fixture::new("rule-transfer-missing-destination");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source_second,
+        &[
+            "rule",
+            "add",
+            "Beta source rule.",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let bundle_path = source.root.join("rule-transfer.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "BETA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    let destination = Fixture::new("rule-transfer-missing-destination-target");
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    let failed = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !failed.status.success(),
+        "import without BETA unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+    assert!(
+        stderr.contains("not registered in this registry"),
+        "{stderr}"
+    );
+    assert!(
+        destination
+            .ok_json(
+                &destination.main,
+                &["rule", "list", "--all", "--full", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused import mutated the destination registry"
+    );
+}
+
+#[test]
+fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() {
+    let fixture = Fixture::new("rule-export-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ALPHA", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Alpha source rule.",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let duplicate_bundle = fixture.root.join("duplicate-bundle.json");
+
+    let duplicate = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--output",
+            duplicate_bundle.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("given more than once"),
+        "{:?}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+
+    let missing_bundle = fixture.root.join("missing-bundle.json");
+    let missing = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "MISSING",
+            "--as",
+            "geo",
+            "--output",
+            missing_bundle.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("not registered in this registry"),
+        "{:?}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_packages_five_binaries_and_refuses_partial_activation() {
+    let fixture = Fixture::new("hig-release");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let broken_install_root = fixture.root.join("broken-install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "package failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let manifest_path = output_dir.join("manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["formatVersion"], 1);
+    assert_eq!(manifest["targets"], json!(["hax", "hig"]));
+    assert_eq!(
+        manifest["sourceCommit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(manifest["sourceTreeClean"], true);
+    assert_eq!(
+        manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "kanban",
+            "kb",
+            "kanban-dispatcher",
+            "kanban-codex-queue-adapter",
+            "kanban-codex-app-server-adapter",
+        ]
+    );
+    let receipt_path = output_dir.with_extension("receipt.json");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["host"], "hax");
+    assert_eq!(receipt["targets"], json!(["hax", "hig"]));
+    assert_eq!(
+        receipt["manifestSha256"],
+        json!(file_sha256(&manifest_path))
+    );
+    assert_eq!(
+        receipt["sourceCommit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+    ] {
+        assert!(
+            output_dir.join(name).is_file(),
+            "missing package binary {name}"
+        );
+    }
+
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "HAX install failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&hax_installed.stdout),
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let hax_installed_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+    let hax_release_dir = PathBuf::from(hax_installed_json["releaseDir"].as_str().unwrap());
+    assert!(hax_release_dir.is_dir(), "HAX release dir missing");
+    assert!(
+        hax_release_dir.join("manifest.json").is_file(),
+        "HAX release manifest missing"
+    );
+    let hax_release_receipt = PathBuf::from(hax_installed_json["receipt"].as_str().unwrap());
+    let hax_release_receipt_json: Value =
+        serde_json::from_slice(&fs::read(&hax_release_receipt).unwrap()).unwrap();
+    assert_eq!(
+        hax_release_receipt_json["releaseDir"],
+        json!(hax_release_dir.to_str().unwrap())
+    );
+    assert_eq!(hax_release_receipt_json["target"], "hax");
+    assert_eq!(hax_release_receipt_json["targets"], json!(["hax", "hig"]));
+    assert_eq!(
+        hax_release_receipt_json["manifestSha256"],
+        json!(file_sha256(&manifest_path))
+    );
+    let hax_release_receipt_bytes = fs::read(&hax_release_receipt).unwrap();
+    let hax_installed_again = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed_again.status.success(),
+        "HAX reinstall failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&hax_installed_again.stdout),
+        String::from_utf8_lossy(&hax_installed_again.stderr)
+    );
+    assert_eq!(
+        fs::read(&hax_release_receipt).unwrap(),
+        hax_release_receipt_bytes,
+        "HAX receipt bytes changed on reactivation"
+    );
+    assert_release_view(&hax_install_root, &hax_bin_dir, &hax_release_dir);
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+        "manifest.json",
+    ] {
+        assert!(
+            hax_release_dir.join(name).exists(),
+            "missing HAX installed file {name}"
+        );
+    }
+
+    let installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "HIG install failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
+        "HIG install wrote unexpected stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    let release_dir = PathBuf::from(installed_json["releaseDir"].as_str().unwrap());
+    assert!(release_dir.is_dir(), "release dir missing");
+    assert!(
+        release_dir.join("manifest.json").is_file(),
+        "release manifest missing"
+    );
+    let release_receipt = PathBuf::from(installed_json["receipt"].as_str().unwrap());
+    let release_receipt_json: Value =
+        serde_json::from_slice(&fs::read(&release_receipt).unwrap()).unwrap();
+    assert_eq!(
+        release_receipt_json["releaseDir"],
+        json!(release_dir.to_str().unwrap())
+    );
+    assert_eq!(release_receipt_json["target"], "hig");
+    assert_eq!(
+        release_receipt_json["manifestSha256"],
+        hax_release_receipt_json["manifestSha256"]
+    );
+    assert_release_view(&install_root, &bin_dir, &release_dir);
+    for name in [
+        "kanban",
+        "kb",
+        "kanban-dispatcher",
+        "kanban-codex-queue-adapter",
+        "kanban-codex-app-server-adapter",
+        "manifest.json",
+    ] {
+        assert!(
+            release_dir.join(name).exists(),
+            "missing installed file {name}"
+        );
+    }
+
+    let installed_again = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed_again.status.success(),
+        "idempotent install failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed_again.stdout),
+        String::from_utf8_lossy(&installed_again.stderr)
+    );
+
+    let partial_package = fixture.root.join("partial-package");
+    fs::create_dir_all(&partial_package).unwrap();
+    for entry in fs::read_dir(&output_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some("kb") {
+            continue;
+        }
+        fs::copy(&path, partial_package.join(path.file_name().unwrap())).unwrap();
+    }
+    fs::copy(
+        &receipt_path,
+        partial_package.with_extension("receipt.json"),
+    )
+    .unwrap();
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            partial_package.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            broken_install_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "partial package activated successfully"
+    );
+    assert!(
+        !broken_install_root.exists(),
+        "partial package left an activated install root behind"
+    );
+}
+
+#[test]
+fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_current() {
+    let fixture = Fixture::new("hig-release-reactivation-failure");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+
+    let installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
+        "HIG install wrote unexpected stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    let release_dir = PathBuf::from(installed_json["releaseDir"].as_str().unwrap());
+    let release_receipt = PathBuf::from(installed_json["receipt"].as_str().unwrap());
+    let release_receipt_bytes = fs::read(&release_receipt).unwrap();
+    let stable_links = capture_release_links(&install_root, &bin_dir);
+
+    let failed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("HIG_RELEASE_FAIL_AFTER_CURRENT", "1")
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !failed.status.success(),
+        "reactivation failure unexpectedly succeeded"
+    );
+    assert_eq!(
+        capture_release_links(&install_root, &bin_dir),
+        stable_links,
+        "reactivation failure changed the public release view"
+    );
+    assert!(
+        release_dir.is_dir(),
+        "reactivation failure removed the release tree"
+    );
+    assert_eq!(
+        fs::read(&release_receipt).unwrap(),
+        release_receipt_bytes,
+        "reactivation failure rewrote the release receipt"
+    );
+    let receipt_count = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(
+        receipt_count, 1,
+        "reactivation failure left receipt residue"
+    );
+}
+
+#[test]
+fn hig_release_script_usage_refuses_missing_and_unknown_commands_with_exit_64() {
+    let fixture = Fixture::new("hig-release-usage");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+
+    for args in [Vec::<&str>::new(), vec!["bogus", "hax"]] {
+        let output = Command::new("bash")
+            .current_dir(&fixture.main)
+            .arg(&script)
+            .args(args.iter().copied())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "unexpected exit code for {:?}",
+            args
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("usage:"), "{stderr}");
+        assert!(
+            stderr.contains("hig-release.sh package hax [--output DIR]"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("package <hax|hig>"),
+            "stale usage text leaked into stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn hig_release_script_rejects_package_target_hig() {
+    let fixture = Fixture::new("hig-release-package-hig");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hig", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !packaged.status.success(),
+        "package hig unexpectedly succeeded"
+    );
+    assert_eq!(packaged.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&packaged.stderr).contains("package target must be hax"),
+        "stderr: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_rejects_hig_install_without_hax_install_root() {
+    let fixture = Fixture::new("hig-release-hig-before-hax");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "HIG install without hax install root succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("--hax-install-root is required for hig installs"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_rejects_the_build_provenance_receipt_for_hig_install() {
+    let fixture = Fixture::new("hig-release-build-receipt");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let build_receipt = output_dir.with_extension("receipt.json");
+    let fake_hax_install_root = fixture.root.join("fake-hax-install");
+    let fake_release_dir = fake_hax_install_root
+        .join("releases")
+        .join(release_id_from_package(&output_dir));
+    fs::create_dir_all(&fake_release_dir).unwrap();
+    for entry in fs::read_dir(&output_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        fs::copy(&path, fake_release_dir.join(path.file_name().unwrap())).unwrap();
+    }
+    fs::copy(
+        &build_receipt,
+        fake_release_dir.with_extension("receipt.json"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&fake_release_dir, fake_hax_install_root.join("current")).unwrap();
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            fake_hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "build provenance receipt unexpectedly authorized HIG install"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("hax activation receipt is incomplete or mismatched")
+            || String::from_utf8_lossy(&refused.stderr)
+                .contains("hax activation receipt is missing"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_rejects_a_mismatched_hax_install_receipt() {
+    let fixture = Fixture::new("hig-release-hax-receipt-mismatch");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef01234567",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let hax_install_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+    let hax_receipt_path = PathBuf::from(hax_install_json["receipt"].as_str().unwrap());
+    let mut forged: Value = serde_json::from_slice(&fs::read(&hax_receipt_path).unwrap()).unwrap();
+    forged["releaseId"] = json!("mismatched-release-id");
+    fs::write(
+        &hax_receipt_path,
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+
+    let refused = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--hax-install-root",
+            hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "mismatched hax receipt unexpectedly authorized HIG install"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("hax activation receipt is incomplete or mismatched"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
+    let fixture = Fixture::new("hig-release-rollback");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef00000000",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let release_second = "1700000000";
+    let commit = |index: usize| format!("0123456789abcdef0123456789abcdef{:08x}", index);
+    let hax_ctx = HaxInstallContext {
+        fixture: &fixture,
+        script: &script,
+        path: &path,
+        hostname_bin: &hostname_bin,
+        fake_repo_root: &fake_repo_root,
+        remote_root: &remote_root,
+    };
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let mut release_dirs = Vec::new();
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let _hax_install_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+
+    for index in 0..5 {
+        let package_dir = if index == 0 {
+            output_dir.clone()
+        } else {
+            let cloned = fixture.root.join(format!("package-{index:02}"));
+            clone_release_package(&output_dir, &cloned, &commit(index));
+            cloned
+        };
+        let hax_install_root = if index == 0 {
+            hax_install_root.clone()
+        } else {
+            install_matching_hax_package(
+                &hax_ctx,
+                &package_dir,
+                &commit(index),
+                &format!("rollback-hax-{index:02}"),
+            )
+        };
+        let installed = Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", commit(index))
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+            .arg(&script)
+            .args([
+                "install",
+                "hig",
+                "--package",
+                package_dir.to_str().unwrap(),
+                "--hax-install-root",
+                hax_install_root.to_str().unwrap(),
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "install {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        release_dirs.push(PathBuf::from(
+            installed_json["releaseDir"].as_str().unwrap(),
+        ));
+    }
+
+    let failed_package = fixture.root.join("package-failed");
+    clone_release_package(&output_dir, &failed_package, &commit(99));
+    let failed_hax_install_root = install_matching_hax_package(
+        &hax_ctx,
+        &failed_package,
+        &commit(99),
+        "rollback-hax-failed",
+    );
+    let stable_links = capture_release_links(&install_root, &bin_dir);
+    let failed_release_dir = install_root.join(format!(
+        "releases/{}",
+        release_id_from_package(&failed_package)
+    ));
+    let failed_install = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(99))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .env("HIG_RELEASE_FAIL_AFTER_CURRENT", "1")
+        .arg(&script)
+        .args([
+            "install",
+            "hig",
+            "--package",
+            failed_package.to_str().unwrap(),
+            "--hax-install-root",
+            failed_hax_install_root.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !failed_install.status.success(),
+        "failed activation unexpectedly succeeded"
+    );
+    assert_eq!(
+        capture_release_links(&install_root, &bin_dir),
+        stable_links,
+        "failed activation changed the public release view"
+    );
+    assert!(
+        !failed_release_dir.exists(),
+        "failed release directory was retained"
+    );
+    assert!(
+        !failed_release_dir.with_extension("receipt.json").exists(),
+        "failed release receipt was retained"
+    );
+    let release_receipts_after_failure = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(
+        release_receipts_after_failure, 5,
+        "failed release counted toward retention"
+    );
+
+    for index in 5..11 {
+        let cloned = fixture.root.join(format!("package-{index:02}"));
+        clone_release_package(&output_dir, &cloned, &commit(index));
+        let hax_install_root = install_matching_hax_package(
+            &hax_ctx,
+            &cloned,
+            &commit(index),
+            &format!("rollback-hax-{index:02}"),
+        );
+        let installed = Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", commit(index))
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+            .arg(&script)
+            .args([
+                "install",
+                "hig",
+                "--package",
+                cloned.to_str().unwrap(),
+                "--hax-install-root",
+                hax_install_root.to_str().unwrap(),
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "install {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        release_dirs.push(PathBuf::from(
+            installed_json["releaseDir"].as_str().unwrap(),
+        ));
+    }
+
+    let release_receipts = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(
+        release_receipts, 10,
+        "retention did not stop at ten releases"
+    );
+
+    let rollback = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(10))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .arg(&script)
+        .args([
+            "rollback",
+            "hig",
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+            "--steps",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rollback.status.success(),
+        "rollback failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&rollback.stdout),
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    let rollback_json: Value = serde_json::from_slice(&rollback.stdout).unwrap();
+    assert_eq!(
+        PathBuf::from(rollback_json["releaseDir"].as_str().unwrap()),
+        release_dirs[9]
+    );
+    let current_link = install_root.join("current");
+    assert_eq!(fs::read_link(&current_link).unwrap(), release_dirs[9]);
+    assert_release_view(&install_root, &bin_dir, &release_dirs[9]);
+}
+
+#[test]
+fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover() {
+    let fixture = Fixture::new("hig-release-rollback-fail");
+    let fake_repo_root = fixture.root.join("fake-repo");
+    fs::create_dir_all(&fake_repo_root).unwrap();
+    let remote_root = fixture.root.join("remote-root");
+    fs::create_dir_all(&remote_root).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+    let stubs = write_release_tool_stubs(
+        &fixture,
+        &fake_repo_root,
+        "0123456789abcdef0123456789abcdef11111111",
+        env!("CARGO_BIN_EXE_kanban"),
+        "hax",
+    );
+    let hostname_bin = stubs.join("hostname");
+    let output_dir = fixture.root.join("package");
+    let hax_install_root = fixture.root.join("install-hax");
+    let hax_bin_dir = fixture.root.join("bin-hax");
+    let install_root = fixture.root.join("install");
+    let bin_dir = fixture.root.join("bin");
+    let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+    let commit = |index: usize| format!("0123456789abcdef0123456789abcdef{:08x}", index);
+    let hax_ctx = HaxInstallContext {
+        fixture: &fixture,
+        script: &script,
+        path: &path,
+        hostname_bin: &hostname_bin,
+        fake_repo_root: &fake_repo_root,
+        remote_root: &remote_root,
+    };
+
+    let packaged = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let mut release_dirs = Vec::new();
+    let hax_installed = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(0))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .arg(&script)
+        .args([
+            "install",
+            "hax",
+            "--package",
+            output_dir.to_str().unwrap(),
+            "--install-root",
+            hax_install_root.to_str().unwrap(),
+            "--bin-dir",
+            hax_bin_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hax_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hax_installed.stderr)
+    );
+    let _hax_install_json: Value = serde_json::from_slice(&hax_installed.stdout).unwrap();
+
+    for index in 1..3 {
+        let package_dir = if index == 0 {
+            output_dir.clone()
+        } else {
+            let cloned = fixture.root.join(format!("rollback-package-{index:02}"));
+            clone_release_package(&output_dir, &cloned, &commit(index));
+            cloned
+        };
+        let hax_install_root = if index == 0 {
+            hax_install_root.clone()
+        } else {
+            install_matching_hax_package(
+                &hax_ctx,
+                &package_dir,
+                &commit(index),
+                &format!("rollback-fail-hax-{index:02}"),
+            )
+        };
+        let installed = Command::new("bash")
+            .current_dir(&fixture.main)
+            .env("PATH", &path)
+            .env("HOSTNAME_BIN", &hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &fake_repo_root)
+            .env("FAKE_GIT_HEAD", commit(index))
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &remote_root)
+            .arg(&script)
+            .args([
+                "install",
+                "hig",
+                "--package",
+                package_dir.to_str().unwrap(),
+                "--hax-install-root",
+                hax_install_root.to_str().unwrap(),
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "install {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        release_dirs.push(PathBuf::from(
+            installed_json["releaseDir"].as_str().unwrap(),
+        ));
+    }
+
+    let stable_links = capture_release_links(&install_root, &bin_dir);
+    let failed_rollback = Command::new("bash")
+        .current_dir(&fixture.main)
+        .env("PATH", &path)
+        .env("HOSTNAME_BIN", &hostname_bin)
+        .env("FAKE_HOST", "hax")
+        .env("FAKE_REPO_ROOT", &fake_repo_root)
+        .env("FAKE_GIT_HEAD", commit(1))
+        .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+        .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env("HIG_RELEASE_FAIL_AFTER_CURRENT", "1")
+        .arg(&script)
+        .args([
+            "rollback",
+            "hig",
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+            "--steps",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !failed_rollback.status.success(),
+        "injected rollback failure unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&failed_rollback.stdout),
+        String::from_utf8_lossy(&failed_rollback.stderr)
+    );
+    assert_eq!(
+        capture_release_links(&install_root, &bin_dir),
+        stable_links,
+        "rollback failure changed the public release view"
+    );
+    assert_eq!(
+        fs::read_link(install_root.join("current")).unwrap(),
+        release_dirs[1],
+        "rollback failure changed current\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&failed_rollback.stdout),
+        String::from_utf8_lossy(&failed_rollback.stderr)
+    );
+    let release_receipts = fs::read_dir(install_root.join("releases"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".receipt.json"))
+        })
+        .count();
+    assert_eq!(release_receipts, 2, "rollback failure altered retention");
+}
+
+#[test]
 fn compiled_binary_archives_settled_history_without_deleting_it() {
     let fixture = Fixture::new("archive");
     fixture.ok_json(&fixture.main, &["init", "--name", "Archive", "--json"]);
@@ -17745,4 +20364,855 @@ fn compiled_binary_tracks_verified_deployments_and_self_archives_only_non_curren
         [], |row| row.get(0),
     ).unwrap();
     assert!(index_sql.contains("WHERE archived=0"));
+}
+
+#[test]
+fn compiled_binary_lists_retired_rootless_boards_once_in_workspace_list_all() {
+    let fixture = Fixture::new("rootless-retire-list");
+    let rootless = fixture.root.join("rootless");
+    fs::create_dir_all(&rootless).unwrap();
+
+    let created = fixture.ok_json(
+        &rootless,
+        &["init", "--name", "ROOTLESS", "--rootless", "--json"],
+    );
+    let rootless_path = created["boardPath"].as_str().unwrap().to_owned();
+
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ROOTLESS",
+            "--as",
+            "geo",
+            "--note",
+            "retire rootless board",
+            "--json",
+        ],
+    );
+    assert_eq!(retired["archived"], true);
+
+    let active_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ROOTLESS"),
+        "the retired rootless board leaked into the default inventory: {active_list}"
+    );
+
+    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
+    let rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "ROOTLESS")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        1,
+        "retired rootless board duplicated in all inventory"
+    );
+    let row = rows[0];
+    assert_eq!(row["archived"], true);
+    assert_eq!(row["rootless"], true);
+    assert_eq!(row["rootPath"], "");
+    assert_eq!(row["boardPath"], rootless_path);
+
+    let restored = fixture.ok_json(
+        &fixture.root,
+        &["workspace", "unretire", "ROOTLESS", "--as", "geo", "--json"],
+    );
+    assert_eq!(restored["archived"], false);
+    assert!(
+        restored["workspaceRoots"].as_array().unwrap().is_empty(),
+        "unretiring a rootless board should not fabricate roots"
+    );
+
+    let restored_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        restored_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "ROOTLESS" && row["rootless"] == true),
+        "unretiring the rootless board did not restore the active inventory: {restored_list}"
+    );
+}
+
+#[test]
+fn compiled_binary_keeps_rootless_retired_boards_visible_after_previous_detach_history() {
+    let fixture = Fixture::new("rootless-retire-history");
+    let project = fixture.root.join("project");
+    fs::create_dir_all(&project).unwrap();
+
+    let created = fixture.ok_json(&project, &["init", "--name", "ROOTLESS-HISTORY", "--json"]);
+    let board_path = created["boardPath"].as_str().unwrap().to_owned();
+    let root_path = created["workspaceRoots"][0]
+        .as_str()
+        .expect("rootless history root")
+        .to_owned();
+
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            &root_path,
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ROOTLESS-HISTORY",
+            "--as",
+            "geo",
+            "--note",
+            "retire after detach",
+            "--json",
+        ],
+    );
+    assert_eq!(retired["archived"], true);
+    assert!(
+        retired["workspaceRoots"].as_array().unwrap().is_empty(),
+        "retiring a rootless board must not invent roots"
+    );
+
+    let active_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ROOTLESS-HISTORY"),
+        "the retired rootless board leaked into the default inventory"
+    );
+
+    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
+    let rootless_rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["boardPath"] == board_path && row["rootless"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rootless_rows.len(),
+        1,
+        "retired rootless board with prior history disappeared from all inventory"
+    );
+    let row = rootless_rows[0];
+    assert_eq!(row["archived"], true);
+    assert_eq!(row["rootPath"], "");
+    assert_eq!(row["boardPath"], board_path);
+}
+
+#[test]
+fn compiled_binary_keeps_same_name_retired_boards_distinct_by_path() {
+    let fixture = Fixture::new("retired-same-name");
+    let first = fixture.root.join("first");
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+
+    let first_created = fixture.ok_json(&first, &["init", "--name", "SAME", "--json"]);
+    let first_path = first_created["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "SAME",
+            "--as",
+            "geo",
+            "--note",
+            "retire first same-name board",
+            "--json",
+        ],
+    );
+
+    let second_created = fixture.ok_json(&second, &["init", "--name", "SAME", "--json"]);
+    let second_path = second_created["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "SAME",
+            "--as",
+            "geo",
+            "--note",
+            "retire second same-name board",
+            "--json",
+        ],
+    );
+
+    let all_list = fixture.ok_json(&fixture.main, &["workspace", "list", "--all", "--json"]);
+    let same_name_rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "SAME")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_name_rows.len(),
+        2,
+        "same-name retired boards were deduped"
+    );
+    let mut paths = same_name_rows
+        .iter()
+        .map(|row| row["boardPath"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut expected = vec![first_path, second_path];
+    expected.sort();
+    assert_eq!(paths, expected);
+    assert!(
+        same_name_rows.iter().all(|row| row["archived"] == true),
+        "retired same-name boards must remain archived in the all inventory"
+    );
+}
+
+#[test]
+fn the_mcp_server_rejects_retired_direct_board_paths_over_stdio() {
+    let fixture = Fixture::new("mcp-retired-db");
+    let active = fixture.root.join("active");
+    let retired = fixture.root.join("retired");
+    fs::create_dir_all(&active).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+
+    fixture.ok_json(&active, &["init", "--name", "MCP", "--json"]);
+    let retired_board = fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
+    let retired_path = retired_board["boardPath"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "workspace",
+            "retire",
+            "RETIRED",
+            "--as",
+            "geo",
+            "--note",
+            "retire MCP board",
+            "--json",
+        ],
+    );
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let refused = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "task_list", "arguments": { "db": retired_path } }
+    }));
+    assert_eq!(refused["result"]["isError"], true);
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("retire MCP board"), "{text}");
+
+    session.finish();
+}
+
+#[test]
+fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_conflicts() {
+    let fixture = Fixture::new("workspace-retire-unretire");
+    let alpha = fixture.root.join("alpha");
+    let alpha_spare = fixture.root.join("alpha-spare");
+    let beta = fixture.root.join("beta");
+    let alpha_nested = alpha.join("nested");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::create_dir_all(&alpha_spare).unwrap();
+    fs::create_dir_all(&beta).unwrap();
+    fs::create_dir_all(&alpha_nested).unwrap();
+    let alpha_spare = alpha_spare.canonicalize().unwrap();
+
+    let alpha_registered = fixture.ok_json(&alpha, &["init", "--name", "ALPHA", "--json"]);
+    let alpha_root = alpha_registered["workspaceRoots"][0]
+        .as_str()
+        .expect("alpha root")
+        .to_owned();
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            "ALPHA",
+            "--workspace",
+            alpha_spare.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            alpha_spare.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &alpha,
+        &[
+            "task",
+            "add",
+            "Retired needle 77",
+            "--id",
+            "t-retired-77",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    fixture.ok_json(&beta, &["init", "--name", "BETA", "--json"]);
+    let retirement_note = "moved-to-hig";
+
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--note",
+            retirement_note,
+            "--json",
+        ],
+    );
+    assert_eq!(retired["name"], "ALPHA");
+    assert_eq!(retired["archivedBy"], "geo");
+    assert_eq!(retired["archivedNote"], retirement_note);
+    assert_eq!(retired["workspaceRoots"], json!([alpha_root.clone()]));
+    assert!(retired["archivedAt"].as_i64().is_some());
+    let retired_path = retired["boardPath"].as_str().unwrap().to_owned();
+
+    let with_env = |key: &str, value: &str, args: &[&str]| -> Output {
+        fixture
+            .command(&fixture.root)
+            .env(key, value)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let direct_write = fixture.run(
+        &fixture.root,
+        &[
+            "task",
+            "add",
+            "Blocked by retirement",
+            "--db",
+            &retired_path,
+            "--json",
+        ],
+    );
+    assert!(
+        !direct_write.status.success(),
+        "a retired board path still answered writes"
+    );
+    let direct_write_stderr = String::from_utf8_lossy(&direct_write.stderr).into_owned();
+    assert!(
+        direct_write_stderr.contains(retirement_note),
+        "{direct_write_stderr}"
+    );
+
+    let direct_watch = fixture.run(
+        &fixture.root,
+        &["watch", "--db", &retired_path, "--limit", "0", "--json"],
+    );
+    assert!(
+        !direct_watch.status.success(),
+        "a retired board path still answered watch"
+    );
+    let direct_watch_stderr = String::from_utf8_lossy(&direct_watch.stderr).into_owned();
+    assert!(
+        direct_watch_stderr.contains(retirement_note),
+        "{direct_watch_stderr}"
+    );
+
+    let env_list = with_env("KANBAN_DB", &retired_path, &["task", "list", "--json"]);
+    assert!(
+        !env_list.status.success(),
+        "KANBAN_DB still answered from a retired board"
+    );
+    let env_list_stderr = String::from_utf8_lossy(&env_list.stderr).into_owned();
+    assert!(
+        env_list_stderr.contains(retirement_note),
+        "{env_list_stderr}"
+    );
+
+    let active_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ALPHA"),
+        "retired board leaked into the default workspace list"
+    );
+    let all_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--all", "--json"]);
+    let retired_rows = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["boardPath"] == retired_path && row["rootless"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retired_rows.len(),
+        0,
+        "retired rooted board still gained a rootless summary row"
+    );
+    let retired_row = all_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["boardPath"] == retired_path && row["rootPath"] == alpha_root)
+        .expect("archived ALPHA retirement row");
+    assert_eq!(retired_row["archived"], true);
+    assert_eq!(retired_row["archivedBy"], "geo");
+    assert_eq!(retired_row["archivedNote"], retirement_note);
+    assert_eq!(retired_row["rootless"], false);
+
+    let dashboard = fixture.ok_json(&fixture.root, &["dashboard", "--json"]);
+    assert!(
+        dashboard
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ALPHA"),
+        "retired board leaked into the default dashboard"
+    );
+    let dashboard_all = fixture.ok_json(&fixture.root, &["dashboard", "--all", "--json"]);
+    let dashboard_alpha = dashboard_all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ALPHA")
+        .expect("archived ALPHA dashboard row");
+    assert_eq!(dashboard_alpha["archived"], true);
+    assert_eq!(dashboard_alpha["archivedNote"], retirement_note);
+
+    let doctor = fixture.ok_json(&fixture.root, &["doctor", "--json"]);
+    assert!(
+        doctor["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["name"] != "ALPHA"),
+        "retired board leaked into the default doctor report"
+    );
+    let doctor_all = fixture.ok_json(&fixture.root, &["doctor", "--all", "--json"]);
+    let doctor_alpha = doctor_all["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ALPHA")
+        .expect("archived ALPHA doctor row");
+    assert_eq!(doctor_alpha["archived"], true);
+    assert_eq!(doctor_alpha["archivedBy"], "geo");
+    assert_eq!(doctor_alpha["archivedNote"], retirement_note);
+
+    let search_default = fixture.ok_json(
+        &fixture.root,
+        &["search", "Retired needle 77", "--all-boards", "--json"],
+    );
+    assert!(
+        search_default["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["board"] != "ALPHA"),
+        "default all-board search inspected a retired board"
+    );
+    let rebuilt_default = fixture.ok_json(
+        &fixture.root,
+        &["search-rebuild", "--all-boards", "--as", "geo", "--json"],
+    );
+    assert!(
+        rebuilt_default["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["board"] != "ALPHA"),
+        "default all-board search rebuild inspected a retired board"
+    );
+    let search_all = fixture.ok_json(
+        &fixture.root,
+        &[
+            "search",
+            "Retired needle 77",
+            "--all-boards",
+            "--all",
+            "--json",
+        ],
+    );
+    let search_alpha = search_all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["board"] == "ALPHA")
+        .expect("archived ALPHA search result");
+    assert_eq!(search_alpha["board"], "ALPHA");
+
+    let denied_name = fixture.run(
+        &fixture.root,
+        &[
+            "task",
+            "add",
+            "Blocked by retirement",
+            "--project",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !denied_name.status.success(),
+        "a retired board name was still writable"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_name.stderr).contains(retirement_note),
+        "{}",
+        String::from_utf8_lossy(&denied_name.stderr)
+    );
+
+    let denied_root = fixture.run(&alpha_nested, &["task", "show", "t-retired-77", "--json"]);
+    assert!(
+        !denied_root.status.success(),
+        "a retired root still resolved"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_root.stderr).contains(retirement_note),
+        "{}",
+        String::from_utf8_lossy(&denied_root.stderr)
+    );
+
+    fixture.ok_json(
+        &beta,
+        &[
+            "workspace",
+            "attach",
+            "--to",
+            "BETA",
+            "--workspace",
+            &alpha_root,
+            "--json",
+        ],
+    );
+    let conflict = fixture.run(
+        &fixture.root,
+        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+    );
+    assert!(
+        !conflict.status.success(),
+        "a conflicting unretire was accepted"
+    );
+    let conflict_stderr = String::from_utf8_lossy(&conflict.stderr).into_owned();
+    assert!(
+        conflict_stderr.contains("cannot be unretired"),
+        "{conflict_stderr}"
+    );
+    let failed_unretire_events = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_unretired",
+            "--json",
+        ],
+    );
+    assert!(
+        failed_unretire_events.as_array().unwrap().is_empty(),
+        "a failed unretire wrote an audit event"
+    );
+
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "detach",
+            "--root",
+            &alpha_root,
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let restored = fixture.ok_json(
+        &fixture.root,
+        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+    );
+    assert_eq!(restored["name"], "ALPHA");
+    assert_eq!(restored["workspaceRoots"], json!([alpha_root.clone()]));
+    assert!(restored.get("archivedAt").is_none());
+    assert!(restored.get("archivedBy").is_none());
+    assert!(restored.get("archivedNote").is_none());
+
+    let restored_list = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
+    assert!(
+        restored_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "ALPHA" && row["archived"] == false),
+        "unretire did not restore the default workspace list"
+    );
+    let restored_search = fixture.ok_json(
+        &fixture.root,
+        &["search", "Retired needle 77", "--all-boards", "--json"],
+    );
+    assert!(
+        restored_search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["board"] == "ALPHA" && row["archived"] == false),
+        "unretire did not restore all-board search access"
+    );
+    assert_eq!(
+        fixture.ok_json(&alpha_nested, &["task", "show", "t-retired-77", "--json"])["id"],
+        "t-retired-77",
+        "unretire did not restore the retired workspace path"
+    );
+
+    let retired_events = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_retired",
+            "--json",
+        ],
+    );
+    assert_eq!(retired_events.as_array().unwrap().len(), 1);
+    assert_eq!(retired_events[0]["actor"], "geo");
+    assert!(
+        !retired_events[0]["payload"]["retirementId"]
+            .as_str()
+            .expect("retirement id")
+            .is_empty()
+    );
+    assert_eq!(
+        retired_events[0]["payload"]["archivedNote"],
+        retirement_note
+    );
+    let unretired_events = fixture.ok_json(
+        &fixture.root,
+        &[
+            "events",
+            "--registry",
+            "--kind",
+            "workspace_unretired",
+            "--json",
+        ],
+    );
+    assert_eq!(unretired_events.as_array().unwrap().len(), 1);
+    assert_eq!(unretired_events[0]["actor"], "geo");
+    assert_eq!(
+        retired_events[0]["payload"]["retirementId"],
+        unretired_events[0]["payload"]["retirementId"]
+    );
+    assert_eq!(
+        unretired_events[0]["payload"]["restoredRoots"],
+        json!([alpha_root])
+    );
+}
+
+#[test]
+fn retired_direct_db_refuses_when_registry_is_corrupt_or_stale_but_external_db_without_registry_still_works()
+ {
+    let fixture = Fixture::new("retired-direct-db-boundary");
+    let managed = fixture.root.join("managed");
+    let workspace = managed.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let created = fixture.ok_json(&workspace, &["init", "--name", "ALPHA", "--json"]);
+    assert_eq!(created["name"], "ALPHA");
+    let retired = fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--note",
+            "moved-to-hig",
+            "--json",
+        ],
+    );
+    let retired_path = retired["boardPath"].as_str().unwrap().to_owned();
+    let registry_source = fixture.data.join("registry.db");
+
+    let corrupt_root = fixture.root.join("corrupt-data");
+    fs::create_dir_all(&corrupt_root).unwrap();
+    let corrupt_registry = corrupt_root.join("registry.db");
+    fs::copy(&registry_source, &corrupt_registry).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&corrupt_registry)
+        .unwrap()
+        .set_len(32)
+        .unwrap();
+
+    let corrupt_flag = fixture
+        .command_with_data_dir(&fixture.root, &corrupt_root)
+        .args(["task", "list", "--db", &retired_path, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !corrupt_flag.status.success(),
+        "a corrupt registry still allowed a retired direct board path"
+    );
+
+    let corrupt_env = fixture
+        .command_with_data_dir(&fixture.root, &corrupt_root)
+        .env("KANBAN_DB", &retired_path)
+        .args(["task", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !corrupt_env.status.success(),
+        "a corrupt registry still allowed KANBAN_DB on a retired board"
+    );
+
+    let stale_root = fixture.root.join("stale-data");
+    fs::create_dir_all(&stale_root).unwrap();
+    let stale_registry = stale_root.join("registry.db");
+    fs::copy(&registry_source, &stale_registry).unwrap();
+    let connection = Connection::open(&stale_registry).unwrap();
+    connection.execute_batch("PRAGMA user_version=11;").unwrap();
+
+    let stale_flag = fixture
+        .command_with_data_dir(&fixture.root, &stale_root)
+        .args(["task", "list", "--db", &retired_path, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !stale_flag.status.success(),
+        "a stale registry still allowed a retired direct board path"
+    );
+
+    let stale_env = fixture
+        .command_with_data_dir(&fixture.root, &stale_root)
+        .env("KANBAN_DB", &retired_path)
+        .args(["task", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !stale_env.status.success(),
+        "a stale registry still allowed KANBAN_DB on a retired board"
+    );
+
+    let external_root = fixture.root.join("external-data");
+    fs::create_dir_all(&external_root).unwrap();
+    let external_db = fixture.root.join("external.db");
+    let external_added = fixture
+        .command_with_data_dir(&fixture.root, &external_root)
+        .args([
+            "task",
+            "add",
+            "External control task",
+            "--id",
+            "t-external",
+            "--db",
+            external_db.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        external_added.status.success(),
+        "a truly external direct board file should stay usable without a registry"
+    );
+    let external_added_json: Value = serde_json::from_slice(&external_added.stdout).unwrap();
+    assert_eq!(external_added_json["id"], "t-external");
+
+    let external_list = fixture
+        .command_with_data_dir(&fixture.root, &external_root)
+        .args([
+            "task",
+            "list",
+            "--db",
+            external_db.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        external_list.status.success(),
+        "a truly external direct board file should stay usable without a registry"
+    );
+    let external_list_json: Value = serde_json::from_slice(&external_list.stdout).unwrap();
+    assert!(
+        external_list_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "t-external"),
+        "the external control board lost its task after a successful list"
+    );
+}
+
+#[test]
+fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
+    let fixture = Fixture::new("serve-retired-board");
+    let active = fixture.root.join("active");
+    let retired = fixture.root.join("retired");
+    fs::create_dir_all(&active).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+
+    fixture.ok_json(&active, &["init", "--name", "ACTIVE", "--json"]);
+    fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "RETIRED",
+            "--as",
+            "geo",
+            "--note",
+            "retire served board",
+            "--json",
+        ],
+    );
+
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let (status, boards) = http_get(port, "/boards");
+    assert_eq!(status, 200, "{boards}");
+    assert!(
+        boards.contains("ACTIVE"),
+        "the active board disappeared from the board index: {boards}"
+    );
+    assert!(
+        !boards.contains("RETIRED"),
+        "the retired board leaked into the board index: {boards}"
+    );
+
+    let (status, retired_page) = http_get(port, "/board/RETIRED");
+    assert_eq!(status, 500, "{retired_page}");
+    assert!(
+        retired_page.contains("retire served board"),
+        "{retired_page}"
+    );
 }

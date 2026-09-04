@@ -88,14 +88,14 @@ task, story, or non-draft epic. Everything else stays read-only. Full board
 control would be a much larger surface to build, design and secure, and every
 verb in it becomes reachable with the password.
 
-The actor for a UI write is `geo`. There is one person behind that password, so
-the attribution is honest. An opt-in `--actor-header NAME` path can replace
-that default only while the server remains loopback-only behind an
-authenticated edge that strips every client-supplied copy before injecting
-one verified actor value. If the header name or value is invalid, missing,
-duplicated, empty, contains control characters, or exceeds the size limit, the
-write fails closed. Same-origin still applies. If this ever has a second user
-that stops being true, it needs revisiting before then rather than after.
+The actor for a UI write is `geo` by default. An opt-in `--actor-header NAME`
+path can replace that default when a trusted edge injects a validated header
+value; the edge must strip any client-supplied copy and set
+`X-Auth-Request-Email` from a successful `auth_request`. If the header name is
+invalid, missing, duplicated, empty, oversized, or malformed, the write fails
+closed. Same-origin still applies, and `--actor-header` may be enabled only
+while the server remains loopback-only. If this ever has a second user that
+stops being true, it needs revisiting before then rather than after.
 
 ### Needs you is live, but WebSockets are not a second ledger
 
@@ -112,9 +112,10 @@ agent update cannot erase text George is typing. This preserves one read path
 and makes the socket a notification channel rather than replicated state.
 
 Reply forms are bounded and strictly decoded. Browser POSTs require the Origin
-authority to equal Host, resolve through `Store::resolve_attention`, and are
-attributed to `geo`. Empty, oversized, malformed, cross-origin, unknown-board
-and already-resolved submissions fail without a partial write.
+authority to equal Host, resolve through `Store::resolve_attention` by
+default, and use `Store::resolve_attention_from_trusted_edge` in opt-in actor
+header mode. Empty, oversized, malformed, cross-origin, unknown-board and
+already-resolved submissions fail without a partial write.
 
 ### No hot reload
 

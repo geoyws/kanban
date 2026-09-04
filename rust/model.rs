@@ -47,6 +47,12 @@ pub struct Rule {
     pub source_board: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_registry_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_boards: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_content_sha256: Option<String>,
 }
 
 pub const SUBSCRIPTION_STATUSES: [&str; 2] = ["active", "paused"];
@@ -212,6 +218,47 @@ pub struct RuleMigrationReport {
     pub rules_imported: usize,
     pub rules_already_imported: usize,
     pub source_rules_retired: usize,
+}
+
+/// One rule entry in a source-to-destination transfer bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTransferItem {
+    pub source_board: Option<String>,
+    pub source_registry_uuid: String,
+    pub source_rule_id: String,
+    pub source_boards: Vec<String>,
+    pub source_content_sha256: String,
+    pub body: String,
+    pub author: String,
+    pub archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub tags: Vec<String>,
+}
+
+/// A deterministic, auditable export bundle for allowlisted rule transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTransferBundle {
+    pub format_version: u32,
+    pub exported_by: String,
+    pub exported_at: i64,
+    pub source_registry_uuid: String,
+    pub source_registry_audit: crate::audit::AuditReport,
+    pub source_boards: Vec<String>,
+    pub rules: Vec<RuleTransferItem>,
+}
+
+/// Receipt for a registry-to-registry rule import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleTransferReport {
+    pub imported_rules: usize,
+    pub already_imported_rules: usize,
+    pub destination_boards_verified: usize,
+    pub source_registry_uuid: String,
+    pub source_registry_audit_head: String,
 }
 
 /// A registered root that no longer names the directory it was registered for.
@@ -513,6 +560,21 @@ pub struct ProjectRecord {
     pub archived_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_note: Option<String>,
+}
+
+/// Receipt for adopting an existing board file into the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAdoptReceipt {
+    #[serde(flatten)]
+    pub project: ProjectRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+    pub source_board_path: String,
+    /// SHA-256 of the exact migrated snapshot inode published to the registry.
+    pub source_sha256: String,
+    /// Byte count of the exact migrated snapshot inode published to the registry.
+    pub source_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
