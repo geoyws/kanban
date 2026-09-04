@@ -400,6 +400,29 @@ Candidate inspection is strictly read-only and never returns lease tokens.
 It shares eligibility and ordering with `claim --next`; claim the selected ID
 atomically before starting work because inspection does not reserve it.
 
+### Who holds a task — `t cat`, never `t ls`
+
+**`task list` does not carry the claim at all.** The key is absent from every
+row it returns, so a listing renders a fully-leased task exactly like a free
+one. Only `task show` carries it:
+
+```bash
+kb t cat <id> --json    # .claim = {agentID, claimedAt, heartbeatAt, expiresAt, sessionID, taskID}
+kb t ls --status in_progress --json   # no .claim key on any row — says NOTHING about leases
+```
+
+The holder is **`claim.agentID`**. There is no `claim.actor`; reading one
+returns null for every task, live leases included. `assignee` is a separate
+field and is not the lease holder.
+
+This is the usual absent-value trap: sweeping `in_progress` with `t ls` to find
+who holds what reports every task as unclaimed, which looks like an answer and
+is not one. Iterate `t cat` over the ids instead, and compare `expiresAt`
+against **HAX's** clock (`ssh hax 'date +%s000'`) rather than the calling
+machine's, since the lease was issued there.
+
+Verified 2026-09-04 on `px` against a task holding a live lease.
+
 `--state done` or `blocked` on a checkpoint **releases the lease in the same
 transaction** that records it — there is no window where the work reads finished
 but the lease is still held.
@@ -843,6 +866,14 @@ once a silent wrong answer.
   like a finding, and that is how a typo becomes a wrong answer somebody acts on.
 - `--tag` and `--clear-tags` together are refused rather than ranked, like every
   other pair of answers to one question.
+- **`--limit` is not universal.** `task list` rejects it outright and names what
+  it does take: `--all`, `--db`, `--help`, `--json`, `--project`, `--status`,
+  `--tag`, `--with-relations`, `--workspace`. `attention list` and `search` do
+  take it. So the two listings you reach for most fail in opposite directions:
+  passing `--limit` to `t ls` is a hard error you cannot miss, while omitting it
+  from `att list` silently caps at 100 and quietly under-reports. Pass
+  `--limit 500` to `att list` before counting or duplicate-checking; never add it
+  to `t ls`. Verified 2026-09-04.
 
 ## Reference
 
