@@ -1,0 +1,2 @@
+# board	home_host	ssh_target	expected_remote	kb_exec
+kanban	hax	hax	hax	/root/.local/bin/kb

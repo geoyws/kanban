@@ -1,0 +1,3 @@
+[submodule "skills/kb"]
+	path = skills/kb
+	url = https://github.com/geoyws/kb-skill.git

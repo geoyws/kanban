@@ -1,8 +1,15 @@
 # ADR-014: The repo ships its own skill, and lives as a dotfiles submodule
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-036](ADR-036-the-kb-skill-is-a-pinned-submodule-of-the-public-package.md)
 **Date:** 2026-08-21
 **Deciders:** George
+
+> **Historical.** The skill no longer lives in this repository. `skills/kb` is a
+> pinned submodule of the public package `geoyws/kb-skill`, and host routing
+> moved to `skills/hosts.tsv`. ADR-036 keeps this ADR's actual guarantee — one
+> commit names one skill revision, checked at compile time — through the gitlink
+> rather than through an in-repo copy. Read the decision below as the reasoning
+> that produced that guarantee, not as current instruction.
 
 ## Context
 
