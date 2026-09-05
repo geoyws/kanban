@@ -96,7 +96,8 @@ Usage:
              [--priority P0|P1|P2|0-9] [--depends-on ID ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
-  kanban task list [--status STATUS] [--tag NAME] [--with-relations] [--all] [--json]
+  kanban task list [--status STATUS] [--tag NAME] [--lane LANE] [--with-relations] [--all]
+             [--fields id,title,status,... | --no-body] [--json]
   kanban task show ID [--json]
   kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
@@ -137,7 +138,7 @@ Usage:
              [--priority P0|P1|P2|0-9]
              [--task ID] [--tag NAME ...] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--tag NAME]
-             [--limit N] [--json]
+             [--lane LANE] [--limit N] [--fields id,kind,status,... | --no-body] [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
   kanban attention resolve ID --as ACTOR --note TEXT [--json]
@@ -183,7 +184,7 @@ again for a fresh token. Unknown flags are errors.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 27] = [
+pub(crate) const BOOLEAN: [&str; 28] = [
     "help",
     "json",
     "version",
@@ -211,6 +212,7 @@ pub(crate) const BOOLEAN: [&str; 27] = [
     "all-boards",
     "registry",
     "follow",
+    "no-body",
 ];
 
 /// Removed boolean flags that remain recognizable only to return an actionable
@@ -644,7 +646,15 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "task",
         Some("list"),
-        &["status", "with-relations", "tag", "all"],
+        &[
+            "status",
+            "with-relations",
+            "tag",
+            "lane",
+            "fields",
+            "no-body",
+            "all",
+        ],
         &[],
         true,
     ),
@@ -853,7 +863,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("list"),
-        &["status", "kind", "task", "tag", "limit", "all"],
+        &[
+            "status", "kind", "task", "tag", "lane", "limit", "fields", "no-body", "all",
+        ],
         &[],
         true,
     ),
@@ -2544,10 +2556,11 @@ fn list_json(
     store: &Store,
     status: Option<&str>,
     tag: Option<&str>,
+    lane: Option<&str>,
     relations: bool,
     include_archived: bool,
 ) -> Result<Value> {
-    let tasks = store.list_tasks(status, tag, include_archived)?;
+    let tasks = store.list_tasks(status, tag, lane, include_archived)?;
     if !relations {
         return Ok(serde_json::to_value(tasks)?);
     }
@@ -2567,6 +2580,119 @@ fn list_json(
         out.push(Value::Object(value));
     }
     Ok(Value::Array(out))
+}
+
+/// The keys of one `task list` row, exactly as a caller sees them.
+///
+/// `--fields` is checked against this list rather than against the rows that
+/// came back, so an empty listing refuses a misspelt key the same way a full
+/// one does. The test module serializes a row and compares, so the list cannot
+/// drift from the struct.
+const TASK_FIELDS: [&str; 20] = [
+    "id",
+    "type",
+    "parentID",
+    "title",
+    "body",
+    "assignee",
+    "lane",
+    "deliverable",
+    "staleMinutes",
+    "driverOnly",
+    "status",
+    "priority",
+    "priorityLevel",
+    "createdAt",
+    "updatedAt",
+    "completedAt",
+    "archived",
+    "archivedAt",
+    "metadata",
+    "tags",
+];
+
+/// The one key `task list --with-relations` adds to every row.
+const TASK_RELATION_FIELD: &str = "dependencies";
+
+/// The keys of one `attention list` row, exactly as a caller sees them.
+const ATTENTION_FIELDS: [&str; 17] = [
+    "id",
+    "taskID",
+    "kind",
+    "body",
+    "raisedBy",
+    "createdAt",
+    "status",
+    "priority",
+    "priorityLevel",
+    "resolvedAt",
+    "resolvedBy",
+    "resolution",
+    "reopenedAt",
+    "reopenedBy",
+    "reopenNote",
+    "archived",
+    "tags",
+];
+
+/// The keys `--fields` or `--no-body` keep of every row in a listing, or
+/// `None` for the default of the whole row.
+///
+/// A listing carrying every body is the bulk of what crosses the wire from a
+/// remote caller — measured at 1 MB for 702 tasks — and a caller choosing
+/// what to read is the only projection that shrinks it without lying about
+/// what is on the board. Bodies stay reachable per row through `task show`
+/// and `context`.
+///
+/// `--fields` and `--no-body` together are two answers to one question, and
+/// are refused rather than ranked (ADR-008).
+fn projection(args: &Args, fields: &[&str]) -> Result<Option<Vec<String>>> {
+    match (args.one("fields"), args.has("no-body")) {
+        (Some(_), true) => bail!(
+            "--fields and --no-body both choose the keys of every row; pass one: \
+             --fields names the keys to keep, --no-body keeps every key but body"
+        ),
+        (None, false) => Ok(None),
+        (None, true) => Ok(Some(
+            fields
+                .iter()
+                .filter(|field| **field != "body")
+                .map(|field| (*field).to_owned())
+                .collect(),
+        )),
+        (Some(raw), false) => {
+            let mut keep = Vec::new();
+            for name in raw.split(',').map(str::trim) {
+                if name.is_empty() {
+                    bail!(
+                        "--fields {raw:?} has an empty entry; pass a comma list of row keys \
+                         such as --fields id,title,status, or drop --fields for whole rows"
+                    );
+                }
+                if !fields.contains(&name) {
+                    bail!(
+                        "--fields names {name}, which is not a key of these rows; \
+                         the keys are {}",
+                        fields.join(", ")
+                    );
+                }
+                keep.push(name.to_owned());
+            }
+            Ok(Some(keep))
+        }
+    }
+}
+
+/// Drop every key of every row that `keep` does not name.
+fn project(rows: &mut Value, keep: &[String]) {
+    let Value::Array(rows) = rows else {
+        return;
+    };
+    for row in rows {
+        if let Value::Object(row) = row {
+            row.retain(|key, _| keep.iter().any(|kept| kept == key));
+        }
+    }
 }
 
 /// Delete all but the newest `keep` snapshots under the managed backups root.
@@ -3574,9 +3700,9 @@ fn run() -> Result<()> {
                 }
             }
             let store = Store::open(Path::new(&project.board_path))?;
-            let tasks = store.list_tasks(None, None, false)?;
+            let tasks = store.list_tasks(None, None, None, false)?;
             let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
-            let attention = store.attention(Some("open"), None, None, None, 1000, false)?;
+            let attention = store.attention(Some("open"), None, None, None, None, 1000, false)?;
             let mut counts = Map::new();
             for status in TASK_STATUSES {
                 counts.insert(
@@ -4256,16 +4382,26 @@ fn run() -> Result<()> {
         return print(&task, args.has("json"));
     }
     if command == "task" && sub == Some("list") {
-        return print(
-            &list_json(
-                &store,
-                args.one("status"),
-                args.one("tag"),
-                args.has("with-relations"),
-                args.has("all"),
-            )?,
-            args.has("json"),
-        );
+        let relations = args.has("with-relations");
+        let mut fields = TASK_FIELDS.to_vec();
+        if relations {
+            fields.push(TASK_RELATION_FIELD);
+        }
+        // Checked before the query, so a misspelt key is refused without
+        // reading the board.
+        let keep = projection(&args, &fields)?;
+        let mut rows = list_json(
+            &store,
+            args.one("status"),
+            args.one("tag"),
+            args.one("lane"),
+            relations,
+            args.has("all"),
+        )?;
+        if let Some(keep) = &keep {
+            project(&mut rows, keep);
+        }
+        return print(&rows, args.has("json"));
     }
     if command == "task" && sub == Some("show") {
         let id = rest.first().context("task id is required")?;
@@ -4648,17 +4784,20 @@ fn run() -> Result<()> {
         );
     }
     if command == "attention" && sub == Some("list") {
-        return print(
-            &store.attention(
-                args.one("status"),
-                args.one("kind"),
-                args.one("task"),
-                args.one("tag"),
-                args.limit(100)?,
-                args.has("all"),
-            )?,
-            args.has("json"),
-        );
+        let keep = projection(&args, &ATTENTION_FIELDS)?;
+        let mut rows = serde_json::to_value(store.attention(
+            args.one("status"),
+            args.one("kind"),
+            args.one("task"),
+            args.one("tag"),
+            args.one("lane"),
+            args.limit(100)?,
+            args.has("all"),
+        )?)?;
+        if let Some(keep) = &keep {
+            project(&mut rows, keep);
+        }
+        return print(&rows, args.has("json"));
     }
     if command == "attention" && sub == Some("update") {
         if args.has("tag") && args.has("clear-tags") {
@@ -5500,5 +5639,141 @@ mod tests {
         assert!(!SUBCOMMAND_GROUPS.contains(&"claim"));
         // Unlisted stems are not inferred.
         assert_eq!(canonical_sub("task", "li"), "li");
+    }
+
+    fn task_row() -> Value {
+        serde_json::to_value(
+            serde_json::from_value::<crate::model::Task>(json!({
+                "id": "t-1",
+                "type": "task",
+                "title": "Row",
+                "body": "long body",
+                "lane": "driver-2",
+                "driverOnly": false,
+                "status": "todo",
+                "priority": 3,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "archived": false,
+                "metadata": {},
+                "tags": ["kanban"],
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn attention_row() -> Value {
+        serde_json::to_value(crate::model::Attention {
+            id: "a-1".into(),
+            task_id: Some("t-1".into()),
+            kind: "decision".into(),
+            body: "long body".into(),
+            raised_by: "worker@driver-2".into(),
+            created_at: 1,
+            status: "open".into(),
+            priority: 0,
+            priority_level: Some("P0".into()),
+            resolved_at: None,
+            resolved_by: None,
+            resolution: None,
+            reopened_at: None,
+            reopened_by: None,
+            reopen_note: None,
+            archived: false,
+            tags: vec![],
+        })
+        .unwrap()
+    }
+
+    fn keys(row: &Value) -> Vec<&str> {
+        row.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn the_field_lists_name_exactly_the_keys_a_row_carries() {
+        // `--fields` validates against these lists, not against the rows that
+        // came back, so the lists must be the rows: a key added to the struct
+        // and not here would be refused as unknown, and a key removed from the
+        // struct and not here would be accepted and silently absent.
+        let mut expected = TASK_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&task_row()), expected);
+        let mut expected = ATTENTION_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&attention_row()), expected);
+    }
+
+    #[test]
+    fn fields_keeps_exactly_the_named_keys_and_nothing_else() {
+        let keep = projection(&args(&["--fields", "id,title, lane"]), &TASK_FIELDS)
+            .unwrap()
+            .unwrap();
+        let mut rows = Value::Array(vec![task_row(), task_row()]);
+        project(&mut rows, &keep);
+        for row in rows.as_array().unwrap() {
+            assert_eq!(keys(row), ["id", "lane", "title"]);
+            assert_eq!(row["lane"], "driver-2");
+        }
+    }
+
+    #[test]
+    fn no_body_drops_only_the_body() {
+        let keep = projection(&args(&["--no-body"]), &ATTENTION_FIELDS)
+            .unwrap()
+            .unwrap();
+        let mut rows = Value::Array(vec![attention_row()]);
+        project(&mut rows, &keep);
+        let mut expected = ATTENTION_FIELDS.to_vec();
+        expected.retain(|field| *field != "body");
+        expected.sort_unstable();
+        assert_eq!(keys(&rows[0]), expected);
+        assert_eq!(rows[0]["raisedBy"], "worker@driver-2");
+    }
+
+    #[test]
+    fn the_default_is_the_whole_row() {
+        assert!(projection(&args(&[]), &TASK_FIELDS).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_naming_the_keys_that_exist() {
+        let error = projection(&args(&["--fields", "id,bodyy"]), &ATTENTION_FIELDS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bodyy"), "{error}");
+        for field in ATTENTION_FIELDS {
+            assert!(error.contains(field), "{error} does not name {field}");
+        }
+        // `dependencies` exists only when --with-relations adds it, and the
+        // refusal must not offer it otherwise.
+        let error = projection(&args(&["--fields", "dependencies"]), &TASK_FIELDS)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("the keys are dependencies"), "{error}");
+        let mut with_relations = TASK_FIELDS.to_vec();
+        with_relations.push(TASK_RELATION_FIELD);
+        assert_eq!(
+            projection(&args(&["--fields", "dependencies"]), &with_relations)
+                .unwrap()
+                .unwrap(),
+            ["dependencies"]
+        );
+        let error = projection(&args(&["--fields", "id,,title"]), &TASK_FIELDS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty entry"), "{error}");
+    }
+
+    #[test]
+    fn fields_and_no_body_are_two_answers_to_one_question() {
+        let error = projection(&args(&["--fields", "id", "--no-body"]), &TASK_FIELDS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pass one"), "{error}");
     }
 }

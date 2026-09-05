@@ -12804,6 +12804,147 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
 }
 
 #[test]
+fn a_listing_can_be_narrowed_to_a_lane_and_projected_to_the_keys_asked_for() {
+    // `task list --json` on the px board is a megabyte of bodies, and a remote
+    // caller who wanted ids and titles paid for all of it. The board answers a
+    // smaller question now: a lane, and the keys the caller names.
+    let fixture = Fixture::new("lane-projection");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LANES", "--json"]);
+    let body = "plan ".repeat(200);
+    for (id, lane) in [
+        ("t-two-a", "driver-2"),
+        ("t-two-b", "driver-2"),
+        ("t-three", "driver-3"),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task", "add", "Work", "--id", id, "--lane", lane, "--body", &body, "--json",
+            ],
+        );
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Unlaned", "--id", "t-none", "--json"],
+    );
+
+    let listed = |args: &[&str]| fixture.run(&fixture.main, args);
+    let full = listed(&["task", "list", "--json"]);
+    assert!(full.status.success());
+    let projected = listed(&[
+        "task", "list", "--lane", "driver-2", "--fields", "id,lane,title", "--json",
+    ]);
+    assert!(
+        projected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&projected.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["t-two-a", "t-two-b"],
+        "the lane filter keeps that lane and nothing else"
+    );
+    for row in rows {
+        let keys = row.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(keys, ["id", "lane", "title"], "exactly the keys asked for");
+        assert_eq!(row["lane"], "driver-2");
+    }
+    assert!(
+        projected.stdout.len() * 10 < full.stdout.len(),
+        "projected {} bytes is not small against the full {} bytes",
+        projected.stdout.len(),
+        full.stdout.len()
+    );
+
+    let without_body: Value = fixture.ok_json(&fixture.main, &["task", "list", "--no-body", "--json"]);
+    assert_eq!(without_body.as_array().unwrap().len(), 4);
+    for row in without_body.as_array().unwrap() {
+        assert!(row.get("body").is_none(), "--no-body left a body on {row}");
+        assert!(row.get("metadata").is_some(), "--no-body dropped more than the body");
+    }
+    // The body is still there for whoever asks for the row.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-two-a", "--json"])["body"],
+        body
+    );
+
+    // A misspelt key is refused naming the keys that exist, before any row
+    // is read, so an empty board refuses it the same way.
+    let refused = listed(&["task", "list", "--fields", "id,titel", "--json"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("titel"), "{stderr}");
+    assert!(stderr.contains("title"), "{stderr}");
+    assert!(stderr.contains("staleMinutes"), "{stderr}");
+
+    // Attention: a row is in a lane through its raiser or through its task.
+    let raise = |body: &str, raiser: &str, task: Option<&str>| {
+        let mut args = vec!["attention", "raise", body, "--as", raiser];
+        if let Some(task) = task {
+            args.extend(["--task", task]);
+        }
+        args.push("--json");
+        fixture.ok_json(&fixture.main, &args)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let by_raiser = raise("raiser route", "worker@driver-2", None);
+    let by_task = raise("task route", "geo", Some("t-two-a"));
+    raise("elsewhere", "worker@driver-3", Some("t-three"));
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention", "list", "--lane", "driver-2", "--fields", "id,raisedBy", "--json",
+        ],
+    );
+    let mut ids = attention
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            assert_eq!(
+                row.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["id", "raisedBy"]
+            );
+            row["id"].as_str().unwrap().to_owned()
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    let mut expected = vec![by_raiser, by_task];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    // The MCP manifest is projected from the same table, so the new flags
+    // reach a tool without anyone restating them (ADR-010).
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    for name in ["task list", "attention list"] {
+        let operation = schema["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["name"] == name)
+            .unwrap();
+        let kind = |flag: &str| {
+            operation["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == flag)
+                .unwrap_or_else(|| panic!("{name} does not advertise --{flag}"))["kind"]
+                .clone()
+        };
+        assert_eq!(kind("lane"), "value");
+        assert_eq!(kind("fields"), "value");
+        assert_eq!(kind("no-body"), "boolean");
+    }
+}
+
+#[test]
 fn a_negative_limit_is_refused_rather_than_read_as_no_limit() {
     // SQLite reads LIMIT -1 as *no limit*, so a caller who explicitly bounded
     // a listing got every row of it back and reported success -- the same
