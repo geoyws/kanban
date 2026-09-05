@@ -904,6 +904,11 @@ interpreted unambiguously is refused rather than guessed
   meets a restore in progress waits five seconds and then says so rather than
   reading a half-replaced root. A board named by path outside the data root
   (`--db /tmp/scratch.db`) is untouched by any of this.
+- **A `--json` refusal is JSON on stdout.** Every refusal exits non-zero and
+  names its fix on stderr; with `--json` the same message also reaches stdout
+  as `{"error": "…"}`, and nothing else does. `claim --candidates --json`
+  without `--as` used to leave stdout empty, so a consumer piping it into a
+  parser read a valid-looking empty candidate list while P0 rows sat in todo.
 
 Overrides are reviewable, because forcing one writes durable history:
 

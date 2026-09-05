@@ -93,6 +93,35 @@ fn ndjson_values(output: &Output) -> Vec<Value> {
         .collect()
 }
 
+/// What a `--json` refusal leaves on stdout: an object holding only `error`,
+/// so a parser meets the refusal rather than an empty result, and no answer
+/// rides along with it. Returns the message.
+fn refusal_object(output: &Output) -> String {
+    assert!(
+        !output.status.success(),
+        "expected a refusal, got exit {:?}\nstdout: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "refusal stdout is not JSON: {error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let object = value.as_object().unwrap_or_else(|| panic!("refusal is not an object: {value}"));
+    assert_eq!(
+        object.keys().collect::<Vec<_>>(),
+        ["error"],
+        "a refusal carried more than its message: {value}"
+    );
+    object["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("refusal message is not a string: {value}"))
+        .to_owned()
+}
+
 fn decode_watch_cursor(cursor: &str) -> Value {
     let bytes = URL_SAFE_NO_PAD.decode(cursor).unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -3336,6 +3365,48 @@ fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
         let claimed = fixture.ok_json(&fixture.main, &["claim", id, "--as", "worker", "--json"]);
         assert_eq!(claimed["taskID"], id);
     }
+}
+
+#[test]
+fn a_json_refusal_reaches_stdout_as_an_error_object_and_exits_non_zero() {
+    // `claim --candidates --json` without --as wrote its refusal to stderr
+    // only, so a consumer piping stdout into a parser saw an empty result and
+    // concluded there was no claimable work while P0 rows sat in todo. Absence
+    // and error must not render identically on the surface a parser reads.
+    let fixture = Fixture::new("json-refusal");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REFUSAL", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "claimable", "--id", "t-claimable", "--json"],
+    );
+
+    let refused = fixture.run(&fixture.main, &["claim", "--candidates", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(refusal_object(&refused), "--as is required");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--as is required"),
+        "stderr still carries the refusal for the MCP layer and humans"
+    );
+
+    // The same refusal without --json stays prose on stderr and nothing on
+    // stdout: a human reading a terminal did not ask for an object.
+    let prose = fixture.run(&fixture.main, &["claim", "--candidates"]);
+    assert_eq!(prose.status.code(), Some(1));
+    assert!(prose.stdout.is_empty());
+
+    // With --as the same command answers with the candidate list, so the two
+    // outcomes a parser can meet are a bare array and an `error` object.
+    let candidates = fixture.ok_json(
+        &fixture.main,
+        &["claim", "--candidates", "--as", "worker", "--json"],
+    );
+    assert_eq!(candidates.as_array().unwrap().len(), 1, "{candidates}");
+
+    // A refusal raised before the parser has finished -- a flag missing its
+    // value -- is still a refusal a --json caller asked to receive as JSON.
+    let unparsed = fixture.run(&fixture.main, &["task", "list", "--json", "--status"]);
+    assert_eq!(unparsed.status.code(), Some(1));
+    assert_eq!(refusal_object(&unparsed), "--status requires a value");
 }
 
 #[test]
@@ -10003,13 +10074,9 @@ fn watch_replays_resumes_and_respects_selector_boundaries() {
             "selector mismatch unexpectedly reused the stream: {:?}",
             args
         );
+        // Only the refusal reaches stdout: no events from the other stream.
         assert!(
-            mismatch.stdout.is_empty(),
-            "selector mismatch wrote to stdout: {}",
-            String::from_utf8_lossy(&mismatch.stdout)
-        );
-        assert!(
-            String::from_utf8_lossy(&mismatch.stderr).contains("different watch stream"),
+            refusal_object(&mismatch).contains("different watch stream"),
             "selector mismatch did not name the stream boundary: {}",
             String::from_utf8_lossy(&mismatch.stderr)
         );
@@ -10837,11 +10904,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             !rejected.status.success(),
             "invalid watch succeeded: {args:?}"
         );
-        assert!(
-            rejected.stdout.is_empty(),
-            "invalid watch wrote stdout: {args:?}"
-        );
-        let error = String::from_utf8_lossy(&rejected.stderr);
+        let error = refusal_object(&rejected);
         assert!(
             error.contains(expected),
             "{args:?}: expected {expected:?} in {error}"
@@ -22061,8 +22124,10 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
             stderr.contains(retirement_note),
             "{label} omitted the recorded retirement note: {stderr}"
         );
+        // The refusal is the only thing on stdout: no answer from BETA rides
+        // along with it.
         assert!(
-            output.stdout.is_empty(),
+            refusal_object(&output).contains(selector),
             "{label} returned a wrong-board answer while refusing: {}",
             String::from_utf8_lossy(&output.stdout)
         );
@@ -22207,7 +22272,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
     );
     let denied_name_stderr = String::from_utf8_lossy(&denied_name.stderr);
     assert!(denied_name_stderr.contains("ALPHA"), "{denied_name_stderr}");
-    assert!(denied_name.stdout.is_empty());
+    assert!(refusal_object(&denied_name).contains("ALPHA"));
     let beta_tasks = fixture.ok_json(&beta, &["task", "list", "--json"]);
     assert_eq!(beta_tasks.as_array().unwrap().len(), 1);
     assert_eq!(beta_tasks[0]["id"], "t-retired-77");
@@ -22225,7 +22290,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
     );
     let denied_root_stderr = String::from_utf8_lossy(&denied_root.stderr);
     assert!(denied_root_stderr.contains("ALPHA"), "{denied_root_stderr}");
-    assert!(denied_root.stdout.is_empty());
+    assert!(refusal_object(&denied_root).contains("ALPHA"));
 
     fixture.ok_json(
         &beta,
