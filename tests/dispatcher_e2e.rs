@@ -10,6 +10,20 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// A per-delivery deadline wide enough that it cannot lose a race.
+///
+/// Only ONE test here is about the deadline itself (`sleep` mode, whose adapter
+/// sleeps 30s against a deliberately tight 500ms - a 60x margin, so it is a
+/// decision and not a coin toss). Everywhere else the deadline is incidental to
+/// the property under test, and a tight one is a bug: each delivery `exec`s a
+/// freshly compiled adapter binary, so the budget covers a cold spawn. Under a
+/// loaded full-suite run that spawn can stall, and the delivery is then
+/// reclassified as `adapter_timeout` - turning an asserted success into 0
+/// succeeded, or a specific asserted error into the wrong error. Measured
+/// 2026-09-06: `dispatcher_pause_and_resume_are_rechecked_at_the_process_boundary`
+/// failed exactly that way once in a full run and passed on re-run (t-0ca6de57).
+const AMPLE_TIMEOUT_MS: &str = "30000";
+
 /// Compile a fixture fake program into `target` and make it executable.
 fn compile_fake(source: &str, target: &Path) {
     let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
@@ -470,8 +484,8 @@ fn dispatcher_help_version_and_conflicts_cross_the_compiled_process_boundary() {
 fn dispatcher_success_targets_one_consumer_and_resolves_every_explicit_selector() {
     let fixture = Fixture::new("success");
     fixture.write_config("success", Some("exit"));
-    fixture.add_subscription("sub-primary", "consumer.test", "1000", "1");
-    fixture.add_subscription("sub-other", "consumer.other", "1000", "1");
+    fixture.add_subscription("sub-primary", "consumer.test", AMPLE_TIMEOUT_MS, "1");
+    fixture.add_subscription("sub-other", "consumer.other", AMPLE_TIMEOUT_MS, "1");
     fixture.append_event("dispatch-success");
 
     let output = fixture
@@ -575,10 +589,10 @@ fn dispatcher_rejects_retired_board_paths_before_it_can_claim() {
 #[test]
 fn dispatcher_failure_modes_are_safe_and_durable() {
     for (mode, expected, timeout) in [
-        ("exit", "adapter_exit", "5000"),
-        ("malformed", "adapter_response_invalid", "5000"),
-        ("mismatch", "adapter_response_invalid", "5000"),
-        ("oversized", "adapter_stdout_overflow", "5000"),
+        ("exit", "adapter_exit", AMPLE_TIMEOUT_MS),
+        ("malformed", "adapter_response_invalid", AMPLE_TIMEOUT_MS),
+        ("mismatch", "adapter_response_invalid", AMPLE_TIMEOUT_MS),
+        ("oversized", "adapter_stdout_overflow", AMPLE_TIMEOUT_MS),
         ("sleep", "adapter_timeout", "500"),
     ] {
         let fixture = Fixture::new(mode);
@@ -617,7 +631,7 @@ fn dispatcher_failure_modes_are_safe_and_durable() {
 #[test]
 fn dispatcher_missing_config_fails_before_materialize_or_claim() {
     let fixture = Fixture::new("config-before-claim");
-    fixture.add_subscription("sub-e2e", "consumer.test", "1000", "1");
+    fixture.add_subscription("sub-e2e", "consumer.test", AMPLE_TIMEOUT_MS, "1");
     fixture.append_event("dispatch-config-before-claim");
     let output = fixture
         .dispatcher()
@@ -636,11 +650,48 @@ fn dispatcher_missing_config_fails_before_materialize_or_claim() {
     assert_eq!(count, 0);
 }
 
+/// Say WHY a delivery did not succeed, in the panic message itself.
+///
+/// `succeeded: 0` on its own cannot distinguish "the dispatcher refused" from
+/// "the adapter breached its deadline" from "nothing was queued at all", which
+/// is precisely the ambiguity that left t-0ca6de57 undiagnosable after the
+/// fact. Reads the durable row and its newest attempt, and reports absence as
+/// absence rather than unwrapping into a second, less informative panic.
+fn delivery_diagnosis(fixture: &Fixture, subscription: &str) -> String {
+    let connection = fixture.db();
+    let delivery = connection
+        .query_row(
+            "SELECT status, attempts FROM subscription_deliveries WHERE subscription_id=?1",
+            [subscription],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map(|(status, attempts)| format!("delivery status={status} attempts={attempts}"))
+        .unwrap_or_else(|error| format!("no delivery row ({error})"));
+    let attempt = connection
+        .query_row(
+            "SELECT attempt, outcome, COALESCE(error_code,'-') FROM subscription_delivery_attempts \
+             WHERE subscription_id=?1 ORDER BY attempt DESC LIMIT 1",
+            [subscription],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map(|(attempt, outcome, code)| {
+            format!("newest attempt #{attempt} outcome={outcome} error={code}")
+        })
+        .unwrap_or_else(|error| format!("no attempt row ({error})"));
+    format!("{delivery}; {attempt}")
+}
+
 #[test]
 fn dispatcher_pause_and_resume_are_rechecked_at_the_process_boundary() {
     let fixture = Fixture::new("pause-resume");
     fixture.write_config("success", None);
-    fixture.add_subscription("sub-e2e", "consumer.test", "1000", "1");
+    fixture.add_subscription("sub-e2e", "consumer.test", AMPLE_TIMEOUT_MS, "1");
     assert_success(
         &fixture.kanban(&[
             "subscription",
@@ -692,16 +743,19 @@ fn dispatcher_pause_and_resume_are_rechecked_at_the_process_boundary() {
         .output()
         .unwrap();
     assert_success(&resumed, "resumed dispatcher");
+    let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&resumed.stdout).unwrap()["succeeded"],
-        1
+        report["succeeded"],
+        1,
+        "a resumed subscription must deliver. {}, report={report}",
+        delivery_diagnosis(&fixture, "sub-e2e")
     );
 }
 
 #[test]
 fn concurrent_dispatcher_processes_deliver_one_event_only_once() {
     let fixture = Fixture::new("concurrent");
-    fixture.seed("success", "1000", "1");
+    fixture.seed("success", AMPLE_TIMEOUT_MS, "1");
     let args = ["--db", fixture.board.to_str().unwrap(), "--once", "--json"];
     let first = fixture.dispatcher().args(args).spawn().unwrap();
     let second = fixture.dispatcher().args(args).spawn().unwrap();
@@ -754,7 +808,7 @@ fn concurrent_dispatcher_processes_deliver_one_event_only_once() {
 #[test]
 fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
     let fixture = Fixture::new("crash-recovery");
-    fixture.seed("success", "5000", "2");
+    fixture.seed("success", AMPLE_TIMEOUT_MS, "2");
     let event_id: String = fixture
         .db()
         .query_row(
@@ -786,18 +840,36 @@ fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
         )
         .unwrap();
     assert_eq!(leased, "leased");
-    thread::sleep(Duration::from_millis(36_200));
 
-    let recovered = fixture
-        .dispatcher()
-        .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
-        .output()
-        .unwrap();
-    assert_success(&recovered, "crash recovery");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&recovered.stdout).unwrap()["succeeded"],
-        1
-    );
+    // POLL for recovery rather than sleeping a precomputed constant. The old
+    // `sleep(36_200)` silently mirrored two numbers living in other files -
+    // this fixture's deadline and LEASE_CLEANUP_HEADROOM_MS
+    // (rust/dispatcher.rs:26) - so widening the incidental deadlines broke it
+    // and revealed the coupling (t-0ca6de57). Polling has no number to drift.
+    //
+    // Recovery cannot come sooner than the lease regardless of how often we
+    // ask: the sweep schedules the retry from `lease_deadline_at`, not from
+    // `now` (rust/store.rs:2730). I checked that by making the sweep ignore
+    // the deadline entirely - the row was reclaimed at once and STILL was not
+    // delivered for ~60s. So the loop is a bound, not a busy-wait shortcut.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let attempt = fixture
+            .dispatcher()
+            .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
+            .output()
+            .unwrap();
+        assert_success(&attempt, "crash recovery");
+        if serde_json::from_slice::<Value>(&attempt.stdout).unwrap()["succeeded"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an expired lease was never reclaimed. {}",
+            delivery_diagnosis(&fixture, "sub-e2e")
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
     let db = fixture.db();
     let status: String = db
         .query_row(
@@ -837,7 +909,7 @@ fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
 #[test]
 fn release_binary_ignores_dispatcher_crash_seam() {
     let fixture = Fixture::new("release-crash-seam-inert");
-    fixture.seed("success", "5000", "2");
+    fixture.seed("success", AMPLE_TIMEOUT_MS, "2");
     let event_id: String = fixture
         .db()
         .query_row(
@@ -881,7 +953,7 @@ fn release_binary_ignores_dispatcher_crash_seam() {
 fn dispatcher_sigterm_stops_long_poll_and_running_adapter_cleanly() {
     let idle = Fixture::new("signal-idle");
     idle.write_config("success", None);
-    idle.add_subscription("sub-e2e", "consumer.test", "1000", "1");
+    idle.add_subscription("sub-e2e", "consumer.test", AMPLE_TIMEOUT_MS, "1");
     let child = idle
         .dispatcher()
         .args(["--db", idle.board.to_str().unwrap(), "--json"])
@@ -897,7 +969,7 @@ fn dispatcher_sigterm_stops_long_poll_and_running_adapter_cleanly() {
     );
 
     let running = Fixture::new("signal-adapter");
-    running.seed("sleep", "5000", "1");
+    running.seed("sleep", AMPLE_TIMEOUT_MS, "1");
     let child = running
         .dispatcher()
         .args(["--db", running.board.to_str().unwrap(), "--once", "--json"])
@@ -929,7 +1001,7 @@ fn dispatcher_sigterm_contains_real_app_server_adapter_and_stubborn_descendants(
         .collect::<Vec<_>>();
     let (adapter_pid_file, child_pid_file, grandchild_pid_file, capture) =
         fixture.write_real_app_server_config();
-    fixture.add_app_server_subscription("5000");
+    fixture.add_app_server_subscription(AMPLE_TIMEOUT_MS);
     fixture.append_event("dispatch-real-app-server-signal");
 
     let child = fixture
