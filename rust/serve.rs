@@ -18,9 +18,13 @@
 //! the documented arrangement, not a workaround.
 //!
 //! The write surface is deliberately narrow: an authenticated operator may
-//! reply to and resolve an attention item, or open a draft epic. WebSockets
-//! carry revision notices, never ledger content or capabilities; the browser
-//! fetches the canonical server-rendered projection after a notice.
+//! reply to and resolve an attention item, or open a draft epic. The socket
+//! carries the coarse revision, after which the browser fetches the canonical
+//! server-rendered projection, and it carries NOTICES: a notice is an
+//! already-authorized summary this process read through the store's filtered
+//! event path — never an envelope, never a payload, and never a cursor the
+//! browser would then have to be trusted about
+//! (`docs/ui-pubsub-consumption-seams.md`).
 //!
 //! In opt-in deployments, `--actor-header NAME` threads one trusted edge
 //! header into the audit actor for the write surface. The proxy in front of
@@ -37,8 +41,9 @@ use crate::search;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde_json::json;
 use sha1::{Digest, Sha1};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -634,6 +639,46 @@ fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
 
 // --------------------------------------------------------------- live status
 
+/// How many new events one board may hand a connection one by one before it
+/// is told a count instead.
+///
+/// Five, because that is where an operator stops reading lines and starts
+/// reading a number, and because a single operator action writes fewer than
+/// that: resolving an attention item is one event, claiming a task is one.
+/// A normal action therefore always arrives as itself, and only a burst — a
+/// lane's script, a sweep retiring six dead leases at once — collapses into
+/// one sentence. The flood this prevents is the whole point: six individual
+/// frames past the fold say less than "6 changes while you were away".
+const NOTICE_LAG_THRESHOLD: usize = 5;
+
+/// The most rows one scan reads from one board.
+///
+/// A ceiling, not a cursor: it bounds the work one tick can do while catching
+/// up, and the remainder is read by the next scan.
+const NOTICE_SCAN_LIMIT: i64 = 500;
+
+/// One already-authorized ledger row, borrowed from the batch it came in.
+struct NoticeRow<'a> {
+    seq: i64,
+    kind: &'a str,
+    task: Option<&'a str>,
+}
+
+/// What one board's scan produced, and where that board's position now is.
+struct BoardNotices {
+    frames: Vec<String>,
+    cursor: i64,
+    truncated: bool,
+}
+
+/// What one tick's scan produced across every board.
+struct NoticeScan {
+    frames: Vec<String>,
+    /// Scan again on the next tick even if nothing changed: a page was full,
+    /// or a board was busy and its rows have not been read yet.
+    again: bool,
+}
+
 fn websocket(request: Request) {
     if request.method() != &Method::Get || !same_origin(&request) {
         let response =
@@ -676,22 +721,47 @@ fn websocket(request: Request) {
     let Ok(mut revision) = ledger_revision() else {
         return;
     };
+    // The position this connection reads from, and the ONLY copy of it: a
+    // local in the frame of the thread `serve` spawned for this socket. No
+    // static, no shared map, no lock — so one connection has no name for
+    // another's position and cannot read, advance or stall it. It dies with
+    // the socket, which is precisely why a reconnect starts at the head again
+    // and the browser never has to hold a cursor of its own.
+    let mut positions = notice_positions_at_head();
     if write_ws_text(
         &mut stream,
-        &format!(r#"{{"type":"ready","revision":"{revision:016x}"}}"#),
+        &format!(r#"{{"type":"ready","revision":"{revision:016x}","noticesFrom":"now"}}"#),
     )
     .is_err()
     {
         return;
     }
     let mut ticks = 0_u8;
+    let mut rescan = false;
     loop {
         thread::sleep(Duration::from_secs(1));
         ticks = ticks.wrapping_add(1);
         let Ok(current) = ledger_revision() else {
             continue;
         };
-        if current != revision {
+        let changed = current != revision;
+        let mut sent = false;
+        if changed || rescan {
+            // Gated on the coarse revision because a board file that did not
+            // change cannot have gained an event. WHAT is new is decided by
+            // this connection's position and never by the revision, so a
+            // write that lands mid-scan is read by the next scan rather than
+            // lost to this one: the baseline moves, the position does not.
+            let scan = notice_scan(&mut positions);
+            rescan = scan.again;
+            for frame in scan.frames {
+                if write_ws_text(&mut stream, &frame).is_err() {
+                    return;
+                }
+                sent = true;
+            }
+        }
+        if changed {
             revision = current;
             if write_ws_text(
                 &mut stream,
@@ -701,6 +771,9 @@ fn websocket(request: Request) {
             {
                 return;
             }
+            sent = true;
+        }
+        if sent {
             ticks = 0;
         } else if ticks >= 15 {
             if write_ws_text(&mut stream, r#"{"type":"heartbeat"}"#).is_err() {
@@ -709,6 +782,226 @@ fn websocket(request: Request) {
             ticks = 0;
         }
     }
+}
+
+/// Every active board's current head, for a connection that has just opened.
+///
+/// A board this cannot open or read is simply absent from the map, and the
+/// first scan meets it as a first sight and adopts ITS head then. One busy
+/// open must not become a replay of a whole trail.
+fn notice_positions_at_head() -> HashMap<PathBuf, i64> {
+    let mut positions = HashMap::new();
+    let Ok(boards) = projects() else {
+        return positions;
+    };
+    for (project, store) in boards {
+        if let Ok(head) = store.event_head_seq() {
+            positions.insert(PathBuf::from(&project.board_path), head);
+        }
+    }
+    positions
+}
+
+/// Read every active board forward from where this connection stands.
+///
+/// Never fails: a long-lived socket must not die because one board was busy
+/// for fifty milliseconds. A board that could not be read keeps its position
+/// and is retried, because skipping it is how a notice becomes an absence.
+/// A board that has left the registry drops out of the map, so the map is
+/// bounded by the boards that exist rather than by every board ever seen.
+fn notice_scan(positions: &mut HashMap<PathBuf, i64>) -> NoticeScan {
+    let Ok(boards) = projects() else {
+        return NoticeScan {
+            frames: Vec::new(),
+            again: true,
+        };
+    };
+    let mut frames = Vec::new();
+    let mut again = false;
+    let mut next = HashMap::with_capacity(boards.len());
+    for (project, store) in boards {
+        let path = PathBuf::from(&project.board_path);
+        let cursor = positions.get(&path).copied();
+        match board_notices(&project.name, &store, cursor) {
+            Ok(mut board) => {
+                frames.append(&mut board.frames);
+                again |= board.truncated;
+                next.insert(path, board.cursor);
+            }
+            Err(_) => {
+                again = true;
+                if let Some(cursor) = cursor {
+                    next.insert(path, cursor);
+                }
+            }
+        }
+    }
+    *positions = next;
+    NoticeScan { frames, again }
+}
+
+/// One board's newly-visible rows, as frames, and where its position lands.
+///
+/// Every row here came through [`Store::events_since_filtered`], which runs
+/// each one past `visible_events` — so a row the operator may not see is
+/// never named in a frame. The unfiltered `events_since` has no place on this
+/// path: its purpose is to move a cursor past rows a filter rejected, and a
+/// notice built from it would name exactly those rows.
+///
+/// The position advances only over rows this connection was actually handed,
+/// so nothing is skipped. A trailing run of rows the operator may not see is
+/// therefore re-examined by the next scan, which costs one indexed query and
+/// sends no frame.
+fn board_notices(board: &str, store: &Store, cursor: Option<i64>) -> Result<BoardNotices> {
+    let head = store.event_head_seq()?;
+    let Some(cursor) = cursor else {
+        // First sight of a board, including one adopted while this connection
+        // was open. Starting at zero would announce a whole board's history as
+        // if it had just happened.
+        return Ok(BoardNotices {
+            frames: Vec::new(),
+            cursor: head,
+            truncated: false,
+        });
+    };
+    if head < cursor {
+        // The board rewound — restored from a backup. Re-anchor instead of
+        // sitting ahead of the head reading nothing for the rest of the day.
+        return Ok(BoardNotices {
+            frames: Vec::new(),
+            cursor: head,
+            truncated: false,
+        });
+    }
+    let visible = store.events_since_filtered(
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        cursor,
+        NOTICE_SCAN_LIMIT,
+        false,
+    )?;
+    let Some(last) = visible.last().map(|event| event.seq) else {
+        return Ok(BoardNotices {
+            frames: Vec::new(),
+            cursor,
+            truncated: false,
+        });
+    };
+    let rows = visible
+        .iter()
+        .map(|event| NoticeRow {
+            seq: event.seq,
+            kind: &event.kind,
+            task: event.task_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    Ok(BoardNotices {
+        frames: notice_batch(board, &rows, |id| {
+            store.require_task(id).ok().map(|task| task.title)
+        }),
+        cursor: last,
+        // A full page means more may be waiting, so scan again next tick
+        // rather than sitting on it until the next write. Exact while the
+        // filter passes everything, which is `serve`'s own case; under
+        // managed enforcement a page trimmed by the filter reads as short,
+        // and the remainder then waits for the next revision change. The
+        // position has still advanced only over what was delivered, so that
+        // is a delay and never a skip.
+        truncated: visible.len() as i64 == NOTICE_SCAN_LIMIT,
+    })
+}
+
+/// Either a frame per row, or one frame saying how many there were.
+///
+/// `title` is a lookup rather than a field because the summarised path must
+/// not pay for it: a burst of four hundred rows collapses into one sentence,
+/// and reading four hundred task titles to build a sentence that names none
+/// of them would be work done to be thrown away.
+fn notice_batch(
+    board: &str,
+    rows: &[NoticeRow<'_>],
+    title: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    match rows.last() {
+        None => Vec::new(),
+        Some(last) if rows.len() > NOTICE_LAG_THRESHOLD => {
+            vec![behind_frame(board, last.seq, rows.len())]
+        }
+        Some(_) => rows
+            .iter()
+            .map(|row| notice_frame(board, row, &title))
+            .collect(),
+    }
+}
+
+/// One thing that happened, in the words a person reads.
+///
+/// The whole frame is the key, the words, the row it is about and the board
+/// it is on. No payload — `attention_raised` carries the raised item's tag
+/// list in its own — no kind, no actor, no seq presented as a cursor, no
+/// capability. Built through `serde_json` rather than formatted, because a
+/// task title is arbitrary operator text and a hand-written frame is one
+/// quotation mark away from being a different frame.
+fn notice_frame(
+    board: &str,
+    row: &NoticeRow<'_>,
+    title: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut frame = json!({
+        "type": "notice",
+        "key": notice_key(board, row.seq),
+        "what": plain_words(row.kind),
+        "board": board,
+    });
+    if let Some(task) = row.task {
+        frame["task"] = json!(task);
+        // Absent rather than empty when the row is gone: a blank title reads
+        // as a task with no name, which is a different claim.
+        if let Some(title) = title(task) {
+            frame["title"] = json!(title);
+        }
+    }
+    frame.to_string()
+}
+
+/// How far behind this connection was, as one sentence.
+fn behind_frame(board: &str, through: i64, count: usize) -> String {
+    json!({
+        "type": "behind",
+        "key": notice_key(board, through),
+        "what": format!("{count} changes while you were away"),
+        "board": board,
+    })
+    .to_string()
+}
+
+/// The stable key for one event.
+///
+/// `(board, seq)` is the ledger's own identity for an event: `seq` is
+/// per-board, and the registry refuses a second ACTIVE board with the same
+/// name, so the pair cannot collide between two boards one operator sees.
+/// The browser dedupes on it, which is what makes a redelivered notice
+/// harmless rather than a second action.
+fn notice_key(board: &str, seq: i64) -> String {
+    format!("{board}#{seq}")
+}
+
+/// A ledger kind as words rather than as a token.
+///
+/// Derived from the kind instead of a table of sentences. A table goes stale
+/// the moment a new kind is recorded, and its fallback would have to say
+/// something like "something changed" — turning a named event into an unnamed
+/// one, which is the absence-reads-as-a-finding failure in miniature.
+fn plain_words(kind: &str) -> String {
+    let mut words = kind.replace('_', " ");
+    if let Some(first) = words.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    words
 }
 
 fn websocket_accept(key: &str) -> String {
@@ -2170,6 +2463,17 @@ fn page(title: &str, body: &str) -> String {
 
 const JS: &str = r#"
 const setLive = text => { const el = document.querySelector('[data-live]'); if (el) el.textContent = text; };
+// A redelivered notice must not act twice, so every key the page has already
+// rendered is remembered. Bounded at 200: a reconnect never replays (the
+// server starts a new connection at the head), so this only ever holds a
+// short recent history, and a page left open for days must not grow a set
+// that never forgets.
+const NOTICE_MEMORY = 200;
+// How many notices stay on screen. The strip is meant to be readable at a
+// glance, not to be a log; `kb ev` is the log.
+const NOTICE_SHOWN = 8;
+const seenNotices = new Set();
+let liveConnects = 0;
 const hasDraftReply = () => [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim());
 function bindQuickReplies() {
   document.querySelectorAll('form.reply').forEach(form => {
@@ -2193,20 +2497,83 @@ async function refreshProjection() {
   const response = await fetch(location.pathname + location.search, {credentials: 'same-origin'});
   if (!response.ok) throw new Error(`refresh ${response.status}`);
   const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
+  const strip = document.querySelector('[data-notices]');
+  if (strip) next.prepend(strip);
   document.querySelector('main').replaceWith(next);
   bindQuickReplies();
   setLive('live');
+}
+function noticeStrip() {
+  let strip = document.querySelector('[data-notices]');
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.className = 'notices';
+    strip.setAttribute('data-notices', '');
+    strip.setAttribute('role', 'status');
+    strip.setAttribute('aria-live', 'polite');
+    document.querySelector('main').prepend(strip);
+  }
+  return strip;
+}
+function applyNotice(notice) {
+  if (!notice || !notice.key || seenNotices.has(notice.key)) return false;
+  seenNotices.add(notice.key);
+  while (seenNotices.size > NOTICE_MEMORY) seenNotices.delete(seenNotices.values().next().value);
+  const row = document.createElement('p');
+  row.className = notice.type === 'notice' ? 'notice' : 'notice summary';
+  row.dataset.key = notice.key;
+  if (notice.board) {
+    const board = document.createElement('span');
+    board.className = 'notice-board';
+    board.textContent = notice.board;
+    row.append(board);
+  }
+  const what = document.createElement('span');
+  what.className = 'notice-what';
+  what.textContent = notice.what || '';
+  row.append(what);
+  if (notice.task) {
+    const link = document.createElement('a');
+    link.href = `/task/${encodeURIComponent(notice.board)}/${encodeURIComponent(notice.task)}`;
+    link.textContent = notice.title ? `${notice.task} ${notice.title}` : notice.task;
+    row.append(link);
+  }
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'dismiss';
+  dismiss.textContent = 'Dismiss';
+  row.append(dismiss);
+  const strip = noticeStrip();
+  strip.prepend(row);
+  while (strip.children.length > NOTICE_SHOWN) strip.lastElementChild.remove();
+  return true;
 }
 function connectLive() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const socket = new WebSocket(`${scheme}://${location.host}/live`);
   socket.onopen = () => setLive('live');
   socket.onmessage = event => {
-    try { if (JSON.parse(event.data).type === 'refresh') refreshProjection().catch(() => setLive('refresh failed')); } catch (_) {}
+    let frame;
+    try { frame = JSON.parse(event.data); } catch (_) { return; }
+    if (frame.type === 'notice' || frame.type === 'behind') { applyNotice(frame); return; }
+    if (frame.type === 'ready') {
+      // The server starts every connection at the head and says so. Only a
+      // RECONNECT needs saying out loud: the operator who just lost a socket
+      // is the one who would otherwise wonder what they missed.
+      if (liveConnects++ > 0 && frame.noticesFrom === 'now') {
+        applyNotice({type: 'reconnected', key: `reconnected-${liveConnects}`, what: 'Reconnected. Showing changes from now.'});
+      }
+      return;
+    }
+    if (frame.type === 'refresh') refreshProjection().catch(() => setLive('refresh failed'));
   };
   socket.onclose = () => { setLive('reconnecting'); setTimeout(connectLive, 1500); };
   socket.onerror = () => socket.close();
 }
+document.addEventListener('click', event => {
+  const dismiss = event.target.closest('.notice > .dismiss');
+  if (dismiss) dismiss.parentElement.remove();
+});
 bindQuickReplies();
 connectLive();
 "#;
@@ -2261,6 +2628,16 @@ margin:1rem 0;background:linear-gradient(145deg,var(--raised),var(--surface));bo
 .heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
 .live{color:#3fb950;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}\
 .success{background:#12351f;border:1px solid #2c7a44;border-radius:6px;padding:.6rem .75rem}\
+.notices{display:grid;gap:.35rem;margin:0 0 1.1rem}\
+.notice{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:0;padding:.4rem .55rem;\
+font-size:.85rem;background:var(--surface);border:1px solid var(--line);\
+border-left:3px solid var(--accent);border-radius:.5rem;animation:notice-in .18s ease-out}\
+.notice-board{color:var(--muted)}\
+.notice-what{font-weight:650}\
+.notice.summary .notice-what{font-weight:800}\
+.notice .dismiss{margin-left:auto;min-height:auto;padding:.1rem .5rem;font-size:.75rem;\
+font-weight:600;background:#202a38;border-color:#3a4657;box-shadow:none}\
+@keyframes notice-in{from{opacity:0;transform:translateY(-.25rem)}to{opacity:1;transform:none}}\
 .reply{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--line)}.reply label{display:block;color:var(--muted);font-size:.8rem;margin-bottom:.35rem}\
 .reply textarea{display:block;width:100%;min-height:5.5rem;resize:vertical;line-height:1.45}\
 .actions{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.65rem}.actions button{min-width:6.5rem}\
@@ -2294,7 +2671,8 @@ dd{margin:0;font-size:.9rem;word-break:break-word}\
 .plan-body{max-height:28rem;overflow-y:auto}\
 .error{color:#f85149}\
 @media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.send{order:0;margin-left:0;width:100%}.actions button{flex:1}.heading{align-items:flex-start}table{min-width:38rem}}\
-@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}}\
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
+.notice{animation:none}}\
 ";
 
 #[cfg(test)]
@@ -2940,6 +3318,111 @@ mod tests {
             websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    fn notice_rows(count: usize) -> Vec<NoticeRow<'static>> {
+        (0..count)
+            .map(|index| NoticeRow {
+                seq: 40 + index as i64,
+                kind: "attention_raised",
+                task: Some("t-1"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_batch_is_summarised_only_past_the_lag_threshold() {
+        let title = |_: &str| Some("Approve the release".to_owned());
+        // Just under, and exactly at: every change arrives as itself.
+        for count in [NOTICE_LAG_THRESHOLD - 1, NOTICE_LAG_THRESHOLD] {
+            let frames = notice_batch("BOARD", &notice_rows(count), title);
+            assert_eq!(frames.len(), count, "{count} rows: {frames:?}");
+            for frame in &frames {
+                let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+                assert_eq!(frame["type"], "notice", "{frame}");
+            }
+        }
+        // Just over: one sentence, not a flood, and it says how far behind.
+        let frames = notice_batch(
+            "BOARD",
+            &notice_rows(NOTICE_LAG_THRESHOLD + 1),
+            // A summarised batch names no row, so it must not read one
+            // either: four hundred title lookups to build a sentence that
+            // mentions none of them is work done to be thrown away.
+            |_: &str| panic!("a summarised batch read a task title"),
+        );
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let frame: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(frame["type"], "behind");
+        assert_eq!(frame["what"], "6 changes while you were away");
+        assert_eq!(frame["key"], "BOARD#45", "the key names the row reached");
+        assert_eq!(frame["board"], "BOARD");
+        assert!(frame.get("task").is_none(), "{frame}");
+        // An empty batch is silence, not an empty announcement.
+        assert!(notice_batch("BOARD", &[], title).is_empty());
+    }
+
+    #[test]
+    fn a_notice_carries_the_summary_contract_and_nothing_else() {
+        let frame: serde_json::Value = serde_json::from_str(&notice_frame(
+            "BOARD",
+            &NoticeRow {
+                seq: 7,
+                kind: "attention_raised",
+                task: Some("t-abc"),
+            },
+            |id| {
+                assert_eq!(id, "t-abc");
+                Some("Approve \"the\" release\nnow".to_owned())
+            },
+        ))
+        .expect("a task title is arbitrary operator text and must still parse");
+        assert_eq!(
+            frame.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["board", "key", "task", "title", "type", "what"],
+            "the frame grew a field the summary contract excludes: {frame}"
+        );
+        assert_eq!(frame["type"], "notice");
+        assert_eq!(frame["key"], "BOARD#7");
+        assert_eq!(frame["what"], "Attention raised");
+        assert_eq!(frame["task"], "t-abc");
+        assert_eq!(frame["title"], "Approve \"the\" release\nnow");
+        assert_eq!(frame["board"], "BOARD");
+
+        // A board-level row names no task, so it claims none. The title is
+        // absent rather than empty when the row it named is gone: a blank
+        // title reads as a task with no name, which is a different claim.
+        let removed: serde_json::Value = serde_json::from_str(&notice_frame(
+            "BOARD",
+            &NoticeRow {
+                seq: 8,
+                kind: "task_removed",
+                task: Some("t-gone"),
+            },
+            |_| None,
+        ))
+        .unwrap();
+        assert_eq!(
+            removed.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["board", "key", "task", "type", "what"],
+            "{removed}"
+        );
+        let system: serde_json::Value = serde_json::from_str(&notice_frame(
+            "BOARD",
+            &NoticeRow {
+                seq: 9,
+                kind: "sitrep_posted",
+                task: None,
+            },
+            |_| panic!("a row with no task looked one up"),
+        ))
+        .unwrap();
+        assert_eq!(
+            system.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["board", "key", "type", "what"],
+            "{system}"
+        );
+        assert_eq!(system["what"], "Sitrep posted");
     }
 
     #[test]

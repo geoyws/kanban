@@ -1168,103 +1168,9 @@ fn spawn_server_with_actor_header(fixture: &Fixture, actor_header: Option<&str>)
             })
             .port();
         drop(listener);
-        let port_arg = port.to_string();
-        let mut command = fixture.command(&fixture.main);
-        command.args(["serve", "--port", &port_arg]);
-        if let Some(name) = actor_header {
-            command.args(["--actor-header", name]);
-        }
-        let mut child = command
-            .spawn()
-            .unwrap_or_else(|error| panic!("spawn kanban serve on {port}: {error}"));
-        let stderr = child.stderr.take().unwrap();
-        let expected_banner = server_ready_banner(port);
-        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-        let stderr_sink = Arc::clone(&stderr_lines);
-        let (stderr_tx, stderr_rx) = mpsc::channel();
-        let stderr_thread = std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stderr)
-                .lines()
-                .map_while(Result::ok)
-            {
-                stderr_sink.lock().unwrap().push(line.clone());
-                if stderr_tx.send(line).is_err() {
-                    return;
-                }
-            }
-        });
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .unwrap_or_else(|error| panic!("wait on kanban serve candidate {port}: {error}"))
-            {
-                let _ = child.wait();
-                let _ = stderr_thread.join();
-                let stderr = stderr_lines.lock().unwrap().join("\n");
-                failures.push(format!(
-                    "port {port} exited before readiness on attempt {attempt}: {status}: {stderr}"
-                ));
-                break;
-            }
-            match stderr_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(line) => {
-                    if line_is_server_ready_banner(&expected_banner, &line) {
-                        match std::panic::catch_unwind(|| http_get(port, "/")) {
-                            Ok((200, _body)) => {
-                                return ServerGuard {
-                                    child: Some(child),
-                                    port,
-                                    stderr_thread: Some(stderr_thread),
-                                };
-                            }
-                            Ok((status, body)) => {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                let _ = stderr_thread.join();
-                                let stderr = stderr_lines.lock().unwrap().join("\n");
-                                failures.push(format!(
-                                    "port {port} printed readiness banner but GET / returned {status} on attempt {attempt}: {body}\n{stderr}"
-                                ));
-                                break;
-                            }
-                            Err(_) => {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                let _ = stderr_thread.join();
-                                let stderr = stderr_lines.lock().unwrap().join("\n");
-                                failures.push(format!(
-                                    "port {port} printed readiness banner but GET / panicked on attempt {attempt}\n{stderr}"
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stderr_thread.join();
-                    let stderr = stderr_lines.lock().unwrap().join("\n");
-                    failures.push(format!(
-                        "port {port} stopped emitting stderr before readiness on attempt {attempt}: {stderr}"
-                    ));
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stderr_thread.join();
-                let stderr = stderr_lines.lock().unwrap().join("\n");
-                failures.push(format!(
-                    "port {port} timed out on attempt {attempt}: {stderr}"
-                ));
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        match try_spawn_server(fixture, port, actor_header, attempt) {
+            Ok(guard) => return guard,
+            Err(failure) => failures.push(failure),
         }
     }
     panic!(
@@ -1272,6 +1178,129 @@ fn spawn_server_with_actor_header(fixture: &Fixture, actor_header: Option<&str>)
         failures.len(),
         failures.join("\n---\n")
     );
+}
+
+/// Put a server back on a port this fixture has already used.
+///
+/// A browser reconnects to the origin it loaded, so the only way to exercise
+/// a real reconnect is to kill the server and put another one at the same
+/// address. The port is briefly unbindable while the kernel releases the
+/// listener, so this retries rather than failing on the first refusal.
+fn spawn_server_on_port(fixture: &Fixture, port: u16) -> ServerGuard {
+    let mut failures = Vec::new();
+    for attempt in 0..16_u16 {
+        match try_spawn_server(fixture, port, None, attempt) {
+            Ok(guard) => return guard,
+            Err(failure) => failures.push(failure),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "kanban serve never re-bound port {port} after {} attempts:\n{}",
+        failures.len(),
+        failures.join("\n---\n")
+    );
+}
+
+fn try_spawn_server(
+    fixture: &Fixture,
+    port: u16,
+    actor_header: Option<&str>,
+    attempt: u16,
+) -> Result<ServerGuard, String> {
+    let port_arg = port.to_string();
+    let mut command = fixture.command(&fixture.main);
+    command.args(["serve", "--port", &port_arg]);
+    if let Some(name) = actor_header {
+        command.args(["--actor-header", name]);
+    }
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn kanban serve on {port}: {error}"));
+    let stderr = child.stderr.take().unwrap();
+    let expected_banner = server_ready_banner(port);
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let stderr_sink = Arc::clone(&stderr_lines);
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            stderr_sink.lock().unwrap().push(line.clone());
+            if stderr_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("wait on kanban serve candidate {port}: {error}"))
+        {
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            let stderr = stderr_lines.lock().unwrap().join("\n");
+            return Err(format!(
+                "port {port} exited before readiness on attempt {attempt}: {status}: {stderr}"
+            ));
+        }
+        match stderr_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if line_is_server_ready_banner(&expected_banner, &line) {
+                    match std::panic::catch_unwind(|| http_get(port, "/")) {
+                        Ok((200, _body)) => {
+                            return Ok(ServerGuard {
+                                child: Some(child),
+                                port,
+                                stderr_thread: Some(stderr_thread),
+                            });
+                        }
+                        Ok((status, body)) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = stderr_thread.join();
+                            let stderr = stderr_lines.lock().unwrap().join("\n");
+                            return Err(format!(
+                                "port {port} printed readiness banner but GET / returned {status} on attempt {attempt}: {body}\n{stderr}"
+                            ));
+                        }
+                        Err(_) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = stderr_thread.join();
+                            let stderr = stderr_lines.lock().unwrap().join("\n");
+                            return Err(format!(
+                                "port {port} printed readiness banner but GET / panicked on attempt {attempt}\n{stderr}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_thread.join();
+                let stderr = stderr_lines.lock().unwrap().join("\n");
+                return Err(format!(
+                    "port {port} stopped emitting stderr before readiness on attempt {attempt}: {stderr}"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            let stderr = stderr_lines.lock().unwrap().join("\n");
+            return Err(format!(
+                "port {port} timed out on attempt {attempt}: {stderr}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn project_command(fixture: &Fixture, board: &str) -> Command {
@@ -19250,6 +19279,10 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     );
     let ready: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket)).unwrap();
     assert_eq!(ready["type"], "ready");
+    // Every connection starts at the current head and says so on the wire.
+    // That sentence is what lets the browser hold no cursor of its own: it
+    // has nothing to resume from and nothing to be trusted about.
+    assert_eq!(ready["noticesFrom"], "now", "{ready}");
 
     fixture.ok_json(
         &fixture.main,
@@ -19264,6 +19297,19 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "--json",
         ],
     );
+    // The specific news first, then the coarse "read the page again". The
+    // notice is an already-authorized summary: a key, words, and the board.
+    // No payload — this row's own carries its tag list — no cursor, no
+    // capability, and here no task because the item names none.
+    let notice: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket)).unwrap();
+    assert_eq!(
+        notice.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["board", "key", "type", "what"],
+        "the notice frame grew a field on the wire: {notice}"
+    );
+    assert_eq!(notice["type"], "notice", "{notice}");
+    assert_eq!(notice["what"], "Attention raised", "{notice}");
+    assert_eq!(notice["board"], "SERVEWRITE", "{notice}");
     let changed: serde_json::Value = serde_json::from_str(&read_ws_text(&mut socket)).unwrap();
     assert_eq!(changed["type"], "refresh", "{changed}");
     assert_ne!(changed["revision"], ready["revision"]);
@@ -19502,6 +19548,435 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
         reply_resolved["resolution"],
         "Comment: This is the durable note"
     );
+}
+
+/// What the page itself says about its socket. `[data-live]` is written from
+/// `socket.onopen` and `socket.onclose`, so this is the browser reporting its
+/// own connection rather than the test guessing at one.
+///
+/// Compared case-insensitively because `get_inner_text` reads what is
+/// RENDERED, and `.live` is uppercased by the stylesheet.
+fn wait_for_live_status(tab: &headless_chrome::Tab, want: &str, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let status = tab
+            .find_element("[data-live]")
+            .ok()
+            .and_then(|element| element.get_inner_text().ok());
+        if status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case(want))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: the live region never said {want:?} (it said {status:?})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn notice_rows_on_page(tab: &headless_chrome::Tab) -> Vec<String> {
+    tab.find_elements("[data-notices] .notice")
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get_inner_text().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn wait_for_notice_rows(tab: &headless_chrome::Tab, count: usize, label: &str) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let rows = notice_rows_on_page(tab);
+        if rows.len() == count {
+            return rows;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: wanted {count} notice row(s), the page shows {rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Long enough for several server ticks to pass, so "nothing else arrived" is
+/// a measurement and not the absence of a measurement. The live loop polls at
+/// one second.
+const NOTICE_SETTLE: Duration = Duration::from_secs(4);
+
+#[test]
+fn a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-notice");
+    fixture.ok_json(&fixture.main, &["init", "--name", "NOTICE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Approve the release",
+            "--id",
+            "t-notice",
+            "--json",
+        ],
+    );
+    let server = spawn_server(&fixture);
+    let origin = server.origin();
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("initial tab");
+    tab.navigate_to(&origin).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+    wait_for_live_status(&tab, "live", "first connect");
+    // A marker only a document load can clear, so "without a reload" is
+    // measured rather than asserted.
+    tab.evaluate("window.__sameDocument = true", false)
+        .expect("set the same-document marker");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Approve the release",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "t-notice",
+            "--json",
+        ],
+    );
+
+    let rows = wait_for_notice_rows(&tab, 1, "the CLI change");
+    assert!(rows[0].contains("NOTICE"), "which board: {rows:?}");
+    assert!(
+        rows[0].contains("Attention raised"),
+        "what happened, in words: {rows:?}"
+    );
+    assert!(rows[0].contains("t-notice"), "which row: {rows:?}");
+    assert!(
+        rows[0].contains("Approve the release"),
+        "the row's title: {rows:?}"
+    );
+    assert_eq!(
+        tab.evaluate("window.__sameDocument === true", false)
+            .expect("read the same-document marker")
+            .value,
+        Some(json!(true)),
+        "the page reloaded instead of being notified"
+    );
+
+    // The key is the ledger's own identity for that event, which is what
+    // makes a redelivery recognisable rather than a second thing happening.
+    let raised = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_raised", "--json"],
+    );
+    let seq = raised[0]["seq"].as_i64().expect("the raised event's seq");
+    assert_eq!(
+        tab.find_element("[data-notices] .notice")
+            .expect("notice row")
+            .get_attribute_value("data-key")
+            .expect("read data-key"),
+        Some(format!("NOTICE#{seq}"))
+    );
+    // The strip survives the projection re-fetch the same revision triggers:
+    // a notice that vanished a second after arriving would be no notice.
+    std::thread::sleep(NOTICE_SETTLE);
+    assert_eq!(
+        notice_rows_on_page(&tab).len(),
+        1,
+        "the notice did not survive the refresh it arrived with"
+    );
+}
+
+#[test]
+fn a_reconnected_notice_socket_in_real_chrome_does_not_replay_history() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-notice-reconnect");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RECONNECT", "--json"]);
+    for id in ["t-before", "t-gap-1", "t-gap-2", "t-gap-3", "t-after"] {
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", "Work to notice", "--id", id, "--json"],
+        );
+    }
+    let server = spawn_server(&fixture);
+    let port = server.port;
+    let origin = server.origin();
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("initial tab");
+    tab.navigate_to(&origin).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+    wait_for_live_status(&tab, "live", "first connect");
+
+    let raise = |body: &str, task: &str| {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--as",
+                "codex@driver",
+                "--kind",
+                "decision",
+                "--task",
+                task,
+                "--json",
+            ],
+        );
+    };
+    raise("Before the socket died", "t-before");
+    let rows = wait_for_notice_rows(&tab, 1, "before the socket died");
+    assert!(
+        rows[0].contains("t-before"),
+        "the connection named history instead of the change just made: {rows:?}"
+    );
+
+    // Kill the server out from under the page: the socket closes and the
+    // browser starts reconnecting on its own, exactly as it does in the field.
+    drop(server);
+    wait_for_live_status(&tab, "reconnecting", "socket died");
+
+    // Three changes the page could not possibly have seen.
+    raise("While the socket was down", "t-gap-1");
+    raise("Still down", "t-gap-2");
+    raise("Down again", "t-gap-3");
+
+    let server = spawn_server_on_port(&fixture, port);
+    wait_for_live_status(&tab, "live", "reconnected");
+    std::thread::sleep(NOTICE_SETTLE);
+
+    let rows = notice_rows_on_page(&tab);
+    assert_eq!(
+        rows.len(),
+        2,
+        "a reconnect replayed history instead of starting at the head: {rows:?}"
+    );
+    assert!(
+        rows[0].contains("Reconnected. Showing changes from now."),
+        "a reconnect must say where it starts from: {rows:?}"
+    );
+    assert!(
+        rows[1].contains("t-before"),
+        "the notice from before the outage: {rows:?}"
+    );
+    for gap in ["t-gap-1", "t-gap-2", "t-gap-3"] {
+        assert!(
+            !rows.iter().any(|row| row.contains(gap)),
+            "{gap} was replayed at an operator who just reconnected: {rows:?}"
+        );
+    }
+
+    // Resumed, not merely quiet: the next change still arrives.
+    raise("After the reconnect", "t-after");
+    let rows = wait_for_notice_rows(&tab, 3, "after the reconnect");
+    assert!(rows[0].contains("t-after"), "{rows:?}");
+    drop(server);
+}
+
+#[test]
+fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-notice-lag");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LAG", "--json"]);
+    for index in 0..7 {
+        let id = format!("t-lease-{index}");
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", "Leased work", "--id", &id, "--json"],
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "claim",
+                &id,
+                "--as",
+                &format!("ghost-{index}"),
+                "--session",
+                &format!("ghost-session-{index}"),
+                "--json",
+            ],
+        );
+    }
+    let board = board_path_for_project(&fixture, &fixture.main, "LAG");
+    let server = spawn_server(&fixture);
+    let origin = server.origin();
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("initial tab");
+    tab.navigate_to(&origin).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+    wait_for_live_status(&tab, "live", "first connect");
+
+    // Seven leases die at once, and the next board open retires all seven in
+    // ONE transaction — so no tick can see a partial batch, and the burst is
+    // genuinely a burst rather than a race with the poll interval.
+    Connection::open(&board)
+        .unwrap()
+        .execute("UPDATE task_claims SET expires_at=1", [])
+        .unwrap();
+    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["events", "--kind", "claim_expired", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        7,
+        "the burst this test is about did not happen"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while notice_rows_on_page(&tab).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "seven changes produced nothing at all"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(NOTICE_SETTLE);
+    let rows = notice_rows_on_page(&tab);
+    assert_eq!(
+        rows.len(),
+        1,
+        "seven changes arrived as {} rows instead of one summary: {rows:?}",
+        rows.len()
+    );
+    assert!(
+        rows[0].contains("7 changes while you were away"),
+        "the summary must say how far behind it was: {rows:?}"
+    );
+    assert!(
+        !rows[0].contains("Claim expired"),
+        "a summary names no row: {rows:?}"
+    );
+    let classes = tab
+        .find_element("[data-notices] .notice")
+        .expect("summary row")
+        .get_attribute_value("class")
+        .expect("read class");
+    assert_eq!(classes.as_deref(), Some("notice summary"), "{classes:?}");
+    drop(server);
+}
+
+#[test]
+fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    // The server never sends one key twice — a new connection starts at the
+    // head — so the redelivery here is handed to the page's OWN handler with
+    // the frame the server actually sent, key and all. That the server cannot
+    // produce a duplicate is exactly why the guard has to be in the browser:
+    // nothing upstream is left to prove it.
+    let fixture = Fixture::new("serve-notice-twice");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TWICE", "--json"]);
+    for id in ["t-once", "t-later"] {
+        fixture.ok_json(
+            &fixture.main,
+            &["task", "add", "Approve the release", "--id", id, "--json"],
+        );
+    }
+    let server = spawn_server(&fixture);
+    let origin = server.origin();
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("initial tab");
+    tab.navigate_to(&origin).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+    wait_for_live_status(&tab, "live", "first connect");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Approve the release",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "t-once",
+            "--json",
+        ],
+    );
+    wait_for_notice_rows(&tab, 1, "first delivery");
+    let key = tab
+        .find_element("[data-notices] .notice")
+        .expect("notice row")
+        .get_attribute_value("data-key")
+        .expect("read data-key")
+        .expect("the notice carries a key");
+    let redeliver = format!(
+        "applyNotice({{type:'notice',key:{key:?},what:'Attention raised',\
+         task:'t-once',title:'Approve the release',board:'TWICE'}}) === false"
+    );
+
+    assert_eq!(
+        tab.evaluate(&redeliver, false)
+            .expect("redeliver the notice")
+            .value,
+        Some(json!(true)),
+        "the page accepted a key it had already rendered"
+    );
+    assert_eq!(
+        notice_rows_on_page(&tab).len(),
+        1,
+        "a redelivered notice rendered twice"
+    );
+
+    // Dismissing is the action a notice offers. A redelivery must not undo it:
+    // the key is remembered, so the answer stays "already seen".
+    tab.find_element("[data-notices] .notice > .dismiss")
+        .expect("dismiss button")
+        .click()
+        .expect("dismiss the notice");
+    wait_for_notice_rows(&tab, 0, "after dismissing");
+    assert_eq!(
+        tab.evaluate(&redeliver, false)
+            .expect("redeliver the dismissed notice")
+            .value,
+        Some(json!(true)),
+        "a dismissed notice came back on redelivery"
+    );
+    assert!(
+        notice_rows_on_page(&tab).is_empty(),
+        "a dismissed notice came back on redelivery"
+    );
+
+    // And the guard is memory, not deafness: a different change still lands.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "A second decision",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "decision",
+            "--task",
+            "t-later",
+            "--json",
+        ],
+    );
+    let rows = wait_for_notice_rows(&tab, 1, "a different change");
+    assert!(rows[0].contains("t-later"), "{rows:?}");
+    drop(server);
 }
 
 #[test]

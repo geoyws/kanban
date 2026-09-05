@@ -3058,6 +3058,27 @@ impl Store {
         self.visible_events(rows)
     }
 
+    /// Where this board's ledger currently ends.
+    ///
+    /// Board scope only, because what leaves this function is a sequence
+    /// number and not row content — the same reasoning [`Store::events_since`]
+    /// states for its own scope, minus the rows. It discloses that the board
+    /// has had `n` events, which board read already tells a caller.
+    ///
+    /// A live consumer needs this to START at the head: a connection that
+    /// began at zero would replay the whole trail at an operator who just
+    /// reconnected, and one whose position sat ahead of the head — a board
+    /// restored from a backup — would stall silently, which is missing
+    /// information that reads as absence of information.
+    pub fn event_head_seq(&self) -> Result<i64> {
+        self.authz.check_read(&[])?;
+        self.connection
+            .query_row("SELECT COALESCE(max(seq),0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+    }
+
     /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
     ///
     /// Deliberately board-wide: watch reads this as the tail that lets a cursor
