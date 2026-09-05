@@ -93,7 +93,7 @@ Usage:
   kanban restore --from DIRECTORY --force [--as ACTOR] [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
-             [--priority P0|P1|P2|0-9] [--depends-on ID ...]
+             [--priority P0|P1|P2|0-9] [--depends-on ID ...] [--tag NAME ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
   kanban task list [--status STATUS] [--tag NAME] [--lane LANE] [--all]
@@ -106,11 +106,18 @@ Usage:
              assigned to someone else)
   kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
-  kanban task update ID --as ACTOR [task fields, incl. --body-file PATH]
+  kanban task update ID --as ACTOR [--title TEXT] [--body TEXT | --body-file PATH]
+             [--priority P0|P1|P2|0-9] [--parent ID | --clear-parent]
+             [--tag NAME ... | --clear-tags] [--depends-on ID ... | --clear-dependencies]
+             [--assignee AGENT | --unassign] [--lane LANE | --clear-lane]
+             [--deliverable TEXT | --clear-deliverable] [--stale-minutes N]
+             [--driver-only | --no-driver-only] [--json]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
   kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
-  kanban claim [ID | --next] --as AGENT [claim options] [--json]
+  kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
+             [--lane LANE] [--role ROLE] [--caller-scope driver]
+             [--no-cross-lane] [--allow-reassign] [--json]
   kanban claim --candidates --as AGENT [--tag NAME] [--lane LANE] [--role ROLE]
              [--caller-scope driver] [--no-cross-lane] [--allow-reassign]
              [--limit N] [--json]
@@ -130,7 +137,8 @@ Usage:
              (--repo, --branch, --head and --dirty are captured from the cwd's
              git checkout when omitted; an explicit flag overrides the capture)
   kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--limit N] [--all] [--json]
-  kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
+  kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
+             [--caller-scope driver] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
@@ -151,7 +159,8 @@ Usage:
              [--priority P0|P1|P2|0-9]
              [--task ID] [--tag NAME ...] [--json]
   kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--tag NAME]
-             [--lane LANE] [--limit N] [--fields id,kind,status,... | --no-body] [--json]
+             [--lane LANE] [--all] [--limit N]
+             [--fields id,kind,status,... | --no-body] [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
   kanban attention resolve ID --as ACTOR --note TEXT [--json]
@@ -3847,8 +3856,15 @@ fn run() -> Result<()> {
             }
             let store = Store::open(Path::new(&project.board_path))?;
             let tasks = store.list_tasks(None, None, None, false)?;
-            let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
-            let attention = store.attention(Some("open"), None, None, None, None, 1000, false)?;
+            // Counted, not fetched: a listing page passed off as a count told
+            // an operator 100 pending handoffs on a board holding 101, with
+            // nothing to say it had stopped. The ranking below needs only the
+            // most urgent row of each, which both listings put first.
+            let pending_handoffs = store.count_pending_handoffs()?;
+            let open_attention = store.count_open_attention()?;
+            let urgent_handoff = store.handoffs(None, Some("pending"), None, 1, false)?;
+            let urgent_attention =
+                store.attention(Some("open"), None, None, None, None, 1, false)?;
             let mut counts = Map::new();
             for status in TASK_STATUSES {
                 counts.insert(
@@ -3857,10 +3873,10 @@ fn run() -> Result<()> {
                 );
             }
             value.insert("taskCounts".into(), Value::Object(counts));
-            value.insert("pendingHandoffs".into(), json!(handoffs.len()));
+            value.insert("pendingHandoffs".into(), json!(pending_handoffs));
             // The count an operator most needs to see without being asked: a
             // record raised for them that nobody has settled.
-            value.insert("openAttention".into(), json!(attention.len()));
+            value.insert("openAttention".into(), json!(open_attention));
             value.insert("totalTasks".into(), json!(tasks.len()));
             value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
             let queued = tasks
@@ -3868,11 +3884,15 @@ fn run() -> Result<()> {
                 .filter(|task| task.status == "todo")
                 .map(|task| (task.priority, task.created_at))
                 .chain(
-                    attention
+                    urgent_attention
                         .iter()
                         .map(|item| (item.priority, item.created_at)),
                 )
-                .chain(handoffs.iter().map(|item| (item.priority, item.created_at)))
+                .chain(
+                    urgent_handoff
+                        .iter()
+                        .map(|item| (item.priority, item.created_at)),
+                )
                 .collect::<Vec<_>>();
             let highest = queued.iter().map(|(priority, _)| *priority).min();
             let oldest_at_highest = highest
@@ -5485,49 +5505,144 @@ mod tests {
         }
     }
 
-    /// The usage lines `--help` prints for one command: its `  kanban NAME`
-    /// line and the indented continuation lines under it.
-    fn usage_block(command: &str, sub: Option<&str>) -> String {
-        let heading = match sub {
-            Some(sub) => format!("  kanban {command} {sub} "),
-            None => format!("  kanban {command} "),
-        };
-        let mut lines = HELP.lines().skip_while(|line| !line.starts_with(&heading));
-        let mut block = lines
-            .next()
-            .unwrap_or_else(|| panic!("--help has no usage line starting `{heading}`"))
-            .to_owned();
-        for line in lines.take_while(|line| line.starts_with("             ")) {
-            block.push('\n');
-            block.push_str(line);
+    /// One `  kanban …` usage entry from `--help`: the command word, the form
+    /// words that name it, and the lines of its syntax.
+    ///
+    /// A line documents every subcommand its form words name -- so `deploy
+    /// show ID | list […]` documents `deploy show` and `deploy list`, `story
+    /// signoff|unsignoff ID` documents both signoffs, and each `claim` line
+    /// documents `claim`. The form words are the words after the command up to
+    /// the first flag or bracket, split on `|`. Continuation lines are the
+    /// indented ones beneath the heading; a parenthetical note is prose about
+    /// the command, not its syntax, and is left out.
+    struct UsageEntry {
+        command: &'static str,
+        names: Vec<&'static str>,
+        lines: Vec<&'static str>,
+    }
+
+    impl UsageEntry {
+        fn documents(&self, command: &str, sub: Option<&str>) -> bool {
+            self.command == command && sub.is_none_or(|sub| self.names.contains(&sub))
         }
-        block
+
+        /// Every `--flag` in the syntax, as whole tokens: `--head` here does
+        /// not vouch for `--header`, and `--body-file` is not `--body`.
+        fn flags(&self) -> HashSet<&'static str> {
+            self.lines
+                .iter()
+                .flat_map(|line| line.split(|c: char| c.is_whitespace() || "[]()|,;".contains(c)))
+                .filter_map(|token| token.strip_prefix("--"))
+                .collect()
+        }
+
+        fn heading(&self) -> &'static str {
+            self.lines[0].trim()
+        }
+    }
+
+    fn usage_entries() -> Vec<UsageEntry> {
+        const CONTINUATION: &str = "             ";
+        let mut entries = Vec::new();
+        let mut lines = HELP.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(rest) = line.strip_prefix("  kanban ") else {
+                continue;
+            };
+            let mut words = rest.split_whitespace();
+            let command = words.next().unwrap();
+            let names = words
+                .take_while(|word| !word.starts_with(['[', '(', '-']))
+                .flat_map(|word| word.split('|'))
+                .collect();
+            let mut entry = UsageEntry {
+                command,
+                names,
+                lines: vec![line],
+            };
+            let mut in_note = false;
+            while let Some(next) = lines.next_if(|next| next.starts_with(CONTINUATION)) {
+                let text = next.trim();
+                in_note |= text.starts_with('(');
+                if !in_note {
+                    entry.lines.push(next);
+                }
+                in_note &= !text.ends_with(')');
+            }
+            entries.push(entry);
+        }
+        entries
     }
 
     #[test]
-    fn help_documents_every_flag_checkpoint_handoff_create_and_task_list() {
-        // Both handlers read --repo, --branch, --head and --dirty ahead of git
-        // capture, and for a caller on a host where capture returns nothing
-        // those four are the only way to store a head at all -- yet --help
-        // named none of them, so the /session skill guessed the surface and
-        // guessed two of them wrong. The parser's flag row is the surface;
-        // this reads every flag on it back out of the usage block. `task list`
-        // is here because --with-claims is the only way a listing names a
-        // holder, and a flag --help does not name is one nobody finds.
-        for (command, sub) in [
-            ("checkpoint", None),
-            ("handoff", Some("create")),
-            ("task", Some("list")),
-        ] {
-            let (flags, _) = command_spec(command, sub).unwrap();
-            let block = usage_block(command, sub);
-            for flag in flags {
-                assert!(
-                    block.contains(&format!("--{flag}")),
-                    "`{command} {}` accepts --{flag} but its --help usage does not name it:\n{block}",
-                    sub.unwrap_or("")
-                );
+    fn help_documents_every_flag_every_command_accepts() {
+        // The parser's flag row is the surface, and a flag --help does not
+        // name is one nobody finds: the /session skill guessed checkpoint's
+        // --repo and --branch wrong when --help named neither, and `task add
+        // --tag`, `handoff accept --caller-scope` and `attention list --all`
+        // went unfound for as long as the check covered three commands. This
+        // reads every flag on every row back out of that command's usage
+        // lines, then every --flag in the usage back against the rows the
+        // line names, so the two cannot drift in either direction; every
+        // disagreement is reported, not just the first.
+        //
+        // Global flags are never on a row (the duplicates test above) and are
+        // documented once under "Global options" rather than on every line;
+        // --json rides on the lines where it helps. Any of them may appear on
+        // any line.
+        let entries = usage_entries();
+        let mut drift = Vec::new();
+        for (command, sub, flags, ..) in COMMANDS {
+            let name = match sub {
+                Some(sub) => format!("{command} {sub}"),
+                None => (*command).to_owned(),
+            };
+            let mine = entries
+                .iter()
+                .filter(|entry| entry.documents(command, *sub))
+                .collect::<Vec<_>>();
+            assert!(!mine.is_empty(), "--help has no usage line for `{name}`");
+            let documented = mine
+                .iter()
+                .flat_map(|entry| entry.flags())
+                .collect::<HashSet<_>>();
+            for flag in *flags {
+                if !documented.contains(flag) {
+                    drift.push(format!(
+                        "`{name}` accepts --{flag} but its --help usage does not name it"
+                    ));
+                }
             }
+        }
+        for entry in &entries {
+            let accepted = COMMANDS
+                .iter()
+                .filter(|(command, sub, ..)| entry.documents(command, *sub))
+                .flat_map(|(_, _, flags, ..)| flags.iter().copied())
+                .chain(GLOBAL_FLAGS)
+                .collect::<HashSet<_>>();
+            for flag in entry.flags() {
+                if !accepted.contains(flag) {
+                    drift.push(format!(
+                        "--help names --{flag} on `{}`, which no command on that line accepts",
+                        entry.heading()
+                    ));
+                }
+            }
+        }
+        drift.sort_unstable();
+        assert!(
+            drift.is_empty(),
+            "--help and the parser disagree:\n{}",
+            drift.join("\n")
+        );
+        // The selectors are the once-documented globals.
+        let globals = HELP.split_once("Global options").unwrap().1;
+        for flag in ["project", "workspace", "db"] {
+            assert!(
+                globals.contains(&format!("  --{flag} ")),
+                "--{flag} is not documented under Global options"
+            );
         }
     }
 

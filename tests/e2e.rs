@@ -13704,6 +13704,85 @@ fn every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_mee
     }
 }
 
+/// The survey's numbers are counted, not fetched: `pendingHandoffs` was the
+/// length of a 100-row listing page and `openAttention` of a 1000-row one, so
+/// a board holding 101 and 1001 reported 100 and 1000 with nothing to say
+/// either had stopped.
+///
+/// Read bottom-up: the boards are seeded one row past each old page, which is
+/// the one case the silent cap answered wrong, and the same numbers are read
+/// back through `dashboard --json` and the served Boards page.
+#[test]
+fn dashboard_and_boards_page_count_past_the_listing_page() {
+    let fixture = Fixture::new("survey-counts");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SURVEY", "--json"]);
+    let board = board_path_for_project(&fixture, &fixture.main, "SURVEY");
+    {
+        // Written straight into the tables, as the task-show-handoffs cap
+        // above is: eleven hundred spawns of the binary would seed the same
+        // rows, only slowly, and it is the survey's read that is under test.
+        let connection = Connection::open(&board).unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        for index in 0..101 {
+            connection
+                .execute(
+                    "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,\
+                     summary,intent,next_action,created_at) \
+                     VALUES(?,NULL,NULL,'manual','pending','agent',?,'carry on','resume',?)",
+                    params![
+                        format!("h-{index:08}"),
+                        format!("handoff {index}"),
+                        index as i64
+                    ],
+                )
+                .unwrap();
+        }
+        for index in 0..1001 {
+            connection
+                .execute(
+                    "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                     VALUES(?,NULL,'decision',?,'agent',?,'open')",
+                    params![
+                        format!("a-{index:08}"),
+                        format!("item {index}"),
+                        index as i64
+                    ],
+                )
+                .unwrap();
+        }
+        connection.execute_batch("COMMIT").unwrap();
+    }
+
+    let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    assert_eq!(dashboard[0]["pendingHandoffs"], 101);
+    assert_eq!(dashboard[0]["openAttention"], 1001);
+
+    // The count and the listing describe the same rows.
+    let handoffs = fixture.ok_json(
+        &fixture.main,
+        &["handoff", "list", "--limit", "101", "--json"],
+    );
+    assert_eq!(handoffs.as_array().unwrap().len(), 101);
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--limit", "1001", "--json"],
+    );
+    assert_eq!(attention.as_array().unwrap().len(), 1001);
+
+    // The served Boards page is the same projection.
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/boards");
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("<td class=\"n waiting\">1001</td>"),
+        "open attention on the Boards page:\n{body}"
+    );
+    assert!(
+        body.contains("<td class=n>101</td>"),
+        "pending handoffs on the Boards page:\n{body}"
+    );
+}
+
 #[test]
 fn a_draft_task_is_not_offered_as_work_until_it_is_promoted() {
     // `backlog` already meant real work that is simply unscheduled. There was
