@@ -1360,6 +1360,64 @@ DROP INDEX IF EXISTS idx_events_created_seq;
 CREATE INDEX idx_events_created_seq ON events(created_at,seq);
 "#;
 
+/// Retiring a handoff makes its `status` `retired`, which widens the status
+/// CHECK — and SQLite cannot alter a CHECK in place, so the table is rebuilt.
+/// A rebuild is the easiest place in a schema to change something nobody asked
+/// to change, so the rebuilt table reproduces the original exactly apart from
+/// the widened CHECK and the three new columns. The copy names every column
+/// rather than `SELECT *`, so re-running this step against a table that already
+/// carries the new columns (a board whose `user_version` was lowered without
+/// reverting the schema) copies the original twenty-five and leaves the new
+/// three NULL instead of doubling them.
+///
+/// The search view `search_source_rows` reads `handoffs` by name, and the three
+/// `search_handoffs_*` triggers attach to it. `PRAGMA legacy_alter_table=ON`
+/// keeps the view's `FROM handoffs` reference from being rewritten to the old
+/// name during the rename, so after the new table takes the name the view is
+/// correct without being recreated; the three triggers follow their table
+/// through the rename, are dropped with it, and are recreated here.
+const BOARD_V24: &str = r#"
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE handoffs RENAME TO handoffs_old;
+CREATE TABLE handoffs (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ checkpoint_seq INTEGER REFERENCES checkpoints(seq) ON DELETE SET NULL,
+ reason TEXT NOT NULL CHECK(reason IN ('token_pressure','provider_limit','session_end','manual')),
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','cancelled','retired')),
+ from_agent TEXT NOT NULL,from_session TEXT,from_model TEXT,to_agent TEXT,
+ summary TEXT NOT NULL,intent TEXT NOT NULL,next_action TEXT NOT NULL,
+ blockers TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(blockers)),
+ validations TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(validations)),repo_path TEXT,branch TEXT,
+ head_sha TEXT,dirty_summary TEXT,created_at INTEGER NOT NULL,accepted_at INTEGER,
+ accepted_by TEXT,accepted_session TEXT,root_head TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ retired_at INTEGER,
+ retired_by TEXT,
+ retire_note TEXT
+) STRICT;
+INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority)
+ SELECT id,task_id,checkpoint_seq,reason,status,from_agent,from_session,from_model,to_agent,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,accepted_at,accepted_by,accepted_session,root_head,archived,priority FROM handoffs_old;
+DROP TABLE handoffs_old;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_handoffs_task_created ON handoffs(task_id,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_created ON handoffs(status,created_at) WHERE archived=0;
+CREATE INDEX idx_handoffs_status_priority ON handoffs(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_handoffs_ai AFTER INSERT ON handoffs BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_au AFTER UPDATE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='handoff' AND source_id=new.id;
+END;
+CREATE TRIGGER search_handoffs_ad AFTER DELETE ON handoffs BEGIN
+ DELETE FROM search_documents WHERE source_kind='handoff' AND source_id=old.id;
+END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1555,7 +1613,7 @@ ALTER TABLE boards ADD COLUMN archived_note TEXT;
 ALTER TABLE boards ADD COLUMN retirement_id TEXT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 23;
+pub const BOARD_SCHEMA_VERSION: usize = 24;
 pub const REGISTRY_SCHEMA_VERSION: usize = 13;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -1793,7 +1851,7 @@ pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -3177,7 +3235,7 @@ mod tests {
 
         migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 23);
+        assert_eq!(schema_version(&connection).unwrap(), 24);
         assert_eq!(
             index_sql(&connection, "idx_tasks_priority_created_id"),
             "CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at,id)"
@@ -3196,5 +3254,112 @@ mod tests {
             "unexpected seq-only event index(es): {}",
             seq_only_secondary.join(", ")
         );
+    }
+
+    #[test]
+    fn board_schema_v24_adds_handoff_retire_columns_and_widens_the_status_check() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..23]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 23);
+        // A pending session handoff, written through the v23 shape.
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-v23','manual','pending','agent','summary','intent','next',1000)",
+                [],
+            )
+            .unwrap();
+        let handoff_triggers = |connection: &Connection| -> Vec<String> {
+            connection
+                .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'search_handoffs_%' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            handoff_triggers(&connection).len(),
+            3,
+            "the v23 board is missing the search_handoffs triggers"
+        );
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 24);
+
+        // The row survived the rebuild, byte for byte.
+        let (id, status): (String, String) = connection
+            .query_row(
+                "SELECT id,status FROM handoffs WHERE id='h-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "h-v23");
+        assert_eq!(status, "pending");
+
+        // The three retire columns exist and are null for the untouched row.
+        let mut statement = connection.prepare("PRAGMA table_info('handoffs')").unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for column in ["retired_at", "retired_by", "retire_note"] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "the rebuild lost the {column} column"
+            );
+        }
+        let (retired_at, retired_by, retire_note): (Option<i64>, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT retired_at,retired_by,retire_note FROM handoffs WHERE id='h-v23'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(retired_at, None);
+        assert_eq!(retired_by, None);
+        assert_eq!(retire_note, None);
+
+        // The status CHECK widened to admit `retired`, and the table now
+        // accepts the transition.
+        let ddl: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='handoffs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl.contains("'retired'"),
+            "the rebuilt handoffs status CHECK was not widened: {ddl}"
+        );
+        connection
+            .execute(
+                "UPDATE handoffs SET status='retired',retired_at=2000,retired_by='agent',retire_note='gone' WHERE id='h-v23'",
+                [],
+            )
+            .unwrap();
+
+        // The search view and handoff triggers survived the rebuild.
+        assert_eq!(
+            handoff_triggers(&connection).len(),
+            3,
+            "the rebuild dropped the search_handoffs triggers"
+        );
+        for index in [
+            "idx_handoffs_task_created",
+            "idx_handoffs_status_created",
+            "idx_handoffs_status_priority",
+        ] {
+            assert!(
+                index_names(&connection, "handoffs")
+                    .iter()
+                    .any(|name| name == index),
+                "the rebuild dropped {index}"
+            );
+        }
     }
 }

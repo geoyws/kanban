@@ -491,6 +491,12 @@ pub struct Handoff {
     pub accepted_at: Option<i64>,
     pub accepted_by: Option<String>,
     pub accepted_session: Option<String>,
+    /// Set when a pending handoff was retired instead of accepted: a handoff
+    /// is history, resolved never deleted, so the row keeps who closed it and
+    /// why rather than vanishing.
+    pub retired_at: Option<i64>,
+    pub retired_by: Option<String>,
+    pub retire_note: Option<String>,
     pub archived: bool,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
@@ -702,6 +708,20 @@ pub const DEPLOYMENT_TIERS: [&str; 7] = ["@_bdt", "@_bd", "@_bst", "@_bs", "@_s"
 pub const DEPLOYMENT_STATUSES: [&str; 5] =
     ["started", "succeeded", "failed", "cancelled", "abandoned"];
 pub const DEPLOYMENT_PHASES: [&str; 4] = ["build", "publish", "start", "verification"];
+
+/// The canonical seven-tier deployment table, quoted from the estate CLAUDE.md
+/// ("Deployment tiers" section): `@_bdt` and `@_bd` are MBP tiers, hosted on
+/// `geoywsMBP` (or the thin client `geoywsMBA`); `@_bst`, `@_bs`, `@_s`,
+/// `@_uat` and `@_p` are Hetzner tiers. Every other canonical tier is Hetzner
+/// by exclusion, so this list and [`MBP_HOSTS`] are the whole table — no other
+/// pairing is hard-coded anywhere.
+pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
+
+/// The only hostnames that are MBP. Everything else is treated as a Hetzner
+/// host, which is the load-bearing half: an MBP tier stamped with a Hetzner
+/// host (`@_bdt` on `hig`, measured in the field) is refused, while a Hetzner
+/// tier on `geoywsMBP` is refused as the mirror image.
+pub const MBP_HOSTS: [&str; 2] = ["geoywsMBP", "geoywsMBA"];
 
 /// One immutable deployment attempt. Terminal completion only fills the
 /// result columns; a retry is always a new row linked through `retry_of`.

@@ -2487,7 +2487,7 @@ mod tests {
             .unwrap_or(SOURCE);
         // Every `&mut self` method on Store, which is the complete set of ways
         // this module could change a board.
-        const MUTATORS: [&str; 23] = [
+        const MUTATORS: [&str; 24] = [
             "add_task",
             "move_task",
             "remove_task",
@@ -2504,6 +2504,7 @@ mod tests {
             "resolve_attention",
             "create_handoff",
             "accept_handoff",
+            "retire_handoff",
             "signoff_story",
             "advance_story",
             "sweep_expired_claims",

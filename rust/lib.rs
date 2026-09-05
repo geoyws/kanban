@@ -139,6 +139,7 @@ Usage:
   kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--limit N] [--all] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
              [--caller-scope driver] [--json]
+  kanban handoff retire ID --as AGENT --note TEXT [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
@@ -834,6 +835,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id"],
         false,
     ),
+    ("handoff", Some("retire"), &["as", "note"], &["id"], false),
     (
         "import",
         Some("atmux-json"),
@@ -4971,6 +4973,16 @@ fn run() -> Result<()> {
         )?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),
+            args.has("json"),
+        );
+    }
+    if command == "handoff" && sub == Some("retire") {
+        return print(
+            &store.retire_handoff(
+                rest.first().context("handoff id is required")?,
+                args.require("as")?,
+                args.require("note")?,
+            )?,
             args.has("json"),
         );
     }

@@ -921,6 +921,9 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
         accepted_at: row.get("accepted_at")?,
         accepted_by: row.get("accepted_by")?,
         accepted_session: row.get("accepted_session")?,
+        retired_at: row.get("retired_at")?,
+        retired_by: row.get("retired_by")?,
+        retire_note: row.get("retire_note")?,
         archived: row.get::<_, i64>("archived")? != 0,
     })
 }
@@ -4314,7 +4317,7 @@ impl Store {
         if let Some(value) = status {
             validate(
                 value,
-                &["pending", "accepted", "cancelled"],
+                &["pending", "accepted", "cancelled", "retired"],
                 "handoff status",
             )?;
         }
@@ -4353,6 +4356,20 @@ impl Store {
     pub fn create_handoff(&mut self, input: HandoffInput) -> Result<Handoff> {
         validate(&input.reason, &HANDOFF_REASONS, "handoff reason")?;
         validate_priority(Some(input.priority))?;
+        // A session handoff has no task to carry its address, so it must name
+        // the lane meant to pick it up: a targetless one wedges `/session
+        // cont`, which refuses a lane filter that matches several and a schema
+        // that reads null (ADR-008 — the refusal names the fix). A task handoff
+        // is addressed by its task, whose queue takes it, so `--to` stays
+        // optional there.
+        if input.task_id.is_none()
+            && input
+                .to_agent
+                .as_deref()
+                .is_none_or(|to| to.trim().is_empty())
+        {
+            bail!("a session handoff needs an addressee: pass --to LANE (e.g. --to driver-2)");
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4455,6 +4472,15 @@ impl Store {
             .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
             .optional()?
             .with_context(|| format!("handoff {id} not found"))?;
+        if handoff.status == "retired" {
+            bail!(
+                "handoff {id} was retired by {} at {} (epoch ms); a retired handoff is closed history, not work to accept",
+                handoff.retired_by.as_deref().unwrap_or("someone"),
+                handoff
+                    .retired_at
+                    .map_or("an unknown time".into(), |at| at.to_string())
+            );
+        }
         if handoff.status != "pending" {
             bail!("handoff {id} is {}", handoff.status);
         }
@@ -4568,6 +4594,53 @@ impl Store {
             active_claim(&transaction, &task.id, now)?.context("accepted claim disappeared")?;
         transaction.commit()?;
         Ok((updated, Some(claim)))
+    }
+
+    /// Retire a pending handoff without deleting it, mirroring `rule retire`
+    /// and `attention resolve`: a handoff is history, resolved never deleted,
+    /// so the row keeps who closed it and why. Only a pending handoff can be
+    /// retired — an accepted one already happened, and a retired one is
+    /// already closed — and there is no lease to override: a pending session
+    /// handoff holds none, and a pending task handoff released its lease at
+    /// creation, so `--force` would have nothing to seize.
+    pub fn retire_handoff(&mut self, id: &str, actor: &str, note: &str) -> Result<Handoff> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let note = nonempty(note, "retire note")?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
+            .optional()?
+            .with_context(|| format!("handoff {id} not found"))?;
+        if existing.status == "retired" {
+            bail!(
+                "handoff {id} is already retired by {}",
+                existing.retired_by.as_deref().unwrap_or("someone")
+            );
+        }
+        if existing.status != "pending" {
+            bail!(
+                "handoff {id} is {}, not pending; only a pending handoff can be retired",
+                existing.status
+            );
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE handoffs SET status='retired',retired_at=?,retired_by=?,retire_note=? WHERE id=? AND status='pending'",
+            params![now, actor, note, id],
+        )?;
+        event(
+            &transaction,
+            existing.task_id.as_deref(),
+            "handoff_retired",
+            Some(&actor),
+            json!({"handoffID":id,"note":note,"toAgent":existing.to_agent}),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn signoff_story(
@@ -4962,6 +5035,28 @@ impl Store {
         Ok(())
     }
 
+    /// Refuse a (tier, host) pair the canonical table forbids, naming the tier,
+    /// the host, and the row it violates. Per-attempt receipts are immutable,
+    /// so this guards only new records; a replay of one already written is
+    /// returned before it is reached. Only [`MBP_TIERS`] on a non-MBP host and
+    /// non-MBP tiers on an [`MBP_HOSTS`] host are refused, because every other
+    /// host is Hetzner by exclusion (see the constants in `model.rs`).
+    fn require_deploy_tier_host(tier: &str, host: &str) -> Result<()> {
+        let mbp_tier = MBP_TIERS.contains(&tier);
+        let mbp_host = MBP_HOSTS.contains(&host);
+        if mbp_tier && !mbp_host {
+            bail!(
+                "tier {tier} is an MBP tier (canonical row \"{tier} -> geoywsMBP\"), but host is {host}; deploy it from geoywsMBP (or geoywsMBA)"
+            );
+        }
+        if !mbp_tier && mbp_host {
+            bail!(
+                "tier {tier} is a Hetzner tier (canonical row \"{tier} -> Hetzner host\"), but host is {host}; deploy it from a Hetzner host (e.g. hax or hig)"
+            );
+        }
+        Ok(())
+    }
+
     pub fn start_deployment(&mut self, input: StartDeployment) -> Result<DeploymentStartReceipt> {
         validate(&input.tier, &DEPLOYMENT_TIERS, "deployment tier")?;
         let repo = nonempty(&input.repo, "repo")?.to_owned();
@@ -5023,6 +5118,7 @@ impl Store {
                 });
             }
         }
+        Self::require_deploy_tier_host(&input.tier, &host)?;
         let id = format!("d-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let capability_token = Uuid::new_v4().to_string();
         let now = now_ms();

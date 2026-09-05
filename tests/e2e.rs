@@ -1725,7 +1725,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|project| project["schemaVersion"] == 23)
+            .all(|project| project["schemaVersion"] == 24)
     );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -1921,9 +1921,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 13);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 13);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 23);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 23);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 23);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 24);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 24);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 24);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -2776,7 +2776,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        23
+        24
     );
     assert_eq!(
         reopened
@@ -7379,6 +7379,8 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
             "create",
             "--as",
             "agent",
+            "--to",
+            "driver-2",
             "--summary",
             "resume this",
             "--intent",
@@ -12599,6 +12601,8 @@ fn a_handoff_can_be_about_the_session_rather_than_one_task() {
             "made-up",
             "--as",
             "a",
+            "--to",
+            "driver-2",
             "--summary",
             "s",
             "--intent",
@@ -12677,6 +12681,298 @@ fn handoff_history_survives_the_task_it_was_about() {
     // And the board is still consistent: a dangling reference would show here.
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true, "{doctor}");
+}
+
+#[test]
+fn session_handoff_requires_an_addressee_but_a_task_handoff_does_not() {
+    let fixture = Fixture::new("session-handoff-addressee");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ADDR", "--json"]);
+
+    // A session handoff (no task id) with no --to is refused, naming the fix.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "claude@driver-2",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--json",
+        ],
+    );
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains("--to"),
+        "the refusal must name --to: {message}"
+    );
+    assert!(
+        message.contains("driver-2"),
+        "the refusal must give an example lane: {message}"
+    );
+
+    // With --to it is created and carries the addressee.
+    let created = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "claude@driver-2",
+            "--to",
+            "driver-2",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--json",
+        ],
+    );
+    assert_eq!(created["toAgent"], "driver-2");
+    assert_eq!(created["status"], "pending");
+
+    // A task handoff keeps --to optional: the task is the address.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-1", "--as", "outgoing", "--json"],
+    );
+    let task_handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-1",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "outgoing",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--json",
+        ],
+    );
+    assert!(task_handoff["toAgent"].is_null());
+    assert_eq!(task_handoff["taskID"], "t-1");
+}
+
+#[test]
+fn handoff_retire_closes_a_pending_handoff_without_deleting_it() {
+    let fixture = Fixture::new("handoff-retire");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RETIRE", "--json"]);
+
+    let session = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "claude@driver-2",
+            "--to",
+            "driver-2",
+            "--summary",
+            "Phase landed",
+            "--intent",
+            "continue",
+            "--next-action",
+            "merge",
+            "--json",
+        ],
+    );
+    let id = session["id"].as_str().unwrap().to_owned();
+
+    let retired = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "retire",
+            &id,
+            "--as",
+            "geoyws",
+            "--note",
+            "repo and branch gone",
+            "--json",
+        ],
+    );
+    assert_eq!(retired["status"], "retired");
+    assert_eq!(retired["retiredBy"], "geoyws");
+    assert_eq!(retired["retireNote"], "repo and branch gone");
+    assert!(retired["retiredAt"].is_i64());
+
+    // `--status pending` no longer shows it; `--status retired` does, with the
+    // note and the actor.
+    let pending = fixture.ok_json(
+        &fixture.main,
+        &["handoff", "list", "--status", "pending", "--json"],
+    );
+    assert!(
+        pending
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["id"] != id.as_str()),
+        "a retired handoff stayed in the pending resume queue"
+    );
+    let retired_list = fixture.ok_json(
+        &fixture.main,
+        &["handoff", "list", "--status", "retired", "--json"],
+    );
+    let row = retired_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == id.as_str())
+        .expect("the retired handoff is not listed under --status retired");
+    assert_eq!(row["retireNote"], "repo and branch gone");
+    assert_eq!(row["retiredBy"], "geoyws");
+
+    // Accepting a retired handoff refuses, naming retired, by whom, and when.
+    let accepted = fixture.run(
+        &fixture.main,
+        &["handoff", "accept", &id, "--as", "driver-2", "--json"],
+    );
+    let message = refusal_object(&accepted);
+    assert!(message.contains("retired"), "{message}");
+    assert!(message.contains("geoyws"), "{message}");
+    assert!(
+        message.contains("epoch ms"),
+        "the refusal must name when it was retired: {message}"
+    );
+
+    // Retiring twice refuses.
+    let twice = fixture.run(
+        &fixture.main,
+        &[
+            "handoff", "retire", &id, "--as", "geoyws", "--note", "again", "--json",
+        ],
+    );
+    let twice_message = refusal_object(&twice);
+    assert!(twice_message.contains("already retired"), "{twice_message}");
+
+    // Retiring an accepted one refuses.
+    let other = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "--as",
+            "a",
+            "--to",
+            "b",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--json",
+        ],
+    );
+    let other_id = other["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &["handoff", "accept", &other_id, "--as", "b", "--json"],
+    );
+    let retire_accepted = fixture.run(
+        &fixture.main,
+        &[
+            "handoff", "retire", &other_id, "--as", "geoyws", "--note", "x", "--json",
+        ],
+    );
+    let retire_accepted_message = refusal_object(&retire_accepted);
+    assert!(
+        retire_accepted_message.contains("not pending"),
+        "{retire_accepted_message}"
+    );
+
+    // The retirement is on the durable audit trail, note included.
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connection = Connection::open(&board).unwrap();
+    let payload: String = connection
+        .query_row(
+            "SELECT payload FROM events WHERE kind='handoff_retired' ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(payload.contains("repo and branch gone"), "{payload}");
+    assert!(payload.contains(&id), "{payload}");
+}
+
+#[test]
+fn deploy_start_refuses_a_tier_host_pair_the_canonical_table_forbids() {
+    let fixture = Fixture::new("deploy-tier-host");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TIERHOST", "--json"]);
+    let start = |tier: &str, host: &str| {
+        fixture.run(
+            &fixture.main,
+            &[
+                "deploy",
+                "start",
+                "--repo",
+                "geoyws/kanban",
+                "--commit",
+                "1111111111111111111111111111111111111111",
+                "--tier",
+                tier,
+                "--environment",
+                "env",
+                "--host",
+                host,
+                "--url",
+                "https://x",
+                "--as",
+                "e2e",
+                "--json",
+            ],
+        )
+    };
+
+    // An MBP tier on a Hetzner host is refused, naming tier, host, and row.
+    let refused = start("@_bdt", "hig");
+    let message = refusal_object(&refused);
+    assert!(message.contains("@_bdt"), "{message}");
+    assert!(message.contains("hig"), "{message}");
+    assert!(message.contains("geoywsMBP"), "{message}");
+
+    // The same MBP tier on the MBP host is accepted.
+    let accepted = start("@_bdt", "geoywsMBP");
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    // A Hetzner tier on an MBP host is refused.
+    let refused = start("@_p", "geoywsMBP");
+    let message = refusal_object(&refused);
+    assert!(message.contains("@_p"), "{message}");
+    assert!(message.contains("geoywsMBP"), "{message}");
+    assert!(message.contains("Hetzner"), "{message}");
+
+    // The same Hetzner tier on a Hetzner host is accepted.
+    let accepted = start("@_p", "hax");
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
 }
 
 #[test]
@@ -13620,6 +13916,8 @@ const CAPPED_LISTINGS: &[CappedListing] = &[
                     "create",
                     "--as",
                     "agent",
+                    "--to",
+                    "driver-2",
                     "--summary",
                     &format!("handoff {index}"),
                     "--intent",
@@ -14263,7 +14561,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        23
+        24
     );
     assert_eq!(
         connection
@@ -14865,6 +15163,8 @@ fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
             "create",
             "--as",
             "worker",
+            "--to",
+            "driver-2",
             "--summary",
             "s",
             "--intent",
@@ -16416,7 +16716,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 24_i64)
+        .pragma_update(None, "user_version", 25_i64)
         .unwrap();
     drop(newer_connection);
 
@@ -17081,6 +17381,8 @@ fn priority_orders_cli_dashboard_and_web_queues_before_age() {
                 "create",
                 "--as",
                 "agent",
+                "--to",
+                "driver-2",
                 "--summary",
                 summary,
                 "--intent",
