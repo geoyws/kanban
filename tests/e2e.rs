@@ -13074,6 +13074,443 @@ fn a_negative_limit_is_refused_rather_than_read_as_no_limit() {
     }
 }
 
+/// One capped listing, for the ADR-037 property below. Adding a listing is
+/// one row here; the test refuses to pass until every `--limit`-taking
+/// operation the binary publishes has one.
+struct CappedListing {
+    label: &'static str,
+    /// The listing as invoked, without `--limit` or `--json`.
+    argv: &'static [&'static str],
+    /// The default it must not pass off as the whole.
+    default: usize,
+    /// Where the rows sit in the reply: the bare array, or this key of an object.
+    rows: Option<&'static str>,
+    /// Stand up whatever the rows hang off; what it returns is handed to `seed`.
+    prepare: fn(&Fixture) -> String,
+    /// Add one more row the listing would return.
+    seed: fn(&Fixture, &str, usize),
+}
+
+fn seed_nothing(_: &Fixture) -> String {
+    String::new()
+}
+
+fn seed_task(fixture: &Fixture) -> String {
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "capped history", "--id", "t-1", "--json"],
+    );
+    String::new()
+}
+
+fn seed_task_and_lease(fixture: &Fixture) -> String {
+    seed_task(fixture);
+    fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "agent", "--json"])["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn seed_task_and_board_path(fixture: &Fixture) -> String {
+    seed_task(fixture);
+    board_path_for_project(fixture, &fixture.main, "CAPPED")
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+const CAPPED_LISTINGS: &[CappedListing] = &[
+    CappedListing {
+        label: "events",
+        argv: &["events"],
+        default: 50,
+        rows: None,
+        prepare: seed_task,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "note",
+                    "t-1",
+                    &format!("event {index}"),
+                    "--as",
+                    "agent",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "registry-events",
+        argv: &["events", "--registry"],
+        default: 50,
+        rows: None,
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "rule",
+                    "add",
+                    &format!("rule {index}"),
+                    "--as",
+                    "geo",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "sitrep-list",
+        argv: &["sitrep", "list"],
+        default: 20,
+        rows: None,
+        prepare: seed_nothing,
+        // One lane each: a lane keeps only its ten newest current, and the
+        // rest are archived out of the default view.
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "sitrep",
+                    "post",
+                    &format!("sitrep {index}"),
+                    "--as",
+                    "agent",
+                    "--lane",
+                    &format!("lane-{index}"),
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "attention-list",
+        argv: &["attention", "list"],
+        default: 100,
+        rows: None,
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "attention",
+                    "raise",
+                    &format!("item {index}"),
+                    "--as",
+                    "agent",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "deploy-list",
+        argv: &["deploy", "list"],
+        default: 100,
+        rows: None,
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "deploy",
+                    "start",
+                    "--repo",
+                    "geoyws/kanban",
+                    "--commit",
+                    "1111111111111111111111111111111111111111",
+                    "--tier",
+                    "@_p",
+                    "--environment",
+                    "production",
+                    "--host",
+                    "hax",
+                    "--url",
+                    "https://kb.geoy.ws",
+                    "--operation-id",
+                    &format!("op-{index}"),
+                    "--as",
+                    "agent",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "claim-candidates",
+        argv: &["claim", "--candidates", "--as", "agent"],
+        default: 100,
+        rows: None,
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "task",
+                    "add",
+                    &format!("candidate {index}"),
+                    "--id",
+                    &format!("t-c{index}"),
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "search",
+        argv: &["search", "quokka", "--source", "task"],
+        default: 10,
+        rows: Some("results"),
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "task",
+                    "add",
+                    &format!("quokka {index}"),
+                    "--id",
+                    &format!("t-q{index}"),
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "handoff-list",
+        argv: &["handoff", "list"],
+        default: 100,
+        rows: None,
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "handoff",
+                    "create",
+                    "--as",
+                    "agent",
+                    "--summary",
+                    &format!("handoff {index}"),
+                    "--intent",
+                    "carry on",
+                    "--next-action",
+                    "resume",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "task-show-notes",
+        argv: &["task", "show", "t-1"],
+        default: 100,
+        rows: Some("notes"),
+        prepare: seed_task,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "note",
+                    "t-1",
+                    &format!("note {index}"),
+                    "--as",
+                    "agent",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "task-show-checkpoints",
+        argv: &["task", "show", "t-1"],
+        default: 20,
+        rows: Some("checkpoints"),
+        prepare: seed_task_and_lease,
+        seed: |fixture, lease, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "checkpoint",
+                    "t-1",
+                    "--lease",
+                    lease,
+                    "--as",
+                    "agent",
+                    "--summary",
+                    &format!("checkpoint {index}"),
+                    "--intent",
+                    "carry on",
+                    "--next-action",
+                    "resume",
+                    "--json",
+                ],
+            );
+        },
+    },
+    CappedListing {
+        label: "task-show-handoffs",
+        argv: &["task", "show", "t-1"],
+        default: 100,
+        rows: Some("handoffs"),
+        prepare: seed_task_and_board_path,
+        // Written straight into the table: every task handoff the CLI creates
+        // also writes a checkpoint, so a hundred of them through the binary
+        // would trip the twenty-checkpoint cap first and this cap could never
+        // be observed on its own. The rows are real; only the checkpoint
+        // side-effect is skipped.
+        seed: |_, board, index| {
+            Connection::open(board)
+                .unwrap()
+                .execute(
+                    "INSERT INTO handoffs(id,task_id,checkpoint_seq,reason,status,from_agent,\
+                     summary,intent,next_action,created_at) \
+                     VALUES(?,'t-1',NULL,'manual','pending','agent',?,'carry on','resume',?)",
+                    params![
+                        format!("h-{index:08}"),
+                        format!("handoff {index}"),
+                        index as i64
+                    ],
+                )
+                .unwrap();
+        },
+    },
+];
+
+/// ADR-037: a capped listing that would exceed its default without `--limit`
+/// refuses and names the flag; exactly the default is complete and answered;
+/// an explicit `--limit` is honoured as-is.
+///
+/// Read bottom-up: the refusal is asserted on a board holding one row more
+/// than the default, which is the one case every day of the silent-cap bug
+/// answered with a full-looking page and exit 0. A test that only seeded
+/// under the cap would have passed throughout.
+#[test]
+fn every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_meets() {
+    // Enumerated from the surface the binary publishes, so a listing that
+    // grows `--limit` later has to join the table or fail here. `watch` is
+    // the one exception: its `--limit` sizes a batch, and it computes and
+    // reports truncation itself.
+    let fixture = Fixture::new("capped-surface");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SURFACE", "--json"]);
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    for operation in schema["operations"].as_array().unwrap() {
+        let name = operation["name"].as_str().unwrap();
+        let takes_limit = operation["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|flag| flag["name"] == "limit");
+        if !takes_limit || name == "watch" {
+            continue;
+        }
+        let words = name.split(' ').collect::<Vec<_>>();
+        assert!(
+            CAPPED_LISTINGS
+                .iter()
+                .any(|listing| listing.argv.starts_with(&words)),
+            "`{name}` takes --limit but no CAPPED_LISTINGS row proves it refuses its default"
+        );
+    }
+    drop(fixture);
+
+    for listing in CAPPED_LISTINGS {
+        let fixture = Fixture::new(&format!("capped-{}", listing.label));
+        fixture.ok_json(&fixture.main, &["init", "--name", "CAPPED", "--json"]);
+        let context = (listing.prepare)(&fixture);
+        let rows = |value: &Value| -> Vec<Value> {
+            match listing.rows {
+                Some(key) => value[key].as_array(),
+                None => value.as_array(),
+            }
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no rows at {:?} in {value}",
+                    listing.label, listing.rows
+                )
+            })
+            .clone()
+        };
+        let with_limit = |limit: usize| -> Vec<Value> {
+            let mut argv = listing.argv.to_vec();
+            let limit = limit.to_string();
+            argv.extend(["--limit", &limit, "--json"]);
+            rows(&fixture.ok_json(&fixture.main, &argv))
+        };
+        let mut bare = listing.argv.to_vec();
+        bare.push("--json");
+
+        // Whatever `init` and `prepare` already wrote counts toward the cap.
+        let baseline = with_limit(listing.default + 1).len();
+        assert!(
+            baseline <= listing.default,
+            "{}: the board starts past the cap ({baseline})",
+            listing.label
+        );
+        for index in baseline..listing.default {
+            (listing.seed)(&fixture, &context, index);
+        }
+
+        // Exactly the default, no extra row: complete, and answered as such.
+        // This is the false refusal a count-equals-limit check would commit.
+        let complete = fixture.run(&fixture.main, &bare);
+        assert!(
+            complete.status.success(),
+            "{}: exactly {} rows were refused as if more existed\nstderr: {}",
+            listing.label,
+            listing.default,
+            String::from_utf8_lossy(&complete.stderr)
+        );
+        assert_eq!(
+            rows(&serde_json::from_slice(&complete.stdout).unwrap()).len(),
+            listing.default,
+            "{}: a complete page at the cap was cut",
+            listing.label
+        );
+
+        // One past it, no --limit: refuse, naming the cap and the flag.
+        (listing.seed)(&fixture, &context, listing.default);
+        let refused = fixture.run(&fixture.main, &bare);
+        let message = refusal_object(&refused);
+        assert!(
+            message.contains("--limit"),
+            "{}: the refusal does not name its fix: {message}",
+            listing.label
+        );
+        assert!(
+            message.contains(&listing.default.to_string()),
+            "{}: the refusal does not name the cap it stopped at: {message}",
+            listing.label
+        );
+        let plain = fixture.run(&fixture.main, listing.argv);
+        assert!(
+            !plain.status.success(),
+            "{}: without --json the same listing answered",
+            listing.label
+        );
+        assert!(
+            String::from_utf8_lossy(&plain.stderr).contains("--limit"),
+            "{}: the plain refusal does not name --limit",
+            listing.label
+        );
+
+        // An explicit bound is honoured as stated, hit or not, with no marker.
+        assert_eq!(
+            with_limit(listing.default).len(),
+            listing.default,
+            "{}: --limit at the cap did not return exactly the cap",
+            listing.label
+        );
+        assert_eq!(
+            with_limit(listing.default + 1).len(),
+            listing.default + 1,
+            "{}: --limit above the cap did not reach the row past it",
+            listing.label
+        );
+    }
+}
+
 #[test]
 fn a_draft_task_is_not_offered_as_work_until_it_is_promoted() {
     // `backlog` already meant real work that is simply unscheduled. There was
