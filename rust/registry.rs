@@ -4793,7 +4793,7 @@ mod tests {
         assert_eq!(created.workspace_roots, vec![root_text.clone()]);
 
         let attached = registry
-            .attach(&extra_root, "Alpha", "geo")
+            .attach(&extra_root, "Alpha", "geoyws")
             .expect("attach spare root");
         assert_eq!(attached.root_path, extra_text);
         assert_eq!(attached.board_path, created.board_path);
@@ -4805,11 +4805,11 @@ mod tests {
         assert!(active[0].workspace_roots.contains(&extra_text));
 
         let retired = registry
-            .retire("Alpha", "geo", "retire for test")
+            .retire("Alpha", "geoyws", "retire for test")
             .expect("retire project");
         assert_eq!(retired.name, "Alpha");
         assert!(retired.archived_at.is_some());
-        assert_eq!(retired.archived_by.as_deref(), Some("geo"));
+        assert_eq!(retired.archived_by.as_deref(), Some("geoyws"));
         assert_eq!(retired.archived_note.as_deref(), Some("retire for test"));
         assert_eq!(retired.workspace_roots.len(), 2);
         assert!(retired.workspace_roots.contains(&root_text));
@@ -4826,7 +4826,7 @@ mod tests {
         assert!(archived[0].workspace_roots.contains(&root_text));
         assert!(archived[0].workspace_roots.contains(&extra_text));
 
-        let restored = registry.unretire("Alpha", "geo").expect("unretire project");
+        let restored = registry.unretire("Alpha", "geoyws").expect("unretire project");
         assert_eq!(restored.name, "Alpha");
         assert!(restored.archived_at.is_none());
         assert!(restored.archived_by.is_none());

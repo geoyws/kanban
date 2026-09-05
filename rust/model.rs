@@ -644,6 +644,12 @@ pub struct CheckpointInput {
     pub root_head: Option<String>,
 }
 
+/// The one actor who may settle or reopen anyone's attention item and whom
+/// the browser acts as when no actor header is configured. Rows resolved
+/// before 2026-09-05 carry the historical spelling `geo`; that is a record,
+/// not an alias, and `geo` is refused like any other non-raiser today.
+pub const OPERATOR_ACTOR: &str = "geoyws";
+
 /// The kinds of thing that can need the operator, and nothing else.
 ///
 /// Deliberately no `info`: a note that does not need anyone is a note, and

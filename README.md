@@ -163,23 +163,23 @@ Short, non-secret constraints live in one registry-owned rules document. Boards
 still own work; they are selectors on rules, never a second rule species:
 
 ```bash
-kb r new "Universal rule." --as geo                    # tags: ALL
-kb r new --body-file /tmp/non-secret-rule.md --as geo
+kb r new "Universal rule." --as geoyws                    # tags: ALL
+kb r new --body-file /tmp/non-secret-rule.md --as geoyws
 kb r ls                         # active table of contents, oldest first
 kb r cat r-12345678             # fetch one full body lazily
-kb r up r-12345678 --body "Production runtime is compiled Rust." --as geo
-kb rule retire r-12345678 --as geo
+kb r up r-12345678 --body "Production runtime is compiled Rust." --as geoyws
+kb rule retire r-12345678 --as geoyws
 kb r ls --all --full            # include retired rules and full bodies
 kb ev --rule r-12345678         # audited revision/retirement trail
 
 # Target one or more boards, or every board except named boards.
-kb r new "Kanban-only rule." --board kanban --as geo
-kb r new "Everywhere except project-a." --except-board project-a --as geo
+kb r new "Kanban-only rule." --board kanban --as geoyws
+kb r new "Everywhere except project-a." --except-board project-a --as geoyws
 
 # Intersect board selection with one or more subsystem tags.
-kb r new "Queuer-specific rule." --tag queuer --as geo
-kb r new "Aix rule on two boards." --board crm-react --board pai-root --tag aix --as geo
-kb r up r-12345678 --clear-tags --as geo
+kb r new "Queuer-specific rule." --tag queuer --as geoyws
+kb r new "Aix rule on two boards." --board crm-react --board pai-root --tag aix --as geoyws
+kb r up r-12345678 --clear-tags --as geoyws
 ```
 
 Examples below use bare tag names in storage and CLI. Prose may render them as
@@ -226,8 +226,8 @@ kb att list --status open --tag queuer
 kb att update a-12345678 --body "Corrected request." --as codex@driver
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
-kb att resolve a-12345678 --as geo --note "Approved after review."
-kb att reopen a-12345678 --as geo --note "Resolved the wrong item."
+kb att resolve a-12345678 --as geoyws --note "Approved after review."
+kb att reopen a-12345678 --as geoyws --note "Resolved the wrong item."
 ```
 
 Several tags describe several touched subsystems. An agent may correct the body
@@ -236,12 +236,16 @@ event trail, and the update does not settle the request. Resolving it freezes
 the row with the rest of the historical receipt. Unknown tags are refused
 rather than producing an empty-looking filter result.
 
-Resolution is deliberately asymmetric: `geo` may settle any item, while an
-agent may settle only an item whose `raisedBy` is that exact actor, and every
-resolution requires a non-empty note. If a resolution was mistaken, only
-`geo` or the recorded resolver may reopen it. Reopening returns the item to the
-open queue without clearing `resolvedAt`, `resolvedBy` or `resolution`; it adds
-`reopenedAt`, `reopenedBy` and `reopenNote`, and the transition is audited.
+Resolution is deliberately asymmetric: the operator actor `geoyws` may settle
+any item, while an agent may settle only an item whose `raisedBy` is that exact
+actor, and every resolution requires a non-empty note. `geoyws` is the one
+operator spelling (`OPERATOR_ACTOR` in `rust/model.rs`); `geo` is not an alias
+and is refused like any other non-raiser. Rows resolved before 2026-09-05 carry
+`geo` in `resolvedBy` and `raisedBy` as the historical spelling; they are left
+as recorded. If a resolution was mistaken, only `geoyws` or the recorded
+resolver may reopen it. Reopening returns the item to the open queue without
+clearing `resolvedAt`, `resolvedBy` or `resolution`; it adds `reopenedAt`,
+`reopenedBy` and `reopenNote`, and the transition is audited.
 
 ## Working from anywhere
 
@@ -327,10 +331,10 @@ when needed:
 ```bash
 kanban init --name my-project --workspace /path/to/main-worktree
 kanban init --name scratchboard --rootless
-kanban workspace adopt --from-board /path/to/existing-board.db --name imported --workspace /path/to/adopted-root --as geo
+kanban workspace adopt --from-board /path/to/existing-board.db --name imported --workspace /path/to/adopted-root --as geoyws
 cd /path/to/another-worktree
 kanban workspace attach --to my-project
-kanban workspace detach --root /path/to/retired-worktree --as geo
+kanban workspace detach --root /path/to/retired-worktree --as geoyws
 kanban workspace retire NAME --as ACTOR --note TEXT
 kanban workspace unretire NAME --as ACTOR
 ```
@@ -614,13 +618,13 @@ Priority badges use P0/P1/P2 everywhere a queued row appears.
 Every read goes through the same `Store` methods the CLI calls, so there is no
 second implementation to keep in step.
 
-The Plans page can open an existing draft epic as `geo`, moving it to `todo` and
+The Plans page can open an existing draft epic as `geoyws`, moving it to `todo` and
 releasing its child work for claims. This is the only browser write besides an
 attention reply: it requires a same-origin POST and refuses any row that is not
 currently a draft epic.
 
 The **Needs you** page is the deliberately narrow exception to the read-only
-surface: reply inline to resolve an attention item as `geo`. Same-origin checks,
+surface: reply inline to resolve an attention item as `geoyws`. Same-origin checks,
 strict bounded form decoding and the Store's duplicate-resolution refusal guard
 the write. Quick replies are available on a phone without removing free text.
 Every other route remains read-only, enforced by the source mutator allowlist
@@ -642,10 +646,10 @@ kb subscription add --project NAME --id sub-codex-queue \
   --subject task:t-12345678 --kind checkpoint_added --tag orchestration \
   --consumer codex.queue --action enqueue-turn \
   --timeout-ms 30000 --max-retries 3 --rate-per-minute 60 \
-  --max-concurrency 1 --secret-ref codex_queue_token --as geo --json
+  --max-concurrency 1 --secret-ref codex_queue_token --as geoyws --json
 kb subscription list --project NAME --json
-kb subscription pause sub-codex-queue --project NAME --as geo --json
-kb subscription resume sub-codex-queue --project NAME --as geo --json
+kb subscription pause sub-codex-queue --project NAME --as geoyws --json
+kb subscription resume sub-codex-queue --project NAME --as geoyws --json
 ```
 
 Subscriptions are board-local declarative records. The selected board is the

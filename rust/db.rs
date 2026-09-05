@@ -2428,7 +2428,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "task_created",
-            "geo",
+            "geoyws",
             "{}",
             10,
         )
@@ -2438,7 +2438,7 @@ mod tests {
             &connection,
             None,
             "subscription_added",
-            "geo",
+            "geoyws",
             anchor_payload,
             11,
         )
@@ -2448,7 +2448,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "checkpoint_added",
-            "geo",
+            "geoyws",
             matching_payload,
             12,
         )
@@ -2474,9 +2474,9 @@ mod tests {
                     Option::<String>::None,
                     "active",
                     20,
-                    "geo",
+                    "geoyws",
                     20,
-                    "geo",
+                    "geoyws",
                     Option::<i64>::None,
                     Option::<String>::None,
                 ],
@@ -2584,7 +2584,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "task_created",
-            "geo",
+            "geoyws",
             "{}",
             10,
         )
@@ -2593,7 +2593,7 @@ mod tests {
             &connection,
             None,
             "subscription_added",
-            "geo",
+            "geoyws",
             r#"{"subscriptionID":"sub-1"}"#,
             11,
         )
@@ -2602,7 +2602,7 @@ mod tests {
             &connection,
             None,
             "subscription_added",
-            "geo",
+            "geoyws",
             r#"{"subscriptionID":"sub-old"}"#,
             12,
         )
@@ -2611,7 +2611,7 @@ mod tests {
             &connection,
             Some("t-subject"),
             "checkpoint_added",
-            "geo",
+            "geoyws",
             r#"{"_semanticV1":{"subject":{"type":"task","id":"t-subject"},"relations":[],"priorStatus":"todo","currentStatus":"in_progress","tags":["pubsub"]}}"#,
             13,
         )
@@ -2637,9 +2637,9 @@ mod tests {
                     Option::<String>::None,
                     "active",
                     20,
-                    "geo",
+                    "geoyws",
                     20,
-                    "geo",
+                    "geoyws",
                     Option::<i64>::None,
                     Option::<String>::None,
                 ],
@@ -2759,7 +2759,7 @@ mod tests {
                         1,
                         Option::<String>::None,
                         "task_created",
-                        "geo",
+                        "geoyws",
                         "{}",
                         10,
                         0,
@@ -2776,7 +2776,7 @@ mod tests {
                             2,
                             Option::<String>::None,
                             "subscription_added",
-                            "geo",
+                            "geoyws",
                             first_payload,
                             11,
                             0,
@@ -2794,7 +2794,7 @@ mod tests {
                             3,
                             Option::<String>::None,
                             "subscription_added",
-                            "geo",
+                            "geoyws",
                             second_payload,
                             12,
                             0,
@@ -2825,9 +2825,9 @@ mod tests {
                         Option::<String>::None,
                         "active",
                         20,
-                        "geo",
+                        "geoyws",
                         20,
-                        "geo",
+                        "geoyws",
                         Option::<i64>::None,
                         Option::<String>::None,
                     ],
@@ -2851,7 +2851,7 @@ mod tests {
                 rusqlite::params![
                     "g-existing",
                     "Keep evidence exact.",
-                    "geo",
+                    "geoyws",
                     0,
                     10,
                     11,
@@ -2863,7 +2863,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
-                rusqlite::params!["g-existing", "global_rule_added", "geo", "{}", 10],
+                rusqlite::params!["g-existing", "global_rule_added", "geoyws", "{}", 10],
             )
             .unwrap();
 
