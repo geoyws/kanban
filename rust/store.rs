@@ -925,6 +925,42 @@ fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
     })
 }
 
+/// The handoff listing's WHERE clause and its bound values, shared with the
+/// pending count so the two cannot disagree about which rows are pending.
+///
+/// Built up rather than enumerated: three optional filters is eight
+/// hand-written queries, and the eighth is the one that gets forgotten.
+fn handoff_filter(
+    task: Option<&str>,
+    status: Option<&str>,
+    to_agent: Option<&str>,
+    include_archived: bool,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut clauses = Vec::new();
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !include_archived {
+        clauses.push("archived=0");
+    }
+    if let Some(task) = task {
+        clauses.push("task_id=?");
+        values.push(Box::new(task.to_owned()));
+    }
+    if let Some(status) = status {
+        clauses.push("status=?");
+        values.push(Box::new(status.to_owned()));
+    }
+    if let Some(agent) = to_agent {
+        clauses.push("to_agent=?");
+        values.push(Box::new(agent.to_owned()));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    (where_clause, values)
+}
+
 #[derive(Debug)]
 struct BoardEventIdentityRow {
     seq: i64,
@@ -3946,6 +3982,49 @@ impl Store {
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
+        let (where_clause, mut values) =
+            self.attention_filter(status, kind, task, tag, lane, include_archived)?;
+        values.push(Box::new(limit));
+        let sql = format!(
+            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',priority ASC,created_at ASC,id ASC LIMIT ?"
+        );
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement
+            .query_map(params_from_iter(refs), attention_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_attention_tags(&self.connection, &mut rows)?;
+        Ok(rows)
+    }
+
+    /// How many attention rows nobody has settled: the dashboard's number,
+    /// counted rather than fetched, so a board past the listing's page still
+    /// reports what it holds. Same filter as `attention(Some("open"), …)`.
+    pub fn count_open_attention(&self) -> Result<i64> {
+        let (where_clause, values) =
+            self.attention_filter(Some("open"), None, None, None, None, false)?;
+        let refs = values.iter().map(|value| value.as_ref());
+        self.connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM attention{where_clause}"),
+                params_from_iter(refs),
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// The listing's WHERE clause and its bound values, shared with the count
+    /// so the two cannot disagree about which rows are open.
+    fn attention_filter(
+        &self,
+        status: Option<&str>,
+        kind: Option<&str>,
+        task: Option<&str>,
+        tag: Option<&str>,
+        lane: Option<&str>,
+        include_archived: bool,
+    ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
         let mut clauses = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !include_archived {
@@ -4008,18 +4087,7 @@ impl Store {
         } else {
             format!(" WHERE {}", clauses.join(" AND "))
         };
-        values.push(Box::new(limit));
-        let sql = format!(
-            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',priority ASC,created_at ASC,id ASC LIMIT ?"
-        );
-        let refs = values.iter().map(|value| value.as_ref());
-        let mut statement = self.connection.prepare(&sql)?;
-        let mut rows = statement
-            .query_map(params_from_iter(refs), attention_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        attach_attention_tags(&self.connection, &mut rows)?;
-        Ok(rows)
+        Ok((where_clause, values))
     }
 
     pub fn open_attentions(&self, task: &str) -> Result<Vec<Attention>> {
@@ -4246,30 +4314,7 @@ impl Store {
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
-        // Built up rather than enumerated: three optional filters is eight
-        // hand-written queries, and the eighth is the one that gets forgotten.
-        let mut clauses = Vec::new();
-        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if !include_archived {
-            clauses.push("archived=0");
-        }
-        if let Some(task) = task {
-            clauses.push("task_id=?");
-            values.push(Box::new(task.to_owned()));
-        }
-        if let Some(status) = status {
-            clauses.push("status=?");
-            values.push(Box::new(status.to_owned()));
-        }
-        if let Some(agent) = to_agent {
-            clauses.push("to_agent=?");
-            values.push(Box::new(agent.to_owned()));
-        }
-        let where_clause = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        };
+        let (where_clause, mut values) = handoff_filter(task, status, to_agent, include_archived);
         values.push(Box::new(limit));
         let sql = format!(
             "SELECT * FROM handoffs{where_clause} ORDER BY status!='pending',priority ASC,created_at ASC,id ASC LIMIT ?"
@@ -4279,6 +4324,22 @@ impl Store {
         statement
             .query_map(params_from_iter(refs), handoff_row)?
             .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// How many handoffs nobody has accepted or cancelled: the dashboard's
+    /// number, counted rather than fetched, so a board past the listing's
+    /// page still reports what it holds. Same filter as
+    /// `handoffs(None, Some("pending"), None, …)`.
+    pub fn count_pending_handoffs(&self) -> Result<i64> {
+        let (where_clause, values) = handoff_filter(None, Some("pending"), None, false);
+        let refs = values.iter().map(|value| value.as_ref());
+        self.connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM handoffs{where_clause}"),
+                params_from_iter(refs),
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 

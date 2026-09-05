@@ -1214,18 +1214,27 @@ fn boards() -> Result<String> {
     for (project, store) in projects()? {
         let tasks = store.list_tasks(None, None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        let attention = store.attention(Some("open"), None, None, None, None, 1000, false)?;
-        let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
+        // Counted, not fetched, for the same reason as `dashboard`: a page
+        // used as a count saturates silently. Only the most urgent row of
+        // each ranks the board, and both listings put it first.
+        let open_attention = store.count_open_attention()?;
+        let pending_handoffs = store.count_pending_handoffs()?;
+        let urgent_attention = store.attention(Some("open"), None, None, None, None, 1, false)?;
+        let urgent_handoff = store.handoffs(None, Some("pending"), None, 1, false)?;
         let queued = tasks
             .iter()
             .filter(|task| task.status == "todo")
             .map(|task| (task.priority, task.created_at))
             .chain(
-                attention
+                urgent_attention
                     .iter()
                     .map(|item| (item.priority, item.created_at)),
             )
-            .chain(handoffs.iter().map(|item| (item.priority, item.created_at)))
+            .chain(
+                urgent_handoff
+                    .iter()
+                    .map(|item| (item.priority, item.created_at)),
+            )
             .collect::<Vec<_>>();
         let highest = queued
             .iter()
@@ -1245,12 +1254,12 @@ fn boards() -> Result<String> {
              <td class=n>{handoffs}</td><td class=n>{total}</td></tr>",
             url = escape(&project.name),
             name = escape(&project.name),
-            flag = if attention.is_empty() { "" } else { " waiting" },
-            attention = attention.len(),
+            flag = if open_attention == 0 { "" } else { " waiting" },
+            attention = open_attention,
             todo = count("todo"),
             doing = count("in_progress"),
             stale = store.stale_tasks()?.len(),
-            handoffs = handoffs.len(),
+            handoffs = pending_handoffs,
             total = tasks.len(),
         );
         rows.push((highest, oldest, project.name.clone(), row));
