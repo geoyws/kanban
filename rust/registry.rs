@@ -1719,6 +1719,19 @@ impl Registry {
         })
     }
 
+    /// Open a named registry root writable, for tests that need a private data
+    /// root without mutating the environment (which would race across parallel
+    /// tests). Not compiled outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn open_test_at(root: &Path) -> Result<Self> {
+        let connection = open_registry(&root.join("registry.db"))?;
+        Ok(Self {
+            connection,
+            root: root.to_path_buf(),
+            adoption_boards: None,
+        })
+    }
+
     pub(crate) fn board_path_state(&self, path: &Path) -> Result<BoardPathState> {
         let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let mut statement = self.connection.prepare(
