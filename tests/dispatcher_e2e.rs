@@ -7,74 +7,27 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn fake_adapter() -> &'static Path {
-    static ADAPTER: OnceLock<PathBuf> = OnceLock::new();
-    ADAPTER
-        .get_or_init(|| {
-            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/dispatcher_fake_adapter.rs");
-            let root = env::temp_dir().join(format!(
-                "kanban-dispatcher-adapter-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir_all(&root).unwrap();
-            let binary = root.join("fake-adapter");
-            let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args(["--edition=2024"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "compile fake adapter from {}",
-                source.display()
-            );
-            binary
-        })
-        .as_path()
-}
-
-fn fake_codex() -> &'static Path {
-    static CODEX: OnceLock<PathBuf> = OnceLock::new();
-    CODEX
-        .get_or_init(|| {
-            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/codex_app_server_adapter_fake_codex.rs");
-            let root = env::temp_dir().join(format!(
-                "kanban-dispatcher-fake-codex-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir_all(&root).unwrap();
-            let binary = root.join("fake-codex");
-            let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args(["--edition=2024"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "compile fake codex from {}",
-                source.display()
-            );
-            binary
-        })
-        .as_path()
+/// Compile a fixture fake program into `target` and make it executable.
+fn compile_fake(source: &str, target: &Path) {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
+    let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2024"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "compile fake from {}",
+        source_path.display()
+    );
+    let mut permissions = fs::metadata(target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(target, permissions).unwrap();
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -153,6 +106,7 @@ impl Fixture {
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
         fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let output = Self::kanban_command(&project, &data)
             .args(["init", "--name", "DISPATCH-E2E", "--json"])
             .output()
@@ -265,11 +219,14 @@ impl Fixture {
     }
 
     fn write_config(&self, primary_mode: &str, other_mode: Option<&str>) {
+        let fake_adapter = self.root.join("fake-adapter");
+        compile_fake("tests/fixtures/dispatcher_fake_adapter.rs", &fake_adapter);
+        let capture = &self.capture;
         let action = |mode: &str| {
             json!({
                 "capability": "deliver",
-                "executable": fake_adapter(),
-                "args": [mode, self.capture],
+                "executable": &fake_adapter,
+                "args": [mode, capture],
             })
         };
         let mut consumers = serde_json::Map::new();
@@ -306,8 +263,10 @@ impl Fixture {
 
     fn write_real_app_server_config(&self) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let codex = self.root.join("fake-codex");
-        fs::copy(fake_codex(), &codex).unwrap();
-        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        compile_fake(
+            "tests/fixtures/codex_app_server_adapter_fake_codex.rs",
+            &codex,
+        );
         let codex_home = self.root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
         fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();

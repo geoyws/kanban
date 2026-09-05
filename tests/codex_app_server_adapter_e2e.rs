@@ -120,6 +120,7 @@ struct Fixture {
     codex_home: PathBuf,
     capture: PathBuf,
     codex: PathBuf,
+    tmpdir: PathBuf,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -153,36 +154,24 @@ fn parse_line(line: &str) -> Value {
     serde_json::from_str(line.trim_end_matches('\n')).unwrap()
 }
 
-fn compile_fake_codex() -> &'static Path {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/codex_app_server_adapter_fake_codex.rs");
-        let root = env::temp_dir().join(format!(
-            "kanban-codex-app-server-adapter-fake-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let binary = root.join("fake-codex");
-        let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-            .args(["--edition=2024"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&binary)
-            .status()
-            .unwrap();
-        assert!(
-            status.success(),
-            "compile fake codex from {}",
-            source.display()
-        );
-        binary
-    })
-    .as_path()
+/// Compile a fixture fake program into `target` and make it executable.
+fn compile_fake(source: &str, target: &Path) {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
+    let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2024"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "compile fake from {}",
+        source_path.display()
+    );
+    let mut permissions = fs::metadata(target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(target, permissions).unwrap();
 }
 
 fn process_test_mutex() -> &'static Mutex<()> {
@@ -553,10 +542,21 @@ impl Fixture {
         }
         let codex_home = codex_home.canonicalize().unwrap();
 
-        fs::copy(compile_fake_codex(), &codex).unwrap();
-        let mut permissions = fs::metadata(&codex).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&codex, permissions).unwrap();
+        // The adapter honours `TMPDIR` (via `std::env::temp_dir`) for its own
+        // schema scratch dir, so pinning `TMPDIR` inside the guarded root
+        // means a killed or timed-out adapter child leaves its scratch where
+        // `remove_dir_all(root)` sweeps it, rather than orphaned in the system
+        // temp dir.
+        let tmpdir = root.join("tmp");
+        fs::create_dir_all(&tmpdir).unwrap();
+        let mut permissions = fs::metadata(&tmpdir).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&tmpdir, permissions).unwrap();
+
+        compile_fake(
+            "tests/fixtures/codex_app_server_adapter_fake_codex.rs",
+            &codex,
+        );
 
         let paths = FixturePaths {
             cwd: cwd.clone(),
@@ -571,6 +571,7 @@ impl Fixture {
             codex_home,
             capture,
             codex,
+            tmpdir,
         }
     }
 
@@ -583,6 +584,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kanban-codex-app-server-adapter"));
         command
             .current_dir(&self.root)
+            .env("TMPDIR", &self.tmpdir)
             .arg("--codex")
             .arg(&self.codex)
             .arg("--codex-home")
@@ -2119,4 +2121,111 @@ fn compiled_process_blocked_protocol_write_uses_the_shared_deadline_and_reaps_th
     assert!(records.iter().any(|record| {
         record["mode"] == "listen-stage" && record["stage"] == "2" && record["phase"] == "stubborn"
     }));
+}
+
+/// Count scratch directories directly under the system temp dir whose name
+/// starts with `prefix`. Used to prove no fixture or adapter scratch survives
+/// a panic or a killed child.
+fn scratch_dirs_matching(prefix: &str) -> usize {
+    fs::read_dir(env::temp_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn dir_nonempty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+#[test]
+fn fixture_scratch_dir_is_removed_when_a_test_panics() {
+    let observed = std::panic::catch_unwind(|| {
+        let fixture = fixture_with_mutation("panic-proof", |_| {});
+        assert!(fixture.root.exists());
+        panic!("deliberate panic to prove the Drop guard still runs");
+    });
+    assert!(observed.is_err(), "the fixture scope should have panicked");
+    assert_eq!(
+        scratch_dirs_matching("kanban-codex-app-server-adapter-e2e-panic-proof-"),
+        0,
+        "no fixture scratch dir may survive a panic"
+    );
+}
+
+#[test]
+fn killed_adapter_child_leaves_no_schema_scratch_dir() {
+    let _test_guard = process_test_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Fixture::new("kill-proof", |paths| {
+        let cwd = paths.cwd.canonicalize().unwrap();
+        let codex_home = paths.codex_home.canonicalize().unwrap();
+        let mut scenario = scenario_for_cwd(
+            &cwd.to_string_lossy(),
+            &codex_home.to_string_lossy(),
+            &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+        );
+        // Hang inside the schema stage so the adapter holds its schema scratch
+        // dir open long enough for us to kill it before its own cleanup runs.
+        scenario.schema_stdout = Emit::Sleep(5_000);
+        scenario
+    });
+    let scenario = scenario_for_cwd(
+        &fixture.cwd.canonicalize().unwrap().to_string_lossy(),
+        &fixture.codex_home.to_string_lossy(),
+        &format!("{SUBSCRIPTION_ID}:{EVENT_ID}"),
+    );
+    let mut child = fixture
+        .adapter_command(
+            &schema_hash(&scenario.schema_client_request),
+            &schema_hash(&scenario.schema_protocol),
+            60_000,
+        )
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(serde_json::to_string(&request()).unwrap().as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+
+    // The adapter's `TempSchemaDir` honours `TMPDIR` (pinned to `fixture.tmpdir`),
+    // so its schema scratch must appear inside the guarded tree, never in the
+    // system temp dir.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !dir_nonempty(&fixture.tmpdir) {
+        assert!(
+            Instant::now() < deadline,
+            "adapter never created its schema scratch under the pinned TMPDIR"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        scratch_dirs_matching("kanban-codex-app-server-schema-"),
+        0,
+        "the adapter schema scratch must not appear in the system temp dir"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let root = fixture.root.clone();
+    drop(fixture);
+    assert!(
+        !root.exists(),
+        "fixture root must be swept after a killed adapter"
+    );
+    assert_eq!(
+        scratch_dirs_matching("kanban-codex-app-server-schema-"),
+        0,
+        "no adapter schema scratch dir may survive a killed adapter"
+    );
 }

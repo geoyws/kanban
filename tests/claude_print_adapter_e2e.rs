@@ -5,40 +5,33 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-static FAKE: LazyLock<PathBuf> = LazyLock::new(|| {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/claude_print_adapter_fake_claude.rs");
-    let root = env::temp_dir().join(format!(
-        "kanban-fake-claude-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let binary = root.join("claude");
+
+/// Compile a fixture fake program into `target` and make it executable.
+fn compile_fake(source: &str, target: &Path) {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
+    let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2024"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(target)
+        .status()
+        .unwrap();
     assert!(
-        Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-            .args(["--edition=2024"])
-            .arg(source)
-            .arg("-o")
-            .arg(&binary)
-            .status()
-            .unwrap()
-            .success()
+        status.success(),
+        "compile fake from {}",
+        source_path.display()
     );
-    binary
-});
-fn fake() -> &'static Path {
-    FAKE.as_path()
+    let mut permissions = fs::metadata(target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(target, permissions).unwrap();
 }
+
 struct Fixture {
     root: PathBuf,
     home: PathBuf,
     cwd: PathBuf,
+    claude: PathBuf,
     capture: PathBuf,
 }
 impl Fixture {
@@ -60,12 +53,18 @@ impl Fixture {
             m.set_mode(0o700);
             fs::set_permissions(p, m).unwrap();
         }
-        let capture = fake().parent().unwrap().join("capture.ndjson");
+        let claude = root.join("claude");
+        compile_fake(
+            "tests/fixtures/claude_print_adapter_fake_claude.rs",
+            &claude,
+        );
+        let capture = root.join("capture.ndjson");
         let _ = fs::remove_file(&capture);
         Self {
             root,
             home,
             cwd,
+            claude,
             capture,
         }
     }
@@ -76,7 +75,7 @@ impl Fixture {
         fs::write(self.home.join("scenario.txt"), scenario).unwrap();
         let mut c = Command::new(env!("CARGO_BIN_EXE_kanban-claude-print-adapter"));
         c.args(["--claude"])
-            .arg(fake())
+            .arg(&self.claude)
             .args(["--home"])
             .arg(&self.home)
             .args(["--cwd"])

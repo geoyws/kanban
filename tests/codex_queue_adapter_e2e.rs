@@ -5,45 +5,40 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn fake_codex() -> &'static Path {
-    static BINARY: OnceLock<PathBuf> = OnceLock::new();
-    BINARY
-        .get_or_init(|| {
-            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/codex_queue_adapter_fake_codex.rs");
-            let root = env::temp_dir().join(format!(
-                "kanban-codex-queue-adapter-fake-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::create_dir_all(&root).unwrap();
-            let binary = root.join("fake-codex");
-            let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args(["--edition=2024"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "compile fake codex from {}",
-                source.display()
-            );
-            binary
-        })
-        .as_path()
+/// Compile a fixture fake program into `target` and make it executable.
+fn compile_fake(source: &str, target: &Path) {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(source);
+    let status = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--edition=2024"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "compile fake from {}",
+        source_path.display()
+    );
+    let mut permissions = fs::metadata(target).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(target, permissions).unwrap();
+}
+
+/// Create `path` as a private directory (mode `0700`) and any parents.
+fn private_dir(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 struct Fixture {
     root: PathBuf,
     codex_home: PathBuf,
+    codex: PathBuf,
     capture: PathBuf,
 }
 
@@ -57,16 +52,17 @@ impl Fixture {
             "kanban-codex-queue-adapter-e2e-{label}-{}-{unique}",
             std::process::id()
         ));
+        private_dir(&root);
         let codex_home = root.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
-        let mut permissions = fs::metadata(&codex_home).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&codex_home, permissions).unwrap();
-        let capture = fake_codex().parent().unwrap().join("capture.ndjson");
+        private_dir(&codex_home);
+        let codex = root.join("fake-codex");
+        compile_fake("tests/fixtures/codex_queue_adapter_fake_codex.rs", &codex);
+        let capture = root.join("capture.ndjson");
         let _ = fs::remove_file(&capture);
         Self {
             root,
             codex_home,
+            codex,
             capture,
         }
     }
@@ -76,7 +72,7 @@ impl Fixture {
         command
             .current_dir(&self.root)
             .arg("--codex")
-            .arg(fake_codex())
+            .arg(&self.codex)
             .arg("--codex-home")
             .arg(&self.codex_home)
             .arg("--thread")
