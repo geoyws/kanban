@@ -333,11 +333,84 @@ bin_link_path() {
   printf '%s/%s' "$1" "$2"
 }
 
+# The four functions below are embedded verbatim in the remote install script
+# (see install_remote); hig_release_script_local_and_remote_install_guards_are_identical
+# in tests/e2e.rs fails when the two copies drift.
+physical_dir() {
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+# A managed symlink is one this installer wrote: its target sits directly in
+# "$install_root/$expected_parent" (current -> releases/<id>, bin/<name> ->
+# current/<name>). Anything else belongs to the operator and is never replaced.
+managed_symlink() {
+  local link="$1"
+  local install_root="$2"
+  local expected_parent="$3"
+  [[ -L "$link" ]] || return 1
+  local target parent root_physical parent_physical
+  target="$(readlink "$link")"
+  [[ "$target" == /* ]] || target="$(dirname "$link")/$target"
+  parent="$(dirname "$target")"
+  [[ "${parent##*/}" == "$expected_parent" ]] || return 1
+  root_physical="$(physical_dir "$install_root")" || return 1
+  parent_physical="$(physical_dir "$(dirname "$parent")")" || return 1
+  [[ "$parent_physical" == "$root_physical" ]]
+}
+
+# Refuses, before anything is written, every path an activation writes through
+# unless it has the shape this installer creates: releases/ and releases/<id>
+# real directories, current and bin/<name> absent or managed symlinks, the bin
+# dir a real directory. Called from a clean state so a refusal mutates nothing.
+ensure_safe_release_view() {
+  local install_root="$1"
+  local bin_dir="$2"
+  local release_id="$3"
+  shift 3
+  local releases="$install_root/releases"
+  local current="$install_root/current"
+  local release_path="$releases/$release_id"
+  [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
+  [[ ! -e "$install_root" || -d "$install_root" ]] || die "install root is not a directory: $install_root"
+  if [[ -e "$releases" || -L "$releases" ]]; then
+    [[ ! -L "$releases" ]] || die "refusing to install through a symlink at $releases; remove it so releases/ is a real directory inside $install_root"
+    [[ -d "$releases" ]] || die "refusing to install: $releases is not a directory; move it aside so the installer can create releases/"
+  fi
+  if [[ -e "$release_path" || -L "$release_path" ]]; then
+    [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
+    [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
+  fi
+  if [[ -e "$current" || -L "$current" ]]; then
+    managed_symlink "$current" "$install_root" releases ||
+      die "refusing to replace $current: it is not a symlink into $releases managed by this installer; move it aside before installing"
+  fi
+  if [[ -e "$bin_dir" || -L "$bin_dir" ]]; then
+    [[ ! -L "$bin_dir" ]] || die "bin dir must not be a symlink: $bin_dir; pass --bin-dir with the real directory"
+    [[ -d "$bin_dir" ]] || die "bin dir is not a directory: $bin_dir; pass --bin-dir with a directory"
+  fi
+  local binary link
+  for binary in "$@"; do
+    link="$bin_dir/$binary"
+    if [[ -e "$link" || -L "$link" ]]; then
+      managed_symlink "$link" "$install_root" current ||
+        die "refusing to replace $link: it is not a symlink into $current managed by this installer; move it aside before installing"
+    fi
+  done
+}
+
 atomic_symlink() {
   local target="$1"
   local link_path="$2"
   local link_parent
   link_parent="$(dirname "$link_path")"
+  if [[ -e "$link_path" || -L "$link_path" ]] && [[ ! -L "$link_path" ]]; then
+    printf 'hig-release: refusing to replace %s: it is not a symlink; move it aside before installing\n' "$link_path" >&2
+    return 1
+  fi
+  if [[ -L "$link_parent" ]]; then
+    printf 'hig-release: refusing to write through a symlink at %s; replace it with a real directory\n' "$link_parent" >&2
+    return 1
+  fi
   mkdir -p "$link_parent"
   local staging
   staging="$(mktemp -d "$link_parent/.${link_path##*/}.XXXXXX")"
@@ -624,12 +697,12 @@ install_release_tree() {
   validate_package "$package_dir" "$target"
   validate_receipt "$receipt" "$target" "$package_dir"
 
-  [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
-  mkdir -p "$install_root/releases"
-
   local release_id release_path release_meta staging receipt_json installed_at activation_sequence
   local previous_current="" current_switched=0 release_created=0
   release_id="$(release_id_from_receipt "$receipt")"
+  ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
+  mkdir -p "$install_root/releases"
+
   release_path="$(release_dir "$install_root" "$release_id")"
   release_meta="$(release_receipt "$install_root" "$release_id")"
   if [[ -L "$(current_link "$install_root")" ]]; then
@@ -871,11 +944,83 @@ cleanup_remote() {
 
 trap cleanup_remote EXIT
 
+# Verbatim copies of the local guard functions; see the comment above the
+# local physical_dir for the drift test that pins them.
+physical_dir() {
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+# A managed symlink is one this installer wrote: its target sits directly in
+# "$install_root/$expected_parent" (current -> releases/<id>, bin/<name> ->
+# current/<name>). Anything else belongs to the operator and is never replaced.
+managed_symlink() {
+  local link="$1"
+  local install_root="$2"
+  local expected_parent="$3"
+  [[ -L "$link" ]] || return 1
+  local target parent root_physical parent_physical
+  target="$(readlink "$link")"
+  [[ "$target" == /* ]] || target="$(dirname "$link")/$target"
+  parent="$(dirname "$target")"
+  [[ "${parent##*/}" == "$expected_parent" ]] || return 1
+  root_physical="$(physical_dir "$install_root")" || return 1
+  parent_physical="$(physical_dir "$(dirname "$parent")")" || return 1
+  [[ "$parent_physical" == "$root_physical" ]]
+}
+
+# Refuses, before anything is written, every path an activation writes through
+# unless it has the shape this installer creates: releases/ and releases/<id>
+# real directories, current and bin/<name> absent or managed symlinks, the bin
+# dir a real directory. Called from a clean state so a refusal mutates nothing.
+ensure_safe_release_view() {
+  local install_root="$1"
+  local bin_dir="$2"
+  local release_id="$3"
+  shift 3
+  local releases="$install_root/releases"
+  local current="$install_root/current"
+  local release_path="$releases/$release_id"
+  [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
+  [[ ! -e "$install_root" || -d "$install_root" ]] || die "install root is not a directory: $install_root"
+  if [[ -e "$releases" || -L "$releases" ]]; then
+    [[ ! -L "$releases" ]] || die "refusing to install through a symlink at $releases; remove it so releases/ is a real directory inside $install_root"
+    [[ -d "$releases" ]] || die "refusing to install: $releases is not a directory; move it aside so the installer can create releases/"
+  fi
+  if [[ -e "$release_path" || -L "$release_path" ]]; then
+    [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
+    [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
+  fi
+  if [[ -e "$current" || -L "$current" ]]; then
+    managed_symlink "$current" "$install_root" releases ||
+      die "refusing to replace $current: it is not a symlink into $releases managed by this installer; move it aside before installing"
+  fi
+  if [[ -e "$bin_dir" || -L "$bin_dir" ]]; then
+    [[ ! -L "$bin_dir" ]] || die "bin dir must not be a symlink: $bin_dir; pass --bin-dir with the real directory"
+    [[ -d "$bin_dir" ]] || die "bin dir is not a directory: $bin_dir; pass --bin-dir with a directory"
+  fi
+  local binary link
+  for binary in "$@"; do
+    link="$bin_dir/$binary"
+    if [[ -e "$link" || -L "$link" ]]; then
+      managed_symlink "$link" "$install_root" current ||
+        die "refusing to replace $link: it is not a symlink into $current managed by this installer; move it aside before installing"
+    fi
+  done
+}
+
 atomic_symlink() {
   local target="$1"
   local link_path="$2"
   local link_parent
   link_parent="$(dirname "$link_path")"
+  if [[ -e "$link_path" || -L "$link_path" ]] && [[ ! -L "$link_path" ]]; then
+    printf 'hig-release: refusing to replace %s: it is not a symlink; move it aside before installing\n' "$link_path" >&2
+    return 1
+  fi
+  if [[ -L "$link_parent" ]]; then
+    printf 'hig-release: refusing to write through a symlink at %s; replace it with a real directory\n' "$link_parent" >&2
+    return 1
+  fi
   mkdir -p "$link_parent"
   local staging
   staging="$(mktemp -d "$link_parent/.${link_path##*/}.XXXXXX")"
@@ -1040,9 +1185,9 @@ while IFS=$'\t' read -r name sha256 size version; do
   [[ "$(file_version "$path")" == "$version" ]] || die "remote binary $name version mismatch"
 done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$receipt")
 
-[[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
-mkdir -p "$install_root/releases"
 release_id="$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
+ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter
+mkdir -p "$install_root/releases"
 release_path="$install_root/releases/$release_id"
 release_receipt="$install_root/releases/$release_id.receipt.json"
 previous_current=""
@@ -1210,6 +1355,7 @@ rollback_release() {
     previous_current="$(readlink "$(current_link "$install_root")")"
   fi
   [[ -f "$release_receipt" ]] || die "release metadata missing for $release_id"
+  ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
   validate_release_files "$release_path" "$target"
   trap 'rollback_activation_view "$install_root" "$release_path" "$release_receipt" "$previous_current" "$current_switched" "$release_created" "$bin_dir"' ERR
   ensure_public_binary_links "$install_root" "$bin_dir"
