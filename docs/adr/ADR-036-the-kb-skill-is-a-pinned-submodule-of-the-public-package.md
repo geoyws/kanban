@@ -76,3 +76,11 @@ makes "which skill did this binary ship with" answerable from the commit.
 - `docs/adr/ADR-010-adapters-generated-from-the-command-surface.md`
 - `rust/lib.rs` — the compile-time alias-drift test
 - `skills/hosts.tsv`
+
+## Addendum, 2026-09-05
+
+`public-kb-skill/`, the staging directory the package was first published
+from, was removed. It had already drifted 23 lines from the pinned
+`skills/kb/SKILL.md`, nothing built or tested against it, and a writer edited it
+on 2026-09-05 believing it was the skill source. The package repository is the
+only place the skill is authored.

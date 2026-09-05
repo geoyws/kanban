@@ -1,8 +1,0 @@
-#!/bin/bash
-set -euo pipefail
-
-repo_root=${1:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
-hook_path=".githooks"
-
-git -C "$repo_root" config core.hooksPath "$hook_path"
-printf 'install-hooks: set core.hooksPath=%s\n' "$hook_path"
