@@ -589,7 +589,7 @@ impl ResolvedDispatch {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::Subscription;
+    use crate::model::{OPERATOR_ACTOR, Subscription};
     use serde_json::json;
     use std::ffi::{OsStr, OsString};
     use std::fs;
@@ -785,9 +785,9 @@ pub(crate) mod tests {
             secret_ref: secret_ref.map(str::to_owned),
             status: "active".to_owned(),
             created_at: 1,
-            created_by: "geo".to_owned(),
+            created_by: OPERATOR_ACTOR.to_owned(),
             updated_at: 1,
-            updated_by: "geo".to_owned(),
+            updated_by: OPERATOR_ACTOR.to_owned(),
             paused_at: None,
             paused_by: None,
         }

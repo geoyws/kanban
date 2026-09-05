@@ -1415,13 +1415,13 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
     );
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "pubsub", "--as", "geo", "--json"],
+        &["tag", "add", "pubsub", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
         &[
             "task", "add", "Parent", "--id", "e-sub", "--type", "epic", "--status", "todo", "--as",
-            "geo", "--json",
+            "geoyws", "--json",
         ],
     );
     fixture.ok_json(
@@ -1437,7 +1437,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             "--tag",
             "pubsub",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -1476,7 +1476,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             "--secret-ref",
             "codex_queue_token",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -1572,7 +1572,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
 
     let paused = fixture.ok_json(
         &fixture.main,
-        &["subscription", "pause", "sub-e2e", "--as", "geo", "--json"],
+        &["subscription", "pause", "sub-e2e", "--as", "geoyws", "--json"],
     );
     assert_eq!(paused["status"], "paused");
     assert!(
@@ -1592,7 +1592,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
     );
     let resumed = fixture.ok_json(
         &fixture.main,
-        &["subscription", "resume", "sub-e2e", "--as", "geo", "--json"],
+        &["subscription", "resume", "sub-e2e", "--as", "geoyws", "--json"],
     );
     assert_eq!(resumed["status"], "active");
 
@@ -1619,7 +1619,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
                 "--max-concurrency",
                 "1",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         ),
@@ -1645,7 +1645,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
                 "--secret-ref",
                 "env:TOKEN=raw",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         ),
@@ -1669,7 +1669,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
                 "--max-concurrency",
                 "1",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         ),
@@ -1680,7 +1680,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
                 "pause",
                 "sub-missing",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         ),
@@ -1691,7 +1691,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
                 "resume",
                 "sub-missing",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         ),
@@ -1751,7 +1751,7 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
             "add",
             "First handoff rule.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -1762,7 +1762,7 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
             "add",
             "Second handoff rule.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -1975,7 +1975,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
             "--description",
             "handoff lifecycle",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -1986,7 +1986,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
             "add",
             "Handoff-tagged task rule.",
             "--as",
-            "geo",
+            "geoyws",
             "--tag",
             "handoff",
             "--json",
@@ -3248,7 +3248,7 @@ fn claim_candidates_are_read_only_and_match_the_atomic_scheduler() {
     let fixture = Fixture::new("claim-candidates");
     fixture.ok_json(&fixture.main, &["init", "--name", "CANDIDATES", "--json"]);
     for tag in ["claims", "other"] {
-        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geoyws", "--json"]);
     }
     let add = |id: &str, extra: &[&str]| {
         let mut args = vec!["task", "add", id, "--id", id, "--tag", "claims"];
@@ -6273,7 +6273,7 @@ fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
     );
     kb_json(
         &fixture.main,
-        &["t", "mv", "t-1", "review", "--as", "geo", "--json"],
+        &["t", "mv", "t-1", "review", "--as", "geoyws", "--json"],
     );
     assert_eq!(
         kb_json(&fixture.main, &["t", "cat", "t-1", "--json"])["status"],
@@ -6281,11 +6281,11 @@ fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
     );
     kb_json(
         &fixture.main,
-        &["t", "up", "t-1", "--as", "geo", "--priority", "1", "--json"],
+        &["t", "up", "t-1", "--as", "geoyws", "--priority", "1", "--json"],
     );
     kb_json(
         &fixture.main,
-        &["n", "t-1", "a note", "--as", "geo", "--json"],
+        &["n", "t-1", "a note", "--as", "geoyws", "--json"],
     );
     assert!(kb(&fixture.main, &["ctx", "t-1"]).status.success());
     assert!(kb(&fixture.main, &["dash"]).status.success());
@@ -6296,7 +6296,7 @@ fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
         fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["priority"],
         1
     );
-    kb_json(&fixture.main, &["t", "rm", "t-1", "--as", "geo", "--json"]);
+    kb_json(&fixture.main, &["t", "rm", "t-1", "--as", "geoyws", "--json"]);
     assert!(
         fixture
             .ok_json(&fixture.main, &["task", "list", "--json"])
@@ -6313,7 +6313,7 @@ fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
     );
     kb_json(
         &fixture.main,
-        &["n", "rm", "note on task rm", "--as", "geo", "--json"],
+        &["n", "rm", "note on task rm", "--as", "geoyws", "--json"],
     );
     assert_eq!(
         kb_json(&fixture.main, &["t", "cat", "rm", "--json"])["id"],
@@ -6531,7 +6531,7 @@ fn compiled_binary_detects_registry_rule_history_edit() {
     fixture.ok_json(&fixture.main, &["init", "--name", "Audit", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["rule", "add", "Keep evidence.", "--as", "geo", "--json"],
+        &["rule", "add", "Keep evidence.", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
 
@@ -7253,7 +7253,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
         let refused = fixture.run(
             &fixture.main,
             &[
-                "task", "update", "t-3", "--as", "geo", flag, value, "--json",
+                "task", "update", "t-3", "--as", "geoyws", flag, value, "--json",
             ],
         );
         assert!(!refused.status.success(), "{flag} {value} was accepted");
@@ -7273,7 +7273,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
             "update",
             "t-3",
             "--as",
-            "geo",
+            "geoyws",
             "--priority",
             "-1",
             "--json",
@@ -7306,7 +7306,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
     let updated = fixture.ok_json(
         &fixture.main,
         &[
-            "task", "update", "t-3", "--as", "geo", "--title", "renamed", "--json",
+            "task", "update", "t-3", "--as", "geoyws", "--title", "renamed", "--json",
         ],
     );
     assert_eq!(updated["title"], "renamed");
@@ -8333,7 +8333,7 @@ fn compiled_binary_refuses_arguments_it_would_have_dropped() {
     fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-1", "todo", "--as", "geo", "--json"],
+        &["task", "move", "t-1", "todo", "--as", "geoyws", "--json"],
     );
 }
 
@@ -8773,7 +8773,7 @@ fn a_story_status_is_not_writable_around_its_gate() {
     // took a signoff, dispatched a merge task, or flipped a parent epic.
     let direct = fixture.run(
         &fixture.main,
-        &["task", "move", "s-1", "done", "--as", "geo", "--json"],
+        &["task", "move", "s-1", "done", "--as", "geoyws", "--json"],
     );
     assert!(
         !direct.status.success(),
@@ -8799,7 +8799,7 @@ fn a_story_status_is_not_writable_around_its_gate() {
     // The gate itself keeps writing the same column, and the projection holds.
     fixture.ok_json(
         &fixture.main,
-        &["story", "advance", "s-1", "--as", "geo", "--json"],
+        &["story", "advance", "s-1", "--as", "geoyws", "--json"],
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "s-1", "--json"])["status"],
@@ -8811,7 +8811,7 @@ fn a_story_status_is_not_writable_around_its_gate() {
     // refusing it would remove the only way to say it.
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "s-1", "blocked", "--as", "geo", "--json"],
+        &["task", "move", "s-1", "blocked", "--as", "geoyws", "--json"],
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "s-1", "--json"])["status"],
@@ -8822,7 +8822,7 @@ fn a_story_status_is_not_writable_around_its_gate() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "task", "move", "s-1", "done", "--as", "geo", "--force", "--json",
+            "task", "move", "s-1", "done", "--as", "geoyws", "--force", "--json",
         ],
     );
     let events = fixture.ok_json(&fixture.main, &["events", "--task", "s-1", "--json"]);
@@ -8841,7 +8841,7 @@ fn a_story_status_is_not_writable_around_its_gate() {
     );
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-1", "done", "--as", "geo", "--json"],
+        &["task", "move", "t-1", "done", "--as", "geoyws", "--json"],
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["status"],
@@ -8928,7 +8928,7 @@ fn a_task_cannot_be_made_to_contain_work() {
     let reparent = fixture.run(
         &fixture.main,
         &[
-            "task", "update", "s-ok", "--as", "geo", "--parent", "t-1", "--json",
+            "task", "update", "s-ok", "--as", "geoyws", "--parent", "t-1", "--json",
         ],
     );
     assert!(
@@ -9428,7 +9428,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "add",
             "Read-only schema probe.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -9932,7 +9932,7 @@ fn watch_replays_resumes_and_respects_selector_boundaries() {
             "t-main",
             "Main board task note",
             "--as",
-            "geo",
+            "geoyws",
             "--kind",
             "progress",
             "--json",
@@ -10003,7 +10003,7 @@ fn watch_replays_resumes_and_respects_selector_boundaries() {
             "add",
             "Alpha registry rule.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10014,7 +10014,7 @@ fn watch_replays_resumes_and_respects_selector_boundaries() {
             "add",
             "Beta registry rule.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10353,7 +10353,7 @@ fn watch_follow_streams_new_events_and_keeps_outputs_separated() {
         &board_path,
         Some("t-follow"),
         "watch_secret_probe",
-        "geo",
+        "geoyws",
         json!({
             "token": "outer-secret",
             "tokenCount": 7,
@@ -10409,7 +10409,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
         &["init", "--name", "WATCH-SEMANTIC-ENVELOPE", "--json"],
     );
     for tag in ["alpha", "zeta"] {
-        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geoyws", "--json"]);
     }
     fixture.ok_json(
         &fixture.main,
@@ -10422,7 +10422,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
             "--type",
             "epic",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10439,7 +10439,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
             "--parent",
             "e-root",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10454,7 +10454,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
             "--status",
             "done",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10475,13 +10475,13 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
             "--tag",
             "alpha",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-child", "done", "--as", "geo", "--json"],
+        &["task", "move", "t-child", "done", "--as", "geoyws", "--json"],
     );
 
     let audit = fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
@@ -10497,7 +10497,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
         &board_path,
         Some("t-child"),
         "legacy_semantic_probe",
-        "geo",
+        "geoyws",
         json!({
             "token": "outer-secret",
             "tokenized": "visible",
@@ -10512,7 +10512,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
         &board_path,
         Some("t-child"),
         "legacy_oversized_probe",
-        "geo",
+        "geoyws",
         json!({"blob": "x".repeat(20_000)}),
     );
 
@@ -10554,7 +10554,7 @@ fn watch_emits_truthful_bounded_semantic_envelopes() {
             event["timestamp"].as_i64().is_some_and(|at| at > 0),
             "{event}"
         );
-        assert_eq!(event["actor"], "geo", "{event}");
+        assert_eq!(event["actor"], "geoyws", "{event}");
         assert_eq!(event["subject"], json!({"type":"task","id":"t-child"}));
         assert_eq!(event["tags"], json!(["alpha", "zeta"]));
         assert!(event["payload"].get("_semanticV1").is_none(), "{event}");
@@ -10627,7 +10627,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
         &["init", "--name", "WATCH-SEMANTIC-FILTERS", "--json"],
     );
     for tag in ["alpha", "zeta"] {
-        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geoyws", "--json"]);
     }
     fixture.ok_json(
         &fixture.main,
@@ -10640,7 +10640,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--type",
             "epic",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10657,7 +10657,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--parent",
             "e-root",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10670,7 +10670,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--id",
             "t-other",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10685,7 +10685,7 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--status",
             "done",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10706,13 +10706,13 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
             "--tag",
             "alpha",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-child", "done", "--as", "geo", "--json"],
+        &["task", "move", "t-child", "done", "--as", "geoyws", "--json"],
     );
 
     let kinds = fixture.run(
@@ -10804,11 +10804,11 @@ fn watch_filters_sparse_history_and_binds_normalized_predicates_to_cursors() {
 
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-child", "todo", "--as", "geo", "--json"],
+        &["task", "move", "t-child", "todo", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-child", "done", "--as", "geo", "--json"],
+        &["task", "move", "t-child", "done", "--as", "geoyws", "--json"],
     );
     let resumed = fixture.run(
         &fixture.main,
@@ -10928,7 +10928,7 @@ fn watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats() {
             "--id",
             "t-interleaved",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -10986,7 +10986,7 @@ fn watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats() {
             "t-interleaved",
             "in_progress",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -11002,7 +11002,7 @@ fn watch_follow_delivers_an_event_queued_behind_interleaved_heartbeats() {
         moved["payload"]["subject"],
         json!({"type":"task","id":"t-interleaved"})
     );
-    assert_eq!(moved["payload"]["actor"], "geo");
+    assert_eq!(moved["payload"]["actor"], "geoyws");
     assert_eq!(moved["payload"]["priorStatus"], "todo");
     assert_eq!(moved["payload"]["currentStatus"], "in_progress");
     assert!(watcher.finish().is_empty());
@@ -11026,7 +11026,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
             "--type",
             "epic",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -11043,7 +11043,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
             "--parent",
             "e-root",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -11058,7 +11058,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
             "--parent",
             "s-parent",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -11103,7 +11103,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
 
     fixture.ok_json(
         &fixture.main,
-        &["task", "remove", "t-removed", "--as", "geo", "--json"],
+        &["task", "remove", "t-removed", "--as", "geoyws", "--json"],
     );
     let removed = watcher.next_stdout_event_json(Duration::from_secs(10));
     assert_eq!(removed["type"], "event");
@@ -11118,7 +11118,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
 
     fixture.ok_json(
         &fixture.main,
-        &["task", "remove", "s-parent", "--as", "geo", "--json"],
+        &["task", "remove", "s-parent", "--as", "geoyws", "--json"],
     );
     let replay = fixture.run(
         &fixture.main,
@@ -11168,7 +11168,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
 
     let rule = fixture.ok_json(
         &fixture.main,
-        &["rule", "add", "Registry event", "--as", "geo", "--json"],
+        &["rule", "add", "Registry event", "--as", "geoyws", "--json"],
     );
     fixture.ok_json(
         &fixture.main,
@@ -11179,7 +11179,7 @@ fn watch_replays_removed_subjects_and_keeps_registry_semantics_separate() {
             "--body",
             "Updated registry event",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -11252,7 +11252,7 @@ fn watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits() {
     }
     fixture.ok_json(
         &fixture.main,
-        &["note", "t-one", "Backlog note", "--as", "geo", "--json"],
+        &["note", "t-one", "Backlog note", "--as", "geoyws", "--json"],
     );
     let board_path = board_path_for_project(&fixture, &fixture.main, "WATCH-BOUNDED");
     let expected_seqs = {
@@ -11965,7 +11965,7 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     let rule = session.ask(json!({
         "jsonrpc": "2.0", "id": 30, "method": "tools/call",
         "params": { "name": "rule_add", "arguments": {
-            "body": "MCP-created rule.", "board": ["MCP"], "as": "geo"
+            "body": "MCP-created rule.", "board": ["MCP"], "as": "geoyws"
         } }
     }));
     assert_eq!(rule["result"]["isError"], false, "{rule}");
@@ -11991,7 +11991,7 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
     // transport error: the refusal names the fix, and an agent needs to read it.
     let refused = session.ask(json!({
         "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-        "params": { "name": "task_move", "arguments": { "id": "t-wire", "status": "nonsense", "as": "geo" } }
+        "params": { "name": "task_move", "arguments": { "id": "t-wire", "status": "nonsense", "as": "geoyws" } }
     }));
     assert_eq!(refused["result"]["isError"], true);
     assert!(
@@ -12440,7 +12440,7 @@ fn handoff_history_survives_the_task_it_was_about() {
 
     fixture.ok_json(
         &fixture.main,
-        &["task", "remove", "t-1", "--as", "geo", "--force", "--json"],
+        &["task", "remove", "t-1", "--as", "geoyws", "--force", "--json"],
     );
 
     let after = fixture.ok_json(&fixture.main, &["handoff", "list", "--json"]);
@@ -12474,7 +12474,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         &["task", "add", "Work", "--id", "t-1", "--json"],
     );
     for tag in ["infra", "ui"] {
-        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geoyws", "--json"]);
     }
 
     let blocking = fixture.ok_json(
@@ -12664,7 +12664,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         ],
     );
     assert!(!unauthorized.status.success());
-    assert!(String::from_utf8_lossy(&unauthorized.stderr).contains("only geo"));
+    assert!(String::from_utf8_lossy(&unauthorized.stderr).contains("only geoyws"));
     let missing_note = fixture.run(
         &fixture.main,
         &[
@@ -12672,7 +12672,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "resolve",
             approval["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -12687,14 +12687,14 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "resolve",
             approval["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "approved and pushed",
             "--json",
         ],
     );
     assert_eq!(settled["status"], "resolved");
-    assert_eq!(settled["resolvedBy"], "geo");
+    assert_eq!(settled["resolvedBy"], "geoyws");
     assert_eq!(settled["resolution"], "approved and pushed");
     assert!(!settled["resolvedAt"].is_null());
 
@@ -12712,7 +12712,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         ],
     );
     assert!(!wrong_reopener.status.success());
-    assert!(String::from_utf8_lossy(&wrong_reopener.stderr).contains("only geo"));
+    assert!(String::from_utf8_lossy(&wrong_reopener.stderr).contains("only geoyws"));
     let reopened = fixture.ok_json(
         &fixture.main,
         &[
@@ -12720,17 +12720,17 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "reopen",
             approval["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "The wrong item was resolved.",
             "--json",
         ],
     );
     assert_eq!(reopened["status"], "open");
-    assert_eq!(reopened["resolvedBy"], "geo");
+    assert_eq!(reopened["resolvedBy"], "geoyws");
     assert_eq!(reopened["resolution"], "approved and pushed");
     assert!(!reopened["reopenedAt"].is_null());
-    assert_eq!(reopened["reopenedBy"], "geo");
+    assert_eq!(reopened["reopenedBy"], "geoyws");
     let settled = fixture.ok_json(
         &fixture.main,
         &[
@@ -12738,7 +12738,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "resolve",
             approval["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "Approved after reopening the mistaken transition.",
             "--json",
@@ -12796,7 +12796,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         ],
     );
     assert!(!again.status.success(), "a settled item was re-settled");
-    assert!(String::from_utf8_lossy(&again.stderr).contains("already resolved by geo"));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already resolved by geoyws"));
 
     // The operator sees the count without having to ask for it.
     let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
@@ -12818,7 +12818,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     // An item about a removed task keeps its text, like a handoff does.
     fixture.ok_json(
         &fixture.main,
-        &["task", "remove", "t-1", "--as", "geo", "--force", "--json"],
+        &["task", "remove", "t-1", "--as", "geoyws", "--force", "--json"],
     );
     let orphaned = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
     let survivor = orphaned
@@ -12842,7 +12842,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "resolve",
             blocking["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "Settled before simulating the v16 migration boundary.",
             "--json",
@@ -12868,6 +12868,98 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
         23
     );
+}
+
+#[test]
+fn the_operator_actor_is_geoyws_and_geo_is_not_an_alias() {
+    // George, 2026-09-05: "make sure that I'm geoyws and not geo so it's less
+    // ambiguous." `geo` is retired outright, not kept as a second spelling.
+    let fixture = Fixture::new("operator-actor");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OPERATOR", "--json"]);
+    let raise = |body: &str| {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--as",
+                "someone@lane",
+                "--kind",
+                "decision",
+                "--json",
+            ],
+        )
+    };
+
+    // The retired spelling is refused exactly like any other non-raiser, and
+    // the refusal names the actor that would have been accepted.
+    let retired = raise("the old spelling must not slip through");
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            retired["id"].as_str().unwrap(),
+            "--as",
+            "geo",
+            "--note",
+            "Approved.",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "`--as geo` resolved an item raised by someone else"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("only geoyws or that same raiser may resolve it"),
+        "{stderr}"
+    );
+    let still_open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert!(still_open
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == retired["id"]));
+
+    let operator = raise("needs the operator");
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            operator["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--note",
+            "Approved.",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["resolvedBy"], "geoyws");
+
+    // The raiser settling its own row is unchanged by the rename.
+    let own = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            retired["id"].as_str().unwrap(),
+            "--as",
+            "someone@lane",
+            "--note",
+            "Withdrawn by the raiser.",
+            "--json",
+        ],
+    );
+    assert_eq!(own["status"], "resolved");
+    assert_eq!(own["resolvedBy"], "someone@lane");
 }
 
 #[test]
@@ -12961,7 +13053,7 @@ fn a_listing_can_be_narrowed_to_a_lane_and_projected_to_the_keys_asked_for() {
             .to_owned()
     };
     let by_raiser = raise("raiser route", "worker@driver-2", None);
-    let by_task = raise("task route", "geo", Some("t-two-a"));
+    let by_task = raise("task route", "geoyws", Some("t-two-a"));
     raise("elsewhere", "worker@driver-3", Some("t-three"));
     let attention = fixture.ok_json(
         &fixture.main,
@@ -13145,7 +13237,7 @@ fn a_draft_task_is_not_offered_as_work_until_it_is_promoted() {
     // Promoting it is an ordinary move, and then it is work like any other.
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "t-draft", "todo", "--as", "geo", "--json"],
+        &["task", "move", "t-draft", "todo", "--as", "geoyws", "--json"],
     );
     assert_eq!(
         fixture.ok_json(
@@ -13212,7 +13304,7 @@ fn the_draft_migration_preserves_the_table_it_rebuilds() {
 
     let refused = fixture.run(
         &fixture.main,
-        &["task", "remove", "e-1", "--as", "geo", "--force", "--json"],
+        &["task", "remove", "e-1", "--as", "geoyws", "--force", "--json"],
     );
     assert!(
         !refused.status.success(),
@@ -13511,7 +13603,7 @@ fn a_plan_is_an_epic_whose_body_survives_being_revised() {
             "update",
             "e-plan",
             "--as",
-            "geo",
+            "geoyws",
             "--body-file",
             plan_file.to_str().unwrap(),
             "--json",
@@ -13547,7 +13639,7 @@ fn a_plan_is_an_epic_whose_body_survives_being_revised() {
             "update",
             "e-plan",
             "--as",
-            "geo",
+            "geoyws",
             "--title",
             "Q4 migration programme",
             "--json",
@@ -13873,7 +13965,7 @@ fn work_under_an_unopened_plan_is_not_handed_to_a_driver() {
     // Opening the plan makes its work available to any driver.
     fixture.ok_json(
         &fixture.main,
-        &["task", "move", "e-plan", "todo", "--as", "geo", "--json"],
+        &["task", "move", "e-plan", "todo", "--as", "geoyws", "--json"],
     );
     let claimed = fixture.ok_json(
         &fixture.main,
@@ -13933,13 +14025,13 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "--description",
             "hosts, containers, deploys",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     assert_eq!(registered["name"], "infra");
     assert_eq!(registered["description"], "hosts, containers, deploys");
-    assert_eq!(registered["createdBy"], "geo");
+    assert_eq!(registered["createdBy"], "geoyws");
     assert_eq!(registered["uses"], 0);
 
     // Registering the same concept twice is the collision the file exists to
@@ -14029,7 +14121,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     let typo = fixture.run(
         &fixture.main,
         &[
-            "task", "update", "t-chat", "--tag", "askiee", "--as", "geo", "--json",
+            "task", "update", "t-chat", "--tag", "askiee", "--as", "geoyws", "--json",
         ],
     );
     assert!(!typo.status.success(), "an unregistered tag was attached");
@@ -14095,7 +14187,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
             "infra",
             "--clear-tags",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -14112,7 +14204,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     let replaced = fixture.ok_json(
         &fixture.main,
         &[
-            "task", "update", "e-plan", "--tag", "infra", "--as", "geo", "--json",
+            "task", "update", "e-plan", "--tag", "infra", "--as", "geoyws", "--json",
         ],
     );
     assert_eq!(
@@ -14133,7 +14225,7 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "tag", "remove", "queuer", "--force", "--as", "geo", "--json",
+            "tag", "remove", "queuer", "--force", "--as", "geoyws", "--json",
         ],
     );
     assert_eq!(
@@ -14370,13 +14462,13 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "--root",
             &retired_root,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     assert_eq!(detached["rootPath"], retired_root);
     assert_eq!(detached["archived"], true);
-    assert_eq!(detached["archivedBy"], "geo");
+    assert_eq!(detached["archivedBy"], "geoyws");
     assert!(detached["archivedAt"].as_i64().is_some());
     let lifecycle = fixture.ok_json(
         &fixture.root,
@@ -14388,7 +14480,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "--json",
         ],
     );
-    assert_eq!(lifecycle[0]["actor"], "geo");
+    assert_eq!(lifecycle[0]["actor"], "geoyws");
     assert_eq!(lifecycle[0]["payload"]["rootPath"], retired_root);
 
     let active = fixture.ok_json(&fixture.root, &["workspace", "list", "--json"]);
@@ -14438,13 +14530,13 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "--root",
             &project_root,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     assert_eq!(detached_root["rootPath"], project_root);
     assert_eq!(detached_root["archived"], true);
-    assert_eq!(detached_root["archivedBy"], "geo");
+    assert_eq!(detached_root["archivedBy"], "geoyws");
     let doctor = fixture.ok_json(&fixture.root, &["doctor", "--json"]);
     let detached_project = doctor["projects"]
         .as_array()
@@ -14491,7 +14583,7 @@ fn an_intentionally_retired_worktree_leaves_auditable_registry_history() {
             "--root",
             &retired_root,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -14589,7 +14681,7 @@ fn workspace_adopt_copies_a_source_board_from_another_registry_and_preserves_it(
             "--workspace",
             adopt_root.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -14721,7 +14813,7 @@ fn workspace_adopt_copies_a_source_board_from_another_registry_and_preserves_it(
         &fixture.main,
         &["events", "--registry", "--kind", "board_adopted", "--json"],
     );
-    assert_eq!(events[0]["actor"], "geo");
+    assert_eq!(events[0]["actor"], "geoyws");
     assert_eq!(events[0]["payload"]["name"], "Alpha");
     assert_eq!(events[0]["payload"]["rootPath"], adopt_root.as_str());
     assert_eq!(
@@ -14811,7 +14903,7 @@ fn workspace_adopt_missing_or_invalid_source_creates_no_live_registry_state() {
                 "Alpha",
                 "--rootless",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         );
@@ -14891,7 +14983,7 @@ fn workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_c
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ])
         .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
@@ -14911,7 +15003,7 @@ fn workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_c
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -14967,7 +15059,7 @@ fn workspace_adopt_handles_helper_fd_collisions_and_cloexec() {
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15000,7 +15092,7 @@ fn workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held() {
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ])
         .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
@@ -15019,7 +15111,7 @@ fn workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held() {
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15065,7 +15157,7 @@ fn workspace_adopt_recovers_after_publishing_before_commit() {
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ])
         .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_publish");
@@ -15122,7 +15214,7 @@ fn release_binary_ignores_workspace_adopt_pause_hook() {
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ])
         .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
@@ -15171,7 +15263,7 @@ fn workspace_adopt_rejects_boards_symlink_without_external_write_lock_or_event()
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15277,7 +15369,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
                 "Alpha",
                 "--rootless",
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         );
@@ -15328,7 +15420,7 @@ fn workspace_adopt_rejects_a_duplicate_active_board_name_across_processes() {
             "Alpha",
             "--rootless",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15512,7 +15604,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "add",
             "Never render <b>rules</b> without escaping.\n\nThe full body is visible.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15525,7 +15617,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--tag",
             "infra",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15536,7 +15628,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "add",
             "Global <em>rule</em> inherited everywhere.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15549,7 +15641,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--board",
             "OTHER",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15562,7 +15654,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--except-board",
             "SERVED",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15573,7 +15665,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "add",
             "RETIRED RULE MUST NOT RENDER",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -15584,7 +15676,7 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "retire",
             retired_rule["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -16032,7 +16124,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--status",
             "todo",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -16048,7 +16140,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--kind",
             "decision",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -16121,7 +16213,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--status",
             "todo",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -16137,7 +16229,7 @@ fn seed_actor_header_fixture(fixture: &Fixture, board: &str) -> ActorHeaderFixtu
             "--kind",
             "decision",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -16376,11 +16468,11 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
         .unwrap();
     assert!(
         !unauthorized_cli.status.success(),
-        "CLI resolve by non-geo/non-raiser actor was accepted"
+        "CLI resolve by non-geoyws/non-raiser actor was accepted"
     );
     let stderr = String::from_utf8_lossy(&unauthorized_cli.stderr);
     assert!(
-        stderr.contains("only geo or that same raiser may resolve"),
+        stderr.contains("only geoyws or that same raiser may resolve"),
         "{stderr}"
     );
 }
@@ -16401,7 +16493,7 @@ fn serve_actor_header_defaults_to_geo_when_flag_is_absent() {
         b"decision=approve&reply=done",
     );
     assert_eq!(status, 303, "{response}");
-    assert_attention_resolution(&fixture, board, &seeded.default_task_id, "geo");
+    assert_attention_resolution(&fixture, board, &seeded.default_task_id, "geoyws");
 }
 
 #[test]
@@ -16849,7 +16941,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         &fixture.main,
         &["attention", "list", "--status", "resolved", "--json"],
     );
-    assert_eq!(resolved[0]["resolvedBy"], "geo");
+    assert_eq!(resolved[0]["resolvedBy"], "geoyws");
     assert_eq!(
         resolved[0]["resolution"],
         "Decision: Approved. Proceed.\nComment: Approved. Proceed after the backup."
@@ -17082,7 +17174,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
         &["attention", "list", "--status", "resolved", "--json"],
     );
     assert_eq!(resolved.as_array().unwrap().len(), 1);
-    assert_eq!(resolved[0]["resolvedBy"], "geo");
+    assert_eq!(resolved[0]["resolvedBy"], "geoyws");
     assert_eq!(
         resolved[0]["resolution"],
         "Decision: Approved. Proceed.\nComment: Approved. Proceed after the review."
@@ -17520,12 +17612,12 @@ fn rules_have_an_ordered_audited_retire_only_lifecycle() {
             "add",
             "Never touch the PX database layer.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     assert!(first["id"].as_str().unwrap().starts_with("r-"));
-    assert_eq!(first["author"], "geo");
+    assert_eq!(first["author"], "geoyws");
     assert_eq!(first["archived"], false);
 
     let body_file = fixture.root.join("rule.md");
@@ -17563,7 +17655,7 @@ fn rules_have_an_ordered_audited_retire_only_lifecycle() {
             "--body",
             "Never alter the PX database layer.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -17589,7 +17681,7 @@ fn rules_have_an_ordered_audited_retire_only_lifecycle() {
 
     fixture.ok_json(
         &fixture.main,
-        &["rule", "retire", first_id, "--as", "geo", "--json"],
+        &["rule", "retire", first_id, "--as", "geoyws", "--json"],
     );
     let active = fixture.ok_json(&fixture.main, &["rule", "list", "--json"]);
     assert_eq!(active.as_array().unwrap().len(), 1);
@@ -17609,7 +17701,7 @@ fn rules_have_an_ordered_audited_retire_only_lifecycle() {
     );
 
     for args in [
-        vec!["rule", "add", "", "--as", "geo", "--json"],
+        vec!["rule", "add", "", "--as", "geoyws", "--json"],
         vec!["rule", "add", "valid", "--as", "", "--json"],
     ] {
         let refused = fixture.run(&fixture.main, &args);
@@ -17627,7 +17719,7 @@ fn rules_have_an_ordered_audited_retire_only_lifecycle() {
             "--body",
             "flagged",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -17659,7 +17751,7 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
             "add",
             "Never touch the PX database layer.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -17669,7 +17761,7 @@ fn active_rule_summaries_frame_context_and_new_claims_without_leaking_into_get_c
     );
     let long = fixture.ok_json(
         &fixture.main,
-        &["rule", "add", "--body", &long_body, "--as", "geo", "--json"],
+        &["rule", "add", "--body", &long_body, "--as", "geoyws", "--json"],
     );
 
     let claim = fixture.ok_json(
@@ -17740,10 +17832,10 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
     fixture.ok_json(&second, &["init", "--name", "RULE-TAGS-TWO", "--json"]);
     fixture.ok_json(&third, &["init", "--name", "RULE-TAGS-THREE", "--json"]);
     for tag in ["infra", "queuer"] {
-        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geo", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", tag, "--as", "geoyws", "--json"]);
     }
     for cwd in [&fixture.main, &second, &third] {
-        fixture.ok_json(cwd, &["tag", "add", "shared", "--as", "geo", "--json"]);
+        fixture.ok_json(cwd, &["tag", "add", "shared", "--as", "geoyws", "--json"]);
     }
 
     let scoped = fixture.ok_json(
@@ -17753,7 +17845,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "add",
             "Only tagged task context.",
             "--as",
-            "geo",
+            "geoyws",
             "--tag",
             "queuer",
             "--tag",
@@ -17770,7 +17862,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "add",
             "Cross-board selector.",
             "--as",
-            "geo",
+            "geoyws",
             "--board",
             "RULE-TAGS-ONE",
             "--board",
@@ -17790,7 +17882,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
         "add",
         "Unknown project tag.",
         "--as",
-        "geo",
+        "geoyws",
         "--tag",
         "missing",
         "--json",
@@ -17946,7 +18038,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
 
     let remove_in_use = fixture.run(
         &fixture.main,
-        &["tag", "remove", "infra", "--as", "geo", "--force", "--json"],
+        &["tag", "remove", "infra", "--as", "geoyws", "--force", "--json"],
     );
     assert!(
         !remove_in_use.status.success(),
@@ -17965,7 +18057,7 @@ fn compiled_binary_matches_task_scoped_rules_across_boards() {
             "update",
             scoped["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--clear-tags",
             "--json",
         ],
@@ -18020,7 +18112,7 @@ fn registry_rejects_duplicate_names_before_creating_a_new_board() {
             "--root",
             omega_root_str.as_str(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18084,7 +18176,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
              created_at INTEGER NOT NULL
             ) STRICT;
             CREATE INDEX idx_global_rule_events_rule_seq ON global_rule_events(rule_id,seq);
-            INSERT INTO global_rules VALUES('g-old','Existing global rule.','geo',0,1,1);
+            INSERT INTO global_rules VALUES('g-old','Existing global rule.','geoyws',0,1,1);
             PRAGMA user_version=3;
             "#,
         )
@@ -18414,7 +18506,7 @@ fn registry_rejects_last_root_detach_for_legacy_duplicate_names() {
             "--root",
             &omega_left_root,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18439,7 +18531,7 @@ fn registry_rejects_last_root_detach_for_legacy_duplicate_names() {
             "--root",
             &sigma_root_path,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18466,7 +18558,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     fixture.ok_json(&second, &["init", "--name", "TWO", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "infra", "--as", "geo", "--json"],
+        &["tag", "add", "infra", "--as", "geoyws", "--json"],
     );
     let registry = Connection::open(fixture.data.join("registry.db")).unwrap();
     let board_path = |name: &str| {
@@ -18483,14 +18575,14 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     registry
         .execute(
             "INSERT INTO global_rules(id,body,author,archived,created_at,updated_at,board_tags,task_tags) \
-             VALUES('g-late','Late rolling-upgrade rule.','geo',0,3,3,'[\"ALL\"]','[\"infra\"]')",
+             VALUES('g-late','Late rolling-upgrade rule.','geoyws',0,3,3,'[\"ALL\"]','[\"infra\"]')",
             [],
         )
         .unwrap();
     registry
         .execute(
             "INSERT INTO global_rule_events(rule_id,kind,actor,payload,created_at) \
-             VALUES('g-late','global_rule_added','geo','{\"ruleID\":\"g-late\"}',3)",
+             VALUES('g-late','global_rule_added','geoyws','{\"ruleID\":\"g-late\"}',3)",
             [],
         )
         .unwrap();
@@ -18498,14 +18590,14 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
     Connection::open(&one_path)
         .unwrap()
         .execute(
-            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-one','ONE infrastructure rule.','geo',0,1,1,'[\"infra\"]')",
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-one','ONE infrastructure rule.','geoyws',0,1,1,'[\"infra\"]')",
             [],
         )
         .unwrap();
     Connection::open(&two_path)
         .unwrap()
         .execute(
-            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-two','TWO board rule.','geo',0,2,2,'[]')",
+            "INSERT INTO rules(id,body,author,archived,created_at,updated_at,task_tags) VALUES('r-legacy-two','TWO board rule.','geoyws',0,2,2,'[]')",
             [],
         )
         .unwrap();
@@ -18514,7 +18606,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
 
     let first = fixture.ok_json(
         &fixture.root,
-        &["rule", "consolidate", "--as", "geo", "--json"],
+        &["rule", "consolidate", "--as", "geoyws", "--json"],
     );
     assert_eq!(first["boardsMigrated"], 2);
     assert_eq!(first["rulesImported"], 2);
@@ -18572,7 +18664,7 @@ fn compiled_binary_consolidates_board_rules_once_and_retires_the_sources() {
 
     let second_run = fixture.ok_json(
         &fixture.root,
-        &["rule", "consolidate", "--as", "geo", "--json"],
+        &["rule", "consolidate", "--as", "geoyws", "--json"],
     );
     assert_eq!(second_run["boardsAlreadyMigrated"], 2);
     assert_eq!(second_run["legacyRegistryAlreadyMigrated"], true);
@@ -18595,7 +18687,7 @@ fn unified_rules_are_stored_once_and_frame_every_board_claim_and_context() {
             "add",
             "Never store credentials in Kanban.\n\nKeep secrets in git-crypt.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18611,7 +18703,7 @@ fn unified_rules_are_stored_once_and_frame_every_board_claim_and_context() {
         fixture.ok_json(
             cwd,
             &[
-                "rule", "add", local, "--board", board, "--as", "geo", "--json",
+                "rule", "add", local, "--board", board, "--as", "geoyws", "--json",
             ],
         );
         let claim = fixture.ok_json(cwd, &["claim", task, "--as", "worker", "--json"]);
@@ -18654,7 +18746,7 @@ fn unified_rules_are_stored_once_and_frame_every_board_claim_and_context() {
             "--body",
             "Never store secrets in Kanban.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18668,7 +18760,7 @@ fn unified_rules_are_stored_once_and_frame_every_board_claim_and_context() {
 
     fixture.ok_json(
         &fixture.main,
-        &["rule", "retire", global_id, "--as", "geo", "--json"],
+        &["rule", "retire", global_id, "--as", "geoyws", "--json"],
     );
     let active = fixture.ok_json(&fixture.main, &["rule", "list", "--json"]);
     assert_eq!(active.as_array().unwrap().len(), 2);
@@ -18705,7 +18797,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
 
     let all = fixture.ok_json(
         &fixture.main,
-        &["rule", "add", "Every board.", "--as", "geo", "--json"],
+        &["rule", "add", "Every board.", "--as", "geoyws", "--json"],
     );
     let only = fixture.ok_json(
         &fixture.main,
@@ -18718,7 +18810,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "--board",
             "TWO",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18731,7 +18823,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "--except-board",
             "ONE",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18774,7 +18866,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
     let retargeted = fixture.ok_json(
         &fixture.main,
         &[
-            "rule", "update", only_id, "--board", "THREE", "--as", "geo", "--json",
+            "rule", "update", only_id, "--board", "THREE", "--as", "geoyws", "--json",
         ],
     );
     assert_eq!(retargeted["body"], "Only one and two.");
@@ -18788,7 +18880,16 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
 
     for args in [
         vec![
-            "rule", "add", "Bad mix.", "--board", "ALL", "--board", "ONE", "--as", "geo", "--json",
+            "rule",
+            "add",
+            "Bad mix.",
+            "--board",
+            "ALL",
+            "--board",
+            "ONE",
+            "--as",
+            "geoyws",
+            "--json",
         ],
         vec![
             "rule",
@@ -18799,7 +18900,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "--except-board",
             "TWO",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
         vec![
@@ -18809,7 +18910,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "--board",
             "MISSING",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
         vec![
@@ -18818,7 +18919,7 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "Legacy scope.",
             "--global",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     ] {
@@ -18838,11 +18939,11 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
     source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
     source.ok_json(
         &source.main,
-        &["tag", "add", "alpha", "--as", "geo", "--json"],
+        &["tag", "add", "alpha", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
-        &["tag", "add", "beta", "--as", "geo", "--json"],
+        &["tag", "add", "beta", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
@@ -18855,7 +18956,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "--tag",
             "alpha",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18870,7 +18971,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "--tag",
             "beta",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18887,7 +18988,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "--board",
             "BETA",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             bundle_path.to_str().unwrap(),
             "--json",
@@ -18899,7 +19000,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
 
     let bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
     assert_eq!(bundle["formatVersion"], 1);
-    assert_eq!(bundle["exportedBy"], "geo");
+    assert_eq!(bundle["exportedBy"], "geoyws");
     assert_eq!(bundle["sourceBoards"], json!(["ALPHA", "BETA"]));
     assert_eq!(bundle["rules"].as_array().unwrap().len(), 2);
     assert_eq!(
@@ -18921,7 +19022,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "import",
             bundle_path.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18964,7 +19065,7 @@ fn compiled_binary_exports_and_imports_allowlisted_rules_without_mutating_source
             "import",
             bundle_path.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -18989,11 +19090,11 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
     source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
     source.ok_json(
         &source.main,
-        &["tag", "add", "alpha", "--as", "geo", "--json"],
+        &["tag", "add", "alpha", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
-        &["tag", "add", "beta", "--as", "geo", "--json"],
+        &["tag", "add", "beta", "--as", "geoyws", "--json"],
     );
     source.ok_json(
         &source.main,
@@ -19006,7 +19107,7 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
             "--tag",
             "alpha",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19021,7 +19122,7 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
             "--tag",
             "beta",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19036,7 +19137,7 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
             "--board",
             "BETA",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             bundle_path.to_str().unwrap(),
             "--json",
@@ -19059,7 +19160,7 @@ fn compiled_binary_refuses_rule_import_when_a_bundle_item_source_registry_uuid_d
             "import",
             bundle_path.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19112,7 +19213,7 @@ fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board(
             "--board",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19125,7 +19226,7 @@ fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board(
             "--board",
             "BETA",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19140,7 +19241,7 @@ fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board(
             "--board",
             "BETA",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             bundle_path.to_str().unwrap(),
             "--json",
@@ -19156,7 +19257,7 @@ fn compiled_binary_refuses_rule_import_when_destination_lacks_an_exported_board(
             "import",
             bundle_path.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19195,7 +19296,7 @@ fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import
             "--board",
             "px",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19208,7 +19309,7 @@ fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import
             "--board",
             "px",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             bundle_path.to_str().unwrap(),
             "--json",
@@ -19227,7 +19328,7 @@ fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import
                 "--board",
                 board,
                 "--as",
-                "geo",
+                "geoyws",
                 "--json",
             ],
         );
@@ -19259,7 +19360,7 @@ fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import
             "import",
             bundle_path.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19307,7 +19408,7 @@ fn compiled_binary_refuses_refingerprinted_import_whose_only_selector_targets_an
             "--board",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19321,7 +19422,7 @@ fn compiled_binary_refuses_refingerprinted_import_whose_only_selector_targets_an
             "--board",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             bundle_path.to_str().unwrap(),
             "--json",
@@ -19366,7 +19467,7 @@ fn compiled_binary_refuses_refingerprinted_import_whose_only_selector_targets_an
             "import",
             bundle_path.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19436,7 +19537,7 @@ fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() 
             "--board",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -19452,7 +19553,7 @@ fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() 
             "--board",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             duplicate_bundle.to_str().unwrap(),
             "--json",
@@ -19474,7 +19575,7 @@ fn compiled_binary_refuses_duplicate_rule_export_selectors_and_missing_boards() 
             "--board",
             "MISSING",
             "--as",
-            "geo",
+            "geoyws",
             "--output",
             missing_bundle.to_str().unwrap(),
             "--json",
@@ -20985,7 +21086,7 @@ fn compiled_binary_archives_settled_history_without_deleting_it() {
             "--id",
             "t-old",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21048,7 +21149,7 @@ fn compiled_binary_archives_settled_history_without_deleting_it() {
             "resolve",
             attention["id"].as_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "accepted",
             "--json",
@@ -21438,7 +21539,7 @@ fn compiled_binary_lists_retired_rootless_boards_once_in_workspace_list_all() {
             "retire",
             "ROOTLESS",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "retire rootless board",
             "--json",
@@ -21476,7 +21577,7 @@ fn compiled_binary_lists_retired_rootless_boards_once_in_workspace_list_all() {
 
     let restored = fixture.ok_json(
         &fixture.root,
-        &["workspace", "unretire", "ROOTLESS", "--as", "geo", "--json"],
+        &["workspace", "unretire", "ROOTLESS", "--as", "geoyws", "--json"],
     );
     assert_eq!(restored["archived"], false);
     assert!(
@@ -21516,7 +21617,7 @@ fn compiled_binary_keeps_rootless_retired_boards_visible_after_previous_detach_h
             "--root",
             &root_path,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21527,7 +21628,7 @@ fn compiled_binary_keeps_rootless_retired_boards_visible_after_previous_detach_h
             "retire",
             "ROOTLESS-HISTORY",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "retire after detach",
             "--json",
@@ -21584,7 +21685,7 @@ fn compiled_binary_keeps_same_name_retired_boards_distinct_by_path() {
             "retire",
             "SAME",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "retire first same-name board",
             "--json",
@@ -21600,7 +21701,7 @@ fn compiled_binary_keeps_same_name_retired_boards_distinct_by_path() {
             "retire",
             "SAME",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "retire second same-name board",
             "--json",
@@ -21651,7 +21752,7 @@ fn the_mcp_server_rejects_retired_direct_board_paths_over_stdio() {
             "retire",
             "RETIRED",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "retire MCP board",
             "--json",
@@ -21692,7 +21793,7 @@ fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
             "--board",
             "px",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21705,7 +21806,7 @@ fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
             "--except-board",
             "px",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21718,7 +21819,7 @@ fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
             "--board",
             "kanban",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21734,7 +21835,7 @@ fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
             "retire",
             "px",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "split host registries",
             "--json",
@@ -21785,7 +21886,7 @@ fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
     for id in [only_id, except_id] {
         fixture.ok_json(
             &fixture.root,
-            &["rule", "retire", id, "--as", "geo", "--json"],
+            &["rule", "retire", id, "--as", "geoyws", "--json"],
         );
     }
     let retired_board = fixture.ok_json(
@@ -21795,7 +21896,7 @@ fn hax_registry_requires_rule_retirement_before_retiring_a_named_board() {
             "retire",
             "px",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "split host registries",
             "--json",
@@ -21857,7 +21958,7 @@ fn doctor_reports_stale_active_selectors_without_blocking_rule_history() {
     fixture.ok_json(&fixture.main, &["init", "--name", "px", "--json"]);
     let rule = fixture.ok_json(
         &fixture.main,
-        &["rule", "add", "Recoverable rule.", "--as", "geo", "--json"],
+        &["rule", "add", "Recoverable rule.", "--as", "geoyws", "--json"],
     );
     let rule_id = rule["id"].as_str().unwrap();
     {
@@ -21906,7 +22007,7 @@ fn doctor_reports_stale_active_selectors_without_blocking_rule_history() {
             "--body",
             "An edit must not preserve a stale active selector.",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21926,7 +22027,7 @@ fn doctor_reports_stale_active_selectors_without_blocking_rule_history() {
 
     fixture.ok_json(
         &fixture.main,
-        &["rule", "retire", rule_id, "--as", "geo", "--json"],
+        &["rule", "retire", rule_id, "--as", "geoyws", "--json"],
     );
     let recovered = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(recovered["healthy"], true, "{recovered}");
@@ -21971,7 +22072,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
             "--root",
             alpha_spare.to_str().unwrap(),
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -21984,7 +22085,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
             "--id",
             "t-retired-77",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -22009,14 +22110,14 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
             "retire",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             retirement_note,
             "--json",
         ],
     );
     assert_eq!(retired["name"], "ALPHA");
-    assert_eq!(retired["archivedBy"], "geo");
+    assert_eq!(retired["archivedBy"], "geoyws");
     assert_eq!(retired["archivedNote"], retirement_note);
     assert_eq!(retired["workspaceRoots"], json!([alpha_root.clone()]));
     assert!(retired["archivedAt"].as_i64().is_some());
@@ -22161,7 +22262,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         .find(|row| row["boardPath"] == retired_path && row["rootPath"] == alpha_root)
         .expect("archived ALPHA retirement row");
     assert_eq!(retired_row["archived"], true);
-    assert_eq!(retired_row["archivedBy"], "geo");
+    assert_eq!(retired_row["archivedBy"], "geoyws");
     assert_eq!(retired_row["archivedNote"], retirement_note);
     assert_eq!(retired_row["rootless"], false);
 
@@ -22201,7 +22302,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         .find(|row| row["name"] == "ALPHA")
         .expect("archived ALPHA doctor row");
     assert_eq!(doctor_alpha["archived"], true);
-    assert_eq!(doctor_alpha["archivedBy"], "geo");
+    assert_eq!(doctor_alpha["archivedBy"], "geoyws");
     assert_eq!(doctor_alpha["archivedNote"], retirement_note);
 
     let search_default = fixture.ok_json(
@@ -22218,7 +22319,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
     );
     let rebuilt_default = fixture.ok_json(
         &fixture.root,
-        &["search-rebuild", "--all-boards", "--as", "geo", "--json"],
+        &["search-rebuild", "--all-boards", "--as", "geoyws", "--json"],
     );
     assert!(
         rebuilt_default["reports"]
@@ -22257,7 +22358,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
             "--project",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
@@ -22306,7 +22407,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
     );
     let conflict = fixture.run(
         &fixture.root,
-        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+        &["workspace", "unretire", "ALPHA", "--as", "geoyws", "--json"],
     );
     assert!(
         !conflict.status.success(),
@@ -22340,13 +22441,13 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
             "--root",
             &alpha_root,
             "--as",
-            "geo",
+            "geoyws",
             "--json",
         ],
     );
     let restored = fixture.ok_json(
         &fixture.root,
-        &["workspace", "unretire", "ALPHA", "--as", "geo", "--json"],
+        &["workspace", "unretire", "ALPHA", "--as", "geoyws", "--json"],
     );
     assert_eq!(restored["name"], "ALPHA");
     assert_eq!(restored["workspaceRoots"], json!([alpha_root.clone()]));
@@ -22392,7 +22493,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         ],
     );
     assert_eq!(retired_events.as_array().unwrap().len(), 1);
-    assert_eq!(retired_events[0]["actor"], "geo");
+    assert_eq!(retired_events[0]["actor"], "geoyws");
     assert!(
         !retired_events[0]["payload"]["retirementId"]
             .as_str()
@@ -22414,7 +22515,7 @@ fn retiring_and_unretiring_a_workspace_hides_it_by_default_and_rolls_back_confli
         ],
     );
     assert_eq!(unretired_events.as_array().unwrap().len(), 1);
-    assert_eq!(unretired_events[0]["actor"], "geo");
+    assert_eq!(unretired_events[0]["actor"], "geoyws");
     assert_eq!(
         retired_events[0]["payload"]["retirementId"],
         unretired_events[0]["payload"]["retirementId"]
@@ -22442,7 +22543,7 @@ fn retired_direct_db_refuses_when_registry_is_corrupt_or_stale_but_external_db_w
             "retire",
             "ALPHA",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "moved-to-hig",
             "--json",
@@ -22579,7 +22680,7 @@ fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
             "retire",
             "RETIRED",
             "--as",
-            "geo",
+            "geoyws",
             "--note",
             "retire served board",
             "--json",

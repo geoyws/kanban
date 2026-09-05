@@ -4065,11 +4065,11 @@ impl Store {
             );
         }
         if !trusted_edge
-            && authorization_actor != "geo"
+            && authorization_actor != OPERATOR_ACTOR
             && authorization_actor != existing.raised_by
         {
             bail!(
-                "attention {id} was raised by {}; only geo or that same raiser may resolve it — \
+                "attention {id} was raised by {}; only {OPERATOR_ACTOR} or that same raiser may resolve it — \
                  use attention update to correct it without closing George's queue",
                 existing.raised_by
             );
@@ -4124,9 +4124,9 @@ impl Store {
         if existing.status != "resolved" {
             bail!("attention {id} is already open; there is no resolution to reopen");
         }
-        if actor != "geo" && existing.resolved_by.as_deref() != Some(actor.as_str()) {
+        if actor != OPERATOR_ACTOR && existing.resolved_by.as_deref() != Some(actor.as_str()) {
             bail!(
-                "attention {id} was resolved by {}; only geo or that resolver may reopen it",
+                "attention {id} was resolved by {}; only {OPERATOR_ACTOR} or that resolver may reopen it",
                 existing.resolved_by.as_deref().unwrap_or("someone")
             );
         }
@@ -5376,7 +5376,7 @@ mod tests {
     #[test]
     fn trusted_edge_resolution_records_the_edge_actor_without_changing_cli_rules() {
         let mut store = test_store("trusted-edge-resolution");
-        store.initialize("TRUSTED", "geo").unwrap();
+        store.initialize("TRUSTED", "geoyws").unwrap();
         insert_task(&store, "t-web");
         insert_task(&store, "t-cli");
         insert_task(&store, "t-forbidden");
@@ -5385,7 +5385,7 @@ mod tests {
             .raise_attention(
                 "Resolve from the trusted edge.",
                 "decision",
-                "geo",
+                "geoyws",
                 Some("t-web"),
                 0,
                 &[],
@@ -5405,7 +5405,7 @@ mod tests {
             .raise_attention(
                 "Geo still owns this other one.",
                 "decision",
-                "geo",
+                "geoyws",
                 Some("t-forbidden"),
                 0,
                 &[],
@@ -5436,10 +5436,10 @@ mod tests {
 
         let forbidden = store
             .resolve_attention(&forbidden_attention.id, "ifca-sso", Some("not allowed"))
-            .expect_err("CLI resolve must still reject a non-geo, non-raiser actor")
+            .expect_err("CLI resolve must still reject a non-geoyws, non-raiser actor")
             .to_string();
         assert!(
-            forbidden.contains("only geo or that same raiser may resolve"),
+            forbidden.contains("only geoyws or that same raiser may resolve"),
             "{forbidden}"
         );
     }
@@ -8375,7 +8375,7 @@ mod tests {
     #[test]
     fn attention_lane_matches_the_raiser_suffix_or_the_task_lane() {
         let mut store = test_store("attention-lane");
-        store.initialize("LANES", "geo").unwrap();
+        store.initialize("LANES", "geoyws").unwrap();
         insert_lane_task(&store, "t-lane", Some("driver-2"));
         insert_lane_task(&store, "t-other", Some("driver-3"));
         let raise = |store: &mut Store, body: &str, raiser: &str, task: Option<&str>| {
@@ -8387,7 +8387,7 @@ mod tests {
         // Route one: the raiser is `<name>@driver-2`, about no task.
         let by_raiser = raise(&mut store, "raiser route", "worker@driver-2", None);
         // Route two: raised by someone else, about a task in driver-2.
-        let by_task = raise(&mut store, "task route", "geo", Some("t-lane"));
+        let by_task = raise(&mut store, "task route", "geoyws", Some("t-lane"));
         // Neither: the raiser's lane is another, and so is the task's.
         raise(&mut store, "elsewhere", "worker@driver-3", Some("t-other"));
         // `driver-2` is a suffix of `@driver-2` only after the `@`: a raiser

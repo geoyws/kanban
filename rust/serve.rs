@@ -28,7 +28,9 @@
 //! successful auth_request; same-origin still gates the POSTs and the header
 //! does not relax it.
 
-use crate::model::{Attention, DeploymentAttempt, ProjectRecord, SearchOptions, Sitrep, Task};
+use crate::model::{
+    Attention, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep, Task,
+};
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
 use crate::store::Store;
@@ -81,7 +83,7 @@ impl ServeConfig {
 
     fn actor_for_write(&self, request: &Request) -> Result<String> {
         match self.actor_header.as_deref() {
-            None => Ok("geo".to_owned()),
+            None => Ok(OPERATOR_ACTOR.to_owned()),
             Some(name) => configured_actor(request, name),
         }
     }
@@ -1334,7 +1336,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
             html.push_str(&format!(
                 "<form method=post action=\"/plan/{project_path}/{id_path}/open\">\
                  <button type=submit>Open plan</button></form>\
-                 <p class=cmd>Equivalent: <code>kb t mv {id} todo --as geo --project {project}</code></p>",
+                 <p class=cmd>Equivalent: <code>kb t mv {id} todo --as {OPERATOR_ACTOR} --project {project}</code></p>",
                 project_path = url_encode(&project.name),
                 id_path = url_encode(&plan.id),
                 id = escape(&plan.id),
@@ -1985,18 +1987,18 @@ mod tests {
         let mut registry = Registry::open().expect("open registry");
         let board_name = "SERVE-RENDER";
         let project = registry
-            .register(None, board_name, false, "geo")
+            .register(None, board_name, false, "geoyws")
             .expect("register rootless board");
         let board_path = PathBuf::from(&project.board_path);
         let mut store = Store::open(&board_path).expect("open store");
         store
-            .initialize(board_name, "geo")
+            .initialize(board_name, "geoyws")
             .expect("initialize board metadata");
         store
-            .add_tag("ops", Some("Operational work"), Some("geo"))
+            .add_tag("ops", Some("Operational work"), Some("geoyws"))
             .expect("register ops tag");
         store
-            .add_tag("release", Some("Release work"), Some("geo"))
+            .add_tag("release", Some("Release work"), Some("geoyws"))
             .expect("register release tag");
         let epic = store
             .add_task(AddTask {
@@ -2014,7 +2016,7 @@ mod tests {
                 priority: 0,
                 dependencies: vec![],
                 metadata: serde_json::json!({"workflowStatus": "planning"}),
-                actor: Some("geo".to_owned()),
+                actor: Some("geoyws".to_owned()),
                 tags: vec!["ops".to_owned()],
             })
             .expect("add epic");
@@ -2025,7 +2027,7 @@ mod tests {
                 parent_id: Some(epic.id.clone()),
                 title: "Ship <script>render</script>".to_owned(),
                 body: Some("Story body with <em>markup</em>".to_owned()),
-                assignee: Some("geo".to_owned()),
+                assignee: Some("geoyws".to_owned()),
                 lane: None,
                 deliverable: Some("Release package".to_owned()),
                 stale_minutes: None,
@@ -2034,7 +2036,7 @@ mod tests {
                 priority: 2,
                 dependencies: vec![],
                 metadata: serde_json::json!({}),
-                actor: Some("geo".to_owned()),
+                actor: Some("geoyws".to_owned()),
                 tags: vec!["release".to_owned()],
             })
             .expect("add story");
@@ -2045,7 +2047,7 @@ mod tests {
                 parent_id: Some(epic.id.clone()),
                 title: "Implement <i>escape</i>".to_owned(),
                 body: Some("Task body with & < >".to_owned()),
-                assignee: Some("geo".to_owned()),
+                assignee: Some("geoyws".to_owned()),
                 lane: Some("driver-2".to_owned()),
                 deliverable: None,
                 stale_minutes: Some(120),
@@ -2054,7 +2056,7 @@ mod tests {
                 priority: 1,
                 dependencies: vec![story.id.clone()],
                 metadata: serde_json::json!({"focus": "render"}),
-                actor: Some("geo".to_owned()),
+                actor: Some("geoyws".to_owned()),
                 tags: vec!["ops".to_owned(), "release".to_owned()],
             })
             .expect("add task");
@@ -2065,7 +2067,7 @@ mod tests {
                 parent_id: Some(epic.id.clone()),
                 title: "Completed <span>delivery</span>".to_owned(),
                 body: Some("Done body with <u>markup</u>".to_owned()),
-                assignee: Some("geo".to_owned()),
+                assignee: Some("geoyws".to_owned()),
                 lane: Some("driver-3".to_owned()),
                 deliverable: None,
                 stale_minutes: None,
@@ -2074,14 +2076,14 @@ mod tests {
                 priority: 3,
                 dependencies: vec![task.id.clone()],
                 metadata: serde_json::json!({"done": true}),
-                actor: Some("geo".to_owned()),
+                actor: Some("geoyws".to_owned()),
                 tags: vec!["release".to_owned()],
             })
             .expect("add done task");
         store
             .add_note(
                 &epic.id,
-                "geo",
+                "geoyws",
                 "decision",
                 "Keep the <script> tag escaped & readable.",
             )
@@ -2090,7 +2092,7 @@ mod tests {
             .raise_attention(
                 "Please review <strong>before release</strong>.",
                 "decision",
-                "geo",
+                "geoyws",
                 Some(&epic.id),
                 0,
                 &["ops".to_owned(), "release".to_owned()],
@@ -2127,7 +2129,7 @@ mod tests {
                 mechanism: Some("manual".to_owned()),
                 operation_id: Some("serve-op-current".to_owned()),
                 retry_of: None,
-                actor: "geo".to_owned(),
+                actor: "geoyws".to_owned(),
                 lane: Some("deploy".to_owned()),
             })
             .expect("start current deployment");
@@ -2140,7 +2142,7 @@ mod tests {
                 receipt: Some("served <release> successfully".to_owned()),
                 artifact_uri: Some("artifact://kanban/<render>".to_owned()),
                 served_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
-                actor: "geo".to_owned(),
+                actor: "geoyws".to_owned(),
             })
             .expect("finish current deployment");
         let failed_start = store
@@ -2156,7 +2158,7 @@ mod tests {
                 mechanism: Some("manual".to_owned()),
                 operation_id: Some("serve-op-failed".to_owned()),
                 retry_of: None,
-                actor: "geo".to_owned(),
+                actor: "geoyws".to_owned(),
                 lane: Some("deploy".to_owned()),
             })
             .expect("start failed deployment");
@@ -2169,7 +2171,7 @@ mod tests {
                 receipt: Some("build <failed> because the render check did not pass".to_owned()),
                 artifact_uri: None,
                 served_commit: None,
-                actor: "geo".to_owned(),
+                actor: "geoyws".to_owned(),
             })
             .expect("finish failed deployment");
         assert_eq!(attention.task_id.as_deref(), Some(epic.id.as_str()));
