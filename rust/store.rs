@@ -8197,7 +8197,13 @@ mod tests {
             .unwrap();
 
         store
-            .post_sitrep("driver", "A sitrep for the driver lane.", "test", Some("t-embed"), None)
+            .post_sitrep(
+                "driver",
+                "A sitrep for the driver lane.",
+                "test",
+                Some("t-embed"),
+                None,
+            )
             .unwrap();
 
         let health = store.search_health().unwrap();

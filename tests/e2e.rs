@@ -2274,8 +2274,7 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["projects"][0]["searchIndex"]["healthy"], true);
     assert_eq!(
-        doctor["projects"][0]["searchIndex"]["missingEmbeddings"],
-        0,
+        doctor["projects"][0]["searchIndex"]["missingEmbeddings"], 0,
         "a source mutation left its document unembedded; the incremental path must re-embed inline"
     );
 
@@ -2610,7 +2609,14 @@ fn doctor_flags_and_rebuild_repairs_a_search_index_without_embeddings() {
     );
     fixture.ok_json(
         &fixture.main,
-        &["note", "t-embed", "A note for the probe.", "--as", "tester", "--json"],
+        &[
+            "note",
+            "t-embed",
+            "A note for the probe.",
+            "--as",
+            "tester",
+            "--json",
+        ],
     );
     let claim = fixture.ok_json(
         &fixture.main,
@@ -2667,11 +2673,13 @@ fn doctor_flags_and_rebuild_repairs_a_search_index_without_embeddings() {
     let healthy = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(healthy["healthy"], true, "{healthy}");
     assert_eq!(
-        healthy["projects"][0]["searchIndex"]["missingEmbeddings"],
-        0,
+        healthy["projects"][0]["searchIndex"]["missingEmbeddings"], 0,
         "{healthy}"
     );
-    assert_eq!(healthy["projects"][0]["searchIndex"]["healthy"], true, "{healthy}");
+    assert_eq!(
+        healthy["projects"][0]["searchIndex"]["healthy"], true,
+        "{healthy}"
+    );
 
     // (b) Null out the vectors directly; doctor must refuse to call it healthy
     // and must name the gap and the rebuild command in the reason.
@@ -2716,13 +2724,11 @@ fn doctor_flags_and_rebuild_repairs_a_search_index_without_embeddings() {
     let rebuilt = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(rebuilt["healthy"], true, "{rebuilt}");
     assert_eq!(
-        rebuilt["projects"][0]["searchIndex"]["missingEmbeddings"],
-        0,
+        rebuilt["projects"][0]["searchIndex"]["missingEmbeddings"], 0,
         "{rebuilt}"
     );
     assert_eq!(
-        rebuilt["projects"][0]["searchIndex"]["healthy"],
-        true,
+        rebuilt["projects"][0]["searchIndex"]["healthy"], true,
         "{rebuilt}"
     );
 }
@@ -14659,10 +14665,7 @@ fn a_command_outside_a_repository_records_no_provenance() {
     let plain = fixture.root.join("plain");
     fs::create_dir_all(&plain).unwrap();
     fixture.ok_json(&plain, &["init", "--name", "NONE", "--json"]);
-    fixture.ok_json(
-        &plain,
-        &["task", "add", "Work", "--id", "t-1", "--json"],
-    );
+    fixture.ok_json(&plain, &["task", "add", "Work", "--id", "t-1", "--json"]);
 
     let claim = fixture.ok_json(&plain, &["claim", "t-1", "--as", "worker", "--json"]);
     assert!(claim["worktree"].is_null(), "provenance was invented");
@@ -14686,10 +14689,7 @@ fn a_provenance_write_outside_a_checkout_is_refused_and_flags_are_validated() {
     let plain = fixture.root.join("plain");
     fs::create_dir_all(&plain).unwrap();
     fixture.ok_json(&plain, &["init", "--name", "REFUSED", "--json"]);
-    fixture.ok_json(
-        &plain,
-        &["task", "add", "Work", "--id", "t-1", "--json"],
-    );
+    fixture.ok_json(&plain, &["task", "add", "Work", "--id", "t-1", "--json"]);
     let claim = fixture.ok_json(&plain, &["claim", "t-1", "--as", "worker", "--json"]);
     let token = claim["leaseToken"].as_str().unwrap().to_owned();
 
@@ -14709,15 +14709,42 @@ fn a_provenance_write_outside_a_checkout_is_refused_and_flags_are_validated() {
     };
 
     refuses_blank(&[
-        "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
-        "--intent", "i", "--next-action", "n", "--json",
+        "checkpoint",
+        "t-1",
+        "--lease",
+        &token,
+        "--as",
+        "worker",
+        "--summary",
+        "s",
+        "--intent",
+        "i",
+        "--next-action",
+        "n",
+        "--json",
     ]);
     refuses_blank(&[
-        "handoff", "create", "--as", "worker", "--summary", "s", "--intent", "i",
-        "--next-action", "n", "--json",
+        "handoff",
+        "create",
+        "--as",
+        "worker",
+        "--summary",
+        "s",
+        "--intent",
+        "i",
+        "--next-action",
+        "n",
+        "--json",
     ]);
     refuses_blank(&[
-        "sitrep", "post", "Where I stand", "--as", "worker", "--lane", "driver-2", "--json",
+        "sitrep",
+        "post",
+        "Where I stand",
+        "--as",
+        "worker",
+        "--lane",
+        "driver-2",
+        "--json",
     ]);
 
     // An explicit flag that smuggles garbage is refused by its shape, not
@@ -14726,12 +14753,33 @@ fn a_provenance_write_outside_a_checkout_is_refused_and_flags_are_validated() {
     let head_shape = fixture.run(
         &plain,
         &[
-            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
-            "--intent", "i", "--next-action", "n", "--repo", "/tmp/r", "--branch", "b",
-            "--head", "zzz", "--dirty", "clean", "--json",
+            "checkpoint",
+            "t-1",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--repo",
+            "/tmp/r",
+            "--branch",
+            "b",
+            "--head",
+            "zzz",
+            "--dirty",
+            "clean",
+            "--json",
         ],
     );
-    assert!(!head_shape.status.success(), "a non-hex --head was accepted");
+    assert!(
+        !head_shape.status.success(),
+        "a non-hex --head was accepted"
+    );
     assert!(
         String::from_utf8_lossy(&head_shape.stderr).contains("--head"),
         "the shape refusal must name --head: {}",
@@ -14741,12 +14789,33 @@ fn a_provenance_write_outside_a_checkout_is_refused_and_flags_are_validated() {
     let dirty_wording = fixture.run(
         &plain,
         &[
-            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
-            "--intent", "i", "--next-action", "n", "--repo", "/tmp/r", "--branch", "b",
-            "--head", "0123456789abcdef0123456789abcdef01234567", "--dirty", "3 files", "--json",
+            "checkpoint",
+            "t-1",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--repo",
+            "/tmp/r",
+            "--branch",
+            "b",
+            "--head",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--dirty",
+            "3 files",
+            "--json",
         ],
     );
-    assert!(!dirty_wording.status.success(), "a malformed --dirty was accepted");
+    assert!(
+        !dirty_wording.status.success(),
+        "a malformed --dirty was accepted"
+    );
     assert!(
         String::from_utf8_lossy(&dirty_wording.stderr).contains("--dirty"),
         "the wording refusal must name --dirty: {}",
@@ -14771,9 +14840,27 @@ fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
     let checkpoint = fixture.ok_json(
         &fixture.main,
         &[
-            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
-            "--intent", "i", "--next-action", "n", "--repo", "/tmp/example-repo",
-            "--branch", "feature-x", "--head", head, "--dirty", "2 files changed", "--json",
+            "checkpoint",
+            "t-1",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--repo",
+            "/tmp/example-repo",
+            "--branch",
+            "feature-x",
+            "--head",
+            head,
+            "--dirty",
+            "2 files changed",
+            "--json",
         ],
     );
     assert_eq!(checkpoint["repoPath"], "/tmp/example-repo");
@@ -14789,9 +14876,25 @@ fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
     fixture.ok_json(
         &fixture.main,
         &[
-            "handoff", "create", "--as", "worker", "--summary", "s", "--intent", "i",
-            "--next-action", "n", "--repo", "/tmp/example-repo", "--branch", "feature-x",
-            "--head", head, "--dirty", "2 files changed", "--json",
+            "handoff",
+            "create",
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--repo",
+            "/tmp/example-repo",
+            "--branch",
+            "feature-x",
+            "--head",
+            head,
+            "--dirty",
+            "2 files changed",
+            "--json",
         ],
     );
     let listed = fixture.ok_json(&fixture.main, &["handoff", "list", "--json"]);
@@ -14804,9 +14907,22 @@ fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
     let sitrep = fixture.ok_json(
         &fixture.main,
         &[
-            "sitrep", "post", "Where I stand", "--as", "worker", "--lane", "driver-2",
-            "--repo", "/tmp/example-repo", "--branch", "feature-x", "--head", head,
-            "--dirty", "2 files changed", "--json",
+            "sitrep",
+            "post",
+            "Where I stand",
+            "--as",
+            "worker",
+            "--lane",
+            "driver-2",
+            "--repo",
+            "/tmp/example-repo",
+            "--branch",
+            "feature-x",
+            "--head",
+            head,
+            "--dirty",
+            "2 files changed",
+            "--json",
         ],
     );
     assert_eq!(sitrep["worktree"], "/tmp/example-repo");
@@ -14833,13 +14949,27 @@ fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
         "git rev-parse HEAD failed: {}",
         String::from_utf8_lossy(&real_head.stderr)
     );
-    let real_head = String::from_utf8(real_head.stdout).unwrap().trim().to_owned();
+    let real_head = String::from_utf8(real_head.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
 
     let captured = fixture.ok_json(
         &fixture.main,
         &[
-            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
-            "--intent", "i", "--next-action", "n", "--json",
+            "checkpoint",
+            "t-1",
+            "--lease",
+            &token,
+            "--as",
+            "worker",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--json",
         ],
     );
     assert!(

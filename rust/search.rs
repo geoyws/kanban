@@ -645,7 +645,12 @@ fn embed_document(connection: &Connection, document: &Document) -> Result<()> {
     let vector = embed(&document_text(document));
     connection.execute(
         "UPDATE search_documents SET source_hash=?,embedding_model=?,embedding=? WHERE seq=?",
-        params![source_hash(document), EMBEDDING_MODEL, encode(&vector), document.seq],
+        params![
+            source_hash(document),
+            EMBEDDING_MODEL,
+            encode(&vector),
+            document.seq
+        ],
     )?;
     Ok(())
 }
