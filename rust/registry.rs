@@ -393,6 +393,21 @@ pub fn data_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/share/kanban"))
 }
 
+/// The canonical data root, ignoring the `KANBAN_DATA_DIR` scratch override.
+///
+/// `data_root()` honours `KANBAN_DATA_DIR`, which ADR-038 clause 9 names a
+/// *scratch* override for `direct` mode. Managed-enforcement detection must
+/// read the canonical location — the one the broker owns — not the caller's
+/// scratch, so a `KANBAN_DATA_DIR` redirection cannot make a `managed` estate
+/// look `direct`.
+pub(crate) fn canonical_data_root() -> Result<PathBuf> {
+    if let Some(value) = env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(value).join("kanban"));
+    }
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/share/kanban"))
+}
+
 pub(crate) fn prepare_live_root_for_adoption() -> Result<()> {
     pin_live_root_for_adoption().map(|_| ())
 }
