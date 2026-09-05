@@ -235,11 +235,16 @@ Aliases (the binary installs as both `kanban` and `kb`):
   t=task  s=story  h=handoff  w/ws=workspace  cp=checkpoint  hb=heartbeat
   ctx=context  ev=events  dash=dashboard  rel=release  n=note  r=rule  sr=sitrep  v=version
   att/attn=attention
-  task:      ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
-  story:     adv=advance
-  handoff:   ls=list  new=create  acc=accept
-  workspace: ls=list  att=attach  det=detach
-  rule:      ls=list  new=add  up=update  cat=show
+  task:          ls=list  mv=move  rm=remove  new=add  up=update  meta=metadata  cat=show
+  story:         adv=advance
+  handoff:       ls=list  new=create  acc=accept
+  workspace:     ls=list  att=attach  det=detach
+  attention:     ls=list  up=update  new=raise
+  tag:           ls=list  new=add  rm=remove
+  rule:          ls=list  new=add  up=update  cat=show
+  sitrep:        ls=list  new=post
+  deploy:        ls=list  cat=show
+  subscription:  ls=list  new=add  cat=show
              repeat --board NAME; --except-board NAME means ALL except that board
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
@@ -1591,45 +1596,91 @@ fn canonical_command(value: &str) -> &str {
     }
 }
 
+/// Each group's creating verb: the long subcommand `new` stands for.
+///
+/// A property of the group's vocabulary, not derivable from its command names:
+/// `task`, `tag` and `rule` call creating `add`, `handoff` calls it `create`,
+/// `sitrep` calls it `post`, and `attention` calls it `raise`. Groups whose
+/// creating verb is ambiguous — `deploy start` reads as beginning an operation
+/// rather than creating one, and `workspace attach`/`adopt` as moving a board
+/// rather than making one — are deliberately left out, so `new` stays an
+/// unknown subcommand there rather than guessing.
+const CREATING_VERBS: &[(&str, &str)] = &[
+    ("task", "add"),
+    ("handoff", "create"),
+    ("tag", "add"),
+    ("rule", "add"),
+    ("sitrep", "post"),
+    ("subscription", "add"),
+    ("attention", "raise"),
+];
+
+/// Mechanical subcommand shortforms, applied to every [`SUBCOMMAND_GROUPS`]
+/// entry that declares the long subcommand on [`COMMANDS`].
+///
+/// The lookup is what makes these compose: a group gains `ls` exactly when it
+/// declares `list`, so a group that adds a `list` later gets `ls` for free and
+/// a group whose surface already has `list` cannot silently lack it — the
+/// defect that left `attention ls` unknown while the hand-written match listed
+/// task, story, handoff, workspace, tag, rule, sitrep, deploy and subscription.
+const MECHANICAL_SUBS: &[(&str, &str)] = &[
+    ("ls", "list"),
+    ("up", "update"),
+    ("cat", "show"),
+    ("rm", "remove"),
+];
+
+/// Whether a command declares the given subcommand on the [`COMMANDS`] surface.
+fn has_subcommand(command: &str, sub: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|(name, expected, ..)| *name == command && *expected == Some(sub))
+}
+
 /// Short names for subcommands, scoped to their group so `ls` can mean the
 /// obvious thing under each without ever being ambiguous.
 ///
 /// Only applied to [`SUBCOMMAND_GROUPS`]: for `claim`, `note` or `checkpoint`
 /// the second positional is a task id, and a task genuinely called `rm` must
-/// not be rewritten.
+/// not be rewritten. That holds by construction here — [`has_subcommand`] only
+/// ever answers true for a command that declares the long subcommand, and
+/// `claim`/`note`/`checkpoint` declare none — so a task id is never rewritten.
+///
+/// The mechanical shortforms come from [`MECHANICAL_SUBS`] against [`COMMANDS`],
+/// `new` from [`CREATING_VERBS`], and only the idiosyncratic stems that neither
+/// table can derive are written down in the match below.
 fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
+    // Stems that are not derivable from the long subcommand's name.
     match (command, value) {
-        ("task", "ls") => "list",
-        ("task", "mv") => "move",
-        ("task", "rm") => "remove",
-        ("task", "new") => "add",
-        ("task", "up") => "update",
-        ("task", "meta") => "metadata",
-        ("task", "cat") => "show",
-        ("story", "adv") => "advance",
-        ("handoff", "ls") => "list",
-        ("handoff", "new") => "create",
-        ("handoff", "acc") => "accept",
-        ("workspace", "ls") => "list",
-        ("workspace", "att") => "attach",
-        ("workspace", "adopt") => "adopt",
-        ("workspace", "det") => "detach",
-        ("tag", "ls") => "list",
-        ("tag", "new") => "add",
-        ("tag", "rm") => "remove",
-        ("rule", "ls") => "list",
-        ("rule", "new") => "add",
-        ("rule", "up") => "update",
-        ("rule", "cat") => "show",
-        ("sitrep", "ls") => "list",
-        ("sitrep", "new") => "post",
-        ("deploy", "ls") => "list",
-        ("deploy", "cat") => "show",
-        ("subscription", "ls") => "list",
-        ("subscription", "new") => "add",
-        ("subscription", "cat") => "show",
-        (_, other) => other,
+        ("task", "mv") => return "move",
+        ("task", "meta") => return "metadata",
+        ("story", "adv") => return "advance",
+        ("handoff", "acc") => return "accept",
+        ("workspace", "att") => return "attach",
+        ("workspace", "det") => return "detach",
+        _ => {}
     }
+
+    // `new` resolves to the group's creating verb, where it has one.
+    if value == "new" {
+        if let Some(full) = CREATING_VERBS
+            .iter()
+            .find(|(group, _)| *group == command)
+            .map(|(_, full)| *full)
+        {
+            return full;
+        }
+    }
+
+    // Mechanical shortforms, resolved against COMMANDS so a group only gains
+    // one it actually declares.
+    for (short, full) in MECHANICAL_SUBS {
+        if *short == value && has_subcommand(command, full) {
+            return full;
+        }
+    }
+
+    value
 }
 
 struct Args {
@@ -7456,6 +7507,48 @@ mod tests {
         assert!(!SUBCOMMAND_GROUPS.contains(&"claim"));
         // Unlisted stems are not inferred.
         assert_eq!(canonical_sub("task", "li"), "li");
+    }
+
+    #[test]
+    fn every_group_shortform_is_derived_from_the_command_table() {
+        // The mechanical shortforms are derived from COMMANDS, not hand-listed:
+        // a group that declares the long subcommand must resolve the shortform,
+        // and one that does not must leave it alone. Walking every group in
+        // SUBCOMMAND_GROUPS here is what makes a group silently losing (or
+        // gaining) a shortform fail the gate — the defect that left
+        // `attention ls` unknown while the hand-written match listed nine of
+        // the ten shortform-bearing groups.
+        for group in SUBCOMMAND_GROUPS {
+            for (short, full) in MECHANICAL_SUBS {
+                if has_subcommand(group, full) {
+                    assert_eq!(
+                        canonical_sub(group, short),
+                        *full,
+                        "{group} declares `{full}` on the command surface but `{short}` does not resolve to it"
+                    );
+                } else {
+                    assert_eq!(
+                        canonical_sub(group, short),
+                        *short,
+                        "{group} does not declare `{full}` but `{short}` resolves to it"
+                    );
+                }
+            }
+            // `new` resolves to the group's creating verb, where it has one,
+            // and stays unknown where it does not.
+            match CREATING_VERBS.iter().find(|(name, _)| *name == group) {
+                Some((_, full)) => assert_eq!(
+                    canonical_sub(group, "new"),
+                    *full,
+                    "{group} declares `{full}` as its creating verb but `new` does not resolve to it"
+                ),
+                None => assert_eq!(
+                    canonical_sub(group, "new"),
+                    "new",
+                    "{group} has no creating verb but `new` resolves to a subcommand"
+                ),
+            }
+        }
     }
 
     fn task() -> crate::model::Task {
