@@ -1960,17 +1960,22 @@ fn require_board_file(path: &Path, explicit: bool, creation: BoardCreation) -> R
 fn present_bypasses(args: &Args) -> Vec<routing::SelectorBypass> {
     use routing::SelectorBypass;
     let mut bypasses = Vec::new();
+    // Order matters: only the FIRST present bypass is named, and the caller
+    // should be told about the thing they just typed. An exported
+    // KANBAN_DATA_DIR is ambient -- often set once in a shell profile -- so
+    // naming it when the command line said `--workspace` sends the operator
+    // looking in the wrong place. Explicit flags first, then the environment.
     if args.has("db") {
         bypasses.push(SelectorBypass::DirectDb);
-    }
-    if env::var_os("KANBAN_DATA_DIR").is_some() {
-        bypasses.push(SelectorBypass::RootPath);
     }
     if args.has("workspace") {
         bypasses.push(SelectorBypass::Workspace);
     }
     if args.has("project") {
         bypasses.push(SelectorBypass::Project);
+    }
+    if env::var_os("KANBAN_DATA_DIR").is_some() {
+        bypasses.push(SelectorBypass::RootPath);
     }
     if env::var_os("KANBAN_DB").is_some() || env::var_os("KANBAN_PROJECT").is_some() {
         bypasses.push(SelectorBypass::EnvironmentSelector);
@@ -6315,6 +6320,12 @@ mod tests {
         xdg: PathBuf,
         _guard: std::sync::MutexGuard<'static, ()>,
         original: Option<std::ffi::OsString>,
+        /// An exported KANBAN_DATA_DIR contradicts a redirected canonical
+        /// root, AND is itself one of the five bypasses -- so an ambient one
+        /// (the gate runs `KANBAN_DATA_DIR=$(mktemp -d) cargo test`) would
+        /// mask whichever bypass a case means to observe. Cleared for the
+        /// guard's life, restored on drop.
+        original_data_dir: Option<std::ffi::OsString>,
     }
 
     impl CanonicalRoot {
@@ -6333,11 +6344,16 @@ mod tests {
             ));
             fs::create_dir_all(&xdg).expect("create xdg dir");
             let original = std::env::var_os("XDG_DATA_HOME");
-            unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+            let original_data_dir = std::env::var_os("KANBAN_DATA_DIR");
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &xdg);
+                std::env::remove_var("KANBAN_DATA_DIR");
+            }
             CanonicalRoot {
                 xdg,
                 _guard,
                 original,
+                original_data_dir,
             }
         }
 
@@ -6356,11 +6372,16 @@ mod tests {
                 .execute("UPDATE enforcement_state SET state=? WHERE id=1", [state])
                 .unwrap();
             let original = std::env::var_os("XDG_DATA_HOME");
-            unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+            let original_data_dir = std::env::var_os("KANBAN_DATA_DIR");
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &xdg);
+                std::env::remove_var("KANBAN_DATA_DIR");
+            }
             CanonicalRoot {
                 xdg,
                 _guard,
                 original,
+                original_data_dir,
             }
         }
     }
@@ -6371,6 +6392,10 @@ mod tests {
                 match &self.original {
                     Some(value) => std::env::set_var("XDG_DATA_HOME", value),
                     None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+                match &self.original_data_dir {
+                    Some(value) => std::env::set_var("KANBAN_DATA_DIR", value),
+                    None => std::env::remove_var("KANBAN_DATA_DIR"),
                 }
             }
             let _ = fs::remove_dir_all(&self.xdg);

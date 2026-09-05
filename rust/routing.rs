@@ -16,7 +16,7 @@
 //! caller reaches a direct open, a repointed data root, or a selector the
 //! broker would have to resolve.
 
-use crate::registry::{Registry, canonical_data_root};
+use crate::registry::canonical_data_root;
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::ErrorKind;
@@ -160,28 +160,52 @@ fn enforcement_state_at(root: &Path) -> Result<Enforcement> {
         Err(error) => return Err(error.into()),
     }
     // ADR-008: an enforcement state we cannot READ is ambiguous, and ambiguity
-    // fails closed. Mapping every error to `Direct` would let a corrupt, locked
-    // or newer-schema registry on a managed host silently re-open all five
-    // bypasses -- the one direction this gate must never fail in.
+    // fails closed. Mapping every error to `Direct` -- the PERMISSIVE end of
+    // the enum -- would let a corrupt or locked registry on a managed host
+    // silently re-open all five bypasses, the one direction this gate must
+    // never fail in.
     //
-    // The single exception is a registry predating REGISTRY_V14, which has no
-    // `enforcement_state` table at all. That is not ambiguous: it is an
-    // unmanaged single-user estate by construction, and refusing its selectors
-    // would break every install that has not migrated.
-    let registry = Registry::open_readonly_at(root)
+    // A registry predating REGISTRY_V14 is the exception, and it is checked
+    // with a bare `PRAGMA user_version` rather than `Registry::open_readonly_at`
+    // on purpose: that helper REFUSES a pre-V14 registry outright, so routing
+    // it through there would turn "you have not migrated yet" into a hard
+    // refusal of every selector. An unmigrated estate is not ambiguous, it is
+    // an unmanaged single-user one, and it must keep working.
+    let connection = open_readonly_sqlite(&registry_path)
         .with_context(|| format!("read enforcement state from {}", registry_path.display()))?;
-    if !registry.has_enforcement_state_table()? {
+    let schema: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .with_context(|| format!("read enforcement state from {}", registry_path.display()))?;
+    if schema < ENFORCEMENT_STATE_SCHEMA {
         return Ok(Enforcement::Direct);
     }
-    let state = registry
-        .enforcement_state()
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM enforcement_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
         .with_context(|| format!("read enforcement state from {}", registry_path.display()))?;
     Ok(Enforcement::parse(&state))
+}
+
+/// The registry schema that introduced `enforcement_state`. Below this a
+/// registry is legacy-unmanaged, not ambiguous.
+const ENFORCEMENT_STATE_SCHEMA: i64 = 14;
+
+/// Open the registry file read-only for the enforcement probe alone, without
+/// the schema-version gate `Registry::open_readonly_at` applies.
+fn open_readonly_sqlite(path: &Path) -> Result<rusqlite::Connection> {
+    Ok(rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::Registry;
 
     #[test]
     fn every_bypass_is_refused_by_name_in_managed_mode() {
@@ -281,10 +305,6 @@ mod tests {
 
         // 2. A real V14+ registry reads its own stored state.
         let fresh = Registry::open_test_at(&root).unwrap();
-        assert!(
-            fresh.has_enforcement_state_table().unwrap(),
-            "a freshly opened registry is at V14+; this test's premise moved"
-        );
         drop(fresh);
         assert_eq!(enforcement_state_at(&root).unwrap(), Enforcement::Direct);
 
@@ -297,17 +317,25 @@ mod tests {
         }
         assert_eq!(enforcement_state_at(&root).unwrap(), Enforcement::Managed);
 
-        // 4. A pre-V14 registry has no such table. Not ambiguous: unmanaged.
+        // 4. An UNMIGRATED registry, still stamped below V14. This is the case
+        // that must not fail closed: `Registry::open_readonly_at` refuses such
+        // a file outright, so probing through it would turn "you have not
+        // migrated yet" into a refusal of every selector for existing users.
+        // The row still says `managed` here, which is exactly the trap -- the
+        // schema stamp is what decides, so a stale row cannot lock anyone out.
         {
             let connection = rusqlite::Connection::open(root.join("registry.db")).unwrap();
             connection
-                .execute_batch("DROP TABLE enforcement_state")
+                .execute_batch(&format!(
+                    "PRAGMA user_version = {}",
+                    ENFORCEMENT_STATE_SCHEMA - 1
+                ))
                 .unwrap();
         }
         assert_eq!(
             enforcement_state_at(&root).unwrap(),
             Enforcement::Direct,
-            "a registry that never had the table is a legacy single-user estate"
+            "an unmigrated registry is a legacy single-user estate, not an ambiguity"
         );
 
         // 5. Present but unreadable as SQLite. This is the case that used to
