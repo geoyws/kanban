@@ -3463,6 +3463,23 @@ impl Registry {
                     rule.source_rule_id
                 );
             }
+            if let Some(selector) = rule.tags.iter().find(|tag| {
+                tag.strip_prefix("ONLY:")
+                    .is_some_and(|board| !allowed_boards.contains(board))
+            }) {
+                bail!(
+                    "rule transfer bundle item {} selector {} reaches outside the bundle sourceBoards allowlist [{}]; re-export from the source registry with `rule export --board {} --as ACTOR` naming every board the rule selects, or drop that selector from the source rule before exporting",
+                    rule.source_rule_id,
+                    selector,
+                    source_boards.join(", "),
+                    source_boards
+                        .iter()
+                        .map(String::as_str)
+                        .chain(std::iter::once(&selector["ONLY:".len()..]))
+                        .collect::<Vec<_>>()
+                        .join(" --board ")
+                );
+            }
             let expected_content_sha256 = rule_fingerprint(
                 &rule.source_registry_uuid,
                 &rule.source_rule_id,

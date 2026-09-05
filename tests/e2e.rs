@@ -18998,7 +18998,10 @@ fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("selector ONLY:unum"), "{stderr}");
-    assert!(stderr.contains("found 0"), "{stderr}");
+    assert!(
+        stderr.contains("outside the bundle sourceBoards allowlist [px]"),
+        "{stderr}"
+    );
 
     let registry = Connection::open(destination.data.join("registry.db")).unwrap();
     let rule_count: i64 = registry
@@ -19013,6 +19016,139 @@ fn hig_registry_refuses_absent_named_selectors_on_add_and_refingerprinted_import
     assert_eq!(
         ledger_count, 0,
         "a refused import wrote an import-ledger row"
+    );
+}
+
+#[test]
+fn compiled_binary_refuses_refingerprinted_import_whose_only_selector_targets_an_active_board_outside_source_boards()
+ {
+    let source = Fixture::new("rule-transfer-scope-source");
+    let source_second = source.root.join("second");
+    fs::create_dir_all(&source_second).unwrap();
+    source.ok_json(&source.main, &["init", "--name", "ALPHA", "--json"]);
+    source.ok_json(&source_second, &["init", "--name", "BETA", "--json"]);
+    let added = source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Alpha-only source rule.",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    let source_rule_id = added["id"].as_str().unwrap().to_owned();
+    let bundle_path = source.root.join("alpha-rules.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ALPHA",
+            "--as",
+            "geo",
+            "--output",
+            bundle_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    // BETA is a live, uniquely named board in the destination, so the
+    // active-selector check alone would accept ONLY:BETA; only the
+    // sourceBoards allowlist can refuse it.
+    let destination = Fixture::new("rule-transfer-scope-destination");
+    let destination_second = destination.root.join("second");
+    fs::create_dir_all(&destination_second).unwrap();
+    destination.ok_json(&destination.main, &["init", "--name", "ALPHA", "--json"]);
+    destination.ok_json(&destination_second, &["init", "--name", "BETA", "--json"]);
+
+    let mut bundle: Value = serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    assert_eq!(bundle["sourceBoards"], json!(["ALPHA"]));
+    bundle["rules"][0]["tags"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("ONLY:BETA"));
+    let fingerprint = rule_transfer_item_fingerprint(&bundle["rules"][0]);
+    bundle["rules"][0]["sourceContentSha256"] = json!(fingerprint);
+    fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+
+    let registry = Connection::open(destination.data.join("registry.db")).unwrap();
+    let audit_head = |registry: &Connection| -> (i64, Option<String>) {
+        registry
+            .query_row(
+                "SELECT count(*), (SELECT event_hash FROM rule_events ORDER BY seq DESC LIMIT 1) FROM rule_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let audit_before = audit_head(&registry);
+
+    let refused = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle_path.to_str().unwrap(),
+            "--as",
+            "geo",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a re-fingerprinted ONLY selector outside sourceBoards was imported"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("item {source_rule_id} selector ONLY:BETA")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("outside the bundle sourceBoards allowlist [ALPHA]"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`rule export --board ALPHA --board BETA --as ACTOR`"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("found 0"),
+        "refusal came from the absent-selector check, not the allowlist: {stderr}"
+    );
+
+    let rule_count: i64 = registry
+        .query_row("SELECT count(*) FROM rules", [], |row| row.get(0))
+        .unwrap();
+    let ledger_count: i64 = registry
+        .query_row("SELECT count(*) FROM rule_import_ledger", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rule_count, 0, "a refused import wrote a destination rule");
+    assert_eq!(
+        ledger_count, 0,
+        "a refused import wrote an import-ledger row"
+    );
+    assert_eq!(
+        audit_head(&registry),
+        audit_before,
+        "a refused import appended to the destination audit chain"
+    );
+    assert!(
+        destination
+            .ok_json(
+                &destination.main,
+                &["rule", "list", "--all", "--full", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused import mutated the destination registry"
     );
 }
 
