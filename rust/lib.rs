@@ -3052,7 +3052,7 @@ fn missing_board_error(board_path: &str) -> anyhow::Error {
 }
 
 fn open_store(args: &Args, creation: BoardCreation) -> Result<Store> {
-    Store::open(&store_path(args, creation)?)
+    Store::open_as_caller(&store_path(args, creation)?)
 }
 
 /// The board selectors this command discards, and what it addresses instead.
@@ -3206,7 +3206,7 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
                         continue;
                     }
                 }
-                let store = Store::open(Path::new(&project.board_path))?;
+                let store = Store::open_as_caller(Path::new(&project.board_path))?;
                 results.extend(store.search(&project.name, &options)?);
                 boards.push(project.name);
             }
@@ -3272,7 +3272,7 @@ fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value>
                     continue;
                 }
             }
-            let mut store = Store::open(Path::new(&project.board_path))?;
+            let mut store = Store::open_as_caller(Path::new(&project.board_path))?;
             reports.push(store.rebuild_search(&project.name, actor)?);
         }
         // An index left unrebuilt because the file would not open is not the
@@ -4159,7 +4159,7 @@ fn restore(args: &Args) -> Result<()> {
         // a board whose corruption sits in free pages copied cleanly and then
         // failed here, aborting the restore just the same. Anything that cannot
         // be copied *and* described as a board becomes a verbatim copy instead.
-        match Store::open_readonly(&path)
+        match Store::open_readonly_as_caller(&path)
             .and_then(|store| store.backup(&destination))
             .and_then(|()| snapshot_file(&rescue, &destination, "board", name.clone()))
         {
@@ -4221,6 +4221,27 @@ fn restore(args: &Args) -> Result<()> {
     )?;
     drop(registry);
 
+    // Replacing a board file is the widest write there is: every row on it is
+    // discarded and every row of the snapshot takes its place, and
+    // `replace_database` is a rename, so no later per-row check will ever see
+    // it. Each destination that still exists is therefore gated on the caller
+    // being able to write the WHOLE board, checked before the first rename so
+    // a refusal leaves the estate untouched rather than half-restored. The
+    // rescue copy above went through `Store::backup`, which applies the
+    // matching bulk-READ gate.
+    for (_, destination) in &overwrites {
+        // Only a destination that still OPENS as a board has rows this could
+        // be withholding. A corrupt or foreign file is exactly what `restore`
+        // exists to replace, and it has already been copied out of the way
+        // above; refusing it here would turn the guard into the reason a
+        // recovery cannot happen.
+        if destination.exists()
+            && let Ok(store) = Store::open_readonly_as_caller(destination)
+        {
+            store.require_whole_board_write()?;
+        }
+    }
+
     let mut restored = Vec::new();
     for (from, to) in std::iter::once((registry_source.clone(), root.join("registry.db")))
         .chain(overwrites.iter().cloned())
@@ -4242,7 +4263,7 @@ fn restore(args: &Args) -> Result<()> {
         }),
     )?;
     for (_, destination) in &overwrites {
-        Store::open(destination)?.record_system_event(
+        Store::open_as_caller(destination)?.record_system_event(
             "snapshot_restored",
             actor,
             json!({
@@ -4572,7 +4593,7 @@ fn run() -> Result<()> {
             args.has("force"),
             args.one("as").unwrap_or("system@cli"),
         )?;
-        let mut store = Store::open(Path::new(&record.board_path))?;
+        let mut store = Store::open_as_caller(Path::new(&record.board_path))?;
         store.initialize(&record.name, args.one("as").unwrap_or("system@cli"))?;
         return print(&record, args.has("json"));
     }
@@ -4668,7 +4689,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open(Path::new(&project.board_path))?;
+            let store = Store::open_as_caller(Path::new(&project.board_path))?;
             let tasks = store.list_tasks(None, None, None, false)?;
             // Counted, not fetched: a listing page passed off as a count told
             // an operator 100 pending handoffs on a board holding 101, with
@@ -4778,7 +4799,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open_readonly(Path::new(&project.board_path))?;
+            let store = Store::open_readonly_as_caller(Path::new(&project.board_path))?;
             let mut audit = store.audit()?;
             if let Some(record) = anchor.as_ref().and_then(|manifest| {
                 let current_name = Path::new(&project.board_path).file_name()?;
@@ -4860,7 +4881,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open(Path::new(&project.board_path))?;
+            let store = Store::open_as_caller(Path::new(&project.board_path))?;
             let board_schema = db::schema_version(&store.connection)?;
             let check = store.integrity()?;
             // `integrity_check` validates the b-tree and nothing about what
@@ -4955,7 +4976,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open(Path::new(&project.board_path))?;
+            let store = Store::open_as_caller(Path::new(&project.board_path))?;
             let file_name = Path::new(&project.board_path)
                 .file_name()
                 .with_context(|| format!("board path has no file name: {}", project.board_path))?;
@@ -5168,7 +5189,7 @@ fn run() -> Result<()> {
                 "claim --candidates creates no lease; --session and --lease-minutes do not apply"
             );
         }
-        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let store = Store::open_readonly_as_caller(&store_path_readonly(&args)?)?;
         let options = ClaimOptions {
             git: None,
             agent_id: args.require("as")?.into(),
@@ -5191,14 +5212,14 @@ fn run() -> Result<()> {
     }
 
     if command == "subscription" && sub == Some("list") {
-        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let store = Store::open_readonly_as_caller(&store_path_readonly(&args)?)?;
         return print(
             &store.subscriptions(args.one("status"), args.one("consumer"), args.has("all"))?,
             args.has("json"),
         );
     }
     if command == "subscription" && sub == Some("show") {
-        let store = Store::open_readonly(&store_path_readonly(&args)?)?;
+        let store = Store::open_readonly_as_caller(&store_path_readonly(&args)?)?;
         return print(
             &store.require_subscription(rest.first().context("subscription id is required")?)?,
             args.has("json"),

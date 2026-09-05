@@ -536,7 +536,7 @@ fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
         if !path.exists() {
             continue;
         }
-        let store = Store::open(path)?;
+        let store = Store::open_as_caller(path)?;
         out.push((project, store));
     }
     Ok(out)
@@ -961,7 +961,7 @@ fn search_page(query: &str) -> Result<String> {
             missing.push(project.name);
             continue;
         }
-        let store = Store::open(Path::new(&project.board_path))?;
+        let store = Store::open_as_caller(Path::new(&project.board_path))?;
         results.extend(store.search(&project.name, &options)?);
         boards.push(project.name);
     }

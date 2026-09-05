@@ -1,3 +1,4 @@
+use crate::authz::AuthzContext;
 use crate::model::{
     Rule, SearchIndexHealth, SearchIndexReport, SearchOptions, SearchReceipt, SearchResult,
     UnreadableBoard,
@@ -388,10 +389,78 @@ fn snippet(document: &Document, query_words: &[String]) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The REAL tags of one indexed document's source row, read from the source
+/// tables at materialisation time.
+///
+/// `search_documents.tags` is a PROJECTED COPY, written by the triggers in
+/// `BOARD_V13` and rewritten when the source changes. Authorizing against
+/// that copy would make a stale index a bypass: a board restored from an
+/// older snapshot, an index that predates a retag, or a `search-rebuild` that
+/// has not run yet all leave a row whose indexed tags are narrower than the
+/// tags it now carries — and the guard would then hand over a row the caller
+/// may no longer see. So the copy is used for RANKING (which is all it is
+/// good for) and never for the decision.
+///
+/// Every source kind except `rule` hangs off a task, and every one of those
+/// derives its indexed tags from that task's `task_tags` (see
+/// `search_source_rows`). An `attention` document is the exception worth
+/// naming: the view gives it the TASK's tags, but the attention row carries
+/// its own in `attention_tags`, so both are required here. A `rule` lives in
+/// the registry and carries no board tag, so board scope is its whole check.
+///
+/// A document whose task no longer exists is a stale index entry with no
+/// source row left to authorize against, so it yields the tag that can never
+/// be satisfied — it is dropped rather than trusted.
+fn document_row_tags(connection: &Connection, document: &Document) -> Result<Vec<String>> {
+    let mut tags = Vec::new();
+    if let Some(task_id) = document.task_id.as_deref() {
+        let exists: i64 =
+            connection.query_row("SELECT COUNT(*) FROM tasks WHERE id=?", [task_id], |row| {
+                row.get(0)
+            })?;
+        if exists == 0 {
+            return Ok(vec![STALE_INDEX_TAG.to_owned()]);
+        }
+        let mut statement =
+            connection.prepare("SELECT tag FROM task_tags WHERE task_id=? ORDER BY tag")?;
+        tags.extend(
+            statement
+                .query_map([task_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    if document.source_kind == "attention" {
+        let mut statement = connection
+            .prepare("SELECT tag FROM attention_tags WHERE attention_id=? ORDER BY tag")?;
+        tags.extend(
+            statement
+                .query_map([document.source_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+    }
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
+}
+
+/// The tag a stale index entry is authorized against. `*` is not a legal tag
+/// slug (ADR-033's vocabulary reserves it for the board wildcard atom and
+/// `ScopeTuple::from_atoms` will not build a `tag:` from it), so no grant can
+/// name it and no caller can satisfy it. A document pointing at a row that no
+/// longer exists is therefore always dropped.
+const STALE_INDEX_TAG: &str = "*";
+
+/// Rank and materialise search hits.
+///
+/// `authz` is the store's context, passed down rather than re-derived: search
+/// is the surface where the row is reached through an INDEX, so the guard has
+/// to be applied where the result is built and against the row's real tags.
+/// See [`document_row_tags`].
 pub fn search(
     connection: &Connection,
     board: &str,
     options: &SearchOptions,
+    authz: &AuthzContext,
 ) -> Result<Vec<SearchResult>> {
     if options.query.trim().is_empty() {
         bail!("search query is required");
@@ -402,11 +471,18 @@ pub fn search(
     if options.max_chars < 256 || options.max_chars > 100_000 {
         bail!("search max chars must be between 256 and 100000");
     }
+    // Board scope first: no read on this board, no hits from it at all. The
+    // board is the context's, taken from the board file's own name — never the
+    // `board` display label above, which is whatever the caller passed.
+    authz.check_read(&[])?;
     let query_words = words(&options.query);
     let query_vector = embed(&options.query);
     let lexical = lexical_scores(connection, &options.query)?;
     let mut results = Vec::new();
     for document in load_documents(connection, options)? {
+        if authz.is_enforcing() && !authz.permits_read(&document_row_tags(connection, &document)?) {
+            continue;
+        }
         let hash = source_hash(&document);
         let vector = if document.source_hash.as_deref() == Some(hash.as_str())
             && document.embedding_model.as_deref() == Some(EMBEDDING_MODEL)

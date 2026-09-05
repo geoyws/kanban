@@ -310,7 +310,7 @@ pub(crate) fn resolve_context(args: DispatcherArgs) -> Result<DispatcherContext>
                 );
             }
             existing_board(&canonical)?;
-            let store = Store::open_readonly(&canonical)?;
+            let store = Store::open_readonly_as_caller(&canonical)?;
             (canonical, store.board_name()?)
         }
         BoardSelector::Project(name) => {

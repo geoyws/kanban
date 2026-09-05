@@ -250,7 +250,7 @@ fn resolve_with_source(
     };
     let board_source = canonical_source_path(&board_path)?;
     let archived = args.has("all");
-    let store = Store::open_readonly(&board_path)?;
+    let store = Store::open_readonly_as_caller(&board_path)?;
     if let Some(task_id) = task.as_deref()
         && !store.watch_subject_exists(task_id)?
     {
@@ -353,7 +353,7 @@ struct Poll {
 fn poll_once(spec: &WatchSpec, cursor: i64) -> Result<Poll> {
     match &spec.source {
         Source::Board { path, .. } => {
-            let store = Store::open_readonly(path)?;
+            let store = Store::open_readonly_as_caller(path)?;
             read_snapshot(&store, |store| {
                 let batch = store.events_since_filtered(
                     spec.key.selector_value.as_deref(),
@@ -919,8 +919,14 @@ fn ensure_cursor_within_head(source: &Source, cursor: i64) -> Result<()> {
     Ok(())
 }
 
+/// The board's current ledger head, for the `--cursor` bound.
+///
+/// Board-scope read: the head is a sequence number, and telling an
+/// unauthorized caller how much traffic a board carries is still telling it
+/// something about a board it may not read.
 fn board_head(path: &Path) -> Result<i64> {
-    let store = Store::open_readonly(path)?;
+    let store = Store::open_readonly_as_caller(path)?;
+    store.require_board_read()?;
     Ok(store
         .connection
         .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |row| {

@@ -163,6 +163,31 @@ impl AuthzContext {
         &self.board_id
     }
 
+    /// Whether the guard is live at all — that is, whether the estate is
+    /// [`Enforcement::Managed`].
+    ///
+    /// Surfaces that reach a row indirectly (a search index, an event tail, a
+    /// deployment projection) have to read each row's REAL tags to check it,
+    /// and that read costs a query per row. Outside `Managed` the answer is
+    /// always "permitted", so those surfaces ask this first and skip the work
+    /// entirely: the direct estate pays nothing for a guard that cannot deny.
+    /// It is never a substitute for [`check_read`]/[`check_write`] — it only
+    /// says whether asking them could change an outcome.
+    pub fn is_enforcing(&self) -> bool {
+        self.enforcement.is_managed()
+    }
+
+    /// [`Self::check_read`] as a predicate, for filtering an enumeration.
+    ///
+    /// A caller who NAMES one row is told `denied or not found`; a caller who
+    /// asks for a LIST is simply not handed the rows it may not see, because a
+    /// refusal in the middle of an enumeration is an existence oracle — it
+    /// says "there is something here you cannot have", which is exactly what
+    /// the single generic denial exists to avoid.
+    pub fn permits_read(&self, tags: &[String]) -> bool {
+        self.check_read(tags).is_ok()
+    }
+
     /// The all-of-tag read check for a row carrying `tags`.
     pub fn check_read(&self, tags: &[String]) -> Result<()> {
         check_read(self.enforcement, &self.authority, &self.board_id, tags)

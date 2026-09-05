@@ -517,6 +517,118 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+/// The tags one EVENT exposes, which is more than the tags its row carries
+/// today.
+///
+/// Two sets, unioned:
+///
+/// 1. the row's **real current tags**, read live from `task_tags` — never from
+///    the event payload. A row a caller may not see now must not be
+///    reconstructible from its history, and the history is exactly where the
+///    row's *former* shape is written down.
+/// 2. the tag set the event's own `_semanticV1` snapshot froze. A retag event
+///    names the resulting set in its snapshot, so an event about a retag would
+///    otherwise hand over the very tag the caller lacks — the row would stay
+///    invisible while the name of the thing that hid it leaked.
+///
+/// The union is what the all-of-tag rule is then applied to, so an event is
+/// visible only to a caller who could see the row both as it is and as that
+/// event recorded it.
+///
+/// An event whose task has since been removed yields only its snapshot tags:
+/// there is no live row left to read, and the snapshot is the strictest
+/// evidence remaining.
+fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
+    let mut tags = match event.task_id.as_deref() {
+        Some(id) => task_tags(connection, id)?,
+        None => Vec::new(),
+    };
+    if let Some(Value::Array(frozen)) = event.payload.pointer("/_semanticV1/tags") {
+        tags.extend(
+            frozen
+                .iter()
+                .filter_map(|tag| tag.as_str())
+                .map(str::to_owned),
+        );
+    }
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
+}
+
+/// Every tag this board has on a row or in its own tag registry.
+///
+/// The bulk paths — a backup, a restore's rescue copy, an archive sweep, a
+/// search-index rebuild — reach every row on the board at once, so there is no
+/// per-row tag set to check: the unit being read or written is the board. The
+/// all-of-tag rule is therefore applied to the UNION, which says a caller who
+/// cannot see one tagged row cannot be handed a copy of the whole file either.
+/// Without that, the bulk path is the one way to read everything.
+///
+/// Read from the row tables as well as `tags`, because a row may still carry a
+/// tag whose registry entry was removed, and an archived `task_tags` row still
+/// records a tag the row carries.
+fn board_tag_universe(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT tag FROM task_tags \
+         UNION SELECT tag FROM attention_tags \
+         UNION SELECT name FROM tags \
+         ORDER BY 1",
+    )?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// The REAL tags of the task one deployment attempt names, or none when it
+/// names no task or does not exist.
+///
+/// Takes the connection so a write path can read it inside its own
+/// `BEGIN IMMEDIATE`, which is what keeps a concurrent retag from slipping
+/// between the check and the write. Read live from `task_tags`, never from
+/// anything the immutable attempt row froze at deploy time.
+fn deployment_subject_tags_on(connection: &Connection, deployment_id: &str) -> Result<Vec<String>> {
+    let task_id: Option<String> = connection
+        .query_row(
+            "SELECT task_id FROM deployments WHERE id=?",
+            [deployment_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    match task_id.as_deref() {
+        Some(task_id) => task_tags(connection, task_id),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The bulk-read gate: board scope, plus every tag on the board.
+///
+/// See [`board_tag_universe`] for why a whole-board copy is checked against
+/// the union rather than per row. Takes the connection so a path holding a
+/// `BEGIN IMMEDIATE` can read the universe in the SAME snapshot it is about
+/// to sweep — reading it off `Store::connection` while a transaction is open
+/// does not even borrow-check, which is a pleasant way for the compiler to
+/// insist on the correct snapshot.
+fn whole_board_read_on(authz: &AuthzContext, connection: &Connection) -> Result<()> {
+    if !authz.is_enforcing() {
+        return Ok(());
+    }
+    authz.check_read(&board_tag_universe(connection)?)
+}
+
+/// The bulk-write gate: the same union, at `write`, on both sides — a
+/// board-wide mutation leaves every row's tag set where it found it, so the
+/// old and the resulting sets are the same set.
+fn whole_board_write_on(authz: &AuthzContext, connection: &Connection) -> Result<()> {
+    if !authz.is_enforcing() {
+        return Ok(());
+    }
+    let universe = board_tag_universe(connection)?;
+    authz.check_write(&universe, &universe)
+}
+
 /// The nearest ancestor still in draft, if any.
 ///
 /// A draft protects the row it is on and, until this, nothing beneath it. A
@@ -1848,18 +1960,40 @@ impl SnapshotSource for Store {
 }
 
 impl Store {
-    /// The board UUID a path names: its file stem, the immutable identity
-    /// ADR-032 mints as the board file's name. A scratch `--db` path with no
-    /// meaningful stem yields the empty string, which the guard never
-    /// consults outside [`crate::routing::Enforcement::Managed`].
-    fn board_id_for(path: &Path) -> String {
-        board_id_from_path(&path.to_string_lossy()).unwrap_or_default()
-    }
-
+    /// Open a board file DIRECTLY: POSIX file permission is the only
+    /// authorization, no policy row is consulted, and the guard no-ops. That
+    /// is ADR-038 clause 9's direct open, stated as a constructor.
+    ///
+    /// This is the constructor for `init` (which creates the file before any
+    /// principal could be resolved against it), for the importers, and for
+    /// tests. **Every surface that answers a caller uses
+    /// [`Store::open_as_caller`] instead**, so that the enforcement read and
+    /// the authority mint happen exactly once, at the process entry point,
+    /// where `authz.rs` says they belong. Deliberately not folded into this
+    /// constructor: a board open would then depend on ambient process state
+    /// (`XDG_DATA_HOME`) that has nothing to do with the file being opened.
     pub fn open(path: &Path) -> Result<Self> {
         let mut store = Self {
             connection: open_board(path)?,
-            authz: AuthzContext::direct(Self::board_id_for(path)),
+            authz: AuthzContext::direct(
+                board_id_from_path(&path.to_string_lossy()).unwrap_or_default(),
+            ),
+        };
+        store.sweep_expired_claims()?;
+        Ok(store)
+    }
+
+    /// Open a board AS THIS PROCESS, under the authorization context
+    /// [`crate::routing::board_authz`] resolves from the kernel and the
+    /// canonical registry.
+    ///
+    /// The one constructor every process entry point uses — the CLI, `serve`,
+    /// `watch`, and the dispatcher — and the reason none of them can state a
+    /// board id, an enforcement state, or an authority of its own.
+    pub(crate) fn open_as_caller(path: &Path) -> Result<Self> {
+        let mut store = Self {
+            connection: open_board(path)?,
+            authz: crate::routing::board_authz(path)?,
         };
         store.sweep_expired_claims()?;
         Ok(store)
@@ -1893,26 +2027,85 @@ impl Store {
     pub(crate) fn open_for_dispatcher(path: &Path) -> Result<Self> {
         Ok(Self {
             connection: open_board(path)?,
-            authz: AuthzContext::direct(Self::board_id_for(path)),
+            // The dispatcher is a separate process, so this is ITS authority,
+            // minted from ITS kernel UID — not the subscription's `actor`
+            // column, and not the authority of whoever wrote the row that
+            // produced the event. A job acts on rows on its own behalf.
+            authz: crate::routing::board_authz(path)?,
         })
     }
 
-    pub fn open_readonly(path: &Path) -> Result<Self> {
+    /// The read-only open AS THIS PROCESS.
+    ///
+    /// Re-resolved on every call, and `watch` calls it once per poll: that is
+    /// what makes a REVOCATION land mid-stream rather than at the next
+    /// reconnect (see [`crate::routing::board_authz`]).
+    pub(crate) fn open_readonly_as_caller(path: &Path) -> Result<Self> {
         Ok(Self {
             connection: open_board_readonly(path)?,
-            authz: AuthzContext::direct(Self::board_id_for(path)),
+            authz: crate::routing::board_authz(path)?,
         })
     }
 
-    pub fn search(&self, board: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
-        crate::search::search(&self.connection, board, options)
+    /// The bulk-read gate on this store's own connection.
+    pub(crate) fn require_whole_board_read(&self) -> Result<()> {
+        whole_board_read_on(&self.authz, &self.connection)
     }
 
+    /// The bulk-write gate on this store's own connection.
+    pub(crate) fn require_whole_board_write(&self) -> Result<()> {
+        whole_board_write_on(&self.authz, &self.connection)
+    }
+
+    /// Keep only the events this caller may see, by each event's REAL tags.
+    ///
+    /// Board scope is required outright — no board read, no ledger at all —
+    /// and then each row is filtered rather than refused, because a refusal
+    /// inside an enumeration would say "there is history here you cannot
+    /// have". Outside managed enforcement this does no per-row work at all.
+    fn visible_events(&self, events: Vec<Event>) -> Result<Vec<Event>> {
+        self.authz.check_read(&[])?;
+        if !self.authz.is_enforcing() {
+            return Ok(events);
+        }
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            if self
+                .authz
+                .permits_read(&event_tags(&self.connection, &event)?)
+            {
+                out.push(event);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Search reaches rows through an INDEX, so the guard cannot be applied
+    /// here: `search_documents` carries a projected copy of each row's tags,
+    /// and a stale copy is a bypass. The context goes down into
+    /// [`crate::search::search`], which re-reads each hit's real tags from the
+    /// source tables as it materialises it.
+    ///
+    /// `board` is a display name for the citation and the receipt. It is a
+    /// label the caller supplied — `serve` passes the project's name — and it
+    /// is never the authorization subject; the board id inside the context is.
+    pub fn search(&self, board: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        crate::search::search(&self.connection, board, options, &self.authz)
+    }
+
+    /// Rebuilding the index reads every row on the board and writes a
+    /// searchable copy of it, so it takes the bulk-write gate: a caller who
+    /// cannot see a tagged row must not be able to (re)write that row's index
+    /// entry either.
     pub fn rebuild_search(&mut self, board: &str, actor: &str) -> Result<SearchIndexReport> {
+        self.require_whole_board_write()?;
         crate::search::rebuild(&mut self.connection, board, actor)
     }
 
+    /// Index health is counts and a model name, not row content, so board
+    /// scope is the whole check.
     pub fn search_health(&self) -> Result<SearchIndexHealth> {
+        self.authz.check_read(&[])?;
         crate::search::health(&self.connection)
     }
 
@@ -2220,12 +2413,25 @@ impl Store {
     /// Filtering belongs in the eligibility query rather than after `LIMIT 1`:
     /// otherwise an unrelated consumer at the head of the queue can make a
     /// targeted dispatcher report a false idle result.
+    ///
+    /// Authorization is the JOB's, not the row's. A delivery exists because a
+    /// subscription matched an event; that says nothing about whether THIS
+    /// dispatcher process may read the row the event is about. Board scope is
+    /// required to scan at all, and a candidate whose event the job may not
+    /// read is reported as no candidate — never as an error naming it, which
+    /// would be an existence oracle for a row on another tenant's board.
+    ///
+    /// One consequence, stated rather than hidden: this query is `LIMIT 1`, so
+    /// an unreadable delivery at the head of the queue leaves that consumer
+    /// idle until the authority is granted or the delivery is retired. It
+    /// blocks visibly instead of being dead-lettered silently.
     pub(crate) fn next_due_subscription_delivery_for_consumer(
         &self,
         now: i64,
         consumer_id: Option<&str>,
     ) -> Result<Option<SubscriptionDeliveryCandidate>> {
         validate_nonnegative_now(now, "dispatcher now")?;
+        self.authz.check_read(&[])?;
         let cutoff = now.saturating_sub(60_000);
         let mut statement = self.connection.prepare(
             "SELECT d.subscription_id,d.event_id,d.event_seq,d.event_kind,d.event_created_at,d.status,d.attempts,d.next_attempt_at,d.lease_token,d.lease_deadline_at,d.last_attempt_at,d.last_error_code,d.acked_at,d.dead_lettered_at,d.created_at,d.updated_at \
@@ -2267,7 +2473,13 @@ impl Store {
             return Ok(None);
         }
         validate_pending_or_retry_delivery(&delivery, &subscription)?;
-        let _event = require_delivery_event_identity(&self.connection, &delivery, &subscription)?;
+        let event = require_delivery_event_identity(&self.connection, &delivery, &subscription)?;
+        if !self
+            .authz
+            .permits_read(&event_tags(&self.connection, &event)?)
+        {
+            return Ok(None);
+        }
         let next_attempt_at = delivery
             .next_attempt_at
             .context("subscription delivery candidate is missing next_attempt_at")?;
@@ -2294,6 +2506,14 @@ impl Store {
 
     /// Claim one exact delivery candidate, or return `None` when it lost
     /// eligibility before the transaction could commit it.
+    ///
+    /// This is where a board row leaves the process: the claim carries the
+    /// whole `Event`, and the dispatcher projects it into the request body an
+    /// ADAPTER process reads. So the job's authority is checked HERE, under
+    /// the mutation lock and before the lease is taken — an unauthorized
+    /// delivery is left pending for a dispatcher that may read it, rather than
+    /// leased, invoked and then refused after the adapter has already seen the
+    /// row.
     pub(crate) fn claim_subscription_delivery(
         &mut self,
         subscription_id: &str,
@@ -2303,6 +2523,7 @@ impl Store {
     ) -> Result<Option<SubscriptionDeliveryClaim>> {
         validate_delivery_lease_duration(lease_duration_ms)?;
         validate_nonnegative_now(now, "dispatcher now")?;
+        self.authz.check_read(&[])?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2350,6 +2571,10 @@ impl Store {
             return Ok(None);
         }
         let event = require_delivery_event_identity(&transaction, &delivery, &subscription)?;
+        if !self.authz.permits_read(&event_tags(&transaction, &event)?) {
+            transaction.commit()?;
+            return Ok(None);
+        }
         let attempt_number = delivery.attempts + 1;
         let lease_token = format!("lease-{}", Uuid::new_v4().simple());
         let lease_deadline_at = now
@@ -2407,8 +2632,14 @@ impl Store {
 
     /// Release expired leases and either retry them immediately or dead-letter
     /// them once they exhausted their retry budget.
+    ///
+    /// Lease bookkeeping, not row content: nothing here is returned to a
+    /// caller and no event payload is read, so the gate is board-scope write
+    /// — a dispatcher with no authority on the board does not get to move its
+    /// delivery rows around either.
     pub(crate) fn recover_expired_subscription_deliveries(&mut self, now: i64) -> Result<usize> {
         validate_nonnegative_now(now, "dispatcher now")?;
+        self.authz.check_write(&[], &[])?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2493,6 +2724,12 @@ impl Store {
     }
 
     /// Ack a leased delivery and close its matching attempt row.
+    ///
+    /// Board-scope write, deliberately NOT the event's tags. The row was
+    /// already authorized at claim time; refusing to record the outcome of
+    /// work an adapter has already done would leave the lease to expire and
+    /// the same delivery to be attempted again forever. A revocation stops the
+    /// NEXT claim, which is where stopping it means something.
     pub(crate) fn finalize_subscription_delivery_success(
         &mut self,
         subscription_id: &str,
@@ -2501,6 +2738,7 @@ impl Store {
         now: i64,
     ) -> Result<bool> {
         validate_nonnegative_now(now, "dispatcher now")?;
+        self.authz.check_write(&[], &[])?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2568,6 +2806,9 @@ impl Store {
     /// Retry delays use a fixed exponential schedule with no jitter so a crash
     /// and a restart agree on the same next attempt time:
     /// `now + min(timeout_ms, 1000ms * 2^(attempt_number - 1))`.
+    ///
+    /// Board-scope write, for the same reason as the success path: this
+    /// records what already happened.
     pub(crate) fn finalize_subscription_delivery_failure(
         &mut self,
         subscription_id: &str,
@@ -2579,6 +2820,7 @@ impl Store {
     ) -> Result<bool> {
         let error_code = validate_delivery_error_code(error_code)?;
         validate_nonnegative_now(now, "dispatcher now")?;
+        self.authz.check_write(&[], &[])?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2722,6 +2964,11 @@ impl Store {
     ) -> Result<Vec<Event>> {
         validate_event_bounds(after, before)?;
         if let Some(id) = task {
+            // A NAMED row: the caller asked about this task's history, so the
+            // answer is the single generic denial before the row is opened —
+            // `require_task` below would otherwise say `task <id> not found`
+            // for a row that exists and is merely invisible.
+            self.authz.check_read(&task_tags(&self.connection, id)?)?;
             require_task(&self.connection, id)?;
         }
         let mut sql = String::from("SELECT * FROM events WHERE 1=1");
@@ -2748,13 +2995,16 @@ impl Store {
         sql.push_str(" ORDER BY seq DESC LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let rows = statement
             .query_map(
                 params_from_iter(values.iter().map(|value| value.as_ref())),
                 board_event_row,
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Filtered by each row's REAL tags AND its own frozen snapshot, so an
+        // invisible row is not reconstructible from its trail and a retag
+        // event does not name the tag that hid it. See [`event_tags`].
+        self.visible_events(rows)
     }
 
     /// Ascending ledger rows after `cursor`, narrowed only by kind and archival.
@@ -2773,6 +3023,16 @@ impl Store {
     /// against here. That asymmetry is deliberate and pre-existing: rule trails
     /// are sparse enough that a stalled cursor costs little, and narrowing a
     /// tail is always safe. Do not "fix" the registry to match this one.
+    ///
+    /// Authorization: board scope only, and deliberately so. This is the one
+    /// event read whose PURPOSE is to see rows the caller's filter rejected,
+    /// so per-row filtering here would stall the cursor behind another task's
+    /// traffic and re-scan the same window forever. Its only caller —
+    /// `watch::poll_once` — takes `.last().seq` from it and nothing else, so
+    /// what leaves this function is a sequence number, not row content. The
+    /// rows a watcher is actually HANDED come from `events_since_filtered`,
+    /// which filters per row. A caller that returned these rows to a consumer
+    /// would be a new leak, and would need the filter that this one skips.
     pub fn events_since(
         &self,
         kind: Option<&str>,
@@ -2781,6 +3041,7 @@ impl Store {
         include_archived: bool,
     ) -> Result<Vec<Event>> {
         validate_event_limit(limit)?;
+        self.authz.check_read(&[])?;
         let mut sql = String::from(
             "SELECT seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash \
              FROM events WHERE seq>?",
@@ -2812,6 +3073,12 @@ impl Store {
     /// `--limit 1` request. The JSON predicates deliberately require the
     /// private semantic snapshot, so legacy rows never match a semantic
     /// filter.
+    ///
+    /// This is the watch DELIVERY path — every row it returns is handed to a
+    /// subscriber — so it filters per row by each event's real tags, through
+    /// [`Store::visible_events`]. Because `watch` re-opens its store on every
+    /// poll, the authority this filter uses is re-minted every poll: a
+    /// revocation stops the very next batch rather than the next reconnect.
     #[allow(clippy::too_many_arguments)]
     pub fn events_since_filtered(
         &self,
@@ -2848,16 +3115,29 @@ impl Store {
         sql.push_str(" ORDER BY seq ASC LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let rows = statement
             .query_map(
                 params_from_iter(values.iter().map(|value| value.as_ref())),
                 board_event_row,
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.visible_events(rows)
     }
 
+    /// Fan every new event out to the subscriptions that match it.
+    ///
+    /// Board-scope write, and deliberately NOT per-event. The
+    /// `board_materialization_cursor` is a single board-wide row, so an event
+    /// this dispatcher skipped would be skipped for every OTHER dispatcher
+    /// too: a narrowly-authorized job could starve a broadly-authorized one by
+    /// walking the cursor past rows it could not see. Materialization is
+    /// therefore an unfiltered system fan-out, and the job's authority is
+    /// checked where it can be checked per job without shared state —
+    /// `next_due_subscription_delivery_for_consumer` and
+    /// `claim_subscription_delivery`, which are the two places a row actually
+    /// reaches a consumer.
     pub(crate) fn materialize_subscriptions(&mut self) -> Result<usize> {
+        self.authz.check_write(&[], &[])?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2970,20 +3250,39 @@ impl Store {
         Ok(inserted)
     }
 
+    /// Board-scope read, for the surfaces whose answer is a board-wide fact
+    /// rather than a row: the ledger head, an index-health count.
+    pub(crate) fn require_board_read(&self) -> Result<()> {
+        self.authz.check_read(&[])
+    }
+
+    /// Whether this board has ever recorded an event of this kind. A kind is
+    /// vocabulary, not a row, so board scope is the whole check.
     pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
+        self.authz.check_read(&[])?;
         board_event_kind_exists(&self.connection, kind)
     }
 
     /// A watch selector may name a task that has since been removed, but a
     /// typo must not read as an authoritative empty stream.
+    ///
+    /// Checked against the named task's REAL tags, so `watch --task T` on an
+    /// invisible row answers `denied or not found` rather than confirming that
+    /// T exists. A task that survives only in event history has no live tag
+    /// row, so that case falls back to board scope.
     pub fn watch_subject_exists(&self, id: &str) -> Result<bool> {
+        self.authz.check_read(&task_tags(&self.connection, id)?)?;
         watch_subject_exists_on(&self.connection, id)
     }
 
     /// Relation predicates accept current task identities and exact targets
     /// retained in semantic history. Unknown IDs fail closed, while removed
     /// parents and dependencies remain replayable.
+    ///
+    /// Same rule as [`Store::watch_subject_exists`]: the relation target is a
+    /// task id, so it is checked against that task's real tags.
     pub fn watch_relation_target_exists(&self, kind: &str, id: &str) -> Result<bool> {
+        self.authz.check_read(&task_tags(&self.connection, id)?)?;
         watch_relation_target_exists_on(&self.connection, kind, id)
     }
 
@@ -5235,15 +5534,26 @@ impl Store {
         })
     }
 
+    /// SQLite's own integrity verdict. Board scope: the strings are page and
+    /// index diagnostics, not rows.
     pub fn integrity(&self) -> Result<Vec<String>> {
+        self.authz.check_read(&[])?;
         integrity(&self.connection)
     }
 
+    /// The ADR-029 hash-chain verdict: counts, a head hash, and where the
+    /// chain broke. Board scope; no row content leaves.
     pub fn audit(&self) -> Result<crate::audit::AuditReport> {
+        self.authz.check_read(&[])?;
         crate::audit::verify_board(&self.connection)
     }
 
+    /// Append a board-level event that belongs to no task (a restore marker, a
+    /// snapshot note). Untagged by construction, so board-scope write is the
+    /// whole check — but it IS a write to the ledger, and an unauthorized
+    /// caller must not be able to append to another tenant's audit chain.
     pub fn record_system_event(&self, kind: &str, actor: &str, payload: Value) -> Result<()> {
+        self.authz.check_write(&[], &[])?;
         event_at(
             &self.connection,
             None,
@@ -5254,7 +5564,11 @@ impl Store {
         )
     }
 
+    /// Foreign-key violations, as `doctor` reports them. Board scope: the
+    /// descriptions name tables and rowids, which is diagnostic rather than
+    /// row content, and a caller with no board read gets none of it.
     pub fn foreign_key_violations(&self) -> Result<Vec<String>> {
+        self.authz.check_read(&[])?;
         crate::db::foreign_key_violations(&self.connection)
     }
 
@@ -5264,18 +5578,40 @@ impl Store {
     /// cosmetic oddity: it sorts ahead of real work and, on a claim, holds a
     /// lease that no sweep will ever retire. A minute of slack keeps ordinary
     /// clock drift between hosts sharing a board out of the report.
+    ///
+    /// This one DOES return row identities, so it is filtered per row by each
+    /// task's real tags — a `doctor` projection must not become the list of
+    /// task ids a caller cannot otherwise see.
     pub fn future_dated_tasks(&self) -> Result<Vec<String>> {
         const SLACK_MS: i64 = 60_000;
+        self.authz.check_read(&[])?;
         let mut statement = self
             .connection
             .prepare("SELECT id FROM tasks WHERE created_at>? OR updated_at>? ORDER BY id")?;
         let horizon = now_ms() + SLACK_MS;
         let rows = statement.query_map([horizon, horizon], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if !self.authz.is_enforcing() {
+            return Ok(ids);
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.authz.permits_read(&task_tags(&self.connection, &id)?) {
+                out.push(id);
+            }
+        }
+        Ok(out)
     }
 
+    /// Copy the whole board file out.
+    ///
+    /// The bulk-read gate, because this is the purest form of the projection
+    /// bypass: every row, every tag, every event and every payload leaves in
+    /// one page-level copy that no later read of ours will ever filter. A
+    /// caller who may not see one tagged row may not take the file that
+    /// contains it.
     pub fn backup(&self, destination: &Path) -> Result<()> {
+        self.require_whole_board_read()?;
         let mut target = create_backup_target(destination)?;
         let backup = rusqlite::backup::Backup::new(&self.connection, &mut target)?;
         backup.run_to_completion(64, std::time::Duration::from_millis(1), None)?;
@@ -5304,6 +5640,12 @@ impl Store {
         Ok(())
     }
 
+    /// Open a deployment attempt.
+    ///
+    /// A deployment attempt is a board row that may POINT AT a task, so the
+    /// check runs under the mutation lock against that task's real tags — a
+    /// caller who cannot see the task cannot record a deployment of it, and
+    /// cannot use the deployment table to learn that the task exists.
     pub fn start_deployment(&mut self, input: StartDeployment) -> Result<DeploymentStartReceipt> {
         validate(&input.tier, &DEPLOYMENT_TIERS, "deployment tier")?;
         let repo = nonempty(&input.repo, "repo")?.to_owned();
@@ -5315,6 +5657,11 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let subject_tags = match input.task_id.as_deref() {
+            Some(task_id) => task_tags(&transaction, task_id)?,
+            None => Vec::new(),
+        };
+        self.authz.check_write(&subject_tags, &subject_tags)?;
         if let Some(task_id) = input.task_id.as_deref() {
             require_task(&transaction, task_id)?;
         }
@@ -5393,11 +5740,63 @@ impl Store {
         })
     }
 
+    /// One named deployment attempt.
+    ///
+    /// Board scope is checked BEFORE the row is read, so an unauthorized
+    /// caller gets the generic denial rather than `deployment <id> not found`,
+    /// which would confirm which ids exist. Then the attempt's subject task is
+    /// checked, because a deployment row is a projection of a task: its
+    /// `taskID`, `branch`, `commit`, `url` and `receipt` describe work the
+    /// caller may have no authority over.
     pub fn require_deployment(&self, id: &str) -> Result<DeploymentAttempt> {
-        self.connection
+        self.authz.check_read(&[])?;
+        let attempt = self
+            .connection
             .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
             .optional()?
-            .with_context(|| format!("deployment {id} not found"))
+            .with_context(|| format!("deployment {id} not found"))?;
+        self.authz
+            .check_read(&self.deployment_subject_tags(&attempt)?)?;
+        Ok(attempt)
+    }
+
+    /// The subject task's REAL tags for one deployment attempt, or none when
+    /// the attempt names no task.
+    ///
+    /// Read live from `task_tags` rather than from anything stored on the
+    /// deployment row: the attempt is immutable and its task can be retagged
+    /// after the fact, so a copy taken at deploy time would authorize against
+    /// a tag set that no longer exists.
+    fn deployment_subject_tags(&self, attempt: &DeploymentAttempt) -> Result<Vec<String>> {
+        if !self.authz.is_enforcing() {
+            return Ok(Vec::new());
+        }
+        match attempt.task_id.as_deref() {
+            Some(task_id) => task_tags(&self.connection, task_id),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Keep only the attempts this caller may see, by each attempt's subject
+    /// task. Filtered rather than refused: this is an enumeration.
+    fn visible_deployments(
+        &self,
+        attempts: Vec<DeploymentAttempt>,
+    ) -> Result<Vec<DeploymentAttempt>> {
+        self.authz.check_read(&[])?;
+        if !self.authz.is_enforcing() {
+            return Ok(attempts);
+        }
+        let mut out = Vec::with_capacity(attempts.len());
+        for attempt in attempts {
+            if self
+                .authz
+                .permits_read(&self.deployment_subject_tags(&attempt)?)
+            {
+                out.push(attempt);
+            }
+        }
+        Ok(out)
     }
 
     pub fn deployments(
@@ -5429,25 +5828,35 @@ impl Store {
         sql.push_str(" ORDER BY created_at DESC,id DESC LIMIT ?");
         values.push(Box::new(limit));
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let rows = statement
             .query_map(
                 params_from_iter(values.iter().map(|value| value.as_ref())),
                 deployment_row,
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.visible_deployments(rows)
     }
 
+    /// The newest succeeded attempt per (repo, tier, environment) — the
+    /// "what is live where" view, and the most attractive projection on the
+    /// board, because it is a short list of exactly the interesting rows.
     pub fn current_deployments(&self) -> Result<Vec<DeploymentAttempt>> {
         let mut statement = self.connection.prepare(
             "SELECT d.* FROM deployments d WHERE d.status='succeeded' AND d.archived=0 AND NOT EXISTS (SELECT 1 FROM deployments newer WHERE newer.status='succeeded' AND newer.repo=d.repo AND newer.tier=d.tier AND newer.environment=d.environment AND (newer.created_at>d.created_at OR (newer.created_at=d.created_at AND newer.id>d.id))) ORDER BY d.repo,d.tier,d.environment",
         )?;
-        statement
+        let rows = statement
             .query_map([], deployment_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.visible_deployments(rows)
     }
 
+    /// Close a deployment attempt with its verdict.
+    ///
+    /// Two-step, under the mutation lock: board-scope write BEFORE the row is
+    /// read, so `deployment <id> not found` cannot become an existence
+    /// oracle, and then the attempt's subject task. The capability token
+    /// proves ownership of the ATTEMPT; it is not authority over the board and
+    /// never substitutes for the check.
     pub fn finish_deployment(&mut self, input: FinishDeployment) -> Result<DeploymentAttempt> {
         validate(&input.result, &DEPLOYMENT_RESULTS, "deployment result")?;
         if input.result == "abandoned" {
@@ -5471,6 +5880,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.authz.check_write(&[], &[])?;
+        let subject_tags = deployment_subject_tags_on(&transaction, &input.id)?;
+        self.authz.check_write(&subject_tags, &subject_tags)?;
         let current: (String, String, Option<String>) = transaction
             .query_row(
                 "SELECT status,capability_token,commit_sha FROM deployments WHERE id=?",
@@ -5514,6 +5926,11 @@ impl Store {
         Ok(deployment)
     }
 
+    /// Abandon a started attempt.
+    ///
+    /// `--force` bypasses the capability token, so the authorization check is
+    /// what stops it becoming a way to write a deployment row on a task the
+    /// caller cannot see. Same two-step under the mutation lock.
     pub fn abandon_deployment(
         &mut self,
         id: &str,
@@ -5527,6 +5944,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.authz.check_write(&[], &[])?;
+        let subject_tags = deployment_subject_tags_on(&transaction, id)?;
+        self.authz.check_write(&subject_tags, &subject_tags)?;
         let (status, capability, task_id, updated_at): (String, String, Option<String>, i64) =
             transaction
                 .query_row(
@@ -5569,6 +5989,15 @@ impl Store {
     /// Rows stay in the same SQLite file and remain readable through `--all`.
     /// This is intentionally an explicit sweep: opening or reading a board must
     /// never mutate it merely because wall-clock time passed.
+    ///
+    /// The bulk-write gate. Each `UPDATE ... WHERE archived=0 AND ...` below
+    /// sweeps every table on the board in one statement, so there is no per-row
+    /// decision to make: the sweep either runs over rows the caller cannot see
+    /// or it does not run. Narrowing each statement by tag instead would let a
+    /// partially-authorized sweep archive half a board and report the other
+    /// half as untouched, which is a worse answer than a refusal. Taken under
+    /// the mutation lock, so a concurrent retag cannot widen the sweep after
+    /// the check.
     pub fn archive_settled(
         &mut self,
         cutoff_at: i64,
@@ -5579,6 +6008,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        whole_board_write_on(&self.authz, &transaction)?;
         let archived_at = now_ms();
 
         let tasks = transaction.execute(

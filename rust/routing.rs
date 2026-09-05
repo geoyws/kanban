@@ -16,8 +16,13 @@
 //! caller reaches a direct open, a repointed data root, or a selector the
 //! broker would have to resolve.
 
-use crate::registry::canonical_data_root;
-use anyhow::{Context, Result};
+use crate::authz::AuthzContext;
+use crate::broker::{PasswdDatabase, SystemPasswd, two_way_passwd_check};
+use crate::model::board_id_from_path;
+use crate::policy::{Capability, ScopeTuple};
+use crate::registry::{Registry, canonical_data_root};
+use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -200,6 +205,89 @@ fn open_readonly_sqlite(path: &Path) -> Result<rusqlite::Connection> {
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?)
+}
+
+/// The one authorization context a board open may carry (ADR-038 clauses 5
+/// and 9).
+///
+/// Every part of it is taken from the kernel and the canonical registry:
+///
+/// - the **board id** is the board file's own name, through the single
+///   `board_id_from_path` mapping (ADR-032);
+/// - the **enforcement state** is [`enforcement_state`], read from the
+///   canonical data root, which deliberately ignores `KANBAN_DATA_DIR`;
+/// - the **authority** is minted from this process's own effective UID.
+///
+/// None of the three is a parameter, an environment variable, a CLI flag, a
+/// JSON-RPC field, or a subscription column. That is the whole point: an MCP
+/// tool call, a dispatcher job, and an adapter are separate processes, and a
+/// separate process must not be able to *state* its board, its enforcement
+/// state, or its authority — it can only be told them by the kernel and the
+/// registry. [`AuthzContext`]'s fields are private, `Store` holds one
+/// non-optionally, and `store` is a private module, so there is no assignment
+/// a caller could make instead and no entry point that could offer it one.
+///
+/// Resolved on every board open rather than cached in a static, because a
+/// long-lived reader has to notice a REVOCATION. `kanban watch --follow`
+/// re-opens its store once per poll, so re-resolving here is what makes an
+/// authority loss take effect mid-stream instead of at the next reconnect.
+pub fn board_authz(path: &Path) -> Result<AuthzContext> {
+    let board_id = board_id_from_path(&path.to_string_lossy()).unwrap_or_default();
+    let enforcement = enforcement_state()?;
+    // Outside `managed`, clause 9 is explicit that a directly opened board is
+    // authorized by POSIX file permission and nothing else, and that a policy
+    // row "has no effect on a direct open; it is not consulted, so it cannot
+    // be reported as having allowed anything". So it is not consulted here:
+    // the authority stays empty and the guard no-ops. The enforcement state is
+    // still carried verbatim rather than flattened to `Direct`, so anything
+    // reporting it reports what the registry actually says.
+    if !enforcement.is_managed() {
+        return Ok(AuthzContext::new(enforcement, HashMap::new(), board_id));
+    }
+    // Under `managed` a failure to establish authority is not an error to
+    // report, it is an absence of authority: an empty map denies every row
+    // through the one generic refusal, so an unbound UID, a diverged passwd
+    // pair and an unreadable policy table are indistinguishable from outside.
+    // Fail-closed, and not an oracle.
+    Ok(AuthzContext::new(
+        enforcement,
+        local_authority().unwrap_or_default(),
+        board_id,
+    ))
+}
+
+/// The authority this process holds, minted from its own kernel identity.
+///
+/// The broker's `SO_PEERCRED` hop is a separate slice, and in its place this
+/// applies exactly the evidence chain `local_actor` already applies to the
+/// `access` command family: the effective UID from the kernel, the username
+/// from `getpwuid`, ADR-033's two-way passwd check, the frozen
+/// `{username, uid}` principal lookup, and the pointwise join of that
+/// principal's active grants. A username, an `--as` actor, an
+/// `--actor-header`, or a subscription's `actor` column can produce none of
+/// this and none of them is read here.
+///
+/// Root gets nothing: clause 6 says root is not a policy principal, so a
+/// root-owned board open under managed enforcement holds no board authority
+/// and has to go through break-glass rather than through this.
+fn local_authority() -> Result<HashMap<ScopeTuple, Capability>> {
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        bail!("root is not a policy principal");
+    }
+    let username =
+        PasswdDatabase::name_for_uid(&SystemPasswd, uid)?.context("uid has no passwd entry")?;
+    if !two_way_passwd_check(&SystemPasswd, &username, uid)? {
+        bail!("passwd pair diverged");
+    }
+    // The canonical root, never `data_root()`: reading the caller's
+    // `KANBAN_DATA_DIR` here would let a scratch registry mint the authority
+    // for a managed board, which is the root-path bypass wearing a hat.
+    let registry = Registry::open_readonly_at(&canonical_data_root()?)?;
+    let principal = registry
+        .resolve_principal(&username, uid)?
+        .context("uid resolves to no enabled principal")?;
+    registry.principal_authority(&principal.row.id)
 }
 
 #[cfg(test)]
