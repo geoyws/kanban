@@ -1,4 +1,5 @@
 use crate::WATCH_BATCH_LIMIT;
+use crate::authz::AuthzContext;
 use crate::db::{
     SnapshotSource, checkpoint as wal_checkpoint, create_backup_target, integrity, open_board,
     open_board_readonly,
@@ -491,6 +492,29 @@ fn set_attention_tags(connection: &Connection, id: &str, tags: &[String]) -> Res
         )?;
     }
     Ok(())
+}
+
+/// A task's tags, read (usually under the mutation lock) for the all-of-tag
+/// authorization check. An absent row yields no tags, so a caller without
+/// board scope still receives the generic denial.
+fn task_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
+    let mut statement =
+        connection.prepare("SELECT tag FROM task_tags WHERE task_id=? ORDER BY tag")?;
+    statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// An attention row's tags, read (usually under the mutation lock) for the
+/// all-of-tag authorization check. An absent row yields no tags.
+fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
+    let mut statement =
+        connection.prepare("SELECT tag FROM attention_tags WHERE attention_id=? ORDER BY tag")?;
+    statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// The nearest ancestor still in draft, if any.
@@ -1738,6 +1762,12 @@ pub struct ClaimOptions {
 
 pub struct Store {
     pub connection: Connection,
+    /// The one authorization context every board-row surface checks through
+    /// (ADR-038 clause 5, t-90903ebe). Resolved once at open — the direct
+    /// estate has no principal, so its authority map is empty and the guard
+    /// no-ops; the managed broker path injects a minted context via
+    /// [`Store::open_with_authz`].
+    authz: AuthzContext,
 }
 
 /// The scheduler's single definition of an eligible next task.
@@ -1818,23 +1848,59 @@ impl SnapshotSource for Store {
 }
 
 impl Store {
+    /// The board UUID a path names: its file stem, the immutable identity
+    /// ADR-032 mints as the board file's name. A scratch `--db` path with no
+    /// meaningful stem yields the empty string, which the guard never
+    /// consults outside [`crate::routing::Enforcement::Managed`].
+    fn board_id_for(path: &Path) -> String {
+        board_id_from_path(&path.to_string_lossy()).unwrap_or_default()
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut store = Self {
             connection: open_board(path)?,
+            authz: AuthzContext::direct(Self::board_id_for(path)),
         };
         store.sweep_expired_claims()?;
         Ok(store)
     }
 
+    /// Open a board under a fully-specified authorization context — the
+    /// managed broker path, and the tenancy tests. The context's enforcement
+    /// state, authority map, and board UUID are all taken as-is; the store
+    /// never re-reads them per surface. The managed broker hop is a separate
+    /// slice (t-86eb4fb3), so today only the tenancy tests drive it.
+    #[allow(dead_code)]
+    pub fn open_with_authz(path: &Path, authz: AuthzContext) -> Result<Self> {
+        let mut store = Self {
+            connection: open_board(path)?,
+            authz,
+        };
+        store.sweep_expired_claims()?;
+        Ok(store)
+    }
+
+    /// Wrap an already-open connection with the direct (single-user) context.
+    /// For tests that build a connection by hand; the guard no-ops.
+    #[cfg(test)]
+    pub(crate) fn from_connection(connection: Connection) -> Self {
+        Self {
+            connection,
+            authz: AuthzContext::direct(String::new()),
+        }
+    }
+
     pub(crate) fn open_for_dispatcher(path: &Path) -> Result<Self> {
         Ok(Self {
             connection: open_board(path)?,
+            authz: AuthzContext::direct(Self::board_id_for(path)),
         })
     }
 
     pub fn open_readonly(path: &Path) -> Result<Self> {
         Ok(Self {
             connection: open_board_readonly(path)?,
+            authz: AuthzContext::direct(Self::board_id_for(path)),
         })
     }
 
@@ -1874,6 +1940,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock: a concurrent write cannot slip between this
+        // check and the INSERT below.
+        self.authz.check_write(&[], &[])?;
         let subject_task_id = input
             .subject_task_id
             .as_deref()
@@ -2017,6 +2086,7 @@ impl Store {
     }
 
     pub fn require_subscription(&self, id: &str) -> Result<Subscription> {
+        self.authz.check_read(&[])?;
         self.connection
             .query_row(
                 "SELECT * FROM subscriptions WHERE id=?",
@@ -2039,6 +2109,7 @@ impl Store {
         if let Some(consumer) = consumer_id {
             subscription_identifier(consumer, "consumer id", 64)?;
         }
+        self.authz.check_read(&[])?;
         let mut sql = String::from("SELECT * FROM subscriptions WHERE 1=1");
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(status) = status {
@@ -2072,6 +2143,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock: a concurrent write cannot slip between this
+        // check and the UPDATE below.
+        self.authz.check_write(&[], &[])?;
         let current = transaction
             .query_row(
                 "SELECT * FROM subscriptions WHERE id=?",
@@ -2962,6 +3036,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A new row has no old tag set; the resulting set is what the caller
+        // asked for. Under the mutation lock.
+        self.authz.check_write(&[], &input.tags)?;
         let now = now_ms();
         if let Some(parent) = &input.parent_id {
             let parent = require_task(&transaction, parent)?;
@@ -3004,6 +3081,12 @@ impl Store {
     }
 
     pub fn require_task(&self, id: &str) -> Result<Task> {
+        // All-of-tag check BEFORE the row is opened: read the row's tags first,
+        // then gate on them. An absent row yields no tags, so a caller without
+        // board scope still receives the generic denial, never a difference
+        // between "invisible" and "absent".
+        let tags = task_tags(&self.connection, id)?;
+        self.authz.check_read(&tags)?;
         let mut one = require_task(&self.connection, id)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
         Ok(one)
@@ -3025,6 +3108,7 @@ impl Store {
         lane: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<Task>> {
+        self.authz.check_read(&[])?;
         let (where_clause, values) = self.task_filter(status, tag, lane, include_archived)?;
         let sql = format!("SELECT * FROM tasks{where_clause} ORDER BY priority,created_at,id");
         let refs = values.iter().map(|value| value.as_ref());
@@ -3052,6 +3136,7 @@ impl Store {
         lane: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<(Task, Option<ClaimSummary>)>> {
+        self.authz.check_read(&[])?;
         let (where_clause, filters) = self.task_filter(status, tag, lane, include_archived)?;
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(filters.len() + 1);
         values.push(Box::new(now_ms()));
@@ -3151,6 +3236,8 @@ impl Store {
     }
 
     pub fn dependencies(&self, id: &str) -> Result<Vec<Task>> {
+        // Relations carry no tags of their own: board scope only.
+        self.authz.check_read(&[])?;
         let mut rows = dependencies(&self.connection, id)?;
         attach_tags(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -3183,6 +3270,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, and before the row is opened: a status move
+        // does not retag, so the old and resulting tag sets are the row's.
+        let old_tags = task_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
         let current = require_active_task(&transaction, id)?;
         // A story's status column is a projection of its gate, not a field the
         // caller owns. Writing it directly leaves the row asserting one thing
@@ -3244,6 +3335,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: removal leaves no
+        // row, so the resulting tag set is empty.
+        let old_tags = task_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &[])?;
         let task = require_active_task(&transaction, id)?;
         let seized = require_free_lease(&transaction, id, &actor, force, "remove")?;
         // Children have no ON DELETE CASCADE, so the raw foreign-key failure is
@@ -3302,6 +3397,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: a metadata patch
+        // does not retag, so old and resulting tag sets are the row's.
+        let old_tags = task_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
         let current = require_active_task(&transaction, id)?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let object = patch
@@ -3338,6 +3437,12 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: a retag is
+        // permitted only to a caller who could see the row before AND after,
+        // so the old and resulting tag sets are both checked at `write`.
+        let old_tags = task_tags(&transaction, id)?;
+        let resulting_tags = input.tags.clone().unwrap_or_else(|| old_tags.clone());
+        self.authz.check_write(&old_tags, &resulting_tags)?;
         let current = require_active_task(&transaction, id)?;
         let previous_parent = current.parent_id.clone();
         let parent = input.parent_id.unwrap_or(current.parent_id);
@@ -3445,6 +3550,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Claims carry no tags of their own: board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let now = now_ms();
         expire_claims(&transaction, now)?;
         let task = if let Some(id) = id {
@@ -3537,6 +3644,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Task>> {
         let agent = nonempty(&options.agent_id, "agent id")?;
+        self.authz.check_read(&[])?;
         let tag = tag
             .map(|value| validate_registered_tags(&self.connection, &[value.to_owned()], "claim"))
             .transpose()?
@@ -3551,6 +3659,7 @@ impl Store {
     }
 
     pub fn get_claim(&self, id: &str) -> Result<Option<Claim>> {
+        self.authz.check_read(&[])?;
         active_claim(&self.connection, id, now_ms())
     }
 
@@ -3567,6 +3676,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Board scope, under the lock: a heartbeat moves a claim row.
+        self.authz.check_write(&[], &[])?;
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
         match git {
@@ -3605,6 +3716,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Board scope, under the lock: a release drops a claim row.
+        self.authz.check_write(&[], &[])?;
         let claim = require_lease(&transaction, id, token, now_ms())?;
         transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
         if !keep_status {
@@ -3633,6 +3746,7 @@ impl Store {
 
     pub fn add_note(&mut self, id: &str, author: &str, kind: &str, body: &str) -> Result<TaskNote> {
         validate(kind, &NOTE_KINDS, "note kind")?;
+        self.authz.check_write(&[], &[])?;
         require_active_task(&self.connection, id)?;
         let now = now_ms();
         self.connection.execute(
@@ -3656,6 +3770,7 @@ impl Store {
     }
 
     pub fn notes(&self, id: &str, limit: i64) -> Result<Vec<TaskNote>> {
+        self.authz.check_read(&[])?;
         let task = require_task(&self.connection, id)?;
         let cold = if task.archived { "" } else { " AND archived=0" };
         let sql = format!(
@@ -3669,6 +3784,7 @@ impl Store {
     }
 
     pub fn checkpoints(&self, id: &str, limit: i64) -> Result<Vec<Checkpoint>> {
+        self.authz.check_read(&[])?;
         let task = require_task(&self.connection, id)?;
         let cold = if task.archived { "" } else { " AND archived=0" };
         let sql = format!(
@@ -3686,6 +3802,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Checkpoints carry no tags of their own: board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
         let prior_status = require_task(&transaction, &input.task_id)?.status;
@@ -3750,6 +3868,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The master file has no tags of its own: board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let exists: Option<String> = transaction
             .query_row("SELECT name FROM tags WHERE name=?", [&name], |row| {
                 row.get(0)
@@ -3783,6 +3903,7 @@ impl Store {
 
     /// The master file, with how many rows carry each entry.
     pub fn tags(&self) -> Result<Vec<Tag>> {
+        self.authz.check_read(&[])?;
         let mut statement = self.connection.prepare(
             "SELECT t.name,t.description,t.created_by,t.created_at,
                     ((SELECT count(*) FROM task_tags x WHERE x.tag=t.name) +
@@ -3808,6 +3929,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let rule_uses: i64 = transaction.query_row(
             "SELECT count(*) FROM rules r, json_each(r.task_tags) j \
              WHERE r.archived=0 AND j.value=?",
@@ -3853,6 +3976,7 @@ impl Store {
 
     /// Active rules are a document, so their order is oldest first.
     pub fn rules(&self, include_archived: bool) -> Result<Vec<Rule>> {
+        self.authz.check_read(&[])?;
         let clause = if include_archived {
             ""
         } else {
@@ -3872,6 +3996,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let changed = transaction.execute(
             "UPDATE rules SET archived=1,author=?,updated_at=? WHERE id=? AND archived=0",
             params![actor, now_ms(), id],
@@ -4028,6 +4154,9 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A new attention row has no old tag set; the resulting set is the
+        // tags the caller asked for. Under the mutation lock.
+        self.authz.check_write(&[], tags)?;
         if let Some(id) = task_id {
             require_active_task(&transaction, id)?;
         }
@@ -4080,6 +4209,7 @@ impl Store {
         if let Some(value) = kind {
             validate(value, &ATTENTION_KINDS, "attention kind")?;
         }
+        self.authz.check_read(&[])?;
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
@@ -4103,6 +4233,7 @@ impl Store {
     /// counted rather than fetched, so a board past the listing's page still
     /// reports what it holds. Same filter as `attention(Some("open"), …)`.
     pub fn count_open_attention(&self) -> Result<i64> {
+        self.authz.check_read(&[])?;
         let (where_clause, values) =
             self.attention_filter(Some("open"), None, None, None, None, false)?;
         let refs = values.iter().map(|value| value.as_ref());
@@ -4214,6 +4345,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: a retag is
+        // permitted only to a caller who could see the row before AND after.
+        let old_tags = attention_tags(&transaction, id)?;
+        let resulting_tags = tags
+            .map(|tags| tags.to_vec())
+            .unwrap_or_else(|| old_tags.clone());
+        self.authz.check_write(&old_tags, &resulting_tags)?;
         let existing = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
@@ -4293,6 +4431,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: settling an item
+        // does not retag, so old and resulting tag sets are the row's.
+        let old_tags = attention_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
         let existing = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
@@ -4358,6 +4500,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: reopening does
+        // not retag, so old and resulting tag sets are the row's.
+        let old_tags = attention_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
         let existing = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
@@ -4408,6 +4554,7 @@ impl Store {
         if let Some(value) = status {
             validate(value, &HANDOFF_STATUSES, "handoff status")?;
         }
+        self.authz.check_read(&[])?;
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
@@ -4429,6 +4576,7 @@ impl Store {
     /// page still reports what it holds. Same filter as
     /// `handoffs(None, Some("pending"), None, …)`.
     pub fn count_pending_handoffs(&self) -> Result<i64> {
+        self.authz.check_read(&[])?;
         let (where_clause, values) = handoff_filter(None, Some("pending"), None, false);
         let refs = values.iter().map(|value| value.as_ref());
         self.connection
@@ -4460,6 +4608,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Handoffs carry no tags of their own: board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let now = now_ms();
         let prior_status = input
             .task_id
@@ -4553,6 +4703,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let now = now_ms();
         expire_claims(&transaction, now)?;
         let handoff = transaction
@@ -4696,6 +4848,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
         let existing = transaction
             .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
             .optional()?
@@ -4741,6 +4895,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: signoff does not
+        // retag, so old and resulting tag sets are the row's.
+        let old_tags = task_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
         let story = require_active_task(&transaction, id)?;
         require_story_type(id, &story.task_type, "takes signoff")?;
         if story.metadata.get("workflowStatus").and_then(Value::as_str) != Some("review") {
@@ -4804,6 +4962,10 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Under the mutation lock, before the row is opened: advancing a story
+        // does not retag, so old and resulting tag sets are the row's.
+        let old_tags = task_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
         let story = require_active_task(&transaction, id)?;
         require_story_type(id, &story.task_type, "advances")?;
         let current = story
@@ -4999,6 +5161,7 @@ impl Store {
     /// `updated_at` otherwise, so a task dispatched into `in_progress` without
     /// a claim is still covered.
     pub fn stale_tasks(&self) -> Result<Vec<StaleTask>> {
+        self.authz.check_read(&[])?;
         let now = now_ms();
         let mut statement = self.connection.prepare(
             "SELECT t.*, c.heartbeat_at AS claim_heartbeat FROM tasks t
@@ -5603,6 +5766,456 @@ mod tests {
                 ],
             )
             .expect("insert task");
+    }
+
+    fn assert_denied<T: std::fmt::Debug>(result: anyhow::Result<T>, surface: &str) {
+        match result {
+            Ok(value) => panic!("{surface} reached the other board: {value:?}"),
+            Err(error) => assert_eq!(
+                error.to_string(),
+                "denied or not found",
+                "{surface} must deny with the generic string"
+            ),
+        }
+    }
+
+    fn task_input(id: &str, title: &str, tags: Vec<String>, dependencies: Vec<String>) -> AddTask {
+        AddTask {
+            id: Some(id.to_owned()),
+            task_type: "task".to_owned(),
+            parent_id: None,
+            title: title.to_owned(),
+            body: None,
+            assignee: None,
+            lane: None,
+            deliverable: None,
+            stale_minutes: None,
+            driver_only: false,
+            status: "todo".to_owned(),
+            priority: 3,
+            dependencies,
+            metadata: serde_json::json!({}),
+            actor: Some("seed".to_owned()),
+            tags,
+        }
+    }
+
+    fn claim_options(agent: &str) -> ClaimOptions {
+        ClaimOptions {
+            agent_id: agent.to_owned(),
+            session_id: None,
+            lease_ms: 60_000,
+            caller_lane: None,
+            role_filter: None,
+            caller_scope: None,
+            cross_lane: false,
+            allow_reassign: false,
+            git: None,
+        }
+    }
+
+    fn checkpoint_input(task_id: &str, author: &str) -> CheckpointInput {
+        CheckpointInput {
+            task_id: task_id.to_owned(),
+            lease_token: "token".to_owned(),
+            author: author.to_owned(),
+            session_id: None,
+            model: None,
+            state: "continue".to_owned(),
+            summary: "s".to_owned(),
+            intent: "i".to_owned(),
+            next_action: "n".to_owned(),
+            blockers: vec![],
+            validations: vec![],
+            repo_path: None,
+            branch: None,
+            head_sha: None,
+            dirty_summary: None,
+            root_head: None,
+        }
+    }
+
+    fn handoff_input() -> HandoffInput {
+        HandoffInput {
+            task_id: None,
+            lease_token: None,
+            from_agent: "actor".to_owned(),
+            from_session: None,
+            from_model: None,
+            to_agent: Some("driver-2".to_owned()),
+            reason: "manual".to_owned(),
+            priority: 3,
+            summary: "s".to_owned(),
+            intent: "i".to_owned(),
+            next_action: "n".to_owned(),
+            blockers: vec![],
+            validations: vec![],
+            repo_path: None,
+            branch: None,
+            head_sha: None,
+            dirty_summary: None,
+            root_head: None,
+        }
+    }
+
+    fn tenant_subscription_input() -> AddSubscription {
+        AddSubscription {
+            id: None,
+            subject_task_id: None,
+            relations: vec![],
+            kinds: vec![],
+            prior_statuses: vec![],
+            current_statuses: vec![],
+            tags: vec![],
+            consumer_id: "c1".to_owned(),
+            action_id: "a1".to_owned(),
+            timeout_ms: 1_000,
+            max_retries: 3,
+            rate_per_minute: 60,
+            max_concurrency: 1,
+            secret_ref: None,
+            actor: "actor".to_owned(),
+        }
+    }
+
+    /// Two boards in one registry, a caller whose authority covers exactly one
+    /// of them, and the assertion that NO row of the other board is reachable
+    /// through ANY surface in scope. Removing any single surface's guard makes
+    /// the matching assertion fire.
+    #[test]
+    fn managed_tenancy_hides_every_surface_of_the_other_board() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board_a = "aaaaaaaa-1111-4111-8111-111111111111";
+        let board_b = "bbbbbbbb-2222-4222-8222-222222222222";
+        let b_dir = std::env::temp_dir().join(format!("kanban-tenant-b-{}", Uuid::new_v4()));
+        fs::create_dir_all(&b_dir).expect("create board b dir");
+        let b_path = b_dir.join(format!("{board_b}.db"));
+
+        // Seed the OTHER board (B) with real rows, via the direct estate.
+        {
+            let mut b = Store::open(&b_path).expect("open seed board");
+            b.initialize("board-b", "seed").expect("init board b");
+            b.add_tag("beta", None, Some("seed")).expect("seed tag");
+            b.add_task(task_input("t-b2", "dependency target", vec![], vec![]))
+                .expect("seed dependency target");
+            b.add_task(task_input(
+                "t-b",
+                "the other board's row",
+                vec!["beta".to_owned()],
+                vec!["t-b2".to_owned()],
+            ))
+            .expect("seed task");
+            b.raise_attention(
+                "needs eyes",
+                "blocking",
+                "seed",
+                Some("t-b"),
+                3,
+                &["beta".to_owned()],
+            )
+            .expect("seed attention");
+            b.add_note("t-b", "seed", "progress", "a note on the other board")
+                .expect("seed note");
+            b.create_handoff(handoff_input()).expect("seed handoff");
+            drop(b);
+        }
+
+        // The caller's authority covers exactly board A.
+        let authority = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board_a.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::Board {
+                    board_id: board_a.to_owned(),
+                },
+                Capability::Write,
+            ),
+            (
+                ScopeTuple::BoardWildcard {
+                    board_id: board_a.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardWildcard {
+                    board_id: board_a.to_owned(),
+                },
+                Capability::Write,
+            ),
+        ]);
+
+        let mut store = Store::open_with_authz(
+            &b_path,
+            AuthzContext::new(Enforcement::Managed, authority, board_b.to_owned()),
+        )
+        .expect("open the other board under A-only authority");
+
+        // Reads: no row of B is reachable.
+        assert_denied(store.require_task("t-b"), "task show");
+        assert_denied(store.list_tasks(None, None, None, false), "task list");
+        assert_denied(
+            store.list_tasks_with_claims(None, None, None, false),
+            "task list --with-claims",
+        );
+        assert_denied(store.dependencies("t-b"), "relations dependencies");
+        assert_denied(store.ancestors("t-b"), "relations ancestors");
+        assert_denied(store.notes("t-b", 10), "note list");
+        assert_denied(store.checkpoints("t-b", 10), "checkpoint list");
+        assert_denied(store.handoffs(None, None, None, 10, false), "handoff list");
+        assert_denied(store.count_pending_handoffs(), "handoff count");
+        assert_denied(
+            store.attention(None, None, None, None, None, 10, false),
+            "attention list",
+        );
+        assert_denied(store.count_open_attention(), "attention count");
+        assert_denied(store.open_attentions("t-b"), "attention open-by-task");
+        assert_denied(
+            store.claim_candidates(&claim_options("agent"), None, 10),
+            "claim candidates",
+        );
+        assert_denied(store.get_claim("t-b"), "claim show");
+        assert_denied(store.rules(false), "rule list");
+        assert_denied(store.tags(), "tag list");
+        assert_denied(store.subscriptions(None, None, false), "subscription list");
+        assert_denied(store.require_subscription("sub-x"), "subscription show");
+        assert_denied(store.stale_tasks(), "stale task list");
+
+        // Writes: no write to B succeeds.
+        assert_denied(
+            store.add_task(task_input("t-new", "new", vec![], vec![])),
+            "task add",
+        );
+        assert_denied(
+            store.move_task("t-b", "todo", "actor", serde_json::json!({}), false),
+            "task move",
+        );
+        assert_denied(store.remove_task("t-b", "actor", false), "task remove");
+        assert_denied(
+            store.patch_metadata("t-b", serde_json::json!({"k": "v"}), "actor"),
+            "task metadata",
+        );
+        assert_denied(
+            store.update_task(
+                "t-b",
+                UpdateTask {
+                    tags: Some(vec!["beta".to_owned()]),
+                    ..Default::default()
+                },
+                "actor",
+            ),
+            "task update",
+        );
+        assert_denied(
+            store.signoff_story("t-b", "actor", true, None),
+            "story signoff",
+        );
+        assert_denied(
+            store.advance_story("t-b", "actor", None, None, None),
+            "story advance",
+        );
+        assert_denied(
+            store.raise_attention("body", "blocking", "actor", None, 3, &[]),
+            "attention raise",
+        );
+        assert_denied(
+            store.update_attention("a-x", None, Some(&["beta".to_owned()]), "actor"),
+            "attention update",
+        );
+        assert_denied(
+            store.resolve_attention("a-x", "actor", Some("done")),
+            "attention resolve",
+        );
+        assert_denied(
+            store.reopen_attention("a-x", "actor", "oops"),
+            "attention reopen",
+        );
+        assert_denied(store.claim(Some("t-b"), claim_options("agent")), "claim");
+        assert_denied(store.heartbeat("t-b", "token", 60_000, None), "heartbeat");
+        assert_denied(store.release("t-b", "token", false), "release");
+        assert_denied(
+            store.add_note("t-b", "actor", "progress", "body"),
+            "note add",
+        );
+        assert_denied(
+            store.checkpoint(checkpoint_input("t-b", "actor")),
+            "checkpoint add",
+        );
+        assert_denied(store.create_handoff(handoff_input()), "handoff create");
+        assert_denied(
+            store.accept_handoff("h-x", "agent", None, 60_000, None, None),
+            "handoff accept",
+        );
+        assert_denied(
+            store.retire_handoff("h-x", "actor", "note"),
+            "handoff retire",
+        );
+        assert_denied(store.add_tag("gamma", None, Some("actor")), "tag add");
+        assert_denied(store.remove_tag("beta", Some("actor"), false), "tag remove");
+        assert_denied(store.retire_rule("r-x", "actor"), "rule retire");
+        assert_denied(
+            store.add_subscription(tenant_subscription_input()),
+            "subscription add",
+        );
+        assert_denied(
+            store.pause_subscription("sub-x", "actor"),
+            "subscription pause",
+        );
+        assert_denied(
+            store.resume_subscription("sub-x", "actor"),
+            "subscription resume",
+        );
+    }
+
+    /// A caller who can see a task's old tag set but not the resulting one is
+    /// denied a retag, and the row is byte-unchanged afterwards — the write did
+    /// not partially apply.
+    #[test]
+    fn retag_denied_when_only_the_old_tags_are_visible_and_the_row_is_unchanged() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "cccccccc-3333-4333-8333-333333333333";
+        let dir = std::env::temp_dir().join(format!("kanban-retag-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create retag dir");
+        let path = dir.join(format!("{board}.db"));
+
+        {
+            let mut s = Store::open(&path).expect("open seed board");
+            s.initialize("retag", "seed").expect("init");
+            s.add_tag("alpha", None, Some("seed")).expect("seed alpha");
+            s.add_tag("beta", None, Some("seed")).expect("seed beta");
+            s.add_task(task_input(
+                "t-r",
+                "the row",
+                vec!["alpha".to_owned()],
+                vec![],
+            ))
+            .expect("seed task");
+            drop(s);
+        }
+
+        // The caller holds write on the board and on `alpha` (the old tag),
+        // but NOT on `beta` (the resulting tag).
+        let authority = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Write,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "alpha".to_owned(),
+                },
+                Capability::Write,
+            ),
+        ]);
+
+        let mut store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, authority, board.to_owned()),
+        )
+        .expect("open under managed authority");
+
+        let error = store
+            .update_task(
+                "t-r",
+                UpdateTask {
+                    tags: Some(vec!["beta".to_owned()]),
+                    ..Default::default()
+                },
+                "actor",
+            )
+            .expect_err("a retag to an unseen tag must be denied");
+        assert_eq!(error.to_string(), "denied or not found");
+
+        // The row is unchanged: still tagged alpha, still todo, same title.
+        let direct = Store::open(&path).expect("reopen directly");
+        let task = direct.require_task("t-r").expect("row still exists");
+        assert_eq!(task.tags, vec!["alpha".to_owned()]);
+        assert_eq!(task.status, "todo");
+        assert_eq!(task.title, "the row");
+    }
+
+    /// The same both-scopes rule at the other tagged surface: `attention_tags`
+    /// is a separate table from `task_tags`, so a retag there is a separate
+    /// call site with its own old/resulting computation.
+    #[test]
+    fn attention_retag_denied_when_only_the_old_tags_are_visible_and_the_row_is_unchanged() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "dddddddd-4444-4444-8444-444444444444";
+        let dir = std::env::temp_dir().join(format!("kanban-att-retag-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create attention retag dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let raised = {
+            let mut s = Store::open(&path).expect("open seed board");
+            s.initialize("attention-retag", "seed").expect("init");
+            s.add_tag("alpha", None, Some("seed")).expect("seed alpha");
+            s.add_tag("beta", None, Some("seed")).expect("seed beta");
+            s.raise_attention(
+                "needs eyes",
+                "decision",
+                "seed",
+                None,
+                3,
+                &["alpha".to_owned()],
+            )
+            .expect("seed attention")
+        };
+        assert_eq!(raised.tags, vec!["alpha".to_owned()]);
+
+        // Write on the board and on `alpha` (the old tag), never on `beta`.
+        let authority = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Write,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "alpha".to_owned(),
+                },
+                Capability::Write,
+            ),
+        ]);
+
+        let mut store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, authority, board.to_owned()),
+        )
+        .expect("open under managed authority");
+
+        let error = store
+            .update_attention(
+                &raised.id,
+                Some("rewritten"),
+                Some(&["beta".to_owned()]),
+                "actor",
+            )
+            .expect_err("a retag to an unseen tag must be denied");
+        assert_eq!(error.to_string(), "denied or not found");
+
+        // Neither the tags nor the body moved: the write did not partly apply.
+        let direct = Store::open(&path).expect("reopen directly");
+        let after = direct
+            .attention(None, None, None, None, None, 10, false)
+            .expect("read attention directly");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].tags, vec!["alpha".to_owned()]);
+        assert_eq!(after[0].body, "needs eyes");
+        assert_eq!(after[0].status, "open");
     }
 
     #[test]

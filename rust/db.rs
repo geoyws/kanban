@@ -2688,7 +2688,7 @@ mod tests {
             0
         );
 
-        let mut store = crate::store::Store { connection };
+        let mut store = crate::store::Store::from_connection(connection);
         assert_eq!(store.materialize_subscriptions().unwrap(), 1);
         assert_eq!(
             store

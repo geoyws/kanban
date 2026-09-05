@@ -113,6 +113,75 @@ fn check_scopes(
     Ok(())
 }
 
+/// The one authorization context a [`crate::store::Store`] carries: the
+/// enforcement state, the caller's already-minted authority map, and the
+/// board's immutable UUID (ADR-032). It is resolved once — the enforcement
+/// read is one call — and handed to the store, never re-derived per surface.
+///
+/// Every board-row surface checks through this context, so a surface cannot
+/// state an authorization decision without one: the store's field is
+/// non-optional, private, and set at open. In the direct (single-user) estate
+/// there is no principal, so the authority map is empty and — because
+/// [`check_read`]/[`check_write`] no-op outside [`Enforcement::Managed`] — the
+/// guard permits everything, exactly as before.
+#[derive(Debug, Clone)]
+pub struct AuthzContext {
+    enforcement: Enforcement,
+    authority: HashMap<ScopeTuple, Capability>,
+    board_id: String,
+}
+
+impl AuthzContext {
+    /// The direct-estate context for a board opened by its file path: no
+    /// principal exists, so the authority map is empty and the enforcement
+    /// state is `Direct`. This is what `Store::open` and its siblings build.
+    pub fn direct(board_id: String) -> Self {
+        Self {
+            enforcement: Enforcement::Direct,
+            authority: HashMap::new(),
+            board_id,
+        }
+    }
+
+    /// A fully-specified context: the enforcement state the caller read, the
+    /// authority the caller minted, and the board UUID. Used by the managed
+    /// broker path and by tests that drive tenancy isolation.
+    pub fn new(
+        enforcement: Enforcement,
+        authority: HashMap<ScopeTuple, Capability>,
+        board_id: String,
+    ) -> Self {
+        Self {
+            enforcement,
+            authority,
+            board_id,
+        }
+    }
+
+    /// The board UUID this context authorizes against.
+    pub fn board_id(&self) -> &str {
+        &self.board_id
+    }
+
+    /// The all-of-tag read check for a row carrying `tags`.
+    pub fn check_read(&self, tags: &[String]) -> Result<()> {
+        check_read(self.enforcement, &self.authority, &self.board_id, tags)
+    }
+
+    /// The both-scopes write check: `old_tags` (what the caller could see
+    /// before) and `resulting_tags` (what the caller could see after) must
+    /// both satisfy `write`.
+    pub fn check_write(&self, old_tags: &[String], resulting_tags: &[String]) -> Result<()> {
+        check_write(
+            self.enforcement,
+            &self.authority,
+            &self.board_id,
+            old_tags,
+            resulting_tags,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +423,48 @@ mod tests {
         assert_eq!(
             invisible, absent,
             "the two denials must be byte-identical, carrying no row detail"
+        );
+    }
+
+    #[test]
+    fn authz_context_carries_the_board_and_delegates_to_the_guard() {
+        // The direct context permits everything (empty authority, no-op guard).
+        let direct = AuthzContext::direct(BOARD.to_owned());
+        assert_eq!(direct.board_id(), BOARD);
+        assert!(direct.check_read(&["secret".to_owned()]).is_ok());
+        assert!(
+            direct
+                .check_write(&["secret".to_owned()], &["other".to_owned()])
+                .is_ok(),
+            "the direct estate must permit what managed denies"
+        );
+
+        // A fully-specified managed context delegates to check_read/check_write
+        // with the board and authority it was built from.
+        let managed = AuthzContext::new(
+            Enforcement::Managed,
+            grants(&[(board(), Capability::Read)]),
+            BOARD.to_owned(),
+        );
+        assert_eq!(managed.board_id(), BOARD);
+        assert!(
+            managed.check_read(&[]).is_ok(),
+            "board read permits an untagged row"
+        );
+        assert!(
+            managed.check_read(&["secret".to_owned()]).is_err(),
+            "board read alone must deny a tagged row"
+        );
+        // A write context with read-only authority denies.
+        let read_only = AuthzContext::new(
+            Enforcement::Managed,
+            grants(&[(board(), Capability::Read)]),
+            BOARD.to_owned(),
+        );
+        assert_eq!(
+            read_only.check_write(&[], &[]).unwrap_err().to_string(),
+            DENIED_OR_NOT_FOUND,
+            "read authority must not satisfy a write check"
         );
     }
 }

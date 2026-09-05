@@ -1297,12 +1297,8 @@ fn active_board_ids(connection: &Connection) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut ids = Vec::new();
     for path in paths {
-        if let Some(stem) = std::path::Path::new(&path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .filter(|stem| !stem.is_empty())
-        {
-            ids.push(stem.to_owned());
+        if let Some(stem) = crate::model::board_id_from_path(&path) {
+            ids.push(stem);
         }
     }
     Ok(ids)

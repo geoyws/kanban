@@ -1,6 +1,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The immutable per-board UUID ADR-032 mints as the board file's name, read
+/// back from a published board path: `<root>/boards/<uuid>.db` -> `<uuid>`.
+///
+/// This is the one place the path-to-identity mapping lives. Scope atoms key
+/// on this value, never on the board's display name, and the store's
+/// authorization context carries it so no surface re-parses a path. A path
+/// with no file stem (a scratch `--db` path, which only the direct estate
+/// opens) yields `None`, and callers fall back to the empty string — the
+/// value is never consulted because the guard no-ops outside
+/// [`crate::routing::Enforcement::Managed`].
+pub fn board_id_from_path(board_path: &str) -> Option<String> {
+    std::path::Path::new(board_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_owned)
+}
+
 /// Every status a task row may hold.
 ///
 /// `draft` leads because it precedes the rest: a row still being written, whose
@@ -586,6 +604,10 @@ pub struct StaleTask {
 pub struct WorkspaceRecord {
     pub root_path: String,
     pub name: String,
+    /// The immutable per-board UUID (ADR-032), derived from the board file's
+    /// stem. `workspace list --json` carries it as `boardID`.
+    #[serde(rename = "boardID")]
+    pub board_id: String,
     pub board_path: String,
     pub created_at: i64,
     pub last_used_at: i64,
@@ -976,4 +998,22 @@ pub struct HandoffInput {
     pub head_sha: Option<String>,
     pub dirty_summary: Option<String>,
     pub root_head: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::board_id_from_path;
+
+    #[test]
+    fn board_id_from_path_reads_the_uuid_stem_and_ignores_extension() {
+        assert_eq!(
+            board_id_from_path("/root/boards/b1e2c2d9-b9e8-4c67-923d-153f7faed19a.db"),
+            Some("b1e2c2d9-b9e8-4c67-923d-153f7faed19a".to_owned())
+        );
+        // A path with no file component (the root, or the empty path) yields
+        // nothing, which the direct estate falls back to the empty string and
+        // never consults.
+        assert_eq!(board_id_from_path("/"), None);
+        assert_eq!(board_id_from_path(""), None);
+    }
 }

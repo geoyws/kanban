@@ -7,6 +7,7 @@ use crate::db::{
 use crate::model::{
     Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, RuleTransferBundle,
     RuleTransferItem, RuleTransferReport, UnreachableRoot, WorkspaceAdoptReceipt, WorkspaceRecord,
+    board_id_from_path,
 };
 use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
@@ -446,10 +447,12 @@ pub(crate) fn pin_live_root_for_adoption() -> Result<PinnedAdoptionRoot> {
 }
 
 fn row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    let board_path: String = record.get("board_path")?;
     Ok(WorkspaceRecord {
         root_path: record.get("root_path")?,
         name: record.get("name")?,
-        board_path: record.get("board_path")?,
+        board_id: board_id_from_path(&board_path).unwrap_or_default(),
+        board_path,
         created_at: record.get("created_at")?,
         last_used_at: record.get("last_used_at")?,
         archived: record.get::<_, i64>("archived")? != 0,
@@ -461,10 +464,12 @@ fn row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
 }
 
 fn history_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    let board_path: String = record.get("board_path")?;
     Ok(WorkspaceRecord {
         root_path: record.get("root_path")?,
         name: record.get("name")?,
-        board_path: record.get("board_path")?,
+        board_id: board_id_from_path(&board_path).unwrap_or_default(),
+        board_path,
         created_at: record.get("created_at")?,
         last_used_at: record.get("last_used_at")?,
         archived: true,
@@ -476,10 +481,12 @@ fn history_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> 
 }
 
 fn rootless_row(record: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    let board_path: String = record.get("board_path")?;
     Ok(WorkspaceRecord {
         root_path: record.get("root_path")?,
         name: record.get("name")?,
-        board_path: record.get("board_path")?,
+        board_id: board_id_from_path(&board_path).unwrap_or_default(),
+        board_path,
         created_at: record.get("created_at")?,
         last_used_at: record.get("last_used_at")?,
         archived: record.get::<_, i64>("archived")? != 0,
@@ -573,10 +580,12 @@ fn latest_history_root(
              LIMIT 1",
             [text.as_ref()],
             |record| {
+                let board_path: String = record.get("board_path")?;
                 Ok(WorkspaceRecord {
                     root_path: record.get("root_path")?,
                     name: record.get("name")?,
-                    board_path: record.get("board_path")?,
+                    board_id: board_id_from_path(&board_path).unwrap_or_default(),
+                    board_path,
                     created_at: record.get("created_at")?,
                     last_used_at: record.get("last_used_at")?,
                     archived: true,
