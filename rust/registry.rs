@@ -4826,7 +4826,9 @@ mod tests {
         assert!(archived[0].workspace_roots.contains(&root_text));
         assert!(archived[0].workspace_roots.contains(&extra_text));
 
-        let restored = registry.unretire("Alpha", "geoyws").expect("unretire project");
+        let restored = registry
+            .unretire("Alpha", "geoyws")
+            .expect("unretire project");
         assert_eq!(restored.name, "Alpha");
         assert!(restored.archived_at.is_none());
         assert!(restored.archived_by.is_none());

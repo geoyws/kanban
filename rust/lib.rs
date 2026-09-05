@@ -2772,11 +2772,7 @@ const ATTENTION_FIELDS: [&str; 17] = [
 /// are refused rather than ranked (ADR-008). A key in `gated` is one the row
 /// carries only under the named flag; asking for it without the flag is
 /// refused naming the flag, not a key list that omits it.
-fn projection(
-    args: &Args,
-    fields: &[&str],
-    gated: &[(&str, &str)],
-) -> Result<Option<Vec<String>>> {
+fn projection(args: &Args, fields: &[&str], gated: &[(&str, &str)]) -> Result<Option<Vec<String>>> {
     match (args.one("fields"), args.has("no-body")) {
         (Some(_), true) => bail!(
             "--fields and --no-body both choose the keys of every row; pass one: \
@@ -6001,9 +5997,13 @@ mod tests {
         }
         // The wrong names for a holder are refused naming the keys that are.
         for wrong in ["actor", "claim.actor", "holder"] {
-            let error = projection(&args(&["--fields", wrong]), &TASK_FIELDS, &TASK_GATED_FIELDS)
-                .unwrap_err()
-                .to_string();
+            let error = projection(
+                &args(&["--fields", wrong]),
+                &TASK_FIELDS,
+                &TASK_GATED_FIELDS,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(error.contains(wrong), "{error}");
             assert!(error.contains("claimed"), "{error}");
         }

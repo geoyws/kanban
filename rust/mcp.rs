@@ -662,8 +662,7 @@ mod tests {
         assert_eq!(list["inputSchema"]["properties"]["all"]["type"], "boolean");
         for flag in ["with-relations", "with-claims"] {
             assert_eq!(
-                list["inputSchema"]["properties"][flag]["type"],
-                "boolean",
+                list["inputSchema"]["properties"][flag]["type"], "boolean",
                 "--{flag}"
             );
         }

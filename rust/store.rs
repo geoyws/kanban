@@ -30,7 +30,9 @@ fn nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 fn lane_filter(value: &str) -> Result<&str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        bail!("--lane must name a lane, got an empty value: pass the lane to filter to, or drop --lane");
+        bail!(
+            "--lane must name a lane, got an empty value: pass the lane to filter to, or drop --lane"
+        );
     }
     Ok(trimmed)
 }
@@ -8466,7 +8468,9 @@ mod tests {
                 )
                 .expect("insert claim");
         }
-        let listed = store.list_tasks_with_claims(None, None, None, false).unwrap();
+        let listed = store
+            .list_tasks_with_claims(None, None, None, false)
+            .unwrap();
         let claim = |id: &str| {
             listed
                 .iter()
@@ -8474,7 +8478,10 @@ mod tests {
                 .map(|(_, claim)| claim.clone())
                 .unwrap()
         };
-        assert_eq!(claim("t-live").map(|claim| claim.agent_id).as_deref(), Some("driver-2"));
+        assert_eq!(
+            claim("t-live").map(|claim| claim.agent_id).as_deref(),
+            Some("driver-2")
+        );
         assert!(claim("t-lapsed").is_none(), "a lapsed lease read as held");
         assert!(claim("t-free").is_none());
         assert_eq!(listed.len(), 3, "the join must not drop or duplicate rows");
