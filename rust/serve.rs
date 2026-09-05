@@ -241,7 +241,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
                 page("Board not found", "<h1>Board not found</h1>"),
             ));
         };
-        let tasks = store.list_tasks(None, None, false)?;
+        let tasks = store.list_tasks(None, None, None, false)?;
         let is_draft_epic = tasks
             .iter()
             .any(|task| task.id == *id && task.task_type == "epic" && task.status == "draft");
@@ -757,7 +757,7 @@ fn compose_resolution_note(decision: &str, reply: Option<&str>) -> Result<String
 }
 
 fn task_open_attention(store: &Store, task_id: &str) -> Result<Vec<Attention>> {
-    store.attention(Some("open"), None, Some(task_id), None, 1000, false)
+    store.attention(Some("open"), None, Some(task_id), None, None, 1000, false)
 }
 
 fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
@@ -833,7 +833,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     let mut stores = std::collections::BTreeMap::new();
     for (project, store) in projects()? {
         let name = project.name.clone();
-        for item in store.attention(Some("open"), None, None, None, 1000, false)? {
+        for item in store.attention(Some("open"), None, None, None, None, 1000, false)? {
             items.push((name.clone(), item));
         }
         stores.insert(name, store);
@@ -1210,9 +1210,9 @@ fn boards() -> Result<String> {
     );
     let mut rows = Vec::new();
     for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None, false)?;
+        let tasks = store.list_tasks(None, None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        let attention = store.attention(Some("open"), None, None, None, 1000, false)?;
+        let attention = store.attention(Some("open"), None, None, None, None, 1000, false)?;
         let handoffs = store.handoffs(None, Some("pending"), None, 100, false)?;
         let queued = tasks
             .iter()
@@ -1281,7 +1281,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
     }
     let mut found = 0;
     for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None, false)?;
+        let tasks = store.list_tasks(None, None, None, false)?;
         let drafts = tasks
             .iter()
             .filter(|task| task.status == "draft" && task.task_type == "epic")
@@ -1425,7 +1425,7 @@ fn lanes() -> Result<String> {
 /// One board's rows, grouped by status in workflow order.
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
-    let tasks = store.list_tasks(None, None, false)?;
+    let tasks = store.list_tasks(None, None, None, false)?;
     let rules = Registry::open()?.applicable_rules(Some(&project.name), None, false)?;
     let mut html = format!("<h1>{}</h1>", escape(&project.name));
     let roots = if project.workspace_roots.is_empty() {

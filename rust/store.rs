@@ -23,6 +23,18 @@ fn nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+/// A `--lane` filter value, refused when it names nothing.
+///
+/// No task carries an empty lane, so `--lane ""` would return an empty list
+/// that reads exactly like "nothing is in that lane".
+fn lane_filter(value: &str) -> Result<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("--lane must name a lane, got an empty value: pass the lane to filter to, or drop --lane");
+    }
+    Ok(trimmed)
+}
+
 fn validate_rule_actor(value: &str) -> Result<&str> {
     nonempty(value, "author")
 }
@@ -2860,15 +2872,20 @@ impl Store {
         Ok(one.remove(0))
     }
 
-    /// Rows, optionally narrowed by status and by tag.
+    /// Rows, optionally narrowed by status, by tag and by lane.
     ///
     /// A tag filter checks the master file first: asking for one that was never
     /// registered returns an empty list otherwise, which reads exactly like
     /// "nothing is tagged that" and is how a typo becomes a wrong answer.
+    ///
+    /// A lane is not registered anywhere, so the lane filter is an exact match
+    /// on the row's own `lane`: a task with no lane matches no lane, and no
+    /// lane is inferred for it.
     pub fn list_tasks(
         &self,
         status: Option<&str>,
         tag: Option<&str>,
+        lane: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<Task>> {
         if let Some(value) = status {
@@ -2882,6 +2899,10 @@ impl Store {
         if let Some(value) = status {
             clauses.push("status=?");
             values.push(Box::new(value.to_owned()));
+        }
+        if let Some(lane) = lane {
+            clauses.push("lane=?");
+            values.push(Box::new(lane_filter(lane)?.to_owned()));
         }
         if let Some(tag) = tag {
             let tag = validate_tag_name(tag)?;
@@ -3828,12 +3849,19 @@ impl Store {
     /// An unanswered question does not get less urgent by being ignored, so
     /// age breaks priority ties oldest-first. Explicit priority comes first:
     /// a new P0 must not sit behind an old routine P2.
+    ///
+    /// `lane` is the kb-att rule: a row belongs to a lane when its raiser is
+    /// `<anything>@<lane>` or when the task it is about carries that lane.
+    /// Both routes are one SQL clause, so `limit` bounds the lane's rows and
+    /// not a page that was filtered after the fact.
+    #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
         status: Option<&str>,
         kind: Option<&str>,
         task: Option<&str>,
         tag: Option<&str>,
+        lane: Option<&str>,
         limit: i64,
         include_archived: bool,
     ) -> Result<Vec<Attention>> {
@@ -3862,6 +3890,20 @@ impl Store {
         if let Some(task) = task {
             clauses.push("task_id=?");
             values.push(Box::new(task.to_owned()));
+        }
+        if let Some(lane) = lane {
+            // `substr` with a negative start counts from the end, so this is
+            // an exact suffix test that no `%` or `_` in the lane can widen the
+            // way LIKE would. The suffix is bound twice because every other
+            // placeholder in this statement is positional.
+            clauses.push(
+                "(substr(raised_by, -length(?)) = ? \
+                 OR task_id IN (SELECT id FROM tasks WHERE lane=?))",
+            );
+            let lane = lane_filter(lane)?;
+            values.push(Box::new(format!("@{lane}")));
+            values.push(Box::new(format!("@{lane}")));
+            values.push(Box::new(lane.to_owned()));
         }
         if let Some(tag) = tag {
             let tag = validate_tag_name(tag)?;
@@ -3909,7 +3951,7 @@ impl Store {
     }
 
     pub fn open_attentions(&self, task: &str) -> Result<Vec<Attention>> {
-        self.attention(Some("open"), None, Some(task), None, 1000, false)
+        self.attention(Some("open"), None, Some(task), None, None, 1000, false)
     }
 
     /// Correct an open attention row without settling it. The event retains
@@ -8293,5 +8335,82 @@ mod tests {
             .expect_err("over-cap limits must be rejected")
             .to_string();
         assert!(over.contains("1000"), "{over}");
+    }
+
+    fn insert_lane_task(store: &Store, id: &str, lane: Option<&str>) {
+        insert_task(store, id);
+        store
+            .connection
+            .execute("UPDATE tasks SET lane=? WHERE id=?", params![lane, id])
+            .expect("set lane");
+    }
+
+    #[test]
+    fn list_tasks_lane_filter_matches_the_row_lane_exactly() {
+        let store = test_store("list-tasks-lane");
+        insert_lane_task(&store, "t-two", Some("driver-2"));
+        insert_lane_task(&store, "t-three", Some("driver-3"));
+        insert_lane_task(&store, "t-none", None);
+
+        let ids = |lane: Option<&str>| {
+            store
+                .list_tasks(None, None, lane, false)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(Some("driver-2")), ["t-two"]);
+        assert_eq!(ids(Some("driver-3")), ["t-three"]);
+        // A lane nobody is in is empty, and a task without a lane is in none.
+        assert_eq!(ids(Some("driver")), [] as [String; 0]);
+        assert_eq!(ids(None).len(), 3, "no filter is the whole board");
+        let error = store
+            .list_tasks(None, None, Some("  "), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--lane must name a lane"), "{error}");
+    }
+
+    #[test]
+    fn attention_lane_matches_the_raiser_suffix_or_the_task_lane() {
+        let mut store = test_store("attention-lane");
+        store.initialize("LANES", "geo").unwrap();
+        insert_lane_task(&store, "t-lane", Some("driver-2"));
+        insert_lane_task(&store, "t-other", Some("driver-3"));
+        let raise = |store: &mut Store, body: &str, raiser: &str, task: Option<&str>| {
+            store
+                .raise_attention(body, "decision", raiser, task, 6, &[])
+                .expect("raise")
+                .id
+        };
+        // Route one: the raiser is `<name>@driver-2`, about no task.
+        let by_raiser = raise(&mut store, "raiser route", "worker@driver-2", None);
+        // Route two: raised by someone else, about a task in driver-2.
+        let by_task = raise(&mut store, "task route", "geo", Some("t-lane"));
+        // Neither: the raiser's lane is another, and so is the task's.
+        raise(&mut store, "elsewhere", "worker@driver-3", Some("t-other"));
+        // `driver-2` is a suffix of `@driver-2` only after the `@`: a raiser
+        // in a lane that merely ends the same way must not match.
+        raise(&mut store, "near miss", "worker@xdriver-2", None);
+
+        let ids = |lane: Option<&str>, limit: i64| {
+            store
+                .attention(None, None, None, None, lane, limit, false)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        };
+        let mut matched = ids(Some("driver-2"), 100);
+        matched.sort();
+        let mut expected = vec![by_raiser.clone(), by_task.clone()];
+        expected.sort();
+        assert_eq!(matched, expected);
+        // The filter is applied before the limit, not to a page after it.
+        assert_eq!(ids(Some("driver-2"), 1).len(), 1);
+        assert!(expected.contains(&ids(Some("driver-2"), 1)[0]));
+        assert_eq!(ids(Some("driver-3"), 100).len(), 1);
+        assert_eq!(ids(None, 100).len(), 4, "no filter is every row");
     }
 }
