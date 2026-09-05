@@ -5918,7 +5918,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 13"),
+        version.contains("registry schema 14"),
         "version output: {version}"
     );
 }

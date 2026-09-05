@@ -1613,8 +1613,114 @@ ALTER TABLE boards ADD COLUMN archived_note TEXT;
 ALTER TABLE boards ADD COLUMN retirement_id TEXT;
 "#;
 
+/// Linux principal, broker policy, and bootstrap state (ADR-038, ADR-033).
+///
+/// Entirely additive: three append-only policy journals plus their rebuildable
+/// projections. No existing registry table is altered, no board schema is
+/// touched, and every pre-existing registry and audit row is preserved. The
+/// journals join ADR-029's registry hash chain through
+/// `crate::audit::append_*`; their `payload` column holds the canonical JSON of
+/// the row and is what the chain digest covers, so truncation, reordering, or
+/// substitution in any of the three fails `audit verify`.
+const REGISTRY_V14: &str = r#"
+CREATE TABLE policy_events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ event_id TEXT NOT NULL UNIQUE,
+ kind TEXT NOT NULL,
+ occurred_at INTEGER NOT NULL,
+ prev_hash TEXT,
+ event_hash TEXT,
+ payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+CREATE INDEX idx_policy_events_kind ON policy_events(kind,seq);
+
+CREATE TABLE policy_epochs (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ epoch INTEGER NOT NULL UNIQUE,
+ occurred_at INTEGER NOT NULL,
+ prev_hash TEXT,
+ event_hash TEXT,
+ payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+
+CREATE TABLE access_audit (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ event_id TEXT NOT NULL UNIQUE,
+ occurred_at INTEGER NOT NULL,
+ prev_hash TEXT,
+ event_hash TEXT,
+ payload TEXT NOT NULL CHECK(json_valid(payload))
+) STRICT;
+CREATE INDEX idx_access_audit_event_id ON access_audit(event_id);
+
+CREATE TABLE principals (
+ id TEXT PRIMARY KEY NOT NULL,
+ username TEXT NOT NULL,
+ uid INTEGER NOT NULL,
+ enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+ bound_at_epoch INTEGER NOT NULL,
+ bound_by_event_id TEXT NOT NULL,
+ disabled_at_epoch INTEGER,
+ disabled_by_event_id TEXT,
+ successor_id TEXT,
+ predecessor_id TEXT,
+ replaces TEXT NOT NULL DEFAULT '[]'
+  CHECK(json_valid(replaces) AND json_type(replaces) = 'array')
+) STRICT;
+CREATE UNIQUE INDEX idx_principals_active_username ON principals(username) WHERE enabled=1;
+CREATE UNIQUE INDEX idx_principals_active_uid ON principals(uid) WHERE enabled=1;
+
+CREATE TABLE grants (
+ id TEXT PRIMARY KEY NOT NULL,
+ principal_id TEXT NOT NULL,
+ capability TEXT NOT NULL CHECK(capability IN ('read','write','admin')),
+ scope TEXT NOT NULL
+  CHECK(json_valid(scope) AND json_type(scope) = 'array'),
+ state TEXT NOT NULL CHECK(state IN ('active','revoked','retired')),
+ origin TEXT NOT NULL CHECK(origin IN ('bootstrap','board_seed','grant','rebind_transfer','breakglass_registry_admin')),
+ granted_at_epoch INTEGER NOT NULL,
+ granted_by_principal_id TEXT,
+ granted_by_event_id TEXT NOT NULL,
+ retired_at_epoch INTEGER,
+ retired_by_event_id TEXT,
+ transferred_from_grant_id TEXT
+) STRICT;
+CREATE INDEX idx_grants_principal_state ON grants(principal_id,state);
+
+CREATE TABLE sso_mappings (
+ id TEXT PRIMARY KEY NOT NULL,
+ principal_id TEXT NOT NULL,
+ provider TEXT NOT NULL,
+ subject TEXT NOT NULL,
+ mapped_at_epoch INTEGER NOT NULL,
+ mapped_by_event_id TEXT NOT NULL,
+ unmapped_at_epoch INTEGER,
+ unmapped_by_event_id TEXT
+) STRICT;
+CREATE UNIQUE INDEX idx_sso_active_pair ON sso_mappings(provider,subject)
+ WHERE unmapped_at_epoch IS NULL;
+CREATE INDEX idx_sso_principal ON sso_mappings(principal_id);
+
+CREATE TABLE enforcement_state (
+ id INTEGER PRIMARY KEY NOT NULL CHECK(id = 1),
+ state TEXT NOT NULL CHECK(state IN ('direct','prepared','managed'))
+) STRICT;
+INSERT INTO enforcement_state(id,state) VALUES(1,'direct');
+
+CREATE TABLE proofs (
+ proof_id TEXT PRIMARY KEY NOT NULL,
+ proof_hash TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('rebind','sso_subject')),
+ principal_id TEXT NOT NULL,
+ bound_epoch INTEGER NOT NULL,
+ bound_state_hash TEXT NOT NULL,
+ expires_at INTEGER NOT NULL,
+ created_at INTEGER NOT NULL
+) STRICT;
+"#;
+
 pub const BOARD_SCHEMA_VERSION: usize = 24;
-pub const REGISTRY_SCHEMA_VERSION: usize = 13;
+pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
 ///
@@ -2311,6 +2417,7 @@ const REGISTRY_MIGRATIONS: &[&str] = &[
     REGISTRY_V11,
     REGISTRY_V12,
     REGISTRY_V13,
+    REGISTRY_V14,
 ];
 
 pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
@@ -2964,6 +3071,80 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// `REGISTRY_V14` is additive: it adds the policy journals and projections
+    /// without altering any existing registry table or any board schema, and
+    /// pre-existing registry rows survive the cutover untouched.
+    #[test]
+    fn registry_v14_adds_policy_tables_and_preserves_existing_registry_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &REGISTRY_MIGRATIONS[..13]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 13);
+        // An old-shape board row and an old-shape rule event must survive.
+        connection
+            .execute(
+                "INSERT INTO boards(board_path,name,created_at,last_used_at,archived) \
+                 VALUES('/root/boards/00000000-0000-0000-0000-000000000001.db','keep',10,11,0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rule_events(rule_id,kind,actor,payload,created_at) \
+                 VALUES('r-keep','rule_added','geoyws','{}',10)",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection, REGISTRY_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 14);
+
+        let boards: i64 = connection
+            .query_row("SELECT count(*) FROM boards WHERE name='keep'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            boards, 1,
+            "board rows are preserved by the policy migration"
+        );
+        let events: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rule_events WHERE rule_id='r-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            events, 1,
+            "rule events are preserved by the policy migration"
+        );
+
+        // Every new table exists and the enforcement state starts direct.
+        for table in [
+            "policy_events",
+            "policy_epochs",
+            "access_audit",
+            "principals",
+            "grants",
+            "sso_mappings",
+            "enforcement_state",
+            "proofs",
+        ] {
+            assert!(
+                sqlite_table_exists(&connection, table).unwrap(),
+                "policy migration must create {table}"
+            );
+        }
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM enforcement_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "direct");
     }
 
     use super::*;

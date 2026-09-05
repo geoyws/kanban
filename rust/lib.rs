@@ -19,6 +19,8 @@ mod import;
 mod lock;
 mod mcp;
 mod model;
+#[allow(dead_code)]
+mod policy;
 mod registry;
 mod search;
 mod serve;
