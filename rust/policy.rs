@@ -1327,6 +1327,22 @@ impl Registry {
         enforcement_state_on(&self.connection)
     }
 
+    /// Whether this registry has reached `REGISTRY_V14`, which introduced
+    /// `enforcement_state`.
+    ///
+    /// The managed-mode gate needs to tell a legacy registry (no such table,
+    /// legitimately unmanaged) apart from one it simply could not read
+    /// (ambiguous, and per ADR-008 fails closed). Collapsing the two would
+    /// make every read failure look like a fresh single-user install.
+    pub fn has_enforcement_state_table(&self) -> Result<bool> {
+        let count: i64 = self.connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='enforcement_state'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// The deterministic state hash of the complete projection.
     pub fn policy_state_hash(&self) -> Result<String> {
         compute_state_hash(&self.connection)

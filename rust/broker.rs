@@ -1058,6 +1058,95 @@ mod tests {
         assert_eq!(ctx.state_hash(), live_hash);
     }
 
+    // -- MCP command process (item 7) --------------------------------------
+
+    #[test]
+    fn an_mcp_command_process_is_authenticated_by_its_peer_uid_not_any_client_value() {
+        // Serialize with every other environment-mutating test.
+        let _guard = crate::dispatch::tests::env_guard();
+        // Every client-supplied identity vector, forged. None may reach the
+        // minted identity: the MCP hop (ADR-038 clause 11) carries no
+        // authority, so the broker reads only the socket peer UID.
+        let _sudo = EnvGuard::set("SUDO_USER", "mallory");
+        let _db = EnvGuard::set("KANBAN_DB", "/tmp/forged/mcp.db");
+
+        let (mut registry, admin_id) = bootstrapped("mcp-peer-uid");
+        let (epoch, hash) = registry.live_policy_state().unwrap();
+        let admin = actor(Some(&admin_id), "geoyws", 1000, epoch, &hash);
+        let mcp = registry
+            .bind_principal("kanban-mcp", 1001, &[], &admin)
+            .expect("bind the mcp service principal");
+
+        // The MCP command process connects with kernel peer UID 1001; the
+        // claimed actor and environment are forged and must not decide.
+        let creds = PeerCredentials::new(Some(48215), 1001, 1001);
+        let passwd = FakePasswd::pair("kanban-mcp", 1001);
+        let ctx = mint_principal_context(
+            &creds,
+            &passwd,
+            &registry,
+            ClientKind::McpCommand,
+            "rq-mcp".to_owned(),
+            Some("geoyws".to_owned()),
+        )
+        .expect("mint the mcp command principal");
+
+        // Identity is the frozen principal resolved from the peer UID, never
+        // the claimed actor, the forged env, or a caller-chosen value.
+        assert_eq!(ctx.principal_id(), mcp.row.id);
+        assert_eq!(ctx.username(), "kanban-mcp");
+        assert_eq!(ctx.uid(), 1001);
+        assert_eq!(ctx.client_kind(), ClientKind::McpCommand);
+        assert!(ctx.client_kind().is_service());
+    }
+
+    // -- one boundary (item 8) ---------------------------------------------
+
+    #[test]
+    fn a_service_operation_and_a_cli_one_cross_the_same_boundary() {
+        let (mut registry, admin_id) = bootstrapped("same-boundary");
+        let (epoch, hash) = registry.live_policy_state().unwrap();
+        let admin = actor(Some(&admin_id), "geoyws", 1000, epoch, &hash);
+        let backup = registry
+            .bind_principal("kanban-backup", 2000, &[], &admin)
+            .expect("bind the backup service principal");
+
+        // The same peer UID, minted once as a CLI caller and once as a backup
+        // service caller, must resolve to the same principal: there is ONE
+        // minting route (`mint_principal_context`), reached only through
+        // `Broker::accept_principal`, whatever the client kind.
+        let creds = PeerCredentials::new(Some(48216), 2000, 2000);
+        let passwd = FakePasswd::pair("kanban-backup", 2000);
+
+        let cli = mint_principal_context(
+            &creds,
+            &passwd,
+            &registry,
+            ClientKind::Cli,
+            "rq-cli".to_owned(),
+            Some("geoyws".to_owned()),
+        )
+        .expect("mint as cli");
+        let service = mint_principal_context(
+            &creds,
+            &passwd,
+            &registry,
+            ClientKind::Backup,
+            "rq-svc".to_owned(),
+            Some("geoyws".to_owned()),
+        )
+        .expect("mint as service");
+
+        // Same identity; the client kind is the only difference, and it is a
+        // label beside the identity, not a second authority.
+        assert_eq!(cli.principal_id(), service.principal_id());
+        assert_eq!(cli.principal_id(), backup.row.id);
+        assert_eq!(cli.username(), service.username());
+        assert_eq!(cli.uid(), service.uid());
+        assert_eq!(cli.client_kind(), ClientKind::Cli);
+        assert_eq!(service.client_kind(), ClientKind::Backup);
+    }
+
     // -- offline maintenance (item 5) --------------------------------------
 
     #[test]

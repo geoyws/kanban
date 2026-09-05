@@ -24,6 +24,7 @@ mod model;
 #[allow(dead_code)]
 mod policy;
 mod registry;
+mod routing;
 mod search;
 mod serve;
 mod store;
@@ -1953,6 +1954,55 @@ fn require_board_file(path: &Path, explicit: bool, creation: BoardCreation) -> R
     }
 }
 
+/// The five selector bypasses present on this invocation, most deliberate
+/// first: a typed flag outranks an environment default (see [`BoardSelection`]
+/// for why), so the first refusal names the caller's most specific request.
+fn present_bypasses(args: &Args) -> Vec<routing::SelectorBypass> {
+    use routing::SelectorBypass;
+    let mut bypasses = Vec::new();
+    if args.has("db") {
+        bypasses.push(SelectorBypass::DirectDb);
+    }
+    if env::var_os("KANBAN_DATA_DIR").is_some() {
+        bypasses.push(SelectorBypass::RootPath);
+    }
+    if args.has("workspace") {
+        bypasses.push(SelectorBypass::Workspace);
+    }
+    if args.has("project") {
+        bypasses.push(SelectorBypass::Project);
+    }
+    if env::var_os("KANBAN_DB").is_some() || env::var_os("KANBAN_PROJECT").is_some() {
+        bypasses.push(SelectorBypass::EnvironmentSelector);
+    }
+    bypasses
+}
+
+/// Refuse the five selector bypasses, by name, when the registry is under
+/// managed enforcement (ADR-038 clause 9, ADR-033).
+///
+/// In managed mode the broker owns board data and the data root, so every
+/// route around it — a direct `--db` file, a repointed `KANBAN_DATA_DIR`, a
+/// `--workspace` path, a `--project` name, or a `KANBAN_DB`/`KANBAN_PROJECT`
+/// default — is a bypass and is refused with a specific message and a non-zero
+/// exit. There is no silent downgrade to direct (unmanaged) access. Under
+/// `direct` and `prepared` enforcement every selector is still honoured, so
+/// existing single-user behaviour is unchanged.
+fn refuse_managed_bypasses(args: &Args) -> Result<()> {
+    let bypasses = present_bypasses(args);
+    // Nothing to refuse: skip the enforcement read entirely, so an ordinary
+    // no-selector command (the working directory) never opens the registry and
+    // single-user behaviour is untouched.
+    if bypasses.is_empty() {
+        return Ok(());
+    }
+    let state = routing::enforcement_state()?;
+    if let Some(message) = routing::refusal(state, &bypasses) {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
 /// Board selection, most explicit first:
 ///   1. `--db PATH`           — a board file directly
 ///   2. `--project NAME`      — a registered project by name, from anywhere
@@ -3745,6 +3795,12 @@ fn run() -> Result<()> {
     if command == "mcp" {
         return mcp::serve();
     }
+
+    // Before any board resolution, the data-root lock, or a store open: in
+    // managed multi-user mode, refuse the five selector bypasses by name
+    // (ADR-038 clause 9). A spawned MCP command process reaches this same gate
+    // through the ordinary CLI it runs, so it is refused the same way.
+    refuse_managed_bypasses(&args)?;
 
     let creation = board_creation(command, spec_sub);
     match command_spec(command, spec_sub) {
@@ -6248,5 +6304,165 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("pass one"), "{error}");
+    }
+
+    // -- managed-mode selector bypass gate (ADR-038 clause 9) -------------
+
+    /// A private canonical data root (`$XDG_DATA_HOME/kanban`) with a chosen
+    /// enforcement state, installed for the guard's lifetime and restored (and
+    /// deleted) on drop.
+    struct CanonicalRoot {
+        xdg: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl CanonicalRoot {
+        fn managed() -> CanonicalRoot {
+            Self::with_state("managed")
+        }
+
+        /// A canonical data root with NO registry at all: the fresh-install
+        /// case, which must read as unmanaged (`direct`).
+        fn absent() -> CanonicalRoot {
+            let _guard = crate::dispatch::tests::env_guard();
+            let xdg = std::env::temp_dir().join(format!(
+                "kanban-routing-xdg-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&xdg).expect("create xdg dir");
+            let original = std::env::var_os("XDG_DATA_HOME");
+            unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+            CanonicalRoot {
+                xdg,
+                _guard,
+                original,
+            }
+        }
+
+        fn with_state(state: &str) -> CanonicalRoot {
+            let _guard = crate::dispatch::tests::env_guard();
+            let xdg = std::env::temp_dir().join(format!(
+                "kanban-routing-xdg-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let root = xdg.join("kanban");
+            fs::create_dir_all(&root).expect("create canonical root");
+            let registry = Registry::open_test_at(&root).expect("open canonical test registry");
+            registry
+                .connection
+                .execute("UPDATE enforcement_state SET state=? WHERE id=1", [state])
+                .unwrap();
+            let original = std::env::var_os("XDG_DATA_HOME");
+            unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+            CanonicalRoot {
+                xdg,
+                _guard,
+                original,
+            }
+        }
+    }
+
+    impl Drop for CanonicalRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.xdg);
+        }
+    }
+
+    /// An environment variable installed for the guard's lifetime, restored on
+    /// drop. Serialized by the [`CanonicalRoot`] env guard.
+    struct EnvVar {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> EnvVar {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            EnvVar { key, original }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn managed_mode_refuses_each_selector_bypass_by_name() {
+        let _root = CanonicalRoot::managed();
+
+        // The three typed-flag bypasses, each refused by name.
+        for (flag, name) in [
+            (vec!["--db", "/tmp/x.db"], "--db"),
+            (vec!["--workspace", "/tmp/ws"], "--workspace"),
+            (vec!["--project", "alpha"], "--project"),
+        ] {
+            let error = refuse_managed_bypasses(&args(&flag))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "bypass {flag:?} refused as {error:?}");
+        }
+
+        // The root-path bypass: KANBAN_DATA_DIR.
+        {
+            let _dir = EnvVar::set("KANBAN_DATA_DIR", "/tmp/elsewhere");
+            let error = refuse_managed_bypasses(&args(&[])).unwrap_err().to_string();
+            assert!(error.contains("KANBAN_DATA_DIR"), "{error}");
+        }
+        // The environment selector: KANBAN_DB, then KANBAN_PROJECT.
+        {
+            let _db = EnvVar::set("KANBAN_DB", "/tmp/forged.db");
+            let error = refuse_managed_bypasses(&args(&[])).unwrap_err().to_string();
+            assert!(error.contains("KANBAN_DB"), "{error}");
+        }
+        {
+            let _proj = EnvVar::set("KANBAN_PROJECT", "alpha");
+            let error = refuse_managed_bypasses(&args(&[])).unwrap_err().to_string();
+            assert!(error.contains("KANBAN_PROJECT"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unmanaged_mode_keeps_every_selector_working() {
+        let _root = CanonicalRoot::with_state("direct");
+
+        // The same three typed flags are honoured, not refused.
+        for flag in [
+            vec!["--db", "/tmp/x.db"],
+            vec!["--workspace", "/tmp/ws"],
+            vec!["--project", "alpha"],
+        ] {
+            refuse_managed_bypasses(&args(&flag)).expect("a direct caller keeps its selectors");
+        }
+        // And the environment defaults keep working too.
+        let _dir = EnvVar::set("KANBAN_DATA_DIR", "/tmp/elsewhere");
+        let _db = EnvVar::set("KANBAN_DB", "/tmp/x.db");
+        let _proj = EnvVar::set("KANBAN_PROJECT", "alpha");
+        refuse_managed_bypasses(&args(&[])).expect("a direct caller keeps env defaults");
+    }
+
+    #[test]
+    fn an_absent_registry_reads_as_unmanaged_not_an_error() {
+        let _root = CanonicalRoot::absent();
+        // A fresh install has no canonical registry; that is `direct`, not a
+        // reason to refuse the selector and not an error to surface.
+        refuse_managed_bypasses(&args(&["--db", "/tmp/x.db"]))
+            .expect("no registry means no managed estate; --db is not refused");
     }
 }
