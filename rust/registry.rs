@@ -1672,6 +1672,14 @@ impl SnapshotSource for Registry {
 }
 
 impl Registry {
+    /// The data root this registry was opened at: the directory that owns the
+    /// registry database and, under managed enforcement, the broker socket.
+    /// The broker's file-ownership boundary (ADR-038 clause 9) verifies this
+    /// exact path before serving.
+    pub(crate) fn data_root_path(&self) -> &Path {
+        &self.root
+    }
+
     pub fn open() -> Result<Self> {
         let root = data_root()?;
         own_private_dir(&root)?;

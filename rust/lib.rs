@@ -2,6 +2,8 @@ mod adapter_process;
 mod adapter_protocol;
 mod audit;
 #[allow(dead_code)]
+mod broker;
+#[allow(dead_code)]
 mod claude_print_adapter;
 #[allow(dead_code)]
 mod codex_app_server_adapter;
