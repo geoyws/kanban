@@ -54,6 +54,23 @@ exercised, so a new one cannot be labelled without proving it. A capability flag
 an adapter trusts to gate writes is a security property, and one that is merely
 declared is worth nothing.
 
+**Amended 2026-09-05 (geoyws, kanban a-3902225d): a record the caller cannot
+cause is not the caller's write.** "Writes nothing anywhere" is about what the
+*caller* can change. A broker that authorizes an operation appends its own
+audit row for its own decision (ADR-033), about the caller, and the caller
+cannot cause, shape, or suppress it; a registry recency touch is the same shape
+(ADR-029). Neither makes the operation `readOnly: false`. Read literally
+without this, every brokered operation — `task list` included — would be
+`false`, and a flag that is `false` for everything tells a harness nothing,
+which is exactly the worthlessness the paragraph above refuses.
+
+The strict reading is unchanged for anything the caller reaches: `backup` and
+`todo` still create files at the caller's request and are still not read-only.
+The tested property is unchanged too — the e2e measures the board file's bytes,
+and a broker's audit row is not in that file. This narrowing lives here, once,
+so no downstream document redefines the term; ADR-038 cites it rather than
+restating it.
+
 ## Consequences
 
 An MCP server, an orch plugin, or an atmux adapter generates its tool list from

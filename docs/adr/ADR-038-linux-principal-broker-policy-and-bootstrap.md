@@ -1,8 +1,8 @@
 # ADR-038: Linux principal, broker, policy, and bootstrap
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-05
-**Deciders:** Proposed by claude@driver under George's 2026-09-05 standing goal; George accepts or amends
+**Deciders:** geoyws, 2026-09-05, on kanban attention a-3902225d — drafted by claude@driver under the standing goal, amended on both open clauses (clause 12 keys on the existing ADR-032 UUID; the `readOnly` narrowing moved into ADR-010 where the term is defined), then accepted
 **Extends:** [ADR-033](ADR-033-principals-are-frozen-username-plus-uid-and-minted-through-a-peer-credential-broker.md), which it does not supersede; where this document and ADR-033 could be read differently, ADR-033 wins and the difference is named here
 
 ## Context
@@ -508,16 +508,21 @@ say one of those three. The `--scope` set on `grant`, `revoke`, and `explain`
 must normalize to exactly one valid tuple from clause 5; on `audit` it is a
 filter that must itself form one valid tuple when present.
 
-`BOARD_ID` is the registry's stable per-board identity, not the board's
-display name. ADR-033 says "an unknown board ID" is refused and ADR-028 says
-roots are not identity; a name is not identity either, because ADR-035 lets a
-name be retired and a new board take it, and a grant keyed on the name would
-follow it. The registry today exposes a board by `name` and `boardPath` only,
-so this clause requires the registry to mint and expose an immutable
-`boardID` for every board at registration or adoption (ADR-032 already
-publishes adopted boards under a fresh UUID directory), to carry it in
-`workspace list --json` and `board_seeded`, and never to reuse it after
-retirement.
+`BOARD_ID` is the UUID ADR-032 already mints, not the board's display name and
+not a third identifier. ADR-033 says "an unknown board ID" is refused and
+ADR-028 says roots are not identity; a name is not identity either, because
+ADR-035 lets a name be retired and a new board take it, and a grant keyed on
+the name would follow it onto the new board. ADR-032 publishes every
+registry-owned board under a fresh UUID directory, so that UUID is already the
+one immutable per-board identity the registry holds; this clause requires only
+that it be *exposed* — carried in `workspace list --json` and `board_seeded`
+and never reused after retirement — rather than minted afresh.
+
+**Amended 2026-09-05 (geoyws, kanban a-3902225d).** The first draft required a
+newly minted registry `boardID`. George ruled for the existing ADR-032 UUID:
+it closes the same name-retake hazard without inventing a third name for one
+board, and a board that already has an immutable identity does not need a
+second one.
 
 ## Generated-schema contract
 
@@ -558,21 +563,18 @@ below without a new policy-schema version.
 `principal show`, `principal list`, `explain`, `audit`, and `enforcement show`
 are `readOnly: true`; every other `access` operation is `readOnly: false`.
 
-That classification needs one word of ADR-010 narrowed, and the narrowing is
-named here rather than slipped in. ADR-010 says read-only means the operation
-writes "not the board, not the registry, not a file". ADR-033 says every
-brokered decision — a `task list` included — appends an access-audit row to
-the registry. Read together literally, no brokered operation would be
-read-only and the flag a harness uses to withhold mutation would say `false`
-for everything, which is a flag that means nothing. This document reads
-ADR-010's "registry" as the registry's *work state*: the audit row is the
-broker's record of its own decision, written by the broker about the caller,
-and the caller cannot cause, shape, or suppress it. A harness withholding
-mutation wants to know what the caller can change, and the caller cannot
-change an audit row. ADR-010's own E2E is unaffected: it measures the board
-file's bytes, and a read-only operation still leaves them identical. Registry
+That classification rests on ADR-010, which owns the definition: a record the
+caller cannot cause is not the caller's write, so the access-audit row a
+broker appends for its own decision (clause 4) leaves a brokered read
+`readOnly: true`. This document does not restate or narrow the term — see
+ADR-010's 2026-09-05 amendment, where the reasoning lives once. Registry
 recency touches remain outside the audit contract exactly as ADR-029 states,
 and `store_path_readonly` keeps refusing to write them for a read.
+
+**Amended 2026-09-05 (geoyws, kanban a-3902225d).** The first draft narrowed
+ADR-010's wording here, in a downstream document. George ruled that ADR-010 be
+amended formally instead, so the definition has one home and no document
+redefines a term it does not own.
 
 ### A principal, as `principal show --json` emits it
 
@@ -837,8 +839,10 @@ grant (clause 6).
   shipped; the broker gains a subject-keyed mapping and never learns an email.
 - Root's two roles — seeding an empty registry and repairing a live one — stay
   distinct commands with distinct confirm literals, and neither becomes a row.
-- The registry must mint and expose an immutable `boardID`; scope atoms key on
-  it, not on the name. This is new registry surface.
+- The registry must EXPOSE the immutable per-board UUID ADR-032 already mints;
+  scope atoms key on it, not on the name. This is new registry surface only in
+  the sense of carrying an existing identity in `workspace list --json` and
+  `board_seeded` — no new identifier is created.
 - `schema --json` grows the `access` operations; `doctor --json` grows a
   `policy` block; the `/kb` skill and the MCP tool list inherit both from the
   manifest, not from a restatement.
@@ -873,12 +877,12 @@ commit.
 
 - `docs/adr/ADR-033-principals-are-frozen-username-plus-uid-and-minted-through-a-peer-credential-broker.md` — the accepted contract this document extends: broker ownership and `SO_PEERCRED` (lines 23–57), frozen principals (59–89), sealed context (91–103), CLI and MCP as clients (105–123), enforcement states (125–221), negotiation (223–248), capabilities and tuples (250–295), preimage authorization (297–315), grammar and event kinds (317–450), journals and audit shape (452–557), bootstrap and break-glass (559–604), SSO boundary (606–629)
 - `docs/adr/ADR-011-in-binary-mcp-server-and-in-place-reload.md` — the stdio contract left unchanged: tool call runs the binary (31–63), the 2026-09-03 amendment (37–46), in-place reload conditions (65–105), stdio-only decision (135–151)
-- `docs/adr/ADR-010-adapters-generated-from-the-command-surface.md` — schema follows the surface; `readOnly` strict reading (44–55)
+- `docs/adr/ADR-010-adapters-generated-from-the-command-surface.md` — schema follows the surface; `readOnly` strict reading (44–55) and its 2026-09-05 amendment, which owns the broker-audit narrowing this document cites
 - `docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md` — refusals name their fix; the `--db` re-permission incident (37–41)
 - `docs/adr/ADR-029-audit-journals-are-hash-chained-and-externally-anchored.md` — the chain the policy journals join; root outside the threat model (11, 54); restore and anchors (38–42)
 - `docs/adr/ADR-027-rules-are-one-tag-scoped-kb-document.md` — registry-owned rules and `ONLY:<board>` selectors as the precedent for board-scoped registry rows
 - `docs/adr/ADR-028-roots-are-hints-not-board-identity.md` — roots are not identity, cited by ADR-033 for `--db` as addressing
-- `docs/adr/ADR-032-workspace-adopt-copies-boards-into-registry-owned-storage.md` — adopted boards published under a fresh UUID directory (56), the basis for a minted `boardID`
+- `docs/adr/ADR-032-workspace-adopt-copies-boards-into-registry-owned-storage.md` — boards published under a fresh UUID directory (56); that UUID *is* `BOARD_ID`
 - `docs/adr/ADR-035-workspace-retire-and-unretire.md` — a retired name can be taken by a new board, the reason scope atoms do not key on names
 - `docs/adr/ADR-036-the-kb-skill-is-a-pinned-submodule-of-the-public-package.md` and `docs/adr/ADR-037-truncated-listings-refuse-a-default-limit-they-exceed.md` — house style
 - `docs/adr/ADR-006-rust-runtime-and-compiled-binary-e2e.md` — release-gate evidence crosses the binary boundary
