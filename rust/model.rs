@@ -318,6 +318,30 @@ pub const NOTE_KINDS: [&str; 6] = [
 pub const HANDOFF_REASONS: [&str; 4] =
     ["token_pressure", "provider_limit", "session_end", "manual"];
 
+/// The states a checkpoint may record, and nothing else. `continue` keeps the
+/// lease and the row `in_progress`; `blocked` and `done` are terminal.
+pub const CHECKPOINT_STATES: [&str; 3] = ["continue", "blocked", "done"];
+
+/// The statuses a pending handoff may hold. `retired` is history — resolved,
+/// never deleted — so a retired handoff is closed rather than advanced.
+pub const HANDOFF_STATUSES: [&str; 4] = ["pending", "accepted", "cancelled", "retired"];
+
+/// The relation kinds a watch or subscription filter may select on. One
+/// vocabulary for both surfaces, so a filter cannot say a relation here that
+/// the other side refuses.
+pub const RELATION_KINDS: [&str; 3] = ["parent", "ancestor", "depends-on"];
+
+/// The story gate, in order. A story moves one step at a time along this list.
+pub const STORY_FLOW: [&str; 7] = [
+    "planning",
+    "ready",
+    "in-progress",
+    "testing",
+    "review",
+    "merging",
+    "done",
+];
+
 /// Operator-facing projection of the durable 0-9 queue key.
 pub fn priority_level(priority: i64) -> Option<&'static str> {
     match priority {
@@ -663,6 +687,10 @@ pub const OPERATOR_ACTOR: &str = "geoyws";
 /// operator can retire.
 pub const ATTENTION_KINDS: [&str; 5] = ["blocking", "decision", "approval", "review", "risk"];
 
+/// The statuses an attention row may hold. `resolved` is history — reopened
+/// rather than deleted — so a resolved row is closed until reopened.
+pub const ATTENTION_STATUSES: [&str; 2] = ["open", "resolved"];
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attention {
@@ -707,6 +735,10 @@ pub struct ArchiveReport {
 pub const DEPLOYMENT_TIERS: [&str; 7] = ["@_bdt", "@_bd", "@_bst", "@_bs", "@_s", "@_uat", "@_p"];
 pub const DEPLOYMENT_STATUSES: [&str; 5] =
     ["started", "succeeded", "failed", "cancelled", "abandoned"];
+/// The results a finished deployment may record. `started` is the initial
+/// state and can never be a result, so this is [`DEPLOYMENT_STATUSES`] without
+/// its first entry.
+pub const DEPLOYMENT_RESULTS: [&str; 4] = ["succeeded", "failed", "cancelled", "abandoned"];
 pub const DEPLOYMENT_PHASES: [&str; 4] = ["build", "publish", "start", "verification"];
 
 /// The canonical seven-tier deployment table, quoted from the estate CLAUDE.md

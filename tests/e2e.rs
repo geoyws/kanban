@@ -14184,6 +14184,593 @@ fn every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_mee
     }
 }
 
+/// One enum-valued argument, for the ADR-008 property below. Adding one is a
+/// row here; the test refuses to pass until every argument the binary
+/// publishes with a closed set has one.
+struct EnumArgument {
+    label: &'static str,
+    /// The `schema --json` operation name the argument belongs to.
+    operation: &'static str,
+    /// The flag name (without `--`) or the positional name.
+    argument: &'static str,
+    /// Whether `argument` is a positional (`task move`'s `status`).
+    positional: bool,
+    /// Stand up whatever the command needs to reach the enum validation; the
+    /// returned string substitutes `@ctx@` in `argv`.
+    prepare: fn(&Fixture) -> String,
+    /// A full invocation whose enum argument is the `@bogus@` token. The test
+    /// swaps in a deliberately bad value, so the only refusal is the enum.
+    argv: &'static [&'static str],
+}
+
+fn seed_story(fixture: &Fixture) -> String {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "gated story",
+            "--type",
+            "story",
+            "--id",
+            "s-1",
+            "--json",
+        ],
+    );
+    String::new()
+}
+
+const ENUM_ARGUMENTS: &[EnumArgument] = &[
+    EnumArgument {
+        label: "checkpoint-state",
+        operation: "checkpoint",
+        argument: "state",
+        positional: false,
+        prepare: seed_task_and_lease,
+        argv: &[
+            "checkpoint",
+            "t-1",
+            "--lease",
+            "@ctx@",
+            "--as",
+            "agent",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--state",
+            "@bogus@",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "task-add-type",
+        operation: "task add",
+        argument: "type",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["task", "add", "titled", "--type", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "task-add-status",
+        operation: "task add",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["task", "add", "titled", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "task-list-status",
+        operation: "task list",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["task", "list", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "task-move-status",
+        operation: "task move",
+        argument: "status",
+        positional: true,
+        prepare: seed_nothing,
+        argv: &["task", "move", "t-1", "@bogus@", "--as", "agent", "--json"],
+    },
+    EnumArgument {
+        label: "note-kind",
+        operation: "note",
+        argument: "kind",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "note", "t-1", "body", "--as", "agent", "--kind", "@bogus@", "--json",
+        ],
+    },
+    EnumArgument {
+        label: "attention-raise-kind",
+        operation: "attention raise",
+        argument: "kind",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "attention",
+            "raise",
+            "needs a look",
+            "--as",
+            "agent",
+            "--kind",
+            "@bogus@",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "attention-list-kind",
+        operation: "attention list",
+        argument: "kind",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["attention", "list", "--kind", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "attention-list-status",
+        operation: "attention list",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["attention", "list", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "deploy-start-tier",
+        operation: "deploy start",
+        argument: "tier",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "deploy",
+            "start",
+            "--repo",
+            "r",
+            "--commit",
+            "c",
+            "--tier",
+            "@bogus@",
+            "--environment",
+            "e",
+            "--host",
+            "h",
+            "--url",
+            "u",
+            "--as",
+            "agent",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "deploy-list-tier",
+        operation: "deploy list",
+        argument: "tier",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["deploy", "list", "--tier", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "deploy-list-status",
+        operation: "deploy list",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["deploy", "list", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "deploy-finish-result",
+        operation: "deploy finish",
+        argument: "result",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "deploy", "finish", "d-1", "--token", "x", "--result", "@bogus@", "--phase", "build",
+            "--as", "agent", "--json",
+        ],
+    },
+    EnumArgument {
+        label: "deploy-finish-phase",
+        operation: "deploy finish",
+        argument: "phase",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "deploy",
+            "finish",
+            "d-1",
+            "--token",
+            "x",
+            "--result",
+            "succeeded",
+            "--phase",
+            "@bogus@",
+            "--as",
+            "agent",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "handoff-create-reason",
+        operation: "handoff create",
+        argument: "reason",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "handoff",
+            "create",
+            "--as",
+            "agent",
+            "--summary",
+            "s",
+            "--intent",
+            "i",
+            "--next-action",
+            "n",
+            "--reason",
+            "@bogus@",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "handoff-list-status",
+        operation: "handoff list",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["handoff", "list", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "subscription-add-relation",
+        operation: "subscription add",
+        argument: "relation",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "subscription",
+            "add",
+            "--consumer",
+            "c",
+            "--action",
+            "a",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "agent",
+            "--relation",
+            "@bogus@:id",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "subscription-add-prior-status",
+        operation: "subscription add",
+        argument: "prior-status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "subscription",
+            "add",
+            "--consumer",
+            "c",
+            "--action",
+            "a",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "agent",
+            "--prior-status",
+            "@bogus@",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "subscription-add-current-status",
+        operation: "subscription add",
+        argument: "current-status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "subscription",
+            "add",
+            "--consumer",
+            "c",
+            "--action",
+            "a",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "agent",
+            "--current-status",
+            "@bogus@",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "subscription-list-status",
+        operation: "subscription list",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["subscription", "list", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "story-advance-to",
+        operation: "story advance",
+        argument: "to",
+        positional: false,
+        prepare: seed_story,
+        argv: &[
+            "story", "advance", "s-1", "--as", "agent", "--to", "@bogus@", "--json",
+        ],
+    },
+    EnumArgument {
+        label: "watch-relation",
+        operation: "watch",
+        argument: "relation",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["watch", "--relation", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "watch-prior-status",
+        operation: "watch",
+        argument: "prior-status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["watch", "--prior-status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "watch-current-status",
+        operation: "watch",
+        argument: "current-status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["watch", "--current-status", "@bogus@", "--json"],
+    },
+    EnumArgument {
+        label: "access-grant-capability",
+        operation: "access grant",
+        argument: "capability",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "access",
+            "grant",
+            "--principal",
+            "p",
+            "--capability",
+            "@bogus@",
+            "--scope",
+            "registry",
+            "--as",
+            "geoyws",
+            "--reason",
+            "r",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "access-revoke-capability",
+        operation: "access revoke",
+        argument: "capability",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "access",
+            "revoke",
+            "--principal",
+            "p",
+            "--capability",
+            "@bogus@",
+            "--scope",
+            "registry",
+            "--as",
+            "geoyws",
+            "--reason",
+            "r",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "access-explain-capability",
+        operation: "access explain",
+        argument: "capability",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &[
+            "access",
+            "explain",
+            "--principal",
+            "p",
+            "--capability",
+            "@bogus@",
+            "--scope",
+            "registry",
+            "--json",
+        ],
+    },
+    EnumArgument {
+        label: "access-audit-capability",
+        operation: "access audit",
+        argument: "capability",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["access", "audit", "--capability", "@bogus@", "--json"],
+    },
+];
+
+/// ADR-008: an enum-valued refusal names the whole set it accepts, so the
+/// caller reads the exit status and the fix in one message. The values are
+/// read back out of `schema --json`, which is the same surface an adapter
+/// validates against (ADR-010), so a set the manifest advertises but the
+/// refusal omits fails here — and an argument the binary publishes with a
+/// closed set but no table row fails the completeness check above the loop.
+///
+/// Read bottom-up: the refusal is asserted against a deliberately bad value,
+/// which is the one input every silent "invalid X" of the old shape answered
+/// with no hint of what would work.
+#[test]
+fn every_enum_argument_refusal_names_the_whole_set() {
+    let fixture = Fixture::new("enum-surface");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ENUM", "--json"]);
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+
+    // (operation, argument, positional) -> the accepted values, projected from
+    // the manifest. This is the "join the table or fail" guard: every argument
+    // the binary publishes with a closed set must have a row, and every row
+    // must be published, so the two cannot drift in either direction.
+    let mut schema_values: BTreeMap<(String, String, bool), Vec<String>> = BTreeMap::new();
+    for operation in schema["operations"].as_array().unwrap() {
+        let name = operation["name"].as_str().unwrap().to_owned();
+        for flag in operation["flags"].as_array().unwrap() {
+            if let Some(values) = flag.get("values").and_then(Value::as_array) {
+                schema_values.insert(
+                    (
+                        name.clone(),
+                        flag["name"].as_str().unwrap().to_owned(),
+                        false,
+                    ),
+                    values
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect(),
+                );
+            }
+        }
+        if let Some(positionals) = operation.get("positionalValues").and_then(Value::as_object) {
+            for (positional, values) in positionals {
+                schema_values.insert(
+                    (name.clone(), positional.clone(), true),
+                    values
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.as_str().unwrap().to_owned())
+                        .collect(),
+                );
+            }
+        }
+    }
+    for arg in ENUM_ARGUMENTS {
+        let key = (
+            arg.operation.to_owned(),
+            arg.argument.to_owned(),
+            arg.positional,
+        );
+        assert!(
+            schema_values.contains_key(&key),
+            "{}: no schema --json row publishes values for {}.{}",
+            arg.label,
+            arg.operation,
+            arg.argument
+        );
+        let values = schema_values.get(&key).unwrap();
+        assert!(
+            !values.is_empty(),
+            "{}: schema --json publishes an empty set",
+            arg.label
+        );
+    }
+    for (key, _) in &schema_values {
+        let (operation, argument, positional) = key;
+        assert!(
+            ENUM_ARGUMENTS.iter().any(|arg| {
+                arg.operation == operation
+                    && arg.argument == argument
+                    && arg.positional == *positional
+            }),
+            "schema --json publishes values for {operation} {argument} but no ENUM_ARGUMENTS row proves its refusal names them"
+        );
+    }
+    drop(fixture);
+
+    for arg in ENUM_ARGUMENTS {
+        let fixture = Fixture::new(&format!("enum-{}", arg.label));
+        fixture.ok_json(&fixture.main, &["init", "--name", "ENUM", "--json"]);
+        let context = (arg.prepare)(&fixture);
+        let bogus = "bogus-value";
+        let argv: Vec<String> = arg
+            .argv
+            .iter()
+            .map(|token| match *token {
+                "@ctx@" => context.clone(),
+                "@bogus@" => bogus.to_owned(),
+                _ => (*token).to_owned(),
+            })
+            .collect();
+        let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let refused = fixture.run(&fixture.main, &borrowed);
+        let message = refusal_object(&refused);
+        let values = schema_values
+            .get(&(
+                arg.operation.to_owned(),
+                arg.argument.to_owned(),
+                arg.positional,
+            ))
+            .unwrap();
+        for value in values {
+            assert!(
+                message.contains(value.as_str()),
+                "{}: the refusal omits {value:?}: {message}",
+                arg.label
+            );
+        }
+    }
+}
+
+/// `story advance` on an epic names the verb that does move it: an epic has no
+/// gate, and the answer the claim refusal already gives — "claim one of its
+/// children instead" — has no story-advance equivalent, so the discoverable
+/// fix is `task move`. The old refusal said only "not a story".
+#[test]
+fn story_advance_on_an_epic_names_the_working_verb() {
+    let fixture = Fixture::new("story-advance-epic");
+    fixture.ok_json(&fixture.main, &["init", "--name", "STORY", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "the plan", "--type", "epic", "--id", "e-1", "--json",
+        ],
+    );
+    let refused = fixture.run(
+        &fixture.main,
+        &["story", "advance", "e-1", "--as", "agent", "--json"],
+    );
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains("is an epic") && message.contains("only a story advances"),
+        "{message}"
+    );
+    assert!(
+        message.contains("task move e-1 <status>"),
+        "the refusal does not name the verb that moves an epic: {message}"
+    );
+    assert!(!message.contains("a epic"), "{message}");
+}
+
 /// The survey's numbers are counted, not fetched: `pendingHandoffs` was the
 /// length of a 100-row listing page and `openAttention` of a 1000-row one, so
 /// a board holding 101 and 1001 reported 100 and 1000 with nothing to say

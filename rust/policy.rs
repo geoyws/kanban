@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// The closed capability vocabulary, in the same order [`Capability::from_str`]
+/// accepts. One list so the refusal, the manifest and the help text name one
+/// set rather than three copies of it.
+pub const CAPABILITIES: [&str; 3] = ["read", "write", "admin"];
+
 /// One capability level. Declaration order is the ordering: `read < write <
 /// admin`. `none` is never stored; it is the absence of a grant row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

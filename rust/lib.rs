@@ -33,7 +33,7 @@ mod watch;
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
-use crate::policy::{Capability, PolicyActor, PolicyContext, ScopeTuple};
+use crate::policy::{CAPABILITIES, Capability, PolicyActor, PolicyContext, ScopeTuple};
 use crate::registry::{
     BoardPathState, PreparedAdoption, Registry, WORKSPACE_ADOPT_HELPER_COMMAND, data_root, now_ms,
     preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
@@ -74,35 +74,35 @@ Usage:
   kanban events [--task ID | --rule ID | --registry] [--kind KIND]
              [--after MS] [--before MS] [--limit N] [--all] [--json]
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
-             [--relation KIND:ID ...] [--prior-status STATUS ...]
-             [--current-status STATUS ...] [--tag NAME ...]
+             [--relation parent:ID|ancestor:ID|depends-on:ID ...] [--prior-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...]
+             [--current-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...] [--tag NAME ...]
              [--cursor TOKEN|0] [--follow] [--all] [--limit N] [--json]
   kanban subscription add --consumer NAME --action NAME --timeout-ms N
              --max-retries N --rate-per-minute N --max-concurrency N --as ACTOR
-             [--id ID] [--subject task:ID] [--relation KIND:ID ...]
-             [--kind KIND ...] [--prior-status STATUS ...]
-             [--current-status STATUS ...] [--tag NAME ...] [--secret-ref NAME] [--json]
+             [--id ID] [--subject task:ID] [--relation parent:ID|ancestor:ID|depends-on:ID ...]
+             [--kind KIND ...] [--prior-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...]
+             [--current-status draft|backlog|todo|in_progress|blocked|review|done|cancelled ...] [--tag NAME ...] [--secret-ref NAME] [--json]
   kanban subscription list [--status active|paused] [--consumer NAME] [--all] [--json]
   kanban subscription show ID [--json]
   kanban subscription pause|resume ID --as ACTOR [--json]
   kanban backup [--output DIRECTORY] [--keep N] [--json]
   kanban archive --older-than-days N --as ACTOR [--dry-run] [--json]
-  kanban deploy start --repo REPO --commit FULL_SHA --tier TIER --environment NAME
+  kanban deploy start --repo REPO --commit FULL_SHA --tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p --environment NAME
              --host HOST --url URL --as ACTOR [--task ID] [--branch NAME]
              [--lane LANE] [--mechanism NAME] [--operation-id ID] [--retry-of ID]
-  kanban deploy finish ID --token TOKEN --result succeeded|failed|cancelled --as ACTOR
+  kanban deploy finish ID --token TOKEN --result succeeded|failed|cancelled|abandoned --as ACTOR
              --phase build|publish|start|verification --receipt TEXT
              [--served-commit FULL_SHA] [--artifact-uri URI]
   kanban deploy abandon ID --as ACTOR --note TEXT [--token TOKEN | --force]
-  kanban deploy show ID | list [--status STATUS] [--tier TIER] [--limit N] [--all]
+  kanban deploy show ID | list [--status started|succeeded|failed|cancelled|abandoned] [--tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p] [--limit N] [--all]
   kanban deploy current
   kanban restore --from DIRECTORY --force [--as ACTOR] [--json]
   kanban task add TITLE [--as ACTOR] [--id ID] [--type epic|story|task] [--parent ID]
-             [--body TEXT | --body-file PATH] [--status draft|backlog|todo|…]
+             [--body TEXT | --body-file PATH] [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled]
              [--priority P0|P1|P2|0-9] [--depends-on ID ...] [--tag NAME ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
              [--stale-minutes N] [--driver-only]
-  kanban task list [--status STATUS] [--tag NAME] [--lane LANE] [--all]
+  kanban task list [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled] [--tag NAME] [--lane LANE] [--all]
              [--with-claims] [--with-relations]
              [--fields id,title,status,... | --no-body] [--json]
   kanban task show ID [--limit N] [--json]
@@ -110,7 +110,7 @@ Usage:
              carry claim, whose holder is claim.agentID. assignee is intent,
              never the lease: an assigned task can be free, a held one
              assigned to someone else)
-  kanban task move ID STATUS --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
+  kanban task move ID draft|backlog|todo|in_progress|blocked|review|done|cancelled --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
   kanban task update ID --as ACTOR [--title TEXT] [--body TEXT | --body-file PATH]
              [--priority P0|P1|P2|0-9] [--parent ID | --clear-parent]
@@ -119,7 +119,7 @@ Usage:
              [--deliverable TEXT | --clear-deliverable] [--stale-minutes N]
              [--driver-only | --no-driver-only] [--json]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
-  kanban story advance ID --as ACTOR [--to STATE] [--reviewer AGENT] [--committer AGENT]
+  kanban story advance ID --as ACTOR [--to planning|ready|in-progress|testing|review|merging|done] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role ROLE] [--caller-scope driver]
@@ -129,20 +129,20 @@ Usage:
              [--limit N] [--json]
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
-  kanban note ID TEXT --as AGENT [--kind KIND]
+  kanban note ID TEXT --as AGENT [--kind plan|progress|blocker|decision|evidence|done]
   kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT
-             --next-action TEXT [--session ID] [--model NAME] [--state STATE]
+             --next-action TEXT [--session ID] [--model NAME] [--state continue|blocked|done]
              [--blocker TEXT ...] [--validation TEXT ...]
              [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
   kanban handoff create [ID --lease TOKEN] --as AGENT --summary TEXT --intent TEXT
              --next-action TEXT [--priority P0|P1|P2|0-9] [--to AGENT]
-             [--reason TEXT] [--session ID] [--model NAME]
+             [--reason token_pressure|provider_limit|session_end|manual] [--session ID] [--model NAME]
              [--blocker TEXT ...] [--validation TEXT ...]
              [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
              (without ID: a session handoff, about no one task)
              (--repo, --branch, --head and --dirty are captured from the cwd's
              git checkout when omitted; an explicit flag overrides the capture)
-  kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--limit N] [--all] [--json]
+  kanban handoff list [--task ID] [--status pending|accepted|cancelled|retired] [--to AGENT] [--limit N] [--all] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
              [--caller-scope driver] [--json]
   kanban handoff retire ID --as AGENT --note TEXT [--json]
@@ -165,7 +165,7 @@ Usage:
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--priority P0|P1|P2|0-9]
              [--task ID] [--tag NAME ...] [--json]
-  kanban attention list [--status open|resolved] [--kind KIND] [--task ID] [--tag NAME]
+  kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk] [--task ID] [--tag NAME]
              [--lane LANE] [--all] [--limit N]
              [--fields id,kind,status,... | --no-body] [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
@@ -1296,6 +1296,233 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
 ];
 
+/// Whether an enum-valued argument is a flag or a positional.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgSlot {
+    Flag,
+    Positional,
+}
+
+/// One enum-valued argument on the command surface: which operation it belongs
+/// to, whether it is a flag or a positional, its name, and the closed set of
+/// values it accepts.
+///
+/// This is the single description of every vocabulary the CLI refuses a bad
+/// value from, and it names the same sets `store::validate` refuses against.
+/// [`schema`] projects `values` from it so an adapter can validate before
+/// dispatch (ADR-010), and the e2e enumerates it back out of `schema --json`
+/// so a new enum-valued argument must join here or fail the gate — the same
+/// shape `CAPPED_LISTINGS` uses for ADR-037. Open vocabularies (watch/event
+/// `--kind`, which accept built-ins plus any kind a board has already emitted)
+/// and the numeric `--priority` band are deliberately absent: they are not a
+/// closed set.
+pub(crate) struct EnumArgument {
+    pub command: &'static str,
+    pub sub: Option<&'static str>,
+    pub slot: ArgSlot,
+    pub name: &'static str,
+    pub values: &'static [&'static str],
+}
+
+pub(crate) const ENUM_ARGUMENTS: &[EnumArgument] = &[
+    EnumArgument {
+        command: "checkpoint",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "state",
+        values: &CHECKPOINT_STATES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "type",
+        values: &TASK_TYPES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "task",
+        sub: Some("move"),
+        slot: ArgSlot::Positional,
+        name: "status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "note",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "kind",
+        values: &NOTE_KINDS,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("raise"),
+        slot: ArgSlot::Flag,
+        name: "kind",
+        values: &ATTENTION_KINDS,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "kind",
+        values: &ATTENTION_KINDS,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &ATTENTION_STATUSES,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("start"),
+        slot: ArgSlot::Flag,
+        name: "tier",
+        values: &DEPLOYMENT_TIERS,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "tier",
+        values: &DEPLOYMENT_TIERS,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &DEPLOYMENT_STATUSES,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("finish"),
+        slot: ArgSlot::Flag,
+        name: "result",
+        values: &DEPLOYMENT_RESULTS,
+    },
+    EnumArgument {
+        command: "deploy",
+        sub: Some("finish"),
+        slot: ArgSlot::Flag,
+        name: "phase",
+        values: &DEPLOYMENT_PHASES,
+    },
+    EnumArgument {
+        command: "handoff",
+        sub: Some("create"),
+        slot: ArgSlot::Flag,
+        name: "reason",
+        values: &HANDOFF_REASONS,
+    },
+    EnumArgument {
+        command: "handoff",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &HANDOFF_STATUSES,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "relation",
+        values: &RELATION_KINDS,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "prior-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("add"),
+        slot: ArgSlot::Flag,
+        name: "current-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "subscription",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &SUBSCRIPTION_STATUSES,
+    },
+    EnumArgument {
+        command: "story",
+        sub: Some("advance"),
+        slot: ArgSlot::Flag,
+        name: "to",
+        values: &STORY_FLOW,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "relation",
+        values: &RELATION_KINDS,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "prior-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "watch",
+        sub: None,
+        slot: ArgSlot::Flag,
+        name: "current-status",
+        values: &TASK_STATUSES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("grant"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("revoke"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("explain"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+    EnumArgument {
+        command: "access",
+        sub: Some("audit"),
+        slot: ArgSlot::Flag,
+        name: "capability",
+        values: &CAPABILITIES,
+    },
+];
+
 /// The flags a command accepts, and the positionals it takes after its own
 /// name, in order. A leading `?` marks one the command can do without.
 ///
@@ -2019,6 +2246,14 @@ pub(crate) fn schema() -> Value {
                 Some(sub) => format!("{command} {sub}"),
                 None => (*command).to_owned(),
             };
+            let enum_arg = |slot: ArgSlot, name: &str| {
+                ENUM_ARGUMENTS.iter().find(|arg| {
+                    arg.command == *command
+                        && arg.sub == *sub
+                        && arg.slot == slot
+                        && arg.name == name
+                })
+            };
             let flags = flags
                 .iter()
                 .map(|flag| {
@@ -2033,9 +2268,23 @@ pub(crate) fn schema() -> Value {
                     } else {
                         "value"
                     };
-                    json!({ "name": flag, "kind": kind })
+                    match enum_arg(ArgSlot::Flag, flag) {
+                        Some(arg) => json!({ "name": flag, "kind": kind, "values": arg.values }),
+                        None => json!({ "name": flag, "kind": kind }),
+                    }
                 })
                 .collect::<Vec<_>>();
+            // A positional's accepted set, when it has one (`task move`'s
+            // `status`). Sibling to `positionals` rather than a change to its
+            // shape, so consumers that read the slot names stay intact.
+            let positional_values: Map<String, Value> = positionals
+                .iter()
+                .filter_map(|positional| {
+                    let positional = positional.trim_start_matches('?');
+                    enum_arg(ArgSlot::Positional, positional)
+                        .map(|arg| ((*positional).to_owned(), json!(arg.values)))
+                })
+                .collect();
             json!({
                 "name": name,
                 "command": command,
@@ -2046,6 +2295,9 @@ pub(crate) fn schema() -> Value {
                 // list rather than guess at what the slots mean. A leading
                 // `?` marks one the command can do without.
                 "positionals": positionals,
+                // The accepted values of any enum-valued positional, keyed by
+                // the positional's name. Absent for operations with none.
+                "positionalValues": positional_values,
                 "readOnly": read_only,
                 // Distinct from `readOnly`, which asks whether the operation
                 // writes anything anywhere. This asks the narrower question the
@@ -6439,6 +6691,76 @@ mod tests {
         );
         assert!(command_spec("frobnicate", None).is_none());
         assert!(command_spec("task", Some("frobnicate")).is_none());
+    }
+
+    #[test]
+    fn every_enum_argument_names_a_real_command_flag_or_positional_and_a_closed_set() {
+        // The ENUM_ARGUMENTS table is the single source for the `values` the
+        // manifest publishes, so a stale row that names a command, flag or
+        // positional that does not exist (or a set that is empty or repeats a
+        // value) fails here rather than advertising a fiction to an adapter.
+        for (command, sub, flags, positionals, _) in COMMANDS {
+            let named = ENUM_ARGUMENTS
+                .iter()
+                .filter(|arg| arg.command == *command && arg.sub == *sub)
+                .collect::<Vec<_>>();
+            let mut keys = named
+                .iter()
+                .map(|arg| (arg.slot, arg.name))
+                .collect::<Vec<_>>();
+            keys.sort_unstable_by_key(|(slot, name)| {
+                (u8::from(*slot == ArgSlot::Positional), *name)
+            });
+            let before = keys.len();
+            keys.dedup_by_key(|(slot, name)| (*slot, *name));
+            assert_eq!(
+                before,
+                keys.len(),
+                "{command} {sub:?} declares the same enum argument twice"
+            );
+            for arg in named {
+                assert!(
+                    !arg.values.is_empty(),
+                    "{command} {sub:?} --{} declares an empty set",
+                    arg.name
+                );
+                let mut values = arg.values.to_vec();
+                values.sort_unstable();
+                let before = values.len();
+                values.dedup();
+                assert_eq!(
+                    before,
+                    values.len(),
+                    "{command} {sub:?} --{} repeats a value",
+                    arg.name
+                );
+                match arg.slot {
+                    ArgSlot::Flag => assert!(
+                        flags.contains(&arg.name),
+                        "{command} {sub:?}: --{} is enum-valued but not a flag of the command",
+                        arg.name
+                    ),
+                    ArgSlot::Positional => assert!(
+                        positionals
+                            .iter()
+                            .any(|p| p.trim_start_matches('?') == arg.name),
+                        "{command} {sub:?}: {arg} is enum-valued but not a positional of the command",
+                        arg = arg.name
+                    ),
+                }
+            }
+        }
+        // Every row belongs to a real command.
+        for arg in ENUM_ARGUMENTS {
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(name, expected, ..)| *name == arg.command && *expected == arg.sub),
+                "{} {:?} is enum-valued but not a command",
+                arg.command,
+                arg.sub
+            );
+        }
     }
 
     #[test]

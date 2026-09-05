@@ -54,9 +54,27 @@ fn validate_rule_body(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// "a", "b" or "c", with the Oxford comma the capability refusal already uses.
+/// A refusal that names every value it accepts is the ADR-008 shape: the
+/// caller reads the exit status and the fix in one message.
+fn expected_values(allowed: &[&str]) -> String {
+    match allowed.len() {
+        0 => String::new(),
+        1 => allowed[0].to_owned(),
+        2 => format!("{} or {}", allowed[0], allowed[1]),
+        _ => {
+            let (last, rest) = allowed.split_last().expect("non-empty");
+            format!("{}, or {last}", rest.join(", "))
+        }
+    }
+}
+
 fn validate(value: &str, allowed: &[&str], label: &str) -> Result<()> {
     if !allowed.contains(&value) {
-        bail!("invalid {label} {value}");
+        bail!(
+            "invalid {label} {value}; expected {}",
+            expected_values(allowed)
+        );
     }
     Ok(())
 }
@@ -223,16 +241,26 @@ fn require_claimable_type(id: &str, task_type: &str) -> Result<()> {
     Ok(())
 }
 
-/// The story gate, in order. A story moves one step at a time along this list.
-const STORY_FLOW: [&str; 7] = [
-    "planning",
-    "ready",
-    "in-progress",
-    "testing",
-    "review",
-    "merging",
-    "done",
-];
+/// Refuse a story verb on anything but a story.
+///
+/// The mirror of [`require_claimable_type`]: `story advance` and `story
+/// signoff` walk a story's gate, and an epic or a task has none. An epic's
+/// status is moved by the gate exactly once and then by `task move` — no
+/// `epic advance` verb exists — so the refusal names the verb that does work
+/// rather than only saying "not a story" (ADR-008: a refusal is its own fix).
+fn require_story_type(id: &str, task_type: &str, verb: &str) -> Result<()> {
+    if task_type == "story" {
+        return Ok(());
+    }
+    let remedy = match task_type {
+        "epic" => format!("move it with `task move {id} <status>` instead"),
+        _ => format!("a {task_type} has no workflow gate"),
+    };
+    bail!(
+        "task {id} is {} {task_type}, and only a story {verb}: {remedy}",
+        article(task_type)
+    );
+}
 
 /// The task status a story's gate state projects onto the row.
 ///
@@ -1795,11 +1823,7 @@ impl Store {
             let (kind, target) = relation
                 .split_once(':')
                 .context("subscription relation must be KIND:ID")?;
-            validate(
-                kind,
-                &["parent", "ancestor", "depends-on"],
-                "subscription relation kind",
-            )?;
+            validate(kind, &RELATION_KINDS, "subscription relation kind")?;
             if target.trim().is_empty() || target != target.trim() {
                 bail!("subscription relation target is required");
             }
@@ -3587,11 +3611,7 @@ impl Store {
     }
 
     pub fn checkpoint(&mut self, input: CheckpointInput) -> Result<Checkpoint> {
-        validate(
-            &input.state,
-            &["continue", "blocked", "done"],
-            "checkpoint state",
-        )?;
+        validate(&input.state, &CHECKPOINT_STATES, "checkpoint state")?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3984,7 +4004,7 @@ impl Store {
         include_archived: bool,
     ) -> Result<Vec<Attention>> {
         if let Some(value) = status {
-            validate(value, &["open", "resolved"], "attention status")?;
+            validate(value, &ATTENTION_STATUSES, "attention status")?;
         }
         if let Some(value) = kind {
             validate(value, &ATTENTION_KINDS, "attention kind")?;
@@ -4315,11 +4335,7 @@ impl Store {
         include_archived: bool,
     ) -> Result<Vec<Handoff>> {
         if let Some(value) = status {
-            validate(
-                value,
-                &["pending", "accepted", "cancelled", "retired"],
-                "handoff status",
-            )?;
+            validate(value, &HANDOFF_STATUSES, "handoff status")?;
         }
         if let Some(id) = task {
             require_task(&self.connection, id)?;
@@ -4655,9 +4671,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let story = require_active_task(&transaction, id)?;
-        if story.task_type != "story" {
-            bail!("task {id} is not a story");
-        }
+        require_story_type(id, &story.task_type, "takes signoff")?;
         if story.metadata.get("workflowStatus").and_then(Value::as_str) != Some("review") {
             bail!("story signoff is only valid in review");
         }
@@ -4720,9 +4734,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let story = require_active_task(&transaction, id)?;
-        if story.task_type != "story" {
-            bail!("task {id} is not a story");
-        }
+        require_story_type(id, &story.task_type, "advances")?;
         let current = story
             .metadata
             .get("workflowStatus")
@@ -5202,11 +5214,7 @@ impl Store {
     }
 
     pub fn finish_deployment(&mut self, input: FinishDeployment) -> Result<DeploymentAttempt> {
-        validate(
-            &input.result,
-            &DEPLOYMENT_STATUSES[1..],
-            "deployment result",
-        )?;
+        validate(&input.result, &DEPLOYMENT_RESULTS, "deployment result")?;
         if input.result == "abandoned" {
             bail!("use deploy abandon for an abandoned attempt");
         }
