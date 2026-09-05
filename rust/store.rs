@@ -3806,16 +3806,18 @@ impl Store {
     /// enough that an agent writes twenty a day, because the alternative it is
     /// competing with is a reply that scrolls away.
     ///
-    /// Provenance is captured rather than asked for, the same way a claim's is
-    /// — an update that says "tests green" without saying which checkout is a
-    /// claim nobody can check.
+    /// Provenance is refused rather than stored blank, the same rule the CLI
+    /// applies to checkpoints and handoffs — an update that says "tests green"
+    /// without saying which checkout is a claim nobody can check. `provenance`
+    /// is `None` only for the dashboard fixtures that seed a sitrep with no
+    /// checkout at all.
     pub fn post_sitrep(
         &mut self,
         lane: &str,
         body: &str,
         author: &str,
         task_id: Option<&str>,
-        git: Option<&crate::gitctx::GitContext>,
+        provenance: Option<&crate::Provenance>,
     ) -> Result<Sitrep> {
         let lane = nonempty(lane, "lane")?.to_owned();
         let body = nonempty(body, "sitrep body")?.to_owned();
@@ -3837,11 +3839,11 @@ impl Store {
                 task_id,
                 author,
                 body,
-                git.map(|c| c.worktree.clone()),
-                git.and_then(|c| c.branch.clone()),
-                git.map(|c| c.head.clone()),
-                git.and_then(|c| c.root_head.clone()),
-                git.map(crate::gitctx::dirty_summary),
+                provenance.map(|p| p.repo_path.clone()),
+                provenance.map(|p| p.branch.clone()),
+                provenance.map(|p| p.head_sha.clone()),
+                provenance.as_ref().and_then(|p| p.root_head.clone()),
+                provenance.map(|p| p.dirty_summary.clone()),
                 now,
             ],
         )?;

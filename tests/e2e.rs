@@ -46,6 +46,12 @@ impl Fixture {
         let worktree = root.join("worktree");
         fs::create_dir_all(&main).unwrap();
         fs::create_dir_all(&worktree).unwrap();
+        // Both cwds are git repositories so provenance-bearing writes
+        // (checkpoint, handoff create, sitrep post) capture a checkout instead
+        // of refusing. Best-effort: without git the dirs stay plain, and only
+        // tests that explicitly need provenance will fail.
+        let _ = make_repo(&main);
+        let _ = make_repo(&worktree);
         Self {
             root,
             data,
@@ -14319,6 +14325,8 @@ fn a_plan_is_an_epic_whose_body_survives_being_revised() {
 
 /// Make `dir` a git repository with one commit, so provenance has something to
 /// resolve. Returns false when git is unavailable, which is not a test failure.
+/// Idempotent: a directory already carrying a commit is left untouched, because
+/// a second `commit` over a clean tree would fail and be misread as no repo.
 fn make_repo(dir: &Path) -> bool {
     let run = |args: &[&str]| {
         Command::new("git")
@@ -14333,6 +14341,9 @@ fn make_repo(dir: &Path) -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false)
     };
+    if run(&["rev-parse", "--show-toplevel"]) {
+        return run(&["rev-parse", "HEAD"]);
+    }
     if !run(&["init", "-q", "-b", "work"]) {
         return false;
     }
@@ -14500,17 +14511,21 @@ fn where_work_happened_is_captured_rather_than_asked_for() {
 
 #[test]
 fn a_command_outside_a_repository_records_no_provenance() {
-    // Capture is opportunistic. Running outside a repository is not an error --
-    // it simply has no git context, and recording none is the truthful outcome.
+    // Claim is best-effort: running outside a repository is not an error -- it
+    // simply has no git context, and recording none is the truthful outcome.
+    // (A checkpoint/handoff/sitrep would refuse here; a claim is legitimate.)
     let fixture = Fixture::new("provenance-none");
-    fs::create_dir_all(&fixture.main).unwrap();
-    fixture.ok_json(&fixture.main, &["init", "--name", "NONE", "--json"]);
+    // The fixture's cwds are git repositories now, so stand in a plain sibling
+    // directory to observe the no-repository path.
+    let plain = fixture.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    fixture.ok_json(&plain, &["init", "--name", "NONE", "--json"]);
     fixture.ok_json(
-        &fixture.main,
+        &plain,
         &["task", "add", "Work", "--id", "t-1", "--json"],
     );
 
-    let claim = fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    let claim = fixture.ok_json(&plain, &["claim", "t-1", "--as", "worker", "--json"]);
     assert!(claim["worktree"].is_null(), "provenance was invented");
     assert!(claim["branch"].is_null());
     assert!(claim["headSha"].is_null());
@@ -14518,9 +14533,184 @@ fn a_command_outside_a_repository_records_no_provenance() {
     // And the command itself is unaffected.
     assert_eq!(claim["taskID"], "t-1");
     assert_eq!(
-        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["status"],
+        fixture.ok_json(&plain, &["task", "show", "t-1", "--json"])["status"],
         "in_progress"
     );
+}
+
+#[test]
+fn a_provenance_write_outside_a_checkout_is_refused_and_flags_are_validated() {
+    // ADR-008: a field that says something and holds nothing is refused. Run
+    // each provenance-bearing write from a plain (non-repository) directory
+    // with no flags, and require a refusal that names every flag and kb-board.
+    let fixture = Fixture::new("provenance-refused");
+    let plain = fixture.root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    fixture.ok_json(&plain, &["init", "--name", "REFUSED", "--json"]);
+    fixture.ok_json(
+        &plain,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+    let claim = fixture.ok_json(&plain, &["claim", "t-1", "--as", "worker", "--json"]);
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+
+    let refuses_blank = |args: &[&str]| {
+        let output = fixture.run(&plain, args);
+        assert!(
+            !output.status.success(),
+            "a provenance write from outside a checkout succeeded: {args:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        for needle in ["--repo", "--branch", "--head", "--dirty", "kb-board"] {
+            assert!(
+                stderr.contains(needle),
+                "the refusal must name {needle}: {stderr}"
+            );
+        }
+    };
+
+    refuses_blank(&[
+        "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
+        "--intent", "i", "--next-action", "n", "--json",
+    ]);
+    refuses_blank(&[
+        "handoff", "create", "--as", "worker", "--summary", "s", "--intent", "i",
+        "--next-action", "n", "--json",
+    ]);
+    refuses_blank(&[
+        "sitrep", "post", "Where I stand", "--as", "worker", "--lane", "driver-2", "--json",
+    ]);
+
+    // An explicit flag that smuggles garbage is refused by its shape, not
+    // trusted: a HEAD must be hex (full 40 or at least 7), and --dirty must
+    // read like `git status` (the exact wording kb-board writes).
+    let head_shape = fixture.run(
+        &plain,
+        &[
+            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
+            "--intent", "i", "--next-action", "n", "--repo", "/tmp/r", "--branch", "b",
+            "--head", "zzz", "--dirty", "clean", "--json",
+        ],
+    );
+    assert!(!head_shape.status.success(), "a non-hex --head was accepted");
+    assert!(
+        String::from_utf8_lossy(&head_shape.stderr).contains("--head"),
+        "the shape refusal must name --head: {}",
+        String::from_utf8_lossy(&head_shape.stderr)
+    );
+
+    let dirty_wording = fixture.run(
+        &plain,
+        &[
+            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
+            "--intent", "i", "--next-action", "n", "--repo", "/tmp/r", "--branch", "b",
+            "--head", "0123456789abcdef0123456789abcdef01234567", "--dirty", "3 files", "--json",
+        ],
+    );
+    assert!(!dirty_wording.status.success(), "a malformed --dirty was accepted");
+    assert!(
+        String::from_utf8_lossy(&dirty_wording.stderr).contains("--dirty"),
+        "the wording refusal must name --dirty: {}",
+        String::from_utf8_lossy(&dirty_wording.stderr)
+    );
+}
+
+#[test]
+fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
+    // (b) Explicit flags are stored verbatim, so a caller whose checkout is not
+    // the process cwd can still ship the truth across a process boundary.
+    let fixture = Fixture::new("provenance-roundtrip");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RT", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Work", "--id", "t-1", "--json"],
+    );
+    let claim = fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "worker", "--json"]);
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    let checkpoint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
+            "--intent", "i", "--next-action", "n", "--repo", "/tmp/example-repo",
+            "--branch", "feature-x", "--head", head, "--dirty", "2 files changed", "--json",
+        ],
+    );
+    assert_eq!(checkpoint["repoPath"], "/tmp/example-repo");
+    assert_eq!(checkpoint["branch"], "feature-x");
+    assert_eq!(checkpoint["headSha"], head);
+    assert_eq!(checkpoint["dirtySummary"], "2 files changed");
+    // Read back through the same surface a resuming agent would use.
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(shown["checkpoints"][0]["repoPath"], "/tmp/example-repo");
+    assert_eq!(shown["checkpoints"][0]["headSha"], head);
+    assert_eq!(shown["checkpoints"][0]["dirtySummary"], "2 files changed");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff", "create", "--as", "worker", "--summary", "s", "--intent", "i",
+            "--next-action", "n", "--repo", "/tmp/example-repo", "--branch", "feature-x",
+            "--head", head, "--dirty", "2 files changed", "--json",
+        ],
+    );
+    let listed = fixture.ok_json(&fixture.main, &["handoff", "list", "--json"]);
+    let row = &listed.as_array().unwrap()[0];
+    assert_eq!(row["repoPath"], "/tmp/example-repo");
+    assert_eq!(row["branch"], "feature-x");
+    assert_eq!(row["headSha"], head);
+    assert_eq!(row["dirtySummary"], "2 files changed");
+
+    let sitrep = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep", "post", "Where I stand", "--as", "worker", "--lane", "driver-2",
+            "--repo", "/tmp/example-repo", "--branch", "feature-x", "--head", head,
+            "--dirty", "2 files changed", "--json",
+        ],
+    );
+    assert_eq!(sitrep["worktree"], "/tmp/example-repo");
+    assert_eq!(sitrep["branch"], "feature-x");
+    assert_eq!(sitrep["headSha"], head);
+    assert_eq!(sitrep["dirtySummary"], "2 files changed");
+    let sitrep_listed = fixture.ok_json(&fixture.main, &["sitrep", "list", "--json"]);
+    assert_eq!(
+        sitrep_listed.as_array().unwrap()[0]["worktree"],
+        "/tmp/example-repo"
+    );
+
+    // (c) With no flags, capture resolves the checkout the command runs in.
+    // `main` is a git repository (the fixture made it one), so the recorded
+    // values equal that checkout's real HEAD, branch and dirty count.
+    let real_head = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.main)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        real_head.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&real_head.stderr)
+    );
+    let real_head = String::from_utf8(real_head.stdout).unwrap().trim().to_owned();
+
+    let captured = fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint", "t-1", "--lease", &token, "--as", "worker", "--summary", "s",
+            "--intent", "i", "--next-action", "n", "--json",
+        ],
+    );
+    assert!(
+        captured["repoPath"].as_str().unwrap().ends_with("main"),
+        "captured repoPath is not the checkout: {}",
+        captured["repoPath"]
+    );
+    assert_eq!(captured["branch"], "work");
+    assert_eq!(captured["headSha"], real_head);
+    assert_eq!(captured["dirtySummary"], "clean");
 }
 
 #[test]
@@ -18075,8 +18265,9 @@ fn a_sitrep_costs_one_command_and_retires_what_it_supersedes() {
 
     // Provenance is captured, not asked for -- an update saying "tests green"
     // without saying which checkout is a claim nobody can check. The fixture
-    // is not a repository, so it is recorded as absent rather than invented.
-    assert_eq!(mine[0]["branch"], serde_json::Value::Null);
+    // cwd is a git repository, so the branch is captured rather than invented;
+    // outside any checkout this write is refused, never stored blank.
+    assert_eq!(mine[0]["branch"], "work");
 
     // Auto-archiving. Ten stay current per lane; the eleventh does not delete
     // the first, it retires it.
