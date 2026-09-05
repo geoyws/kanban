@@ -9680,6 +9680,22 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "events" => vec!["events"],
             "stale" => vec!["stale"],
             "context" => vec!["context", "t-1"],
+            "access principal show" => {
+                vec!["access", "principal", "show", "--principal", "p-00000000"]
+            }
+            "access principal list" => vec!["access", "principal", "list"],
+            "access explain" => vec![
+                "access",
+                "explain",
+                "--principal",
+                "p-00000000",
+                "--capability",
+                "read",
+                "--scope",
+                "registry",
+            ],
+            "access audit" => vec!["access", "audit"],
+            "access enforcement show" => vec!["access", "enforcement", "show"],
             _ => return None,
         };
         Some(base.into_iter().map(str::to_owned).collect())
@@ -14001,6 +14017,36 @@ const CAPPED_LISTINGS: &[CappedListing] = &[
                     ],
                 )
                 .unwrap();
+        },
+    },
+    CappedListing {
+        label: "access-audit",
+        argv: &["access", "audit"],
+        default: 50,
+        rows: None,
+        prepare: seed_nothing,
+        // A refused `access` attempt appends exactly one denied access-audit
+        // row and no policy event (clause 4), so one denied grant per index
+        // seeds exactly one row of what `access audit` lists.
+        seed: |fixture, _, _index| {
+            let _ = fixture.run(
+                &fixture.main,
+                &[
+                    "access",
+                    "grant",
+                    "--principal",
+                    "p-deadbeef",
+                    "--capability",
+                    "read",
+                    "--scope",
+                    "registry",
+                    "--as",
+                    "geoyws",
+                    "--reason",
+                    "seed",
+                    "--json",
+                ],
+            );
         },
     },
 ];

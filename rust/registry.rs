@@ -1727,6 +1727,24 @@ impl Registry {
         Self::open_readonly_at(&data_root()?)
     }
 
+    /// Open the registry read-only for a policy READ, or report that there is
+    /// no registry yet.
+    ///
+    /// A fresh install has no `registry.db`, and `routing::enforcement_state_at`
+    /// already rules that this is an unmanaged `direct` estate rather than an
+    /// error. The access reads must agree with it: `access enforcement show` is
+    /// among the first things an operator runs, and leaking SQLite's `unable to
+    /// open database file` there both contradicts that ruling and exposes a
+    /// path the caller did not ask about.
+    pub fn open_readonly_if_present() -> Result<Option<Self>> {
+        let root = data_root()?;
+        match fs::symlink_metadata(root.join("registry.db")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+            Ok(_) => Self::open_readonly_at(&root).map(Some),
+        }
+    }
+
     /// Open a named registry root read-only, without consulting the environment.
     ///
     /// `open_readonly` re-resolves `data_root()` on every call, which is wrong

@@ -402,6 +402,8 @@ pub struct PolicyEventPayload {
     pub source: Option<PrincipalValue>,
     pub successor: Option<PrincipalValue>,
     pub delta: PolicyDelta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement: Option<serde_json::Value>,
     pub effect: PolicyEffect,
 }
 
@@ -1307,6 +1309,181 @@ fn compute_empty_state_hash() -> String {
     audit::bytes_sha256(b"enforcement=direct")
 }
 
+/// A proof's lifetime. Proofs are one-shot authorizations minted by the broker
+/// (or, for `rebind`, by an administrator via `prove-rebind`); they never
+/// advance the epoch (clause 8) and expire after this window.
+const PROOF_TTL_MS: i64 = 15 * 60 * 1000;
+
+/// Project one `policy_events` row to the ADR-038 audit shape: the payload
+/// without the store-internal `effect`, plus the table's `seq` and hash links.
+fn policy_event_projection(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    let seq: i64 = row.get(0)?;
+    let prev_hash: Option<String> = row.get(1)?;
+    let event_hash: Option<String> = row.get(2)?;
+    let payload: String = row.get(3)?;
+    let event: PolicyEventPayload = serde_json::from_str(&payload).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let mut value = serde_json::to_value(&event).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("effect");
+        obj.insert("seq".into(), serde_json::json!(seq));
+        obj.insert(
+            "previousHash".into(),
+            serde_json::to_value(prev_hash).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "eventHash".into(),
+            serde_json::to_value(event_hash).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Ok(value)
+}
+
+/// Project one `access_audit` row to the ADR-038 audit shape: the payload plus
+/// the table's `seq` and hash links.
+fn access_audit_projection(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    let seq: i64 = row.get(0)?;
+    let prev_hash: Option<String> = row.get(1)?;
+    let event_hash: Option<String> = row.get(2)?;
+    let payload: String = row.get(3)?;
+    let event: AccessAuditPayload = serde_json::from_str(&payload).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let mut value = serde_json::to_value(&event).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("seq".into(), serde_json::json!(seq));
+        obj.insert(
+            "previousHash".into(),
+            serde_json::to_value(prev_hash).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "eventHash".into(),
+            serde_json::to_value(event_hash).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Ok(value)
+}
+
+fn audit_get_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(|v| v.as_str())
+}
+
+/// Apply the clause-12 `audit` filters to a projected policy event.
+fn audit_policy_matches(
+    value: &serde_json::Value,
+    principal: Option<&str>,
+    actor_principal: Option<&str>,
+    kind: Option<&str>,
+    capability: Option<Capability>,
+    scope: Option<&ScopeTuple>,
+    after_epoch: Option<i64>,
+) -> bool {
+    if let Some(k) = kind {
+        if audit_get_str(value, "kind") != Some(k) {
+            return false;
+        }
+    }
+    if let Some(actor) = actor_principal {
+        if audit_get_str(value, "actorPrincipalID") != Some(actor) {
+            return false;
+        }
+    }
+    if let Some(p) = principal {
+        let target = audit_get_str(value, "targetPrincipalID") == Some(p);
+        let actor = audit_get_str(value, "actorPrincipalID") == Some(p);
+        if !target && !actor {
+            return false;
+        }
+    }
+    if capability.is_some() || scope.is_some() {
+        // Capability and scope are not carried on a policy event's projection;
+        // a tuple filter excludes every policy event (clause 12: the scope
+        // filter must form one tuple, and policy events do not name one).
+        return false;
+    }
+    if let Some(after) = after_epoch {
+        if value
+            .get("afterEpoch")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            < after
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply the clause-12 `audit` filters to a projected access-audit event.
+fn audit_access_matches(
+    value: &serde_json::Value,
+    principal: Option<&str>,
+    actor_principal: Option<&str>,
+    kind: Option<&str>,
+    capability: Option<Capability>,
+    scope: Option<&ScopeTuple>,
+    after_epoch: Option<i64>,
+) -> bool {
+    if let Some(k) = kind {
+        if audit_get_str(value, "operation") != Some(k) {
+            return false;
+        }
+    }
+    if let Some(actor) = actor_principal {
+        if audit_get_str(value, "actorPrincipalID") != Some(actor) {
+            return false;
+        }
+    }
+    if let Some(p) = principal {
+        if audit_get_str(value, "actorPrincipalID") != Some(p) {
+            return false;
+        }
+    }
+    if let Some(cap) = capability {
+        if audit_get_str(value, "requestedCapability") != Some(cap.as_str()) {
+            return false;
+        }
+    }
+    if let Some(tuple) = scope {
+        let atoms = tuple.to_atoms();
+        let matched = value
+            .get("requiredScopes")
+            .and_then(|v| v.as_array())
+            .map(|scopes| {
+                scopes.iter().any(|s| {
+                    s.as_array()
+                        .map(|a| {
+                            a.len() == atoms.len()
+                                && a.iter()
+                                    .zip(atoms.iter())
+                                    .all(|(x, y)| x.as_str() == Some(y.as_str()))
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !matched {
+            return false;
+        }
+    }
+    if let Some(after) = after_epoch {
+        if value
+            .get("policyEpoch")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            < after
+        {
+            return false;
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Registry store APIs.
 // ---------------------------------------------------------------------------
@@ -1532,6 +1709,7 @@ impl Registry {
                     seeded_grant_ids: seeded,
                     ..Default::default()
                 },
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) = append_policy_event(&tx, "bootstrap", occurred_at, &event)?;
@@ -1642,6 +1820,7 @@ impl Registry {
                 source: None,
                 successor: None,
                 delta: PolicyDelta::default(),
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) =
@@ -1744,6 +1923,7 @@ impl Registry {
                 source: None,
                 successor: None,
                 delta: PolicyDelta::default(),
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) =
@@ -1974,6 +2154,7 @@ impl Registry {
                     unmapped_mapping_ids: unmapped_ids,
                     ..Default::default()
                 },
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) =
@@ -2100,6 +2281,7 @@ impl Registry {
                     granted_grant_ids: vec![grant_id],
                     ..Default::default()
                 },
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) = append_policy_event(&tx, "grant_added", occurred_at, &event)?;
@@ -2207,6 +2389,7 @@ impl Registry {
                         revoked_grant_ids: vec![grant.id.clone()],
                         ..Default::default()
                     },
+                    enforcement: None,
                     effect,
                 };
                 let (seq, event_hash) =
@@ -2350,6 +2533,7 @@ impl Registry {
                     mapped_mapping_ids: vec![mapping_id],
                     ..Default::default()
                 },
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) = append_policy_event(&tx, "sso_mapped", occurred_at, &event)?;
@@ -2450,6 +2634,7 @@ impl Registry {
                     unmapped_mapping_ids: vec![mapping.id.clone()],
                     ..Default::default()
                 },
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) = append_policy_event(&tx, "sso_unmapped", occurred_at, &event)?;
@@ -2592,6 +2777,7 @@ impl Registry {
                     granted_grant_ids: vec![grant_id],
                     ..Default::default()
                 },
+                enforcement: None,
                 effect,
             };
             let (seq, event_hash) =
@@ -2619,6 +2805,917 @@ impl Registry {
                 Err(error)
             }
         }
+    }
+
+    /// Clause 12 `principal prove-rebind`: mint a `rebind` proof bound to the
+    /// source principal and frozen to the requested successor pair. Proof
+    /// issuance does not advance the epoch (clause 8); it appends only an
+    /// allowed access-audit row.
+    pub fn prove_rebind(
+        &mut self,
+        source_id: &str,
+        username: &str,
+        uid: u32,
+        actor: &PolicyActor,
+    ) -> Result<String> {
+        let username = username.trim().to_owned();
+        if username.is_empty() {
+            bail!("prove-rebind requires a username");
+        }
+        if uid == 0 {
+            bail!("prove-rebind refuses a root pair");
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome: Result<String> = (|| {
+            let epoch = policy_epoch_on(&tx)?;
+            require_context(&tx, actor, "access principal prove-rebind")?;
+            require_registry_admin(&tx, actor, "access principal prove-rebind", epoch)?;
+            let source = principal_row_on(&tx, source_id)?.ok_or_else(|| {
+                deny(
+                    &tx,
+                    actor,
+                    "access principal prove-rebind",
+                    "principal",
+                    "not_found",
+                    epoch,
+                )
+            })?;
+            if !source.enabled {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access principal prove-rebind",
+                    "principal",
+                    "not_enabled",
+                    epoch,
+                ));
+            }
+            if source.username == username && source.uid == uid {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access principal prove-rebind",
+                    "principal",
+                    "same_pair",
+                    epoch,
+                ));
+            }
+            if let Err(error) = check_pair_collision(&tx, &username, uid, &[], Some(source_id)) {
+                let _ = deny(
+                    &tx,
+                    actor,
+                    "access principal prove-rebind",
+                    "principal",
+                    "collision",
+                    epoch,
+                );
+                bail!("{error}");
+            }
+            let proof_id = short_id("pf");
+            let proof_hash =
+                audit::bytes_sha256(format!("rebind:{source_id}:{username}:{uid}").as_bytes());
+            let now = crate::registry::now_ms();
+            tx.execute(
+                "INSERT INTO proofs(proof_id,proof_hash,kind,principal_id,bound_epoch,\
+                        bound_state_hash,expires_at,created_at) \
+                 VALUES(?,?,?,?,?,?,?,?)",
+                params![
+                    proof_id,
+                    proof_hash,
+                    "rebind",
+                    source_id,
+                    epoch,
+                    actor.state_hash,
+                    now + PROOF_TTL_MS,
+                    now
+                ],
+            )?;
+            let audit = allowed_audit(
+                actor,
+                "access principal prove-rebind",
+                epoch,
+                &enforcement_state_on(&tx)?,
+                None,
+                &[],
+                &[],
+            );
+            append_access_audit(&tx, &audit)?;
+            Ok(proof_id)
+        })();
+        match outcome {
+            Ok(proof_id) => {
+                tx.commit()?;
+                Ok(proof_id)
+            }
+            Err(error) => {
+                let _ = tx.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// Verify a `rebind` source proof (clause 12 `--source-proof`): it must
+    /// exist, be a `rebind` proof bound to the source principal, match the
+    /// frozen successor pair, and be unexpired. Fail-closed on any mismatch.
+    pub fn verify_source_proof(
+        &self,
+        proof_id: &str,
+        source_id: &str,
+        username: &str,
+        uid: u32,
+    ) -> Result<()> {
+        let username = username.trim();
+        let now = crate::registry::now_ms();
+        let row: Option<(String, String, String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT proof_hash,kind,principal_id,expires_at FROM proofs WHERE proof_id=?1",
+                params![proof_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((hash, kind, principal, expires_at)) = row else {
+            bail!("denied or not found");
+        };
+        if kind != "rebind" || principal != source_id || expires_at < now {
+            bail!("denied or not found");
+        }
+        let expected =
+            audit::bytes_sha256(format!("rebind:{source_id}:{username}:{uid}").as_bytes());
+        if hash != expected {
+            bail!("denied or not found");
+        }
+        Ok(())
+    }
+
+    /// Verify an `sso_subject` proof (clause 12 `--subject-proof`). Minted only
+    /// by the broker (the web-edge SSO flow), so with the broker socket absent
+    /// no such proof exists and this fails closed.
+    pub fn verify_subject_proof(
+        &self,
+        proof_id: &str,
+        provider: &str,
+        subject: &str,
+    ) -> Result<()> {
+        let now = crate::registry::now_ms();
+        let row: Option<(String, String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT proof_hash,kind,expires_at FROM proofs WHERE proof_id=?1",
+                params![proof_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((hash, kind, expires_at)) = row else {
+            bail!("denied or not found");
+        };
+        if kind != "sso_subject" || expires_at < now {
+            bail!("denied or not found");
+        }
+        let expected = audit::bytes_sha256(format!("sso_subject:{provider}:{subject}").as_bytes());
+        if hash != expected {
+            bail!("denied or not found");
+        }
+        Ok(())
+    }
+
+    /// Clause 7 break-glass: one rebind without a source proof, root-only.
+    pub fn breakglass_principal_rebind(
+        &mut self,
+        source_id: &str,
+        username: &str,
+        uid: u32,
+        replaces: &[String],
+        actor: &PolicyActor,
+    ) -> Result<Principal> {
+        let username = username.trim().to_owned();
+        if username.is_empty() {
+            bail!("rebind requires a username");
+        }
+        if uid == 0 {
+            bail!("breakglass rebind refuses a root pair");
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome: Result<Principal> = (|| {
+            let epoch = policy_epoch_on(&tx)?;
+            if epoch == 0 {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access breakglass principal-rebind",
+                    "enforcement",
+                    "empty_policy",
+                    epoch,
+                ));
+            }
+            let mut source = principal_row_on(&tx, source_id)?.ok_or_else(|| {
+                deny(
+                    &tx,
+                    actor,
+                    "access breakglass principal-rebind",
+                    "principal",
+                    "not_found",
+                    epoch,
+                )
+            })?;
+            if !source.enabled {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access breakglass principal-rebind",
+                    "principal",
+                    "not_enabled",
+                    epoch,
+                ));
+            }
+            if source.username == username && source.uid == uid {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access breakglass principal-rebind",
+                    "principal",
+                    "same_pair",
+                    epoch,
+                ));
+            }
+            if let Err(error) = check_pair_collision(&tx, &username, uid, replaces, Some(source_id))
+            {
+                let _ = deny(
+                    &tx,
+                    actor,
+                    "access breakglass principal-rebind",
+                    "principal",
+                    "collision",
+                    epoch,
+                );
+                bail!("{error}");
+            }
+
+            let seq = journal_next_seq(&tx, "policy_events")?;
+            let event_id = policy_event_id(seq);
+            let successor_id = short_id("p");
+            let successor = PrincipalRow {
+                id: successor_id.clone(),
+                username,
+                uid,
+                enabled: true,
+                bound_at_epoch: epoch + 1,
+                bound_by_event_id: event_id.clone(),
+                disabled_at_epoch: None,
+                disabled_by_event_id: None,
+                successor_id: None,
+                predecessor_id: Some(source_id.to_owned()),
+                replaces: replaces.to_vec(),
+            };
+            source.enabled = false;
+            source.disabled_at_epoch = Some(epoch + 1);
+            source.disabled_by_event_id = Some(event_id.clone());
+            source.successor_id = Some(successor_id.clone());
+
+            let active_grants = active_grants_for_principal_on(&tx, source_id)?;
+            let active_mappings = mappings_for_principal_on(&tx, source_id)?
+                .into_iter()
+                .filter(|m| m.unmapped_at_epoch.is_none())
+                .collect::<Vec<_>>();
+
+            let mut new_grants = Vec::new();
+            let mut retired = Vec::new();
+            let mut granted_ids = Vec::new();
+            let mut retired_ids = Vec::new();
+            for old in &active_grants {
+                let id = short_id("pg");
+                granted_ids.push(id.clone());
+                retired_ids.push(old.id.clone());
+                retired.push(GrantRetirement {
+                    id: old.id.clone(),
+                    retired_at_epoch: epoch + 1,
+                    retired_by_event_id: event_id.clone(),
+                });
+                new_grants.push(Grant {
+                    id,
+                    principal_id: successor_id.clone(),
+                    capability: old.capability,
+                    scope: old.scope.clone(),
+                    state: GrantState::Active,
+                    origin: GrantOrigin::RebindTransfer,
+                    granted_at_epoch: epoch + 1,
+                    granted_by_principal_id: None,
+                    granted_by_event_id: event_id.clone(),
+                    retired_at_epoch: None,
+                    retired_by_event_id: None,
+                    transferred_from_grant_id: Some(old.id.clone()),
+                });
+            }
+            let mut new_mappings = Vec::new();
+            let mut unmapped = Vec::new();
+            let mut mapped_ids = Vec::new();
+            let mut unmapped_ids = Vec::new();
+            for old in &active_mappings {
+                let id = short_id("ps");
+                mapped_ids.push(id.clone());
+                unmapped_ids.push(old.id.clone());
+                unmapped.push(MappingRetirement {
+                    id: old.id.clone(),
+                    unmapped_at_epoch: epoch + 1,
+                    unmapped_by_event_id: event_id.clone(),
+                });
+                new_mappings.push(SsoMapping {
+                    id,
+                    principal_id: successor_id.clone(),
+                    provider: old.provider.clone(),
+                    subject: old.subject.clone(),
+                    mapped_at_epoch: epoch + 1,
+                    mapped_by_event_id: event_id.clone(),
+                    unmapped_at_epoch: None,
+                    unmapped_by_event_id: None,
+                });
+            }
+
+            let effect = PolicyEffect {
+                principals: vec![source.clone(), successor.clone()],
+                grants: new_grants,
+                retired_grants: retired,
+                mappings: new_mappings,
+                unmapped_mappings: unmapped,
+                ..Default::default()
+            };
+            apply_effect(&tx, &effect)?;
+            let resulting_state_hash = compute_state_hash(&tx)?;
+            let occurred_at = crate::registry::now_ms();
+            let audit = allowed_audit(
+                actor,
+                "access breakglass principal-rebind",
+                epoch + 1,
+                &enforcement_state_on(&tx)?,
+                None,
+                &[],
+                &[],
+            );
+            append_access_audit(&tx, &audit)?;
+            let audit_id = audit.id.clone();
+            let source_value = PrincipalValue {
+                id: source.id.clone(),
+                username: source.username.clone(),
+                uid: source.uid,
+                replaces: source.replaces.clone(),
+            };
+            let successor_value = PrincipalValue {
+                id: successor.id.clone(),
+                username: successor.username.clone(),
+                uid: successor.uid,
+                replaces: successor.replaces.clone(),
+            };
+            let event = PolicyEventPayload {
+                id: event_id.clone(),
+                kind: "breakglass_principal_rebound".to_owned(),
+                occurred_at,
+                before_epoch: epoch,
+                after_epoch: epoch + 1,
+                access_audit_event_id: Some(audit_id),
+                actor_principal_id: None,
+                actor_username: "root".to_owned(),
+                actor_uid: 0,
+                context: actor.context.clone(),
+                target_principal_id: Some(successor_id.clone()),
+                target_mapping_id: None,
+                source: Some(source_value),
+                successor: Some(successor_value),
+                delta: PolicyDelta {
+                    granted_grant_ids: granted_ids,
+                    retired_grant_ids: retired_ids,
+                    mapped_mapping_ids: mapped_ids,
+                    unmapped_mapping_ids: unmapped_ids,
+                    ..Default::default()
+                },
+                enforcement: None,
+                effect,
+            };
+            let (seq, event_hash) =
+                append_policy_event(&tx, "breakglass_principal_rebound", occurred_at, &event)?;
+            append_policy_epoch(
+                &tx,
+                &PolicyEpochPayload {
+                    epoch: epoch + 1,
+                    policy_event_seq: seq,
+                    policy_event_hash: event_hash,
+                    previous_state_hash: actor.state_hash.clone(),
+                    resulting_state_hash,
+                    occurred_at,
+                },
+            )?;
+            principal_with_on(&tx, &successor)
+        })();
+        match outcome {
+            Ok(principal) => {
+                tx.commit()?;
+                Ok(principal)
+            }
+            Err(error) => {
+                let _ = tx.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// Clause 7 break-glass: one SSO mapping without a subject proof,
+    /// root-only.
+    pub fn breakglass_map_sso(
+        &mut self,
+        principal_id: &str,
+        provider: &str,
+        subject: &str,
+        actor: &PolicyActor,
+    ) -> Result<SsoMapping> {
+        if provider != "google" {
+            bail!("the only supported SSO provider is google");
+        }
+        if subject.is_empty()
+            || subject.len() > 255
+            || !subject
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+        {
+            bail!("invalid SSO subject");
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome: Result<SsoMapping> = (|| {
+            let epoch = policy_epoch_on(&tx)?;
+            if epoch == 0 {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access breakglass map-sso",
+                    "enforcement",
+                    "empty_policy",
+                    epoch,
+                ));
+            }
+            let principal = principal_row_on(&tx, principal_id)?.ok_or_else(|| {
+                deny(
+                    &tx,
+                    actor,
+                    "access breakglass map-sso",
+                    "principal",
+                    "not_found",
+                    epoch,
+                )
+            })?;
+            if !principal.enabled {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access breakglass map-sso",
+                    "principal",
+                    "not_enabled",
+                    epoch,
+                ));
+            }
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM sso_mappings WHERE provider=?1 AND subject=?2 AND unmapped_at_epoch IS NULL",
+                    params![provider, subject],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access breakglass map-sso",
+                    "scope",
+                    "already_mapped",
+                    epoch,
+                ));
+            }
+
+            let seq = journal_next_seq(&tx, "policy_events")?;
+            let event_id = policy_event_id(seq);
+            let mapping_id = short_id("ps");
+            let mapping = SsoMapping {
+                id: mapping_id.clone(),
+                principal_id: principal_id.to_owned(),
+                provider: provider.to_owned(),
+                subject: subject.to_owned(),
+                mapped_at_epoch: epoch + 1,
+                mapped_by_event_id: event_id.clone(),
+                unmapped_at_epoch: None,
+                unmapped_by_event_id: None,
+            };
+            let effect = PolicyEffect {
+                mappings: vec![mapping.clone()],
+                ..Default::default()
+            };
+            apply_effect(&tx, &effect)?;
+            let resulting_state_hash = compute_state_hash(&tx)?;
+            let occurred_at = crate::registry::now_ms();
+            let audit = allowed_audit(
+                actor,
+                "access breakglass map-sso",
+                epoch + 1,
+                &enforcement_state_on(&tx)?,
+                None,
+                &[],
+                &[],
+            );
+            append_access_audit(&tx, &audit)?;
+            let audit_id = audit.id.clone();
+            let event = PolicyEventPayload {
+                id: event_id.clone(),
+                kind: "breakglass_sso_mapped".to_owned(),
+                occurred_at,
+                before_epoch: epoch,
+                after_epoch: epoch + 1,
+                access_audit_event_id: Some(audit_id),
+                actor_principal_id: None,
+                actor_username: "root".to_owned(),
+                actor_uid: 0,
+                context: actor.context.clone(),
+                target_principal_id: Some(principal_id.to_owned()),
+                target_mapping_id: Some(mapping_id.clone()),
+                source: None,
+                successor: None,
+                delta: PolicyDelta {
+                    mapped_mapping_ids: vec![mapping_id],
+                    ..Default::default()
+                },
+                enforcement: None,
+                effect,
+            };
+            let (seq, event_hash) =
+                append_policy_event(&tx, "breakglass_sso_mapped", occurred_at, &event)?;
+            append_policy_epoch(
+                &tx,
+                &PolicyEpochPayload {
+                    epoch: epoch + 1,
+                    policy_event_seq: seq,
+                    policy_event_hash: event_hash,
+                    previous_state_hash: actor.state_hash.clone(),
+                    resulting_state_hash,
+                    occurred_at,
+                },
+            )?;
+            Ok(mapping)
+        })();
+        match outcome {
+            Ok(mapping) => {
+                tx.commit()?;
+                Ok(mapping)
+            }
+            Err(error) => {
+                let _ = tx.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// Clause 9/12 `enforcement prepare`: the one-way `direct -> prepared`
+    /// transition, recorded as an `enforcement_prepared` event. The
+    /// broker-dependent probe fields (binary digests, route probes) cannot be
+    /// computed without the broker socket and are recorded as null/empty.
+    pub fn enforcement_prepare(
+        &mut self,
+        expected_epoch: i64,
+        actor: &PolicyActor,
+    ) -> Result<serde_json::Value> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome: Result<serde_json::Value> = (|| {
+            let epoch = policy_epoch_on(&tx)?;
+            require_context(&tx, actor, "access enforcement prepare")?;
+            require_registry_admin(&tx, actor, "access enforcement prepare", epoch)?;
+            let state = enforcement_state_on(&tx)?;
+            if state != "direct" {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access enforcement prepare",
+                    "enforcement",
+                    "not_direct",
+                    epoch,
+                ));
+            }
+            if expected_epoch != epoch {
+                let _ = deny(
+                    &tx,
+                    actor,
+                    "access enforcement prepare",
+                    "epoch",
+                    "expected_epoch_mismatch",
+                    epoch,
+                );
+                bail!(
+                    "expected epoch {expected_epoch} does not match the live policy epoch {epoch}"
+                );
+            }
+            let receipt_id = short_id("pc");
+            let seq = journal_next_seq(&tx, "policy_events")?;
+            let event_id = policy_event_id(seq);
+            let effect = PolicyEffect {
+                enforcement: Some("prepared".to_owned()),
+                ..Default::default()
+            };
+            apply_effect(&tx, &effect)?;
+            let resulting_state_hash = compute_state_hash(&tx)?;
+            let occurred_at = crate::registry::now_ms();
+            let audit = allowed_audit(
+                actor,
+                "access enforcement prepare",
+                epoch + 1,
+                "prepared",
+                None,
+                &[],
+                &[],
+            );
+            append_access_audit(&tx, &audit)?;
+            let audit_id = audit.id.clone();
+            let enforcement = serde_json::json!({
+                "fromState": "direct",
+                "toState": "prepared",
+                "expectedEpoch": expected_epoch,
+                "manifestDigest": null,
+                "prepareReceiptID": receipt_id,
+                "brokerBinaryID": null,
+                "brokerProtocolVersion": null,
+                "commandSchemaHash": null,
+                "policySchemaVersion": crate::db::REGISTRY_SCHEMA_VERSION,
+                "preconditions": [],
+                "clientProbes": [],
+            });
+            let event = PolicyEventPayload {
+                id: event_id.clone(),
+                kind: "enforcement_prepared".to_owned(),
+                occurred_at,
+                before_epoch: epoch,
+                after_epoch: epoch + 1,
+                access_audit_event_id: Some(audit_id),
+                actor_principal_id: actor.principal_id.clone(),
+                actor_username: actor.username.clone(),
+                actor_uid: actor.uid,
+                context: actor.context.clone(),
+                target_principal_id: None,
+                target_mapping_id: None,
+                source: None,
+                successor: None,
+                delta: PolicyDelta::default(),
+                enforcement: Some(enforcement),
+                effect,
+            };
+            let (seq, event_hash) =
+                append_policy_event(&tx, "enforcement_prepared", occurred_at, &event)?;
+            append_policy_epoch(
+                &tx,
+                &PolicyEpochPayload {
+                    epoch: epoch + 1,
+                    policy_event_seq: seq,
+                    policy_event_hash: event_hash,
+                    previous_state_hash: actor.state_hash.clone(),
+                    resulting_state_hash,
+                    occurred_at,
+                },
+            )?;
+            Ok(serde_json::json!({
+                "prepareReceiptID": receipt_id,
+                "epoch": epoch + 1,
+                "enforcementState": "prepared",
+            }))
+        })();
+        match outcome {
+            Ok(value) => {
+                tx.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = tx.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// Clause 9/12 `enforcement activate`: the one-way `prepared -> managed`
+    /// transition, gated on the prepare receipt minted by `enforcement prepare`.
+    pub fn enforcement_activate(
+        &mut self,
+        expected_epoch: i64,
+        prepare_receipt: &str,
+        actor: &PolicyActor,
+    ) -> Result<serde_json::Value> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome: Result<serde_json::Value> = (|| {
+            let epoch = policy_epoch_on(&tx)?;
+            require_context(&tx, actor, "access enforcement activate")?;
+            require_registry_admin(&tx, actor, "access enforcement activate", epoch)?;
+            let state = enforcement_state_on(&tx)?;
+            if state != "prepared" {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access enforcement activate",
+                    "enforcement",
+                    "not_prepared",
+                    epoch,
+                ));
+            }
+            if expected_epoch != epoch {
+                let _ = deny(
+                    &tx,
+                    actor,
+                    "access enforcement activate",
+                    "epoch",
+                    "expected_epoch_mismatch",
+                    epoch,
+                );
+                bail!(
+                    "expected epoch {expected_epoch} does not match the live policy epoch {epoch}"
+                );
+            }
+            let stored_receipt: Option<String> = tx
+                .query_row(
+                    "SELECT payload FROM policy_events WHERE kind='enforcement_prepared' \
+                     ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(stored_receipt) = stored_receipt else {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access enforcement activate",
+                    "proof",
+                    "missing_prepare_receipt",
+                    epoch,
+                ));
+            };
+            let prepared: PolicyEventPayload =
+                serde_json::from_str(&stored_receipt).context("parse prepared event")?;
+            let minted = prepared
+                .enforcement
+                .as_ref()
+                .and_then(|v| v.get("prepareReceiptID"))
+                .and_then(|v| v.as_str());
+            if minted != Some(prepare_receipt) {
+                return Err(deny(
+                    &tx,
+                    actor,
+                    "access enforcement activate",
+                    "proof",
+                    "receipt_mismatch",
+                    epoch,
+                ));
+            }
+
+            let seq = journal_next_seq(&tx, "policy_events")?;
+            let event_id = policy_event_id(seq);
+            let effect = PolicyEffect {
+                enforcement: Some("managed".to_owned()),
+                ..Default::default()
+            };
+            apply_effect(&tx, &effect)?;
+            let resulting_state_hash = compute_state_hash(&tx)?;
+            let occurred_at = crate::registry::now_ms();
+            let audit = allowed_audit(
+                actor,
+                "access enforcement activate",
+                epoch + 1,
+                "managed",
+                None,
+                &[],
+                &[],
+            );
+            append_access_audit(&tx, &audit)?;
+            let audit_id = audit.id.clone();
+            let enforcement = serde_json::json!({
+                "fromState": "prepared",
+                "toState": "managed",
+                "expectedEpoch": expected_epoch,
+                "manifestDigest": null,
+                "prepareReceiptID": prepare_receipt,
+                "brokerBinaryID": null,
+                "brokerProtocolVersion": null,
+                "commandSchemaHash": null,
+                "policySchemaVersion": crate::db::REGISTRY_SCHEMA_VERSION,
+                "preconditions": [],
+                "clientProbes": [],
+            });
+            let event = PolicyEventPayload {
+                id: event_id.clone(),
+                kind: "enforcement_activated".to_owned(),
+                occurred_at,
+                before_epoch: epoch,
+                after_epoch: epoch + 1,
+                access_audit_event_id: Some(audit_id),
+                actor_principal_id: actor.principal_id.clone(),
+                actor_username: actor.username.clone(),
+                actor_uid: actor.uid,
+                context: actor.context.clone(),
+                target_principal_id: None,
+                target_mapping_id: None,
+                source: None,
+                successor: None,
+                delta: PolicyDelta::default(),
+                enforcement: Some(enforcement),
+                effect,
+            };
+            let (seq, event_hash) =
+                append_policy_event(&tx, "enforcement_activated", occurred_at, &event)?;
+            append_policy_epoch(
+                &tx,
+                &PolicyEpochPayload {
+                    epoch: epoch + 1,
+                    policy_event_seq: seq,
+                    policy_event_hash: event_hash,
+                    previous_state_hash: actor.state_hash.clone(),
+                    resulting_state_hash,
+                    occurred_at,
+                },
+            )?;
+            Ok(serde_json::json!({
+                "epoch": epoch + 1,
+                "enforcementState": "managed",
+            }))
+        })();
+        match outcome {
+            Ok(value) => {
+                tx.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = tx.commit();
+                Err(error)
+            }
+        }
+    }
+
+    /// Read the two policy journals — `policy_events` and `access_audit` —
+    /// merged newest-first, projected to the ADR-038 audit shapes, with the
+    /// clause-12 filters applied. `limit` bounds the returned rows.
+    pub fn audit_events(
+        &self,
+        principal: Option<&str>,
+        actor_principal: Option<&str>,
+        kind: Option<&str>,
+        capability: Option<Capability>,
+        scope: Option<&ScopeTuple>,
+        after_epoch: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        {
+            let mut stmt = self.connection.prepare(
+                "SELECT seq,prev_hash,event_hash,payload FROM policy_events ORDER BY seq DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| policy_event_projection(row))?;
+            for row in rows {
+                let value = row?;
+                if audit_policy_matches(
+                    &value,
+                    principal,
+                    actor_principal,
+                    kind,
+                    capability,
+                    scope,
+                    after_epoch,
+                ) {
+                    out.push(value);
+                }
+            }
+        }
+        {
+            let mut stmt = self.connection.prepare(
+                "SELECT seq,prev_hash,event_hash,payload FROM access_audit ORDER BY seq DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| access_audit_projection(row))?;
+            for row in rows {
+                let value = row?;
+                if audit_access_matches(
+                    &value,
+                    principal,
+                    actor_principal,
+                    kind,
+                    capability,
+                    scope,
+                    after_epoch,
+                ) {
+                    out.push(value);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            let ta = a.get("occurredAt").and_then(|v| v.as_i64()).unwrap_or(0);
+            let tb = b.get("occurredAt").and_then(|v| v.as_i64()).unwrap_or(0);
+            tb.cmp(&ta)
+        });
+        out.truncate(limit as usize);
+        Ok(out)
     }
 
     /// Rebuild the projection from `policy_events` and verify it against the
@@ -3584,5 +4681,148 @@ mod tests {
             .unwrap();
         let report = audit::verify_registry(&registry.connection).unwrap();
         assert!(!report.healthy, "tampered access_audit must fail verify");
+    }
+
+    /// Clause 6: every break-glass form refuses at epoch 0, not just
+    /// registry-admin. There is no policy to repair, and break-glass is not
+    /// bootstrap.
+    #[test]
+    fn every_breakglass_form_refuses_at_epoch_0() {
+        let mut registry = test_registry("breakglass-epoch0");
+        registry
+            .connection
+            .execute(
+                "INSERT INTO boards(board_path,name,created_at,last_used_at,archived) \
+                 VALUES('/root/boards/b1.db','b1',1,1,0)",
+                [],
+            )
+            .unwrap();
+        let root_actor = root(&registry);
+        let admin = registry
+            .breakglass_grant_registry_admin("p-nonexistent", &root_actor)
+            .expect_err("breakglass registry-admin must refuse at epoch 0");
+        assert_eq!(admin.to_string(), "denied or not found");
+        let rebind = registry
+            .breakglass_principal_rebind("p-nonexistent", "bob", 2000, &[], &root_actor)
+            .expect_err("breakglass principal-rebind must refuse at epoch 0");
+        assert_eq!(rebind.to_string(), "denied or not found");
+        let map = registry
+            .breakglass_map_sso("p-nonexistent", "google", "subject-1", &root_actor)
+            .expect_err("breakglass map-sso must refuse at epoch 0");
+        assert_eq!(map.to_string(), "denied or not found");
+        assert_eq!(registry.policy_epoch().unwrap(), 0);
+    }
+
+    /// Clause 12: `prove-rebind` mints a `rebind` proof that
+    /// `rebind --source-proof` verifies against the frozen successor pair,
+    /// refusing a different pair, source, or an unknown id fail-closed.
+    #[test]
+    fn prove_rebind_mints_a_verifiable_proof() {
+        let (mut registry, admin_id) = bootstrapped("prove-rebind");
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let bob = registry
+            .bind_principal("bob", 2000, &[], &admin_actor)
+            .unwrap()
+            .row
+            .id;
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let proof = registry
+            .prove_rebind(&bob, "robert", 2001, &admin_actor)
+            .expect("admin can mint a rebind proof");
+        registry
+            .verify_source_proof(&proof, &bob, "robert", 2001)
+            .expect("the proof matches the frozen pair");
+        assert!(
+            registry
+                .verify_source_proof(&proof, &bob, "mallory", 2002)
+                .is_err(),
+            "a proof must not verify a different successor pair"
+        );
+        assert!(
+            registry
+                .verify_source_proof(&proof, &admin_id, "robert", 2001)
+                .is_err(),
+            "a proof must not verify a different source"
+        );
+        assert!(
+            registry
+                .verify_source_proof("pf-deadbeef", &bob, "robert", 2001)
+                .is_err(),
+            "an unknown proof id must not verify"
+        );
+    }
+
+    /// Clause 9: enforcement transitions one-way `direct -> prepared ->
+    /// managed`, and `activate` is gated on the receipt `prepare` minted.
+    #[test]
+    fn enforcement_prepare_then_activate_transitions_state() {
+        let (mut registry, admin_id) = bootstrapped("enforcement");
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let epoch = registry.policy_epoch().unwrap();
+        let receipt = registry
+            .enforcement_prepare(epoch, &admin_actor)
+            .expect("prepare at the live epoch");
+        assert_eq!(registry.enforcement_state().unwrap(), "prepared");
+        let receipt_id = receipt["prepareReceiptID"].as_str().unwrap().to_owned();
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let epoch = registry.policy_epoch().unwrap();
+        registry
+            .enforcement_activate(epoch, &receipt_id, &admin_actor)
+            .expect("activate with the minted receipt");
+        assert_eq!(registry.enforcement_state().unwrap(), "managed");
+    }
+
+    /// Clause 8: the new mutations refuse a stale context with the generic
+    /// denial, exactly like the pre-existing ones.
+    #[test]
+    fn new_mutations_refuse_a_stale_context_generically() {
+        let (mut registry, admin_id) = bootstrapped("stale-new");
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let bob = registry
+            .bind_principal("bob", 2000, &[], &admin_actor)
+            .unwrap()
+            .row
+            .id;
+        let stale = actor(Some(&admin_id), "geoyws", 1000, 0, "deadbeef");
+        let err = registry
+            .prove_rebind(&bob, "robert", 2001, &stale)
+            .expect_err("a stale prove-rebind must be refused");
+        assert_eq!(err.to_string(), "denied or not found");
+        let err = registry
+            .enforcement_prepare(1, &stale)
+            .expect_err("a stale enforcement prepare must be refused");
+        assert_eq!(err.to_string(), "denied or not found");
+    }
+
+    /// Clause 4: a denied attempt on the new mutations appends a denied
+    /// access-audit row and does not advance the epoch.
+    #[test]
+    fn a_denied_new_mutation_appends_an_audit_row() {
+        let (mut registry, admin_id) = bootstrapped("denied-new");
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let bob = registry
+            .bind_principal("bob", 2000, &[], &admin_actor)
+            .unwrap()
+            .row
+            .id;
+        let bob_actor = mint(&registry, &bob, "bob", 2000);
+        let epoch = registry.policy_epoch().unwrap();
+        let before: i64 = registry
+            .connection
+            .query_row("SELECT COUNT(*) FROM access_audit", [], |row| row.get(0))
+            .unwrap();
+        let _ = registry
+            .prove_rebind(&admin_id, "robert", 2001, &bob_actor)
+            .expect_err("a non-admin prove-rebind must deny");
+        let after: i64 = registry
+            .connection
+            .query_row("SELECT COUNT(*) FROM access_audit", [], |row| row.get(0))
+            .unwrap();
+        assert!(after > before, "a denied attempt must append an audit row");
+        assert_eq!(
+            registry.policy_epoch().unwrap(),
+            epoch,
+            "a denial must not advance the epoch"
+        );
     }
 }

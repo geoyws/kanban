@@ -33,6 +33,7 @@ mod watch;
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
+use crate::policy::{Capability, PolicyActor, PolicyContext, ScopeTuple};
 use crate::registry::{
     BoardPathState, PreparedAdoption, Registry, WORKSPACE_ADOPT_HELPER_COMMAND, data_root, now_ms,
     preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
@@ -1312,8 +1313,12 @@ fn command_spec(
 }
 
 /// The most positionals an invocation may hold, counting the words that name it.
+///
+/// A subcommand is counted by its words, not by presence: the `access` surface
+/// names subcommands in two words ("principal show"), so one `Some` there is
+/// two name words (ADR-038 clause 12).
 fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
-    1 + usize::from(sub.is_some()) + positionals.len()
+    1 + sub.map(|s| s.split(' ').count()).unwrap_or(0) + positionals.len()
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
@@ -4093,7 +4098,20 @@ fn run() -> Result<()> {
         .map(String::as_str)
         .map(|value| canonical_sub(command, value));
     let rest = args.positionals.get(2..).unwrap_or(&[]);
-    let spec_sub = sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command));
+    // The `access` surface's subcommands are two words ("principal show",
+    // "sso map-sso", "breakglass registry-admin", "enforcement prepare"), so
+    // the full subcommand joins the first two words (ADR-038 clause 12). Every
+    // other command's subcommand is one word.
+    let spec_sub: Option<String> = if command == "access" {
+        match (sub, args.positionals.get(2)) {
+            (Some(first), Some(second)) => Some(format!("{first} {second}")),
+            (Some(first), None) => Some(first.to_owned()),
+            (None, _) => None,
+        }
+    } else {
+        sub.filter(|_| SUBCOMMAND_GROUPS.contains(&command))
+            .map(str::to_owned)
+    };
 
     // Ahead of the selector refusal below, because a flag that no longer
     // exists is the more actionable complaint about the same command line:
@@ -4108,7 +4126,7 @@ fn run() -> Result<()> {
     // without validating anything and the data-root lock that reads `--db`
     // itself: a selector this command cannot honour is a refusal, not
     // something to discard on the way to a confident answer.
-    reject_ignored_selectors(&args, command, spec_sub)?;
+    reject_ignored_selectors(&args, command, spec_sub.as_deref())?;
 
     if command == "version" {
         emit(&version_string())?;
@@ -4132,16 +4150,16 @@ fn run() -> Result<()> {
     // through the ordinary CLI it runs, so it is refused the same way.
     refuse_managed_bypasses(&args)?;
 
-    let creation = board_creation(command, spec_sub);
-    match command_spec(command, spec_sub) {
+    let creation = board_creation(command, spec_sub.as_deref());
+    match command_spec(command, spec_sub.as_deref()) {
         Some((allowed, positionals)) => {
-            args.reject_unknown(allowed, ignored_selectors(command, spec_sub).0)?;
+            args.reject_unknown(allowed, ignored_selectors(command, spec_sub.as_deref()).0)?;
             args.reject_repeated_for(Some(command))?;
-            args.reject_extra_positionals(arity(spec_sub, positionals))?;
+            args.reject_extra_positionals(arity(spec_sub.as_deref(), positionals))?;
             // Before the data-root lock and before any store: a command that
             // cannot run must not have created a board on its way to saying so.
             let mut words = vec![command];
-            words.extend(spec_sub);
+            words.extend(spec_sub.as_deref());
             args.reject_missing_positionals(&words, positionals)?;
             args.reject_conflicting_board_selectors()?;
         }
@@ -4197,7 +4215,10 @@ fn run() -> Result<()> {
     // environment reaches `board_selection` untouched. The lock decision is
     // where it has to be fixed, and `None` is the fail-closed answer:
     // `touches_data_root(None)` is true, so the lock is taken.
-    let addressed_board = match ignored_selectors(command, spec_sub).0.contains(&"db") {
+    let addressed_board = match ignored_selectors(command, spec_sub.as_deref())
+        .0
+        .contains(&"db")
+    {
         true => None,
         false => direct_db(&args),
     };
@@ -4566,6 +4587,8 @@ fn run() -> Result<()> {
             value.insert("rootless".into(), json!(project.workspace_roots.is_empty()));
             projects.push(Value::Object(value));
         }
+        let policy_epoch = registry.policy_epoch()?;
+        let policy_head = policy_journal_head(&registry)?;
         let result = json!({
             "healthy": healthy,
             "registry": registry_check,
@@ -4575,6 +4598,11 @@ fn run() -> Result<()> {
             "supportedRegistrySchemaVersion": db::REGISTRY_SCHEMA_VERSION,
             "supportedBoardSchemaVersion": db::BOARD_SCHEMA_VERSION,
             "unreachableRoots": unreachable,
+            "policy": {
+                "epoch": policy_epoch,
+                "enforcementState": registry.enforcement_state()?,
+                "journalHead": policy_head,
+            },
             "projects": projects,
         });
         print(&result, args.has("json"))?;
@@ -4870,6 +4898,13 @@ fn run() -> Result<()> {
             &store.require_subscription(rest.first().context("subscription id is required")?)?,
             args.has("json"),
         );
+    }
+
+    // The `access` surface (ADR-038 clause 12) addresses the policy registry,
+    // never a board, so it is dispatched before the board store opens and never
+    // opens one. It is also the only surface that mints a policy actor.
+    if command == "access" {
+        return run_access(&args, spec_sub.as_deref());
     }
 
     let mut store = open_store(&args, creation)?;
@@ -5599,6 +5634,411 @@ fn run() -> Result<()> {
         return Ok(());
     }
     bail!("unknown command; run kanban --help")
+}
+
+/// Mint the policy actor for the local trusted caller. The broker's
+/// `SO_PEERCRED` socket hop is not built (ADR-038 clause 2); in its place the
+/// CLI process's own effective UID is the principal evidence, resolved through
+/// the same two-way passwd check and frozen-principal lookup the broker would
+/// apply. A UID that resolves to no enabled principal (including root) fails
+/// closed with `denied or not found`.
+fn local_actor(
+    registry: &Registry,
+    claimed_actor: Option<String>,
+    reason: Option<String>,
+) -> Result<PolicyActor> {
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        bail!("denied or not found");
+    }
+    let username = match broker::PasswdDatabase::name_for_uid(&broker::SystemPasswd, uid)? {
+        Some(name) => name,
+        None => bail!("denied or not found"),
+    };
+    if !broker::two_way_passwd_check(&broker::SystemPasswd, &username, uid)? {
+        bail!("denied or not found");
+    }
+    let principal = registry.resolve_principal(&username, uid)?;
+    let (epoch, state_hash) = registry.live_policy_state()?;
+    Ok(PolicyActor {
+        principal_id: principal.map(|p| p.row.id),
+        username,
+        uid,
+        epoch,
+        state_hash,
+        context: PolicyContext {
+            authn_kind: "socket_peer".to_owned(),
+            peer_uid: uid,
+            real_uid: None,
+            effective_uid: None,
+            client_kind: "cli".to_owned(),
+            request_id: policy::short_id("rq"),
+            claimed_actor,
+            reason,
+            provider: None,
+            subject: None,
+        },
+    })
+}
+
+/// The root actor for bootstrap and break-glass (clauses 6 and 7). Root's
+/// authority is the host's, never a policy row, so its `principal_id` is null;
+/// the `--as`/`--reason` pair is recorded as a claim, never identity.
+fn root_actor(
+    registry: &Registry,
+    authn_kind: &str,
+    claimed_actor: Option<String>,
+    reason: Option<String>,
+) -> PolicyActor {
+    let (epoch, state_hash) = registry.live_policy_state().unwrap_or((0, String::new()));
+    PolicyActor {
+        principal_id: None,
+        username: "root".to_owned(),
+        uid: 0,
+        epoch,
+        state_hash,
+        context: PolicyContext {
+            authn_kind: authn_kind.to_owned(),
+            peer_uid: 0,
+            real_uid: None,
+            effective_uid: None,
+            client_kind: "cli".to_owned(),
+            request_id: policy::short_id("rq"),
+            claimed_actor,
+            reason,
+            provider: None,
+            subject: None,
+        },
+    }
+}
+
+/// The `--confirm LITERAL` gate for the root and enforcement commands. A
+/// wrong literal is refused rather than treated as absent (ADR-008).
+fn require_confirm(args: &Args, literal: &str) -> Result<()> {
+    let got = args.require("confirm")?;
+    if got != literal {
+        bail!("--confirm must be {literal:?}, got {got:?}");
+    }
+    Ok(())
+}
+
+/// Require the caller to be root (UID 0), the only authority bootstrap and
+/// break-glass honour (clauses 6 and 7). Refused generically otherwise.
+fn require_root() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("denied or not found");
+    }
+    Ok(())
+}
+
+fn access_capability(args: &Args) -> Result<Capability> {
+    let value = args.require("capability")?;
+    Capability::from_str(value)
+        .with_context(|| format!("unknown capability {value:?}; expected read, write, or admin"))
+}
+
+fn access_scope(args: &Args) -> Result<ScopeTuple> {
+    ScopeTuple::from_atoms(&args.many("scope"))
+}
+
+/// The `--as`/`--reason` pair, claimed not authenticated (ADR-038: `--as` is a
+/// claim; only the kernel UID is identity).
+fn access_claimed(args: &Args) -> (Option<String>, Option<String>) {
+    (
+        args.one("as").map(str::to_owned),
+        args.one("reason").map(str::to_owned),
+    )
+}
+
+/// The head of the policy-events journal, or null before any policy event.
+fn policy_journal_head(registry: &Registry) -> Result<Option<String>> {
+    let mut statement = registry
+        .connection
+        .prepare("SELECT event_hash FROM policy_events ORDER BY seq DESC LIMIT 1")?;
+    let mut rows = statement.query([])?;
+    match rows.next()? {
+        Some(row) => Ok(row.get::<_, Option<String>>(0)?),
+        None => Ok(None),
+    }
+}
+
+/// Dispatch the `access` command grammar (ADR-038 clause 12). Reads address a
+/// read-only registry open and write nothing; mutations address a writable
+/// registry and route through the policy store, minting a local actor for the
+/// trusted CLI caller (or root for bootstrap/break-glass).
+fn run_access(args: &Args, sub: Option<&str>) -> Result<()> {
+    let json = args.has("json");
+    match sub {
+        // -- five reads (readOnly: true; they write nothing anywhere) --------
+        //
+        // A fresh install has no registry, which `routing::enforcement_state_at`
+        // already rules is an unmanaged `direct` estate. These reads answer the
+        // same way -- an empty projection -- instead of leaking SQLite's
+        // "unable to open database file" from the first command an operator runs.
+        Some("principal show") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(&serde_json::Value::Null, json);
+            };
+            let id = args.require("principal")?;
+            match registry.principal(id)? {
+                Some(principal) => print(&principal, json),
+                None => print(&serde_json::Value::Null, json),
+            }
+        }
+        Some("principal list") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(&serde_json::json!([]), json);
+            };
+            print(&registry.principals(args.has("disabled"))?, json)
+        }
+        Some("explain") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                // No registry means no grant can match; the denial reason stays
+                // the same generic string every other denial uses.
+                return print(
+                    &serde_json::json!({
+                        "outcome": "denied",
+                        "matchedGrantIDs": [],
+                        "denialReason": "denied or not found",
+                    }),
+                    json,
+                );
+            };
+            let id = args.require("principal")?;
+            let capability = access_capability(args)?;
+            let tuple = access_scope(args)?;
+            print(&registry.explain(id, &tuple, capability)?, json)
+        }
+        Some("audit") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(&serde_json::json!([]), json);
+            };
+            let capability = args
+                .one("capability")
+                .map(|v| {
+                    Capability::from_str(v).with_context(|| {
+                        format!("unknown capability {v:?}; expected read, write, or admin")
+                    })
+                })
+                .transpose()?;
+            let scope = if args.has("scope") {
+                Some(access_scope(args)?)
+            } else {
+                None
+            };
+            let after_epoch = args.optional_integer("after-epoch")?;
+            if after_epoch.is_some_and(|v| v < 0) {
+                bail!("--after-epoch must be non-negative");
+            }
+            let rows = args.bounded_page(50, "audit events", |limit| {
+                registry.audit_events(
+                    args.one("principal"),
+                    args.one("actor-principal"),
+                    args.one("kind"),
+                    capability,
+                    scope.as_ref(),
+                    after_epoch,
+                    limit,
+                )
+            })?;
+            print(&rows, json)
+        }
+        Some("enforcement show") => {
+            let Some(registry) = Registry::open_readonly_if_present()? else {
+                return print(
+                    &serde_json::json!({
+                        "epoch": 0,
+                        "enforcementState": "direct",
+                        "journalHead": serde_json::Value::Null,
+                    }),
+                    json,
+                );
+            };
+            let (epoch, _) = registry.live_policy_state()?;
+            let journal_head = policy_journal_head(&registry)?;
+            print(
+                &serde_json::json!({
+                    "epoch": epoch,
+                    "enforcementState": registry.enforcement_state()?,
+                    "journalHead": journal_head,
+                }),
+                json,
+            )
+        }
+        // -- fourteen mutations ---------------------------------------------
+        Some("bootstrap") => {
+            require_confirm(args, "empty-policy")?;
+            require_root()?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_bootstrap", claimed_actor, reason);
+            let principal = registry.policy_bootstrap(username, uid, &actor)?;
+            print(&principal, json)
+        }
+        Some("principal bind") => {
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let replaces = args.many("replaces");
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let principal = registry.bind_principal(username, uid, &replaces, &actor)?;
+            print(&principal, json)
+        }
+        Some("principal prove-rebind") => {
+            let source = args.require("principal")?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let proof_id = registry.prove_rebind(source, username, uid, &actor)?;
+            print(&serde_json::json!({ "proofID": proof_id }), json)
+        }
+        Some("principal rebind") => {
+            let source = args.require("principal")?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let replaces = args.many("replaces");
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            if let Some(proof) = args.one("source-proof") {
+                registry.verify_source_proof(proof, source, username, uid)?;
+            }
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let principal = registry.rebind_principal(source, username, uid, &replaces, &actor)?;
+            print(&principal, json)
+        }
+        Some("principal disable") => {
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let principal = registry.disable_principal(id, &actor)?;
+            print(&principal, json)
+        }
+        Some("grant") => {
+            let id = args.require("principal")?;
+            let capability = access_capability(args)?;
+            let tuple = access_scope(args)?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let grant = registry.grant(id, &tuple, capability, &actor)?;
+            print(&grant, json)
+        }
+        Some("revoke") => {
+            let id = args.require("principal")?;
+            let capability = access_capability(args)?;
+            let tuple = access_scope(args)?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let grant = registry.revoke(id, &tuple, capability, &actor)?;
+            print(&grant, json)
+        }
+        Some("sso map-sso") => {
+            let provider = args.require("provider")?;
+            let subject = args.require("subject")?;
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            if let Some(proof) = args.one("subject-proof") {
+                registry.verify_subject_proof(proof, provider, subject)?;
+            }
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let mapping = registry.map_sso(id, provider, subject, &actor)?;
+            print(&mapping, json)
+        }
+        Some("sso unmap-sso") => {
+            let provider = args.require("provider")?;
+            let subject = args.require("subject")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let mapping = registry.unmap_sso(provider, subject, &actor)?;
+            print(&mapping, json)
+        }
+        Some("breakglass principal-rebind") => {
+            require_confirm(args, "root-breakglass")?;
+            require_root()?;
+            let source = args.require("principal")?;
+            let username = args.require("username")?;
+            let uid = args
+                .require("uid")?
+                .parse::<u32>()
+                .context("--uid must be a non-negative integer")?;
+            let replaces = args.many("replaces");
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_breakglass", claimed_actor, reason);
+            let principal =
+                registry.breakglass_principal_rebind(source, username, uid, &replaces, &actor)?;
+            print(&principal, json)
+        }
+        Some("breakglass map-sso") => {
+            require_confirm(args, "root-breakglass")?;
+            require_root()?;
+            let provider = args.require("provider")?;
+            let subject = args.require("subject")?;
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_breakglass", claimed_actor, reason);
+            let mapping = registry.breakglass_map_sso(id, provider, subject, &actor)?;
+            print(&mapping, json)
+        }
+        Some("breakglass registry-admin") => {
+            require_confirm(args, "root-breakglass")?;
+            require_root()?;
+            let id = args.require("principal")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = root_actor(&registry, "root_breakglass", claimed_actor, reason);
+            let grant = registry.breakglass_grant_registry_admin(id, &actor)?;
+            print(&grant, json)
+        }
+        Some("enforcement prepare") => {
+            require_confirm(args, "prepared")?;
+            let expected_epoch = args
+                .require("expected-epoch")?
+                .parse::<i64>()
+                .context("--expected-epoch must be a non-negative integer")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let receipt = registry.enforcement_prepare(expected_epoch, &actor)?;
+            print(&receipt, json)
+        }
+        Some("enforcement activate") => {
+            require_confirm(args, "no-direct-fallback")?;
+            let expected_epoch = args
+                .require("expected-epoch")?
+                .parse::<i64>()
+                .context("--expected-epoch must be a non-negative integer")?;
+            let receipt = args.require("prepare-receipt")?;
+            let (claimed_actor, reason) = access_claimed(args);
+            let mut registry = Registry::open()?;
+            let actor = local_actor(&registry, claimed_actor, reason)?;
+            let result = registry.enforcement_activate(expected_epoch, receipt, &actor)?;
+            print(&result, json)
+        }
+        _ => bail!("unknown command; run kanban --help"),
+    }
 }
 
 fn version_string() -> String {

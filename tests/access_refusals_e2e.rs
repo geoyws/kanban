@@ -293,3 +293,69 @@ fn compiled_binary_absent_registry_reads_as_unmanaged() {
     );
     assert!(listed.is_array(), "no registry means no managed estate");
 }
+
+/// The five reads must ANSWER on a machine that has never run `kanban`, not
+/// leak SQLite's `unable to open database file`. `routing::enforcement_state_at`
+/// already rules an absent registry an unmanaged `direct` estate, and
+/// `access enforcement show` is among the first things an operator runs, so
+/// disagreeing there is both a contradiction and a path disclosure.
+#[test]
+fn compiled_binary_access_reads_answer_before_any_registry_exists() {
+    let fixture = AccessFixture::new("reads-before-registry");
+
+    // Deliberately NO `init`: nothing has created a registry.
+    let enforcement = fixture.ok_json(&fixture.main, &["access", "enforcement", "show", "--json"]);
+    assert_eq!(enforcement["enforcementState"], "direct");
+    assert_eq!(enforcement["epoch"], 0);
+    assert!(enforcement["journalHead"].is_null());
+
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["access", "principal", "list", "--json"]),
+        serde_json::json!([])
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["access", "audit", "--json"]),
+        serde_json::json!([])
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &[
+                    "access",
+                    "principal",
+                    "show",
+                    "--principal",
+                    "p-absent",
+                    "--json"
+                ],
+            )
+            .is_null()
+    );
+
+    // A denial with no registry says exactly what every other denial says, so
+    // the absence of a registry is not itself an oracle.
+    let explained = fixture.ok_json(
+        &fixture.main,
+        &[
+            "access",
+            "explain",
+            "--principal",
+            "p-absent",
+            "--capability",
+            "read",
+            "--scope",
+            "registry",
+            "--json",
+        ],
+    );
+    assert_eq!(explained["outcome"], "denied");
+    assert_eq!(explained["denialReason"], "denied or not found");
+    assert_eq!(explained["matchedGrantIDs"], serde_json::json!([]));
+
+    // And no registry was conjured by reading.
+    assert!(
+        !fixture.data.join("registry.db").exists(),
+        "a read must not create the registry it reports on"
+    );
+}
