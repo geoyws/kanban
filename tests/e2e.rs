@@ -22607,3 +22607,135 @@ fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
         "{retired_page}"
     );
 }
+
+#[test]
+fn a_listing_says_whether_each_task_is_held_and_by_whom() {
+    // Measured 2026-09-04 across eight boards: `task list --status
+    // in_progress` carried no claim key at all, so 32 leased tasks read as
+    // free and "no such claim exists anywhere" was reported twice before
+    // `task show` on the same ids turned up live leases. A listing that
+    // structurally cannot show a lease sits on the surface an agent uses to
+    // decide whether work is free to take, and its absence renders as an
+    // answer. Every row now says whether it is held; --with-claims says by
+    // whom, in the shape `task show` already emits.
+    let fixture = Fixture::new("listed-claims");
+    fixture.ok_json(&fixture.main, &["init", "--name", "HELD", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Held", "--id", "t-held", "--json"],
+    );
+    // The free task carries an assignee, which is an inviting wrong answer
+    // to "who holds it": on the px board a task read assignee=driver-3 while
+    // the lease sat elsewhere. Assignee is intent; the claim is possession.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Wanted", "--id", "t-free", "--assignee", "driver-3", "--json",
+        ],
+    );
+    let lease = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-held", "--as", "driver-2", "--json"],
+    );
+    assert_eq!(lease["agentID"], "driver-2");
+
+    let row = |rows: &Value, id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is not in {rows}"))
+            .clone()
+    };
+
+    // The question as it is naturally asked: which in-progress work is held?
+    let in_progress = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--status", "in_progress", "--json"],
+    );
+    let held = row(&in_progress, "t-held");
+    assert_eq!(held["claimed"], true, "{held}");
+    assert!(
+        held.get("claim").is_none(),
+        "the full summary is opt-in through --with-claims: {held}"
+    );
+
+    let with_claims = fixture.ok_json(&fixture.main, &["task", "list", "--with-claims", "--json"]);
+    let held = row(&with_claims, "t-held");
+    assert_eq!(held["claimed"], true, "{held}");
+    assert_eq!(held["claim"]["agentID"], "driver-2", "{held}");
+    assert_eq!(held["claim"]["taskID"], "t-held", "{held}");
+    assert_eq!(held["claim"]["expiresAt"], lease["expiresAt"], "{held}");
+    assert_eq!(held["claim"]["claimedAt"], lease["claimedAt"], "{held}");
+    assert!(
+        held["claim"].get("leaseToken").is_none(),
+        "a listing never carries the token that authorizes writes: {held}"
+    );
+    let free = row(&with_claims, "t-free");
+    assert_eq!(free["claimed"], false, "{free}");
+    assert_eq!(free["claim"], Value::Null, "{free}");
+    assert_eq!(
+        free["assignee"], "driver-3",
+        "assignee is intent and stays its own field: {free}"
+    );
+
+    // `claimed` is a row key like any other, so it projects.
+    let projected = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--fields", "claimed,id", "--json"],
+    );
+    let mut seen = Vec::new();
+    for row in projected.as_array().unwrap() {
+        let keys = row.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(keys, ["claimed", "id"], "exactly the keys asked for");
+        seen.push((row["id"].as_str().unwrap().to_owned(), row["claimed"].as_bool().unwrap()));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("t-free".to_owned(), false), ("t-held".to_owned(), true)]
+    );
+
+    // The wrong field names for the holder are refused where a name is typed,
+    // naming the keys that exist. Reading `claim.actor` off the JSON would
+    // yield null on every task including live ones, indistinguishable from
+    // "no holder"; the binary cannot refuse a missing-key read, so it refuses
+    // the name at the only place it sees one.
+    for wrong in ["actor", "claim.actor"] {
+        let refused = fixture.run(
+            &fixture.main,
+            &["task", "list", "--with-claims", "--fields", wrong, "--json"],
+        );
+        assert!(!refused.status.success(), "--fields {wrong} was accepted");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(wrong), "{stderr}");
+        assert!(stderr.contains("claimed, claim"), "{stderr}");
+    }
+    // Without the flag `claim` is not on the row, and the refusal says which
+    // flag puts it there rather than listing keys that omit it (ADR-008).
+    let refused = fixture.run(
+        &fixture.main,
+        &["task", "list", "--fields", "id,claim", "--json"],
+    );
+    assert!(!refused.status.success(), "--fields claim was accepted without --with-claims");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("--with-claims"), "{stderr}");
+
+    // Releasing the lease is visible on the next listing; nothing is cached.
+    let released = fixture.run(
+        &fixture.main,
+        &["release", "t-held", "--lease", lease["leaseToken"].as_str().unwrap(), "--json"],
+    );
+    assert!(released.status.success(), "{}", String::from_utf8_lossy(&released.stderr));
+    let after = fixture.ok_json(&fixture.main, &["task", "list", "--with-claims", "--json"]);
+    let held = row(&after, "t-held");
+    assert_eq!(held["claimed"], false, "{held}");
+    assert_eq!(held["claim"], Value::Null, "{held}");
+
+    // --help is where a caller who never read the docs learns the flag, and
+    // the one place to say which key is the holder and that assignee is not.
+    let help = fixture.run(&fixture.main, &["task", "list", "--help"]);
+    let usage = String::from_utf8_lossy(&help.stdout);
+    assert!(usage.contains("--with-claims"), "{usage}");
+    assert!(usage.contains("claim.agentID"), "{usage}");
+}

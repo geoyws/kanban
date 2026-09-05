@@ -370,8 +370,11 @@ fn validate_registered_tags(
 ///
 /// One query for the whole set rather than one per row: a board with a thousand
 /// tasks would otherwise pay a thousand round trips to render a list.
-fn attach_tags(connection: &Connection, tasks: &mut [Task]) -> Result<()> {
-    if tasks.is_empty() {
+fn attach_tags<'a>(
+    connection: &Connection,
+    tasks: impl ExactSizeIterator<Item = &'a mut Task>,
+) -> Result<()> {
+    if tasks.len() == 0 {
         return Ok(());
     }
     let mut statement =
@@ -385,7 +388,7 @@ fn attach_tags(connection: &Connection, tasks: &mut [Task]) -> Result<()> {
         let (task_id, tag) = row?;
         by_task.entry(task_id).or_default().push(tag);
     }
-    for task in tasks.iter_mut() {
+    for task in tasks {
         if let Some(tags) = by_task.remove(&task.id) {
             task.tags = tags;
         }
@@ -2867,9 +2870,9 @@ impl Store {
     }
 
     pub fn require_task(&self, id: &str) -> Result<Task> {
-        let mut one = vec![require_task(&self.connection, id)?];
-        attach_tags(&self.connection, &mut one)?;
-        Ok(one.remove(0))
+        let mut one = require_task(&self.connection, id)?;
+        attach_tags(&self.connection, std::iter::once(&mut one))?;
+        Ok(one)
     }
 
     /// Rows, optionally narrowed by status, by tag and by lane.
@@ -2888,6 +2891,81 @@ impl Store {
         lane: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<Task>> {
+        let (where_clause, values) = self.task_filter(status, tag, lane, include_archived)?;
+        let sql = format!("SELECT * FROM tasks{where_clause} ORDER BY priority,created_at,id");
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement
+            .query_map(params_from_iter(refs), task_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_tags(&self.connection, rows.iter_mut())?;
+        Ok(rows)
+    }
+
+    /// [`Store::list_tasks`] with each row's live lease beside it.
+    ///
+    /// The lease is read in the same query, one `LEFT JOIN` on the claims
+    /// primary key, so a thousand-task board pays one round trip and not a
+    /// thousand and one. What comes back is the summary `task show` emits —
+    /// the holder and the lease's timing — and never the token. A lease is
+    /// live by the same test `get_claim` applies, so a row a long-lived
+    /// process lists after the lease lapsed reads as free, not held.
+    pub fn list_tasks_with_claims(
+        &self,
+        status: Option<&str>,
+        tag: Option<&str>,
+        lane: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<(Task, Option<ClaimSummary>)>> {
+        let (where_clause, filters) = self.task_filter(status, tag, lane, include_archived)?;
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(filters.len() + 1);
+        values.push(Box::new(now_ms()));
+        values.extend(filters);
+        let sql = format!(
+            "SELECT t.*, c.agent_id AS claim_agent_id, c.session_id AS claim_session_id, \
+             c.claimed_at AS claim_claimed_at, c.heartbeat_at AS claim_heartbeat_at, \
+             c.expires_at AS claim_expires_at \
+             FROM tasks t LEFT JOIN task_claims c ON c.task_id=t.id AND c.expires_at>?\
+             {where_clause} ORDER BY t.priority,t.created_at,t.id"
+        );
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement
+            .query_map(params_from_iter(refs), |row| {
+                let task = task_row(row)?;
+                let claim = row
+                    .get::<_, Option<String>>("claim_agent_id")?
+                    .map(|agent_id| -> rusqlite::Result<ClaimSummary> {
+                        Ok(ClaimSummary {
+                            task_id: task.id.clone(),
+                            agent_id,
+                            session_id: row.get("claim_session_id")?,
+                            claimed_at: row.get("claim_claimed_at")?,
+                            heartbeat_at: row.get("claim_heartbeat_at")?,
+                            expires_at: row.get("claim_expires_at")?,
+                        })
+                    })
+                    .transpose()?;
+                Ok((task, claim))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
+        Ok(rows)
+    }
+
+    /// The `WHERE` clause of a task listing and the values it binds, in order.
+    ///
+    /// Column names are unqualified: the claims table shares none of them, so
+    /// the same clause serves the plain listing and the join.
+    fn task_filter(
+        &self,
+        status: Option<&str>,
+        tag: Option<&str>,
+        lane: Option<&str>,
+        include_archived: bool,
+    ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
         if let Some(value) = status {
             validate(value, &TASK_STATUSES, "task status")?;
         }
@@ -2935,20 +3013,12 @@ impl Store {
         } else {
             format!(" WHERE {}", clauses.join(" AND "))
         };
-        let sql = format!("SELECT * FROM tasks{where_clause} ORDER BY priority,created_at,id");
-        let refs = values.iter().map(|value| value.as_ref());
-        let mut statement = self.connection.prepare(&sql)?;
-        let mut rows = statement
-            .query_map(params_from_iter(refs), task_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        attach_tags(&self.connection, &mut rows)?;
-        Ok(rows)
+        Ok((where_clause, values))
     }
 
     pub fn dependencies(&self, id: &str) -> Result<Vec<Task>> {
         let mut rows = dependencies(&self.connection, id)?;
-        attach_tags(&self.connection, &mut rows)?;
+        attach_tags(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
 
@@ -3331,7 +3401,7 @@ impl Store {
             .transpose()?
             .and_then(|mut values| values.pop());
         let mut candidates = eligible_claim_candidates(&self.connection, agent, options)?;
-        attach_tags(&self.connection, &mut candidates)?;
+        attach_tags(&self.connection, candidates.iter_mut())?;
         if let Some(tag) = tag {
             candidates.retain(|candidate| candidate.tags.contains(&tag));
         }
@@ -8370,6 +8440,52 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("--lane must name a lane"), "{error}");
+    }
+
+    #[test]
+    fn a_listing_reads_a_lapsed_lease_as_free_without_waiting_for_the_sweep() {
+        // `Store::open` sweeps expired leases before anything reads, so the
+        // CLI never sees one; a long-lived process that opened an hour ago
+        // does. The join must apply the same expiry test `get_claim` does,
+        // or `claimed: true` outlives the lease it reports.
+        let store = test_store("list-tasks-lapsed-lease");
+        insert_lane_task(&store, "t-live", None);
+        insert_lane_task(&store, "t-lapsed", None);
+        insert_lane_task(&store, "t-free", None);
+        let now = now_ms();
+        for (id, agent, expires_at) in [
+            ("t-live", "driver-2", now + 60_000),
+            ("t-lapsed", "ghost", now - 1),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO task_claims(task_id,agent_id,lease_token,claimed_at,heartbeat_at,expires_at) \
+                     VALUES(?,?,?,?,?,?)",
+                    params![id, agent, format!("{id}-token"), now - 10, now - 10, expires_at],
+                )
+                .expect("insert claim");
+        }
+        let listed = store.list_tasks_with_claims(None, None, None, false).unwrap();
+        let claim = |id: &str| {
+            listed
+                .iter()
+                .find(|(task, _)| task.id == id)
+                .map(|(_, claim)| claim.clone())
+                .unwrap()
+        };
+        assert_eq!(claim("t-live").map(|claim| claim.agent_id).as_deref(), Some("driver-2"));
+        assert!(claim("t-lapsed").is_none(), "a lapsed lease read as held");
+        assert!(claim("t-free").is_none());
+        assert_eq!(listed.len(), 3, "the join must not drop or duplicate rows");
+        // What the join reports agrees with the per-task read `task show` uses.
+        for id in ["t-live", "t-lapsed", "t-free"] {
+            assert_eq!(
+                store.get_claim(id).unwrap().map(|claim| claim.agent_id),
+                claim(id).map(|claim| claim.agent_id),
+                "{id}"
+            );
+        }
     }
 
     #[test]
