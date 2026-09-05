@@ -89,7 +89,11 @@ task, story, or non-draft epic. Everything else stays read-only. Full board
 control would be a much larger surface to build, design and secure, and every
 verb in it becomes reachable with the password.
 
-The actor for a UI write is `geo` by default. An opt-in `--actor-header NAME`
+The actor for a UI write is `geoyws` by default — `model::OPERATOR_ACTOR`,
+which is the single definition `serve` reads. It was written here as `geo`
+until 2026-09-06; the ledger's own resolve/reopen gate now accepts the literal
+`geoyws` and refuses the ambiguous `geo`, so an ADR still naming `geo` was
+documenting an actor its own board would reject. An opt-in `--actor-header NAME`
 path can replace that default when a trusted edge injects a validated header
 value; the edge must strip any client-supplied copy and set
 `X-Auth-Request-Email` from a successful `auth_request`. If the header name is
@@ -114,7 +118,8 @@ and makes the socket a notification channel rather than replicated state.
 
 Reply forms are bounded and strictly decoded. Browser POSTs require the Origin
 authority to equal Host and all browser attention resolution calls
-`Store::resolve_attention_from_trusted_edge`: default mode supplies `geo`, while
+`Store::resolve_attention_from_trusted_edge`: default mode supplies
+`OPERATOR_ACTOR` (`geoyws`), while
 opt-in actor-header mode supplies the trusted edge value. The CLI uses
 `Store::resolve_attention`. Empty, oversized, malformed, cross-origin,
 unknown-board and already-resolved submissions fail without a partial write.
