@@ -910,6 +910,18 @@ interpreted unambiguously is refused rather than guessed
   matters most, the marker used to be the first thing cut. `--max-chars` with
   `--json` is an error, because it bounds the rendered text and never bounded
   the packet.
+- **A capped listing refuses a default it would exceed.** `events` (50),
+  `sitrep list` (20), `search` (10), `attention list`, `deploy list`,
+  `handoff list` and `claim --candidates` (100), and `task show`'s notes (100),
+  checkpoints (20) and handoffs (100) each fetch one row past their default;
+  if it is there and no `--limit` was given, the listing exits non-zero and
+  names `--limit N` rather than handing back a page that reads as the whole.
+  `attention list --json` once returned exactly 100 rows that a session
+  report called "100 open attention" when there were 157. Exactly the default
+  with nothing past it is complete and answered as such — the extra row is
+  looked for, never inferred from the count — and an explicit `--limit` is
+  honoured as stated, with no marker
+  ([ADR-037](docs/adr/ADR-037-truncated-listings-refuse-a-default-limit-they-exceed.md)).
 - **A restore cannot race live work.** `restore` is the one operation that goes
   around SQLite, renaming whole database files into place. It now takes the
   data root exclusively and refuses while anything else holds it; board

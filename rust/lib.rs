@@ -99,7 +99,7 @@ Usage:
   kanban task list [--status STATUS] [--tag NAME] [--lane LANE] [--all]
              [--with-claims] [--with-relations]
              [--fields id,title,status,... | --no-body] [--json]
-  kanban task show ID [--json]
+  kanban task show ID [--limit N] [--json]
              (every listed row carries claimed; --with-claims and task show
              carry claim, whose holder is claim.agentID. assignee is intent,
              never the lease: an assigned task can be free, a held one
@@ -129,7 +129,7 @@ Usage:
              (without ID: a session handoff, about no one task)
              (--repo, --branch, --head and --dirty are captured from the cwd's
              git checkout when omitted; an explicit flag overrides the capture)
-  kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--json]
+  kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--limit N] [--all] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
@@ -194,6 +194,12 @@ second board inside a registered project tree (init). claim has no --force, and
 --allow-reassign only filters claim --candidates: to take a task off an agent
 that died holding the lease, task move ID todo --as ACTOR --force, then claim it
 again for a fresh token. Unknown flags are errors.
+
+--limit N is honoured exactly. Without it a listing is capped -- events 50,
+sitrep list 20, search 10, attention list, deploy list, handoff list and
+claim --candidates 100, task show 100 notes, 20 checkpoints and 100 handoffs --
+and one that would exceed its cap refuses and names --limit rather than passing
+the first page off as the whole.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
@@ -673,7 +679,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[],
         true,
     ),
-    ("task", Some("show"), &[], &["id"], true),
+    ("task", Some("show"), &["limit"], &["id"], true),
     (
         "task",
         Some("move"),
@@ -804,7 +810,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "handoff",
         Some("list"),
-        &["task", "status", "to", "all"],
+        &["task", "status", "to", "limit", "all"],
         &[],
         true,
     ),
@@ -1202,6 +1208,44 @@ impl Args {
             );
         }
         Ok(value)
+    }
+
+    /// A capped listing that refuses to pass its default off as the whole
+    /// (ADR-037).
+    ///
+    /// `fetch` is asked for one row more than the default; if that row comes
+    /// back and the caller never said `--limit`, the listing refuses and
+    /// names the flag, because fifty rows and fifty-of-nine-hundred look the
+    /// same in a bare array. Exactly the default with no extra row is complete
+    /// and returned as such -- the extra row is looked for, not inferred from
+    /// the count, so a board holding exactly the default does not refuse. An
+    /// explicit `--limit N` is honoured as-is: the caller stated a bound and
+    /// gets exactly it, silently.
+    ///
+    /// Every capped listing routes through here so the property holds for
+    /// listings rather than for whichever command was patched first.
+    /// `what` names the rows for the refusal ("events", "checkpoints").
+    fn bounded_page<T>(
+        &self,
+        fallback: i64,
+        what: &str,
+        fetch: impl FnOnce(i64) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        let limit = self.limit(fallback)?;
+        if self.one("limit").is_some() {
+            return fetch(limit);
+        }
+        // No flag, so `limit` is the small non-negative default: `+ 1` and
+        // the cast cannot overflow.
+        let rows = fetch(limit + 1)?;
+        if rows.len() > limit as usize {
+            bail!(
+                "found more than {limit} {what} and no --limit was given — a page cut at the \
+                 default would read as the whole; pass --limit N, above {limit} to see more \
+                 or exactly {limit} to take the first {limit} knowingly"
+            );
+        }
+        Ok(rows)
     }
 
     /// The TCP port `serve` listens on, bounded to the real range.
@@ -2422,7 +2466,11 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
 }
 
 fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<SearchReceipt> {
-    let options = search_options(args, query)?;
+    let mut options = search_options(args, query)?;
+    // The stated bound -- the default or the caller's --limit -- is what the
+    // receipt is cut to. `bounded_page` decides how many to fetch (ADR-037),
+    // and the closure writes that into `options` for the stores to read.
+    let (limit, max_chars) = (options.limit, options.max_chars);
     if args.has("all-boards") {
         reject_all_boards_selector(args)?;
         let registry = Registry::open_readonly()?;
@@ -2431,40 +2479,38 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
         } else {
             registry.projects_active()?
         };
-        let mut results = Vec::new();
         let mut boards = Vec::new();
         let mut missing = Vec::new();
         let mut unreadable = Vec::new();
-        for project in projects {
-            match survey_board(&project.board_path) {
-                SurveyBoard::Readable => {}
-                SurveyBoard::Unreadable(reason) => {
-                    unreadable.push(unreadable_board(&project, reason));
-                    continue;
+        let results = args.bounded_page(limit as i64, "search results", |fetch| {
+            options.limit = fetch as usize;
+            let mut results = Vec::new();
+            for project in projects {
+                match survey_board(&project.board_path) {
+                    SurveyBoard::Readable => {}
+                    SurveyBoard::Unreadable(reason) => {
+                        unreadable.push(unreadable_board(&project, reason));
+                        continue;
+                    }
+                    SurveyBoard::Missing => {
+                        missing.push(project.name);
+                        continue;
+                    }
                 }
-                SurveyBoard::Missing => {
-                    missing.push(project.name);
-                    continue;
-                }
+                let store = Store::open(Path::new(&project.board_path))?;
+                results.extend(store.search(&project.name, &options)?);
+                boards.push(project.name);
             }
-            let store = Store::open(Path::new(&project.board_path))?;
-            results.extend(store.search(&project.name, &options)?);
-            boards.push(project.name);
-        }
-        results.extend(search::search_rules(
-            &registry.rules(options.include_archived)?,
-            &options,
-        ));
-        let mut seen = HashSet::new();
-        results.retain(|result| seen.insert(result.citation.clone()));
+            results.extend(search::search_rules(
+                &registry.rules(options.include_archived)?,
+                &options,
+            ));
+            let mut seen = HashSet::new();
+            results.retain(|result| seen.insert(result.citation.clone()));
+            Ok(results)
+        })?;
         return Ok(search::bound_receipt(
-            query,
-            boards,
-            missing,
-            unreadable,
-            results,
-            options.limit,
-            options.max_chars,
+            query, boards, missing, unreadable, results, limit, max_chars,
         ));
     }
 
@@ -2475,11 +2521,15 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
         .clone()
         .or(store.board_name()?)
         .unwrap_or_else(|| "unregistered".to_owned());
-    let mut results = store.search(&board, &options)?;
-    results.extend(search::search_rules(
-        &registry.rules_targeting_board(board_name.as_deref(), options.include_archived)?,
-        &options,
-    ));
+    let results = args.bounded_page(limit as i64, "search results", |fetch| {
+        options.limit = fetch as usize;
+        let mut results = store.search(&board, &options)?;
+        results.extend(search::search_rules(
+            &registry.rules_targeting_board(board_name.as_deref(), options.include_archived)?,
+            &options,
+        ));
+        Ok(results)
+    })?;
     Ok(search::bound_receipt(
         query,
         vec![board],
@@ -2488,8 +2538,8 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
         // reaching here.
         Vec::new(),
         results,
-        options.limit,
-        options.max_chars,
+        limit,
+        max_chars,
     ))
 }
 
@@ -4173,12 +4223,11 @@ fn run() -> Result<()> {
                 "--project, --workspace and --db address boards; --registry and --rule read the registry trail"
             );
         }
+        let registry = Registry::open_readonly()?;
         return print(
-            &Registry::open_readonly()?.rule_events(
-                args.one("rule"),
-                args.one("kind"),
-                args.limit(50)?,
-            )?,
+            &args.bounded_page(50, "events", |limit| {
+                registry.rule_events(args.one("rule"), args.one("kind"), limit)
+            })?,
             args.has("json"),
         );
     }
@@ -4294,10 +4343,12 @@ fn run() -> Result<()> {
             cross_lane: !args.has("no-cross-lane"),
             allow_reassign: args.has("allow-reassign"),
         };
-        let limit =
-            usize::try_from(args.limit(100)?).context("--limit is too large for this platform")?;
         return print(
-            &store.claim_candidates(&options, args.one("tag"), limit)?,
+            &args.bounded_page(100, "claim candidates", |limit| {
+                let limit =
+                    usize::try_from(limit).context("--limit is too large for this platform")?;
+                store.claim_candidates(&options, args.one("tag"), limit)
+            })?,
             args.has("json"),
         );
     }
@@ -4434,12 +4485,9 @@ fn run() -> Result<()> {
     }
     if command == "deploy" && sub == Some("list") {
         return print(
-            &store.deployments(
-                args.one("status"),
-                args.one("tier"),
-                args.has("all"),
-                args.limit(100)?,
-            )?,
+            &args.bounded_page(100, "deployments", |limit| {
+                store.deployments(args.one("status"), args.one("tier"), args.has("all"), limit)
+            })?,
             args.has("json"),
         );
     }
@@ -4518,14 +4566,24 @@ fn run() -> Result<()> {
             serde_json::to_value(store.dependencies(id)?)?,
         );
         value.insert("claim".into(), serde_json::to_value(claim)?);
-        value.insert("notes".into(), serde_json::to_value(store.notes(id, 100)?)?);
+        // One --limit bounds all three histories: a task's record is read as
+        // one thing, and a caller raising it wants the whole of it. Each keeps
+        // its own default, and each refuses on its own past it (ADR-037).
+        value.insert(
+            "notes".into(),
+            serde_json::to_value(args.bounded_page(100, "notes", |limit| store.notes(id, limit))?)?,
+        );
         value.insert(
             "checkpoints".into(),
-            serde_json::to_value(store.checkpoints(id, 20)?)?,
+            serde_json::to_value(
+                args.bounded_page(20, "checkpoints", |limit| store.checkpoints(id, limit))?,
+            )?,
         );
         value.insert(
             "handoffs".into(),
-            serde_json::to_value(store.handoffs(Some(id), None, None, 100, true)?)?,
+            serde_json::to_value(args.bounded_page(100, "handoffs", |limit| {
+                store.handoffs(Some(id), None, None, limit, true)
+            })?)?,
         );
         return print(&Value::Object(value), args.has("json"));
     }
@@ -4769,13 +4827,15 @@ fn run() -> Result<()> {
     }
     if command == "handoff" && sub == Some("list") {
         return print(
-            &store.handoffs(
-                args.one("task"),
-                args.one("status"),
-                args.one("to"),
-                100,
-                args.has("all"),
-            )?,
+            &args.bounded_page(100, "handoffs", |limit| {
+                store.handoffs(
+                    args.one("task"),
+                    args.one("status"),
+                    args.one("to"),
+                    limit,
+                    args.has("all"),
+                )
+            })?,
             args.has("json"),
         );
     }
@@ -4890,15 +4950,18 @@ fn run() -> Result<()> {
     }
     if command == "attention" && sub == Some("list") {
         let keep = projection(&args, &ATTENTION_FIELDS, &[])?;
-        let mut rows = serde_json::to_value(store.attention(
-            args.one("status"),
-            args.one("kind"),
-            args.one("task"),
-            args.one("tag"),
-            args.one("lane"),
-            args.limit(100)?,
-            args.has("all"),
-        )?)?;
+        let mut rows =
+            serde_json::to_value(args.bounded_page(100, "attention items", |limit| {
+                store.attention(
+                    args.one("status"),
+                    args.one("kind"),
+                    args.one("task"),
+                    args.one("tag"),
+                    args.one("lane"),
+                    limit,
+                    args.has("all"),
+                )
+            })?)?;
         if let Some(keep) = &keep {
             project(&mut rows, keep);
         }
@@ -4951,12 +5014,9 @@ fn run() -> Result<()> {
     }
     if command == "sitrep" && sub == Some("list") {
         return print(
-            &store.sitreps(
-                args.one("lane"),
-                args.has("all"),
-                args.one("task"),
-                args.limit(20)?,
-            )?,
+            &args.bounded_page(20, "sitreps", |limit| {
+                store.sitreps(args.one("lane"), args.has("all"), args.one("task"), limit)
+            })?,
             args.has("json"),
         );
     }
@@ -4976,14 +5036,16 @@ fn run() -> Result<()> {
             bail!("--after must not be later than --before");
         }
         return print(
-            &store.events_with_bounds(
-                args.one("task"),
-                args.one("kind"),
-                after,
-                before,
-                args.limit(50)?,
-                args.has("all"),
-            )?,
+            &args.bounded_page(50, "events", |limit| {
+                store.events_with_bounds(
+                    args.one("task"),
+                    args.one("kind"),
+                    after,
+                    before,
+                    limit,
+                    args.has("all"),
+                )
+            })?,
             args.has("json"),
         );
     }
