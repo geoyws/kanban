@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -223,55 +222,41 @@ fn db_lock_contention_test_guard() -> std::sync::MutexGuard<'static, ()> {
 const WORKSPACE_ADOPT_HELPER_ROOT_FD: i32 = 37;
 const WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD: i32 = 38;
 
-struct OccupiedFdsGuard {
-    fds: [i32; 2],
-}
-
-impl OccupiedFdsGuard {
-    fn occupy() -> Self {
-        let root = fs::File::open("/dev/null").unwrap();
-        let snapshot = fs::File::open("/dev/null").unwrap();
-        unsafe {
-            let root_source = libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100);
-            assert!(root_source >= 0);
-            let snapshot_source = libc::fcntl(snapshot.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100);
-            assert!(snapshot_source >= 0);
-            assert!(libc::dup2(root_source, WORKSPACE_ADOPT_HELPER_ROOT_FD) >= 0);
-            assert!(libc::dup2(snapshot_source, WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD) >= 0);
-            assert!(libc::close(root_source) >= 0);
-            assert!(libc::close(snapshot_source) >= 0);
-            assert!(
-                libc::fcntl(
-                    WORKSPACE_ADOPT_HELPER_ROOT_FD,
-                    libc::F_SETFD,
-                    libc::FD_CLOEXEC,
-                ) >= 0
-            );
-            assert!(
-                libc::fcntl(
-                    WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
-                    libc::F_SETFD,
-                    libc::FD_CLOEXEC,
-                ) >= 0
-            );
-        }
-        Self {
-            fds: [
-                WORKSPACE_ADOPT_HELPER_ROOT_FD,
-                WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
-            ],
-        }
-    }
-}
-
-impl Drop for OccupiedFdsGuard {
-    fn drop(&mut self) {
-        for fd in self.fds {
-            unsafe {
-                libc::close(fd);
+/// Occupy the helper's fixed fd numbers with close-on-exec `/dev/null`
+/// handles, so the adopt binary starts with those numbers taken and then
+/// freed at exec, exactly as a parent that happened to hold them would leave
+/// it.
+///
+/// This runs in the FORKED CHILD, from `pre_exec`, never in the test process.
+/// Every test in this binary is a thread of one process sharing one fd table,
+/// and `dup2` onto a fixed low number there clobbers whatever a sibling thread
+/// has on it mid-`spawn` — a pipe it is about to hand to its own child. Three
+/// unrelated spawn-heavy tests failed `Command::spawn` with EBADF on
+/// 2026-09-05, one per gate, once `Fixture::new` began spawning `git init`
+/// twice per fixture and widened the window. Only async-signal-safe calls
+/// belong here: `open`, `dup2`, `fcntl`, `close`.
+fn occupy_helper_fds_in_child() -> std::io::Result<()> {
+    unsafe {
+        for target in [
+            WORKSPACE_ADOPT_HELPER_ROOT_FD,
+            WORKSPACE_ADOPT_HELPER_SNAPSHOT_FD,
+        ] {
+            let source = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if source < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(source, target) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if source != target && libc::close(source) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(target, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -16126,23 +16111,24 @@ fn workspace_adopt_handles_helper_fd_collisions_and_cloexec() {
     let _adopt_test_guard = workspace_adopt_test_guard();
     let fixture = Fixture::new("workspace-adopt-helper-fd-collision");
     let source = external_source_board(&fixture, "source", "Alpha");
-    let _fds = OccupiedFdsGuard::occupy();
 
-    let output = fixture.run(
-        &fixture.main,
-        &[
-            "workspace",
-            "adopt",
-            "--from-board",
-            source.to_str().unwrap(),
-            "--name",
-            "Alpha",
-            "--rootless",
-            "--as",
-            "geoyws",
-            "--json",
-        ],
-    );
+    let mut command = fixture.command(&fixture.main);
+    command.args([
+        "workspace",
+        "adopt",
+        "--from-board",
+        source.to_str().unwrap(),
+        "--name",
+        "Alpha",
+        "--rootless",
+        "--as",
+        "geoyws",
+        "--json",
+    ]);
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, occupy_helper_fds_in_child);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "fd collision and cloexec handoff failed: stdout={} stderr={}",
