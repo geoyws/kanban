@@ -23,6 +23,7 @@ mod import;
 mod lock;
 mod mcp;
 mod model;
+mod opencode_adapter;
 #[allow(dead_code)]
 mod policy;
 mod registry;
@@ -4372,6 +4373,21 @@ pub fn claude_print_adapter_entrypoint() -> ! {
         Err(error) => {
             let _ = writeln!(io::stderr(), "Error: {error:#}");
             std::process::exit(1)
+        }
+    }
+}
+
+/// Entry point for the OpenCode local-server adapter binary.
+pub fn opencode_adapter_entrypoint() -> ! {
+    match opencode_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // This adapter POSTs the delivery to a local HTTP server, so a closed
+        // stdout is not the human CLI's harmless reader-left case: the
+        // acknowledgement never reached the dispatcher. The exit status also
+        // carries the failure classification, which a blanket `1` would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(opencode_adapter::exit_code(&error))
         }
     }
 }

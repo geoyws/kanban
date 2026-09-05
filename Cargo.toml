@@ -37,6 +37,10 @@ path = "rust/bin/kanban-codex-app-server-adapter.rs"
 name = "kanban-claude-print-adapter"
 path = "rust/bin/kanban-claude-print-adapter.rs"
 
+[[bin]]
+name = "kanban-opencode-adapter"
+path = "rust/bin/kanban-opencode-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
