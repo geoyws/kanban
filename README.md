@@ -707,6 +707,22 @@ combined v2 schema hash
 invocation clears child environment except `CODEX_HOME`, probes version/help,
 and emits only `AdapterResponse` on success.
 
+**HAX live smoke receipt, 2026-09-05.** Installed-Codex support is now
+established for this bridge, and separately from the compiled fake-Codex
+contract test. Against `@@hax`'s installed `codex-cli 0.150.1`, the host's own
+`dispatchers.json` binding was invoked with one structured `AdapterRequest`
+(subscription `smoke-t-560b778b`, a 64-hex event ID) and exited `0` in ~6s
+having written only an `AdapterResponse` to stdout and nothing to stderr. The
+turn mutated nothing: the private cwd
+`/root/.local/share/kanban/codex-app-server-cwd` was byte-for-byte the same
+directory listing before and after, the host's tmux panes and their foreground
+commands were unchanged, and the adapter's identity-pinned schema temp dir was
+removed — a `find /tmp -newermt '-3 minutes'` sweep for its own scratch
+returned nothing. A malformed request is still refused rather than coerced:
+a non-hex event ID exits `1` with `adapter delivery event ID must be
+lowercase 64-hex` and never reaches Codex. The interface stays **experimental
+and opt-in** after this receipt, and no active declarative subscription ships.
+
 The third opt-in bridge uses consumer `claude.print`, action
 `start-readonly-turn`, and capability `start`, implemented by
 `kanban-claude-print-adapter`. No active declarative subscription ships.

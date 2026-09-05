@@ -135,7 +135,13 @@ write domains.
   schema/size drift, malformed output, stderr, timeout, wrong/extra/duplicate
   ack, errors, and post-completion output fail closed. Success stdout is only
   `AdapterResponse` after exactly one `{accepted:true,idempotencyKey:<subscriptionID:eventID>}`
-  completion. Delivery remains at-least-once.
+  completion. Delivery remains at-least-once. Installed-Codex support is
+  established by a separately named 2026-09-05 HAX live smoke receipt, not by
+  the fake-Codex contract test: the host's own binding accepted one structured
+  request against installed `codex-cli 0.150.1`, exited `0`, emitted only
+  `AdapterResponse`, wrote nothing to stderr, left the private cwd and the
+  host's tmux panes unchanged, and removed its schema temp dir. The bridge
+  stays experimental and opt-in after that receipt. See README.
 - For the third opt-in bridge, host-local `dispatchers.json` binds consumer
   `claude.print`, action `start-readonly-turn`, and capability `start` to
   `kanban-claude-print-adapter`; no active declarative subscription ships.

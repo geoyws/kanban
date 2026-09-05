@@ -511,7 +511,13 @@ closed. Success stdout is only `AdapterResponse` after one accepted
 `(subscriptionID,eventID)` completion. The acceptance matrix for this bridge
 is separate: focused unit protocol/runtime coverage, compiled-process
 adapter-contract coverage against a dependency-free fake Codex, and a distinct
-HAX live smoke against installed Codex/model. In the summary-view final turn,
+HAX live smoke against installed Codex/model. That third leg is now closed:
+the 2026-09-05 receipt in README records the host's own binding accepting one
+structured request against installed `codex-cli 0.150.1` with an
+`AdapterResponse`, no stderr, an unchanged private cwd, unchanged host tmux
+panes, and its schema temp dir removed. The bridge stays experimental and
+opt-in, and no active declarative subscription ships.
+In the summary-view final turn,
 only a completed `userMessage` may be omitted from `turn/completed.items`;
 `reasoning` and `agentMessage` items remain exact and fail closed.
 
