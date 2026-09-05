@@ -81,6 +81,15 @@ Inspection is read-only: it does not migrate or touch registry recency, expire
 leases, update task state, append events, or cache a result. A returned row is
 still only a candidate; take it with atomic `claim ID` or `claim --next`.
 
+To ask who holds a task, read the lease, not the assignee. Every `task list`
+row carries `claimed`, and `task list --with-claims` (or `task show`) adds
+`claim`, whose holder is `claim.agentID` alongside `expiresAt`; a free task has
+`claimed: false` and `claim: null`. There is no `claim.actor`, and `assignee`
+is a separate field recording intent, not possession: an assigned task can be
+free, and a held task can be assigned to someone else. `--fields actor` is
+refused naming the keys that exist, so the wrong question fails where it is
+typed rather than answering null.
+
 ## Roadmap todo lists
 
 Use the board tree for every durable multi-item todo list. The roadmap is an

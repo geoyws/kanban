@@ -660,10 +660,13 @@ mod tests {
 
         let list = tool("task_list");
         assert_eq!(list["inputSchema"]["properties"]["all"]["type"], "boolean");
-        assert_eq!(
-            list["inputSchema"]["properties"]["with-relations"]["type"],
-            "boolean"
-        );
+        for flag in ["with-relations", "with-claims"] {
+            assert_eq!(
+                list["inputSchema"]["properties"][flag]["type"],
+                "boolean",
+                "--{flag}"
+            );
+        }
     }
 
     #[test]
