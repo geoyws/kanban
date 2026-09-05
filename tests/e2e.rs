@@ -166,10 +166,12 @@ fn adoption_marker_path(fixture: &Fixture) -> PathBuf {
 static WORKSPACE_ADOPT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn workspace_adopt_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking sibling must fail on its own assertion, not cascade a
+    // PoisonError into every later adopt test that shares this lock.
     WORKSPACE_ADOPT_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 static DB_LOCK_CONTENTION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -235,6 +237,7 @@ impl Drop for OccupiedFdsGuard {
     }
 }
 
+#[cfg(debug_assertions)]
 fn wait_for_path(path: &Path) {
     for _ in 0..200 {
         if path.exists() {
@@ -245,6 +248,7 @@ fn wait_for_path(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+#[cfg(debug_assertions)]
 fn wait_for_json_file(path: &Path) -> Value {
     for _ in 0..200 {
         if let Ok(text) = fs::read_to_string(path)
@@ -14660,6 +14664,12 @@ fn workspace_adopt_helper_stays_hidden_from_help_schema_and_mcp() {
     );
 }
 
+// `KANBAN_TEST_WORKSPACE_ADOPT_HOOK` is honoured only by the debug pause seam
+// `workspace_adopt_test_hook` in rust/registry.rs (`#[cfg(debug_assertions)]`).
+// A release binary completes adoption instead of pausing, so this test exists
+// only in debug test binaries; see
+// `release_binary_ignores_workspace_adopt_pause_hook` for the release-side proof.
+#[cfg(debug_assertions)]
 #[test]
 fn workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_crash() {
     let _adopt_test_guard = workspace_adopt_test_guard();
@@ -14765,6 +14775,9 @@ fn workspace_adopt_handles_helper_fd_collisions_and_cloexec() {
     );
 }
 
+// Debug-only: depends on the `after_marker` pause seam (see the note on
+// `workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_crash`).
+#[cfg(debug_assertions)]
 #[test]
 fn workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held() {
     let _adopt_test_guard = workspace_adopt_test_guard();
@@ -14828,6 +14841,9 @@ fn workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held() {
     );
 }
 
+// Debug-only: depends on the `after_publish` pause seam (see the note on
+// `workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_crash`).
+#[cfg(debug_assertions)]
 #[test]
 fn workspace_adopt_recovers_after_publishing_before_commit() {
     let _adopt_test_guard = workspace_adopt_test_guard();
@@ -14876,6 +14892,57 @@ fn workspace_adopt_recovers_after_publishing_before_commit() {
     assert_eq!(
         fs::read_dir(fixture.data.join("boards")).unwrap().count(),
         0
+    );
+}
+
+// Release-side counterpart of the three `#[cfg(debug_assertions)]` adopt tests
+// above. A release binary compiles `workspace_adopt_test_hook` down to `Ok(())`,
+// so the pause env var must be inert: adoption completes, the marker is gone,
+// and the board is registered. This is what a release run reports instead of
+// silently running three fewer tests.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_binary_ignores_workspace_adopt_pause_hook() {
+    let _adopt_test_guard = workspace_adopt_test_guard();
+    let fixture = Fixture::new("workspace-adopt-release-hook-inert");
+    let source = external_source_board(&fixture, "source", "Alpha");
+    let marker = adoption_marker_path(&fixture);
+    let mut command = fixture.command(&fixture.main);
+    command
+        .args([
+            "workspace",
+            "adopt",
+            "--from-board",
+            source.to_str().unwrap(),
+            "--name",
+            "Alpha",
+            "--rootless",
+            "--as",
+            "geo",
+            "--json",
+        ])
+        .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_marker");
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "release binary honoured the debug-only pause hook; the debug-only tests \
+         workspace_adopt_rejects_a_concurrent_adopter_and_recovers_after_a_precommit_crash, \
+         workspace_adopt_refuses_while_the_canonical_data_root_lock_is_held and \
+         workspace_adopt_recovers_after_publishing_before_commit are intentionally \
+         excluded from release test binaries (cfg(debug_assertions)); run `cargo test` \
+         without --release to exercise the seam. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "adoption marker lingered after a completed adopt");
+    let boards = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"]);
+    assert!(
+        boards
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "Alpha"),
+        "release adopt did not register the board: {boards}"
     );
 }
 

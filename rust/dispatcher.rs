@@ -1123,8 +1123,13 @@ mod tests {
         reset_cancellation();
     }
 
+    // Direct `--db` resolution still opens the ambient registry read-only for
+    // the ADR-035 retired-board check, so these fixtures own a private data
+    // root instead of inheriting the operator's registry.
     #[test]
     fn direct_external_database_resolution_holds_no_data_root_lock() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let dir = env::temp_dir().join(format!(
             "kanban-dispatcher-board-{}-{}",
             std::process::id(),
@@ -1150,6 +1155,8 @@ mod tests {
 
     #[test]
     fn direct_symlink_resolution_uses_the_stable_canonical_board() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let dir = env::temp_dir().join(format!(
             "kanban-dispatcher-symlink-{}-{}",
             std::process::id(),
