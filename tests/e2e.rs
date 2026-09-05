@@ -16528,8 +16528,11 @@ fn workspace_adopt_recovers_after_publishing_before_commit() {
         ])
         .env("KANBAN_TEST_WORKSPACE_ADOPT_HOOK", "after_publish");
     let mut child = child.spawn().unwrap();
-    wait_for_path(&marker);
-    let marker_json: Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+    // wait_for_path only proves the file exists; the writing process may still
+    // be mid-write, and reading it then fails with "EOF while parsing a value"
+    // (observed under a loaded gate on 2026-09-05). wait_for_json_file retries
+    // until the content parses.
+    let marker_json: Value = wait_for_json_file(&marker);
     let board_path = PathBuf::from(marker_json["boardPath"].as_str().unwrap());
     wait_for_path(&board_path);
 
