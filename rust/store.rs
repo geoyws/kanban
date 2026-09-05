@@ -1536,31 +1536,100 @@ fn require_lease(connection: &Connection, task_id: &str, token: &str, now: i64) 
 }
 
 fn expire_claims(connection: &Connection, now: i64) -> Result<()> {
-    let mut statement =
-        connection.prepare("SELECT task_id,agent_id FROM task_claims WHERE expires_at<=?")?;
+    // Read the whole row before the DELETE: once the claim is gone, the
+    // provenance it carried (who held it, where, and how stale their last
+    // checkpoint was) is unrecoverable, and the `claim_expired` event is the
+    // only record a successor can read to reconstruct what died.
+    let mut statement = connection.prepare("SELECT * FROM task_claims WHERE expires_at<=?")?;
     let expired = statement
-        .query_map([now], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map([now], claim_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    for (task_id, agent) in expired {
-        connection.execute("DELETE FROM task_claims WHERE task_id=?", [&task_id])?;
+    for claim in expired {
+        // The newest checkpoint written since this claim began. Comparing
+        // against `claimed_at` (not just "newest ever") is what stops a
+        // checkpoint a *previous* holder wrote from being reported as this
+        // holder's freshest work.
+        let last_checkpoint: Option<(i64, i64)> = connection
+            .query_row(
+                "SELECT seq,created_at FROM checkpoints WHERE task_id=? AND created_at>=? ORDER BY seq DESC LIMIT 1",
+                params![claim.task_id, claim.claimed_at],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        connection.execute("DELETE FROM task_claims WHERE task_id=?", [&claim.task_id])?;
         connection.execute(
             "UPDATE tasks SET status='todo',assignee=CASE WHEN assignee=? THEN NULL ELSE assignee END,updated_at=? WHERE id=? AND status='in_progress'",
-            params![agent, now, task_id],
+            params![claim.agent_id, now, claim.task_id],
         )?;
         event_with_status(
             connection,
-            Some(&task_id),
+            Some(&claim.task_id),
             "claim_expired",
-            Some(&agent),
-            json!({}),
+            Some(&claim.agent_id),
+            json!({
+                "sessionId": claim.session_id,
+                "worktree": claim.worktree,
+                "worktreeKind": claim.worktree_kind,
+                "branch": claim.branch,
+                "headSha": claim.head_sha,
+                "rootHead": claim.root_head,
+                "claimedAt": claim.claimed_at,
+                "heartbeatAt": claim.heartbeat_at,
+                "lastCheckpointSeq": last_checkpoint.map(|(seq, _)| seq),
+                "lastCheckpointAt": last_checkpoint.map(|(_, at)| at),
+            }),
             Some("in_progress"),
             Some("todo"),
         )?;
     }
     Ok(())
+}
+
+/// The previous holder whose lease expired, if that expiry is still the reason
+/// the task last entered `todo`.
+///
+/// "Newest ever" would be wrong: a task that was claimed, orphaned, reclaimed
+/// and then completed has a `claim_expired` event in its past, but a later
+/// holder reaching it after a `task move … todo` should not be told that stale
+/// orphan explains the todo. Scoping to `seq >= (newest event whose
+/// `_semanticV1.currentStatus` is `todo`)` drops every `claim_expired` that a
+/// newer move back into `todo` superseded, while still returning the latest
+/// orphan when a task was orphaned, reclaimed and orphaned again.
+fn orphaned_from(connection: &Connection, task_id: &str) -> Result<Option<OrphanedFrom>> {
+    let last_entered_todo: i64 = connection
+        .query_row(
+            "SELECT seq FROM events WHERE task_id=? \
+             AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$._semanticV1.currentStatus')='todo' \
+             ORDER BY seq DESC LIMIT 1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let row: Option<(String, String, i64)> = connection
+        .query_row(
+            "SELECT actor,payload,created_at FROM events \
+             WHERE task_id=? AND kind='claim_expired' AND seq>=? \
+             ORDER BY seq DESC LIMIT 1",
+            params![task_id, last_entered_todo],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((agent, payload, expired_at)) = row else {
+        return Ok(None);
+    };
+    let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    let field = |name: &str| payload.get(name).and_then(Value::as_str).map(str::to_owned);
+    Ok(Some(OrphanedFrom {
+        agent,
+        session_id: field("sessionId"),
+        expired_at,
+        last_checkpoint_at: payload.get("lastCheckpointAt").and_then(Value::as_i64),
+        worktree: field("worktree"),
+        branch: field("branch"),
+        head_sha: field("headSha"),
+    }))
 }
 
 /// A live lease is another agent's authority to write this task. Operator
@@ -3449,10 +3518,12 @@ impl Store {
             Some("in_progress"),
         )?;
         let result = active_claim(&transaction, &task.id, now)?.context("claim was not created")?;
+        let orphaned_from = orphaned_from(&transaction, &task.id)?;
         transaction.commit()?;
         Ok(ClaimReceipt {
             claim: result,
             rules: Vec::new(),
+            orphaned_from,
         })
     }
 
@@ -4989,6 +5060,7 @@ impl Store {
             ancestors: self.ancestors(id)?,
             dependencies: self.dependencies(id)?,
             claim: self.get_claim(id)?.as_ref().map(ClaimSummary::from),
+            orphaned_from: orphaned_from(&self.connection, id)?,
             open_attention,
             notes,
             checkpoints,

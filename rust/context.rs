@@ -539,6 +539,7 @@ mod tests {
             ancestors: vec![],
             dependencies: vec![],
             claim: None,
+            orphaned_from: None,
             open_attention: vec![
                 sample_attention(
                     "a-1",

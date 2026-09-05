@@ -6537,7 +6537,40 @@ fn compiled_binary_retires_dead_leases_before_any_read_and_records_them() {
         &fixture.main,
         &["task", "add", "abandoned", "--id", "t-1", "--json"],
     );
-    fixture.ok_json(&fixture.main, &["claim", "t-1", "--as", "ghost", "--json"]);
+    let ghost = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-1",
+            "--as",
+            "ghost",
+            "--session",
+            "ghost-session",
+            "--json",
+        ],
+    );
+    // A checkpoint written while the lease is live is the freshest work the
+    // dead holder left behind, and a successor must see exactly when.
+    let checkpoint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-1",
+            "--lease",
+            ghost["leaseToken"].as_str().unwrap(),
+            "--as",
+            "ghost",
+            "--session",
+            "ghost-session",
+            "--summary",
+            "half done",
+            "--intent",
+            "finish it",
+            "--next-action",
+            "run the suite",
+            "--json",
+        ],
+    );
 
     // Simulate the agent vanishing: the lease runs out with nobody to release
     // it. Expiry used to happen only inside claim/accept_handoff, so every read
@@ -6575,6 +6608,206 @@ fn compiled_binary_retires_dead_leases_before_any_read_and_records_them() {
     );
     assert_eq!(expired.as_array().unwrap().len(), 1);
     assert_eq!(expired[0]["actor"], "ghost");
+
+    // K1: the payload names the dead holder, where they stood, and how stale
+    // their last checkpoint was — read before the DELETE, not after.
+    let payload = &expired[0]["payload"];
+    assert_eq!(payload["sessionId"], "ghost-session");
+    assert_eq!(payload["worktree"], ghost["worktree"]);
+    assert_eq!(payload["worktreeKind"], ghost["worktreeKind"]);
+    assert_eq!(payload["branch"], ghost["branch"]);
+    assert_eq!(payload["headSha"], ghost["headSha"]);
+    assert_eq!(payload["rootHead"], ghost["rootHead"]);
+    assert_eq!(payload["claimedAt"], ghost["claimedAt"]);
+    assert_eq!(payload["heartbeatAt"], ghost["heartbeatAt"]);
+    assert_eq!(payload["lastCheckpointSeq"], checkpoint["seq"]);
+    assert_eq!(payload["lastCheckpointAt"], checkpoint["createdAt"]);
+
+    // K2: a second agent's claim receipt names who died, when, and how stale.
+    let successor = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-1",
+            "--as",
+            "successor",
+            "--session",
+            "successor-session",
+            "--json",
+        ],
+    );
+    let orphaned = &successor["orphanedFrom"];
+    assert_eq!(orphaned["agent"], "ghost");
+    assert_eq!(orphaned["sessionId"], "ghost-session");
+    assert_eq!(orphaned["expiredAt"], expired[0]["createdAt"]);
+    assert_eq!(orphaned["lastCheckpointAt"], checkpoint["createdAt"]);
+    assert_eq!(orphaned["worktree"], ghost["worktree"]);
+    assert_eq!(orphaned["branch"], ghost["branch"]);
+    assert_eq!(orphaned["headSha"], ghost["headSha"]);
+
+    // K2/K3: the same orphan and the same checkpoint are what `kb ctx` hands
+    // the successor reading the packet cold.
+    let ctx = fixture.ok_json(&fixture.main, &["ctx", "t-1", "--json"]);
+    assert_eq!(ctx["orphanedFrom"], successor["orphanedFrom"]);
+    assert_eq!(
+        ctx["checkpoints"].as_array().unwrap().last().unwrap()["createdAt"],
+        checkpoint["createdAt"]
+    );
+}
+
+#[test]
+fn compiled_binary_reports_null_last_checkpoint_when_the_dead_holder_wrote_none() {
+    let fixture = Fixture::new("sweep-null");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SweepNull", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "abandoned", "--id", "t-1", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-1",
+            "--as",
+            "ghost",
+            "--session",
+            "ghost-session",
+            "--json",
+        ],
+    );
+
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Connection::open(&board)
+        .unwrap()
+        .execute("UPDATE task_claims SET expires_at=1", [])
+        .unwrap();
+    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+
+    // The holder wrote no checkpoint since claiming, so the enriched payload
+    // says exactly that with nulls, never an empty string or a stale value.
+    let expired = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "claim_expired", "--json"],
+    );
+    assert_eq!(expired.as_array().unwrap().len(), 1);
+    assert!(expired[0]["payload"]["lastCheckpointSeq"].is_null());
+    assert!(expired[0]["payload"]["lastCheckpointAt"].is_null());
+
+    // The null survives into the successor's orphanedFrom rather than being
+    // reported as a fresh checkpoint that never happened.
+    let successor = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-1", "--as", "successor", "--json"],
+    );
+    assert_eq!(successor["orphanedFrom"]["agent"], "ghost");
+    assert_eq!(successor["orphanedFrom"]["sessionId"], "ghost-session");
+    assert!(successor["orphanedFrom"]["lastCheckpointAt"].is_null());
+}
+
+#[test]
+fn compiled_binary_reports_only_the_latest_orphan_and_none_after_a_completed_cycle() {
+    let fixture = Fixture::new("sweep-latest");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SweepLatest", "--json"]);
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Orphaned twice: the second holder, not the first, is the one a successor
+    // must be told about.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "re-orphaned", "--id", "t-latest", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-latest", "--as", "first", "--json"],
+    );
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE task_claims SET expires_at=1 WHERE task_id='t-latest'",
+            [],
+        )
+        .unwrap();
+    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-latest", "--as", "second", "--json"],
+    );
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE task_claims SET expires_at=1 WHERE task_id='t-latest'",
+            [],
+        )
+        .unwrap();
+    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let third = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-latest", "--as", "third", "--json"],
+    );
+    assert_eq!(
+        third["orphanedFrom"]["agent"], "second",
+        "a twice-orphaned task must report the latest orphan, not the first"
+    );
+
+    // Claimed, orphaned, reclaimed and completed: after the task finishes and
+    // is moved back to todo, the stale orphan must not be reported to a later
+    // holder.
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "completed", "--id", "t-done", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-done", "--as", "worker", "--json"],
+    );
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE task_claims SET expires_at=1 WHERE task_id='t-done'",
+            [],
+        )
+        .unwrap();
+    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-done", "--as", "successor", "--json"],
+    );
+    // The successor finishes, then the task is moved back into the queue.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "move", "t-done", "done", "--as", "operator", "--force", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "move", "t-done", "todo", "--as", "operator", "--json",
+        ],
+    );
+    // The completed task still names its assignee, so the fresh holder takes
+    // it over explicitly rather than the claim being refused as reassignment.
+    let later = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-done",
+            "--as",
+            "later",
+            "--allow-reassign",
+            "--json",
+        ],
+    );
+    assert!(
+        later.get("orphanedFrom").is_none(),
+        "a completed cycle must not report a stale orphan to a later holder: {later}"
+    );
 }
 
 #[test]

@@ -418,6 +418,27 @@ pub struct ClaimReceipt {
     #[serde(flatten)]
     pub claim: Claim,
     pub rules: Vec<RuleSummary>,
+    /// Who last died holding this task, when, and how stale their last
+    /// checkpoint was — derived from the newest `claim_expired` event since
+    /// the task last entered `todo`. Absent when the task was never orphaned,
+    /// or when it was reclaimed and completed since, so a later holder is not
+    /// told a stale predecessor explains why the task sits in `todo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_from: Option<OrphanedFrom>,
+}
+
+/// The previous holder whose lease expired, surfaced to a successor so it can
+/// see who died, when, and how stale their last checkpoint is.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanedFrom {
+    pub agent: String,
+    pub session_id: Option<String>,
+    pub expired_at: i64,
+    pub last_checkpoint_at: Option<i64>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub head_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,6 +635,11 @@ pub struct ContextPacket {
     pub ancestors: Vec<Task>,
     pub dependencies: Vec<Task>,
     pub claim: Option<ClaimSummary>,
+    /// The previous holder whose lease expired, for a successor reading the
+    /// packet cold. See [`ClaimReceipt::orphaned_from`]; absent when nothing
+    /// is reportable so existing consumers see no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_from: Option<OrphanedFrom>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_attention: Vec<Attention>,
     pub notes: Vec<TaskNote>,
