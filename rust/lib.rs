@@ -111,10 +111,18 @@ Usage:
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
   kanban note ID TEXT --as AGENT [--kind KIND]
-  kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT --next-action TEXT
+  kanban checkpoint ID --lease TOKEN --as AGENT --summary TEXT --intent TEXT
+             --next-action TEXT [--session ID] [--model NAME] [--state STATE]
+             [--blocker TEXT ...] [--validation TEXT ...]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
   kanban handoff create [ID --lease TOKEN] --as AGENT --summary TEXT --intent TEXT
-             --next-action TEXT [--priority P0|P1|P2|0-9]
+             --next-action TEXT [--priority P0|P1|P2|0-9] [--to AGENT]
+             [--reason TEXT] [--session ID] [--model NAME]
+             [--blocker TEXT ...] [--validation TEXT ...]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
              (without ID: a session handoff, about no one task)
+             (--repo, --branch, --head and --dirty are captured from the cwd's
+             git checkout when omitted; an explicit flag overrides the capture)
   kanban handoff list [--task ID] [--status STATUS] [--to AGENT] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N] [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
@@ -1461,6 +1469,19 @@ fn reader_left(error: &anyhow::Error) -> bool {
         .chain()
         .filter_map(|cause| cause.downcast_ref::<io::Error>())
         .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
+}
+
+/// Whether the command line asked for `--json`.
+///
+/// Read from the raw arguments rather than from [`Args`], because the error
+/// this decides the shape of may be the parse itself failing. Recognises the
+/// two spellings [`Args::parse`] does -- `--json` and `--json=VALUE` -- and
+/// nothing looser, so an abbreviation the parser would refuse is not treated
+/// as a request here.
+fn json_requested() -> bool {
+    env::args()
+        .skip(1)
+        .any(|argument| argument == "--json" || argument.starts_with("--json="))
 }
 
 fn cwd() -> Result<PathBuf> {
@@ -3227,7 +3248,18 @@ pub fn entrypoint() -> ! {
         // did not cause.
         Err(error) if reader_left(&error) => std::process::exit(0),
         Err(error) => {
-            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            let message = format!("{error:#}");
+            let _ = writeln!(io::stderr(), "Error: {message}");
+            // A `--json` caller reads stdout and the exit status, and a
+            // pipeline such as `... --json | jq` never sees stderr at all.
+            // `claim --candidates --json` without `--as` left stdout empty,
+            // and an empty stdout piped into a parser reads as "no
+            // candidates" -- absence rendered identically to error. So the
+            // refusal reaches stdout too, as the object a parser will see, and
+            // stderr keeps the prose for the MCP layer and humans.
+            if json_requested() {
+                let _ = print(&json!({ "error": message }), true);
+            }
             std::process::exit(1)
         }
     }
@@ -5180,6 +5212,46 @@ mod tests {
                 "--{flag} undoes another flag but is in no mutually-exclusive \
                  pair, so passing both silently prefers one"
             );
+        }
+    }
+
+    /// The usage lines `--help` prints for one command: its `  kanban NAME`
+    /// line and the indented continuation lines under it.
+    fn usage_block(command: &str, sub: Option<&str>) -> String {
+        let heading = match sub {
+            Some(sub) => format!("  kanban {command} {sub} "),
+            None => format!("  kanban {command} "),
+        };
+        let mut lines = HELP.lines().skip_while(|line| !line.starts_with(&heading));
+        let mut block = lines
+            .next()
+            .unwrap_or_else(|| panic!("--help has no usage line starting `{heading}`"))
+            .to_owned();
+        for line in lines.take_while(|line| line.starts_with("             ")) {
+            block.push('\n');
+            block.push_str(line);
+        }
+        block
+    }
+
+    #[test]
+    fn help_documents_every_flag_checkpoint_and_handoff_create_accept() {
+        // Both handlers read --repo, --branch, --head and --dirty ahead of git
+        // capture, and for a caller on a host where capture returns nothing
+        // those four are the only way to store a head at all -- yet --help
+        // named none of them, so the /session skill guessed the surface and
+        // guessed two of them wrong. The parser's flag row is the surface;
+        // this reads every flag on it back out of the usage block.
+        for (command, sub) in [("checkpoint", None), ("handoff", Some("create"))] {
+            let (flags, _) = command_spec(command, sub).unwrap();
+            let block = usage_block(command, sub);
+            for flag in flags {
+                assert!(
+                    block.contains(&format!("--{flag}")),
+                    "`{command} {}` accepts --{flag} but its --help usage does not name it:\n{block}",
+                    sub.unwrap_or("")
+                );
+            }
         }
     }
 
