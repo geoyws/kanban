@@ -441,10 +441,12 @@ Ranking fuses exact identifiers and phrases, SQLite FTS5/BM25, and a small
 deterministic local semantic model (`kanban-semantic-lite-v1`). The local model
 keeps retrieval private and offline; it is a retrieval aid, not a general
 embedding model. Missing or stale vector cache entries are computed in memory,
-so `search` remains read-only. Only `search-rebuild` persists the cache and
-writes an audit event. `--limit` and `--max-chars` bound agent context, and
+so `search` remains read-only. Incremental writes re-embed the documents they
+touch in the same transaction, and `search-rebuild` refreshes the whole corpus
+and writes an audit event. `--limit` and `--max-chars` bound agent context, and
 `--source`, `--status`, `--tag`, `--lane`, `--after`, `--before`, and `--all`
-filter it. `doctor` reports source/document/FTS parity plus cache freshness.
+filter it. `doctor` reports source/document/FTS parity plus cache freshness and
+fails when any document lacks a current embedding.
 
 The same command description generates the MCP `search` and `search_rebuild`
 tools. The served UI exposes cross-board search at `/search`; both surfaces call

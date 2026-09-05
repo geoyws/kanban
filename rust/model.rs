@@ -869,6 +869,9 @@ pub struct SearchIndexHealth {
     pub missing_embeddings: i64,
     pub stale_embeddings: i64,
     pub embedding_model: String,
+    /// Why `healthy` is false, each naming the measured gap and its fix
+    /// (`kb search-rebuild`). Empty when the index is healthy.
+    pub unhealthy_because: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

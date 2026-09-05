@@ -2267,12 +2267,10 @@ fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     assert_eq!(after_mutation["results"][0]["sourceId"], "t-release");
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["projects"][0]["searchIndex"]["healthy"], true);
-    assert!(
-        doctor["projects"][0]["searchIndex"]["missingEmbeddings"]
-            .as_i64()
-            .unwrap()
-            > 0,
-        "a source mutation did not invalidate its cached vector"
+    assert_eq!(
+        doctor["projects"][0]["searchIndex"]["missingEmbeddings"],
+        0,
+        "a source mutation left its document unembedded; the incremental path must re-embed inline"
     );
 
     fixture.ok_json(
@@ -2580,6 +2578,147 @@ fn compiled_binary_keeps_linked_deployment_search_documents_after_task_mutations
         ],
     );
     assert_healthy();
+}
+
+#[test]
+fn doctor_flags_and_rebuild_repairs_a_search_index_without_embeddings() {
+    let fixture = Fixture::new("search-embed-health");
+    fixture.ok_json(&fixture.main, &["init", "--name", "EMBED-HEALTH", "--json"]);
+
+    // One of each searchable source kind, written through the CLI so the
+    // compiled binary's incremental path is what is under test.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Embedding health probe",
+            "--id",
+            "t-embed",
+            "--body",
+            "The semantic half of hybrid retrieval.",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["note", "t-embed", "A note for the probe.", "--as", "tester", "--json"],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-embed", "--as", "tester", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-embed",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "tester",
+            "--state",
+            "continue",
+            "--summary",
+            "probe checkpoint",
+            "--intent",
+            "exercise the incremental embed path",
+            "--next-action",
+            "check health",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "An attention row is a searchable document.",
+            "--as",
+            "tester",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "A sitrep for the driver lane.",
+            "--as",
+            "tester",
+            "--lane",
+            "driver",
+            "--json",
+        ],
+    );
+
+    // (a) Every write embedded inline, so the index reports no missing vectors.
+    let healthy = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(healthy["healthy"], true, "{healthy}");
+    assert_eq!(
+        healthy["projects"][0]["searchIndex"]["missingEmbeddings"],
+        0,
+        "{healthy}"
+    );
+    assert_eq!(healthy["projects"][0]["searchIndex"]["healthy"], true, "{healthy}");
+
+    // (b) Null out the vectors directly; doctor must refuse to call it healthy
+    // and must name the gap and the rebuild command in the reason.
+    let board_path = board_path_for_project(&fixture, &fixture.main, "EMBED-HEALTH");
+    Connection::open(&board_path)
+        .unwrap()
+        .execute("UPDATE search_documents SET embedding=NULL", [])
+        .unwrap();
+
+    let degraded = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        !degraded.status.success(),
+        "doctor must exit non-zero over a mostly-unembedded index"
+    );
+    let report: Value = serde_json::from_slice(&degraded.stdout).unwrap();
+    assert_eq!(report["healthy"], false, "{report}");
+    let search = &report["projects"][0]["searchIndex"];
+    assert_eq!(search["healthy"], false, "{search}");
+    assert!(
+        search["missingEmbeddings"].as_i64().unwrap() > 0,
+        "{search}"
+    );
+    let reasons = search["unhealthyBecause"].as_array().unwrap();
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("have no embedding")),
+        "reason does not name the missing vectors: {reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("search-rebuild")),
+        "reason does not name the fix: {reasons:?}"
+    );
+
+    // (c) The explicit rebuild restores a clean bill of health.
+    fixture.ok_json(
+        &fixture.main,
+        &["search-rebuild", "--as", "tester", "--json"],
+    );
+    let rebuilt = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    assert_eq!(rebuilt["healthy"], true, "{rebuilt}");
+    assert_eq!(
+        rebuilt["projects"][0]["searchIndex"]["missingEmbeddings"],
+        0,
+        "{rebuilt}"
+    );
+    assert_eq!(
+        rebuilt["projects"][0]["searchIndex"]["healthy"],
+        true,
+        "{rebuilt}"
+    );
 }
 
 #[test]

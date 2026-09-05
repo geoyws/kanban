@@ -182,6 +182,26 @@ fn fts_query(query: &str) -> Option<String> {
     (!tokens.is_empty()).then(|| tokens.join(" OR "))
 }
 
+fn document_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
+    Ok(Document {
+        seq: row.get(0)?,
+        source_kind: row.get(1)?,
+        source_id: row.get(2)?,
+        task_id: row.get(3)?,
+        title: row.get(4)?,
+        body: row.get(5)?,
+        status: row.get(6)?,
+        lane: row.get(7)?,
+        tags: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        archived: row.get::<_, i64>(11)? != 0,
+        source_hash: row.get(12)?,
+        embedding_model: row.get(13)?,
+        embedding: row.get(14)?,
+    })
+}
+
 fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Vec<Document>> {
     let mut sql = String::from(
         "SELECT seq,source_kind,source_id,task_id,title,body,status,lane,tags,\
@@ -217,25 +237,7 @@ fn load_documents(connection: &Connection, options: &SearchOptions) -> Result<Ve
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(
         params_from_iter(values.iter().map(|value| value.as_ref())),
-        |row| {
-            Ok(Document {
-                seq: row.get(0)?,
-                source_kind: row.get(1)?,
-                source_id: row.get(2)?,
-                task_id: row.get(3)?,
-                title: row.get(4)?,
-                body: row.get(5)?,
-                status: row.get(6)?,
-                lane: row.get(7)?,
-                tags: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                archived: row.get::<_, i64>(11)? != 0,
-                source_hash: row.get(12)?,
-                embedding_model: row.get(13)?,
-                embedding: row.get(14)?,
-            })
-        },
+        document_row,
     )?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
@@ -625,6 +627,65 @@ pub fn bound_receipt(
     }
 }
 
+fn document_text(document: &Document) -> String {
+    format!(
+        "{} {} {} {} {}",
+        document.title,
+        document.body,
+        document.tags,
+        document.status.as_deref().unwrap_or(""),
+        document.lane.as_deref().unwrap_or("")
+    )
+}
+
+/// Compute one document's vector and persist it with its source hash and the
+/// current model. Shared by the explicit rebuild and the incremental write
+/// paths, so a source mutation and `search-rebuild` can never drift apart.
+fn embed_document(connection: &Connection, document: &Document) -> Result<()> {
+    let vector = embed(&document_text(document));
+    connection.execute(
+        "UPDATE search_documents SET source_hash=?,embedding_model=?,embedding=? WHERE seq=?",
+        params![source_hash(document), EMBEDDING_MODEL, encode(&vector), document.seq],
+    )?;
+    Ok(())
+}
+
+/// Embed every `search_documents` row whose vector is missing or was computed
+/// by a different model. The incremental write paths call this after a source
+/// mutation so a newly triggered document never sits unembedded; it is
+/// idempotent, so it only ever does work for rows that lack a current vector.
+/// Returns how many rows were embedded.
+pub(crate) fn embed_missing(connection: &Connection) -> Result<i64> {
+    let documents: Vec<Document> = {
+        let mut statement = connection.prepare(
+            "SELECT seq,source_kind,source_id,task_id,title,body,status,lane,tags,\
+                    created_at,updated_at,archived,source_hash,embedding_model,embedding \
+             FROM search_documents \
+             WHERE embedding IS NULL OR embedding_model IS NULL OR source_hash IS NULL \
+                OR embedding_model != ?1",
+        )?;
+        statement
+            .query_map([EMBEDDING_MODEL], document_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut embedded = 0_i64;
+    for document in documents {
+        let hash = source_hash(&document);
+        // A row selected for a NULL marker may still hold a current vector
+        // (e.g. a model name that drifted while the hash stayed current).
+        // Re-embedding it is harmless and keeps `embed_missing` idempotent.
+        if document.embedding.is_none()
+            || document.embedding_model.as_deref() != Some(EMBEDDING_MODEL)
+            || document.source_hash.as_deref() != Some(hash.as_str())
+            || document.embedding.as_deref().and_then(decode).is_none()
+        {
+            embed_document(connection, &document)?;
+            embedded += 1;
+        }
+    }
+    Ok(embedded)
+}
+
 pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<SearchIndexReport> {
     let actor = actor.trim();
     if actor.is_empty() {
@@ -660,23 +721,7 @@ pub fn rebuild(connection: &mut Connection, board: &str, actor: &str) -> Result<
     )?;
     let mut embedded = 0_i64;
     for document in &documents {
-        let vector = embed(&format!(
-            "{} {} {} {} {}",
-            document.title,
-            document.body,
-            document.tags,
-            document.status.as_deref().unwrap_or(""),
-            document.lane.as_deref().unwrap_or("")
-        ));
-        transaction.execute(
-            "UPDATE search_documents SET source_hash=?,embedding_model=?,embedding=? WHERE seq=?",
-            params![
-                source_hash(document),
-                EMBEDDING_MODEL,
-                encode(&vector),
-                document.seq
-            ],
-        )?;
+        embed_document(&transaction, document)?;
         embedded += 1;
     }
     crate::store::event_at(
@@ -739,14 +784,40 @@ pub fn health(connection: &Connection) -> Result<SearchIndexHealth> {
                     || document.embedding.as_deref().and_then(decode).is_none())
         })
         .count() as i64;
+    let mut unhealthy_because = Vec::new();
+    if source_rows != documents {
+        unhealthy_because.push(format!(
+            "{documents} search documents for {source_rows} source rows; \
+             run `kb search-rebuild --project NAME --as ACTOR`"
+        ));
+    }
+    if documents != fts_rows {
+        unhealthy_because.push(format!(
+            "{documents} search documents for {fts_rows} FTS rows; \
+             run `kb search-rebuild --project NAME --as ACTOR`"
+        ));
+    }
+    if missing_embeddings > 0 {
+        unhealthy_because.push(format!(
+            "{missing_embeddings} of {documents} documents have no embedding; \
+             run `kb search-rebuild --project NAME --as ACTOR`"
+        ));
+    }
+    if stale_embeddings > 0 {
+        unhealthy_because.push(format!(
+            "{stale_embeddings} stale embeddings; \
+             run `kb search-rebuild --project NAME --as ACTOR`"
+        ));
+    }
     Ok(SearchIndexHealth {
-        healthy: source_rows == documents && documents == fts_rows,
+        healthy: unhealthy_because.is_empty(),
         source_rows,
         documents,
         fts_rows,
         missing_embeddings,
         stale_embeddings,
         embedding_model: EMBEDDING_MODEL.to_owned(),
+        unhealthy_because,
     })
 }
 
