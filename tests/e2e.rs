@@ -11696,6 +11696,34 @@ fn release_id_from_package(package_dir: &Path) -> String {
     )
 }
 
+/// Byte-level picture of a tree that never follows symlinks: a planted link is
+/// recorded as its target text, so a write that went THROUGH it shows up in
+/// the snapshot of the directory it pointed at, not here.
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, (&'static str, Vec<u8>)> {
+    fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, (&'static str, Vec<u8>)>) {
+        let relative = path.strip_prefix(root).unwrap().to_path_buf();
+        let meta = fs::symlink_metadata(path).unwrap();
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(path).unwrap();
+            out.insert(relative, ("link", target.to_string_lossy().into_owned().into_bytes()));
+        } else if meta.is_dir() {
+            out.insert(relative, ("dir", Vec::new()));
+            for entry in fs::read_dir(path).unwrap() {
+                walk(root, &entry.unwrap().path(), out);
+            }
+        } else {
+            out.insert(relative, ("file", fs::read(path).unwrap()));
+        }
+    }
+    let mut out = BTreeMap::new();
+    match fs::symlink_metadata(root) {
+        Ok(_) => walk(root, root, &mut out),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => panic!("snapshot {}: {error}", root.display()),
+    }
+    out
+}
+
 fn capture_release_links(install_root: &Path, bin_dir: &Path) -> BTreeMap<String, PathBuf> {
     let mut links = BTreeMap::new();
     links.insert(
@@ -21071,6 +21099,319 @@ fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover
         })
         .count();
     assert_eq!(release_receipts, 2, "rollback failure altered retention");
+}
+
+/// A packaged release plus a HAX activation of it, so both install paths can
+/// be driven: `install hax` runs `install_release_tree` in this process's
+/// bash, `install hig` ships the embedded remote script through the ssh stub.
+struct ReleaseGuardHarness {
+    fixture: Fixture,
+    script: PathBuf,
+    path: String,
+    hostname_bin: PathBuf,
+    fake_repo_root: PathBuf,
+    remote_root: PathBuf,
+    package_dir: PathBuf,
+    hax_install_root: PathBuf,
+}
+
+impl ReleaseGuardHarness {
+    fn new(label: &str) -> Self {
+        let fixture = Fixture::new(label);
+        let fake_repo_root = fixture.root.join("fake-repo");
+        fs::create_dir_all(&fake_repo_root).unwrap();
+        let remote_root = fixture.root.join("remote-root");
+        fs::create_dir_all(&remote_root).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+        let stubs = write_release_tool_stubs(
+            &fixture,
+            &fake_repo_root,
+            "0123456789abcdef0123456789abcdef01234567",
+            env!("CARGO_BIN_EXE_kanban"),
+            "hax",
+        );
+        let hostname_bin = stubs.join("hostname");
+        let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+        let package_dir = fixture.root.join("package");
+        let hax_install_root = fixture.root.join("install-hax");
+        let harness = Self {
+            fixture,
+            script,
+            path,
+            hostname_bin,
+            fake_repo_root,
+            remote_root,
+            package_dir,
+            hax_install_root,
+        };
+        let packaged = harness
+            .command()
+            .args([
+                "package",
+                "hax",
+                "--output",
+                harness.package_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            packaged.status.success(),
+            "{}",
+            String::from_utf8_lossy(&packaged.stderr)
+        );
+        let hax_bin_dir = harness.fixture.root.join("bin-hax");
+        let hax_installed = harness.install("hax", &harness.hax_install_root, &hax_bin_dir);
+        assert!(
+            hax_installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&hax_installed.stderr)
+        );
+        harness
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("bash");
+        command
+            .current_dir(&self.fixture.main)
+            .env("PATH", &self.path)
+            .env("HOSTNAME_BIN", &self.hostname_bin)
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &self.fake_repo_root)
+            .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &self.remote_root)
+            .arg(&self.script);
+        command
+    }
+
+    /// `target` is `hax` for the local install path or `hig` for the embedded
+    /// remote script.
+    fn install(&self, target: &str, install_root: &Path, bin_dir: &Path) -> Output {
+        let mut command = self.command();
+        command.args([
+            "install",
+            target,
+            "--package",
+            self.package_dir.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ]);
+        if target == "hig" {
+            command.args(["--hax-install-root", self.hax_install_root.to_str().unwrap()]);
+        }
+        command.output().unwrap()
+    }
+
+    /// Runs an install that must be refused, and proves every watched tree is
+    /// byte-identical afterwards: the refusal happened before any mutation.
+    fn assert_refused_without_mutation(
+        &self,
+        target: &str,
+        install_root: &Path,
+        bin_dir: &Path,
+        refusal: &str,
+        watched: &[&Path],
+    ) {
+        let before: Vec<_> = watched.iter().map(|path| snapshot_tree(path)).collect();
+        let refused = self.install(target, install_root, bin_dir);
+        assert!(
+            !refused.status.success(),
+            "{target}: install succeeded through an unsafe view\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(refusal), "{target}: expected {refusal:?} in:\n{stderr}");
+        for (path, before) in watched.iter().zip(before) {
+            assert_eq!(
+                snapshot_tree(path),
+                before,
+                "{target}: refused install changed {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn hig_release_script_refuses_a_planted_releases_symlink_before_writing_outside_the_tree() {
+    let harness = ReleaseGuardHarness::new("hig-release-releases-symlink");
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("planted-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("planted-bin-{target}"));
+        let outside = harness.fixture.root.join(format!("outside-{target}"));
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("operator.txt"), b"do not touch\n").unwrap();
+        symlink(&outside, install_root.join("releases")).unwrap();
+
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to install through a symlink at {}/releases; remove it so releases/ is a real directory inside {}",
+                install_root.display(),
+                install_root.display()
+            ),
+            &[&outside, &install_root, &bin_dir],
+        );
+        assert_eq!(
+            fs::read(outside.join("operator.txt")).unwrap(),
+            b"do not touch\n",
+            "{target}: the directory behind the planted symlink was written"
+        );
+        assert!(
+            fs::symlink_metadata(&bin_dir).is_err(),
+            "{target}: refused install created the bin dir"
+        );
+    }
+}
+
+#[test]
+fn hig_release_script_refuses_to_replace_operator_files_and_foreign_links_at_current_and_bin_destinations()
+ {
+    let harness = ReleaseGuardHarness::new("hig-release-operator-files");
+    let outside = harness.fixture.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("kanban"), b"#!/bin/sh\necho operator kanban\n").unwrap();
+
+    for target in ["hax", "hig"] {
+        // A regular file where the managed `current` symlink belongs.
+        let install_root = harness.fixture.root.join(format!("current-file-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("current-file-bin-{target}"));
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("current"), b"operator notes\n").unwrap();
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to replace {}/current: it is not a symlink into {}/releases managed by this installer; move it aside before installing",
+                install_root.display(),
+                install_root.display()
+            ),
+            &[&install_root, &bin_dir],
+        );
+        assert_eq!(
+            fs::read(install_root.join("current")).unwrap(),
+            b"operator notes\n",
+            "{target}: the operator's current file was clobbered"
+        );
+        assert!(
+            fs::symlink_metadata(install_root.join("releases")).is_err(),
+            "{target}: refused install created releases/"
+        );
+
+        // A symlink at `current` that the installer did not write.
+        let install_root = harness.fixture.root.join(format!("current-foreign-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("current-foreign-bin-{target}"));
+        fs::create_dir_all(&install_root).unwrap();
+        symlink(&outside, install_root.join("current")).unwrap();
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to replace {}/current: it is not a symlink into {}/releases managed by this installer",
+                install_root.display(),
+                install_root.display()
+            ),
+            &[&outside, &install_root, &bin_dir],
+        );
+        assert_eq!(
+            fs::read_link(install_root.join("current")).unwrap(),
+            outside,
+            "{target}: the operator's current link was repointed"
+        );
+
+        // A regular file at a public binary destination.
+        let install_root = harness.fixture.root.join(format!("bin-file-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("bin-file-bin-{target}"));
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("kb"), b"#!/bin/sh\necho operator kb\n").unwrap();
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to replace {}/kb: it is not a symlink into {}/current managed by this installer; move it aside before installing",
+                bin_dir.display(),
+                install_root.display()
+            ),
+            &[&install_root, &bin_dir],
+        );
+        assert_eq!(
+            fs::read(bin_dir.join("kb")).unwrap(),
+            b"#!/bin/sh\necho operator kb\n",
+            "{target}: the operator's kb file was clobbered"
+        );
+        assert!(
+            fs::symlink_metadata(&install_root).is_err(),
+            "{target}: refused install created the install root"
+        );
+
+        // A symlink at a public binary destination that points somewhere else.
+        let install_root = harness.fixture.root.join(format!("bin-foreign-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("bin-foreign-bin-{target}"));
+        fs::create_dir_all(&bin_dir).unwrap();
+        symlink(outside.join("kanban"), bin_dir.join("kanban")).unwrap();
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to replace {}/kanban: it is not a symlink into {}/current managed by this installer",
+                bin_dir.display(),
+                install_root.display()
+            ),
+            &[&outside, &install_root, &bin_dir],
+        );
+        assert_eq!(
+            fs::read_link(bin_dir.join("kanban")).unwrap(),
+            outside.join("kanban"),
+            "{target}: the operator's kanban link was repointed"
+        );
+    }
+}
+
+#[test]
+fn hig_release_script_local_and_remote_install_guards_are_identical() {
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh"))
+            .unwrap();
+    let remote_start = script.find("<<'REMOTE'\n").unwrap();
+    let remote_end = script[remote_start..].find("\nREMOTE\n").unwrap() + remote_start;
+    for name in [
+        "physical_dir",
+        "managed_symlink",
+        "ensure_safe_release_view",
+        "atomic_symlink",
+    ] {
+        let header = format!("\n{name}() {{\n");
+        let definitions: Vec<(usize, &str)> = script
+            .match_indices(&header)
+            .map(|(at, _)| {
+                let start = at + 1;
+                let end = script[start..].find("\n}\n").unwrap() + start + 3;
+                (start, &script[start..end])
+            })
+            .collect();
+        assert_eq!(
+            definitions.len(),
+            2,
+            "{name} must be defined exactly twice: locally and inside the embedded remote script"
+        );
+        assert!(
+            definitions[0].0 < remote_start && (remote_start..remote_end).contains(&definitions[1].0),
+            "{name}: expected one local definition and one inside the REMOTE heredoc"
+        );
+        assert_eq!(
+            definitions[0].1, definitions[1].1,
+            "{name} drifted between the local and embedded remote install paths"
+        );
+    }
 }
 
 #[test]
