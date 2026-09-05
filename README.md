@@ -909,6 +909,10 @@ interpreted unambiguously is refused rather than guessed
   as `{"error": "…"}`, and nothing else does. `claim --candidates --json`
   without `--as` used to leave stdout empty, so a consumer piping it into a
   parser read a valid-looking empty candidate list while P0 rows sat in todo.
+  The one shape that differs is a command whose report *is* the answer:
+  `doctor` and `audit verify` print their JSON report and then exit non-zero
+  to say it was unhealthy, so no error object follows it and the report stays
+  parseable.
 
 Overrides are reviewable, because forcing one writes durable history:
 

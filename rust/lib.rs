@@ -1458,6 +1458,13 @@ fn print<T: Serialize>(value: &T, _pretty: bool) -> Result<()> {
     emit(&serde_json::to_string_pretty(value)?)
 }
 
+/// Set once anything has reached stdout. `doctor` and `audit verify` print
+/// their report and then return `Err` so the exit status says "unhealthy";
+/// for them the report *is* the answer, and appending a second JSON document
+/// after it would make stdout unparseable. [`entrypoint`] consults this before
+/// writing a refusal object.
+static STDOUT_WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Write one line to stdout, and let a closed pipe be a normal ending.
 ///
 /// `println!` panics when the reader has gone — `kb task list --json | head`
@@ -1472,6 +1479,7 @@ fn emit(text: &str) -> Result<()> {
     // Explicit, because a buffered line lost at exit is output that was
     // reported as written and never arrived.
     out.flush()?;
+    STDOUT_WRITTEN.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -3382,8 +3390,11 @@ pub fn entrypoint() -> ! {
             // and an empty stdout piped into a parser reads as "no
             // candidates" -- absence rendered identically to error. So the
             // refusal reaches stdout too, as the object a parser will see, and
-            // stderr keeps the prose for the MCP layer and humans.
-            if json_requested() {
+            // stderr keeps the prose for the MCP layer and humans -- unless
+            // the command already answered on stdout (`doctor`, `audit
+            // verify` print their report and then fail to mark it unhealthy),
+            // where a second document would make the first unparseable.
+            if json_requested() && !STDOUT_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = print(&json!({ "error": message }), true);
             }
             std::process::exit(1)
