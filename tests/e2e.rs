@@ -1919,8 +1919,8 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(dashboard[0]["taskCounts"]["done"], 1);
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert_eq!(doctor["healthy"], true);
-    assert_eq!(doctor["registrySchemaVersion"], 13);
-    assert_eq!(doctor["supportedRegistrySchemaVersion"], 13);
+    assert_eq!(doctor["registrySchemaVersion"], 14);
+    assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
     assert_eq!(doctor["supportedBoardSchemaVersion"], 24);
     assert_eq!(doctor["projects"][0]["schemaVersion"], 24);
     assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 24);
@@ -19572,7 +19572,7 @@ fn registry_v3_rules_migrate_to_the_unified_all_tag() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
 }
 
@@ -19631,7 +19631,7 @@ fn registry_v10_migration_records_discarded_alias_names() {
         registry
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     let (kind, actor, payload): (String, String, String) = registry
         .query_row(
