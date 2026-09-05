@@ -99,9 +99,11 @@ fn metadata_i64(connection: &Connection, table: &str, key: &str) -> Result<Optio
         .transpose()
 }
 
-pub fn initialize_board_chain(connection: &mut Connection) -> Result<()> {
+/// Returns whether the chain was initialized by this call; a board that
+/// already carried one is left alone and reports `false`.
+pub fn initialize_board_chain(connection: &mut Connection) -> Result<bool> {
     if metadata_i64(connection, "board_meta", "audit_chain_version")?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let rows = {
@@ -156,7 +158,7 @@ pub fn initialize_board_chain(connection: &mut Connection) -> Result<()> {
         )?;
     }
     transaction.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 pub fn initialize_registry_chain(connection: &mut Connection) -> Result<()> {
@@ -260,6 +262,14 @@ pub fn append_board_event(
         "INSERT INTO events(seq,task_id,kind,actor,payload,created_at,archived,prev_hash,event_hash) VALUES(?,?,?,?,?,?,0,?,?)",
         params![seq, task_id, kind, actor, payload, created_at, previous, event_hash],
     )?;
+    // Every audited board mutation passes through here on the transaction's
+    // own connection, after the rows it changed and after the search_*
+    // triggers have added their documents with a NULL embedding. Embedding
+    // here, in the same transaction, is what makes "every write embeds" true
+    // by construction rather than per method: a write path that forgot to
+    // call it cannot exist, because a write path that forgot to audit
+    // cannot exist either. On a healthy board the scan finds nothing.
+    crate::search::embed_missing(connection)?;
     Ok(())
 }
 

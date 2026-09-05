@@ -1752,11 +1752,22 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     // that already satisfied its own constraints, `foreign_key_check` is what
     // `doctor` runs to prove it afterwards, and enforcement is restored before
     // the connection does any work.
+    let before: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     connection.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate(&mut connection, BOARD_MIGRATIONS);
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
-    crate::audit::initialize_board_chain(&mut connection)?;
+    let after: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let chained = crate::audit::initialize_board_chain(&mut connection)?;
+    // A migration rebuilds search documents from their source rows, and
+    // initializing the audit chain updates every event row, which the
+    // search_events_au trigger answers by re-creating the event's document.
+    // Both leave vectors NULL, and neither goes through append_board_event,
+    // where an ordinary write embeds. Only an open that actually did one of
+    // them writes here, so a read-only open stays read-only.
+    if before != after || chained {
+        crate::search::embed_missing(&connection)?;
+    }
     Ok(connection)
 }
 
@@ -1773,6 +1784,9 @@ pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", true)?;
     outcome?;
     crate::audit::initialize_board_chain(connection)?;
+    // Adoption is always a write, and the copied board may predate the
+    // search schema entirely; embed whatever migration and chain-init left.
+    crate::search::embed_missing(connection)?;
     Ok(())
 }
 

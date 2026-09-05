@@ -1750,13 +1750,6 @@ impl Store {
         crate::search::health(&self.connection)
     }
 
-    /// Persist vectors for every search document a write just left unembedded.
-    /// Idempotent; only rows lacking a current vector are touched, so it is
-    /// safe to run after any source mutation.
-    fn embed_missing(&self) -> Result<()> {
-        crate::search::embed_missing(&self.connection).map(|_| ())
-    }
-
     pub fn add_subscription(&mut self, input: AddSubscription) -> Result<Subscription> {
         validate_subscription_bounds(&input)?;
         let actor = nonempty(&input.actor, "actor")?.to_owned();
@@ -2911,7 +2904,6 @@ impl Store {
             Some(&input.status),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         self.require_task(&id)
     }
 
@@ -3148,7 +3140,6 @@ impl Store {
             Some(status),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         self.require_task(id)
     }
 
@@ -3201,6 +3192,11 @@ impl Store {
             None,
         )?;
         transaction.execute("DELETE FROM tasks WHERE id=?", [id])?;
+        // The only write whose documents appear AFTER its audit event:
+        // search_tasks_ad recreates every document tied to the task, so the
+        // embedding append_board_event just did is gone. Embed once more,
+        // still inside the transaction.
+        crate::search::embed_missing(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3234,7 +3230,6 @@ impl Store {
             json!({"keys": object.keys().collect::<Vec<_>>()}),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         self.require_task(id)
     }
 
@@ -3343,7 +3338,6 @@ impl Store {
             payload,
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         self.require_task(id)
     }
 
@@ -3429,7 +3423,6 @@ impl Store {
         )?;
         let result = active_claim(&transaction, &task.id, now)?.context("claim was not created")?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(ClaimReceipt {
             claim: result,
             rules: Vec::new(),
@@ -3537,7 +3530,6 @@ impl Store {
             Some(&current_status),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(())
     }
 
@@ -3562,7 +3554,6 @@ impl Store {
             Some(author),
             json!({"kind":kind}),
         )?;
-        self.embed_missing()?;
         self.notes(id, 1)?.pop().context("note was not created")
     }
 
@@ -3639,7 +3630,6 @@ impl Store {
             checkpoint_row,
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(result)
     }
 
@@ -3764,7 +3754,6 @@ impl Store {
             json!({ "tag": name, "strippedFrom": uses }),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(())
     }
 
@@ -3813,7 +3802,6 @@ impl Store {
         )?;
         let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(result)
     }
 
@@ -3882,7 +3870,6 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM sitreps WHERE id=?", [&id], sitrep_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(result)
     }
 
@@ -3967,7 +3954,6 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4172,7 +4158,6 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4266,7 +4251,6 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4314,7 +4298,6 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4447,7 +4430,6 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM handoffs WHERE id=?", [&id], handoff_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(result)
     }
 
@@ -4501,7 +4483,6 @@ impl Store {
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
             transaction.commit()?;
-            self.embed_missing()?;
             return Ok((updated, None));
         };
         let task = require_task(&transaction, &task_id)?;
@@ -4522,7 +4503,6 @@ impl Store {
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
             transaction.commit()?;
-            self.embed_missing()?;
             return Ok((updated, None));
         }
         require_claimable_type(&task.id, &task.task_type)?;
@@ -4587,7 +4567,6 @@ impl Store {
         let claim =
             active_claim(&transaction, &task.id, now)?.context("accepted claim disappeared")?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok((updated, Some(claim)))
     }
 
@@ -4652,7 +4631,6 @@ impl Store {
             json!({"note":note}),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(json!({"storyID":id,"actor":actor,"at":at,"note":note}))
     }
 
@@ -4854,7 +4832,6 @@ impl Store {
             Some(status),
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(
             json!({"from":current,"to":target,"parentEpicFlipped":parent_flipped,"dispatchedTaskID":dispatched,"noop":false}),
         )
@@ -5066,7 +5043,6 @@ impl Store {
             deployment_row,
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(DeploymentStartReceipt {
             deployment,
             capability_token,
@@ -5196,7 +5172,6 @@ impl Store {
             deployment_row,
         )?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(deployment)
     }
 
@@ -5247,7 +5222,6 @@ impl Store {
         let deployment =
             transaction.query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)?;
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(deployment)
     }
 
@@ -5367,7 +5341,6 @@ impl Store {
             )?;
         }
         transaction.commit()?;
-        self.embed_missing()?;
         Ok(report)
     }
 }
