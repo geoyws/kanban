@@ -180,6 +180,40 @@ Usage:
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
   kanban todo [--output PATH]
+  kanban access bootstrap --username NAME --uid UID --as ACTOR --reason TEXT
+             --confirm empty-policy [--json]
+  kanban access principal bind --username NAME --uid UID [--replaces ID ...]
+             --as ACTOR --reason TEXT [--json]
+  kanban access principal prove-rebind --principal ID --username NAME --uid UID
+             [--replaces ID ...] --as ACTOR --reason TEXT [--json]
+  kanban access principal rebind --principal ID --username NAME --uid UID
+             [--replaces ID ...] --source-proof PROOF --as ACTOR --reason TEXT [--json]
+  kanban access principal disable --principal ID --as ACTOR --reason TEXT [--json]
+  kanban access principal show --principal ID [--json]
+  kanban access principal list [--disabled] [--json]
+  kanban access grant --principal ID --capability read|write|admin
+             [--scope SCOPE ...] --as ACTOR --reason TEXT [--json]
+  kanban access revoke --principal ID --capability read|write|admin
+             [--scope SCOPE ...] --as ACTOR --reason TEXT [--json]
+  kanban access sso map-sso --provider google --subject SUB --subject-proof PROOF
+             --principal ID --as ACTOR --reason TEXT [--json]
+  kanban access sso unmap-sso --provider google --subject SUB --as ACTOR --reason TEXT [--json]
+  kanban access explain --principal ID --capability read|write|admin
+             [--scope SCOPE ...] [--json]
+  kanban access audit [--principal ID] [--actor-principal ID] [--kind KIND]
+             [--capability read|write|admin] [--scope SCOPE ...] [--after-epoch EPOCH]
+             [--limit N] [--json]
+  kanban access breakglass principal-rebind --principal ID --username NAME --uid UID
+             [--replaces ID ...] --as ACTOR --reason TEXT --confirm root-breakglass [--json]
+  kanban access breakglass map-sso --provider google --subject SUB --principal ID
+             --as ACTOR --reason TEXT --confirm root-breakglass [--json]
+  kanban access breakglass registry-admin --principal ID --as ACTOR --reason TEXT
+             --confirm root-breakglass [--json]
+  kanban access enforcement show [--json]
+  kanban access enforcement prepare --expected-epoch EPOCH --as ACTOR --reason TEXT
+             --confirm prepared [--json]
+  kanban access enforcement activate --expected-epoch EPOCH --prepare-receipt RECEIPT
+             --as ACTOR --reason TEXT --confirm no-direct-fallback [--json]
   kanban schema [--json]
   kanban mcp
 
@@ -222,10 +256,11 @@ the first page off as the whole.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 29] = [
+pub(crate) const BOOLEAN: [&str; 30] = [
     "help",
     "json",
     "version",
+    "disabled",
     "force",
     "rootless",
     "next",
@@ -281,6 +316,13 @@ pub(crate) const WATCH_REPEATABLE: [&str; 4] =
 
 pub(crate) const SUBSCRIPTION_REPEATABLE: [&str; 4] =
     ["kind", "relation", "prior-status", "current-status"];
+
+/// Access-only list-valued flags (ADR-038 clause 12): `--scope` and
+/// `--replaces` are repeatable, every other `access` flag is single-valued.
+/// Kept apart from [`REPEATABLE`] for the same reason watch and subscription
+/// are: those flags are scalar everywhere else, and the access command's
+/// collection code is a separate slice.
+pub(crate) const ACCESS_REPEATABLE: [&str; 2] = ["scope", "replaces"];
 
 /// Commands that are processes rather than operations.
 ///
@@ -490,6 +532,122 @@ pub(crate) const IGNORED_SELECTORS: &[IgnoredSelectorRow] = &[
         Some("consolidate"),
         &["db", "project", "workspace"],
         "migrates every registered board, so naming one would imply a partial migration",
+    ),
+    // Every `access` operation acts on the policy registry (ADR-038 clause 12),
+    // never on a board, so all three selectors are discarded on every row.
+    (
+        "access",
+        Some("bootstrap"),
+        &["db", "project", "workspace"],
+        "seeds the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal bind"),
+        &["db", "project", "workspace"],
+        "binds a principal in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal prove-rebind"),
+        &["db", "project", "workspace"],
+        "mints a rebind proof in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal rebind"),
+        &["db", "project", "workspace"],
+        "rebinds a principal in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal disable"),
+        &["db", "project", "workspace"],
+        "disables a principal in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal show"),
+        &["db", "project", "workspace"],
+        "reads a principal from the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("principal list"),
+        &["db", "project", "workspace"],
+        "lists the policy registry's principals, never a board",
+    ),
+    (
+        "access",
+        Some("grant"),
+        &["db", "project", "workspace"],
+        "grants capability in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("revoke"),
+        &["db", "project", "workspace"],
+        "revokes capability in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("sso map-sso"),
+        &["db", "project", "workspace"],
+        "maps an SSO subject in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("sso unmap-sso"),
+        &["db", "project", "workspace"],
+        "unmaps an SSO subject in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("explain"),
+        &["db", "project", "workspace"],
+        "explains authority from the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("audit"),
+        &["db", "project", "workspace"],
+        "reads the policy registry's audit journals, never a board",
+    ),
+    (
+        "access",
+        Some("breakglass principal-rebind"),
+        &["db", "project", "workspace"],
+        "rebinds a principal by root authority in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("breakglass map-sso"),
+        &["db", "project", "workspace"],
+        "maps an SSO subject by root authority in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("breakglass registry-admin"),
+        &["db", "project", "workspace"],
+        "grants registry admin by root authority in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("enforcement show"),
+        &["db", "project", "workspace"],
+        "reads enforcement state from the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("enforcement prepare"),
+        &["db", "project", "workspace"],
+        "prepares the enforcement cutover in the policy registry, never a board",
+    ),
+    (
+        "access",
+        Some("enforcement activate"),
+        &["db", "project", "workspace"],
+        "activates enforcement in the policy registry, never a board",
     ),
 ];
 
@@ -971,6 +1129,170 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ),
     ("context", None, &["max-chars"], &["id"], true),
     ("todo", None, &["output"], &[], false),
+    // The `access` surface (ADR-038 clause 12). Every operation addresses the
+    // policy registry and refuses the three board selectors; nothing here is a
+    // board command. Read-only is exactly what clause 12 lists: `principal
+    // show`, `principal list`, `explain`, `audit`, and `enforcement show` read
+    // authority without writing anything, so they are `true`.
+    (
+        "access",
+        Some("bootstrap"),
+        &["username", "uid", "as", "reason", "confirm"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal bind"),
+        &["username", "uid", "replaces", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal prove-rebind"),
+        &["principal", "username", "uid", "replaces", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal rebind"),
+        &[
+            "principal",
+            "username",
+            "uid",
+            "replaces",
+            "source-proof",
+            "as",
+            "reason",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("principal disable"),
+        &["principal", "as", "reason"],
+        &[],
+        false,
+    ),
+    ("access", Some("principal show"), &["principal"], &[], true),
+    ("access", Some("principal list"), &["disabled"], &[], true),
+    (
+        "access",
+        Some("grant"),
+        &["principal", "capability", "scope", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("revoke"),
+        &["principal", "capability", "scope", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("sso map-sso"),
+        &[
+            "provider",
+            "subject",
+            "subject-proof",
+            "principal",
+            "as",
+            "reason",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("sso unmap-sso"),
+        &["provider", "subject", "as", "reason"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("explain"),
+        &["principal", "capability", "scope"],
+        &[],
+        true,
+    ),
+    (
+        "access",
+        Some("audit"),
+        &[
+            "principal",
+            "actor-principal",
+            "kind",
+            "capability",
+            "scope",
+            "after-epoch",
+            "limit",
+        ],
+        &[],
+        true,
+    ),
+    (
+        "access",
+        Some("breakglass principal-rebind"),
+        &[
+            "principal",
+            "username",
+            "uid",
+            "replaces",
+            "as",
+            "reason",
+            "confirm",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("breakglass map-sso"),
+        &[
+            "provider",
+            "subject",
+            "principal",
+            "as",
+            "reason",
+            "confirm",
+        ],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("breakglass registry-admin"),
+        &["principal", "as", "reason", "confirm"],
+        &[],
+        false,
+    ),
+    ("access", Some("enforcement show"), &[], &[], true),
+    (
+        "access",
+        Some("enforcement prepare"),
+        &["expected-epoch", "as", "reason", "confirm"],
+        &[],
+        false,
+    ),
+    (
+        "access",
+        Some("enforcement activate"),
+        &[
+            "expected-epoch",
+            "prepare-receipt",
+            "as",
+            "reason",
+            "confirm",
+        ],
+        &[],
+        false,
+    ),
 ];
 
 /// The flags a command accepts, and the positionals it takes after its own
@@ -995,7 +1317,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 12] = [
+const SUBCOMMAND_GROUPS: [&str; 13] = [
     "task",
     "story",
     "handoff",
@@ -1008,6 +1330,7 @@ const SUBCOMMAND_GROUPS: [&str; 12] = [
     "audit",
     "deploy",
     "subscription",
+    "access",
 ];
 
 /// Short names for commands, resolved by exact match only.
@@ -1365,7 +1688,8 @@ impl Args {
                 let repeatable = REPEATABLE.contains(&name.as_str())
                     || (command == Some("watch") && WATCH_REPEATABLE.contains(&name.as_str()))
                     || (command == Some("subscription")
-                        && SUBSCRIPTION_REPEATABLE.contains(&name.as_str()));
+                        && SUBSCRIPTION_REPEATABLE.contains(&name.as_str()))
+                    || (command == Some("access") && ACCESS_REPEATABLE.contains(&name.as_str()));
                 values.len() > 1 && !repeatable
             })
             .map(|(name, values)| format!("--{name} ({})", values.join(", ")))
@@ -1696,6 +2020,7 @@ pub(crate) fn schema() -> Value {
                     let kind = if REPEATABLE.contains(flag)
                         || (*command == "watch" && WATCH_REPEATABLE.contains(flag))
                         || (*command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag))
+                        || (*command == "access" && ACCESS_REPEATABLE.contains(flag))
                     {
                         "list"
                     } else if BOOLEAN.contains(flag) {
@@ -5698,7 +6023,22 @@ mod tests {
 
     impl UsageEntry {
         fn documents(&self, command: &str, sub: Option<&str>) -> bool {
-            self.command == command && sub.is_none_or(|sub| self.names.contains(&sub))
+            if self.command != command {
+                return false;
+            }
+            let Some(sub) = sub else { return true };
+            if self.names.contains(&sub) {
+                return true;
+            }
+            // A multi-word subcommand ("principal bind"): the sub's words must
+            // appear as a consecutive run of the entry's form words.
+            let sub_words: Vec<&str> = sub.split_whitespace().collect();
+            if sub_words.len() < 2 {
+                return false;
+            }
+            self.names
+                .windows(sub_words.len())
+                .any(|window| window == sub_words.as_slice())
         }
 
         /// Every `--flag` in the syntax, as whole tokens: `--head` here does
@@ -5915,6 +6255,9 @@ mod tests {
                 if *command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag) {
                     continue;
                 }
+                if *command == "access" && ACCESS_REPEATABLE.contains(flag) {
+                    continue;
+                }
                 let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
                 assert_eq!(
                     collected,
@@ -5931,6 +6274,189 @@ mod tests {
                     .any(|(_, _, flags, ..)| flags.contains(&flag)),
                 "--{flag} is repeatable but no command accepts it"
             );
+        }
+        for flag in ACCESS_REPEATABLE {
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(command, _, flags, ..)| *command == "access" && flags.contains(&flag)),
+                "--{flag} is access-repeatable but no access command accepts it"
+            );
+        }
+    }
+
+    /// The ADR-038 generated-schema contract: every `access` operation of
+    /// clause 12 is emitted by `schema --json` flag-for-flag and
+    /// kind-for-kind, with the exact `readOnly` split the ADR names and all
+    /// three board selectors refused. This is the contract an adapter reads;
+    /// nothing here restates a second description of the surface.
+    #[test]
+    fn access_schema_matches_the_clause_12_grammar() {
+        let schema = schema();
+        let operations = schema["operations"].as_array().unwrap();
+
+        // (subcommand, flags in grammar order, readOnly)
+        let expected: [(&str, &[&str], bool); 19] = [
+            (
+                "bootstrap",
+                &["username", "uid", "as", "reason", "confirm"],
+                false,
+            ),
+            (
+                "principal bind",
+                &["username", "uid", "replaces", "as", "reason"],
+                false,
+            ),
+            (
+                "principal prove-rebind",
+                &["principal", "username", "uid", "replaces", "as", "reason"],
+                false,
+            ),
+            (
+                "principal rebind",
+                &[
+                    "principal",
+                    "username",
+                    "uid",
+                    "replaces",
+                    "source-proof",
+                    "as",
+                    "reason",
+                ],
+                false,
+            ),
+            ("principal disable", &["principal", "as", "reason"], false),
+            ("principal show", &["principal"], true),
+            ("principal list", &["disabled"], true),
+            (
+                "grant",
+                &["principal", "capability", "scope", "as", "reason"],
+                false,
+            ),
+            (
+                "revoke",
+                &["principal", "capability", "scope", "as", "reason"],
+                false,
+            ),
+            (
+                "sso map-sso",
+                &[
+                    "provider",
+                    "subject",
+                    "subject-proof",
+                    "principal",
+                    "as",
+                    "reason",
+                ],
+                false,
+            ),
+            (
+                "sso unmap-sso",
+                &["provider", "subject", "as", "reason"],
+                false,
+            ),
+            ("explain", &["principal", "capability", "scope"], true),
+            (
+                "audit",
+                &[
+                    "principal",
+                    "actor-principal",
+                    "kind",
+                    "capability",
+                    "scope",
+                    "after-epoch",
+                    "limit",
+                ],
+                true,
+            ),
+            (
+                "breakglass principal-rebind",
+                &[
+                    "principal",
+                    "username",
+                    "uid",
+                    "replaces",
+                    "as",
+                    "reason",
+                    "confirm",
+                ],
+                false,
+            ),
+            (
+                "breakglass map-sso",
+                &[
+                    "provider",
+                    "subject",
+                    "principal",
+                    "as",
+                    "reason",
+                    "confirm",
+                ],
+                false,
+            ),
+            (
+                "breakglass registry-admin",
+                &["principal", "as", "reason", "confirm"],
+                false,
+            ),
+            ("enforcement show", &[], true),
+            (
+                "enforcement prepare",
+                &["expected-epoch", "as", "reason", "confirm"],
+                false,
+            ),
+            (
+                "enforcement activate",
+                &[
+                    "expected-epoch",
+                    "prepare-receipt",
+                    "as",
+                    "reason",
+                    "confirm",
+                ],
+                false,
+            ),
+        ];
+
+        let access_ops = operations
+            .iter()
+            .filter(|op| op["command"] == "access")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            access_ops.len(),
+            expected.len(),
+            "the access surface gained or lost an operation"
+        );
+
+        for (sub, flags, read_only) in expected {
+            let name = format!("access {sub}");
+            let operation = access_ops
+                .iter()
+                .find(|op| op["name"] == name)
+                .unwrap_or_else(|| panic!("missing schema operation {name}"));
+            assert_eq!(operation["command"], "access", "{name}");
+            assert_eq!(operation["subcommand"], sub, "{name}");
+            assert_eq!(operation["longRunning"], false, "{name}");
+            assert_eq!(operation["readOnly"], read_only, "{name}");
+            assert_eq!(operation["createsBoard"], false, "{name}");
+            assert_eq!(
+                operation["ignoredSelectors"].as_array().unwrap(),
+                &[json!("db"), json!("project"), json!("workspace")],
+                "{name}"
+            );
+            let emitted = operation["flags"].as_array().unwrap();
+            assert_eq!(emitted.len(), flags.len(), "{name} flag count");
+            for (emitted, expected_flag) in emitted.iter().zip(flags) {
+                assert_eq!(emitted["name"], *expected_flag, "{name}");
+                let kind = if ACCESS_REPEATABLE.contains(expected_flag) {
+                    "list"
+                } else if BOOLEAN.contains(expected_flag) {
+                    "boolean"
+                } else {
+                    "value"
+                };
+                assert_eq!(emitted["kind"], kind, "{name} --{expected_flag}");
+            }
         }
     }
 

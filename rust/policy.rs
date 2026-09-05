@@ -3288,6 +3288,169 @@ mod tests {
         assert_eq!(grant.capability, Capability::Admin);
     }
 
+    // -- refusal matrix: clause 1 UID reuse, clause 6 bootstrap, clause 8 epoch
+
+    /// Clause 1: a recycled UID binds a *fresh* principal. It must not inherit
+    /// the retired principal's grants — the two-way passwd check is what makes
+    /// the divergence detectable at mint time, and a new bind is a new
+    /// principal, not a resurrection of the old one.
+    #[test]
+    fn a_recycled_uid_binds_a_fresh_principal_with_no_grants() {
+        let (mut registry, admin_id) = bootstrapped("uid-reuse");
+        let mut admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let alice = registry
+            .bind_principal("alice", 1001, &[], &admin_actor)
+            .unwrap()
+            .row
+            .id;
+        admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let board = ScopeTuple::Board {
+            board_id: "b1".into(),
+        };
+        registry
+            .grant(&alice, &board, Capability::Write, &admin_actor)
+            .unwrap();
+        admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        registry.disable_principal(&alice, &admin_actor).unwrap();
+
+        // UID 1001 is now free again; the next bind at that UID acknowledges
+        // the retired principal and mints a brand-new identity.
+        admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let mallory = registry
+            .bind_principal("mallory", 1001, &[alice.clone()], &admin_actor)
+            .unwrap();
+        assert_ne!(
+            mallory.row.id, alice,
+            "a recycled UID must be a new principal"
+        );
+        assert_eq!(mallory.row.username, "mallory");
+        assert_eq!(mallory.row.uid, 1001);
+        // The single assertion that would break if grants leaked across a
+        // reused UID: the fresh principal holds nothing.
+        assert!(
+            mallory.grants.is_empty(),
+            "a recycled UID inherited the retired principal's grants: {:?}",
+            mallory.grants
+        );
+        assert!(mallory.sso_mappings.is_empty());
+        // The old pair no longer resolves; only the new frozen pair does.
+        assert!(registry.resolve_principal("alice", 1001).unwrap().is_none());
+        assert_eq!(
+            registry
+                .resolve_principal("mallory", 1001)
+                .unwrap()
+                .unwrap()
+                .row
+                .id,
+            mallory.row.id
+        );
+    }
+
+    /// Clause 6: a fresh registry allows exactly one thing — `bootstrap` — and
+    /// it is not break-glass. Every `breakglass` refuses at epoch 0, and
+    /// `bootstrap` refuses at any epoch other than 0.
+    #[test]
+    fn empty_policy_allows_bootstrap_only_and_no_breakglass() {
+        let mut registry = test_registry("empty-policy");
+        registry
+            .connection
+            .execute(
+                "INSERT INTO boards(board_path,name,created_at,last_used_at,archived) \
+                 VALUES('/root/boards/b1.db','b1',1,1,0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(registry.policy_epoch().unwrap(), 0);
+        let root_actor = root(&registry);
+
+        // Break-glass at epoch 0 is refused: there is no policy to repair, and
+        // clause 6 keeps the two root paths apart.
+        let refused = registry
+            .breakglass_grant_registry_admin("p-nonexistent", &root_actor)
+            .expect_err("breakglass must refuse at epoch 0");
+        assert_eq!(refused.to_string(), "denied or not found");
+
+        // Exactly one command succeeds at epoch 0: bootstrap, which seeds the
+        // first non-root principal and lands at epoch 1.
+        let admin = registry
+            .policy_bootstrap("geoyws", 1000, &root_actor)
+            .expect("bootstrap is the one permitted operation at epoch 0");
+        assert_eq!(registry.policy_epoch().unwrap(), 1);
+        assert!(!admin.grants.is_empty());
+
+        // A second bootstrap is refused: bootstrap is one-shot.
+        let second = registry
+            .policy_bootstrap("mallory", 2000, &root_actor)
+            .expect_err("bootstrap must refuse at epoch 1");
+        assert_eq!(second.to_string(), "denied or not found");
+    }
+
+    /// Clause 8: the epoch advances by exactly one per committed policy event
+    /// and not at all for a denied attempt. Denials append a denied access-audit
+    /// row only; they do not invalidate every other client's context.
+    #[test]
+    fn a_denied_attempt_does_not_advance_the_epoch_but_a_policy_event_does() {
+        let (mut registry, admin_id) = bootstrapped("epoch-monotonic");
+        let epoch_after_bootstrap = registry.policy_epoch().unwrap();
+        assert_eq!(epoch_after_bootstrap, 1);
+        let mut admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let bob = registry
+            .bind_principal("bob", 2000, &[], &admin_actor)
+            .unwrap()
+            .row
+            .id;
+        assert_eq!(
+            registry.policy_epoch().unwrap(),
+            epoch_after_bootstrap + 1,
+            "bind advanced the epoch by exactly one"
+        );
+        admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let carol = registry
+            .bind_principal("carol", 3000, &[], &admin_actor)
+            .unwrap()
+            .row
+            .id;
+        admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        let board = ScopeTuple::Board {
+            board_id: "b1".into(),
+        };
+        // bob gets write, not admin.
+        registry
+            .grant(&bob, &board, Capability::Write, &admin_actor)
+            .unwrap();
+        let epoch_after_grant = registry.policy_epoch().unwrap();
+        assert_eq!(
+            epoch_after_grant,
+            epoch_after_bootstrap + 3,
+            "each policy event advanced the epoch by exactly one"
+        );
+
+        // bob (write only) attempts to grant carol admin: non-escalation
+        // denial. The epoch must not move.
+        let bob_actor = mint(&registry, &bob, "bob", 2000);
+        let err = registry
+            .grant(&carol, &board, Capability::Admin, &bob_actor)
+            .expect_err("bob with write must not grant admin");
+        assert_eq!(err.to_string(), "denied or not found");
+        // The single assertion that would break if denials bumped the epoch.
+        assert_eq!(
+            registry.policy_epoch().unwrap(),
+            epoch_after_grant,
+            "a denied attempt advanced the epoch"
+        );
+
+        // A committed policy event still advances by exactly one.
+        let admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
+        registry
+            .grant(&bob, &board, Capability::Read, &admin_actor)
+            .unwrap();
+        assert_eq!(
+            registry.policy_epoch().unwrap(),
+            epoch_after_grant + 1,
+            "a policy event advanced the epoch by exactly one"
+        );
+    }
+
     #[test]
     fn replay_rebuilds_the_projection_and_matches_every_epoch_hash() {
         let (mut registry, admin_id) = bootstrapped("replay");

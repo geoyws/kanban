@@ -212,12 +212,16 @@ fn scalar(name: &str, value: &Value) -> Result<String> {
 }
 
 /// An MCP tool name: the operation with its spaces and dashes flattened.
+///
+/// A subcommand may itself be multi-word ("principal bind"), so both the
+/// separator (`_` becomes a space in the name) and any inner spaces are
+/// flattened to `_`; `access principal bind` is one tool, `access_principal_bind`.
 fn tool_name(command: &str, sub: Option<&str>) -> String {
     match sub {
         Some(sub) => format!("{command}_{sub}"),
         None => command.to_owned(),
     }
-    .replace('-', "_")
+    .replace(['-', ' '], "_")
 }
 
 /// Every operation, as a tool an agent can be handed.
@@ -254,7 +258,9 @@ fn tools() -> Vec<Value> {
                 .chain(TOOL_GLOBALS.iter())
                 .filter(|flag| !ignored.contains(*flag))
             {
-                let (kind, description): (Value, String) = if crate::REPEATABLE.contains(flag) {
+                let (kind, description): (Value, String) = if crate::REPEATABLE.contains(flag)
+                    || (*command == "access" && crate::ACCESS_REPEATABLE.contains(flag))
+                {
                     (
                         json!({ "type": "array", "items": { "type": "string" } }),
                         format!("--{flag}, repeatable."),
@@ -315,7 +321,11 @@ fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
         other => bail!("arguments must be an object, not {other}"),
     };
     let mut argv = vec![(*command).to_owned()];
-    argv.extend(sub.map(str::to_owned));
+    // A multi-word subcommand ("principal bind") is one argv word per CLI word,
+    // never one word with an embedded space.
+    for word in sub.iter().flat_map(|sub| sub.split_whitespace()) {
+        argv.push(word.to_owned());
+    }
     for positional in *positionals {
         let key = positional.trim_start_matches('?');
         match supplied.get(key) {
@@ -344,7 +354,8 @@ fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
             // the refusal somewhere less obvious.
             bail!("{name} has no argument {key}");
         }
-        let repeatable = crate::REPEATABLE.contains(&key.as_str());
+        let repeatable = crate::REPEATABLE.contains(&key.as_str())
+            || (*command == "access" && crate::ACCESS_REPEATABLE.contains(&key.as_str()));
         match value {
             Value::Null => {}
             // A boolean flag is present or absent; false means absent.
