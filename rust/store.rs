@@ -1750,6 +1750,13 @@ impl Store {
         crate::search::health(&self.connection)
     }
 
+    /// Persist vectors for every search document a write just left unembedded.
+    /// Idempotent; only rows lacking a current vector are touched, so it is
+    /// safe to run after any source mutation.
+    fn embed_missing(&self) -> Result<()> {
+        crate::search::embed_missing(&self.connection).map(|_| ())
+    }
+
     pub fn add_subscription(&mut self, input: AddSubscription) -> Result<Subscription> {
         validate_subscription_bounds(&input)?;
         let actor = nonempty(&input.actor, "actor")?.to_owned();
@@ -2904,6 +2911,7 @@ impl Store {
             Some(&input.status),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         self.require_task(&id)
     }
 
@@ -3140,6 +3148,7 @@ impl Store {
             Some(status),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         self.require_task(id)
     }
 
@@ -3225,6 +3234,7 @@ impl Store {
             json!({"keys": object.keys().collect::<Vec<_>>()}),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         self.require_task(id)
     }
 
@@ -3333,6 +3343,7 @@ impl Store {
             payload,
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         self.require_task(id)
     }
 
@@ -3418,6 +3429,7 @@ impl Store {
         )?;
         let result = active_claim(&transaction, &task.id, now)?.context("claim was not created")?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(ClaimReceipt {
             claim: result,
             rules: Vec::new(),
@@ -3525,6 +3537,7 @@ impl Store {
             Some(&current_status),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(())
     }
 
@@ -3549,6 +3562,7 @@ impl Store {
             Some(author),
             json!({"kind":kind}),
         )?;
+        self.embed_missing()?;
         self.notes(id, 1)?.pop().context("note was not created")
     }
 
@@ -3625,6 +3639,7 @@ impl Store {
             checkpoint_row,
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(result)
     }
 
@@ -3749,6 +3764,7 @@ impl Store {
             json!({ "tag": name, "strippedFrom": uses }),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(())
     }
 
@@ -3797,6 +3813,7 @@ impl Store {
         )?;
         let result = transaction.query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(result)
     }
 
@@ -3865,6 +3882,7 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM sitreps WHERE id=?", [&id], sitrep_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(result)
     }
 
@@ -3949,6 +3967,7 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4153,6 +4172,7 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4246,6 +4266,7 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4293,6 +4314,7 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
         Ok(result.remove(0))
@@ -4425,6 +4447,7 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM handoffs WHERE id=?", [&id], handoff_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(result)
     }
 
@@ -4478,6 +4501,7 @@ impl Store {
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
             transaction.commit()?;
+            self.embed_missing()?;
             return Ok((updated, None));
         };
         let task = require_task(&transaction, &task_id)?;
@@ -4498,6 +4522,7 @@ impl Store {
             let updated =
                 transaction.query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)?;
             transaction.commit()?;
+            self.embed_missing()?;
             return Ok((updated, None));
         }
         require_claimable_type(&task.id, &task.task_type)?;
@@ -4562,6 +4587,7 @@ impl Store {
         let claim =
             active_claim(&transaction, &task.id, now)?.context("accepted claim disappeared")?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok((updated, Some(claim)))
     }
 
@@ -4626,6 +4652,7 @@ impl Store {
             json!({"note":note}),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(json!({"storyID":id,"actor":actor,"at":at,"note":note}))
     }
 
@@ -4827,6 +4854,7 @@ impl Store {
             Some(status),
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(
             json!({"from":current,"to":target,"parentEpicFlipped":parent_flipped,"dispatchedTaskID":dispatched,"noop":false}),
         )
@@ -5038,6 +5066,7 @@ impl Store {
             deployment_row,
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(DeploymentStartReceipt {
             deployment,
             capability_token,
@@ -5167,6 +5196,7 @@ impl Store {
             deployment_row,
         )?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(deployment)
     }
 
@@ -5217,6 +5247,7 @@ impl Store {
         let deployment =
             transaction.query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)?;
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(deployment)
     }
 
@@ -5336,6 +5367,7 @@ impl Store {
             )?;
         }
         transaction.commit()?;
+        self.embed_missing()?;
         Ok(report)
     }
 }
@@ -8086,6 +8118,96 @@ mod tests {
             assert_eq!(event.payload["_semanticV1"]["priorStatus"], "in_progress");
             assert_eq!(event.payload["_semanticV1"]["currentStatus"], expected);
         }
+    }
+
+    #[test]
+    fn incremental_writes_embed_every_source_kind_so_health_stays_clean() {
+        let mut store = test_store("incremental-embed");
+        store
+            .add_task(AddTask {
+                id: Some("t-embed".into()),
+                task_type: "task".into(),
+                parent_id: None,
+                title: "Incremental embedding".into(),
+                body: Some("A task whose vector must be written on add.".into()),
+                assignee: None,
+                lane: Some("driver".into()),
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".into(),
+                priority: 3,
+                dependencies: Vec::new(),
+                metadata: json!({}),
+                actor: Some("test".into()),
+                tags: Vec::new(),
+            })
+            .unwrap();
+
+        store
+            .add_note("t-embed", "test", "progress", "A note written inline.")
+            .unwrap();
+
+        let claim = store
+            .claim(
+                Some("t-embed"),
+                ClaimOptions {
+                    agent_id: "test".into(),
+                    session_id: None,
+                    lease_ms: 60_000,
+                    caller_lane: None,
+                    role_filter: None,
+                    caller_scope: None,
+                    cross_lane: false,
+                    allow_reassign: false,
+                    git: None,
+                },
+            )
+            .unwrap();
+        store
+            .checkpoint(CheckpointInput {
+                task_id: "t-embed".into(),
+                lease_token: claim.claim.lease_token,
+                author: "test".into(),
+                session_id: None,
+                model: None,
+                state: "continue".into(),
+                summary: "checkpoint summary".into(),
+                intent: "intent".into(),
+                next_action: "next".into(),
+                blockers: Vec::new(),
+                validations: Vec::new(),
+                repo_path: None,
+                branch: None,
+                head_sha: None,
+                dirty_summary: None,
+                root_head: None,
+            })
+            .unwrap();
+
+        store
+            .raise_attention(
+                "An attention row must be searchable.",
+                "decision",
+                "test",
+                Some("t-embed"),
+                3,
+                &[],
+            )
+            .unwrap();
+
+        store
+            .post_sitrep("driver", "A sitrep for the driver lane.", "test", Some("t-embed"), None)
+            .unwrap();
+
+        let health = store.search_health().unwrap();
+        assert_eq!(
+            health.missing_embeddings, 0,
+            "incremental writes left documents without embeddings: {:?}",
+            health.unhealthy_because
+        );
+        assert_eq!(health.stale_embeddings, 0, "{:?}", health.unhealthy_because);
+        assert!(health.healthy, "{:?}", health.unhealthy_because);
     }
 
     #[test]

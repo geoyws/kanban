@@ -425,9 +425,12 @@ CREATE INDEX idx_rules_active ON rules(created_at) WHERE archived=0;
 /// source metadata and optional semantic-vector bytes; the external-content
 /// virtual table owns only the lexical index. Source-table triggers rebuild the
 /// affected derived rows, and search-document triggers keep FTS5 in step. A
-/// source mutation deliberately clears its cached embedding: search computes a
-/// missing vector in memory, while the explicit rebuild operation persists the
-/// current model later without making an ordinary read write the board.
+/// trigger re-insert clears the cached embedding, so every Rust write path
+/// re-embeds the rows it touched in the same `Store` call (`search::embed_missing`);
+/// the explicit `search-rebuild` operation persists the whole corpus
+/// transactionally when a board predates the eager path or the model changed.
+/// `search` itself stays read-only and still recomputes a missing vector in
+/// memory, so an ordinary read never writes the board.
 const BOARD_V13: &str = r#"
 CREATE TABLE search_documents (
  seq INTEGER PRIMARY KEY,

@@ -126,6 +126,26 @@ the receipt rather than silently omitted.
 - Backup/restore followed by `search-rebuild` produces the same source set and
   does not change authoritative ledger rows.
 
+## Amendment — 2026-09-05: incremental writes persist vectors, and doctor fails on gaps
+
+The original decision left a source mutation's vector to be recomputed in
+memory on the next read and treated `search-rebuild` as the only writer of the
+cache. Measured on the live boards, the incremental path accumulated most of the
+corpus as unembedded rows (px 71%, kanban 62% by 2026-09-05) while `doctor`
+still reported the index healthy.
+
+Two corrections:
+
+- Every Rust write path that a source trigger refreshes now re-embeds the rows
+  it touched in the same `Store` call (`search::embed_missing`), reusing the
+  rebuild path's per-document embed rather than duplicating the vector math.
+  The in-memory recompute on read remains as a fallback for boards written by
+  an older binary.
+- `doctor`'s `searchIndex.healthy` is false when any document lacks a current
+  embedding, not merely when source/document/FTS counts disagree. An
+  `unhealthyBecause` list names each gap and its fix (`kb search-rebuild`),
+  matching ADR-008's "name its own fix" rule.
+
 ## References
 
 - [SQLite FTS5](https://www.sqlite.org/fts5.html)
