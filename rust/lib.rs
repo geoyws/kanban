@@ -5648,15 +5648,45 @@ fn local_actor(
     reason: Option<String>,
 ) -> Result<PolicyActor> {
     let uid = unsafe { libc::geteuid() };
+    // Each of these three refusals is RECORDED, not just returned. They run
+    // before a principal exists, so the store's own `deny` never sees them,
+    // and a bare `bail!` here left the most interesting attempts -- a root
+    // caller reaching for a policy mutation above all -- with no audit row.
     if uid == 0 {
-        bail!("denied or not found");
+        return Err(registry.record_denied_attempt(
+            "access identity",
+            "principal",
+            "root_is_not_a_policy_principal",
+            "root",
+            uid,
+            claimed_actor,
+            reason,
+        ));
     }
     let username = match broker::PasswdDatabase::name_for_uid(&broker::SystemPasswd, uid)? {
         Some(name) => name,
-        None => bail!("denied or not found"),
+        None => {
+            return Err(registry.record_denied_attempt(
+                "access identity",
+                "principal",
+                "uid_has_no_passwd_entry",
+                "",
+                uid,
+                claimed_actor,
+                reason,
+            ));
+        }
     };
     if !broker::two_way_passwd_check(&broker::SystemPasswd, &username, uid)? {
-        bail!("denied or not found");
+        return Err(registry.record_denied_attempt(
+            "access identity",
+            "principal",
+            "passwd_pair_diverged",
+            &username,
+            uid,
+            claimed_actor,
+            reason,
+        ));
     }
     let principal = registry.resolve_principal(&username, uid)?;
     let (epoch, state_hash) = registry.live_policy_state()?;

@@ -1504,6 +1504,49 @@ impl Registry {
         enforcement_state_on(&self.connection)
     }
 
+    /// Record a denial that happened BEFORE a principal could be resolved, and
+    /// return the same generic refusal every other denial returns.
+    ///
+    /// Clause 4 wants the trail to answer "how did it become true", and a
+    /// refusal is part of that answer. The identity checks that run before any
+    /// policy lookup -- a root caller, a UID with no passwd entry, a passwd
+    /// pair that diverges -- used to `bail!` straight out of the CLI, so the
+    /// hardest-failing and most interesting attempts were the only ones that
+    /// left no row at all. A root caller's denied `access grant` is exactly
+    /// the attempt an operator would go looking for.
+    pub fn record_denied_attempt(
+        &self,
+        operation: &str,
+        stage: &str,
+        code: &str,
+        username: &str,
+        uid: u32,
+        claimed_actor: Option<String>,
+        reason: Option<String>,
+    ) -> anyhow::Error {
+        let epoch = policy_epoch_on(&self.connection).unwrap_or(0);
+        let actor = PolicyActor {
+            principal_id: None,
+            username: username.to_owned(),
+            uid,
+            epoch,
+            state_hash: String::new(),
+            context: PolicyContext {
+                authn_kind: "socket_peer".to_owned(),
+                peer_uid: uid,
+                real_uid: None,
+                effective_uid: None,
+                client_kind: "cli".to_owned(),
+                request_id: short_id("rq"),
+                claimed_actor,
+                reason,
+                provider: None,
+                subject: None,
+            },
+        };
+        deny(&self.connection, &actor, operation, stage, code, epoch)
+    }
+
     /// The deterministic state hash of the complete projection.
     pub fn policy_state_hash(&self) -> Result<String> {
         compute_state_hash(&self.connection)
@@ -4823,6 +4866,66 @@ mod tests {
             registry.policy_epoch().unwrap(),
             epoch,
             "a denial must not advance the epoch"
+        );
+    }
+
+    /// A refusal that happens BEFORE a principal can be resolved must still
+    /// leave a row. Those checks run outside the store's own `deny`, so they
+    /// used to `bail!` straight out of the CLI and record nothing -- and the
+    /// gap was invisible on a developer's machine, where the caller is never
+    /// root. It surfaced only on a real Linux run as uid 0: the denial was
+    /// returned correctly and audited nowhere, so the one attempt an operator
+    /// would most want to find left no trace.
+    #[test]
+    fn a_denial_before_any_principal_exists_is_still_recorded() {
+        let registry = test_registry("denial-before-principal");
+        let epoch = registry.policy_epoch().unwrap();
+        let count = |registry: &Registry| -> i64 {
+            registry
+                .connection
+                .query_row("SELECT count(*) FROM access_audit", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = count(&registry);
+
+        let error = registry.record_denied_attempt(
+            "access identity",
+            "principal",
+            "root_is_not_a_policy_principal",
+            "root",
+            0,
+            Some("root".to_owned()),
+            Some("seed".to_owned()),
+        );
+
+        // The refusal a caller sees is the same generic string as every other
+        // denial, so a pre-principal refusal is not an existence oracle.
+        assert_eq!(error.to_string(), "denied or not found");
+        assert_eq!(
+            count(&registry),
+            before + 1,
+            "a refusal before a principal exists must still append an audit row"
+        );
+
+        let (stage, code, uid): (String, String, i64) = registry
+            .connection
+            .query_row(
+                "SELECT json_extract(payload,'$.decisionStage'), \
+                 json_extract(payload,'$.decisionCode'), \
+                 json_extract(payload,'$.actorUID') \
+                 FROM access_audit ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stage, "principal");
+        assert_eq!(code, "root_is_not_a_policy_principal");
+        assert_eq!(uid, 0, "the row must name the uid that was refused");
+
+        assert_eq!(
+            registry.policy_epoch().unwrap(),
+            epoch,
+            "recording a denial must not advance the epoch"
         );
     }
 }
