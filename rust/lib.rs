@@ -165,7 +165,11 @@ Usage:
              [--tag NAME ... | --clear-tags] [--json]
   kanban attention resolve ID --as ACTOR --note TEXT [--json]
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
-  kanban sitrep post TEXT --as AGENT --lane LANE [--task ID] [--json]
+  kanban sitrep post TEXT --as AGENT --lane LANE [--task ID]
+             [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
+             (--repo, --branch, --head and --dirty are captured from the cwd's
+             git checkout when omitted; a write outside any checkout is refused
+             rather than stored blank, and kb-board supplies them for you)
   kanban sitrep list [--lane LANE] [--task ID] [--all] [--limit N] [--json]
   kanban stale [--json]
   kanban context ID [--max-chars N] [--json]
@@ -917,7 +921,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "sitrep",
         Some("post"),
-        &["as", "lane", "task"],
+        &["as", "lane", "task", "repo", "branch", "head", "dirty"],
         &["text"],
         false,
     ),
@@ -2633,6 +2637,98 @@ fn effective_rule_summaries(
 
 fn option_string(args: &Args, name: &str) -> Option<String> {
     args.one(name).map(str::to_owned)
+}
+
+/// Git provenance a checkpoint, handoff or sitrep must carry before it may be
+/// written. ADR-008: a field that says something and holds nothing is the
+/// defect this project refuses, so a write that would leave one of these blank
+/// is refused rather than stored. `root_head` is capture-only — there is no
+/// `--root-head` flag — and stays absent for a checkout with no superproject.
+pub(crate) struct Provenance {
+    pub(crate) repo_path: String,
+    pub(crate) branch: String,
+    pub(crate) head_sha: String,
+    pub(crate) dirty_summary: String,
+    pub(crate) root_head: Option<String>,
+}
+
+/// A HEAD id: the full 40 hex characters, or at least a 7-character
+/// abbreviation. Anything else is a made-up id wearing a SHA's shape.
+fn looks_like_head_sha(value: &str) -> bool {
+    value.len() >= 7 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The exact wording [`gitctx::dirty_summary`] writes, so an explicit flag
+/// cannot smuggle a different vocabulary into the column.
+fn looks_like_dirty_summary(value: &str) -> bool {
+    if value == "clean" || value == "1 file changed" {
+        return true;
+    }
+    match value.strip_suffix(" files changed") {
+        Some(count) => count.parse::<u32>().is_ok_and(|n| n >= 2),
+        None => false,
+    }
+}
+
+/// Merge the explicit `--repo/--branch/--head/--dirty` flags over what `here()`
+/// captured, and refuse rather than store a blank field. An explicit flag wins
+/// over capture, but a garbage one is refused by its shape rather than trusted.
+fn required_provenance(args: &Args, git: Option<&gitctx::GitContext>) -> Result<Provenance> {
+    let repo_path = option_string(args, "repo").or_else(|| git.map(|g| g.worktree.clone()));
+    let branch = option_string(args, "branch").or_else(|| git.and_then(|g| g.branch.clone()));
+    let head_sha = option_string(args, "head").or_else(|| git.map(|g| g.head.clone()));
+    let dirty_summary = option_string(args, "dirty").or_else(|| git.map(gitctx::dirty_summary));
+
+    if let Some(head) = &head_sha {
+        if !looks_like_head_sha(head) {
+            bail!(
+                "--head must be a 40-hex SHA (or at least a 7-hex abbreviation), got {head:?}; \
+                 pass `git rev-parse HEAD`, or let kb-board supply it from the caller's checkout"
+            );
+        }
+    }
+    if let Some(dirty) = &dirty_summary {
+        if !looks_like_dirty_summary(dirty) {
+            bail!(
+                "--dirty must read like git status — \"clean\", \"1 file changed\", or \
+                 \"N files changed\" — got {dirty:?}; kb-board writes exactly this wording"
+            );
+        }
+    }
+
+    let mut missing = Vec::new();
+    if repo_path.is_none() {
+        missing.push("repo_path");
+    }
+    if branch.is_none() {
+        missing.push("branch");
+    }
+    if head_sha.is_none() {
+        missing.push("head_sha");
+    }
+    if dirty_summary.is_none() {
+        missing.push("dirty_summary");
+    }
+    if !missing.is_empty() {
+        let cwd = cwd()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        bail!(
+            "refusing to record a row with blank provenance: {} missing. This CLI is running \
+             outside a git checkout (cwd {cwd}), so there is no checkout to capture and none \
+             was passed. Pass --repo PATH --branch NAME --head SHA --dirty TEXT, or let \
+             kb-board supply them from the caller's checkout.",
+            missing.join(", ")
+        );
+    }
+
+    Ok(Provenance {
+        repo_path: repo_path.unwrap(),
+        branch: branch.unwrap(),
+        head_sha: head_sha.unwrap(),
+        dirty_summary: dirty_summary.unwrap(),
+        root_head: git.and_then(|g| g.root_head.clone()),
+    })
 }
 
 fn subscription_values(args: &Args, name: &str) -> Vec<String> {
@@ -4785,9 +4881,9 @@ fn run() -> Result<()> {
     }
     if command == "checkpoint" {
         let id = sub.context("task id is required")?;
-        // Captured, not asked for: these columns were 100% empty because they
-        // depended on the caller passing them. An explicit flag still wins.
-        let git = here();
+        // Provenance is refused rather than stored blank (ADR-008): an explicit
+        // flag still wins, but a write that would leave one field empty bails.
+        let provenance = required_provenance(&args, here().as_ref())?;
         let value = store.checkpoint(CheckpointInput {
             task_id: id.into(),
             lease_token: args.require("lease")?.into(),
@@ -4800,14 +4896,11 @@ fn run() -> Result<()> {
             next_action: args.require("next-action")?.into(),
             blockers: args.many("blocker"),
             validations: args.many("validation"),
-            repo_path: option_string(&args, "repo")
-                .or_else(|| git.as_ref().map(|g| g.worktree.clone())),
-            branch: option_string(&args, "branch")
-                .or_else(|| git.as_ref().and_then(|g| g.branch.clone())),
-            head_sha: option_string(&args, "head").or_else(|| git.as_ref().map(|g| g.head.clone())),
-            dirty_summary: option_string(&args, "dirty")
-                .or_else(|| git.as_ref().map(gitctx::dirty_summary)),
-            root_head: git.as_ref().and_then(|g| g.root_head.clone()),
+            repo_path: Some(provenance.repo_path),
+            branch: Some(provenance.branch),
+            head_sha: Some(provenance.head_sha),
+            dirty_summary: Some(provenance.dirty_summary),
+            root_head: provenance.root_head,
         })?;
         return print(&value, args.has("json"));
     }
@@ -4815,7 +4908,7 @@ fn run() -> Result<()> {
         // No task id makes it a session handoff: about the work as a whole
         // rather than one row of it. The store refuses an id without its lease
         // and a lease without its id, since neither half means anything alone.
-        let git = here();
+        let provenance = required_provenance(&args, here().as_ref())?;
         let value = store.create_handoff(HandoffInput {
             task_id: rest.first().map(|id| (*id).to_owned()),
             lease_token: args.one("lease").map(str::to_owned),
@@ -4830,14 +4923,11 @@ fn run() -> Result<()> {
             next_action: args.require("next-action")?.into(),
             blockers: args.many("blocker"),
             validations: args.many("validation"),
-            repo_path: option_string(&args, "repo")
-                .or_else(|| git.as_ref().map(|g| g.worktree.clone())),
-            branch: option_string(&args, "branch")
-                .or_else(|| git.as_ref().and_then(|g| g.branch.clone())),
-            head_sha: option_string(&args, "head").or_else(|| git.as_ref().map(|g| g.head.clone())),
-            dirty_summary: option_string(&args, "dirty")
-                .or_else(|| git.as_ref().map(gitctx::dirty_summary)),
-            root_head: git.as_ref().and_then(|g| g.root_head.clone()),
+            repo_path: Some(provenance.repo_path),
+            branch: Some(provenance.branch),
+            head_sha: Some(provenance.head_sha),
+            dirty_summary: Some(provenance.dirty_summary),
+            root_head: provenance.root_head,
         })?;
         return print(&value, args.has("json"));
     }
@@ -4857,6 +4947,11 @@ fn run() -> Result<()> {
     }
     if command == "handoff" && sub == Some("accept") {
         let id = rest.first().context("handoff id is required")?;
+        // Best-effort, not refused: accept writes the acceptor's provenance to
+        // the claim row, and nothing gates on it (the dashboard renders it
+        // only when present), so a claim taken from outside a checkout is
+        // legitimate — unlike a checkpoint/handoff/sitrep, whose blank
+        // provenance would defeat the /session acceptance gate.
         let git = here();
         let (handoff, claim) = store.accept_handoff(
             id,
@@ -5017,13 +5112,16 @@ fn run() -> Result<()> {
     }
     if command == "sitrep" && sub == Some("post") {
         let text = rest.first().context("sitrep text is required")?;
+        // A sitrep is the low-ceremony sibling of a checkpoint, not a lesser
+        // record: it carries the same provenance, refused rather than blank.
+        let provenance = required_provenance(&args, here().as_ref())?;
         return print(
             &store.post_sitrep(
                 args.require("lane")?,
                 text,
                 args.require("as")?,
                 args.one("task"),
-                here().as_ref(),
+                Some(&provenance),
             )?,
             args.has("json"),
         );

@@ -535,7 +535,9 @@ Posting archives everything past the newest ten in that lane. Archived sitreps
 are hidden from the default read and returned by `--all`; **nothing is deleted**
 — archiving bounds the view, not the table. Provenance (worktree, branch, HEAD,
 root HEAD, dirty count) is captured rather than requested, and `context` carries
-a task's sitreps so a resuming agent gets them without going looking.
+a task's sitreps so a resuming agent gets them without going looking. A
+checkpoint, handoff, or sitrep written from outside a checkout is refused rather
+than stored blank; `kb-board` supplies the checkout for you.
 
 A task's `status` is a workflow state and always a `--status` flag; a *sitrep*
 is prose about a lane and always the `sitrep` command. The old `status` command
