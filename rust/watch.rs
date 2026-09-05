@@ -1418,8 +1418,14 @@ mod tests {
         );
     }
 
+    // Direct `--db` resolution still opens the ambient registry read-only for
+    // the ADR-035 retired-board check, so every fixture below that reaches
+    // that check owns a private data root instead of inheriting the
+    // operator's registry.
     #[test]
     fn direct_db_watch_does_not_need_registry_name_lookup() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let root = temp_watch_dir("direct-db");
         let path = root.join("board.db");
         let _store = Store::open(&path).expect("open test board");
@@ -1442,6 +1448,8 @@ mod tests {
 
     #[test]
     fn direct_db_watch_rejects_unknown_subjects_and_relation_targets_but_accepts_history() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let root = temp_watch_dir("direct-db-subject-relations");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");
@@ -1507,6 +1515,8 @@ mod tests {
 
     #[test]
     fn future_cursor_is_rejected_before_the_watch_starts() {
+        let _env = crate::dispatch::tests::env_guard();
+        let _data_root = crate::dispatch::tests::TestRoot::new();
         let root = temp_watch_dir("future-cursor");
         let path = root.join("board.db");
         let store = Store::open(&path).expect("open test board");

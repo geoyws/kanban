@@ -787,6 +787,11 @@ fn concurrent_dispatcher_processes_deliver_one_event_only_once() {
     );
 }
 
+// `KANBAN_DISPATCHER_TEST_CRASH_AFTER_EVENT_ID` is honoured only by the
+// `#[cfg(debug_assertions)]` seam in `after_adapter_success` (rust/dispatcher.rs).
+// A release binary never exits 86, so this test exists only in debug test
+// binaries; `release_binary_ignores_dispatcher_crash_seam` is the release proof.
+#[cfg(debug_assertions)]
 #[test]
 fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
     let fixture = Fixture::new("crash-recovery");
@@ -863,6 +868,54 @@ fn dispatcher_crash_after_adapter_success_recovers_at_least_once() {
             .count(),
         2
     );
+}
+
+// Release-side counterpart of the `#[cfg(debug_assertions)]` crash test above:
+// the crash env var must be inert in a release dispatcher, so the delivery is
+// acked on the first attempt. This is what a release run reports instead of
+// silently running one fewer test.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_binary_ignores_dispatcher_crash_seam() {
+    let fixture = Fixture::new("release-crash-seam-inert");
+    fixture.seed("success", "5000", "2");
+    let event_id: String = fixture
+        .db()
+        .query_row(
+            "SELECT event_hash FROM events WHERE kind='tag_added' ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let output = fixture
+        .dispatcher()
+        .env("KANBAN_DISPATCHER_TEST_CRASH_AFTER_EVENT_ID", &event_id)
+        .args(["--db", fixture.board.to_str().unwrap(), "--once", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "release dispatcher honoured the debug-only crash seam; the debug-only test \
+         dispatcher_crash_after_adapter_success_recovers_at_least_once is intentionally \
+         excluded from release test binaries (cfg(debug_assertions)); run `cargo test` \
+         without --release to exercise the seam. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["succeeded"],
+        1
+    );
+    let status: String = fixture
+        .db()
+        .query_row(
+            "SELECT status FROM subscription_deliveries WHERE subscription_id='sub-e2e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "acked");
 }
 
 #[test]
