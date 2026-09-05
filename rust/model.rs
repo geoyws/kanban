@@ -155,6 +155,52 @@ pub struct Subscription {
     pub paused_by: Option<String>,
 }
 
+/// Where one subscription has actually got to, derived and never stored.
+///
+/// There is no cursor column and there must not be one: `start_event_seq` is
+/// where a subscription began, and progress is the state of its
+/// `subscription_deliveries` rows. This is that state summarised for a
+/// reader — the highest acked seq plus how much is queued, retrying or
+/// dead-lettered.
+///
+/// `Copy` on purpose: the operator page looks one of these up per rendered
+/// row, and a lookup that allocates is a lookup that shows up in a page
+/// serving thirteen boards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscriptionPosition {
+    /// The highest `acked` delivery seq, or `None` when nothing has been
+    /// acked yet — which is not the same fact as "acked through seq 0".
+    pub acked_through_seq: Option<i64>,
+    pub pending: i64,
+    pub leased: i64,
+    pub retry_wait: i64,
+    pub dead_letter: i64,
+}
+
+/// Every subscription's position on one board, against that board's head.
+///
+/// The head travels with the positions because the two are only meaningful
+/// together: "acked through seq 8" says nothing until you know whether the
+/// board is at seq 8 or seq 800, and reading them apart invites a page that
+/// pairs one board's head with another board's acks.
+#[derive(Debug, Clone, Default)]
+pub struct SubscriptionPositions {
+    pub head_event_seq: i64,
+    pub by_subscription: std::collections::BTreeMap<String, SubscriptionPosition>,
+}
+
+impl SubscriptionPositions {
+    /// A subscription with no delivery rows has a real position — nothing
+    /// acked, nothing queued — rather than a missing one, so this never
+    /// returns an absence the caller has to interpret.
+    pub fn position(&self, subscription_id: &str) -> SubscriptionPosition {
+        self.by_subscription
+            .get(subscription_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 /// A due delivery candidate selected from the durable dispatcher queue.
 ///
 /// The nested subscription carries the immutable consumer/action capability

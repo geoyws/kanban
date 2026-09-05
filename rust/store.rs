@@ -12,7 +12,7 @@ use rusqlite::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -2324,6 +2324,57 @@ impl Store {
         rows?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Every subscription's derived position on this board: one grouped query
+    /// over the delivery rows, plus one read of the event head.
+    ///
+    /// Deliberately not per-subscription. The operator page renders a row per
+    /// subscription across every registered board, so a position query taking
+    /// a subscription id would sit inside that loop and turn one page into one
+    /// query per subscription per board. Two statements answer the whole set
+    /// however many subscriptions the board carries.
+    ///
+    /// `max(CASE WHEN status='acked' ...)` is the whole cursor: the ledger
+    /// already owns "what have I seen" as `seq`, and there is no cursor column
+    /// to read or to keep in step (`docs/ui-pubsub-consumption-seams.md`).
+    pub fn subscription_positions(&self) -> Result<SubscriptionPositions> {
+        self.authz.check_read(&[])?;
+        let head_event_seq =
+            self.connection
+                .query_row("SELECT COALESCE(max(seq),0) FROM events", [], |row| {
+                    row.get(0)
+                })?;
+        let mut statement = self.connection.prepare(
+            "SELECT subscription_id,\
+                    max(CASE WHEN status='acked' THEN event_seq END) AS acked_through_seq,\
+                    sum(status='pending') AS pending,\
+                    sum(status='leased') AS leased,\
+                    sum(status='retry_wait') AS retry_wait,\
+                    sum(status='dead_letter') AS dead_letter \
+             FROM subscription_deliveries GROUP BY subscription_id",
+        )?;
+        let mut by_subscription = BTreeMap::new();
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>("subscription_id")?,
+                SubscriptionPosition {
+                    acked_through_seq: row.get("acked_through_seq")?,
+                    pending: row.get("pending")?,
+                    leased: row.get("leased")?,
+                    retry_wait: row.get("retry_wait")?,
+                    dead_letter: row.get("dead_letter")?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (subscription_id, position) = row?;
+            by_subscription.insert(subscription_id, position);
+        }
+        Ok(SubscriptionPositions {
+            head_event_seq,
+            by_subscription,
+        })
     }
 
     fn set_subscription_paused(
@@ -8042,6 +8093,175 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn subscription_positions_answer_every_row_from_one_grouped_query() {
+        let mut store = subscription_store("subscriptions-positions");
+        let mut ids = Vec::new();
+        for (id, max_retries) in [
+            ("sub-position-acked", 1),
+            ("sub-position-retry", 3),
+            ("sub-position-dead", 0),
+            ("sub-position-leased", 1),
+        ] {
+            let mut input = delivery_subscription_input(id);
+            input.max_retries = max_retries;
+            ids.push(store.add_subscription(input).unwrap().id);
+        }
+        for created_at in [20, 30] {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("t-subject"),
+                "checkpoint_added",
+                "test",
+                "{}",
+                created_at,
+            )
+            .unwrap();
+        }
+        // Added after those events, so its anchor is past them: a
+        // subscription with no delivery rows at all.
+        let idle = store
+            .add_subscription(delivery_subscription_input("sub-position-idle"))
+            .unwrap()
+            .id;
+        store.materialize_subscriptions().unwrap();
+
+        let mut first_event = std::collections::BTreeMap::new();
+        for id in &ids {
+            let event_ids = delivery_event_ids(&store, id);
+            assert_eq!(event_ids.len(), 2, "{id} should have both events queued");
+            first_event.insert(id.clone(), event_ids[0].clone());
+        }
+        let acked_seq = {
+            let event = &first_event["sub-position-acked"];
+            let due_at = delivery_row(&store, "sub-position-acked", event)
+                .next_attempt_at
+                .unwrap();
+            let claimed = store
+                .claim_subscription_delivery("sub-position-acked", event, due_at, 5_000)
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .finalize_subscription_delivery_success(
+                        "sub-position-acked",
+                        event,
+                        &claimed.lease_token,
+                        due_at + 1,
+                    )
+                    .unwrap()
+            );
+            claimed.event_seq
+        };
+        for id in ["sub-position-retry", "sub-position-dead"] {
+            let event = &first_event[id];
+            let due_at = delivery_row(&store, id, event).next_attempt_at.unwrap();
+            let claimed = store
+                .claim_subscription_delivery(id, event, due_at, 5_000)
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .finalize_subscription_delivery_failure(
+                        id,
+                        event,
+                        &claimed.lease_token,
+                        due_at + 1,
+                        false,
+                        "consumer_refused",
+                    )
+                    .unwrap()
+            );
+        }
+        {
+            let event = &first_event["sub-position-leased"];
+            let due_at = delivery_row(&store, "sub-position-leased", event)
+                .next_attempt_at
+                .unwrap();
+            store
+                .claim_subscription_delivery("sub-position-leased", event, due_at, 5_000)
+                .unwrap()
+                .unwrap();
+        }
+
+        let positions = store.subscription_positions().unwrap();
+        assert_eq!(positions.head_event_seq, board_event_count(&store));
+        assert_eq!(
+            positions.position("sub-position-acked"),
+            SubscriptionPosition {
+                acked_through_seq: Some(acked_seq),
+                pending: 1,
+                leased: 0,
+                retry_wait: 0,
+                dead_letter: 0,
+            }
+        );
+        assert_eq!(
+            positions.position("sub-position-retry"),
+            SubscriptionPosition {
+                acked_through_seq: None,
+                pending: 1,
+                leased: 0,
+                retry_wait: 1,
+                dead_letter: 0,
+            }
+        );
+        assert_eq!(
+            positions.position("sub-position-dead"),
+            SubscriptionPosition {
+                acked_through_seq: None,
+                pending: 1,
+                leased: 0,
+                retry_wait: 0,
+                dead_letter: 1,
+            }
+        );
+        assert_eq!(
+            positions.position("sub-position-leased"),
+            SubscriptionPosition {
+                acked_through_seq: None,
+                pending: 1,
+                leased: 1,
+                retry_wait: 0,
+                dead_letter: 0,
+            }
+        );
+        // No delivery rows is a real position, not a missing one.
+        assert!(!positions.by_subscription.contains_key(&idle));
+        assert_eq!(
+            positions.position(&idle),
+            SubscriptionPosition::default(),
+            "a subscription with nothing queued has a position, not an absence"
+        );
+        assert_eq!(positions.by_subscription.len(), ids.len());
+
+        // Not N+1, and provably so: the projection is one grouped statement
+        // over the delivery rows plus one head read, and it takes no
+        // subscription id — there is no shape in which a caller could put it
+        // inside a per-row loop and still get an answer. A reviewer can read
+        // that off the two statements below; this asserts it stays true.
+        const SOURCE: &str = include_str!("store.rs");
+        let body = SOURCE
+            .split_once("pub fn subscription_positions(")
+            .expect("the projection is defined in this file")
+            .1
+            .split_once("\n    fn ")
+            .expect("the next private method ends the body")
+            .0;
+        assert_eq!(body.matches("SELECT").count(), 2, "{body}");
+        assert_eq!(
+            body.matches("FROM subscription_deliveries").count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches("GROUP BY subscription_id").count(),
+            1,
+            "{body}"
+        );
+        assert!(!body.contains("WHERE subscription_id"), "{body}");
     }
 
     #[test]

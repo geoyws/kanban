@@ -622,26 +622,40 @@ loss of the machine the backups are taken from.
 kanban serve --port 14200      # loopback only; no --bind flag exists
 ```
 
-Nine server-rendered views over every registered board: open attention items
+Ten server-rendered views over every registered board: open attention items
 across all of them by priority then age, the dashboard projection, draft plans
 with the work each holds back, the verified deployment matrix and attempt
-detail, `/lanes` lane sitreps, cross-board cited search, one board's rows, and
-one task in full.
+detail, `/lanes` lane sitreps, `/subscriptions` delivery state, cross-board
+cited search, one board's rows, and one task in full.
 Priority badges use P0/P1/P2 everywhere a queued row appears.
 Every read goes through the same `Store` methods the CLI calls, so there is no
 second implementation to keep in step.
 
 The Plans page can open an existing draft epic as `geoyws`, moving it to `todo` and
-releasing its child work for claims. This is the only browser write besides an
-attention reply: it requires a same-origin POST and refuses any row that is not
-currently a draft epic.
+releasing its child work for claims. It requires a same-origin POST and refuses
+any row that is not currently a draft epic.
+
+`/subscriptions` says in words what each subscription watches, where it
+delivers, and where it has actually got to: the start anchor, the highest acked
+seq, the distance to that board's event head, and the pending, retrying and
+dead-lettered counts, with dead-lettered flagged as needing a person. A
+configured `secretRef` renders as the fact that a secret is configured, never
+as its value. Pause and resume are same-origin POSTs through the same audited
+Store operations as `kb subscription pause`/`resume`, and repeating one is a
+no-op that still lands on the page. Whether paused rows are listed is
+`?show=all` in the URL and nothing is stored: no cursor, no preference row.
+Cursor presentation means showing a cursor's meaning — a cursor held in a
+browser would be a claim the server must trust, and a stale one silently skips
+rows (`docs/ui-pubsub-consumption-seams.md`).
 
 The **Needs you** page is the deliberately narrow exception to the read-only
 surface: reply inline to resolve an attention item as `geoyws`. Same-origin checks,
 strict bounded form decoding and the Store's duplicate-resolution refusal guard
 the write. Quick replies are available on a phone without removing free text.
-Every other route remains read-only, enforced by the source mutator allowlist
-and byte-for-byte process-boundary tests.
+Every other route remains read-only: the browser can resolve an attention item,
+open a draft plan, and pause or resume a subscription, and nothing else,
+enforced by the source mutator allowlist and byte-for-byte process-boundary
+tests.
 
 `/live` is a WebSocket notification channel. It sends only revision notices and
 heartbeats; the browser fetches the canonical server-rendered page after a board

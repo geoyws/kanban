@@ -29,7 +29,8 @@
 //! does not relax it.
 
 use crate::model::{
-    Attention, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep, Task,
+    Attention, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep,
+    Subscription, SubscriptionPosition, Task,
 };
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
@@ -182,6 +183,10 @@ fn render(url: &str) -> Result<String> {
         ["boards"] => boards(),
         ["plans"] => plans(query_value(query, "opened").as_deref()),
         ["deployments"] => deployments(),
+        ["subscriptions"] => subscriptions(
+            query_value(query, "show").as_deref(),
+            query_value(query, "changed").as_deref(),
+        ),
         ["lanes"] => lanes(),
         ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
         ["board", project] => board(project),
@@ -196,7 +201,7 @@ fn render(url: &str) -> Result<String> {
 }
 
 fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebResponse> {
-    let path = url.split('?').next().unwrap_or(url);
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -205,7 +210,9 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     if !matches!(
         parts.as_slice(),
-        ["attention", _, _, "reply"] | ["plan", _, _, "open"]
+        ["attention", _, _, "reply"]
+            | ["plan", _, _, "open"]
+            | ["subscription", _, _, "pause" | "resume"]
     ) {
         return Ok(WebResponse::Html(
             404,
@@ -270,6 +277,48 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
         }
         return Ok(WebResponse::Redirect(format!(
             "/plans?opened={}",
+            url_encode(id)
+        )));
+    }
+    if let ["subscription", project, id, verb @ ("pause" | "resume")] = parts.as_slice() {
+        let pause = *verb == "pause";
+        let Ok((_, mut store)) = project_named(project) else {
+            return Ok(WebResponse::Html(
+                404,
+                page("Board not found", "<h1>Board not found</h1>"),
+            ));
+        };
+        // Idempotent because the store makes it so: `set_subscription_paused`
+        // returns the row untouched when it already holds the requested
+        // state, without a second ledger event and without moving
+        // `paused_at`. A double submit therefore lands on the page rather
+        // than erroring or re-stamping who paused it, and this handler needs
+        // no read-then-write of its own — which could not be atomic anyway.
+        let changed = if pause {
+            store.pause_subscription(id, &actor)
+        } else {
+            store.resume_subscription(id, &actor)
+        };
+        if let Err(error) = changed {
+            return Ok(WebResponse::Html(
+                409,
+                page(
+                    "Subscription unchanged",
+                    &format!(
+                        "<h1>Subscription unchanged</h1><p class=error>{}</p>",
+                        escape(&error.to_string())
+                    ),
+                ),
+            ));
+        }
+        // Land where the affected row is visible. A paused row is hidden by
+        // the default filter, so pausing carries `show=all` — an action whose
+        // result vanishes from the page reads as an action that failed.
+        // Resuming keeps whatever filter the form was submitted from.
+        let show_all = pause || query_value(query, "show").as_deref() == Some("all");
+        return Ok(WebResponse::Redirect(format!(
+            "/subscriptions?{}changed={}",
+            if show_all { "show=all&" } else { "" },
             url_encode(id)
         )));
     }
@@ -1364,6 +1413,316 @@ fn plans(opened: Option<&str>) -> Result<String> {
     Ok(page("Plans", &html))
 }
 
+/// One rendered subscription: the row, the board it belongs to, and the
+/// position derived for it against that board's head.
+struct SubscriptionView {
+    board: String,
+    subscription: Subscription,
+    position: SubscriptionPosition,
+    head_event_seq: i64,
+}
+
+/// Subscriptions: what each consumer watches, where it delivers, and how far
+/// it has actually got.
+///
+/// **Position is a presented cursor and nothing else.** Cursor presentation
+/// means showing a cursor's *meaning* — never an opaque token, and never a
+/// copy kept in the browser: a cursor held client-side becomes a claim the
+/// server must trust, and a stale one silently skips rows, which is missing
+/// information that reads as absence of information
+/// (`docs/ui-pubsub-consumption-seams.md`). Everything in that column is
+/// derived per request from the delivery rows and the event head, so a
+/// reload is always the truth and there is nothing to invalidate.
+///
+/// **The one display preference lives in the URL.** `?show=all` lists paused
+/// subscriptions, exactly as `/plans?opened=` and `/search?q=` carry theirs.
+/// It is deliberately not stored: a preferences table would need a migration,
+/// an actor, an authorization rule and a `doctor` check to express something a
+/// shareable URL already says, and two operators would then disagree about
+/// what "the page" lists. If another display choice arrives, it is another
+/// query parameter.
+fn subscriptions(show: Option<&str>, changed: Option<&str>) -> Result<String> {
+    let mut views = Vec::new();
+    for (project, store) in projects()? {
+        // Two statements per board, both outside the row loop: the grouped
+        // delivery projection plus the head it is measured against. Paused
+        // rows are read whatever the filter says, so a hidden row can be
+        // counted and offered rather than reading as "nothing exists".
+        let positions = store.subscription_positions()?;
+        for subscription in store.subscriptions(None, None, true)? {
+            views.push(SubscriptionView {
+                board: project.name.clone(),
+                position: positions.position(&subscription.id),
+                head_event_seq: positions.head_event_seq,
+                subscription,
+            });
+        }
+    }
+    views.sort_by(|a, b| {
+        (&a.board, a.subscription.created_at, &a.subscription.id).cmp(&(
+            &b.board,
+            b.subscription.created_at,
+            &b.subscription.id,
+        ))
+    });
+    Ok(page(
+        "Subscriptions",
+        &subscriptions_body(&views, show == Some("all"), changed),
+    ))
+}
+
+fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Option<&str>) -> String {
+    let mut html = String::from(
+        "<div class=heading><h1>Subscriptions</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
+    );
+    if let Some(id) = changed {
+        html.push_str(&format!(
+            "<p class=success>Recorded the change to <code>{}</code>. The dispatcher reads its state on the next pass.</p>",
+            escape(id)
+        ));
+    }
+    let (shown, hidden): (Vec<_>, Vec<_>) = views
+        .iter()
+        .partition(|view| show_all || view.subscription.status == "active");
+    if shown.is_empty() {
+        // An empty list has two very different causes, and saying the wrong
+        // one is how absence reads as a finding.
+        html.push_str(&if hidden.is_empty() {
+            format!(
+                "<p class=empty>Nothing is subscribed yet. \
+                 <code>kb subscription add --consumer NAME --action NAME --timeout-ms 30000 \
+                 --max-retries 3 --rate-per-minute 60 --max-concurrency 1 --as {OPERATOR_ACTOR}</code> \
+                 registers one, and it starts watching from the event that created it — \
+                 add <code>--kind</code>, <code>--subject</code>, <code>--current-status</code> \
+                 or <code>--tag</code> to narrow what it sees.</p>"
+            )
+        } else {
+            format!(
+                "<p class=empty>Every subscription here is paused right now. \
+                 <a href=\"/subscriptions?show=all\">Show the {} paused one{}</a> to see \
+                 where each of them stopped.</p>",
+                hidden.len(),
+                if hidden.len() == 1 { "" } else { "s" },
+            )
+        });
+        return html;
+    }
+    html.push_str(
+        "<p class=meta>Position is derived per request: the start anchor, the highest acked \
+         seq, and the distance to that board's event head. The distance counts board events, \
+         and a subscription only receives the ones its filter selects — the queued counts are \
+         what is actually waiting for it.</p>",
+    );
+    html.push_str(
+        "<table><thead><tr><th>Subscription</th><th>Watches</th><th>Delivers to</th>\
+         <th>State</th><th>Position</th><th>Limits</th></tr></thead><tbody>",
+    );
+    for view in &shown {
+        html.push_str(&subscription_row(view, show_all));
+    }
+    html.push_str("</tbody></table>");
+    if !hidden.is_empty() {
+        html.push_str(&format!(
+            "<p class=meta>{} paused subscription{} hidden. \
+             <a href=\"/subscriptions?show=all\">Show paused subscriptions</a>.</p>",
+            hidden.len(),
+            if hidden.len() == 1 { " is" } else { "s are" },
+        ));
+    } else if show_all {
+        html.push_str(
+            "<p class=meta>Listing paused subscriptions too. \
+             <a href=\"/subscriptions\">Show active only</a>.</p>",
+        );
+    }
+    html
+}
+
+/// What is actually waiting, rendered only when something is.
+///
+/// These three counts are aspects of position rather than peer facts, and at
+/// rest all three are zero — three columns of nothing crowded out the sentence
+/// that carries the meaning. Silence here reads correctly: nothing queued.
+/// A dead-lettered delivery is the one thing on this page that needs a person,
+/// so it is the one thing that gets loud, in the same treatment open attention
+/// gets on Boards.
+fn queued_state(position: SubscriptionPosition) -> String {
+    let mut parts = Vec::new();
+    if position.pending > 0 {
+        parts.push(format!("{} pending", position.pending));
+    }
+    if position.retry_wait > 0 {
+        parts.push(format!(
+            "<span class=retrying>{} retrying</span>",
+            position.retry_wait
+        ));
+    }
+    if position.dead_letter > 0 {
+        parts.push(format!(
+            "<span class=dead>{} dead-lettered</span>",
+            position.dead_letter
+        ));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("<div class=queued>{}</div>", parts.join(" · "))
+}
+
+fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
+    let subscription = &view.subscription;
+    let position = view.position;
+    let paused = subscription.status != "active";
+    // Nothing acked yet means the subscription is still sitting on its start
+    // anchor, which is where it began — not seq 0, and not "caught up".
+    let acked_position = position
+        .acked_through_seq
+        .unwrap_or(subscription.start_event_seq);
+    // Neither control is destructive: pausing is reversible and resuming
+    // restores the default, so neither gets the approve/decline weight the
+    // attention surface uses for a decision. The page's one loud element is a
+    // dead-lettered delivery, which is the only thing here needing a person.
+    let (verb, verb_label) = if paused {
+        ("resume", "Resume delivery")
+    } else {
+        ("pause", "Pause delivery")
+    };
+    format!(
+        "<tr><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\">{board}</a></div></td>\
+         <td>{watches}</td>\
+         <td><code>{consumer}</code><div class=meta>action <code>{action}</code> · {secret}</div></td>\
+         <td><span class=status>{status}</span>{paused_by}\
+         <form method=post action=\"/subscription/{board_path}/{id_path}/{verb}{carry}\">\
+         <button class=quick type=submit>{verb_label}</button></form></td>\
+         <td>{position_sentence}<div class=meta>{position_meta}</div>{queued}</td>\
+         <td><div class=meta>{limits}</div></td></tr>",
+        id = escape(&subscription.id),
+        board_url = escape(&url_encode(&view.board)),
+        board = escape(&view.board),
+        watches = escape(&watch_sentence(subscription)),
+        consumer = escape(&subscription.consumer_id),
+        action = escape(&subscription.action_id),
+        // Whether a secret is configured is operational; which secret it is
+        // stays a host-local lookup name the page has no business repeating.
+        secret = if subscription.secret_ref.is_some() {
+            "a secret is configured"
+        } else {
+            "no secret configured"
+        },
+        status = escape(&subscription.status),
+        paused_by = match (&subscription.paused_by, subscription.paused_at) {
+            (Some(actor), Some(at)) => format!(
+                "<div class=meta>paused by {} · {}</div>",
+                escape(actor),
+                escape(&ago(at))
+            ),
+            _ => String::new(),
+        },
+        board_path = url_encode(&view.board),
+        id_path = url_encode(&subscription.id),
+        carry = if show_all && paused { "?show=all" } else { "" },
+        position_sentence = escape(&position_sentence(view.head_event_seq, acked_position)),
+        position_meta = format!(
+            "started at seq {}{}{}",
+            subscription.start_event_seq,
+            match position.acked_through_seq {
+                Some(seq) => format!(" · acked through seq {seq}"),
+                None => " · nothing acked yet".to_owned(),
+            },
+            if position.leased == 0 {
+                String::new()
+            } else {
+                format!(" · {} in flight", position.leased)
+            },
+        ),
+        queued = queued_state(position),
+        limits = escape(&format!(
+            "{} ms timeout · {} retries · {}/min · {} at a time",
+            subscription.timeout_ms,
+            subscription.max_retries,
+            subscription.rate_per_minute,
+            subscription.max_concurrency,
+        )),
+    )
+}
+
+/// What a subscription watches, in a sentence.
+///
+/// Six selector fields rendered as six columns is six things to decode; what
+/// an operator wants is to read what the thing is for. Empty selectors narrow
+/// nothing, so a subscription with none of them watches the whole board and
+/// says exactly that.
+///
+/// The rule: `Every <kinds> event`, then the narrowing clauses in a fixed
+/// order — subject, relations, prior statuses, current statuses, tags — the
+/// first attached with a space and any others with commas.
+fn watch_sentence(subscription: &Subscription) -> String {
+    let opening = if subscription.kinds.is_empty() {
+        "Every event".to_owned()
+    } else {
+        format!("Every {} event", or_list(&subscription.kinds))
+    };
+    let mut clauses = Vec::new();
+    if let Some(task) = &subscription.subject_task_id {
+        clauses.push(format!("about task {task}"));
+    }
+    if !subscription.relations.is_empty() {
+        clauses.push(format!(
+            "related through {}",
+            or_list(&subscription.relations)
+        ));
+    }
+    if !subscription.prior_statuses.is_empty() {
+        clauses.push(format!("leaving {}", or_list(&subscription.prior_statuses)));
+    }
+    if !subscription.current_statuses.is_empty() {
+        clauses.push(format!(
+            "arriving at {}",
+            or_list(&subscription.current_statuses)
+        ));
+    }
+    if !subscription.tags.is_empty() {
+        clauses.push(format!("tagged {}", or_list(&subscription.tags)));
+    }
+    let Some((first, rest)) = clauses.split_first() else {
+        return format!("{opening} on the board.");
+    };
+    let mut sentence = format!("{opening} {first}");
+    for clause in rest {
+        sentence.push_str(", ");
+        sentence.push_str(clause);
+    }
+    sentence.push('.');
+    sentence
+}
+
+/// How far behind the board head a subscription is, in words.
+///
+/// "Caught up" is only honest when nothing sits between the last ack and the
+/// head. The count is board events rather than matching events, and the page
+/// says so beside the table: a subscription receives only what its filter
+/// selects, so calling every newer event a backlog would report work as lost
+/// that was never addressed to it.
+fn position_sentence(head_event_seq: i64, acked_position: i64) -> String {
+    match head_event_seq.saturating_sub(acked_position) {
+        behind if behind <= 0 => format!("Caught up with head seq {head_event_seq}."),
+        1 => format!("1 board event behind head seq {head_event_seq}."),
+        behind => format!("{behind} board events behind head seq {head_event_seq}."),
+    }
+}
+
+/// "a", "b", or "c", in the Oxford-comma shape the store's refusals use.
+fn or_list(values: &[String]) -> String {
+    match values {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = values.split_last().expect("more than two values");
+            format!("{}, or {last}", rest.join(", "))
+        }
+    }
+}
+
 /// Where every lane stands, newest first.
 ///
 /// The counterpart to Needs you: that page is what waits on the operator, this
@@ -1799,7 +2158,8 @@ fn page(title: &str, body: &str) -> String {
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
          <nav aria-label=Primary><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
          <div class=nav-links><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
-         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a><a href=\"/deployments\">Deployments</a></div>\
+         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a><a href=\"/deployments\">Deployments</a>\
+         <a href=\"/subscriptions\">Subscriptions</a></div>\
          <form action=/search method=get><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
          </nav><main id=main>{body}</main>\
          <footer>live operator view · <code>kanban serve</code></footer>\
@@ -1890,6 +2250,9 @@ vertical-align:top}\
 th{color:#8b949e;font-weight:600}\
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}\
 td.waiting{color:#f0883e;font-weight:700}\
+.queued{margin-top:.25rem;font-size:.85rem;color:var(--muted)}\
+.queued .retrying{color:#ffd19a;font-weight:600}\
+.queued .dead{color:#f0883e;font-weight:700}\
 td.when{white-space:nowrap;color:#8b949e}\
 td.payload{color:#8b949e;font-size:.85rem;word-break:break-word}\
 .item,.note,.plan,.search-result{border:1px solid var(--line);border-radius:1rem;padding:clamp(.9rem,3vw,1.25rem);\
@@ -1937,12 +2300,13 @@ dd{margin:0;font-size:.9rem;word-break:break-word}\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AddTask, FinishDeployment, StartDeployment};
+    use crate::model::{AddSubscription, AddTask, FinishDeployment, StartDeployment};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tiny_http::TestRequest;
 
     const RENDER_CHILD_TEST: &str = "serve::tests::serve_render_fixture_child_process";
     const RENDER_CHILD_MARKER: &str = "serve-render-fixture-child";
@@ -1982,13 +2346,15 @@ mod tests {
         }
     }
 
-    fn spawn_render_child(data_dir: &Path) -> Output {
+    /// Spawn this test binary again with an isolated data dir, so a fixture
+    /// that has to set `KANBAN_DATA_DIR` never races the rest of the suite.
+    fn spawn_fixture_child(data_dir: &Path, test: &str, marker_env: &str, marker: &str) -> Output {
         Command::new(env::current_exe().expect("current test binary"))
-            .args(["--exact", "--ignored", RENDER_CHILD_TEST, "--nocapture"])
+            .args(["--exact", "--ignored", test, "--nocapture"])
             .env("KANBAN_DATA_DIR", data_dir)
-            .env("KANBAN_SERVE_RENDER_CHILD", RENDER_CHILD_MARKER)
+            .env(marker_env, marker)
             .output()
-            .expect("spawn child render fixture")
+            .expect("spawn child fixture")
     }
 
     fn seed_render_fixture(data_dir: &Path) -> RenderFixture {
@@ -2441,7 +2807,12 @@ mod tests {
     #[test]
     fn serve_render_fixture_parent_spawns_child_process() {
         let data_dir = TempDataDir::new("render");
-        let output = spawn_render_child(data_dir.path());
+        let output = spawn_fixture_child(
+            data_dir.path(),
+            RENDER_CHILD_TEST,
+            "KANBAN_SERVE_RENDER_CHILD",
+            RENDER_CHILD_MARKER,
+        );
         if !output.status.success() {
             panic!(
                 "child render fixture failed\nstdout:\n{}\nstderr:\n{}",
@@ -2474,12 +2845,17 @@ mod tests {
         // check that quietly stops applying.
         const SOURCE: &str = include_str!("serve.rs");
         // The Needs-you reply form resolves exactly one attention item through
-        // the same audited Store operation as `kb att resolve`. No other web
-        // route is allowed a mutator.
-        const ALLOWED: [&str; 3] = [
+        // the same audited Store operation as `kb att resolve`, and the
+        // Subscriptions page pauses or resumes exactly one subscription
+        // through the same audited operation as `kb subscription pause` --
+        // both idempotent, both actor-stamped. No other web route is allowed a
+        // mutator.
+        const ALLOWED: [&str; 5] = [
             "move_task",
             "resolve_attention",
             "resolve_attention_from_trusted_edge",
+            "pause_subscription",
+            "resume_subscription",
         ];
         let shipped = SOURCE
             .split_once("#[cfg(test)]")
@@ -2487,7 +2863,7 @@ mod tests {
             .unwrap_or(SOURCE);
         // Every `&mut self` method on Store, which is the complete set of ways
         // this module could change a board.
-        const MUTATORS: [&str; 24] = [
+        const MUTATORS: [&str; 27] = [
             "add_task",
             "move_task",
             "remove_task",
@@ -2512,6 +2888,9 @@ mod tests {
             "start_deployment",
             "finish_deployment",
             "abandon_deployment",
+            "add_subscription",
+            "pause_subscription",
+            "resume_subscription",
         ];
         for name in MUTATORS {
             if ALLOWED.contains(&name) {
@@ -2648,5 +3027,733 @@ mod tests {
         // A string value loses its quotes; anything else keeps its JSON shape.
         assert_eq!(compact(&serde_json::json!({})), "");
         assert_eq!(compact(&serde_json::Value::Null), "");
+    }
+
+    const SUBSCRIPTIONS_CHILD_TEST: &str =
+        "serve::tests::serve_subscriptions_fixture_child_process";
+    const SUBSCRIPTIONS_CHILD_MARKER: &str = "serve-subscriptions-fixture-child";
+
+    struct SubscriptionsFixture {
+        board: String,
+        board_path: PathBuf,
+        active: String,
+        dead: String,
+        paused: String,
+        secret_ref: String,
+        head_event_seq: i64,
+        acked_seq: i64,
+    }
+
+    fn subscription_fixture(id: &str) -> Subscription {
+        Subscription {
+            id: id.to_owned(),
+            protocol_version: 1,
+            subject_task_id: None,
+            relations: Vec::new(),
+            kinds: Vec::new(),
+            prior_statuses: Vec::new(),
+            current_statuses: Vec::new(),
+            tags: Vec::new(),
+            consumer_id: "codex.queue".to_owned(),
+            action_id: "enqueue-turn".to_owned(),
+            timeout_ms: 30_000,
+            max_retries: 3,
+            rate_per_minute: 60,
+            max_concurrency: 1,
+            start_event_seq: 4,
+            secret_ref: None,
+            status: "active".to_owned(),
+            created_at: 1_787_529_600_000,
+            created_by: OPERATOR_ACTOR.to_owned(),
+            updated_at: 1_787_529_600_000,
+            updated_by: OPERATOR_ACTOR.to_owned(),
+            paused_at: None,
+            paused_by: None,
+        }
+    }
+
+    fn subscription_view(
+        board: &str,
+        subscription: Subscription,
+        head_event_seq: i64,
+        position: SubscriptionPosition,
+    ) -> SubscriptionView {
+        SubscriptionView {
+            board: board.to_owned(),
+            subscription,
+            position,
+            head_event_seq,
+        }
+    }
+
+    #[test]
+    fn a_watch_sentence_names_every_narrowing_in_plain_words() {
+        // Nothing narrowing it means it really does watch everything, and
+        // saying so is the difference between "all events" and six empty
+        // columns an operator has to interpret.
+        assert_eq!(
+            watch_sentence(&subscription_fixture("sub-bare")),
+            "Every event on the board."
+        );
+
+        let mut narrowed = subscription_fixture("sub-narrowed");
+        narrowed.kinds = vec!["task_moved".to_owned()];
+        narrowed.current_statuses = vec!["done".to_owned()];
+        assert_eq!(
+            watch_sentence(&narrowed),
+            "Every task_moved event arriving at done."
+        );
+
+        let mut every = subscription_fixture("sub-every");
+        every.kinds = vec!["note_added".to_owned(), "checkpoint_added".to_owned()];
+        every.subject_task_id = Some("t-1".to_owned());
+        every.relations = vec!["parent:t-9".to_owned()];
+        every.prior_statuses = vec!["todo".to_owned()];
+        every.current_statuses = vec!["in_progress".to_owned(), "review".to_owned()];
+        every.tags = vec!["ops".to_owned(), "release".to_owned(), "infra".to_owned()];
+        assert_eq!(
+            watch_sentence(&every),
+            "Every note_added or checkpoint_added event about task t-1, related through \
+             parent:t-9, leaving todo, arriving at in_progress or review, tagged ops, release, \
+             or infra."
+        );
+    }
+
+    #[test]
+    fn a_position_reads_as_caught_up_only_when_the_head_is_reached() {
+        assert_eq!(position_sentence(12, 12), "Caught up with head seq 12.");
+        assert_eq!(
+            position_sentence(12, 11),
+            "1 board event behind head seq 12."
+        );
+        assert_eq!(
+            position_sentence(12, 8),
+            "4 board events behind head seq 12."
+        );
+        // An ack that reads past the head is not a negative backlog.
+        assert_eq!(position_sentence(12, 14), "Caught up with head seq 12.");
+    }
+
+    #[test]
+    fn an_empty_subscriptions_page_invites_the_command_that_creates_one() {
+        let html = subscriptions_body(&[], false, None);
+        assert_html_contains(&html, "Nothing is subscribed yet.");
+        assert_html_contains(&html, "kb subscription add --consumer NAME --action NAME");
+        assert_html_contains(&html, &format!("--as {OPERATOR_ACTOR}"));
+        assert!(!html.contains("<table"), "{html}");
+    }
+
+    #[test]
+    fn a_subscription_row_carries_its_sentence_delivery_state_position_and_limits() {
+        let mut subscription = subscription_fixture("sub-one");
+        subscription.kinds = vec!["task_moved".to_owned()];
+        subscription.current_statuses = vec!["done".to_owned()];
+        let html = subscriptions_body(
+            &[subscription_view(
+                "PX",
+                subscription,
+                12,
+                SubscriptionPosition {
+                    acked_through_seq: Some(8),
+                    pending: 2,
+                    leased: 1,
+                    retry_wait: 0,
+                    dead_letter: 0,
+                },
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(&html, "<code>sub-one</code>");
+        assert_html_contains(&html, "<a href=\"/board/PX\">PX</a>");
+        assert_html_contains(&html, "Every task_moved event arriving at done.");
+        assert_html_contains(&html, "<code>codex.queue</code>");
+        assert_html_contains(&html, "action <code>enqueue-turn</code>");
+        assert_html_contains(&html, "<span class=status>active</span>");
+        assert_html_contains(&html, "4 board events behind head seq 12.");
+        assert_html_contains(
+            &html,
+            "started at seq 4 · acked through seq 8 · 1 in flight",
+        );
+        assert_html_contains(&html, "30000 ms timeout · 3 retries · 60/min · 1 at a time");
+        assert_html_contains(&html, "action=\"/subscription/PX/sub-one/pause\"");
+        assert_html_contains(&html, "Pause delivery");
+        assert_html_contains(&html, "2 pending");
+    }
+
+    #[test]
+    fn many_subscriptions_each_get_their_own_row_and_position() {
+        let views = [
+            subscription_view(
+                "PX",
+                subscription_fixture("sub-one"),
+                20,
+                SubscriptionPosition {
+                    acked_through_seq: Some(20),
+                    ..SubscriptionPosition::default()
+                },
+            ),
+            subscription_view(
+                "PX",
+                subscription_fixture("sub-two"),
+                20,
+                SubscriptionPosition {
+                    acked_through_seq: Some(15),
+                    pending: 5,
+                    ..SubscriptionPosition::default()
+                },
+            ),
+            subscription_view(
+                "KB",
+                subscription_fixture("sub-three"),
+                20,
+                SubscriptionPosition::default(),
+            ),
+        ];
+        let html = subscriptions_body(&views, false, None);
+        assert_eq!(html.matches("<tr><td><code>sub-").count(), 3, "{html}");
+        assert_html_contains(&html, "Caught up with head seq 20.");
+        assert_html_contains(&html, "5 board events behind head seq 20.");
+        // Nothing acked leaves a subscription on its start anchor, seq 4 here,
+        // rather than at seq 0 — which would report 20 events of phantom lag.
+        assert_html_contains(&html, "16 board events behind head seq 20.");
+        assert_html_contains(&html, "nothing acked yet");
+        let placed = ["sub-one", "sub-two", "sub-three"].map(|id| {
+            html.find(id)
+                .unwrap_or_else(|| panic!("missing {id} in {html}"))
+        });
+        assert!(placed[0] < placed[1] && placed[1] < placed[2], "{html}");
+    }
+
+    #[test]
+    fn a_dead_lettered_delivery_is_flagged_for_the_operator_and_a_retrying_one_is_not() {
+        let retrying = subscriptions_body(
+            &[subscription_view(
+                "PX",
+                subscription_fixture("sub-retry"),
+                12,
+                SubscriptionPosition {
+                    acked_through_seq: Some(12),
+                    retry_wait: 2,
+                    ..SubscriptionPosition::default()
+                },
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(&retrying, "<span class=retrying>2 retrying</span>");
+        // Zero is silence, not a rendered nought: nothing pending and nothing
+        // dead-lettered must not appear at all.
+        assert!(
+            !retrying.contains("pending") && !retrying.contains("dead-lettered"),
+            "an empty count must be silent, not a zero: {retrying}"
+        );
+        assert!(
+            !retrying.contains("class=dead"),
+            "a retry needs no operator: {retrying}"
+        );
+
+        let dead = subscriptions_body(
+            &[subscription_view(
+                "PX",
+                subscription_fixture("sub-dead"),
+                12,
+                SubscriptionPosition {
+                    acked_through_seq: Some(12),
+                    dead_letter: 3,
+                    ..SubscriptionPosition::default()
+                },
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(&dead, "<span class=dead>3 dead-lettered</span>");
+        assert!(
+            !dead.contains("pending") && !dead.contains("retrying"),
+            "an empty count must be silent, not a zero: {dead}"
+        );
+        // Nothing queued renders no queued line at all, which is the whole
+        // reason these three stopped being columns: at rest the cell is the
+        // position sentence and nothing else.
+        let quiet = subscriptions_body(
+            &[subscription_view(
+                "PX",
+                subscription_fixture("sub-quiet"),
+                12,
+                SubscriptionPosition {
+                    acked_through_seq: Some(12),
+                    ..SubscriptionPosition::default()
+                },
+            )],
+            false,
+            None,
+        );
+        assert!(
+            !quiet.contains("class=queued"),
+            "a subscription with nothing waiting must render no queued line: {quiet}"
+        );
+
+        // Three states, three treatments: plain muted, amber for a retry that
+        // resolves itself, and the orange bold that already means "a person
+        // has to look at this" elsewhere in this UI.
+        assert!(
+            CSS.contains(".queued .retrying{color:#ffd19a;font-weight:600}"),
+            "{CSS}"
+        );
+        assert!(
+            CSS.contains(".queued .dead{color:#f0883e;font-weight:700}"),
+            "{CSS}"
+        );
+        assert!(
+            CSS.contains("td.waiting{color:#f0883e;font-weight:700}"),
+            "the dead treatment reuses the operator-attention colour already in this UI: {CSS}"
+        );
+    }
+
+    #[test]
+    fn a_paused_subscription_is_listed_only_when_the_url_asks_for_it() {
+        let mut paused = subscription_fixture("sub-halted");
+        paused.status = "paused".to_owned();
+        paused.paused_at = Some(now_ms() - 90 * 60_000);
+        paused.paused_by = Some(OPERATOR_ACTOR.to_owned());
+        let views = [
+            subscription_view(
+                "PX",
+                subscription_fixture("sub-live"),
+                12,
+                SubscriptionPosition {
+                    acked_through_seq: Some(12),
+                    ..SubscriptionPosition::default()
+                },
+            ),
+            subscription_view(
+                "PX",
+                paused,
+                12,
+                SubscriptionPosition {
+                    acked_through_seq: Some(6),
+                    pending: 4,
+                    ..SubscriptionPosition::default()
+                },
+            ),
+        ];
+
+        let default_view = subscriptions_body(&views, false, None);
+        assert_html_contains(&default_view, "sub-live");
+        assert!(!default_view.contains("sub-halted"), "{default_view}");
+        assert_html_contains(&default_view, "1 paused subscription is hidden.");
+        assert_html_contains(
+            &default_view,
+            "<a href=\"/subscriptions?show=all\">Show paused subscriptions</a>",
+        );
+
+        let everything = subscriptions_body(&views, true, None);
+        assert_html_contains(&everything, "sub-halted");
+        assert_html_contains(
+            &everything,
+            &format!("paused by {OPERATOR_ACTOR} · 1h30m ago"),
+        );
+        assert_html_contains(&everything, "Resume delivery");
+        assert_html_contains(
+            &everything,
+            "action=\"/subscription/PX/sub-halted/resume?show=all\"",
+        );
+        assert!(
+            !everything.contains("paused subscription is hidden"),
+            "{everything}"
+        );
+
+        // Hiding every row is not the same fact as having no subscriptions,
+        // and the page must not report the filter as an absence.
+        let hidden_only = subscriptions_body(&views[1..], false, None);
+        assert_html_contains(&hidden_only, "Every subscription here is paused right now.");
+        assert!(
+            !hidden_only.contains("Nothing is subscribed yet"),
+            "{hidden_only}"
+        );
+    }
+
+    #[test]
+    fn a_configured_secret_is_reported_without_naming_it() {
+        let mut configured = subscription_fixture("sub-secret");
+        configured.secret_ref = Some("codex_queue_token".to_owned());
+        let html = subscriptions_body(
+            &[subscription_view(
+                "PX",
+                configured,
+                4,
+                SubscriptionPosition::default(),
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(&html, "a secret is configured");
+        assert!(!html.contains("codex_queue_token"), "{html}");
+
+        let without = subscriptions_body(
+            &[subscription_view(
+                "PX",
+                subscription_fixture("sub-plain"),
+                4,
+                SubscriptionPosition::default(),
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(&without, "no secret configured");
+    }
+
+    fn append_watched_event(store: &Store, created_at: i64) {
+        crate::audit::append_board_event(
+            &store.connection,
+            None,
+            "checkpoint_added",
+            OPERATOR_ACTOR,
+            "{}",
+            created_at,
+        )
+        .expect("append a watched board event");
+    }
+
+    fn add_watching_subscription(
+        store: &mut Store,
+        id: &str,
+        max_retries: i64,
+        secret_ref: Option<&str>,
+    ) -> String {
+        store
+            .add_subscription(AddSubscription {
+                id: Some(id.to_owned()),
+                subject_task_id: None,
+                relations: Vec::new(),
+                kinds: vec!["checkpoint_added".to_owned()],
+                prior_statuses: Vec::new(),
+                current_statuses: Vec::new(),
+                tags: Vec::new(),
+                consumer_id: "codex.queue".to_owned(),
+                action_id: "enqueue-turn".to_owned(),
+                timeout_ms: 30_000,
+                max_retries,
+                rate_per_minute: 60,
+                max_concurrency: 1,
+                secret_ref: secret_ref.map(str::to_owned),
+                actor: OPERATOR_ACTOR.to_owned(),
+            })
+            .expect("add subscription")
+            .id
+    }
+
+    fn first_delivery(store: &Store, subscription_id: &str) -> (String, i64, i64) {
+        store
+            .connection
+            .query_row(
+                "SELECT event_id,event_seq,next_attempt_at FROM subscription_deliveries \
+                 WHERE subscription_id=? ORDER BY event_seq LIMIT 1",
+                [subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("a materialized delivery")
+    }
+
+    fn settle_first_delivery(store: &mut Store, subscription_id: &str, acknowledge: bool) -> i64 {
+        let (event_id, event_seq, due_at) = first_delivery(store, subscription_id);
+        let claimed = store
+            .claim_subscription_delivery(subscription_id, &event_id, due_at, 5_000)
+            .expect("claim the delivery")
+            .expect("a due delivery");
+        let settled = if acknowledge {
+            store
+                .finalize_subscription_delivery_success(
+                    subscription_id,
+                    &event_id,
+                    &claimed.lease_token,
+                    due_at + 1,
+                )
+                .expect("acknowledge the delivery")
+        } else {
+            store
+                .finalize_subscription_delivery_failure(
+                    subscription_id,
+                    &event_id,
+                    &claimed.lease_token,
+                    due_at + 1,
+                    false,
+                    "consumer_refused",
+                )
+                .expect("fail the delivery")
+        };
+        assert!(settled, "the delivery should have settled");
+        event_seq
+    }
+
+    fn head_event_seq(board_path: &Path) -> i64 {
+        Store::open(board_path)
+            .expect("open board")
+            .connection
+            .query_row("SELECT COALESCE(max(seq),0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .expect("read the event head")
+    }
+
+    fn subscription_state(board_path: &Path, id: &str) -> Subscription {
+        Store::open(board_path)
+            .expect("open board")
+            .require_subscription(id)
+            .expect("the subscription still exists")
+    }
+
+    fn subscription_event_count(board_path: &Path, kind: &str, id: &str) -> i64 {
+        Store::open(board_path)
+            .expect("open board")
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE kind=? AND json_extract(payload,'$.subscriptionID')=?",
+                [kind, id],
+                |row| row.get(0),
+            )
+            .expect("count subscription events")
+    }
+
+    fn seed_subscriptions_fixture(data_dir: &Path) -> SubscriptionsFixture {
+        fs::create_dir_all(data_dir).expect("create isolated data dir");
+        let mut registry = Registry::open().expect("open registry");
+        let board_name = "SERVE-SUBSCRIPTIONS";
+        let project = registry
+            .register(None, board_name, false, OPERATOR_ACTOR)
+            .expect("register rootless board");
+        let board_path = PathBuf::from(&project.board_path);
+        let mut store = Store::open(&board_path).expect("open store");
+        store
+            .initialize(board_name, OPERATOR_ACTOR)
+            .expect("initialize board metadata");
+        // A subscription may only name a kind the board has already recorded,
+        // and only events after its own anchor are ever delivered.
+        append_watched_event(&store, 10);
+        let secret_ref = "serve_subscriptions_token".to_owned();
+        let active =
+            add_watching_subscription(&mut store, "sub-serve-active", 3, Some(&secret_ref));
+        let dead = add_watching_subscription(&mut store, "sub-serve-dead", 0, None);
+        let paused = add_watching_subscription(&mut store, "sub-serve-paused", 3, None);
+        append_watched_event(&store, 20);
+        append_watched_event(&store, 30);
+        store
+            .materialize_subscriptions()
+            .expect("materialize the queued deliveries");
+        let acked_seq = settle_first_delivery(&mut store, &active, true);
+        // Zero retries, so the first failure is terminal.
+        settle_first_delivery(&mut store, &dead, false);
+        store
+            .pause_subscription(&paused, OPERATOR_ACTOR)
+            .expect("pause the third subscription");
+        drop(store);
+        SubscriptionsFixture {
+            board: board_name.to_owned(),
+            head_event_seq: head_event_seq(&board_path),
+            board_path,
+            active,
+            dead,
+            paused,
+            secret_ref,
+            acked_seq,
+        }
+    }
+
+    fn same_origin_post(path: &str) -> Request {
+        TestRequest::new()
+            .with_method(Method::Post)
+            .with_path(path)
+            .with_header(
+                Header::from_bytes(&b"Host"[..], &b"kb.test"[..]).expect("a static header"),
+            )
+            .with_header(
+                Header::from_bytes(&b"Origin"[..], &b"http://kb.test"[..])
+                    .expect("a static header"),
+            )
+            .into()
+    }
+
+    fn post_redirect(url: &str, config: &ServeConfig) -> String {
+        let mut request = same_origin_post(url);
+        match post(&mut request, url, config) {
+            Ok(WebResponse::Redirect(location)) => location,
+            Ok(WebResponse::Html(status, html)) => {
+                panic!("expected a redirect from {url}, got {status}: {html}")
+            }
+            Err(error) => panic!("posting {url} failed: {error}"),
+        }
+    }
+
+    fn post_status(url: &str, request: &mut Request, config: &ServeConfig) -> u16 {
+        match post(request, url, config) {
+            Ok(WebResponse::Html(status, _)) => status,
+            Ok(WebResponse::Redirect(location)) => {
+                panic!("expected a refusal from {url}, got a redirect to {location}")
+            }
+            Err(error) => panic!("posting {url} failed: {error}"),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn serve_subscriptions_fixture_child_process() {
+        let Ok(marker) = env::var("KANBAN_SERVE_SUBSCRIPTIONS_CHILD") else {
+            return;
+        };
+        if marker != SUBSCRIPTIONS_CHILD_MARKER {
+            return;
+        }
+        let data_dir = env::var_os("KANBAN_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("child data dir");
+        let fixture = seed_subscriptions_fixture(&data_dir);
+        let behind = fixture.head_event_seq - fixture.acked_seq;
+        assert!(
+            behind > 1,
+            "the fixture should leave the active subscription measurably behind the head"
+        );
+
+        let listed = render("/subscriptions").expect("render subscriptions");
+        assert_page_title(&listed, "Subscriptions");
+        assert_html_contains(&listed, "<a href=\"/subscriptions\">Subscriptions</a>");
+        assert_html_contains(&listed, &fixture.active);
+        assert_html_contains(&listed, &fixture.dead);
+        assert!(!listed.contains(&fixture.paused), "{listed}");
+        // The lookup name of a configured secret is never a page value.
+        assert!(!listed.contains(&fixture.secret_ref), "{listed}");
+        assert_html_contains(&listed, "a secret is configured");
+        assert_html_contains(&listed, "no secret configured");
+        assert_html_contains(
+            &listed,
+            &format!(
+                "{behind} board events behind head seq {}.",
+                fixture.head_event_seq
+            ),
+        );
+        assert_html_contains(&listed, &format!("acked through seq {}", fixture.acked_seq));
+        assert_html_contains(&listed, "nothing acked yet");
+        // One terminal failure on the zero-retry subscription, and it is the
+        // count the operator is meant to notice.
+        assert_html_contains(&listed, "<span class=dead>1 dead-lettered</span>");
+        assert_html_contains(&listed, "1 paused subscription is hidden.");
+        assert!(
+            listed.find(&fixture.active) < listed.find(&fixture.dead),
+            "rows should follow creation order: {listed}"
+        );
+
+        let everything = render("/subscriptions?show=all").expect("render every subscription");
+        assert_html_contains(&everything, &fixture.paused);
+        assert_html_contains(&everything, "Resume delivery");
+        assert_html_contains(
+            &everything,
+            &format!(
+                "action=\"/subscription/{}/{}/resume?show=all\"",
+                fixture.board, fixture.paused
+            ),
+        );
+        assert_html_contains(&everything, &format!("paused by {OPERATOR_ACTOR}"));
+        assert!(!everything.contains(&fixture.secret_ref), "{everything}");
+
+        let config = ServeConfig::new(None).expect("the default write actor");
+        let pause_url = format!("/subscription/{}/{}/pause", fixture.board, fixture.active);
+        let pause_location = format!("/subscriptions?show=all&changed={}", fixture.active);
+        assert_eq!(post_redirect(&pause_url, &config), pause_location);
+        let paused_once = subscription_state(&fixture.board_path, &fixture.active);
+        assert_eq!(paused_once.status, "paused");
+        assert_eq!(paused_once.paused_by.as_deref(), Some(OPERATOR_ACTOR));
+        let paused_at = paused_once.paused_at.expect("a pause stamp");
+        assert_eq!(
+            subscription_event_count(&fixture.board_path, "subscription_paused", &fixture.active),
+            1
+        );
+
+        // The same POST again: a no-op that still lands on the page, with no
+        // second event and no re-stamped pause.
+        assert_eq!(post_redirect(&pause_url, &config), pause_location);
+        let paused_twice = subscription_state(&fixture.board_path, &fixture.active);
+        assert_eq!(paused_twice.status, "paused");
+        assert_eq!(paused_twice.paused_at, Some(paused_at));
+        assert_eq!(paused_twice.paused_by.as_deref(), Some(OPERATOR_ACTOR));
+        assert_eq!(
+            subscription_event_count(&fixture.board_path, "subscription_paused", &fixture.active),
+            1
+        );
+
+        let resume_url = format!("/subscription/{}/{}/resume", fixture.board, fixture.active);
+        assert_eq!(
+            post_redirect(&resume_url, &config),
+            format!("/subscriptions?changed={}", fixture.active)
+        );
+        let resumed = subscription_state(&fixture.board_path, &fixture.active);
+        assert_eq!(resumed.status, "active");
+        assert_eq!(resumed.paused_at, None);
+        assert_eq!(resumed.paused_by, None);
+
+        // Resuming from the paused-inclusive view keeps that filter, and
+        // resuming twice is as idempotent as pausing twice.
+        let resume_all = format!("{resume_url}?show=all");
+        assert_eq!(
+            post_redirect(&resume_all, &config),
+            format!("/subscriptions?show=all&changed={}", fixture.active)
+        );
+        assert_eq!(
+            subscription_event_count(&fixture.board_path, "subscription_resumed", &fixture.active),
+            1
+        );
+
+        let mut foreign = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path(&pause_url)
+            .with_header(Header::from_bytes(&b"Host"[..], &b"kb.test"[..]).expect("static"))
+            .with_header(
+                Header::from_bytes(&b"Origin"[..], &b"http://elsewhere.test"[..]).expect("static"),
+            )
+            .into();
+        assert_eq!(post_status(&pause_url, &mut foreign, &config), 403);
+        let unmoved = subscription_state(&fixture.board_path, &fixture.active);
+        assert_eq!(unmoved.status, "active");
+
+        let unknown = format!("/subscription/{}/{}/delete", fixture.board, fixture.active);
+        let mut request = same_origin_post(&unknown);
+        assert_eq!(post_status(&unknown, &mut request, &config), 404);
+
+        let missing_board = format!("/subscription/NO-SUCH-BOARD/{}/pause", fixture.active);
+        let mut request = same_origin_post(&missing_board);
+        assert_eq!(post_status(&missing_board, &mut request, &config), 404);
+
+        let missing_row = format!("/subscription/{}/sub-not-here/pause", fixture.board);
+        let mut request = same_origin_post(&missing_row);
+        assert_eq!(post_status(&missing_row, &mut request, &config), 409);
+
+        let banner =
+            render(&format!("/subscriptions?changed={}", fixture.active)).expect("render banner");
+        assert_html_contains(
+            &banner,
+            &format!("Recorded the change to <code>{}</code>", fixture.active),
+        );
+    }
+
+    #[test]
+    fn serve_subscriptions_fixture_parent_spawns_child_process() {
+        let data_dir = TempDataDir::new("subscriptions");
+        let output = spawn_fixture_child(
+            data_dir.path(),
+            SUBSCRIPTIONS_CHILD_TEST,
+            "KANBAN_SERVE_SUBSCRIPTIONS_CHILD",
+            SUBSCRIPTIONS_CHILD_MARKER,
+        );
+        if !output.status.success() {
+            panic!(
+                "child subscriptions fixture failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("test serve::tests::serve_subscriptions_fixture_child_process ... ok"),
+            "child did not execute the ignored subscriptions fixture\n{stdout}"
+        );
     }
 }
