@@ -177,16 +177,40 @@ pub struct SubscriptionPosition {
     pub dead_letter: i64,
 }
 
+/// One code a dead-lettered delivery was refused with, and how many of this
+/// subscription's dead letters carry it.
+///
+/// The code is the adapter's own classification, stored on the delivery row
+/// as `last_error_code`: `opencode_endpoint_unreachable` tells an operator to
+/// check a port, `kimi_frame_oversized` tells them to check a payload, and a
+/// count alone tells them to guess. Not `Copy` and deliberately owned — a
+/// code is text out of the ledger, and the alternative is a reader holding a
+/// borrow of the whole projection while it renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetterCode {
+    pub code: String,
+    pub deliveries: i64,
+}
+
 /// Every subscription's position on one board, against that board's head.
 ///
 /// The head travels with the positions because the two are only meaningful
 /// together: "acked through seq 8" says nothing until you know whether the
 /// board is at seq 8 or seq 800, and reading them apart invites a page that
 /// pairs one board's head with another board's acks.
+///
+/// The dead-letter codes travel with them for the same reason: `dead_letter`
+/// is how many refusals are waiting and the codes are what refused, and a
+/// reader that has one without the other either reports a count nobody can
+/// act on or an attribution that does not add up.
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionPositions {
     pub head_event_seq: i64,
     pub by_subscription: std::collections::BTreeMap<String, SubscriptionPosition>,
+    /// Only subscriptions with dead letters appear here, each with its codes
+    /// ordered by how many deliveries carry them and then by code, so equal
+    /// counts keep one order across reads.
+    pub dead_letters: std::collections::BTreeMap<String, Vec<DeadLetterCode>>,
 }
 
 impl SubscriptionPositions {
@@ -198,6 +222,14 @@ impl SubscriptionPositions {
             .get(subscription_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// The codes behind one subscription's dead letters, empty when it has
+    /// none — same contract as `position`: no absence to interpret.
+    pub fn dead_letter_codes(&self, subscription_id: &str) -> &[DeadLetterCode] {
+        self.dead_letters
+            .get(subscription_id)
+            .map_or(&[], Vec::as_slice)
     }
 }
 

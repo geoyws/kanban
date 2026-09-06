@@ -2326,8 +2326,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Every subscription's derived position on this board: one grouped query
-    /// over the delivery rows, plus one read of the event head.
+    /// Every subscription's derived position on this board — including which
+    /// codes its dead letters were refused with — from one grouped query over
+    /// the delivery rows, plus one read of the event head.
     ///
     /// Deliberately not per-subscription. The operator page renders a row per
     /// subscription across every registered board, so a position query taking
@@ -2338,6 +2339,16 @@ impl Store {
     /// `max(CASE WHEN status='acked' ...)` is the whole cursor: the ledger
     /// already owns "what have I seen" as `seq`, and there is no cursor column
     /// to read or to keep in step (`docs/ui-pubsub-consumption-seams.md`).
+    ///
+    /// The extra `GROUP BY` term is what makes the codes trustworthy rather
+    /// than merely present. Grouping by subscription *and* dead-letter code
+    /// splits each subscription into one row per code plus a null-code row
+    /// carrying everything that is not dead-lettered, and the counts are
+    /// summed back per subscription here. A second statement would have been
+    /// simpler to read and wrong: the dispatcher can dead-letter a delivery
+    /// between two statements, and the page would then print an attribution
+    /// whose parts do not add up to the total it printed beside them. One
+    /// statement is one snapshot.
     pub fn subscription_positions(&self) -> Result<SubscriptionPositions> {
         self.authz.check_read(&[])?;
         let head_event_seq =
@@ -2347,17 +2358,23 @@ impl Store {
                 })?;
         let mut statement = self.connection.prepare(
             "SELECT subscription_id,\
+                    CASE WHEN status='dead_letter' THEN last_error_code END AS dead_letter_code,\
                     max(CASE WHEN status='acked' THEN event_seq END) AS acked_through_seq,\
                     sum(status='pending') AS pending,\
                     sum(status='leased') AS leased,\
                     sum(status='retry_wait') AS retry_wait,\
                     sum(status='dead_letter') AS dead_letter \
-             FROM subscription_deliveries GROUP BY subscription_id",
+             FROM subscription_deliveries GROUP BY subscription_id,dead_letter_code",
         )?;
-        let mut by_subscription = BTreeMap::new();
+        let mut by_subscription: BTreeMap<String, SubscriptionPosition> = BTreeMap::new();
+        let mut dead_letters: BTreeMap<String, Vec<DeadLetterCode>> = BTreeMap::new();
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>("subscription_id")?,
+                // A dead-lettered delivery cannot have a null code — the
+                // table's own CHECK says so — so a null here is a row that is
+                // not dead-lettered, never an unattributed refusal.
+                row.get::<_, Option<String>>("dead_letter_code")?,
                 SubscriptionPosition {
                     acked_through_seq: row.get("acked_through_seq")?,
                     pending: row.get("pending")?,
@@ -2368,12 +2385,37 @@ impl Store {
             ))
         })?;
         for row in rows {
-            let (subscription_id, position) = row?;
-            by_subscription.insert(subscription_id, position);
+            let (subscription_id, dead_letter_code, group) = row?;
+            if let Some(code) = dead_letter_code {
+                dead_letters
+                    .entry(subscription_id.clone())
+                    .or_default()
+                    .push(DeadLetterCode {
+                        code,
+                        deliveries: group.dead_letter,
+                    });
+            }
+            let position = by_subscription.entry(subscription_id).or_default();
+            // `None` sorts below every `Some`, so this is the highest acked
+            // seq across the groups and not an accident of row order.
+            position.acked_through_seq = position.acked_through_seq.max(group.acked_through_seq);
+            position.pending += group.pending;
+            position.leased += group.leased;
+            position.retry_wait += group.retry_wait;
+            position.dead_letter += group.dead_letter;
+        }
+        for codes in dead_letters.values_mut() {
+            codes.sort_by(|left, right| {
+                right
+                    .deliveries
+                    .cmp(&left.deliveries)
+                    .then_with(|| left.code.cmp(&right.code))
+            });
         }
         Ok(SubscriptionPositions {
             head_event_seq,
             by_subscription,
+            dead_letters,
         })
     }
 
@@ -8283,6 +8325,125 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("WHERE subscription_id"), "{body}");
+    }
+
+    #[test]
+    fn dead_letters_are_attributed_to_their_codes_and_retries_are_not() {
+        let mut store = subscription_store("subscriptions-dead-letter-codes");
+        let mut dead_input = delivery_subscription_input("sub-codes-dead");
+        dead_input.max_retries = 0;
+        let dead = store.add_subscription(dead_input).unwrap().id;
+        let mut retry_input = delivery_subscription_input("sub-codes-retry");
+        retry_input.max_retries = 3;
+        let retry = store.add_subscription(retry_input).unwrap().id;
+        for created_at in [20, 30, 40] {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some("t-subject"),
+                "checkpoint_added",
+                "test",
+                "{}",
+                created_at,
+            )
+            .unwrap();
+        }
+        store.materialize_subscriptions().unwrap();
+
+        // Two refusals of one kind and one of another, so the projection has
+        // to both group them and rank them.
+        let events = delivery_event_ids(&store, &dead);
+        for (event, code) in events.iter().zip([
+            "opencode_endpoint_unreachable",
+            "kimi_frame_oversized",
+            "opencode_endpoint_unreachable",
+        ]) {
+            let due_at = delivery_row(&store, &dead, event).next_attempt_at.unwrap();
+            let claimed = store
+                .claim_subscription_delivery(&dead, event, due_at, 5_000)
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .finalize_subscription_delivery_failure(
+                        &dead,
+                        event,
+                        &claimed.lease_token,
+                        due_at + 1,
+                        false,
+                        code,
+                    )
+                    .unwrap()
+            );
+        }
+        // A retry carries a `last_error_code` too, and it is not a dead
+        // letter: attributing it would report a delivery that is still
+        // going to happen as one that has stopped.
+        let retry_event = &delivery_event_ids(&store, &retry)[0];
+        let due_at = delivery_row(&store, &retry, retry_event)
+            .next_attempt_at
+            .unwrap();
+        let claimed = store
+            .claim_subscription_delivery(&retry, retry_event, due_at, 5_000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .finalize_subscription_delivery_failure(
+                    &retry,
+                    retry_event,
+                    &claimed.lease_token,
+                    due_at + 1,
+                    true,
+                    "opencode_deadline_exceeded",
+                )
+                .unwrap()
+        );
+
+        let positions = store.subscription_positions().unwrap();
+        assert_eq!(
+            positions.position(&dead),
+            SubscriptionPosition {
+                acked_through_seq: None,
+                pending: 0,
+                leased: 0,
+                retry_wait: 0,
+                dead_letter: 3,
+            }
+        );
+        // Ranked by how many deliveries carry each code, and the counts add
+        // up to the total beside them.
+        assert_eq!(
+            positions.dead_letter_codes(&dead),
+            [
+                DeadLetterCode {
+                    code: "opencode_endpoint_unreachable".to_owned(),
+                    deliveries: 2,
+                },
+                DeadLetterCode {
+                    code: "kimi_frame_oversized".to_owned(),
+                    deliveries: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            positions
+                .dead_letter_codes(&dead)
+                .iter()
+                .map(|code| code.deliveries)
+                .sum::<i64>(),
+            positions.position(&dead).dead_letter
+        );
+        assert_eq!(positions.position(&retry).retry_wait, 1);
+        assert_eq!(positions.position(&retry).dead_letter, 0);
+        assert!(
+            positions.dead_letter_codes(&retry).is_empty(),
+            "a retrying delivery is not a dead letter: {:?}",
+            positions.dead_letters
+        );
+        assert!(
+            positions.dead_letter_codes("sub-not-here").is_empty(),
+            "an unknown subscription has no codes, not a missing answer"
+        );
     }
 
     #[test]

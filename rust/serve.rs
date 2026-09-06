@@ -33,8 +33,8 @@
 //! does not relax it.
 
 use crate::model::{
-    Attention, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep,
-    Subscription, SubscriptionPosition, Task,
+    Attention, DeadLetterCode, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions,
+    Sitrep, Subscription, SubscriptionPosition, Task,
 };
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
@@ -1706,12 +1706,17 @@ fn plans(opened: Option<&str>) -> Result<String> {
     Ok(page("Plans", &html))
 }
 
-/// One rendered subscription: the row, the board it belongs to, and the
-/// position derived for it against that board's head.
+/// One rendered subscription: the row, the board it belongs to, the position
+/// derived for it against that board's head, and what its dead letters were
+/// refused with.
 struct SubscriptionView {
     board: String,
     subscription: Subscription,
     position: SubscriptionPosition,
+    /// Empty unless this subscription has dead letters, which is most of the
+    /// time: the codes exist to be loud when a delivery has stopped, not to
+    /// occupy the row when nothing has.
+    dead_letter_codes: Vec<DeadLetterCode>,
     head_event_seq: i64,
 }
 
@@ -1746,6 +1751,10 @@ fn subscriptions(show: Option<&str>, changed: Option<&str>) -> Result<String> {
             views.push(SubscriptionView {
                 board: project.name.clone(),
                 position: positions.position(&subscription.id),
+                // Copied out of the projection rather than borrowed from it:
+                // an empty slice copies without allocating, so a board with
+                // nothing dead-lettered pays nothing for this.
+                dead_letter_codes: positions.dead_letter_codes(&subscription.id).to_vec(),
                 head_event_seq: positions.head_event_seq,
                 subscription,
             });
@@ -1830,6 +1839,22 @@ fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Optio
     html
 }
 
+/// How many codes a dead-letter line names before it summarises the rest.
+///
+/// The set is not bounded by anything this page controls. One subscription's
+/// deliveries can carry its adapter's five or six classifications plus any of
+/// the `adapter_*` classes the delivery process itself fails with, so twenty
+/// distinct codes on one row is reachable, and naming all of them lets ledger
+/// cardinality decide how tall a table row is.
+///
+/// Three is where the summary starts paying for itself. Measured at 1180px, a
+/// count and a thirty-character code fill about one wrapped line of the
+/// position column, so three names plus the tail is four lines of the page's
+/// loudest treatment — barely shorter than listing five, and still four for
+/// twenty. What is left over stays counted rather than dropped, so this caps
+/// names and never arithmetic.
+const DEAD_LETTER_CODES_NAMED: usize = 3;
+
 /// What is actually waiting, rendered only when something is.
 ///
 /// These three counts are aspects of position rather than peer facts, and at
@@ -1838,7 +1863,7 @@ fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Optio
 /// A dead-lettered delivery is the one thing on this page that needs a person,
 /// so it is the one thing that gets loud, in the same treatment open attention
 /// gets on Boards.
-fn queued_state(position: SubscriptionPosition) -> String {
+fn queued_state(position: SubscriptionPosition, dead_letter_codes: &[DeadLetterCode]) -> String {
     let mut parts = Vec::new();
     if position.pending > 0 {
         parts.push(format!("{} pending", position.pending));
@@ -1851,14 +1876,75 @@ fn queued_state(position: SubscriptionPosition) -> String {
     }
     if position.dead_letter > 0 {
         parts.push(format!(
-            "<span class=dead>{} dead-lettered</span>",
-            position.dead_letter
+            "<span class=dead>{} dead-lettered{}</span>",
+            position.dead_letter,
+            dead_letter_attribution(position.dead_letter, dead_letter_codes),
         ));
     }
     if parts.is_empty() {
         return String::new();
     }
     format!("<div class=queued>{}</div>", parts.join(" · "))
+}
+
+/// Which refusal the dead letters are, in the same sentence as how many.
+///
+/// `3 dead-lettered` says which subscription stopped; it does not say whether
+/// to check a port or a payload. The code the adapter classified the failure
+/// as is exactly that difference, so it rides along: one code becomes
+/// `, all opencode_endpoint_unreachable` and an operator goes and looks at a
+/// port.
+///
+/// Mixed codes stay apart — `: 3 opencode_endpoint_unreachable,
+/// 1 kimi_frame_oversized` — and are never collapsed into the count or
+/// represented by whichever code came first. Two adapters refusing for two
+/// reasons is two pieces of work, and "all" said about a mixed set is a false
+/// sentence that reads as a diagnosis.
+///
+/// Beyond `DEAD_LETTER_CODES_NAMED` the tail is summarised rather than
+/// listed, and it is summarised with its own numbers — how many codes and how
+/// many deliveries — so the named counts plus the tail still add up to the
+/// total beside them and the named codes cannot read as the whole story. It
+/// carries those numbers instead of pointing at a fuller view because there
+/// is no fuller view to point at: `kanban subscription show` prints the
+/// subscription row, and nothing in the CLI or on this page lists deliveries
+/// one by one.
+///
+/// No `<code>` markup around the code. The queued line is plain prose in the
+/// row (`2 pending`, `3 retrying`), and a monospace chip inside the one bold
+/// orange line on the page is decoration competing with the alarm.
+fn dead_letter_attribution(dead_letter: i64, codes: &[DeadLetterCode]) -> String {
+    match codes {
+        // A count with no code behind it is a state the table's CHECK forbids,
+        // not an adapter that failed anonymously. Say nothing rather than
+        // invent an attribution; the count is still true.
+        [] => String::new(),
+        [only] if only.deliveries == dead_letter => format!(", all {}", escape(&only.code)),
+        _ => {
+            let named = codes.len().min(DEAD_LETTER_CODES_NAMED);
+            let mut attribution = String::from(": ");
+            for (index, code) in codes[..named].iter().enumerate() {
+                if index > 0 {
+                    attribution.push_str(", ");
+                }
+                attribution.push_str(&format!("{} {}", code.deliveries, escape(&code.code)));
+            }
+            let rest = codes.len() - named;
+            if rest > 0 {
+                let deliveries = dead_letter
+                    - codes[..named]
+                        .iter()
+                        .map(|code| code.deliveries)
+                        .sum::<i64>();
+                attribution.push_str(&format!(
+                    ", and {rest} more code{} across {deliveries} deliver{}",
+                    if rest == 1 { "" } else { "s" },
+                    if deliveries == 1 { "y" } else { "ies" },
+                ));
+            }
+            attribution
+        }
+    }
 }
 
 fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
@@ -1927,7 +2013,7 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
                 format!(" · {} in flight", position.leased)
             },
         ),
-        queued = queued_state(position),
+        queued = queued_state(position, &view.dead_letter_codes),
         limits = escape(&format!(
             "{} ms timeout · {} retries · {}/min · {} at a time",
             subscription.timeout_ms,
@@ -3565,7 +3651,31 @@ mod tests {
             board: board.to_owned(),
             subscription,
             position,
+            dead_letter_codes: Vec::new(),
             head_event_seq,
+        }
+    }
+
+    /// A caught-up subscription whose only queued state is dead letters
+    /// carrying the given codes, with the count derived from them so a
+    /// fixture cannot claim a total its own codes contradict.
+    fn dead_lettered_view(id: &str, codes: &[(&str, i64)]) -> SubscriptionView {
+        SubscriptionView {
+            board: "PX".to_owned(),
+            subscription: subscription_fixture(id),
+            position: SubscriptionPosition {
+                acked_through_seq: Some(12),
+                dead_letter: codes.iter().map(|(_, deliveries)| deliveries).sum(),
+                ..SubscriptionPosition::default()
+            },
+            dead_letter_codes: codes
+                .iter()
+                .map(|(code, deliveries)| DeadLetterCode {
+                    code: (*code).to_owned(),
+                    deliveries: *deliveries,
+                })
+                .collect(),
+            head_event_seq: 12,
         }
     }
 
@@ -3737,20 +3847,19 @@ mod tests {
         );
 
         let dead = subscriptions_body(
-            &[subscription_view(
-                "PX",
-                subscription_fixture("sub-dead"),
-                12,
-                SubscriptionPosition {
-                    acked_through_seq: Some(12),
-                    dead_letter: 3,
-                    ..SubscriptionPosition::default()
-                },
+            &[dead_lettered_view(
+                "sub-dead",
+                &[("opencode_endpoint_unreachable", 3)],
             )],
             false,
             None,
         );
-        assert_html_contains(&dead, "<span class=dead>3 dead-lettered</span>");
+        // The count says a person is needed; the code says whether to go and
+        // look at a port or at a payload.
+        assert_html_contains(
+            &dead,
+            "<span class=dead>3 dead-lettered, all opencode_endpoint_unreachable</span>",
+        );
         assert!(
             !dead.contains("pending") && !dead.contains("retrying"),
             "an empty count must be silent, not a zero: {dead}"
@@ -3790,6 +3899,111 @@ mod tests {
         assert!(
             CSS.contains("td.waiting{color:#f0883e;font-weight:700}"),
             "the dead treatment reuses the operator-attention colour already in this UI: {CSS}"
+        );
+    }
+
+    #[test]
+    fn mixed_dead_letter_codes_stay_apart_and_a_summarised_tail_still_adds_up() {
+        // Two adapters refusing for two reasons is two pieces of work. A
+        // single count, or one code standing in for the set, sends an
+        // operator to check one thing and leaves the other one broken.
+        let mixed = subscriptions_body(
+            &[dead_lettered_view(
+                "sub-mixed",
+                &[
+                    ("opencode_endpoint_unreachable", 3),
+                    ("kimi_frame_oversized", 1),
+                ],
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(
+            &mixed,
+            "<span class=dead>4 dead-lettered: 3 opencode_endpoint_unreachable, \
+             1 kimi_frame_oversized</span>",
+        );
+        assert!(
+            !mixed.contains(", all "),
+            "\"all\" said about a mixed set is a false diagnosis: {mixed}"
+        );
+
+        // Past three codes the tail is summarised, and summarised with its
+        // own numbers: 4 + 3 + 2 named plus 1 in the tail is the 10 printed
+        // beside them, so the named codes cannot read as the whole story.
+        let tail = subscriptions_body(
+            &[dead_lettered_view(
+                "sub-tail",
+                &[
+                    ("cursor_worker_busy", 4),
+                    ("opencode_request_rejected", 3),
+                    ("kimi_peer_unanswered", 2),
+                    ("kimi_identity_mismatch", 1),
+                ],
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(
+            &tail,
+            "<span class=dead>10 dead-lettered: 4 cursor_worker_busy, \
+             3 opencode_request_rejected, 2 kimi_peer_unanswered, \
+             and 1 more code across 1 delivery</span>",
+        );
+        assert!(
+            !tail.contains("kimi_identity_mismatch"),
+            "the tail is summarised, not listed: {tail}"
+        );
+
+        let longer_tail = subscriptions_body(
+            &[dead_lettered_view(
+                "sub-longer-tail",
+                &[
+                    ("cursor_worker_unavailable", 5),
+                    ("opencode_deadline_exceeded", 4),
+                    ("opencode_response_invalid", 3),
+                    ("kimi_frame_malformed", 2),
+                    ("kimi_request_rejected", 1),
+                ],
+            )],
+            false,
+            None,
+        );
+        assert_html_contains(
+            &longer_tail,
+            "15 dead-lettered: 5 cursor_worker_unavailable, 4 opencode_deadline_exceeded, \
+             3 opencode_response_invalid, and 2 more codes across 3 deliveries</span>",
+        );
+
+        // A code is ledger text rendered on an operator page, so it is
+        // escaped like every other value: a delivery cannot smuggle markup
+        // into the one line on this page that is meant to be believed.
+        let hostile = subscriptions_body(
+            &[dead_lettered_view(
+                "sub-hostile",
+                &[("<script>steal()</script>", 2)],
+            )],
+            false,
+            None,
+        );
+        assert!(!hostile.contains("<script>"), "{hostile}");
+        assert_html_contains(
+            &hostile,
+            "2 dead-lettered, all &lt;script&gt;steal()&lt;/script&gt;",
+        );
+
+        // A dead letter with no code is a state the delivery table's CHECK
+        // forbids. If one ever appears, the page reports the count it has
+        // instead of inventing an attribution for it.
+        assert_eq!(
+            queued_state(
+                SubscriptionPosition {
+                    dead_letter: 2,
+                    ..SubscriptionPosition::default()
+                },
+                &[],
+            ),
+            "<div class=queued><span class=dead>2 dead-lettered</span></div>"
         );
     }
 
@@ -3926,44 +4140,52 @@ mod tests {
             .id
     }
 
-    fn first_delivery(store: &Store, subscription_id: &str) -> (String, i64, i64) {
+    /// One materialized delivery, addressed by its position in event order,
+    /// so a fixture can settle the second one differently from the first.
+    fn delivery_at(store: &Store, subscription_id: &str, index: i64) -> (String, i64, i64) {
         store
             .connection
             .query_row(
                 "SELECT event_id,event_seq,next_attempt_at FROM subscription_deliveries \
-                 WHERE subscription_id=? ORDER BY event_seq LIMIT 1",
-                [subscription_id],
+                 WHERE subscription_id=? ORDER BY event_seq LIMIT 1 OFFSET ?",
+                rusqlite::params![subscription_id, index],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("a materialized delivery")
     }
 
-    fn settle_first_delivery(store: &mut Store, subscription_id: &str, acknowledge: bool) -> i64 {
-        let (event_id, event_seq, due_at) = first_delivery(store, subscription_id);
+    /// Claim one delivery and settle it: acknowledged when no code is given,
+    /// terminally failed with that code when one is.
+    fn settle_delivery(
+        store: &mut Store,
+        subscription_id: &str,
+        index: i64,
+        failure_code: Option<&str>,
+    ) -> i64 {
+        let (event_id, event_seq, due_at) = delivery_at(store, subscription_id, index);
         let claimed = store
             .claim_subscription_delivery(subscription_id, &event_id, due_at, 5_000)
             .expect("claim the delivery")
             .expect("a due delivery");
-        let settled = if acknowledge {
-            store
+        let settled = match failure_code {
+            None => store
                 .finalize_subscription_delivery_success(
                     subscription_id,
                     &event_id,
                     &claimed.lease_token,
                     due_at + 1,
                 )
-                .expect("acknowledge the delivery")
-        } else {
-            store
+                .expect("acknowledge the delivery"),
+            Some(code) => store
                 .finalize_subscription_delivery_failure(
                     subscription_id,
                     &event_id,
                     &claimed.lease_token,
                     due_at + 1,
                     false,
-                    "consumer_refused",
+                    code,
                 )
-                .expect("fail the delivery")
+                .expect("fail the delivery"),
         };
         assert!(settled, "the delivery should have settled");
         event_seq
@@ -4024,9 +4246,12 @@ mod tests {
         store
             .materialize_subscriptions()
             .expect("materialize the queued deliveries");
-        let acked_seq = settle_first_delivery(&mut store, &active, true);
-        // Zero retries, so the first failure is terminal.
-        settle_first_delivery(&mut store, &dead, false);
+        let acked_seq = settle_delivery(&mut store, &active, 0, None);
+        // Zero retries, so each failure is terminal. Two of them, refused two
+        // different ways: the page has to keep them apart rather than report
+        // one adapter's problem as the whole story.
+        settle_delivery(&mut store, &dead, 0, Some("adapter_timeout"));
+        settle_delivery(&mut store, &dead, 1, Some("adapter_spawn"));
         store
             .pause_subscription(&paused, OPERATOR_ACTOR)
             .expect("pause the third subscription");
@@ -4116,9 +4341,15 @@ mod tests {
         );
         assert_html_contains(&listed, &format!("acked through seq {}", fixture.acked_seq));
         assert_html_contains(&listed, "nothing acked yet");
-        // One terminal failure on the zero-retry subscription, and it is the
-        // count the operator is meant to notice.
-        assert_html_contains(&listed, "<span class=dead>1 dead-lettered</span>");
+        // Two terminal failures on the zero-retry subscription, refused two
+        // different ways. The count is what the operator notices; the codes
+        // are what they act on, and they come out of the delivery rows in the
+        // same projection as the count rather than from a second read that
+        // could disagree with it.
+        assert_html_contains(
+            &listed,
+            "<span class=dead>2 dead-lettered: 1 adapter_spawn, 1 adapter_timeout</span>",
+        );
         assert_html_contains(&listed, "1 paused subscription is hidden.");
         assert!(
             listed.find(&fixture.active) < listed.find(&fixture.dead),

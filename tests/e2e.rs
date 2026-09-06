@@ -19595,6 +19595,209 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
     );
 }
 
+/// Dead-letter one delivery of `event_seq` with `code`, by walking the
+/// delivery table's own state machine: inserted pending, claimed into
+/// `leased`, then failed terminally.
+///
+/// Every step is guarded by a trigger — `must be inserted as pending`,
+/// `state transition is invalid`, `event_id must match events.event_hash` —
+/// so a fixture that fabricated a dead letter the dispatcher could never
+/// produce would be refused by the board instead of believed by the test.
+fn dead_letter_delivery(board_path: &Path, subscription_id: &str, event_seq: i64, code: &str) {
+    let connection = Connection::open(board_path).unwrap();
+    let (event_id, kind, created_at) = connection
+        .query_row(
+            "SELECT event_hash,kind,created_at FROM events WHERE seq=?",
+            params![event_seq],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO subscription_deliveries(subscription_id,event_id,event_seq,event_kind,event_created_at,status,attempts,next_attempt_at,created_at,updated_at) \
+             VALUES(?,?,?,?,?,'pending',0,?,?,?)",
+            params![
+                subscription_id,
+                event_id,
+                event_seq,
+                kind,
+                created_at,
+                created_at,
+                created_at,
+                created_at
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE subscription_deliveries \
+             SET status='leased',attempts=1,lease_token=?,lease_deadline_at=?,next_attempt_at=NULL,last_attempt_at=?,updated_at=? \
+             WHERE subscription_id=? AND event_id=?",
+            params![
+                format!("lease-{event_seq}"),
+                created_at + 5_000,
+                created_at,
+                created_at,
+                subscription_id,
+                event_id
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE subscription_deliveries \
+             SET status='dead_letter',lease_token=NULL,lease_deadline_at=NULL,last_error_code=?,dead_lettered_at=?,updated_at=? \
+             WHERE subscription_id=? AND event_id=?",
+            params![
+                code,
+                created_at + 1,
+                created_at + 1,
+                subscription_id,
+                event_id
+            ],
+        )
+        .unwrap();
+}
+
+/// A dead letter has to say what refused it, in the browser an operator
+/// actually reads it in.
+///
+/// `3 dead-lettered` names the subscription that stopped and nothing about
+/// why, so an operator reads a payload when the answer is a closed port. The
+/// codes the adapters classified their failures as are the difference, and two
+/// codes on one subscription must stay two codes: collapsing them, or letting
+/// the first stand for the set, sends a person to fix one thing and leaves the
+/// other broken.
+#[test]
+fn subscription_dead_letters_name_their_codes_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-dead-letters");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SERVE-DEADLETTER", "--json"],
+    );
+    let subscription_args = |id: &'static str| -> Vec<&'static str> {
+        vec![
+            "subscription",
+            "add",
+            "--id",
+            id,
+            "--kind",
+            "task_added",
+            "--consumer",
+            "opencode",
+            "--action",
+            "deliver-turn",
+            "--timeout-ms",
+            "30000",
+            "--max-retries",
+            "0",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "geoyws",
+            "--json",
+        ]
+    };
+    let refusing = fixture.ok_json(&fixture.main, &subscription_args("sub-browser-refused"));
+    let quiet = fixture.ok_json(&fixture.main, &subscription_args("sub-browser-quiet"));
+    assert_eq!(refusing["id"], "sub-browser-refused");
+    assert_eq!(quiet["id"], "sub-browser-quiet");
+    // Three events after both anchors, so three deliveries can exist at all:
+    // the delivery/event binding trigger refuses any event at or before a
+    // subscription's own start seq.
+    for suffix in ["one", "two", "three"] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("Watched task {suffix}"),
+                "--type",
+                "epic",
+                "--status",
+                "todo",
+                "--as",
+                "geoyws",
+                "--json",
+            ],
+        );
+    }
+    let board_path = board_path_for_project(&fixture, &fixture.main, "SERVE-DEADLETTER");
+    let watched: Vec<i64> = {
+        let connection = Connection::open(&board_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT seq FROM events WHERE kind='task_added' \
+                 AND seq > (SELECT start_event_seq FROM subscriptions WHERE id='sub-browser-refused') \
+                 ORDER BY seq",
+            )
+            .unwrap();
+        let seqs = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        seqs
+    };
+    assert_eq!(watched.len(), 3, "three watched events: {watched:?}");
+    // Two refusals of one kind and one of another, on the same subscription.
+    for (event_seq, code) in watched.iter().zip([
+        "opencode_endpoint_unreachable",
+        "opencode_request_rejected",
+        "opencode_endpoint_unreachable",
+    ]) {
+        dead_letter_delivery(&board_path, "sub-browser-refused", *event_seq, code);
+    }
+
+    let server = spawn_server(&fixture);
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("initial tab");
+    tab.navigate_to(&format!("{origin}/subscriptions"))
+        .expect("load Subscriptions");
+    tab.wait_until_navigated().expect("initial navigation");
+
+    let dead = tab
+        .wait_for_element("span.dead")
+        .expect("the dead-letter line");
+    assert_eq!(
+        dead.get_inner_text().expect("dead-letter text"),
+        "3 dead-lettered: 2 opencode_endpoint_unreachable, 1 opencode_request_rejected",
+        "the rendered line must name both codes with their counts"
+    );
+    // Loud exactly once. The second subscription has nothing waiting, so its
+    // row carries no queued line at all — silent at rest is the reason these
+    // counts are a sentence instead of three columns.
+    let loud = tab
+        .find_elements("span.dead")
+        .map(|rows| rows.len())
+        .unwrap_or_default();
+    assert_eq!(loud, 1, "only the refused subscription may be loud");
+    let queued = tab
+        .find_elements(".queued")
+        .map(|rows| rows.len())
+        .unwrap_or_default();
+    assert_eq!(
+        queued, 1,
+        "a subscription with nothing waiting says nothing"
+    );
+    let content = tab.get_content().expect("page content");
+    assert!(
+        content.contains("sub-browser-quiet") && content.contains("sub-browser-refused"),
+        "both subscriptions should be listed: {content}"
+    );
+}
+
 /// What the page itself says about its socket. `[data-live]` is written from
 /// `socket.onopen` and `socket.onclose`, so this is the browser reporting its
 /// own connection rather than the test guessing at one.
