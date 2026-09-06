@@ -6145,6 +6145,14 @@ impl SealedEstate {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    /// `chmod` on ONE file, which is what an operator sealing a board types.
+    /// Deliberately not [`SealedEstate::seal`]: the sidecars stay writable, so
+    /// the mode of the file under test is the only thing that can decide
+    /// whether a second write lands.
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     fn unseal(&self) {
         for path in self.sealable() {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -6393,6 +6401,215 @@ fn a_write_against_an_unwritable_board_refuses_and_writes_nothing() {
             .any(|task| task["id"] == "t-nope"),
         "a refused write stored its row anyway: {listed}"
     );
+}
+
+/// A seal survives the write it refused, so the RETRY is refused too.
+///
+/// The retry is the property. The refusal above was already correct before
+/// this fix and is not what was broken: `db::open` asserted mode 0600 on every
+/// writable open — "re-assert for databases created before this rule, or by
+/// another tool" — so the same command that correctly refused to write a board
+/// sealed at 0400 returned that board to 0600 on its way out, and the next
+/// attempt landed. Measured against the tree before this fix: attempt one
+/// exited 1 with `attempt to write a readonly database`, the board came back
+/// `-rw-------`, and attempt two exited 0 and stored its row. A seal that
+/// holds for exactly one attempt is a delay, not a seal, and an operator who
+/// sealed a board would have read the refusal as proof that it held.
+///
+/// So both halves are asserted after each attempt: the mode the operator set,
+/// and a second refusal that could only happen if that mode were still there.
+#[test]
+fn a_refused_write_leaves_a_sealed_board_sealed_and_refuses_the_retry() {
+    let estate = SealedEstate::new("seal-survives-board");
+    let fixture = &estate.fixture;
+    if !mode_0400_denies_writes(&fixture.root) {
+        // Root writes through the mode bits, so there is no refusal to retry
+        // and nothing here would be evidence either way.
+        eprintln!(
+            "skipped: this process writes through mode 0400, so a sealed board is not sealed for it"
+        );
+        return;
+    }
+    // A reader held open for the length of the test, so the board's WAL
+    // sidecars exist and stay writable while the CLI runs. That is what a live
+    // board looks like, and it is what makes the retry below depend on the
+    // board file's mode and nothing else: SQLite creates `-wal` and `-shm`
+    // with the MAIN file's mode, so when the refused attempt is itself the
+    // thing that creates them, the retry meets a 0400 `-shm` and refuses on
+    // that — a board file quietly returned to 0600 would still look sealed.
+    // Measured against the unconditional re-assert: without this connection
+    // the retry refuses on the `-shm` and this test passes the defect.
+    let live_reader = Connection::open(&estate.board).unwrap();
+    live_reader
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+
+    // The BOARD only. Sealing the whole estate seals the registry too, and the
+    // registry is opened first, so its refusal would arrive before `db::open`
+    // ever reached the board — measured: with the whole estate sealed, this
+    // test also passes the defect it exists to catch.
+    SealedEstate::set_mode(&estate.board, 0o400);
+
+    let attempt = |id: &str| -> Output {
+        fixture.run(
+            &fixture.main,
+            &["task", "add", "must not land", "--id", id, "--json"],
+        )
+    };
+
+    let first = attempt("t-sealed-1");
+    let first_message = refusal_object(&first);
+    assert!(
+        first_message.contains("readonly database") || first_message.contains("read-only"),
+        "the first write did not refuse on the permission: {first_message}"
+    );
+    let mode_after_first = SealedEstate::mode(&estate.board);
+
+    // Asserted before the modes, because this is the property and it fails
+    // more legibly: `refusal_object` reports a second write that LANDED as the
+    // exit and the row it created, where a mode assertion reports a number.
+    let second = attempt("t-sealed-2");
+    let second_message = refusal_object(&second);
+    assert!(
+        second_message.contains("readonly database") || second_message.contains("read-only"),
+        "the retry refused for some reason other than the permission: {second_message}"
+    );
+
+    assert_eq!(
+        mode_after_first, 0o400,
+        "a refused write re-permissioned the board it had just failed to write"
+    );
+    assert_eq!(
+        SealedEstate::mode(&estate.board),
+        0o400,
+        "the second refused write re-permissioned the board"
+    );
+
+    drop(live_reader);
+    estate.unseal();
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    for id in ["t-sealed-1", "t-sealed-2"] {
+        assert!(
+            !listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["id"] == id),
+            "a refused write stored {id} anyway: {listed}"
+        );
+    }
+}
+
+/// The same rule for the registry, opened through the same `db::open`.
+///
+/// `rule add` writes the registry and nothing else, and only the registry file
+/// is sealed here: the board stays writable, so the refusal is the registry's
+/// and so is any `chmod` that shows up on it.
+#[test]
+fn a_refused_registry_write_leaves_the_registry_sealed_and_refuses_the_retry() {
+    let estate = SealedEstate::new("seal-survives-registry");
+    let fixture = &estate.fixture;
+    if !mode_0400_denies_writes(&fixture.root) {
+        eprintln!(
+            "skipped: this process writes through mode 0400, so a sealed registry is not sealed \
+             for it"
+        );
+        return;
+    }
+    let rules = |fixture: &Fixture| -> usize {
+        fixture
+            .ok_json(&fixture.main, &["rule", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let before = rules(fixture);
+    SealedEstate::set_mode(&estate.registry, 0o400);
+
+    let attempt = |body: &str| -> Output {
+        fixture.run(
+            &fixture.main,
+            &["rule", "add", body, "--as", "geoyws", "--json"],
+        )
+    };
+
+    let first = attempt("Must not land in a sealed registry.");
+    let first_message = refusal_object(&first);
+    assert!(
+        first_message.contains("readonly database") || first_message.contains("read-only"),
+        "the first registry write did not refuse on the permission: {first_message}"
+    );
+    let mode_after_first = SealedEstate::mode(&estate.registry);
+
+    let second = attempt("Must not land on the retry either.");
+    let second_message = refusal_object(&second);
+    assert!(
+        second_message.contains("readonly database") || second_message.contains("read-only"),
+        "the registry retry refused for some reason other than the permission: {second_message}"
+    );
+
+    assert_eq!(
+        mode_after_first, 0o400,
+        "a refused registry write re-permissioned the registry it had just failed to write"
+    );
+    assert_eq!(
+        SealedEstate::mode(&estate.registry),
+        0o400,
+        "the second refused registry write re-permissioned the registry"
+    );
+
+    SealedEstate::set_mode(&estate.registry, 0o600);
+    assert_eq!(
+        rules(fixture),
+        before,
+        "a refused registry write stored its rule anyway"
+    );
+}
+
+/// A board reachable by anyone else is still narrowed to 0600 on a writable
+/// open. The other half of the same rule, and the reason it is tighten-only
+/// rather than deleted.
+///
+/// 0644 is what `Connection::open` produced before Kanban created its files
+/// itself, and 0640 is what a group-sharing umask produces, so both are boards
+/// that exist on disk rather than invented modes. The write has to succeed
+/// too: a `chmod` observed after a refusal would prove the opposite of what
+/// this test is for.
+///
+/// No `mode_0400_denies_writes` skip here, unlike the two seal tests: nothing
+/// is being denied, and `chmod` is a write root performs too, so this holds
+/// whatever the caller's uid.
+#[test]
+fn a_writable_open_narrows_a_group_reachable_board_to_0600() {
+    let estate = SealedEstate::new("tighten-loose-board");
+    let fixture = &estate.fixture;
+
+    for (index, loose) in [0o644u32, 0o640].into_iter().enumerate() {
+        SealedEstate::set_mode(&estate.board, loose);
+        assert_eq!(
+            SealedEstate::mode(&estate.board),
+            loose,
+            "the fixture could not put the board at 0{loose:o}"
+        );
+        let id = format!("t-loose-{index}");
+        let added = fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                "lands on a loose board",
+                "--id",
+                &id,
+                "--json",
+            ],
+        );
+        assert_eq!(added["id"], id, "the write did not land: {added}");
+        assert_eq!(
+            SealedEstate::mode(&estate.board),
+            0o600,
+            "a writable open left the board at 0{loose:o}, reachable by more than its owner"
+        );
+    }
 }
 
 /// The sweep still runs on a writable open, and never on a read.

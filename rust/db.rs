@@ -1744,12 +1744,52 @@ pub fn create_private_dir_all(dir: &Path) -> Result<()> {
     }
 }
 
-/// Create `dir` if missing and assert mode 0700 on it. Only for the private
+/// Clear every permission bit on `path` outside `mode`, and never set one.
+///
+/// One-directional on purpose, and the direction is the whole point.
+///
+/// A board or data root reachable by group or other is the defect the rule
+/// was written for — a file created before the rule existed, or by another
+/// tool, or through a loose umask — and clearing those bits cannot hand
+/// anyone access they did not already have. So that half is asserted on
+/// every open, not only at creation.
+///
+/// A path the operator made MORE restrictive than `mode` is left exactly as
+/// it is. Asserting the mode unconditionally handed the missing bits back:
+/// `task add` against a board sealed at 0400 refused with `attempt to write
+/// a readonly database` and returned the file to 0600 on the way past, so
+/// the retry landed and the seal was a one-attempt delay rather than a seal.
+/// A seal the operator set has to survive a refused write, which is the only
+/// thing that makes it worth setting.
+///
+/// Only the nine permission bits are considered. The sticky bit restricts
+/// deletion rather than granting anything, and setuid/setgid are the
+/// operator's business on a path Kanban did not create, so they are carried
+/// across untouched — clearing them is the one loosening this could perform.
+fn tighten_to(path: &Path, mode: u32) -> Result<()> {
+    let current = fs::metadata(path)
+        .with_context(|| format!("read the mode of {}", path.display()))?
+        .permissions()
+        .mode();
+    let excess = current & 0o777 & !mode;
+    if excess == 0 {
+        return Ok(());
+    }
+    let tightened = current & 0o7777 & !excess;
+    fs::set_permissions(path, Permissions::from_mode(tightened))
+        .with_context(|| format!("tighten {} to mode {tightened:04o}", path.display()))
+}
+
+/// Create `dir` if missing and tighten it to mode 0700. Only for the private
 /// data root, which Kanban owns outright; never for an operator-supplied path.
+///
+/// Tighten-only through [`tighten_to`], because this is an open path and not
+/// a creation one: every writable registry open and every lock acquisition
+/// runs it, so an unconditional assert would re-permission a data root the
+/// operator narrowed on purpose.
 pub fn own_private_dir(dir: &Path) -> Result<()> {
     create_private_dir_all(dir)?;
-    fs::set_permissions(dir, Permissions::from_mode(0o700))
-        .with_context(|| format!("secure directory {}", dir.display()))
+    tighten_to(dir, 0o700).with_context(|| format!("secure directory {}", dir.display()))
 }
 
 /// Create `path` with mode 0600 before anything can open it.
@@ -1838,8 +1878,11 @@ fn open(path: &Path) -> Result<Connection> {
     create_private_file(path)?;
     let connection = Connection::open(path)
         .with_context(|| format!("open SQLite database {}", path.display()))?;
-    // Re-assert for databases created before this rule, or by another tool.
-    fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    // Tighten-only, and never on the way out of a refusal: a database left
+    // group- or world-reachable by an older Kanban or another tool is narrowed
+    // to 0600 here, and one the operator sealed tighter than 0600 stays sealed
+    // so the write below refuses again on the next attempt. See `tighten_to`.
+    tighten_to(path, 0o600)?;
     // synchronous=FULL, not NORMAL: a checkpoint that survives the agent but
     // not the host is not durable, and this ledger exists to be resumed from.
     // Write volume is a handful of rows per model turn, so the extra fsync is
