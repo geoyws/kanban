@@ -15,6 +15,7 @@ mod codex_app_server_messages;
 mod codex_app_server_state;
 mod codex_queue_adapter;
 mod context;
+mod cursor_worker_adapter;
 mod db;
 mod dispatch;
 mod dispatcher;
@@ -4388,6 +4389,21 @@ pub fn opencode_adapter_entrypoint() -> ! {
         Err(error) => {
             let _ = writeln!(io::stderr(), "Error: {error:#}");
             std::process::exit(opencode_adapter::exit_code(&error))
+        }
+    }
+}
+
+/// Entry point for the serialized Cursor worker adapter binary.
+pub fn cursor_worker_adapter_entrypoint() -> ! {
+    match cursor_worker_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // Like the OpenCode bridge, a closed stdout here means the
+        // acknowledgement never reached the dispatcher rather than the human
+        // CLI's harmless reader-left case, and the exit status carries the
+        // failure classification a blanket `1` would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(cursor_worker_adapter::exit_code(&error))
         }
     }
 }
