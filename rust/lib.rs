@@ -20,6 +20,7 @@ mod dispatch;
 mod dispatcher;
 mod gitctx;
 mod import;
+mod kimi_acp_adapter;
 mod lock;
 mod mcp;
 mod model;
@@ -4388,6 +4389,21 @@ pub fn opencode_adapter_entrypoint() -> ! {
         Err(error) => {
             let _ = writeln!(io::stderr(), "Error: {error:#}");
             std::process::exit(opencode_adapter::exit_code(&error))
+        }
+    }
+}
+
+/// Entry point for the Kimi ACP adapter binary.
+pub fn kimi_acp_adapter_entrypoint() -> ! {
+    match kimi_acp_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // This adapter exchanges one framed delivery with an ACP peer, so a
+        // closed stdout is not the human CLI's harmless reader-left case: the
+        // acknowledgement never reached the dispatcher. The exit status also
+        // carries the failure classification, which a blanket `1` would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(kimi_acp_adapter::exit_code(&error))
         }
     }
 }

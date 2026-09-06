@@ -41,6 +41,10 @@ path = "rust/bin/kanban-claude-print-adapter.rs"
 name = "kanban-opencode-adapter"
 path = "rust/bin/kanban-opencode-adapter.rs"
 
+[[bin]]
+name = "kanban-kimi-acp-adapter"
+path = "rust/bin/kanban-kimi-acp-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
