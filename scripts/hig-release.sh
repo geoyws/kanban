@@ -2,6 +2,10 @@
 
 set -Eeuo pipefail
 
+# Every executable the crate declares, in Cargo.toml order. This is the one
+# literal list in the release path: every other site that needs the set
+# (package contents, manifest and receipt name checks, the version probe, the
+# bin-link loops, and the embedded remote installer) derives it from here.
 BINARIES=(
   kanban
   kb
@@ -9,6 +13,10 @@ BINARIES=(
   kanban-codex-queue-adapter
   kanban-codex-app-server-adapter
   kanban-claude-print-adapter
+  kanban-opencode-adapter
+  kanban-kimi-acp-adapter
+  kanban-cursor-worker-adapter
+  kanban-zcode-notify-adapter
 )
 MAX_RELEASES=10
 HOSTNAME_BIN="${HOSTNAME_BIN:-/bin/hostname}"
@@ -65,17 +73,35 @@ sha256_of() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+# The release set as a JSON array, so the manifest and receipt name checks
+# compare against BINARIES rather than a second literal list that can drift.
+binaries_json() {
+  printf '%s\n' "${BINARIES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))'
+}
+
+# Membership in the release set, derived from BINARIES so a name the package
+# does not ship can never be probed as though it belonged to the release.
+release_binary_known() {
+  local candidate="$1"
+  local binary
+  for binary in "${BINARIES[@]}"; do
+    [[ "$binary" != "$candidate" ]] || return 0
+  done
+  return 1
+}
+
 file_version() {
   local binary="$1"
-  case "${binary##*/}" in
+  local name="${binary##*/}"
+  release_binary_known "$name" || die "unknown release binary $name"
+  # `kanban` and `kb` are the operator CLI, whose version is a subcommand; the
+  # dispatcher and every adapter answer the `--version` flag instead.
+  case "$name" in
     kanban | kb)
       "$binary" version
       ;;
-    kanban-dispatcher | kanban-codex-queue-adapter | kanban-codex-app-server-adapter | kanban-claude-print-adapter)
-      "$binary" --version
-      ;;
     *)
-      die "unknown release binary ${binary##*/}"
+      "$binary" --version
       ;;
   esac | tr -d '\r' | sed 's/[[:space:]]*$//'
 }
@@ -147,7 +173,7 @@ validate_release_files() {
     exit 1
   }
 
-  jq -e --arg target "$target" '
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
     (.targets | type == "array") and
     (.targets | length == 2) and
@@ -157,15 +183,8 @@ validate_release_files() {
     (.sourceTreeClean == true) and
     ((.sourceCommit | type) == "string") and
     ((.sourceCommit | length) == 40) and
-    ((.files | length) == 6) and
-    ([.files[].name] == [
-      "kanban",
-      "kb",
-      "kanban-dispatcher",
-      "kanban-codex-queue-adapter",
-      "kanban-codex-app-server-adapter",
-      "kanban-claude-print-adapter"
-    ])
+    ((.files | length) == ($expected_files | length)) and
+    ([.files[].name] == $expected_files)
   ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
 
   while IFS=$'\t' read -r name sha256 size version; do
@@ -200,7 +219,7 @@ validate_receipt() {
   manifest_commit="$(jq -r '.sourceCommit' "$(manifest_path "$package_dir")")"
   [[ -f "$receipt" ]] || die "package receipt is missing: $receipt"
   ensure_regular_dir "$(dirname "$receipt")"
-  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" '
+  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
     (.host == "hax") and
     (.targets | type == "array") and
@@ -212,15 +231,8 @@ validate_receipt() {
     ((.sourceCommit | type) == "string") and
     ((.sourceCommit | length) == 40) and
     (.manifestSha256 == $manifest_sha) and
-    ((.files | length) == 6) and
-    ([.files[].name] == [
-      "kanban",
-      "kb",
-      "kanban-dispatcher",
-      "kanban-codex-queue-adapter",
-      "kanban-codex-app-server-adapter",
-      "kanban-claude-print-adapter"
-    ])
+    ((.files | length) == ($expected_files | length)) and
+    ([.files[].name] == $expected_files)
   ' "$receipt" >/dev/null || die "package receipt is incomplete or mismatched"
   [[ "$(jq -r '.sourceCommit' "$receipt")" == "$manifest_commit" ]] || {
     die "package receipt source commit mismatch"
@@ -535,7 +547,7 @@ package_validate() {
   manifest="$(manifest_path "$package_dir")"
   [[ -f "$manifest" ]] || die "package has no manifest.json"
 
-  jq -e --arg target "$target" '
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
     (.targets | type == "array") and
     (.targets | length == 2) and
@@ -545,15 +557,8 @@ package_validate() {
     (.sourceTreeClean == true) and
     ((.sourceCommit | type) == "string") and
     ((.sourceCommit | length) == 40) and
-    ((.files | length) == 6) and
-    ([.files[].name] == [
-      "kanban",
-      "kb",
-      "kanban-dispatcher",
-      "kanban-codex-queue-adapter",
-      "kanban-codex-app-server-adapter",
-      "kanban-claude-print-adapter"
-    ])
+    ((.files | length) == ($expected_files | length)) and
+    ([.files[].name] == $expected_files)
   ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
 
   while IFS=$'\t' read -r name sha256 size version; do
@@ -907,7 +912,7 @@ install_remote() {
   remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
   tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
   ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
-  HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" <<'REMOTE'
+  HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
 set -Eeuo pipefail
 
 stage_root="$1"
@@ -917,25 +922,51 @@ install_root="$4"
 target="$5"
 bin_dir="$6"
 keep="$7"
+shift 7
+# The release set arrives as the caller's BINARIES instead of a literal list
+# embedded here: a second copy of the set is exactly what drifted before, and
+# a remote installer that links fewer binaries than the package carries would
+# leave a validated release only partly reachable on the host.
+BINARIES=("$@")
 
 die() {
   printf 'hig-release: %s\n' "$*" >&2
   exit 1
 }
 
+(( ${#BINARIES[@]} > 0 )) || die "remote install received no release binary names"
+
+# Membership in the release set, derived from BINARIES so a name the package
+# does not ship can never be probed as though it belonged to the release.
+release_binary_known() {
+  local candidate="$1"
+  local binary
+  for binary in "${BINARIES[@]}"; do
+    [[ "$binary" != "$candidate" ]] || return 0
+  done
+  return 1
+}
+
 file_version() {
   local binary="$1"
-  case "${binary##*/}" in
+  local name="${binary##*/}"
+  release_binary_known "$name" || die "unknown release binary $name"
+  # `kanban` and `kb` are the operator CLI, whose version is a subcommand; the
+  # dispatcher and every adapter answer the `--version` flag instead.
+  case "$name" in
     kanban | kb)
       "$binary" version
       ;;
-    kanban-dispatcher | kanban-codex-queue-adapter | kanban-codex-app-server-adapter | kanban-claude-print-adapter)
+    *)
       "$binary" --version
       ;;
-    *)
-      die "unknown release binary ${binary##*/}"
-      ;;
   esac | tr -d '\r' | sed 's/[[:space:]]*$//'
+}
+
+# The release set as a JSON array, so the receipt name check compares against
+# BINARIES rather than a second literal list that can drift.
+binaries_json() {
+  printf '%s\n' "${BINARIES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))'
 }
 
 cleanup_remote() {
@@ -1035,7 +1066,7 @@ ensure_public_binary_links() {
   local current_path
   current_path="$install_root/current"
   mkdir -p "$bin_dir"
-  for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
+  for binary in "${BINARIES[@]}"; do
     local link_path target
     link_path="$bin_dir/$binary"
     target="$current_path/$binary"
@@ -1072,7 +1103,7 @@ rollback_activation_view() {
   fi
   if [[ -z "$previous_current" ]]; then
     local binary
-    for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
+    for binary in "${BINARIES[@]}"; do
       rm -f -- "$bin_dir/$binary"
     done
   fi
@@ -1153,7 +1184,7 @@ host="$("$hostname_bin" -s 2>/dev/null || "$hostname_bin")"
 manifest="$package_dir/manifest.json"
 [[ -f "$manifest" ]] || die "remote package has no manifest.json"
 
-  jq -e --arg target "$target" '
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
     (.targets | type == "array") and
     (.targets | length == 2) and
@@ -1166,15 +1197,8 @@ manifest="$package_dir/manifest.json"
   ((.sourceCommit | length) == 40) and
   ((.manifestSha256 | type) == "string") and
   ((.manifestSha256 | length) == 64) and
-  ((.files | length) == 6) and
-  ([.files[].name] == [
-    "kanban",
-    "kb",
-    "kanban-dispatcher",
-    "kanban-codex-queue-adapter",
-    "kanban-codex-app-server-adapter",
-    "kanban-claude-print-adapter"
-  ])
+  ((.files | length) == ($expected_files | length)) and
+  ([.files[].name] == $expected_files)
 ' "$receipt" >/dev/null || die "remote package receipt is incomplete or mismatched"
 
 while IFS=$'\t' read -r name sha256 size version; do
@@ -1186,7 +1210,7 @@ while IFS=$'\t' read -r name sha256 size version; do
 done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$receipt")
 
 release_id="$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
-ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter
+ensure_safe_release_view "$install_root" "$bin_dir" "$release_id" "${BINARIES[@]}"
 mkdir -p "$install_root/releases"
 release_path="$install_root/releases/$release_id"
 release_receipt="$install_root/releases/$release_id.receipt.json"
@@ -1198,7 +1222,7 @@ if [[ -L "$install_root/current" ]]; then
 fi
 if [[ ! -d "$release_path" ]]; then
   staging="$(mktemp -d "$install_root/releases/.${release_id}.XXXXXX")"
-  for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
+  for binary in "${BINARIES[@]}"; do
     install -m 0755 "$package_dir/$binary" "$staging/$binary"
   done
   cp "$package_dir/manifest.json" "$staging/manifest.json"
@@ -1253,7 +1277,7 @@ if (( activation_status != 0 )); then
     rm -f -- "$release_receipt"
   fi
   if [[ -z "$previous_current" ]]; then
-    for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
+    for binary in "${BINARIES[@]}"; do
       rm -f -- "$bin_dir/$binary"
     done
   fi

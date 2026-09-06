@@ -804,12 +804,14 @@ Reasoning: `docs/adr/ADR-016-*`.
 
 ## Short names
 
-The crate installs six executables: `kanban` and `kb` are two names for the
-same operator CLI, alongside `kanban-dispatcher`,
-`kanban-codex-queue-adapter`, `kanban-codex-app-server-adapter`, and
-`kanban-claude-print-adapter`. `kb` is a real binary rather than a shell alias
-because agents invoke it from non-interactive cages that never source a shell
-profile.
+The crate installs ten executables, and the HIG release package ships all ten:
+`kanban` and `kb` are two names for the same operator CLI, alongside
+`kanban-dispatcher`, `kanban-codex-queue-adapter`,
+`kanban-codex-app-server-adapter`, `kanban-claude-print-adapter`,
+`kanban-opencode-adapter`, `kanban-kimi-acp-adapter`,
+`kanban-cursor-worker-adapter`, and `kanban-zcode-notify-adapter`. `kb` is a
+real binary rather than a shell alias because agents invoke it from
+non-interactive cages that never source a shell profile.
 
 Commands and subcommands have short forms:
 

@@ -12061,17 +12061,68 @@ fn file_sha256(path: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Every executable the crate declares, in `Cargo.toml` order.
+///
+/// Read out of the manifest instead of typed out again: the release package
+/// has to carry exactly what `cargo build --release --locked --bins`
+/// produces, and a second hand-written list is precisely what let the package
+/// fall four binaries behind the crate.
+fn declared_bin_names() -> Vec<String> {
+    let manifest =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    let mut names = Vec::new();
+    let mut in_bin_section = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_bin_section = line == "[[bin]]";
+            continue;
+        }
+        if !in_bin_section {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("name") {
+            if let Some(value) = value.trim_start().strip_prefix('=') {
+                names.push(value.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    assert!(
+        !names.is_empty(),
+        "Cargo.toml declares no [[bin]] targets, so the parse is wrong"
+    );
+    names
+}
+
+/// The release set `scripts/hig-release.sh` enumerates: its single `BINARIES`
+/// array, which every other site in the script derives from.
+fn release_script_binaries() -> Vec<String> {
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh"))
+            .unwrap();
+    const HEADER: &str = "\nBINARIES=(\n";
+    assert_eq!(
+        script.matches(HEADER).count(),
+        1,
+        "scripts/hig-release.sh must hold exactly one literal BINARIES array; \
+         a second one is a second source of truth that can drift"
+    );
+    let start = script.find(HEADER).unwrap() + HEADER.len();
+    let end = script[start..]
+        .find("\n)\n")
+        .expect("BINARIES array unterminated")
+        + start;
+    script[start..end]
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 fn clone_release_package(source: &Path, target: &Path, source_commit: &str) {
     fs::create_dir_all(target).unwrap();
-    for name in [
-        "kanban",
-        "kb",
-        "kanban-dispatcher",
-        "kanban-codex-queue-adapter",
-        "kanban-codex-app-server-adapter",
-        "kanban-claude-print-adapter",
-    ] {
-        fs::copy(source.join(name), target.join(name)).unwrap();
+    for name in declared_bin_names() {
+        fs::copy(source.join(&name), target.join(&name)).unwrap();
     }
     let mut manifest: Value =
         serde_json::from_slice(&fs::read(source.join("manifest.json")).unwrap()).unwrap();
@@ -12194,15 +12245,8 @@ fn capture_release_links(install_root: &Path, bin_dir: &Path) -> BTreeMap<String
         "current".to_string(),
         fs::read_link(install_root.join("current")).unwrap(),
     );
-    for name in [
-        "kanban",
-        "kb",
-        "kanban-dispatcher",
-        "kanban-codex-queue-adapter",
-        "kanban-codex-app-server-adapter",
-        "kanban-claude-print-adapter",
-    ] {
-        links.insert(name.to_string(), fs::read_link(bin_dir.join(name)).unwrap());
+    for name in declared_bin_names() {
+        links.insert(name.clone(), fs::read_link(bin_dir.join(&name)).unwrap());
     }
     links
 }
@@ -12211,17 +12255,10 @@ fn assert_release_view(install_root: &Path, bin_dir: &Path, release_dir: &Path) 
     let current_link = install_root.join("current");
     assert!(current_link.is_symlink(), "current symlink missing");
     assert_eq!(fs::read_link(&current_link).unwrap(), release_dir);
-    for name in [
-        "kanban",
-        "kb",
-        "kanban-dispatcher",
-        "kanban-codex-queue-adapter",
-        "kanban-codex-app-server-adapter",
-        "kanban-claude-print-adapter",
-    ] {
-        let symlink = bin_dir.join(name);
+    for name in declared_bin_names() {
+        let symlink = bin_dir.join(&name);
         assert!(symlink.is_symlink(), "missing bin symlink {name}");
-        assert_eq!(fs::read_link(&symlink).unwrap(), current_link.join(name));
+        assert_eq!(fs::read_link(&symlink).unwrap(), current_link.join(&name));
     }
 }
 
@@ -12278,7 +12315,11 @@ esac
     );
     write_executable(
         &stubs.join("cargo"),
-        r#"#!/bin/sh
+        // `cargo build --bins` produces every declared executable, so the stub
+        // stands in for all of them: a release script that enumerates fewer
+        // must still be caught by what it packages, not by a short fake build.
+        &[
+            r#"#!/bin/sh
 set -eu
 case "${1:-}" in
   build)
@@ -12290,7 +12331,9 @@ case "${1:-}" in
 esac
 target_root="${CARGO_TARGET_DIR:?}/release"
 mkdir -p "$target_root"
-for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-codex-app-server-adapter kanban-claude-print-adapter; do
+for binary in "#,
+            declared_bin_names().join(" ").as_str(),
+            r#"; do
   source="${FAKE_RELEASE_BINARY:?}"
   if [ -n "${FAKE_RELEASE_BINARY_DIR:-}" ]; then
     source="$FAKE_RELEASE_BINARY_DIR/$binary"
@@ -12299,6 +12342,8 @@ for binary in kanban kb kanban-dispatcher kanban-codex-queue-adapter kanban-code
   chmod 0755 "$target_root/$binary"
 done
 "#,
+        ]
+        .concat(),
     );
     write_executable(
         &stubs.join("date"),
@@ -22366,8 +22411,14 @@ fn hig_release_script_requires_the_initialized_kb_skill_submodule() {
     );
 }
 
+/// The whole release path, end to end, for every executable the crate
+/// declares: packaged bytes come from the Cargo binary targets, HAX activates
+/// them, HIG installs them through the embedded remote script with the HAX
+/// install root hidden, and a package missing one binary is refused before
+/// anything is activated. The name stays count-free on purpose: an assertion
+/// that says "six" while the package ships ten is a lie a reader would trust.
 #[test]
-fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_refuses_partial_activation()
+fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_and_refuses_partial_activation()
  {
     let fixture = Fixture::new("hig-release");
     let fake_repo_root = fixture.root.join("fake-repo");
@@ -22409,7 +22460,34 @@ fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_r
             "kanban-claude-print-adapter",
             Path::new(env!("CARGO_BIN_EXE_kanban-claude-print-adapter")),
         ),
+        (
+            "kanban-opencode-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-opencode-adapter")),
+        ),
+        (
+            "kanban-kimi-acp-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-kimi-acp-adapter")),
+        ),
+        (
+            "kanban-cursor-worker-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-cursor-worker-adapter")),
+        ),
+        (
+            "kanban-zcode-notify-adapter",
+            Path::new(env!("CARGO_BIN_EXE_kanban-zcode-notify-adapter")),
+        ),
     ];
+    // These are the compiled Cargo targets, so they pin the manifest's own
+    // order too: a `[[bin]]` block added without touching this list fails
+    // here rather than shipping a package the crate does not match.
+    assert_eq!(
+        release_binaries
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>(),
+        declared_bin_names(),
+        "the release binaries under test are not the executables Cargo.toml declares"
+    );
     let release_binary_dir = release_binaries[0].1.parent().unwrap();
 
     let packaged = Command::new("bash")
@@ -22448,14 +22526,7 @@ fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_r
             .iter()
             .map(|file| file["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec![
-            "kanban",
-            "kb",
-            "kanban-dispatcher",
-            "kanban-codex-queue-adapter",
-            "kanban-codex-app-server-adapter",
-            "kanban-claude-print-adapter",
-        ]
+        declared_bin_names()
     );
     let receipt_path = output_dir.with_extension("receipt.json");
     let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
@@ -22562,17 +22633,12 @@ fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_r
         "HAX receipt bytes changed on reactivation"
     );
     assert_release_view(&hax_install_root, &hax_bin_dir, &hax_release_dir);
-    for name in [
-        "kanban",
-        "kb",
-        "kanban-dispatcher",
-        "kanban-codex-queue-adapter",
-        "kanban-codex-app-server-adapter",
-        "kanban-claude-print-adapter",
-        "manifest.json",
-    ] {
+    for name in declared_bin_names()
+        .into_iter()
+        .chain(["manifest.json".to_string()])
+    {
         assert!(
-            hax_release_dir.join(name).exists(),
+            hax_release_dir.join(&name).exists(),
             "missing HAX installed file {name}"
         );
     }
@@ -22651,22 +22717,17 @@ fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_r
         );
     }
     assert_release_view(&install_root, &bin_dir, &release_dir);
-    for name in [
-        "kanban",
-        "kb",
-        "kanban-dispatcher",
-        "kanban-codex-queue-adapter",
-        "kanban-codex-app-server-adapter",
-        "kanban-claude-print-adapter",
-        "manifest.json",
-    ] {
+    for name in declared_bin_names()
+        .into_iter()
+        .chain(["manifest.json".to_string()])
+    {
         assert!(
-            release_dir.join(name).exists(),
+            release_dir.join(&name).exists(),
             "missing installed file {name}"
         );
         assert_eq!(
-            fs::read(release_dir.join(name)).unwrap(),
-            fs::read(hax_release_dir.join(name)).unwrap(),
+            fs::read(release_dir.join(&name)).unwrap(),
+            fs::read(hax_release_dir.join(&name)).unwrap(),
             "HIG installed bytes differ from the HAX release for {name}"
         );
     }
@@ -22746,6 +22807,55 @@ fn hig_release_script_installs_six_real_binaries_without_remote_hax_access_and_r
     assert!(
         !broken_install_root.exists(),
         "partial package left an activated install root behind"
+    );
+}
+
+/// The release path must enumerate exactly the executables the crate
+/// declares. `cargo build --release --locked --bins` builds every `[[bin]]`
+/// target, so a binary the script leaves out of `BINARIES` is built on every
+/// release and then reaches no host at all - which is how the package spent
+/// four adapters behind the crate. Both sides are derived here: the expected
+/// set from `Cargo.toml`, the actual set from the script, so the next added
+/// `[[bin]]` fails this test by name instead of silently missing the package.
+#[test]
+fn hig_release_script_enumerates_exactly_the_executables_the_crate_declares() {
+    let declared = declared_bin_names();
+    let enumerated = release_script_binaries();
+    // Proves the manifest parse describes real build output rather than text:
+    // these are the compiled Cargo targets this test binary was built beside.
+    let built = Path::new(env!("CARGO_BIN_EXE_kanban")).parent().unwrap();
+    for name in &declared {
+        assert!(
+            built.join(name).is_file(),
+            "Cargo.toml declares [[bin]] {name}, but cargo built no such executable in {}",
+            built.display()
+        );
+    }
+
+    let missing: Vec<&str> = declared
+        .iter()
+        .filter(|name| !enumerated.contains(name))
+        .map(String::as_str)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "scripts/hig-release.sh does not enumerate declared executables {missing:?}; \
+         every release builds them and no release ships them"
+    );
+    let unknown: Vec<&str> = enumerated
+        .iter()
+        .filter(|name| !declared.contains(name))
+        .map(String::as_str)
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "scripts/hig-release.sh enumerates {unknown:?}, which Cargo.toml declares no [[bin]] for; \
+         packaging would fail on a binary the release build never produces"
+    );
+    assert_eq!(
+        enumerated, declared,
+        "scripts/hig-release.sh BINARIES is not in Cargo.toml [[bin]] order, \
+         so the manifest file order stops matching the crate"
     );
 }
 
