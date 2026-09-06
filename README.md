@@ -619,8 +619,17 @@ loss of the machine the backups are taken from.
 ## The web view
 
 ```bash
-kanban serve --port 14200      # loopback only; no --bind flag exists
+kanban serve --port 14200                     # loopback only; no --bind flag exists
+kanban serve --socket /run/kanban/kanban.sock # proxy-only socket, mode 0660
 ```
+
+Exactly one listener: both flags together, or neither, is a usage error and
+exits 64 rather than 1, so a supervisor can tell a bad unit file from a
+listener worth restarting. A `--socket` path is created mode `0660` owned by
+the serving uid and its primary group — add nginx's `www-data` to that group
+and nothing else on the box can connect. The path must be absolute, and one
+already holding anything other than a stale socket of this uid's, or whose
+parent directory is a symlink, is refused rather than replaced.
 
 Ten server-rendered views over every registered board: open attention items
 across all of them by priority then age, the dashboard projection, draft plans
@@ -788,15 +797,18 @@ is recovered after lease expiry. Delivery is therefore at-least-once, with
 immutable identity `(subscriptionID,eventID)` as the idempotency key rather
 than an exactly-once promise.
 
-Kanban implements no authentication: it binds `127.0.0.1` and trusts the edge.
+Kanban implements no authentication: it binds `127.0.0.1`, or a `0660` Unix
+socket, and trusts the edge.
 The persisted target edge is nginx `auth_request` backed by the shared Google
 SSO at `https://kb.geoy.ws`; only `geoyws@gmail.com` is allowed, and the
 `.geoy.ws` session cookie is shared with Paste, Snip and Docs. When the web
 surface runs in opt-in actor-header mode, nginx must strip any client-supplied
 copy and set `X-Auth-Request-Email` from a successful `auth_request`; Kanban
 uses that normalized value as the audit actor and still requires same-origin.
-That `--actor-header` mode may be enabled only while the server remains
-loopback-only. The `kanban-serve.service` keeps the process up. There is
+That `--actor-header` mode may be enabled only while nothing but the edge can
+reach the server: loopback, or a socket, which is strictly more local than
+loopback rather than a widening of it. The `kanban-serve.service` keeps the
+process up. There is
 deliberately no
 `--bind` flag — any value other than loopback publishes an unauthenticated
 surface.

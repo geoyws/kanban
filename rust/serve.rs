@@ -44,18 +44,24 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::ffi::CString;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-/// The loopback port `kanban serve` listens on.
+/// The mode a `--socket` listener is pinned to: owner and group, nobody else.
 ///
-/// Checked free on this box before it was chosen; nginx reaches it by number,
-/// so changing it means changing the vhost too.
-pub const DEFAULT_PORT: u16 = 14200;
+/// The group is the point. The serving uid keeps read/write, one group gets
+/// read/write because nginx's `www-data` is added to it on the host, and
+/// everybody else is refused by the kernel on `connect` rather than by
+/// anything this process would have to remember to check.
+const SOCKET_MODE: u32 = 0o660;
 
 /// How many rows a detail page will show of any one list.
 ///
@@ -95,7 +101,35 @@ impl ServeConfig {
     }
 }
 
-/// Serve until killed. Never returns `Ok`.
+/// `sysexits.h` `EX_USAGE`: the command line itself could not be used.
+pub const EXIT_USAGE: i32 = 64;
+
+/// A `serve` invocation that named no listener, or named both of them.
+///
+/// This is the one kanban failure that does not exit 1, because it is the one
+/// with a caller that acts on the difference. A supervisor restarting
+/// `kanban-serve.service` should keep retrying a listener that lost its
+/// socket, and should never retry a unit file that asks for a port and a
+/// socket at once: the first is a transient, the second is a typo that will
+/// still be a typo after ten restarts.
+#[derive(Debug)]
+pub struct ListenerUsage(&'static str);
+
+impl ListenerUsage {
+    pub fn error(message: &'static str) -> anyhow::Error {
+        anyhow::Error::new(Self(message))
+    }
+}
+
+impl std::fmt::Display for ListenerUsage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ListenerUsage {}
+
+/// Serve on loopback until killed. Never returns `Ok`.
 pub fn serve(port: u16, actor_header: Option<String>) -> Result<()> {
     let config = ServeConfig::new(actor_header)?;
     let address = format!("127.0.0.1:{port}");
@@ -103,6 +137,58 @@ pub fn serve(port: u16, actor_header: Option<String>) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("bind {address}: {error}"))
         .with_context(|| format!("serve on {address}"))?;
     eprintln!("kanban serve: http://{address} (loopback only; front it with nginx)");
+    accept(server, &config)
+}
+
+/// Serve on a Unix domain socket until killed. Never returns `Ok`.
+///
+/// **Why a socket as well as a port.** Loopback is reachable by every uid on
+/// the box: any local process can open port 14200, and the write surface is
+/// gated by same-origin, which a local process is free to assert about
+/// itself. A socket at [`SOCKET_MODE`] moves that boundary into the
+/// filesystem, where the kernel enforces it on `connect` — the proxy's group
+/// gets in and nothing else does.
+///
+/// **`--actor-header` stays allowed on this path, deliberately.** The header
+/// is only trustworthy because nothing but the proxy can reach the listener,
+/// and a socket is strictly more local than loopback: it takes reachability
+/// away from every uid outside the owning group and gives none back. The
+/// loopback-only invariant the header depends on is therefore preserved
+/// rather than relaxed, which is why this path needs no extra gate on it.
+pub fn serve_unix(path: &Path, actor_header: Option<String>) -> Result<()> {
+    let config = ServeConfig::new(actor_header)?;
+    clear_socket_path(path)?;
+    // The socket exists the instant `bind` returns and takes its mode from
+    // the umask, so an inherited 022 would leave it group- and world-writable
+    // for the window before the chmod in `own_socket_path`. Narrowing first
+    // means it is never created wide; the chmod then makes the mode exact
+    // rather than umask-shaped.
+    let inherited_umask = unsafe { libc::umask((0o777 & !SOCKET_MODE) as libc::mode_t) };
+    let bound = Server::http_unix(path);
+    unsafe { libc::umask(inherited_umask) };
+    let server = bound
+        .map_err(|error| anyhow::anyhow!("bind {}: {error}", path.display()))
+        .with_context(|| format!("serve on unix:{}", path.display()))?;
+    if let Err(error) = own_socket_path(path) {
+        // A listener whose mode could not be pinned is the surface this path
+        // exists to avoid, so the socket is removed rather than served.
+        drop(server);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    eprintln!(
+        "kanban serve: unix:{} (proxy-only socket; front it with nginx)",
+        path.display()
+    );
+    accept(server, &config)
+}
+
+/// The accept loop both listeners share.
+///
+/// Neither transport reaches past this: a request arriving over a socket is
+/// the same [`Request`] the loopback listener yields, routed by the same
+/// handler, so there is no second request path to keep in step.
+fn accept(server: Server, config: &ServeConfig) -> Result<()> {
     for request in server.incoming_requests() {
         if request.url().split('?').next() == Some("/live") {
             // An upgraded socket is long-lived. Keeping it on the accept loop
@@ -110,9 +196,119 @@ pub fn serve(port: u16, actor_header: Option<String>) -> Result<()> {
             thread::spawn(move || websocket(request));
             continue;
         }
-        handle(request, &config);
+        handle(request, config);
     }
     anyhow::bail!("the listener stopped accepting connections")
+}
+
+/// Make PATH bindable, or say exactly why it is not.
+///
+/// `bind` fails on any existing path, so a restart after a kill has to remove
+/// the socket the last process left. What it must never remove is anything
+/// else: an operator who typed a board file's path deserves the file back
+/// rather than a truncated ledger, and a socket another uid owns is not this
+/// process's to take. A socket with a live listener is refused too — taking
+/// the path out from under it would leave nginx talking to a server nobody
+/// else can see, which is worse than refusing to start.
+///
+/// The path must be absolute: a relative one binds against whatever directory
+/// the process was started in, which for a unit file is a setting nobody
+/// reading `--socket` would think to check.
+fn clear_socket_path(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "--socket {} must be an absolute path: a relative one lands wherever the process \
+         happened to be started, and both nginx and the unit file name it absolutely",
+        path.display()
+    );
+    let parent = path.parent().with_context(|| {
+        format!(
+            "--socket {} names a directory, not a socket",
+            path.display()
+        )
+    })?;
+    let parent_kind = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("--socket directory {} cannot be read", parent.display()))?
+        .file_type();
+    anyhow::ensure!(
+        !parent_kind.is_symlink(),
+        "--socket directory {} is a symlink: whoever can retarget it decides where this \
+         listener lands, so it is refused",
+        parent.display()
+    );
+    anyhow::ensure!(
+        parent_kind.is_dir(),
+        "--socket directory {} is not a directory",
+        parent.display()
+    );
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("--socket {} cannot be read", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        existing.file_type().is_socket(),
+        "--socket {} already exists and is not a socket: refusing to replace it",
+        path.display()
+    );
+    let uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        existing.uid() == uid,
+        "--socket {} is a socket owned by uid {}, not this process's uid {uid}: refusing to \
+         replace it",
+        path.display(),
+        existing.uid()
+    );
+    anyhow::ensure!(
+        UnixStream::connect(path).is_err(),
+        "--socket {} already has a listener answering on it: refusing to take the path out \
+         from under it",
+        path.display()
+    );
+    std::fs::remove_file(path)
+        .with_context(|| format!("remove the stale socket at {}", path.display()))
+}
+
+/// Pin the socket to this uid, its primary group, and [`SOCKET_MODE`].
+///
+/// Creation gets ownership and mode from the process, which is close but not
+/// a guarantee: a setgid parent directory hands the socket that directory's
+/// group instead of this process's. Both are set explicitly and then read
+/// back, because "front it with nginx" is only a boundary if the bits the
+/// kernel checks on `connect` are actually the bits that were asked for.
+fn own_socket_path(path: &Path) -> Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let raw = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("--socket {} contains an interior NUL", path.display()))?;
+    anyhow::ensure!(
+        unsafe { libc::chown(raw.as_ptr(), uid, gid) } == 0,
+        "set the owner of {} to uid {uid} gid {gid}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
+        .with_context(|| format!("set the mode of {} to 0{SOCKET_MODE:o}", path.display()))?;
+    let pinned = std::fs::symlink_metadata(path)
+        .with_context(|| format!("re-read {} after pinning it", path.display()))?;
+    anyhow::ensure!(
+        pinned.permissions().mode() & 0o7777 == SOCKET_MODE,
+        "{} came back mode 0{:o}, not 0{SOCKET_MODE:o}: this filesystem did not keep the mode \
+         the listener needs",
+        path.display(),
+        pinned.permissions().mode() & 0o7777
+    );
+    anyhow::ensure!(
+        pinned.uid() == uid && pinned.gid() == gid,
+        "{} came back owned by uid {} gid {}, not uid {uid} gid {gid}",
+        path.display(),
+        pinned.uid(),
+        pinned.gid()
+    );
+    Ok(())
 }
 
 /// Answer one request, turning an error into a page rather than a dropped

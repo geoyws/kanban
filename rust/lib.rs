@@ -76,7 +76,7 @@ Usage:
              [--after MS] [--before MS] [--all] [--all-boards]
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
-  kanban serve [--port N] [--actor-header NAME]
+  kanban serve (--port N | --socket PATH) [--actor-header NAME]
   kanban events [--task ID | --rule ID | --registry] [--kind KIND]
              [--after MS] [--before MS] [--limit N] [--all] [--json]
   kanban watch [--task ID | --rule ID | --registry] [--kind KIND ...]
@@ -734,7 +734,13 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         true,
     ),
     ("search-rebuild", None, &["as", "all-boards"], &[], false),
-    ("serve", None, &["port", "actor-header"], &[], true),
+    (
+        "serve",
+        None,
+        &["port", "socket", "actor-header"],
+        &[],
+        true,
+    ),
     ("backup", None, &["output", "keep"], &[], false),
     (
         "archive",
@@ -1888,11 +1894,18 @@ impl Args {
     /// into an opaque bind failure, or worse a server that starts and is
     /// unreachable. Privileged ports are allowed: this binds loopback and the
     /// operator may have reason to.
-    fn port(&self, fallback: u16) -> Result<u16> {
-        let value = self.integer("port", fallback as i64)?;
+    ///
+    /// Absent is `None` rather than a default port. `serve` takes either a
+    /// port or a `--socket` path, so a default here would have quietly won
+    /// every argument about which listener was meant.
+    fn port(&self) -> Result<Option<u16>> {
+        let Some(value) = self.optional_integer("port")? else {
+            return Ok(None);
+        };
         u16::try_from(value)
             .ok()
             .filter(|port| *port != 0)
+            .map(Some)
             .with_context(|| {
                 format!(
                     "--port must be between 1 and 65535, got {value}: port 0 asks the \
@@ -4326,6 +4339,14 @@ pub fn entrypoint() -> ! {
             if json_requested() && !STDOUT_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = print(&json!({ "error": message }), true);
             }
+            // 1 for everything a retry might fix; `sysexits.h` 64 for a
+            // command line that will still be wrong on the next attempt.
+            // Only `serve`'s listener selection raises that today, and it
+            // raises it by type rather than by message so no future rewording
+            // can silently drop the distinction.
+            if error.downcast_ref::<serve::ListenerUsage>().is_some() {
+                std::process::exit(serve::EXIT_USAGE)
+            }
             std::process::exit(1)
         }
     }
@@ -5003,10 +5024,25 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if command == "serve" {
-        return serve::serve(
-            args.port(serve::DEFAULT_PORT)?,
-            args.single("actor-header")?.map(str::to_owned),
-        );
+        // Exactly one listener. A default port alongside `--socket` would
+        // have picked loopback for an operator who asked for a socket, and
+        // accepting both would bind one and silently ignore the other -- so
+        // both and neither are refused with the shape, not with a bind error
+        // twenty lines later.
+        let actor_header = args.single("actor-header")?.map(str::to_owned);
+        let socket = args.single("socket")?.map(PathBuf::from);
+        return match (args.port()?, socket) {
+            (Some(_), Some(_)) => Err(serve::ListenerUsage::error(
+                "serve takes --port N or --socket PATH, not both: two listeners is not an \
+                 address nginx can be pointed at",
+            )),
+            (None, None) => Err(serve::ListenerUsage::error(
+                "serve needs a listener: --port N for loopback, or --socket PATH for a \
+                 proxy-only Unix socket",
+            )),
+            (Some(port), None) => serve::serve(port, actor_header),
+            (None, Some(path)) => serve::serve_unix(&path, actor_header),
+        };
     }
     if command == "watch" {
         return watch::run(&args);
