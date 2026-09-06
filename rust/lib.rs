@@ -2438,6 +2438,66 @@ enum BoardCreation {
 /// fails until the new entry is written down in the test too.
 const BOARD_CREATORS: [(&str, Option<&str>); 1] = [("task", Some("add"))];
 
+/// The commands that answer about ONE addressed board and only ever read it.
+///
+/// Each takes [`Store::open_readonly_as_caller`] instead of the writable
+/// constructor, so a board the caller cannot write is still a board the caller
+/// can query: a backup directory, a read-only mount, or a board handed to a
+/// reviewer. Measured on 2026-09-07 with the board and `registry.db` at mode
+/// 0400: eleven of the twelve reads in `docs/testing/bench/fixture-frozen.json`
+/// died with `attempt to write a readonly database` — not from reading
+/// anything, but from the recency stamp on the way in and the claim sweep on
+/// the way through. `claim --candidates` was the twelfth and the only one that
+/// answered, because it already opened this way.
+///
+/// An allowlist, and for the same reason as [`BOARD_CREATORS`]: absence is the
+/// safe answer. A command not written here keeps the writable open it has
+/// always had, so a new mutating command cannot inherit read-only access by
+/// sitting next to one of these — it would fail loudly on its first write
+/// instead, and only under a mode this table is about.
+///
+/// Every entry is exercised against a board and a registry at mode 0400 by
+/// `read_only_commands_answer_from_a_board_and_registry_at_mode_0400`, so
+/// removing one from this table fails that test rather than quietly costing an
+/// operator a read.
+///
+/// This table covers only the commands that resolve ONE board through the
+/// dispatch's single open site. The whole-estate reads — `dashboard`,
+/// `doctor`, `backup` and `search` — open each registered board themselves,
+/// and each of those call sites takes [`Store::open_for_read_as_caller`]
+/// directly for the same reason. `search-rebuild` is absent from both: it
+/// writes the index.
+const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 13] = [
+    ("attention", Some("list")),
+    ("deploy", Some("current")),
+    ("deploy", Some("list")),
+    ("deploy", Some("show")),
+    ("handoff", Some("list")),
+    ("sitrep", Some("list")),
+    ("tag", Some("list")),
+    ("task", Some("list")),
+    ("task", Some("show")),
+    // Four commands that take no subcommand. `context` spells its task id
+    // where a subcommand would go (`kanban context t-1234`), so matching on
+    // `sub` would miss every invocation; the other three are bare verbs.
+    ("context", None),
+    ("events", None),
+    ("stale", None),
+    ("todo", None),
+];
+
+/// Whether this invocation is one of [`READ_ONLY_BOARD_COMMANDS`].
+///
+/// A command listed with `None` is read-only whatever follows it, because what
+/// follows is an argument rather than a subcommand. A command listed with a
+/// `Some` matches that subcommand exactly, so `task list` is read-only and
+/// `task move` is not.
+fn reads_only_one_board(command: &str, sub: Option<&str>) -> bool {
+    READ_ONLY_BOARD_COMMANDS
+        .iter()
+        .any(|(name, wanted)| *name == command && (wanted.is_none() || *wanted == sub))
+}
+
 /// Which of the selectors this invocation addresses a board with.
 ///
 /// Resolved in exactly one place so the store, the read-only store, the
@@ -2733,7 +2793,7 @@ fn store_path_readonly(args: &Args) -> Result<PathBuf> {
             return Ok(path);
         }
         BoardSelection::Project(name) => {
-            let registry = Registry::open_readonly()?;
+            let registry = Registry::open_for_read()?;
             let matches = registry.by_name(&name)?;
             match matches.as_slice() {
                 [project] => PathBuf::from(&project.board_path),
@@ -2767,7 +2827,7 @@ fn store_path_readonly(args: &Args) -> Result<PathBuf> {
             }
         }
         BoardSelection::Workspace(workspace) => {
-            let registry = Registry::open_readonly()?;
+            let registry = Registry::open_for_read()?;
             let workspace = match workspace {
                 Some(path) => path,
                 None => cwd()?,
@@ -3191,7 +3251,11 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
     })
 }
 
-fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<SearchReceipt> {
+/// Search reads the board and the registry and writes to neither, so both take
+/// the read-for-read opens. It takes no `BoardCreation`: it is not a board
+/// creator, and answering from a board it had just made is the defect
+/// `store_path_readonly`'s refusal exists to prevent.
+fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
     let mut options = search_options(args, query)?;
     // The stated bound -- the default or the caller's --limit -- is what the
     // receipt is cut to. `bounded_page` decides how many to fetch (ADR-037),
@@ -3223,7 +3287,7 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
                         continue;
                     }
                 }
-                let store = Store::open_as_caller(Path::new(&project.board_path))?;
+                let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
                 results.extend(store.search(&project.name, &options)?);
                 boards.push(project.name);
             }
@@ -3240,9 +3304,9 @@ fn search_command(args: &Args, query: &str, creation: BoardCreation) -> Result<S
         ));
     }
 
-    let registry = Registry::open()?;
+    let registry = Registry::open_for_read()?;
     let board_name = selected_board_name(args)?;
-    let store = open_store(args, creation)?;
+    let store = Store::open_for_read_as_caller(&store_path_readonly(args)?)?;
     let board = board_name
         .clone()
         .or(store.board_name()?)
@@ -3305,8 +3369,15 @@ fn rebuild_search_command(args: &Args, creation: BoardCreation) -> Result<Value>
     Ok(serde_json::to_value(store.rebuild_search(&board, actor)?)?)
 }
 
-/// Rules are one registry-owned document. Bodies remain lazy; this is only the
-/// applicable table of contents for the addressed board and optional task.
+/// The registered NAME of the addressed board, or `None` for a board the
+/// registry does not know.
+///
+/// Read-only throughout, including the workspace walk: a name lookup is not a
+/// selection, so it has no business stamping recency or re-permissioning
+/// `registry.db`. The writable callers below (`search`, `search-rebuild`) each
+/// open the registry or the store writably before reaching here, so nothing
+/// depends on this call to create or migrate it — and `context`, which is
+/// read-only, must be able to answer against a registry it cannot write.
 fn selected_board_name(args: &Args) -> Result<Option<String>> {
     match board_selection(args) {
         BoardSelection::Db { path, .. } => match Registry::board_path_state_if_available(&path)? {
@@ -3319,16 +3390,21 @@ fn selected_board_name(args: &Args) -> Result<Option<String>> {
         },
         BoardSelection::Project(name) => Ok(Some(name)),
         BoardSelection::Workspace(workspace) => {
-            let mut registry = Registry::open()?;
+            let registry = Registry::open_for_read()?;
             let workspace = match workspace {
                 Some(path) => path,
                 None => cwd()?,
             };
-            Ok(registry.resolve(&workspace)?.map(|record| record.name))
+            Ok(registry
+                .resolve_readonly(&workspace)?
+                .map(|record| record.name))
         }
     }
 }
 
+/// Rules are one registry-owned document. Bodies remain lazy; this is only the
+/// applicable table of contents for the addressed board and optional task —
+/// a read, so it takes [`Registry::open_for_read`].
 fn effective_rule_summaries(
     args: &Args,
     store: &Store,
@@ -3341,7 +3417,7 @@ fn effective_rule_summaries(
         .unwrap_or_default()
         .into_iter()
         .collect::<HashSet<_>>();
-    Registry::open()?.applicable_rule_summaries(
+    Registry::open_for_read()?.applicable_rule_summaries(
         board_name.as_deref(),
         task_id.map(|_| &task_tags),
         false,
@@ -4684,7 +4760,15 @@ fn run() -> Result<()> {
         return print(&record, args.has("json"));
     }
     if command == "workspace" && sub == Some("list") {
-        return print(&Registry::open()?.list(args.has("all"))?, args.has("json"));
+        // Read-only, like every other read: this is the FIRST call a resuming
+        // driver makes (`kb ws ls --json`, before it knows which project it is
+        // in), and it used to die on a `registry.db` the caller cannot write.
+        // The writable open would also re-permission the file to 0600 on the
+        // way past, which is a write to a registry nobody asked to change.
+        return print(
+            &Registry::open_for_read()?.list(args.has("all"))?,
+            args.has("json"),
+        );
     }
     if command == "workspace" && sub == Some("attach") {
         let workspace = args.one("workspace").map(PathBuf::from).unwrap_or(cwd()?);
@@ -4736,7 +4820,7 @@ fn run() -> Result<()> {
         return print(&repointed, args.has("json"));
     }
     if command == "dashboard" {
-        let registry = Registry::open()?;
+        let registry = Registry::open_for_read()?;
         let projects = if args.has("all") {
             registry.projects()?
         } else {
@@ -4775,7 +4859,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open_as_caller(Path::new(&project.board_path))?;
+            let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
             let tasks = store.list_tasks(None, None, None, false)?;
             // Counted, not fetched: a listing page passed off as a count told
             // an operator 100 pending handoffs on a board holding 101, with
@@ -4912,7 +4996,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if command == "doctor" {
-        let registry = Registry::open()?;
+        let registry = Registry::open_for_read()?;
         let registry_check = registry.integrity()?;
         let registry_audit = registry.audit()?;
         let active_rule_selectors = registry.active_rule_selector_health()?;
@@ -4967,7 +5051,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open_as_caller(Path::new(&project.board_path))?;
+            let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
             let board_schema = db::schema_version(&store.connection)?;
             let check = store.integrity()?;
             // `integrity_check` validates the b-tree and nothing about what
@@ -5048,7 +5132,7 @@ fn run() -> Result<()> {
         return watch::run(&args);
     }
     if command == "backup" {
-        let registry = Registry::open()?;
+        let registry = Registry::open_for_read()?;
         let directory = args
             .one("output")
             .map(PathBuf::from)
@@ -5077,7 +5161,7 @@ fn run() -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open_as_caller(Path::new(&project.board_path))?;
+            let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
             let file_name = Path::new(&project.board_path)
                 .file_name()
                 .with_context(|| format!("board path has no file name: {}", project.board_path))?;
@@ -5191,6 +5275,23 @@ fn run() -> Result<()> {
         );
     }
 
+    // The two rule reads, ahead of the writable block below: `rule export`
+    // already opened read-only, and these two are the same kind of answer.
+    // Board selectors are refused from the table, before dispatch.
+    if command == "rule" && (sub == Some("list") || sub == Some("show")) {
+        let registry = Registry::open_for_read()?;
+        if sub == Some("show") {
+            return print(
+                &registry.rule(rest.first().context("rule id is required")?)?,
+                args.has("json"),
+            );
+        }
+        if args.has("full") {
+            return print(&registry.rules(args.has("all"))?, args.has("json"));
+        }
+        return print(&registry.rule_summaries(args.has("all"))?, args.has("json"));
+    }
+
     if command == "rule" {
         // Board selectors are refused from the table, before dispatch.
         let mut registry = Registry::open()?;
@@ -5212,18 +5313,6 @@ fn run() -> Result<()> {
             )?;
             return print(
                 &registry.add_rule(body, args.require("as")?, &tags)?,
-                args.has("json"),
-            );
-        }
-        if sub == Some("list") {
-            if args.has("full") {
-                return print(&registry.rules(args.has("all"))?, args.has("json"));
-            }
-            return print(&registry.rule_summaries(args.has("all"))?, args.has("json"));
-        }
-        if sub == Some("show") {
-            return print(
-                &registry.rule(rest.first().context("rule id is required")?)?,
                 args.has("json"),
             );
         }
@@ -5273,7 +5362,7 @@ fn run() -> Result<()> {
             .positionals
             .get(1)
             .context("search query is required")?;
-        return print(&search_command(&args, query, creation)?, args.has("json"));
+        return print(&search_command(&args, query)?, args.has("json"));
     }
     if command == "search-rebuild" {
         return print(&rebuild_search_command(&args, creation)?, args.has("json"));
@@ -5290,7 +5379,7 @@ fn run() -> Result<()> {
                 "claim --candidates creates no lease; --session and --lease-minutes do not apply"
             );
         }
-        let store = Store::open_readonly_as_caller(&store_path_readonly(&args)?)?;
+        let store = Store::open_for_read_as_caller(&store_path_readonly(&args)?)?;
         let options = ClaimOptions {
             git: None,
             agent_id: args.require("as")?.into(),
@@ -5313,14 +5402,14 @@ fn run() -> Result<()> {
     }
 
     if command == "subscription" && sub == Some("list") {
-        let store = Store::open_readonly_as_caller(&store_path_readonly(&args)?)?;
+        let store = Store::open_for_read_as_caller(&store_path_readonly(&args)?)?;
         return print(
             &store.subscriptions(args.one("status"), args.one("consumer"), args.has("all"))?,
             args.has("json"),
         );
     }
     if command == "subscription" && sub == Some("show") {
-        let store = Store::open_readonly_as_caller(&store_path_readonly(&args)?)?;
+        let store = Store::open_for_read_as_caller(&store_path_readonly(&args)?)?;
         return print(
             &store.require_subscription(rest.first().context("subscription id is required")?)?,
             args.has("json"),
@@ -5334,7 +5423,16 @@ fn run() -> Result<()> {
         return run_access(&args, spec_sub.as_deref());
     }
 
-    let mut store = open_store(&args, creation)?;
+    // One open site for the whole rest of the surface, and the only place that
+    // decides between reading and writing the board. `mut` is for the writing
+    // arms below; a read-only connection carries `PRAGMA query_only`, so a
+    // command mis-filed in `READ_ONLY_BOARD_COMMANDS` fails loudly on its
+    // first write rather than silently dropping it.
+    let mut store = if reads_only_one_board(command, sub) {
+        Store::open_for_read_as_caller(&store_path_readonly(&args)?)?
+    } else {
+        open_store(&args, creation)?
+    };
     if command == "subscription" && sub == Some("add") {
         for required in [
             "consumer",

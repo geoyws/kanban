@@ -2097,6 +2097,55 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// The schema version stored in this file, read WITHOUT migrating it.
+///
+/// The probe is a READ and nothing else: `SQLITE_OPEN_READ_ONLY` plus
+/// `PRAGMA query_only`, exactly as [`open_board_readonly`] opens, and
+/// `PRAGMA user_version` is the whole question. It never creates the file,
+/// never runs a migration, and never re-permissions anything — a probe that
+/// wrote would defeat the decision it exists to inform.
+///
+/// `None` for a file that is not there, is not a database, or would not open.
+/// Each routes to the writable open, which is the one that creates, migrates,
+/// and produces the real error for anything else; a probe is not the place to
+/// invent a diagnosis.
+pub fn stored_schema_version(path: &Path) -> Option<usize> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // Without this a probe answers WRONGLY under contention rather than merely
+    // slowly: `Store::drop` checkpoints on every command's exit and takes
+    // exclusive WAL locks, so `SQLITE_BUSY` is routine.
+    connection.busy_handler(Some(busy_backoff)).ok()?;
+    connection.pragma_update(None, "query_only", true).ok()?;
+    schema_version(&connection).ok()
+}
+
+/// Whether this registry file can be opened by [`open_registry_readonly`] as
+/// it stands. See [`stored_schema_version`].
+pub fn registry_schema_is_current(path: &Path) -> bool {
+    stored_schema_version(path) == Some(REGISTRY_MIGRATIONS.len())
+}
+
+/// Whether this file is there and refuses a write from this process.
+///
+/// The question a migration has to ask before it starts: mode bits, a
+/// read-only mount and a directory that will not open all answer here, and as
+/// root the mode bits correctly answer "writable" because they are.
+///
+/// A file that is NOT there answers `false`. Absence is not a refusal — the
+/// writable open creates a board there, which is how a `--db` path becomes one
+/// — and reporting it as unwritable would replace "does not exist" with a
+/// permissions story that is not true.
+pub fn refuses_writes(path: &Path) -> bool {
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => false,
+        Err(error) => error.kind() != ErrorKind::NotFound,
+    }
+}
+
 /// A reader whose queries all run on one SQLite connection.
 ///
 /// Snapshotting one connection while reading from another is the defect

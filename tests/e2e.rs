@@ -5974,6 +5974,571 @@ fn compiled_binary_still_migrates_a_board_that_is_behind() {
     assert_eq!(after, current, "the board was not migrated forward");
 }
 
+/// Whether mode 0400 actually stops THIS process from writing.
+///
+/// The question has to be asked rather than assumed, because it is answered by
+/// the caller's uid: an ordinary user is denied by the kernel, and root ignores
+/// the mode bits entirely. Asked by probe rather than by `geteuid`, so the
+/// answer covers a read-only mount and an ACL too, and so it is the exact
+/// question the tests below care about instead of a proxy for it.
+fn mode_0400_denies_writes(dir: &Path) -> bool {
+    let probe = dir.join("mode-probe");
+    fs::write(&probe, b"probe").unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o400)).unwrap();
+    let denied = fs::OpenOptions::new().write(true).open(&probe).is_err();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&probe).unwrap();
+    denied
+}
+
+/// A board file and a `registry.db` this process cannot write, with the rows
+/// every read in `docs/testing/bench/fixture-frozen.json` needs.
+struct SealedEstate {
+    fixture: Fixture,
+    board: PathBuf,
+    registry: PathBuf,
+    deployment: String,
+    /// `doctor --json`, taken while the estate is still writable and BEFORE
+    /// the lapsed lease below exists. Read for the two schema versions, which
+    /// decide which open a read takes. It cannot be taken later: `doctor` is a
+    /// whole-estate survey that opens every board writably, so running it
+    /// after the lapse would sweep the very row these tests need present.
+    doctor: Value,
+}
+
+impl SealedEstate {
+    fn new(label: &str) -> Self {
+        let fixture = Fixture::new(label);
+        fixture.ok_json(&fixture.main, &["init", "--name", "SEALED", "--json"]);
+        fixture.ok_json(&fixture.main, &["tag", "add", "infra", "--json"]);
+        for id in ["t-read-1", "t-read-2"] {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "task",
+                    "add",
+                    "Readable work",
+                    "--id",
+                    id,
+                    "--tag",
+                    "infra",
+                    "--json",
+                ],
+            );
+        }
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                "Needs a decision",
+                "--as",
+                "geoyws",
+                "--task",
+                "t-read-1",
+                "--json",
+            ],
+        );
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "sitrep",
+                "post",
+                "Lane is moving",
+                "--as",
+                "bench@driver",
+                "--lane",
+                "driver",
+                "--json",
+            ],
+        );
+        let deployment = fixture.ok_json(
+            &fixture.main,
+            &[
+                "deploy",
+                "start",
+                "--repo",
+                "geoyws/kanban",
+                "--commit",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "--tier",
+                "@_s",
+                "--environment",
+                "staging",
+                "--host",
+                "hax",
+                "--url",
+                "https://kb.geoy.ws",
+                "--as",
+                "bench@driver",
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let board = board_path_for_project(&fixture, &fixture.main, "SEALED");
+        let registry = fixture.data.join("registry.db");
+        let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+
+        // LAST, and the reason every test here is a real guard: a lease on
+        // `t-read-2` that has run out and that no sweep has tidied. Without it
+        // `sweep_expired_claims` short-circuits on its `COUNT(*)` probe and
+        // writes nothing, so a read path that swept would still pass every
+        // assertion below. With it, a sweep on the read path has to open a
+        // write transaction against a file that will not take one.
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "claim",
+                "t-read-2",
+                "--as",
+                "ghost",
+                "--session",
+                "ghost-session",
+                "--json",
+            ],
+        );
+        Connection::open(&board)
+            .unwrap()
+            .execute("UPDATE task_claims SET expires_at=1", [])
+            .unwrap();
+
+        Self {
+            fixture,
+            board,
+            registry,
+            deployment,
+            doctor,
+        }
+    }
+
+    /// Every path a `chmod` has to reach: the database file and any WAL
+    /// sidecar beside it. SQLite creates `-wal` and `-shm` with the main
+    /// file's mode, so a sidecar left at 0400 keeps the database unwritable
+    /// after the main file is opened up again — which is a property of SQLite,
+    /// not of the code under test, and would otherwise read as a failure of it.
+    fn sealable(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for base in [&self.board, &self.registry] {
+            paths.push(base.clone());
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = PathBuf::from(format!("{}{suffix}", base.display()));
+                if sidecar.exists() {
+                    paths.push(sidecar);
+                }
+            }
+        }
+        paths
+    }
+
+    /// Take away every write bit on the database files, and nothing else. The
+    /// directory above them stays writable, because the data root is where the
+    /// process lock lives and taking that away tests a different thing.
+    fn seal(&self) {
+        for path in self.sealable() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn unseal(&self) {
+        for path in self.sealable() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+}
+
+/// A board and a registry the caller cannot write are still a board and a
+/// registry the caller can read.
+///
+/// Measured on 2026-09-07 against the tree before this fix, with both files at
+/// mode 0400: eleven of the twelve reads in
+/// `docs/testing/bench/fixture-frozen.json` exited 1 with `attempt to write a
+/// readonly database`, and none of them had read anything yet. Two writes sat
+/// on the read path — the `last_used_at` stamp that board selection made
+/// through a writable registry open, and `sweep_expired_claims` on every
+/// `Store::open_as_caller` — plus the `chmod 0600` re-assert inside `db::open`,
+/// which silently returned the operator's 0400 file to 0600 on the way past.
+/// `claim --candidates` was the twelfth and the only one that answered, because
+/// it already took the read-only open.
+///
+/// Two independent proofs here, because they fail for different reasons:
+///
+/// Every read answers — exit 0, and `--json` output a parser accepts.
+///
+/// And neither file was touched: byte-identical contents AND an unchanged mode.
+/// The mode is the load-bearing half of that pair, and it holds whatever the
+/// caller's uid is: `chmod` is a write that root performs too, so a read path
+/// that re-permissions the file is caught here even where the mode bits would
+/// not have denied it. Where they do deny it — any non-root caller, which is
+/// what the report measured on hax — the exits above are a kernel refusal
+/// rather than a convention, and the test says which case it ran in.
+#[test]
+fn read_only_commands_answer_from_a_board_and_registry_at_mode_0400() {
+    let estate = SealedEstate::new("sealed-reads");
+    let fixture = &estate.fixture;
+
+    // The read-only branch is the one under test, so pin that this board is at
+    // the schema that selects it. A board BEHIND the schema takes the writable
+    // open instead, which is a different test
+    // (`compiled_binary_still_migrates_a_board_that_is_behind`, and
+    // `a_board_behind_the_schema_that_cannot_be_migrated_says_both_halves`).
+    let schema = &estate.doctor;
+    assert_eq!(
+        schema["projects"][0]["schemaVersion"], schema["supportedBoardSchemaVersion"],
+        "this test only exercises the read-only open on a current board"
+    );
+    assert_eq!(
+        schema["registrySchemaVersion"], schema["supportedRegistrySchemaVersion"],
+        "this test only exercises the read-only registry open on a current registry"
+    );
+
+    let kernel_enforced = mode_0400_denies_writes(&fixture.root);
+    estate.seal();
+    let board_before = fs::read(&estate.board).unwrap();
+    let registry_before = fs::read(&estate.registry).unwrap();
+
+    // The twelve reads of the frozen bench fixture, in its order, with this
+    // board's ids substituted for the three `context` reads. Every one of them
+    // is a read a resuming driver performs before it has written anything.
+    let json_reads: [&[&str]; 12] = [
+        &["workspace", "list"],
+        &["handoff", "list", "--status", "pending"],
+        &["attention", "list", "--status", "open", "--limit", "100"],
+        &["stale"],
+        &["attention", "list", "--status", "open", "--limit", "500"],
+        &[
+            "attention",
+            "list",
+            "--status",
+            "resolved",
+            "--limit",
+            "500",
+        ],
+        &["task", "list"],
+        &["context", "t-read-1"],
+        &["context", "t-read-2"],
+        &[
+            "claim",
+            "--candidates",
+            "--as",
+            "bench@driver",
+            "--lane",
+            "driver",
+            "--limit",
+            "100",
+        ],
+        &["sitrep", "list", "--lane", "driver", "--limit", "20"],
+        &["events", "--limit", "50"],
+    ];
+    for read in json_reads {
+        let mut argv = read.to_vec();
+        argv.push("--json");
+        let output = fixture.run(&fixture.main, &argv);
+        assert!(
+            output.status.success(),
+            "{read:?} was refused against a sealed estate (kernel-enforced: \
+             {kernel_enforced})\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{read:?} answered something that is not JSON: {error}\nstdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    }
+
+    // Answering is not enough: the answer has to be the one a writable open
+    // would have given. `t-read-2` holds a lease that has run out, and the
+    // scheduler's candidate list is where the two paths used to disagree — the
+    // untidied claim row hid the task from `claim --candidates` while `claim
+    // --next` handed it straight out.
+    let candidates = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "--candidates",
+            "--as",
+            "bench@driver",
+            "--lane",
+            "driver",
+            "--limit",
+            "100",
+            "--json",
+        ],
+    );
+    assert!(
+        candidates
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == "t-read-2"),
+        "a lapsed lease hid a claimable task from the read-only open: {candidates}"
+    );
+
+    // The rest of the read-only surface, which the bench fixture does not
+    // cover but an operator and an adapter both reach for.
+    for read in [
+        vec!["task", "show", "t-read-1", "--json"],
+        vec!["tag", "list", "--json"],
+        vec!["deploy", "list", "--json"],
+        vec!["deploy", "current", "--json"],
+        vec!["deploy", "show", estate.deployment.as_str(), "--json"],
+        vec!["rule", "list", "--json"],
+    ] {
+        let output = fixture.run(&fixture.main, &read);
+        assert!(
+            output.status.success(),
+            "{read:?} was refused against a sealed estate\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!("{read:?} answered something that is not JSON: {error}")
+        });
+    }
+
+    // `todo` renders a document rather than JSON, and writes the board no more
+    // than the rest of them.
+    let todo = fixture.run(&fixture.main, &["todo"]);
+    assert!(
+        todo.status.success(),
+        "todo was refused against a sealed estate\nstderr: {}",
+        String::from_utf8_lossy(&todo.stderr)
+    );
+    assert!(
+        !todo.stdout.is_empty(),
+        "todo answered nothing at all against a sealed estate"
+    );
+
+    assert_eq!(
+        fs::read(&estate.board).unwrap(),
+        board_before,
+        "a read changed the board's bytes"
+    );
+    assert_eq!(
+        fs::read(&estate.registry).unwrap(),
+        registry_before,
+        "a read changed the registry's bytes"
+    );
+    assert_eq!(
+        SealedEstate::mode(&estate.board),
+        0o400,
+        "a read re-permissioned the board"
+    );
+    assert_eq!(
+        SealedEstate::mode(&estate.registry),
+        0o400,
+        "a read re-permissioned the registry"
+    );
+
+    estate.unseal();
+}
+
+/// A write against a board it cannot write refuses, and leaves the board alone.
+///
+/// The other half of the contract above, and the reason the read-only routing
+/// is not a permission bypass: the read-only open carries `PRAGMA query_only`,
+/// so a mutating command routed through it by mistake would fail rather than
+/// silently drop the write, and a mutating command routed correctly meets the
+/// filesystem.
+#[test]
+fn a_write_against_an_unwritable_board_refuses_and_writes_nothing() {
+    let estate = SealedEstate::new("sealed-write");
+    let fixture = &estate.fixture;
+    if !mode_0400_denies_writes(&fixture.root) {
+        // Root ignores the mode bits, so there is no refusal to observe and
+        // nothing here would be evidence either way. Said out loud rather than
+        // asserted into a pass.
+        eprintln!(
+            "skipped: this process writes through mode 0400, so a sealed board is not sealed for it"
+        );
+        return;
+    }
+    estate.seal();
+    let before = fs::read(&estate.board).unwrap();
+
+    let refused = fixture.run(
+        &fixture.main,
+        &["task", "add", "must not land", "--id", "t-nope", "--json"],
+    );
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains("readonly database") || message.contains("read-only"),
+        "a refusal on an unwritable board must say the file could not be written: {message}"
+    );
+    assert!(
+        !message.contains("panic"),
+        "a refusal must be a refusal, not a panic: {message}"
+    );
+    assert_eq!(
+        fs::read(&estate.board).unwrap(),
+        before,
+        "a refused write left something behind"
+    );
+
+    // And the row genuinely is not there once the board is readable again.
+    estate.unseal();
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == "t-nope"),
+        "a refused write stored its row anyway: {listed}"
+    );
+}
+
+/// The sweep still runs on a writable open, and never on a read.
+///
+/// Both directions in one test on purpose. Deleting
+/// [`Store::sweep_expired_claims`] would make the read-only half pass and this
+/// half fail; running it on the read path — which is the defect this slice
+/// removed — makes this half pass and
+/// `read_only_commands_answer_from_a_board_and_registry_at_mode_0400` fail.
+///
+/// And the answer is the same either way, which is what makes skipping safe: a
+/// lapsed lease reads as unclaimed whichever open served it, because every read
+/// derives that from `expires_at` rather than from the sweep having run.
+#[test]
+fn the_claim_sweep_runs_on_a_writable_open_and_never_on_a_read() {
+    // The lapsed lease on `t-read-2` comes from the shared setup, so the same
+    // board state that every other sealed-estate test starts from is the one
+    // asserted about here.
+    let estate = SealedEstate::new("sealed-sweep");
+    let fixture = &estate.fixture;
+
+    let claim_rows = || -> i64 {
+        Connection::open(&estate.board)
+            .unwrap()
+            .query_row("SELECT count(*) FROM task_claims", [], |row| row.get(0))
+            .unwrap()
+    };
+    let expiry_events = |fixture: &Fixture| -> usize {
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["events", "--kind", "claim_expired", "--json"],
+            )
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    estate.seal();
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let lapsed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "t-read-2")
+        .unwrap();
+    assert_eq!(
+        lapsed["status"], "todo",
+        "a lapsed lease read as owned on the read-only open: {lapsed}"
+    );
+    assert!(
+        lapsed["assignee"].is_null(),
+        "a lapsed lease kept its holder on the read-only open: {lapsed}"
+    );
+    assert_eq!(
+        claim_rows(),
+        1,
+        "a read retired the claim row, so the read path is writing again"
+    );
+    assert_eq!(
+        expiry_events(fixture),
+        0,
+        "a read wrote the retirement into the ledger"
+    );
+
+    // The same board, opened writably: the sweep tidies the row and records it.
+    estate.unseal();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "a write of any kind",
+            "--id",
+            "t-write",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        claim_rows(),
+        0,
+        "the sweep no longer retires a lapsed lease on a writable open"
+    );
+    assert_eq!(
+        expiry_events(fixture),
+        1,
+        "the sweep no longer records the retirement it performed"
+    );
+}
+
+/// A board behind the schema that cannot be migrated says BOTH halves.
+///
+/// The read-only open refuses a board whose schema is not current, so a read
+/// routes such a board to the writable open that migrates it — which is what
+/// keeps `compiled_binary_still_migrates_a_board_that_is_behind` true. When
+/// that open cannot happen either, the refusal has to name the schema and the
+/// permission together. SQLite's own `attempt to write a readonly database`
+/// names only the second, and sends an operator looking for the write that a
+/// `task list` supposedly attempted.
+#[test]
+fn a_board_behind_the_schema_that_cannot_be_migrated_says_both_halves() {
+    let estate = SealedEstate::new("sealed-behind");
+    let fixture = &estate.fixture;
+    if !mode_0400_denies_writes(&fixture.root) {
+        eprintln!(
+            "skipped: this process writes through mode 0400, so a sealed board is not sealed for it"
+        );
+        return;
+    }
+    let current: i64 = Connection::open(&estate.board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    Connection::open(&estate.board)
+        .unwrap()
+        .execute_batch(&format!("PRAGMA user_version={}", current - 1))
+        .unwrap();
+    estate.seal();
+
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "list",
+            "--db",
+            estate.board.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let message = refusal_object(&refused);
+    assert!(
+        message.contains(&format!("schema {}", current - 1)),
+        "the refusal does not name the schema the board is at: {message}"
+    );
+    assert!(
+        message.contains("cannot write the file"),
+        "the refusal does not name the permission: {message}"
+    );
+    assert!(
+        !message.contains("attempt to write a readonly database"),
+        "the refusal leaked SQLite's message instead of explaining itself: {message}"
+    );
+
+    estate.unseal();
+}
+
 #[test]
 fn compiled_binary_keeps_rootless_boards_out_of_unreachable_roots() {
     let fixture = Fixture::new("rootless-doctor-repoint");
@@ -6813,7 +7378,7 @@ fn compiled_binary_suggests_the_flag_an_abbreviation_was_reaching_for() {
 }
 
 #[test]
-fn compiled_binary_retires_dead_leases_before_any_read_and_records_them() {
+fn compiled_binary_never_reads_a_dead_lease_as_owned_and_records_it_on_the_next_write() {
     let fixture = Fixture::new("sweep");
     fixture.ok_json(&fixture.main, &["init", "--name", "Sweep", "--json"]);
     fixture.ok_json(
@@ -6884,6 +7449,38 @@ fn compiled_binary_retires_dead_leases_before_any_read_and_records_them() {
     assert!(todo.contains("No task is currently in progress."), "{todo}");
     assert!(!todo.contains("Owner: unclaimed"), "{todo}");
 
+    // A read is read-only, so the retirement is not history YET: the
+    // `claim_expired` event is a write and lands on the next writable open.
+    // Asserted, not glossed over — if a read ever starts writing again, this
+    // is where it shows up.
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["events", "--kind", "claim_expired", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a read must not write the retirement into the ledger"
+    );
+
+    // K2: a second agent's claim receipt names who died, when, and how stale.
+    // This is also the first WRITABLE open since the lease lapsed, so it is
+    // the one that sweeps the row and records the retirement.
+    let successor = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-1",
+            "--as",
+            "successor",
+            "--session",
+            "successor-session",
+            "--json",
+        ],
+    );
+
     // The sweep is itself durable history, not a silent correction.
     let expired = fixture.ok_json(
         &fixture.main,
@@ -6906,19 +7503,7 @@ fn compiled_binary_retires_dead_leases_before_any_read_and_records_them() {
     assert_eq!(payload["lastCheckpointSeq"], checkpoint["seq"]);
     assert_eq!(payload["lastCheckpointAt"], checkpoint["createdAt"]);
 
-    // K2: a second agent's claim receipt names who died, when, and how stale.
-    let successor = fixture.ok_json(
-        &fixture.main,
-        &[
-            "claim",
-            "t-1",
-            "--as",
-            "successor",
-            "--session",
-            "successor-session",
-            "--json",
-        ],
-    );
+    // K2, continued: the receipt the successor already got.
     let orphaned = &successor["orphanedFrom"];
     assert_eq!(orphaned["agent"], "ghost");
     assert_eq!(orphaned["sessionId"], "ghost-session");
@@ -6967,7 +7552,19 @@ fn compiled_binary_reports_null_last_checkpoint_when_the_dead_holder_wrote_none(
         .unwrap()
         .execute("UPDATE task_claims SET expires_at=1", [])
         .unwrap();
-    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    // The successor's claim is the first WRITABLE open since the lease lapsed,
+    // so it is what sweeps the row and records the retirement; a read would
+    // report the lapse correctly and write nothing.
+    //
+    // The null survives into the successor's orphanedFrom rather than being
+    // reported as a fresh checkpoint that never happened.
+    let successor = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-1", "--as", "successor", "--json"],
+    );
+    assert_eq!(successor["orphanedFrom"]["agent"], "ghost");
+    assert_eq!(successor["orphanedFrom"]["sessionId"], "ghost-session");
+    assert!(successor["orphanedFrom"]["lastCheckpointAt"].is_null());
 
     // The holder wrote no checkpoint since claiming, so the enriched payload
     // says exactly that with nulls, never an empty string or a stale value.
@@ -6978,16 +7575,6 @@ fn compiled_binary_reports_null_last_checkpoint_when_the_dead_holder_wrote_none(
     assert_eq!(expired.as_array().unwrap().len(), 1);
     assert!(expired[0]["payload"]["lastCheckpointSeq"].is_null());
     assert!(expired[0]["payload"]["lastCheckpointAt"].is_null());
-
-    // The null survives into the successor's orphanedFrom rather than being
-    // reported as a fresh checkpoint that never happened.
-    let successor = fixture.ok_json(
-        &fixture.main,
-        &["claim", "t-1", "--as", "successor", "--json"],
-    );
-    assert_eq!(successor["orphanedFrom"]["agent"], "ghost");
-    assert_eq!(successor["orphanedFrom"]["sessionId"], "ghost-session");
-    assert!(successor["orphanedFrom"]["lastCheckpointAt"].is_null());
 }
 
 #[test]
@@ -20321,14 +20908,30 @@ fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
 
-    // Seven leases die at once, and the next board open retires all seven in
-    // ONE transaction — so no tick can see a partial batch, and the burst is
-    // genuinely a burst rather than a race with the poll interval.
+    // Seven leases die at once, and the next WRITABLE board open retires all
+    // seven in ONE transaction — so no tick can see a partial batch, and the
+    // burst is genuinely a burst rather than a race with the poll interval.
+    //
+    // `archive --dry-run` is the vehicle: it takes the writable open, so the
+    // sweep runs, and it writes nothing of its own, so the burst the browser
+    // sees is exactly the seven retirements. A read command would report the
+    // seven lapses correctly and sweep none of them.
     Connection::open(&board)
         .unwrap()
         .execute("UPDATE task_claims SET expires_at=1", [])
         .unwrap();
-    fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "3650",
+            "--dry-run",
+            "--as",
+            "bench@driver",
+            "--json",
+        ],
+    );
     assert_eq!(
         fixture
             .ok_json(
@@ -21773,6 +22376,11 @@ fn registry_v10_migration_records_discarded_alias_names_once_across_competing_pr
         .unwrap();
     drop(registry);
 
+    // The race has to be between two WRITABLE registry opens, and `workspace
+    // list` is no longer one: it reads the registry read-only once the schema
+    // is current, so that a resuming driver can list projects from a
+    // `registry.db` it cannot write. `rule add` is a registry write by
+    // definition, so it is the durable vehicle for this race.
     let outputs = std::thread::scope(|scope| {
         let start = Arc::new(Barrier::new(3));
         let fixture = &fixture;
@@ -21780,13 +22388,33 @@ fn registry_v10_migration_records_discarded_alias_names_once_across_competing_pr
         let first_start = Arc::clone(&start);
         let first = scope.spawn(move || {
             first_start.wait();
-            fixture.run(&fixture.main, &["workspace", "list", "--json"])
+            fixture.run(
+                &fixture.main,
+                &[
+                    "rule",
+                    "add",
+                    "First racer body.",
+                    "--as",
+                    "geoyws",
+                    "--json",
+                ],
+            )
         });
 
         let second_start = Arc::clone(&start);
         let second = scope.spawn(move || {
             second_start.wait();
-            fixture.run(&fixture.main, &["workspace", "list", "--json"])
+            fixture.run(
+                &fixture.main,
+                &[
+                    "rule",
+                    "add",
+                    "Second racer body.",
+                    "--as",
+                    "geoyws",
+                    "--json",
+                ],
+            )
         });
 
         start.wait();

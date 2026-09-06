@@ -1671,6 +1671,59 @@ fn require_lease(connection: &Connection, task_id: &str, token: &str, now: i64) 
     }
 }
 
+/// Apply the row change [`expire_claims`] STORES, without storing it.
+///
+/// A lapsed lease has two consequences on a task: it stops being
+/// `in_progress`, and it stops naming the vanished holder as assignee. The
+/// writable opens materialise both in the `tasks` row, because the retirement
+/// is also durable history and the `claim_expired` event has to be written
+/// somewhere. A read-only open can write neither — and a read that reported
+/// `in_progress · assignee: ghost` would be the exact defect
+/// [`Store::sweep_expired_claims`] exists to prevent, arriving through the
+/// other door.
+///
+/// So the rule is applied here instead, on the values, and the condition is
+/// character-for-character the one `expire_claims` puts in its `UPDATE`:
+/// status `in_progress` becomes `todo`, and an assignee equal to the lapsed
+/// holder becomes nobody. Every read goes through this, so the answer does not
+/// depend on which constructor opened the board — and on a board a writable
+/// open has just swept there is nothing left to find, which is why the probe
+/// comes first and costs one indexed lookup.
+///
+/// `updated_at` is deliberately left alone. It records when the row was last
+/// WRITTEN, and nothing wrote it.
+fn apply_lapsed_leases<'a>(
+    connection: &Connection,
+    tasks: impl ExactSizeIterator<Item = &'a mut Task>,
+) -> Result<()> {
+    if tasks.len() == 0 || !has_claims_table(connection)? {
+        return Ok(());
+    }
+    let mut statement =
+        connection.prepare("SELECT task_id,agent_id FROM task_claims WHERE expires_at<=?")?;
+    let lapsed = statement
+        .query_map([now_ms()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeMap<String, String>>>()?;
+    drop(statement);
+    if lapsed.is_empty() {
+        return Ok(());
+    }
+    for task in tasks {
+        let Some(holder) = lapsed.get(&task.id) else {
+            continue;
+        };
+        if task.status == "in_progress" {
+            task.status = "todo".to_owned();
+        }
+        if task.assignee.as_deref() == Some(holder.as_str()) {
+            task.assignee = None;
+        }
+    }
+    Ok(())
+}
+
 fn expire_claims(connection: &Connection, now: i64) -> Result<()> {
     // Read the whole row before the DELETE: once the claim is gone, the
     // provenance it carried (who held it, where, and how stale their last
@@ -1888,6 +1941,23 @@ pub struct Store {
 /// routing here: duplicating it would let the superbot see work that a claim
 /// immediately refuses, or hide work that the scheduler would actually hand
 /// out.
+///
+/// The two `task_claims` joins carry `expires_at` for the same reason: the
+/// writer runs after [`Store::sweep_expired_claims`] has retired what lapsed,
+/// and read-only inspection never sweeps (see
+/// [`Store::open_readonly_as_caller`]). Reading the stored shape directly
+/// therefore answered differently on the two paths — a task whose lease had
+/// run out was hidden from `claim --candidates`, by its untidied claim row and
+/// by the `in_progress` the sweep had not yet reset, while `claim --next`
+/// handed the same task straight out.
+///
+/// So `c` is the LIVE lease, whose absence is what makes a row claimable, and
+/// `x` is a LAPSED one, whose presence is what makes an `in_progress` row read
+/// as `todo` — character for character the rule [`apply_lapsed_leases`] applies
+/// to a listing and `expire_claims` stores. On a swept board no `x` can match,
+/// so this reduces to `t.status='todo'` and the writer's answer is unchanged.
+/// An `in_progress` row with no claim at all is genuinely in progress and
+/// stays out either way.
 fn eligible_claim_candidates(
     connection: &Connection,
     agent: &str,
@@ -1895,8 +1965,9 @@ fn eligible_claim_candidates(
 ) -> Result<Vec<Task>> {
     let mut statement = connection.prepare(
         "SELECT t.* FROM tasks t
-         LEFT JOIN task_claims c ON c.task_id=t.id
-         WHERE t.status='todo'
+         LEFT JOIN task_claims c ON c.task_id=t.id AND c.expires_at>?
+         LEFT JOIN task_claims x ON x.task_id=t.id AND x.expires_at<=?
+         WHERE (t.status='todo' OR (t.status='in_progress' AND x.task_id IS NOT NULL))
            AND t.archived=0
            AND t.type=?
            AND c.task_id IS NULL
@@ -1907,10 +1978,16 @@ fn eligible_claim_candidates(
            )
          ORDER BY t.priority,t.created_at,t.id",
     )?;
-    let candidates = statement
-        .query_map([CLAIMABLE_TYPE], task_row)?
+    let now = now_ms();
+    let mut candidates = statement
+        .query_map(params![now, now, CLAIMABLE_TYPE], task_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
+    // Before the routing below reads `assignee`: a lapsed lease left the
+    // vanished holder's name in that column until the sweep cleared it, and
+    // routing on the stored value refused the row to every other agent —
+    // silently, and only on the path that had not swept.
+    apply_lapsed_leases(connection, candidates.iter_mut())?;
 
     let mut eligible = Vec::new();
     for candidate in candidates {
@@ -2035,16 +2112,82 @@ impl Store {
         })
     }
 
-    /// The read-only open AS THIS PROCESS.
+    /// The read-only open AS THIS PROCESS. **Every read-only command uses
+    /// this**, so that a board the caller cannot write is still a board the
+    /// caller can read: a backup directory, a read-only mount, or a board
+    /// handed to a reviewer all answer here.
     ///
     /// Re-resolved on every call, and `watch` calls it once per poll: that is
     /// what makes a REVOCATION land mid-stream rather than at the next
     /// reconnect (see [`crate::routing::board_authz`]).
+    ///
+    /// No [`Store::sweep_expired_claims`] and no migration, unlike every
+    /// writable constructor above. Both are writes, and a read that writes is
+    /// not a read — the sweep is the reason `kanban task list` against a board
+    /// at mode 0400 used to die with `attempt to write a readonly database`
+    /// instead of answering.
+    ///
+    /// Skipping the sweep is safe because the sweep is DERIVED, not decided.
+    /// What retirement means is `expires_at<=now`, and every read computes it
+    /// from that column rather than from the sweep having run:
+    /// [`Store::list_tasks`] and [`Store::require_task`] apply
+    /// [`apply_lapsed_leases`], [`active_claim`] filters on `expires_at`, and
+    /// so does [`eligible_claim_candidates`]. So a lapsed lease reads as
+    /// lapsed here whether or not its row has been tidied away, the answer is
+    /// identical to the one a writable open gives, and the next writable open
+    /// recomputes the sweep from the same column and removes the row then.
+    ///
+    /// What a read cannot reproduce is the `claim_expired` LEDGER EVENT, which
+    /// is history of a state change and so a write by definition. It lands on
+    /// the next writable open. Nothing else is lost by not writing, and
+    /// nothing is refused for being unable to.
     pub(crate) fn open_readonly_as_caller(path: &Path) -> Result<Self> {
         Ok(Self {
             connection: open_board_readonly(path)?,
             authz: crate::routing::board_authz(path)?,
         })
+    }
+
+    /// Open a board for a command that only READS it.
+    ///
+    /// Two branches, decided by the board's stored schema and nothing else:
+    ///
+    /// Already at this binary's schema — the overwhelming common case — takes
+    /// [`Store::open_readonly_as_caller`]: no sweep, no recency stamp, no
+    /// `chmod` re-assert, no migration. That is what lets a read answer from a
+    /// board the caller cannot write.
+    ///
+    /// BEHIND this binary's schema takes the writable open, because such a
+    /// board cannot be read at all until it is migrated and a migration is a
+    /// write. Keeping that branch is not a loophole in "a read never writes":
+    /// `kanban task list` has always brought a board forward, the refusal
+    /// `open_board_readonly` would give instead names "any ordinary command"
+    /// as the fix while being itself an ordinary command, and a rolling
+    /// upgrade leaves exactly this state on every board that has not been
+    /// written since.
+    ///
+    /// Behind AND unwritable is a genuine refusal, and it says both halves.
+    /// SQLite's own `attempt to write a readonly database` would name only the
+    /// permission and hide the reason a read wanted to write at all.
+    pub(crate) fn open_for_read_as_caller(path: &Path) -> Result<Self> {
+        let stored = crate::db::stored_schema_version(path);
+        if stored == Some(crate::db::BOARD_SCHEMA_VERSION) {
+            return Self::open_readonly_as_caller(path);
+        }
+        if let Some(version) = stored
+            && crate::db::refuses_writes(path)
+        {
+            bail!(
+                "board file {} is at schema {version}, and this Kanban reads {}. Bringing it \
+                 forward is a write, and this process cannot write the file, so it cannot be \
+                 read as it stands.\n\
+                 Make the file writable and run any ordinary kanban command once to migrate it, \
+                 or copy it somewhere writable and address the copy with --db.",
+                path.display(),
+                crate::db::BOARD_SCHEMA_VERSION
+            );
+        }
+        Self::open_as_caller(path)
     }
 
     /// The bulk-read gate on this store's own connection.
@@ -3003,7 +3146,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Retire leases that have run out, before anything reads the board.
+    /// Retire leases that have run out, on every WRITABLE open of the board.
     ///
     /// Expiry used to happen only inside `claim` and `accept_handoff`, so a
     /// vanished agent left its task reading `in_progress · assignee: ghost`
@@ -3014,6 +3157,13 @@ impl Store {
     /// Doing it here keeps one definition of what expiry means. The common
     /// case is a single indexed count over `idx_task_claims_expiry` and takes
     /// no write lock; only an actual expiry opens a transaction.
+    ///
+    /// This is a WRITE, so [`Store::open_readonly_as_caller`] does not call
+    /// it and nothing here is best-effort on the paths that do: a writable
+    /// open that cannot retire a lapsed lease has a real problem and says so.
+    /// The row it tidies is never what a read answers from — see
+    /// `open_readonly_as_caller` for why every read derives liveness from
+    /// `expires_at` instead.
     pub fn sweep_expired_claims(&mut self) -> Result<usize> {
         if !has_claims_table(&self.connection)? {
             return Ok(0);
@@ -3502,6 +3652,7 @@ impl Store {
         self.authz.check_read(&tags)?;
         let mut one = require_task(&self.connection, id)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
+        apply_lapsed_leases(&self.connection, std::iter::once(&mut one))?;
         Ok(one)
     }
 
@@ -3531,6 +3682,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
+        apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
 
@@ -3584,6 +3736,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
+        apply_lapsed_leases(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         Ok(rows)
     }
 
@@ -3653,6 +3806,7 @@ impl Store {
         self.authz.check_read(&[])?;
         let mut rows = dependencies(&self.connection, id)?;
         attach_tags(&self.connection, rows.iter_mut())?;
+        apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
 
@@ -5573,6 +5727,13 @@ impl Store {
     /// Idleness is measured from the claim heartbeat when one exists, and from
     /// `updated_at` otherwise, so a task dispatched into `in_progress` without
     /// a claim is still covered.
+    ///
+    /// A task whose lease has LAPSED is not stale, it is unclaimed: the same
+    /// rule [`apply_lapsed_leases`] applies to a listing, expressed here as a
+    /// `WHERE` clause because this query selects on the status it would have
+    /// rewritten. Without it a read-only open — which never sweeps — reported
+    /// the vanished holder's task as overdue work in progress, while a
+    /// writable open on the same board reported nothing.
     pub fn stale_tasks(&self) -> Result<Vec<StaleTask>> {
         self.authz.check_read(&[])?;
         let now = now_ms();
@@ -5580,10 +5741,13 @@ impl Store {
             "SELECT t.*, c.heartbeat_at AS claim_heartbeat FROM tasks t
              LEFT JOIN task_claims c ON c.task_id=t.id
              WHERE t.status='in_progress' AND t.archived=0 AND t.stale_minutes IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_claims x WHERE x.task_id=t.id AND x.expires_at<=?
+               )
              ORDER BY t.priority,t.created_at,t.id",
         )?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([now], |row| {
                 let heartbeat: Option<i64> = row.get("claim_heartbeat")?;
                 Ok((task_row(row)?, heartbeat))
             })?
