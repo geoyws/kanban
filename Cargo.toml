@@ -49,6 +49,10 @@ path = "rust/bin/kanban-kimi-acp-adapter.rs"
 name = "kanban-cursor-worker-adapter"
 path = "rust/bin/kanban-cursor-worker-adapter.rs"
 
+[[bin]]
+name = "kanban-zcode-notify-adapter"
+path = "rust/bin/kanban-zcode-notify-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
