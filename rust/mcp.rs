@@ -230,8 +230,13 @@ fn tool_name(command: &str, sub: Option<&str>) -> String {
 /// is a second description of the surface and drifts from the first one
 /// silently. `readOnly` travels with each tool so a harness can withhold
 /// mutation without keeping its own list of which calls write.
+///
+/// One entry is not an operation: `batch`, which carries several of these
+/// calls on one request. It is described by hand because it describes no
+/// command, and it is appended here so `tools/list` and `tools/call` offer
+/// and answer exactly the same set.
 fn tools() -> Vec<Value> {
-    COMMANDS
+    let mut tools = COMMANDS
         .iter()
         .filter(|(command, ..)| !crate::LONG_RUNNING.contains(command))
         .map(|(command, sub, flags, positionals, read_only)| {
@@ -301,7 +306,9 @@ fn tools() -> Vec<Value> {
                 "annotations": { "readOnlyHint": read_only },
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    tools.push(batch_tool());
+    tools
 }
 
 /// Turn a tool call into the argument list the CLI would have been given.
@@ -385,6 +392,16 @@ fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
 /// the refusal text is the most useful thing an agent can be given, and this
 /// CLI's refusals name the fix. A transport-level error would hide it.
 fn call(path: &Path, name: &str, arguments: &Value) -> Value {
+    // `batch` is the one tool that names no command, so the one that cannot be
+    // answered by running the binary. Dispatched here rather than in
+    // `respond` so a batched entry and a standalone call are the same function
+    // call and cannot drift apart: byte-identical results are the property the
+    // benchmark's equivalence check rests on. A batch inside a batch is
+    // impossible — `batch` has no `COMMANDS` row, and validation refuses any
+    // name that has none.
+    if name == BATCH {
+        return batch(path, arguments);
+    }
     let argv = match arguments_for(name, arguments) {
         Ok(argv) => argv,
         Err(error) => return error_result(&error.to_string()),
@@ -410,6 +427,180 @@ fn error_result(message: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": message }],
         "isError": true,
+    })
+}
+
+/// The most calls one `batch` may carry.
+///
+/// A bound rather than none, because a batch is answered by running the binary
+/// once per entry: an unbounded array would put an unbounded amount of work
+/// behind a single request, on a server whose safety rests on being idle and
+/// empty the moment it has answered. The representative agent loop is twelve
+/// reads (`docs/testing/graphql-agent-loop-benchmark.md`); this leaves room
+/// above it without letting one frame become a job.
+const BATCH_LIMIT: usize = 32;
+
+/// The one tool name that is not an operation.
+const BATCH: &str = "batch";
+
+/// Whether a tool name is one `tools/list` offers, and whether its operation
+/// writes: `None` when no listed tool has that name.
+///
+/// Filtered on the same two tables `tools` reads, so what is advertised and
+/// what a batch accepts cannot answer differently. `batch` itself has no row,
+/// so it answers `None` and a batch cannot nest.
+fn listed_read_only(name: &str) -> Option<bool> {
+    COMMANDS
+        .iter()
+        .filter(|(command, ..)| !crate::LONG_RUNNING.contains(command))
+        .find(|(command, sub, ..)| tool_name(command, *sub) == name)
+        .map(|(.., read_only)| *read_only)
+}
+
+/// The `batch` tool as `tools/list` offers it.
+///
+/// Hand-written, unlike every other tool, because it describes no command: its
+/// input is a list of calls, not a command's flags. The one thing that could
+/// drift — which operations a batch will carry — is still read off `COMMANDS`
+/// at call time by `listed_read_only`, so it is not written down twice.
+fn batch_tool() -> Value {
+    json!({
+        "name": BATCH,
+        "description": format!(
+            "Run up to {BATCH_LIMIT} read-only tool calls in one request, in the order given. \
+             Every call must name a read-only tool from this list, or the whole batch is \
+             refused and none of it runs. Each result is exactly what that call returns on \
+             its own. Returns {{\"results\":[{{\"ok\":true,\"result\":…}}|{{\"ok\":false,\"error\":…}}]}} \
+             in order, so one failing call hides no other. A transport shortcut, not a \
+             capability: it can do nothing a separate call could not."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "calls": {
+                    "type": "array",
+                    "maxItems": BATCH_LIMIT,
+                    "description": format!("The calls to run, in order; at most {BATCH_LIMIT}."),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "A read-only tool name from tools/list.",
+                            },
+                            "arguments": {
+                                "type": "object",
+                                "description": "That tool's arguments, exactly as tools/call takes them.",
+                            },
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["calls"],
+        },
+        "annotations": { "readOnlyHint": true },
+    })
+}
+
+/// Answer several read-only tool calls on one request.
+///
+/// The loop this exists for is twelve reads at one round trip each. With
+/// payload projection in place the bytes are no longer the cost and the
+/// latency is: 2.45 s p50 for one agent loop from the MBP to the board home,
+/// measured 2026-09-07, twelve reads paying ~190 ms of round trip apiece. A
+/// batch is those round trips collapsed into one and nothing else.
+///
+/// Two properties make it a shortcut rather than a second surface, and both
+/// are load-bearing:
+///
+/// - **Every entry runs the standalone `call`.** Same resolution, same
+///   argument handling, same open path, so a batched result is byte-identical
+///   to the result the same call returns alone. Anything less and a batch
+///   would be a second way to read the board, free to drift from the first.
+/// - **The whole batch is checked before any of it runs.** A batch that names
+///   one operation it may not perform performs none of them, so a refusal
+///   leaves nothing half-applied to reason about.
+///
+/// A per-entry failure is not a batch failure: it travels as that entry's
+/// `error` beside every other entry's result, because a batch that gave up on
+/// the first refusal would hide eleven answers behind one.
+fn batch(path: &Path, arguments: &Value) -> Value {
+    let empty = serde_json::Map::new();
+    let supplied = match arguments {
+        Value::Object(supplied) => supplied,
+        Value::Null => &empty,
+        other => return error_result(&format!("arguments must be an object, not {other}")),
+    };
+    if let Some(unknown) = supplied.keys().find(|key| key.as_str() != "calls") {
+        return error_result(&format!("{BATCH} has no argument {unknown}"));
+    }
+    let calls = match supplied.get("calls") {
+        Some(Value::Array(calls)) => calls,
+        Some(other) => {
+            return error_result(&format!("{BATCH} calls must be an array, not {other}"));
+        }
+        None => return error_result(&format!("{BATCH} needs a calls array")),
+    };
+    if calls.len() > BATCH_LIMIT {
+        return error_result(&format!(
+            "{BATCH} takes at most {BATCH_LIMIT} calls and was given {}; nothing in it ran",
+            calls.len()
+        ));
+    }
+    let mut planned = Vec::with_capacity(calls.len());
+    for (index, entry) in calls.iter().enumerate() {
+        let Value::Object(fields) = entry else {
+            return error_result(&format!(
+                "{BATCH} call {index} must be an object, not {entry}; nothing in it ran"
+            ));
+        };
+        if let Some(unknown) = fields
+            .keys()
+            .find(|key| !matches!(key.as_str(), "name" | "arguments"))
+        {
+            return error_result(&format!(
+                "{BATCH} call {index} has no field {unknown}; nothing in it ran"
+            ));
+        }
+        let Some(name) = fields.get("name").and_then(Value::as_str) else {
+            return error_result(&format!(
+                "{BATCH} call {index} needs a name; nothing in it ran"
+            ));
+        };
+        match listed_read_only(name) {
+            Some(true) => {}
+            Some(false) => {
+                return error_result(&format!(
+                    "{BATCH} call {index} names {name}, which writes; a batch carries read-only \
+                     tools only, so nothing in it ran"
+                ));
+            }
+            None => {
+                return error_result(&format!(
+                    "{BATCH} call {index} names no such tool {name}; nothing in it ran"
+                ));
+            }
+        }
+        planned.push((name, fields.get("arguments").unwrap_or(&Value::Null)));
+    }
+    let results = planned
+        .into_iter()
+        .map(|(name, arguments)| {
+            let result = call(path, name, arguments);
+            // Absent is treated as failed: a result this layer cannot read is
+            // not a result it may report as success.
+            if result["isError"].as_bool().unwrap_or(true) {
+                json!({ "ok": false, "error": result })
+            } else {
+                json!({ "ok": true, "result": result })
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "content": [{ "type": "text", "text": json!({ "results": results }).to_string() }],
+        "isError": false,
     })
 }
 
@@ -642,6 +833,39 @@ mod tests {
         let total = names.len();
         names.dedup();
         assert_eq!(total, names.len(), "two operations share a tool name");
+        // The listed set is every callable operation plus exactly one name
+        // that is not an operation. Spelled out rather than relaxed: a second
+        // hand-written tool must be added here to be legal, and `batch` must
+        // not collide with a command, or `tools/call batch` would answer for
+        // an operation instead.
+        assert!(
+            !names.contains(&BATCH.to_owned()),
+            "an operation is named {BATCH} and the batch tool would shadow it"
+        );
+        let generated = COMMANDS
+            .iter()
+            .filter(|(command, ..)| !crate::LONG_RUNNING.contains(command))
+            .map(|(c, s, ..)| tool_name(c, *s))
+            .collect::<std::collections::BTreeSet<_>>();
+        let listed = tools()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected = generated;
+        expected.insert(BATCH.to_owned());
+        assert_eq!(
+            listed, expected,
+            "tools/list is not the operations plus {BATCH}"
+        );
+        assert_eq!(listed.len(), tools().len(), "tools/list repeats a name");
+        // And the name that is not an operation resolves to no operation, which
+        // is what stops a batch from carrying a batch.
+        assert_eq!(listed_read_only(BATCH), None);
+        assert_eq!(listed_read_only("task_list"), Some(true));
+        assert_eq!(listed_read_only("task_add"), Some(false));
+        // A long-running command is not listed, so a batch may not name one
+        // even though `arguments_for` can still build its argv.
+        assert_eq!(listed_read_only("watch"), None);
     }
 
     #[test]

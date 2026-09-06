@@ -5,8 +5,10 @@ Contract: docs/testing/graphql-agent-loop-benchmark.md. This script is the
 reproducible half of that contract: it reads the version-controlled fixture,
 runs each transport arm with its own cold setup, warmups and measured
 iterations, and writes one receipt JSON. It never writes to the board: every
-read in the fixture is a read-only CLI operation, and the MCP arm calls the same
-operations through `kb mcp`, which runs the same binary per tool call.
+read in the fixture is a read-only CLI operation, and the MCP arms call the same
+operations through `kb mcp`, which runs the same binary per tool call -- the
+`mcp-batch` arm carrying every batchable read of a loop in one `tools/call
+batch` instead of one call each.
 
 Stdlib only. One command from a clean checkout:
 
@@ -31,7 +33,7 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECEIPT_SCHEMA = "kanban-agent-loop-benchmark-receipt/1"
-ARM_NAMES = ("ssh", "ssh-controlmaster", "mcp-over-ssh")
+ARM_NAMES = ("ssh", "ssh-controlmaster", "mcp-over-ssh", "mcp-batch")
 # OpenSSH 9 prints `debug1: Authenticated to ...`; OpenSSH 10 drops the prefix.
 AUTHENTICATED = re.compile(r"^(?:debug1: )?Authenticated to ", re.M)
 # Shapes a committed receipt must never contain: env-style assignments of
@@ -237,7 +239,25 @@ class ReadResult:
         self.error = error
 
 
-class SshArm:
+class Arm:
+    """What every arm shares: how a loop's reads are issued, and how many
+    requests that takes.
+
+    An arm answers one logical read per fixture entry whatever it does on the
+    wire, so the equivalence check can compare read for read. Lazily, as a
+    generator, so a loop that loses its transport stops instead of retrying
+    eleven more times against a closed pipe.
+    """
+
+    def read_all(self, reads: list[dict]):
+        for read in reads:
+            yield self.read(read)
+
+    def requests_per_loop(self, reads: int) -> int:
+        return reads
+
+
+class SshArm(Arm):
     name = "ssh"
     description = "one fresh ssh connection per logical read, exactly what kb-board/kb-remote do today"
 
@@ -376,7 +396,7 @@ class ControlMasterArm(SshArm):
         return {"control_exit": text, "master_after_exit": self.master_pid()}
 
 
-class McpArm:
+class McpArm(Arm):
     name = "mcp-over-ssh"
     description = "one persistent `ssh <target> kb mcp` child; every logical read is a tools/call on that stdio pipe"
 
@@ -507,7 +527,150 @@ class McpArm:
         }
 
 
-ARMS = {SshArm.name: SshArm, ControlMasterArm.name: ControlMasterArm, McpArm.name: McpArm}
+class McpBatchArm(McpArm):
+    name = "mcp-batch"
+    description = (
+        "one persistent `ssh <target> kb mcp` child; every batchable logical read of the loop is carried in a single "
+        "`tools/call batch` per iteration, the rest issued as ordinary tools/call on the same pipe. Per-read `ms` for a "
+        "batched read is the WHOLE batch's wall time attributed to that read: inside one call there is no per-read "
+        "timing to observe, so those numbers sum to far more than `loop_ms` and only `loop_ms` is comparable. Per-read "
+        "`bytes_sent`/`bytes_received` are that entry's slice of the request and response frames, so they sum to the "
+        "frame minus its envelope rather than to a per-read frame."
+    )
+
+    def __init__(self, fx: dict):
+        super().__init__(fx)
+        self.batchable: list[str] = []
+        self.unbatchable: list[str] = []
+
+    def transport(self) -> dict:
+        transport = super().transport()
+        transport["kind"] = "mcp-stdio-batch-over-persistent-ssh"
+        transport["batch_tool"] = "batch (rust/mcp.rs): up to 32 read-only tool calls per request, validated whole before any entry runs, results returned in order"
+        transport["note"] = (
+            "the -v flag is on the one long-lived ssh so its stderr proves a single authentication; -v prints nothing "
+            "per tools/call. A batch carries only tools whose tools/list entry is readOnlyHint true, which is read off "
+            "the server at setup rather than assumed here"
+        )
+        return transport
+
+    def setup(self) -> dict:
+        result = super().setup()
+        # Which reads may travel in a batch is the server's answer, not this
+        # driver's guess: `batch` refuses any tool whose `tools/list` entry is
+        # not read-only, and `claim --candidates` is read-only in the CLI while
+        # its command row covers every `claim` invocation, plain `claim`
+        # included. Asking makes the partition move on its own if a future
+        # release splits that row.
+        _, response = self._rpc("tools/list", {})
+        listed = json.loads(response)
+        if "error" in listed:
+            raise RuntimeError(f"tools/list failed: {listed['error']}")
+        tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+        if "batch" not in tools:
+            raise RuntimeError("the served kb has no `batch` tool; this arm needs a build that carries it")
+        for read in self.fx["reads"]:
+            tool = tools.get(read["tool"])
+            if tool is None:
+                raise RuntimeError(f"the served kb has no `{read['tool']}` tool")
+            if tool.get("annotations", {}).get("readOnlyHint") is True:
+                self.batchable.append(read["id"])
+            else:
+                self.unbatchable.append(read["id"])
+        if not self.batchable:
+            raise RuntimeError("no fixture read is batchable; there is nothing for this arm to measure")
+        result["batchable_reads"] = list(self.batchable)
+        result["unbatchable_reads"] = list(self.unbatchable)
+        result["unbatchable_reason"] = "the tool's tools/list entry is not readOnlyHint true, so `batch` refuses it; issued as its own tools/call on the same pipe"
+        return result
+
+    def requests_per_loop(self, reads: int) -> int:
+        return 1 + len(self.unbatchable)
+
+    def arguments_for(self, read: dict) -> dict:
+        args = dict(read["args"])
+        if read.get("board_scoped", True):
+            args["project"] = self.fx["board"]
+        return args
+
+    def read_all(self, reads: list[dict]):
+        batched = [read for read in reads if read["id"] in self.batchable]
+        answers = self._batch(batched)
+        for read in reads:
+            if read["id"] in answers:
+                yield answers[read["id"]]
+            else:
+                yield self.read(read)
+
+    def _batch(self, reads: list[dict]) -> dict[str, ReadResult]:
+        """One `tools/call batch`, split back into one ReadResult per read."""
+        calls = [{"name": read["tool"], "arguments": self.arguments_for(read)} for read in reads]
+        entry_sent = [len(json.dumps(call, separators=(",", ":")).encode()) for call in calls]
+        started = time.perf_counter_ns()
+        try:
+            line, response = self._rpc("tools/call", {"name": "batch", "arguments": {"calls": calls}})
+        except RuntimeError as error:
+            ms = (time.perf_counter_ns() - started) / 1e6
+            return {read["id"]: ReadResult(False, ms, sent, 0, b"", str(error)) for read, sent in zip(reads, entry_sent)}
+        ms = (time.perf_counter_ns() - started) / 1e6
+        self.requests += 1
+        assert response is not None
+
+        def failed(message: str) -> dict[str, ReadResult]:
+            return {read["id"]: ReadResult(False, ms, sent, 0, b"", message) for read, sent in zip(reads, entry_sent)}
+
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError as error:
+            return failed(f"invalid frame: {error}")
+        if "error" in parsed:
+            return failed(f"jsonrpc error: {parsed['error']}")
+        envelope = parsed.get("result", {})
+        text = "".join(part.get("text", "") for part in envelope.get("content", []))
+        if envelope.get("isError"):
+            # The whole batch was refused, so no entry ran: every read in it
+            # fails with the server's reason rather than with silence.
+            return failed(f"batch refused: {text[:500]}")
+        try:
+            entries = json.loads(text)["results"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            return failed(f"unreadable batch result: {error}: {text[:500]}")
+        if len(entries) != len(reads):
+            return failed(f"batch answered {len(entries)} results for {len(reads)} calls")
+        answers = {}
+        for read, sent, entry in zip(reads, entry_sent, entries):
+            received = len(json.dumps(entry, separators=(",", ":")).encode())
+            result = entry.get("result") if entry.get("ok") else entry.get("error")
+            body = "".join(part.get("text", "") for part in (result or {}).get("content", [])).encode("utf-8")
+            error = None if entry.get("ok") else f"isError: {body.decode(errors='replace')[:500]}"
+            answers[read["id"]] = ReadResult(bool(entry.get("ok")), ms, sent, received, body, error)
+        return answers
+
+    def reuse_summary(self, before: dict, after: dict, measured_reads: int, teardown: dict) -> dict:
+        loops = measured_reads // len(self.fx["reads"]) if self.fx["reads"] else 0
+        expected = loops * self.requests_per_loop(len(self.fx["reads"]))
+        one_pipe = (
+            before["ssh_pid"] == after["ssh_pid"]
+            and after["alive"]
+            and after["requests_answered"] - before["requests_answered"] == expected
+        )
+        return {
+            "reused": one_pipe and teardown.get("authenticated_lines") == 1,
+            "how_proven": "same ssh child pid alive before and after, one batch plus one call per unbatchable read answered on that one pipe for every measured loop, and the child's -v stderr contains exactly one `Authenticated to` line (checked at teardown)",
+            "connections_per_loop": 0,
+            "requests_per_loop": self.requests_per_loop(len(self.fx["reads"])),
+            "requests_expected": expected,
+            "persistent_connections": 1,
+            "evidence": [before, after],
+        }
+
+
+ARMS = {
+    SshArm.name: SshArm,
+    ControlMasterArm.name: ControlMasterArm,
+    McpArm.name: McpArm,
+    McpBatchArm.name: McpBatchArm,
+}
 
 
 # --------------------------------------------------------------------------- loop
@@ -516,8 +679,7 @@ ARMS = {SshArm.name: SshArm, ControlMasterArm.name: ControlMasterArm, McpArm.nam
 def run_loop(arm, reads: list[dict]) -> dict:
     loop_started = time.perf_counter_ns()
     results = []
-    for read in reads:
-        result = arm.read(read)
+    for read, result in zip(reads, arm.read_all(reads)):
         drop = read.get("normalize_drop_keys", [])
         raw, normalized = canonical_digest(result.body, drop) if result.ok else (None, None)
         results.append({
@@ -552,7 +714,7 @@ def run_arm(name: str, fx: dict, warmups: int, iterations: int, log) -> dict:
         "description": arm.description,
         "transport": arm.transport(),
         "started_at": now_iso(),
-        "requests_per_loop": len(reads),
+        "reads_per_loop": len(reads),
     }
     log(f"[{name}] remote probe (before)")
     receipt["host_before"] = remote_probe(fx)
@@ -569,6 +731,9 @@ def run_arm(name: str, fx: dict, warmups: int, iterations: int, log) -> dict:
         except Exception as teardown_error:  # noqa: BLE001
             receipt["teardown"] = {"error": str(teardown_error)}
         return receipt
+    # After setup, because an arm may only learn how many requests one loop
+    # takes by asking the server what it will accept.
+    receipt["requests_per_loop"] = arm.requests_per_loop(len(reads))
     receipt["reuse_before"] = arm.prove_reuse("before")
     warm = []
     for i in range(warmups):
@@ -729,8 +894,8 @@ def main(argv: list[str] | None = None) -> int:
             "warmups": warmups,
             "iterations": iterations,
             "percentile_method": "nearest-rank over successful measured loops: value at ceil(P/100*n), 1-indexed",
-            "timing": "wall clock, time.perf_counter_ns on the client, per read and per loop",
-            "bytes": "application-layer: request = the exec command string (ssh arms) or the JSON-RPC frame (mcp); response = stdout bytes (ssh arms) or the JSON-RPC frame (mcp); body_bytes = the kb --json output either way. Not wire bytes.",
+            "timing": "wall clock, time.perf_counter_ns on the client, per read and per loop. On mcp-batch a batched read's `ms` is the whole batch call's wall time attributed to that read, because one call has no per-read timing to observe; those per-read numbers therefore sum to far more than loop_ms and only loop_ms is comparable across arms.",
+            "bytes": "application-layer: request = the exec command string (ssh arms) or the JSON-RPC frame (mcp); response = stdout bytes (ssh arms) or the JSON-RPC frame (mcp); body_bytes = the kb --json output either way. On mcp-batch a batched read's request and response bytes are that entry's slice of the one frame, so they sum to the frame minus its envelope. Not wire bytes.",
             "client": local_probe(),
             "ssh_effective_options": ssh_options,
             "rtt": rtt_probe(str(ssh_options.get("hostname", fx["ssh_target"]))),

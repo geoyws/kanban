@@ -329,6 +329,22 @@ questions — `todo` writes a file, so it is not read-only, and it still may not
 create a board — and adapters can rely on all three: the MCP tool builder reads
 `ignoredSelectors` so no tool offers an input the CLI would reject.
 
+`kanban mcp` lists one further tool that is not an operation: `batch`, which
+takes `{calls: [{name, arguments}]}` and answers up to 32 of them on one
+request, in order, as `{results: [{ok, result} | {ok, error}]}`. It exists
+because a remote agent loop pays a round trip per read — twelve reads, 2.45 s
+p50 from the MBP to the board home over SSH, measured 2026-09-07 with payload
+projection already in place — so the latency, not the payload, is the cost. It
+is a transport shortcut and can do nothing a separate call could not: every
+entry must name a tool whose operation is `readOnly`, the whole batch is
+validated before any of it runs, so a batch naming one write performs none of
+its reads, and each entry runs the same code path a standalone `tools/call`
+runs, so a batched result is byte-identical to the same call made alone. A
+failing entry travels as that entry's `error` beside the others' results rather
+than sinking the batch. `claim --candidates` is read-only in the CLI but shares
+a command row with the `claim` that writes a lease, so a batch refuses it and a
+caller issues that one read on its own.
+
 Project names are not unique. If two boards share one, `--project` refuses and
 names every candidate, including rootless boards; use `--workspace PATH` or a
 registered path to pick one. `workspace attach --to .` and similar path-like

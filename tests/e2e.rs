@@ -13527,6 +13527,480 @@ fn the_mcp_server_reports_protocol_edges_over_stdio() {
     session.finish();
 }
 
+/// The text a `tools/call` result carries, whichever way it went.
+fn tool_text(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .expect("a tool result carries content")
+        .iter()
+        .map(|part| part["text"].as_str().unwrap_or_default())
+        .collect()
+}
+
+/// One `tools/call batch` on an open session, answered as `results`.
+fn batch_results(session: &mut Session, id: i64, calls: Vec<Value>) -> Value {
+    let answered = session.ask(json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "batch", "arguments": { "calls": calls } }
+    }));
+    assert_eq!(
+        answered["result"]["isError"],
+        false,
+        "the batch itself was refused: {}",
+        tool_text(&answered["result"])
+    );
+    let parsed: Value =
+        serde_json::from_str(&tool_text(&answered["result"])).expect("a batch answers with JSON");
+    parsed["results"].clone()
+}
+
+/// The refusal text of a batch that was rejected whole.
+fn batch_refusal(session: &mut Session, id: i64, calls: Vec<Value>) -> String {
+    let answered = session.ask(json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "batch", "arguments": { "calls": calls } }
+    }));
+    assert_eq!(
+        answered["result"]["isError"], true,
+        "a batch that must be refused was answered: {answered}"
+    );
+    tool_text(&answered["result"])
+}
+
+/// A response body with the reads' declared volatile keys removed and its keys
+/// sorted -- the benchmark's `canonical_digest`, in Rust.
+///
+/// Dropped at the top level and from every element of a top-level array, for
+/// the same reason the driver does it: selecting a board stamps the workspace
+/// row's `lastUsedAt`, so reading twice moves it, and `context` stamps
+/// `generatedAt` on every answer.
+fn normalized_body(label: &str, body: &str, drop_keys: &[String]) -> String {
+    let mut value: Value = serde_json::from_str(body)
+        .unwrap_or_else(|error| panic!("{label} answered with non-JSON ({error}): {body}"));
+    match &mut value {
+        Value::Object(map) => {
+            for key in drop_keys {
+                map.remove(key);
+            }
+        }
+        Value::Array(elements) => {
+            for element in elements {
+                if let Value::Object(map) = element {
+                    for key in drop_keys {
+                        map.remove(key);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    value.to_string()
+}
+
+/// Whether a body actually carries a key the fixture calls volatile, where
+/// `normalized_body` would drop it: at the top level, or in every element of a
+/// top-level array.
+fn volatile_key_present(body: &str, key: &str) -> bool {
+    match serde_json::from_str::<Value>(body).unwrap_or(Value::Null) {
+        Value::Object(map) => map.contains_key(key),
+        Value::Array(elements) => {
+            !elements.is_empty()
+                && elements
+                    .iter()
+                    .all(|element| element.as_object().is_some_and(|map| map.contains_key(key)))
+        }
+        _ => false,
+    }
+}
+
+fn body_digest(body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[test]
+fn a_batch_naming_a_writing_tool_is_refused_whole_and_runs_nothing() {
+    let fixture = Fixture::new("mcp-batch-refuses-a-write");
+    fixture.ok_json(&fixture.main, &["init", "--name", "BATCHWRITE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "already here", "--id", "t-before", "--json"],
+    );
+    let before = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+
+    // The write sits last, behind two reads that would otherwise have answered.
+    // A batch validated entry by entry as it ran would have executed both and
+    // left the caller to work out how far it got.
+    let refusal = batch_refusal(
+        &mut session,
+        2,
+        vec![
+            json!({ "name": "stale", "arguments": {} }),
+            json!({ "name": "task_list", "arguments": {} }),
+            json!({ "name": "task_add", "arguments": { "title": "batched write", "id": "t-batched" } }),
+        ],
+    );
+    assert!(refusal.contains("call 2"), "{refusal}");
+    assert!(refusal.contains("task_add"), "{refusal}");
+    assert!(refusal.contains("writes"), "{refusal}");
+    assert!(refusal.contains("nothing in it ran"), "{refusal}");
+
+    // A tool that is not listed at all -- a long-running one, which
+    // `tools/list` withholds -- is refused the same way.
+    let unlisted = batch_refusal(
+        &mut session,
+        3,
+        vec![json!({ "name": "watch", "arguments": { "limit": "1" } })],
+    );
+    assert!(unlisted.contains("call 0"), "{unlisted}");
+    assert!(unlisted.contains("no such tool watch"), "{unlisted}");
+
+    // And a batch may not carry a batch: the name resolves to no operation.
+    let nested = batch_refusal(
+        &mut session,
+        4,
+        vec![json!({ "name": "batch", "arguments": { "calls": [] } })],
+    );
+    assert!(nested.contains("no such tool batch"), "{nested}");
+
+    session.finish();
+
+    assert!(
+        !fixture
+            .run(&fixture.main, &["task", "show", "t-batched", "--json"])
+            .status
+            .success(),
+        "the refused batch still created the task its write named"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        before,
+        "the board changed under a batch that was refused whole"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+        events_before,
+        "a refused batch wrote to the ledger"
+    );
+}
+
+#[test]
+fn a_batch_over_the_bound_is_refused_naming_the_bound() {
+    let fixture = Fixture::new("mcp-batch-bound");
+    fixture.ok_json(&fixture.main, &["init", "--name", "BATCHBOUND", "--json"]);
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+
+    let stale_calls = |count: usize| vec![json!({ "name": "stale", "arguments": {} }); count];
+
+    let refusal = batch_refusal(&mut session, 2, stale_calls(33));
+    assert!(refusal.contains("at most 32"), "{refusal}");
+    assert!(
+        refusal.contains("33"),
+        "the refusal did not say how many were sent: {refusal}"
+    );
+    assert!(refusal.contains("nothing in it ran"), "{refusal}");
+
+    // The bound is the bound, not one short of it: 32 runs.
+    let accepted = batch_results(&mut session, 3, stale_calls(32));
+    let accepted = accepted.as_array().unwrap();
+    assert_eq!(accepted.len(), 32);
+    assert!(
+        accepted.iter().all(|entry| entry["ok"] == true),
+        "a batch at the bound did not run: {accepted:?}"
+    );
+
+    session.finish();
+}
+
+#[test]
+fn a_batch_entry_that_fails_carries_its_error_beside_the_others_results() {
+    let fixture = Fixture::new("mcp-batch-partial-failure");
+    fixture.ok_json(&fixture.main, &["init", "--name", "BATCHPART", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "answers", "--id", "t-answers", "--json"],
+    );
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+
+    // The failure is second of four, so the entries after it prove a refusal
+    // stops nothing, and the entry before it proves nothing was rolled back.
+    let results = batch_results(
+        &mut session,
+        2,
+        vec![
+            json!({ "name": "task_show", "arguments": { "id": "t-answers" } }),
+            json!({ "name": "context", "arguments": { "id": "t-absent" } }),
+            json!({ "name": "stale", "arguments": {} }),
+            json!({ "name": "task_list", "arguments": { "fields": "id,title" } }),
+        ],
+    );
+    let results = results.as_array().unwrap();
+    assert_eq!(results.len(), 4);
+
+    assert_eq!(results[0]["ok"], true);
+    let shown: Value = serde_json::from_str(&tool_text(&results[0]["result"])).unwrap();
+    assert_eq!(shown["title"], "answers");
+
+    assert_eq!(results[1]["ok"], false, "an unknown task id answered");
+    assert!(results[1]["result"].is_null(), "a failure carried a result");
+    assert_eq!(results[1]["error"]["isError"], true);
+    let failed = tool_text(&results[1]["error"]);
+    assert!(failed.contains("t-absent"), "{failed}");
+    assert!(failed.contains("not found"), "{failed}");
+
+    assert_eq!(results[2]["ok"], true, "a read after a failure was skipped");
+    assert_eq!(tool_text(&results[2]["result"]).trim(), "[]");
+
+    assert_eq!(results[3]["ok"], true);
+    let listed: Value = serde_json::from_str(&tool_text(&results[3]["result"])).unwrap();
+    assert_eq!(listed[0]["id"], "t-answers");
+
+    // The batch itself succeeded: a per-entry refusal is that entry's answer,
+    // not a verdict on the eleven others. `batch_results` asserted
+    // `isError: false` on the way in.
+    session.finish();
+}
+
+#[test]
+fn a_batched_read_is_byte_identical_to_the_same_read_on_its_own() {
+    // The twelve reads of the benchmark's v2 fixture, read from the fixture
+    // itself so the property is pinned to the loop that is actually measured
+    // rather than to a copy of it that can drift.
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/testing/bench/fixture-v2.json");
+    let bench: Value = serde_json::from_str(&fs::read_to_string(&fixture_path).unwrap()).unwrap();
+    let reads = bench["reads"].as_array().unwrap().clone();
+    assert_eq!(reads.len(), 12, "the v2 fixture is no longer twelve reads");
+
+    let fixture = Fixture::new("mcp-batch-identity");
+    fixture.ok_json(&fixture.main, &["init", "--name", "BATCHID", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "driver", "--as", "geoyws", "--json"],
+    );
+    let mut task_ids = Vec::new();
+    for index in 0..3 {
+        let id = format!("t-ident{index}");
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("identity fixture task {index}"),
+                "--id",
+                &id,
+                "--tag",
+                "driver",
+                "--lane",
+                "driver",
+                "--json",
+            ],
+        );
+        task_ids.push(id);
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &["attention", "raise", "open row", "--as", "geoyws", "--json"],
+    );
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "resolved row",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            resolved["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--note",
+            "resolved for the identity fixture",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "identity fixture sitrep",
+            "--as",
+            "geoyws",
+            "--lane",
+            "driver",
+            "--json",
+        ],
+    );
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let read_only_hint = |name: &str| -> Option<bool> {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| tool["annotations"]["readOnlyHint"] == true)
+    };
+
+    // Each fixture read as this session must ask it: the fixture's own tool
+    // and args, its pinned task ids swapped for this board's, and `project`
+    // added exactly where the driver adds it.
+    let mut planned = Vec::new();
+    let mut next_task = 0;
+    for read in &reads {
+        let mut arguments = read["args"].as_object().unwrap().clone();
+        if arguments.contains_key("id") {
+            arguments.insert("id".into(), json!(task_ids[next_task % task_ids.len()]));
+            next_task += 1;
+        }
+        if read["board_scoped"] != false {
+            arguments.insert("project".into(), json!("BATCHID"));
+        }
+        let drop_keys = read["normalize_drop_keys"]
+            .as_array()
+            .map(|keys| {
+                keys.iter()
+                    .map(|key| key.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        planned.push((
+            read["id"].as_str().unwrap().to_owned(),
+            read["tool"].as_str().unwrap().to_owned(),
+            Value::Object(arguments),
+            drop_keys,
+        ));
+    }
+    assert_eq!(next_task, 3, "the v2 fixture no longer pins three task ids");
+
+    // Eleven of the twelve are batchable. `claim --candidates` is read-only in
+    // the CLI -- it opens the board read-only and refuses the lease flags --
+    // but its `COMMANDS` row covers every `claim` invocation, and plain `claim`
+    // writes a lease. The row is the only signal this layer has, so the batch
+    // refuses `claim` and the benchmark's batch arm issues that one read on its
+    // own. Asserted here because the arm's round-trip count depends on it.
+    let (batchable, standalone_only): (Vec<_>, Vec<_>) = planned
+        .iter()
+        .partition(|(_, tool, ..)| read_only_hint(tool) == Some(true));
+    assert_eq!(batchable.len(), 11);
+    assert_eq!(standalone_only.len(), 1);
+    assert_eq!(standalone_only[0].0, "claim_candidates");
+    assert_eq!(read_only_hint("claim"), Some(false));
+
+    // Every read on its own first, so the comparison is against a real answer
+    // rather than against two refusals that happen to match.
+    let mut alone = BTreeMap::new();
+    for (index, (id, tool, arguments, _)) in planned.iter().enumerate() {
+        let answered = session.ask(json!({
+            "jsonrpc": "2.0", "id": 100 + index as i64, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        }));
+        assert_eq!(
+            answered["result"]["isError"],
+            false,
+            "{id} did not answer on its own: {}",
+            tool_text(&answered["result"])
+        );
+        alone.insert(id.clone(), tool_text(&answered["result"]));
+    }
+
+    let calls = batchable
+        .iter()
+        .map(|(_, tool, arguments, _)| json!({ "name": tool, "arguments": arguments }))
+        .collect::<Vec<_>>();
+    let batched = batch_results(&mut session, 200, calls);
+    let batched = batched.as_array().unwrap();
+    assert_eq!(batched.len(), batchable.len());
+
+    for (entry, (id, .., drop_keys)) in batched.iter().zip(batchable.iter()) {
+        assert_eq!(entry["ok"], true, "{id} failed inside the batch: {entry}");
+        let inside = tool_text(&entry["result"]);
+        let outside = &alone[id];
+        // The property the benchmark's equivalence check rests on, read for
+        // read: the same call inside a batch and on its own answers with the
+        // same bytes, apart from keys the fixture declares volatile.
+        let inside_canonical =
+            normalized_body(&format!("{id} inside the batch"), &inside, drop_keys);
+        let outside_canonical = normalized_body(&format!("{id} on its own"), outside, drop_keys);
+        assert_eq!(
+            inside_canonical, outside_canonical,
+            "{id} differed between a batch and a standalone call"
+        );
+        assert_eq!(
+            body_digest(&inside_canonical),
+            body_digest(&outside_canonical),
+            "{id} normalized digests differ"
+        );
+        if drop_keys.is_empty() {
+            // Nothing was declared volatile, so nothing was dropped and the
+            // raw bytes must match too.
+            assert_eq!(inside, *outside, "{id} raw bodies differ");
+        } else {
+            // A declared volatile key that is not in the response would make
+            // the normalization a no-op and the comparison above vacuous, so
+            // the fixture's claim about this read is checked, not trusted.
+            for key in drop_keys {
+                assert!(
+                    volatile_key_present(&inside, key),
+                    "{id} declares {key} volatile but the batched response has no \
+                     such key; normalize_drop_keys asserts nothing for this read"
+                );
+                assert!(
+                    volatile_key_present(outside, key),
+                    "{id} declares {key} volatile but the standalone response has \
+                     no such key; normalize_drop_keys asserts nothing for this read"
+                );
+            }
+        }
+    }
+
+    session.finish();
+}
+
 #[test]
 fn the_mcp_server_replaces_itself_without_dropping_the_session() {
     let fixture = Fixture::new("mcp-reload");
