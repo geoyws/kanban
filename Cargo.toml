@@ -45,6 +45,10 @@ path = "rust/bin/kanban-opencode-adapter.rs"
 name = "kanban-kimi-acp-adapter"
 path = "rust/bin/kanban-kimi-acp-adapter.rs"
 
+[[bin]]
+name = "kanban-cursor-worker-adapter"
+path = "rust/bin/kanban-cursor-worker-adapter.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"
