@@ -32,6 +32,7 @@ mod search;
 mod serve;
 mod store;
 mod watch;
+mod zcode_notify_adapter;
 
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
@@ -4388,6 +4389,22 @@ pub fn opencode_adapter_entrypoint() -> ! {
         Err(error) => {
             let _ = writeln!(io::stderr(), "Error: {error:#}");
             std::process::exit(opencode_adapter::exit_code(&error))
+        }
+    }
+}
+
+/// Entry point for the notify-only ZCode adapter binary.
+pub fn zcode_notify_adapter_entrypoint() -> ! {
+    match zcode_notify_adapter::entrypoint() {
+        Ok(()) => std::process::exit(0),
+        // Notify-only, so a closed stdout is not the human CLI's harmless
+        // reader-left case: the acknowledgement never reached the dispatcher
+        // and the notification must be retried rather than recorded. The exit
+        // status also carries the failure classification, which a blanket `1`
+        // would erase.
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "Error: {error:#}");
+            std::process::exit(zcode_notify_adapter::exit_code(&error))
         }
     }
 }
