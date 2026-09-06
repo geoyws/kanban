@@ -54,7 +54,8 @@ def sha256(data: bytes) -> str:
 def canonical_digest(body: bytes, drop_keys: list[str]) -> tuple[str, str | None]:
     """(raw sha256, normalized sha256 or None when the body is not JSON).
 
-    Normalization: parse, drop the fixture's declared volatile top-level keys,
+    Normalization: parse, drop the fixture's declared volatile keys (top level,
+    and per element of a top-level array),
     re-serialize with sorted keys and no whitespace. The same body over any
     transport yields the same normalized digest; a body that differs in
     anything but the dropped keys does not.
@@ -64,9 +65,18 @@ def canonical_digest(body: bytes, drop_keys: list[str]) -> tuple[str, str | None
         value = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return raw, None
+    # Volatile keys are dropped at the top level and from every element of a
+    # top-level array: `workspace list` answers with an array of workspace rows,
+    # and selecting a board stamps each row's lastUsedAt, so the reading itself
+    # moves that field on every iteration.
     if isinstance(value, dict):
         for key in drop_keys:
             value.pop(key, None)
+    elif isinstance(value, list):
+        for element in value:
+            if isinstance(element, dict):
+                for key in drop_keys:
+                    element.pop(key, None)
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return raw, sha256(canonical.encode("utf-8"))
 

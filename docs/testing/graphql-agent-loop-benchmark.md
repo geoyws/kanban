@@ -73,6 +73,14 @@ Held fixed:
 - **Response equivalence:** the sha-256 of every read's response body, per
   arm. A read whose digest differs between arms means the arms did not read
   the same board, and the receipt is disqualified (section 5).
+  Volatile keys a read declares in the fixture (`normalize_drop_keys`) are
+  removed before digesting, at the top level and from each element of an
+  array response. `workspace_list` declares `lastUsedAt`: selecting a board
+  stamps that field on the workspace row, so the bench's own reads move it on
+  every iteration and a raw digest could never be equivalent on any board.
+  Measured 2026-09-07 on the frozen v1f fixture - eleven of twelve reads
+  equivalent across arms, this one drifting within every arm with a constant
+  body length.
 
 Recorded only:
 

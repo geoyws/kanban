@@ -24,7 +24,11 @@
       "args": {},
       "board_scoped": false,
       "source": "session/SKILL.md:206 (`kb-remote ws ls --json`, registry discovery before PROJECT is known)",
-      "consumed": "name, rootPath of every row (session/SKILL.md:283-299 resolves PROJECT from the row whose rootPath prefixes the worktree)"
+      "consumed": "name, rootPath of every row (session/SKILL.md:283-299 resolves PROJECT from the row whose rootPath prefixes the worktree)",
+      "normalize_drop_keys": [
+        "lastUsedAt"
+      ],
+      "volatile_note": "Selecting a board stamps the workspace row lastUsedAt, so the bench reads themselves move it; excluded from the digest, not from the response."
     },
     {
       "id": "handoff_pending",
