@@ -2764,7 +2764,10 @@ dd{margin:0;font-size:.9rem;word-break:break-word}\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz::AuthzContext;
     use crate::model::{AddSubscription, AddTask, FinishDeployment, StartDeployment};
+    use crate::policy::{Capability, ScopeTuple, authority};
+    use crate::routing::Enforcement;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4468,6 +4471,325 @@ mod tests {
         assert!(
             stdout.contains("test serve::tests::serve_subscriptions_fixture_child_process ... ok"),
             "child did not execute the ignored subscriptions fixture\n{stdout}"
+        );
+    }
+
+    // ---------------------------------------------------------- the authz seam
+    //
+    // Authorization is the SERVING PROCESS's, never the caller's: it is minted
+    // in `routing::board_authz` from the effective UID, the two-way passwd
+    // check and the principal's grants in the canonical registry, and it is
+    // decided in `authz.rs`. A request reaches exactly two things here —
+    // `ServeConfig::actor_for_write`, which picks the AUDIT actor, and
+    // `same_origin`, which is CSRF defence — and neither can produce
+    // authority. These tests pin that separation at the one write a browser
+    // can reach, stating the principal's authority explicitly through
+    // `Store::open_with_authz` the way the store's tenancy tests do.
+
+    /// The tag every seeded row carries, so a principal holding board scope
+    /// alone is still one scope short of the row.
+    const AUTHZ_TAG: &str = "alpha";
+
+    /// The one refusal the guard produces, byte-identical for an invisible and
+    /// an absent row.
+    const AUTHZ_DENIAL: &str = "denied or not found";
+
+    struct AuthzBoard {
+        /// Held for its `Drop`: the board file lives in this directory.
+        _dir: TempDataDir,
+        path: PathBuf,
+        board_id: String,
+        attention: Vec<String>,
+    }
+
+    /// A board file carrying `rows` open attention items, each tagged
+    /// [`AUTHZ_TAG`], seeded through the DIRECT estate — the only estate that
+    /// can create rows before any principal exists.
+    fn seed_authz_board(label: &str, board_id: &str, rows: usize) -> AuthzBoard {
+        let dir = TempDataDir::new(label);
+        let path = dir.path().join(format!("{board_id}.db"));
+        let mut store = Store::open(&path).expect("open the seed board");
+        store
+            .initialize(label, "seed")
+            .expect("initialize the seed board");
+        store
+            .add_tag(AUTHZ_TAG, None, Some("seed"))
+            .expect("register the row tag");
+        let attention = (0..rows)
+            .map(|index| {
+                store
+                    .raise_attention(
+                        &format!("needs a decision ({index})"),
+                        "decision",
+                        "seed",
+                        None,
+                        0,
+                        &[AUTHZ_TAG.to_owned()],
+                    )
+                    .expect("raise an open item")
+                    .id
+            })
+            .collect();
+        drop(store);
+        AuthzBoard {
+            _dir: dir,
+            path,
+            board_id: board_id.to_owned(),
+            attention,
+        }
+    }
+
+    /// Open the seeded board under a managed principal holding exactly
+    /// `grants` — the shape `routing::board_authz` mints from the kernel,
+    /// supplied here so a test can say what the principal holds.
+    fn managed_store(board: &AuthzBoard, grants: Vec<(ScopeTuple, Capability)>) -> Store {
+        Store::open_with_authz(
+            &board.path,
+            AuthzContext::new(
+                Enforcement::Managed,
+                authority(grants),
+                board.board_id.clone(),
+            ),
+        )
+        .expect("open the board under the stated authority")
+    }
+
+    /// Board write and nothing else: every seeded row carries a tag this
+    /// principal was never granted, so every seeded row is outside it.
+    fn board_scope_only(board: &AuthzBoard) -> Vec<(ScopeTuple, Capability)> {
+        vec![(
+            ScopeTuple::Board {
+                board_id: board.board_id.clone(),
+            },
+            Capability::Write,
+        )]
+    }
+
+    /// Board and tag write: the seeded rows are inside this principal.
+    fn board_and_tag_scope(board: &AuthzBoard) -> Vec<(ScopeTuple, Capability)> {
+        vec![
+            (
+                ScopeTuple::Board {
+                    board_id: board.board_id.clone(),
+                },
+                Capability::Write,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.board_id.clone(),
+                    tag: AUTHZ_TAG.to_owned(),
+                },
+                Capability::Write,
+            ),
+        ]
+    }
+
+    fn same_origin_post_with_header(path: &str, name: &str, value: &str) -> Request {
+        TestRequest::new()
+            .with_method(Method::Post)
+            .with_path(path)
+            .with_header(
+                Header::from_bytes(&b"Host"[..], &b"kb.test"[..]).expect("a static header"),
+            )
+            .with_header(
+                Header::from_bytes(&b"Origin"[..], &b"http://kb.test"[..])
+                    .expect("a static header"),
+            )
+            .with_header(
+                Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("a test header"),
+            )
+            .into()
+    }
+
+    /// **A header cannot grant.** `--actor-header` threads one edge value into
+    /// the AUDIT actor and nowhere else, so the capability set of a write stays
+    /// the serving principal's whatever the request claims. Every claim — the
+    /// SSO identity, the operator's own name, `root` — is refused while the
+    /// principal is one scope short of the row, and the identical claim lands
+    /// once the PRINCIPAL holds that scope.
+    #[test]
+    fn actor_header_value_never_widens_the_serving_principals_authority() {
+        let claims = ["ifca-sso", OPERATOR_ACTOR, "root", "admin@edge.test"];
+        let board = seed_authz_board(
+            "authz-header",
+            "eeeeeeee-5555-4555-8555-555555555555",
+            claims.len() + 1,
+        );
+        let config =
+            ServeConfig::new(Some("X-Kanban-Actor".to_owned())).expect("a valid header name");
+
+        for (index, claimed) in claims.iter().enumerate() {
+            let url = format!("/attention/AUTHZ-HEADER/{}/reply", board.attention[index]);
+            let request = same_origin_post_with_header(&url, "X-Kanban-Actor", claimed);
+            let actor = config
+                .actor_for_write(&request)
+                .expect("the edge value becomes the audit actor");
+            assert_eq!(
+                &actor, claimed,
+                "the header value must reach the audit actor verbatim"
+            );
+            let mut store = managed_store(&board, board_scope_only(&board));
+            let error = store
+                .resolve_attention_from_trusted_edge(&board.attention[index], &actor, Some("done"))
+                .expect_err("a header value must not grant a scope the principal lacks");
+            assert_eq!(
+                error.to_string(),
+                AUTHZ_DENIAL,
+                "claiming {claimed} in a request header must not widen the authority map"
+            );
+        }
+
+        // Nothing partly applied: every seeded row is still open.
+        let direct = Store::open(&board.path).expect("reopen the board directly");
+        let open = direct
+            .attention(Some("open"), None, None, None, None, 100, false)
+            .expect("read the rows directly");
+        assert_eq!(
+            open.len(),
+            board.attention.len(),
+            "a refused write must leave every row open"
+        );
+
+        // The same rejected claim, on the same request shape, permitted now —
+        // and permitted because the PRINCIPAL gained the scope, not because
+        // the request changed at all.
+        let mut granted = managed_store(&board, board_and_tag_scope(&board));
+        let resolved = granted
+            .resolve_attention_from_trusted_edge(
+                board.attention.last().expect("a spare row"),
+                "ifca-sso",
+                Some("done"),
+            )
+            .expect("the principal's own authority permits this write");
+        assert_eq!(
+            resolved.status, "resolved",
+            "the write the authority map permits must land"
+        );
+    }
+
+    /// **Same-origin authorizes nothing.** A perfectly same-origin POST,
+    /// carrying the default loopback audit actor, still fails closed when the
+    /// serving principal is short of the board scope, and again when it is
+    /// short of only the row's tag. Passing the CSRF gate says the form came
+    /// from this site; it says nothing about capability.
+    #[test]
+    fn same_origin_post_is_csrf_defence_and_grants_no_capability() {
+        let board = seed_authz_board(
+            "authz-same-origin",
+            "ffffffff-6666-4666-8666-666666666666",
+            1,
+        );
+        let config = ServeConfig::new(None).expect("the default write actor");
+        let url = format!("/attention/AUTHZ-ORIGIN/{}/reply", board.attention[0]);
+        let request = same_origin_post(&url);
+        assert!(
+            same_origin(&request),
+            "the fixture request must pass the CSRF gate"
+        );
+        let actor = config
+            .actor_for_write(&request)
+            .expect("the default audit actor");
+        assert_eq!(
+            actor, OPERATOR_ACTOR,
+            "with no --actor-header the audit actor is the loopback operator"
+        );
+
+        // Short of the board scope entirely.
+        let mut nothing = managed_store(&board, vec![]);
+        assert_eq!(
+            nothing
+                .resolve_attention_from_trusted_edge(&board.attention[0], &actor, Some("done"))
+                .expect_err("same-origin must not authorize a principal holding nothing")
+                .to_string(),
+            AUTHZ_DENIAL,
+        );
+        // Short of only the row's tag.
+        let mut board_scope = managed_store(&board, board_scope_only(&board));
+        assert_eq!(
+            board_scope
+                .resolve_attention_from_trusted_edge(&board.attention[0], &actor, Some("done"))
+                .expect_err("same-origin must not authorize past the tag scope")
+                .to_string(),
+            AUTHZ_DENIAL,
+        );
+
+        let direct = Store::open(&board.path).expect("reopen the board directly");
+        let rows = direct
+            .attention(None, None, None, None, None, 10, false)
+            .expect("read the row directly");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "open",
+            "a refused write must not settle the row"
+        );
+        assert_eq!(
+            rows[0].resolved_by, None,
+            "a refused write must record no resolver"
+        );
+    }
+
+    /// **Audit identity and authorization principal are separately
+    /// observable.** A permitted write records the edge identity verbatim on
+    /// the row and in the ledger event, while what permitted it was the
+    /// authority map: the SAME identity is refused once the map is short of
+    /// the row's tag, and a DIFFERENT identity is permitted once it is not.
+    /// The guard reads the map and never the identity.
+    #[test]
+    fn audit_identity_is_recorded_while_the_authorization_principal_decides() {
+        let board = seed_authz_board("authz-audit", "aaaaaaaa-7777-4777-8777-777777777777", 2);
+        let config =
+            ServeConfig::new(Some("X-Auth-Request-Email".to_owned())).expect("a valid header name");
+        let url = format!("/attention/AUTHZ-AUDIT/{}/reply", board.attention[0]);
+        let request = same_origin_post_with_header(&url, "X-Auth-Request-Email", "sso@edge.test");
+        let actor = config
+            .actor_for_write(&request)
+            .expect("the edge identity becomes the audit actor");
+        assert_eq!(actor, "sso@edge.test");
+
+        let mut granted = managed_store(&board, board_and_tag_scope(&board));
+        let resolved = granted
+            .resolve_attention_from_trusted_edge(&board.attention[0], &actor, Some("done"))
+            .expect("the principal holds this row");
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some(actor.as_str()),
+            "the row must record the audit identity verbatim"
+        );
+        let direct = Store::open(&board.path).expect("reopen the board directly");
+        let events = direct
+            .events(None, Some("attention_resolved"), 10, true)
+            .expect("read the ledger directly");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].actor.as_deref(),
+            Some(actor.as_str()),
+            "the ledger event must name the audit identity"
+        );
+
+        // The same audit identity, refused on the second row: the guard read
+        // the authority map, so the identity decided neither call.
+        let mut deprived = managed_store(&board, board_scope_only(&board));
+        assert_eq!(
+            deprived
+                .resolve_attention_from_trusted_edge(&board.attention[1], &actor, Some("done"))
+                .expect_err("an audit identity cannot authorize anything")
+                .to_string(),
+            AUTHZ_DENIAL,
+        );
+        // A different audit identity on that same row, permitted, because the
+        // map covers it.
+        let mut granted_again = managed_store(&board, board_and_tag_scope(&board));
+        let second = granted_again
+            .resolve_attention_from_trusted_edge(
+                &board.attention[1],
+                "other@edge.test",
+                Some("done"),
+            )
+            .expect("the principal holds this row");
+        assert_eq!(
+            second.resolved_by.as_deref(),
+            Some("other@edge.test"),
+            "the second audit identity must be recorded verbatim too"
         );
     }
 }

@@ -1,11 +1,12 @@
 //! The epic's bypass matrix, at the compiled-process boundary (ADR-006,
 //! ADR-038 clauses 5 and 9).
 //!
-//! Seven classes, one test each: cross-board, retagging, history, projection,
-//! actor, selector, and revocation. Every one spawns the real `kanban` binary
-//! against a real SQLite estate — a library call in this process would not
-//! establish the thing being asserted, because the authority under test is
-//! minted from the SPAWNED process's own kernel identity and nothing else.
+//! Eight classes, one test each: cross-board, retagging, history, projection,
+//! actor, selector, revocation, and the web write surface. Every one spawns
+//! the real `kanban` binary against a real SQLite estate — a library call in
+//! this process would not establish the thing being asserted, because the
+//! authority under test is minted from the SPAWNED process's own kernel
+//! identity and nothing else.
 //!
 //! How a managed estate is reached without the broker. The broker's socket hop
 //! is a separate slice, and `routing::board_authz` stands in for it exactly as
@@ -27,7 +28,8 @@ use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -976,6 +978,106 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     stream.wait_for_event(APPEAR);
 }
 
+// ---------------------------------------------------------------------------
+// 8. Web edge: a request header and a same-origin POST are not authority.
+// ---------------------------------------------------------------------------
+
+/// `kanban serve --actor-header NAME` threads one trusted edge header into the
+/// AUDIT actor, and the POST also has to pass the same-origin check. Neither
+/// is an authorization input: a perfectly-formed same-origin write, carrying
+/// the username of a principal that really does own this board, is refused
+/// with the one generic denial while the SERVING process holds nothing on it —
+/// and the byte-identical request lands once that process's OWN principal is
+/// granted the board.
+///
+/// The refusal is `409` rather than `403`, which is the load-bearing detail:
+/// the same-origin gate PASSED and the guard refused anyway. The audit actor
+/// offered is `kanban-board-owner`, the real owner bound under another UID, so
+/// what the header carries is not a fiction the edge could be blamed for.
+#[test]
+fn a_trusted_edge_header_and_a_same_origin_post_are_not_authority() {
+    let estate = ManagedEstate::new("web-edge");
+    let work_a = estate.work_a.clone();
+
+    let raised = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "needs a decision",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    let attention = raised["id"].as_str().unwrap().to_owned();
+
+    // A principal that really owns board A — under another username and UID.
+    // This process's own principal owns board B and nothing on A.
+    estate.bind_other(
+        "p-real-owner",
+        "kanban-board-owner",
+        &owner_of(&estate.id_a),
+    );
+    estate.bind_self("p-elsewhere", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+
+    let server = WebServer::start(&estate, &work_a, "X-Kanban-Actor");
+    let reply = format!("/attention/Alpha/{attention}/reply");
+    let (status, body) = server.post(
+        &reply,
+        &[("X-Kanban-Actor", "kanban-board-owner")],
+        "decision=approve&reply=forged",
+    );
+    assert_eq!(status, 409, "the guard must refuse this write: {body}");
+    assert!(
+        body.contains(DENIED),
+        "the refusal must be the generic denial: {body}"
+    );
+
+    // Read the row back with enforcement lifted, so the read is not itself
+    // the thing being refused: the item is untouched.
+    estate.enforce("direct");
+    let open = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array().unwrap().len(),
+        1,
+        "a refused web write must leave the item open"
+    );
+    estate.enforce("managed");
+
+    // Now grant the SERVING process's own principal the board. Nothing about
+    // the request changes — not the header, not the origin, not the body.
+    estate.grant("p-elsewhere", &owner_of(&estate.id_a));
+    let (status, body) = server.post(
+        &reply,
+        &[("X-Kanban-Actor", "kanban-board-owner")],
+        "decision=approve&reply=recorded",
+    );
+    assert_eq!(
+        status, 303,
+        "the principal's own authority must permit this write: {body}"
+    );
+
+    estate.enforce("direct");
+    let resolved = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    let rows = resolved.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["resolvedBy"].as_str(),
+        Some("kanban-board-owner"),
+        "the edge identity is the AUDIT actor, recorded verbatim"
+    );
+}
+
 /// How many of these lines are event envelopes rather than heartbeats.
 fn events_in(lines: &[String]) -> usize {
     lines
@@ -1056,6 +1158,111 @@ impl Stream {
 }
 
 impl Drop for Stream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One `kanban serve --port N --actor-header NAME` against this estate, on an
+/// ephemeral loopback port.
+///
+/// Readiness is the process's own banner naming that port, drained through a
+/// channel so a server that never binds fails on a deadline instead of parking
+/// the test on a blocking read. `GET /` is deliberately NOT the gate: under
+/// managed enforcement the operator page reads rows this principal may not
+/// see, so a page error is the expected state, not a failure to start.
+struct WebServer {
+    child: Child,
+    port: u16,
+}
+
+impl WebServer {
+    fn start(estate: &ManagedEstate, cwd: &Path, header: &str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a loopback port");
+        let port = listener
+            .local_addr()
+            .expect("read the reserved port")
+            .port();
+        drop(listener);
+        let mut child = estate
+            .command(cwd)
+            .args([
+                "serve",
+                "--port",
+                &port.to_string(),
+                "--actor-header",
+                header,
+            ])
+            .spawn()
+            .expect("spawn kanban serve");
+        let stderr = child.stderr.take().expect("serve stderr is piped");
+        let (sender, lines) = channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let banner =
+            format!("kanban serve: http://127.0.0.1:{port} (loopback only; front it with nginx)");
+        let deadline = Instant::now() + APPEAR;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            match lines.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    if line == banner {
+                        return Self { child, port };
+                    }
+                    seen.push(line);
+                }
+                Err(_) => continue,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "kanban serve never announced {banner:?} within {APPEAR:?}:\n{}",
+            seen.join("\n")
+        );
+    }
+
+    /// One same-origin POST: `Host` and `Origin` name the same authority, so
+    /// the CSRF gate passes and whatever happens next is the guard's answer.
+    fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+        let port = self.port;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n",
+            body.len()
+        )
+        .unwrap();
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").unwrap();
+        }
+        write!(stream, "\r\n").unwrap();
+        stream.write_all(body.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        (status, text)
+    }
+}
+
+impl Drop for WebServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
