@@ -1695,6 +1695,50 @@ impl SnapshotSource for Registry {
     }
 }
 
+/// Whether SQLite refused a write because the file cannot take one — the mode
+/// bits, the mount, or the directory, as opposed to anything about the data.
+///
+/// Narrow on purpose. `DatabaseBusy` is contention, which the busy handler
+/// already answers and which a caller should still hear about; a constraint
+/// violation is a bug. Only "this file is not writable" is folded away.
+fn unwritable_database(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ReadOnly
+                    | rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::PermissionDenied,
+                ..
+            },
+            _
+        )
+    )
+}
+
+/// Stamp `last_used_at` BEST-EFFORT, and never turn the stamp into a refusal.
+///
+/// Recency is derived convenience — it orders the dashboard and nothing else
+/// reads it — so a registry this process cannot write must not be able to
+/// refuse a command over it. Measured before this existed: with `registry.db`
+/// at mode 0400, selecting a board stamped the workspace row on the way in and
+/// every read died with `attempt to write a readonly database` before it ever
+/// reached the board. Read-only commands no longer come through here at all
+/// (they take [`Registry::open_readonly`]), and this keeps the property from
+/// depending on that routing staying correct.
+///
+/// Only "the file cannot take a write" is swallowed, per
+/// [`unwritable_database`]; every other failure is still returned. Nothing is
+/// lost by skipping: the next writable selection stamps `now`, which is the
+/// only value this ever writes.
+fn stamp_recency(connection: &Connection, sql: &str, values: impl rusqlite::Params) -> Result<()> {
+    match connection.execute(sql, values) {
+        Ok(_) => Ok(()),
+        Err(error) if unwritable_database(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Registry {
     /// The data root this registry was opened at: the directory that owns the
     /// registry database and, under managed enforcement, the broker socket.
@@ -1734,6 +1778,29 @@ impl Registry {
 
     pub fn open_readonly() -> Result<Self> {
         Self::open_readonly_at(&data_root()?)
+    }
+
+    /// Open the registry for a command that only READS it.
+    ///
+    /// The registry twin of [`Store::open_for_read_as_caller`], and decided
+    /// the same way, by the stored schema alone. Already at this binary's
+    /// schema takes the read-only open: no recency stamp, no migration, and no
+    /// `chmod` re-assert on a `registry.db` nobody asked to change — which is
+    /// what lets `kanban workspace list`, the first call a resuming driver
+    /// makes, answer from a registry the caller cannot write.
+    ///
+    /// Behind it takes the writable open, because [`open_registry_readonly`]
+    /// REFUSES a registry below `REGISTRY_SCHEMA_VERSION` rather than migrate
+    /// it, and an estate that has not yet been brought forward must not have
+    /// every read refused (see `routing::enforcement_state_at`, which makes
+    /// the same allowance for the same reason). Missing takes it too: the
+    /// writable open is what creates a first registry.
+    pub fn open_for_read() -> Result<Self> {
+        let root = data_root()?;
+        if crate::db::registry_schema_is_current(&root.join("registry.db")) {
+            return Self::open_readonly_at(&root);
+        }
+        Self::open()
     }
 
     /// Open the registry read-only for a policy READ, or report that there is
@@ -2301,17 +2368,22 @@ impl Registry {
         exact_on(&self.connection, workspace)
     }
 
+    /// Resolve the project containing `workspace`, stamping recency on the way
+    /// through. The stamp is best-effort — see [`stamp_recency`]; the
+    /// resolution itself is not.
     pub fn resolve(&mut self, workspace: &Path) -> Result<Option<WorkspaceRecord>> {
         let mut cursor = workspace
             .canonicalize()
             .with_context(|| format!("resolve workspace {}", workspace.display()))?;
         loop {
             if let Some(found) = self.exact(&cursor)? {
-                self.connection.execute(
+                stamp_recency(
+                    &self.connection,
                     "UPDATE workspace_roots SET last_used_at=? WHERE root_path=?",
                     params![now_ms(), found.root_path],
                 )?;
-                self.connection.execute(
+                stamp_recency(
+                    &self.connection,
                     "UPDATE boards SET last_used_at=? WHERE board_path=?",
                     params![now_ms(), found.board_path],
                 )?;
@@ -4240,13 +4312,14 @@ impl Registry {
     /// side effect of walking the registry; name-based resolution has no walk,
     /// so without this the dashboard's recency ordering would freeze for any
     /// project addressed only by name.
+    ///
+    /// Best-effort: see [`stamp_recency`].
     pub fn touch_board(&self, board_path: &str) -> Result<()> {
-        let now = now_ms();
-        self.connection.execute(
+        stamp_recency(
+            &self.connection,
             "UPDATE boards SET last_used_at=? WHERE board_path=?",
-            params![now, board_path],
-        )?;
-        Ok(())
+            params![now_ms(), board_path],
+        )
     }
 
     pub fn integrity(&self) -> Result<Vec<String>> {
