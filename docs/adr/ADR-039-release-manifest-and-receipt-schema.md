@@ -254,6 +254,18 @@ state, before anything is written, and refuses exactly:
 9. bin dir exists and is not a directory — `:401`
 10. any `<bin-dir>/<release-binary>` exists and is not a symlink this installer
     manages — `:406`–`:408`
+11. `releases/<releaseId>.receipt.json` exists and is not a receipt this
+    installer could have written — called between refusals 6 and 7 (`:463`),
+    and `ensure_managed_activation_receipt` (`:407`, embedded verbatim at
+    `:1090` and pinned by the same drift test) requires all three of: a
+    regular non-symlink file that parses as a JSON object (`:412`–`:417`);
+    `releaseId`, `sourceCommit` and `manifestSha256` all equal to the release
+    being installed (`:418`–`:423`); and an integer `activationSequence` from
+    1 up to the `releases/.activation-sequence` counter, which reads 0 when
+    that counter is absent, so a sequence no activation ever issued is refused
+    (`:424`–`:437`). A receipt this installer wrote passes all three, which is
+    what keeps re-activating an installed release idempotent rather than
+    refused.
 
 "Managed" is decided by `managed_symlink` (`scripts/hig-release.sh:358`): the
 link's target parent directory must be named `releases` (for `current`) or
@@ -261,7 +273,7 @@ link's target parent directory must be named `releases` (for `current`) or
 root (`:367`–`:370`, resolving through `physical_dir` at `:351`). An operator's
 own file or a symlink pointing anywhere else is never replaced. The whole guard
 is embedded verbatim in the remote installer (`scripts/hig-release.sh:1006`
-onward, the same ten refusals at `:1014`, `:1015`, `:1017`, `:1018`, `:1021`,
+onward, the same refusals 1–10 at `:1014`, `:1015`, `:1017`, `:1018`, `:1021`,
 `:1022`, `:1026`, `:1029`, `:1030`, `:1037`), and
 `hig_release_script_local_and_remote_install_guards_are_identical` in
 `tests/e2e.rs` fails when the two copies drift.

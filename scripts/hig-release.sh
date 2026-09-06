@@ -369,7 +369,7 @@ bin_link_path() {
   printf '%s/%s' "$1" "$2"
 }
 
-# The four functions below are embedded verbatim in the remote install script
+# The five functions below are embedded verbatim in the remote install script
 # (see install_remote); hig_release_script_local_and_remote_install_guards_are_identical
 # in tests/e2e.rs fails when the two copies drift.
 physical_dir() {
@@ -394,6 +394,49 @@ managed_symlink() {
   [[ "$parent_physical" == "$root_physical" ]]
 }
 
+# `releases/<id>.receipt.json` is as much a managed destination as `current`
+# and the bin links: the installer writes it only when nothing is there, so a
+# receipt already at that path is adopted whole -- reported back as this
+# activation's receipt, and read by release_entries as the ordering key that
+# decides retention and rollback. A planted one therefore pins itself newest
+# and evicts a real release without ever having been installed. A receipt
+# this installer wrote names the release being installed in all three
+# identity fields and carries a sequence this install root actually issued,
+# so re-activating an installed release still passes; anything else is
+# refused before a byte is written.
+ensure_managed_activation_receipt() {
+  local receipt="$1"
+  local install_root="$2"
+  local release_id="$3"
+  [[ -e "$receipt" || -L "$receipt" ]] || return 0
+  [[ ! -L "$receipt" ]] ||
+    die "refusing to install: $receipt is a symlink, not an activation receipt this installer wrote; move it aside before installing"
+  [[ -f "$receipt" ]] ||
+    die "refusing to install: $receipt is not a regular file, so it is not an activation receipt this installer wrote; move it aside before installing"
+  jq -e 'type == "object"' "$receipt" >/dev/null 2>&1 ||
+    die "refusing to install: $receipt does not parse as a JSON object; move it aside before installing"
+  jq -e --arg release_id "$release_id" --arg source_commit "${release_id%%-*}" --arg manifest_sha "${release_id##*-}" '
+    (.releaseId == $release_id) and
+    (.sourceCommit == $source_commit) and
+    (.manifestSha256 == $manifest_sha)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt does not name the release being installed ($release_id); move it aside before installing"
+  local counter=0 sequence sequence_path
+  sequence="$(jq -c '.activationSequence' "$receipt")"
+  sequence_path="$install_root/releases/.activation-sequence"
+  if [[ -f "$sequence_path" && ! -L "$sequence_path" ]]; then
+    counter="$(tr -d '[:space:]' <"$sequence_path")"
+    [[ "$counter" =~ ^[0-9]+$ ]] || counter=0
+  fi
+  jq -e --argjson counter "$counter" '
+    ((.activationSequence | type) == "number") and
+    ((.activationSequence | floor) == .activationSequence) and
+    (.activationSequence >= 1) and
+    (.activationSequence <= $counter)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt carries activationSequence $sequence, which is not an integer this install root has issued (its counter stands at $counter); move it aside before installing"
+}
+
 # Refuses, before anything is written, every path an activation writes through
 # unless it has the shape this installer creates: releases/ and releases/<id>
 # real directories, current and bin/<name> absent or managed symlinks, the bin
@@ -406,6 +449,7 @@ ensure_safe_release_view() {
   local releases="$install_root/releases"
   local current="$install_root/current"
   local release_path="$releases/$release_id"
+  local release_meta="$releases/$release_id.receipt.json"
   [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
   [[ ! -e "$install_root" || -d "$install_root" ]] || die "install root is not a directory: $install_root"
   if [[ -e "$releases" || -L "$releases" ]]; then
@@ -416,6 +460,7 @@ ensure_safe_release_view() {
     [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
     [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
   fi
+  ensure_managed_activation_receipt "$release_meta" "$install_root" "$release_id"
   if [[ -e "$current" || -L "$current" ]]; then
     managed_symlink "$current" "$install_root" releases ||
       die "refusing to replace $current: it is not a symlink into $releases managed by this installer; move it aside before installing"
@@ -1039,6 +1084,42 @@ managed_symlink() {
   [[ "$parent_physical" == "$root_physical" ]]
 }
 
+# Verbatim copy of the local guard; see the comment above the local
+# ensure_managed_activation_receipt for why a receipt already at the release
+# receipt path is refused unless this installer could have written it.
+ensure_managed_activation_receipt() {
+  local receipt="$1"
+  local install_root="$2"
+  local release_id="$3"
+  [[ -e "$receipt" || -L "$receipt" ]] || return 0
+  [[ ! -L "$receipt" ]] ||
+    die "refusing to install: $receipt is a symlink, not an activation receipt this installer wrote; move it aside before installing"
+  [[ -f "$receipt" ]] ||
+    die "refusing to install: $receipt is not a regular file, so it is not an activation receipt this installer wrote; move it aside before installing"
+  jq -e 'type == "object"' "$receipt" >/dev/null 2>&1 ||
+    die "refusing to install: $receipt does not parse as a JSON object; move it aside before installing"
+  jq -e --arg release_id "$release_id" --arg source_commit "${release_id%%-*}" --arg manifest_sha "${release_id##*-}" '
+    (.releaseId == $release_id) and
+    (.sourceCommit == $source_commit) and
+    (.manifestSha256 == $manifest_sha)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt does not name the release being installed ($release_id); move it aside before installing"
+  local counter=0 sequence sequence_path
+  sequence="$(jq -c '.activationSequence' "$receipt")"
+  sequence_path="$install_root/releases/.activation-sequence"
+  if [[ -f "$sequence_path" && ! -L "$sequence_path" ]]; then
+    counter="$(tr -d '[:space:]' <"$sequence_path")"
+    [[ "$counter" =~ ^[0-9]+$ ]] || counter=0
+  fi
+  jq -e --argjson counter "$counter" '
+    ((.activationSequence | type) == "number") and
+    ((.activationSequence | floor) == .activationSequence) and
+    (.activationSequence >= 1) and
+    (.activationSequence <= $counter)
+  ' "$receipt" >/dev/null ||
+    die "refusing to install: $receipt carries activationSequence $sequence, which is not an integer this install root has issued (its counter stands at $counter); move it aside before installing"
+}
+
 # Refuses, before anything is written, every path an activation writes through
 # unless it has the shape this installer creates: releases/ and releases/<id>
 # real directories, current and bin/<name> absent or managed symlinks, the bin
@@ -1051,6 +1132,7 @@ ensure_safe_release_view() {
   local releases="$install_root/releases"
   local current="$install_root/current"
   local release_path="$releases/$release_id"
+  local release_meta="$releases/$release_id.receipt.json"
   [[ ! -L "$install_root" ]] || die "install root must not be a symlink: $install_root"
   [[ ! -e "$install_root" || -d "$install_root" ]] || die "install root is not a directory: $install_root"
   if [[ -e "$releases" || -L "$releases" ]]; then
@@ -1061,6 +1143,7 @@ ensure_safe_release_view() {
     [[ ! -L "$release_path" ]] || die "refusing to activate a symlink at $release_path; remove it so the release directory is a real directory inside $releases"
     [[ -d "$release_path" ]] || die "refusing to activate: $release_path is not a directory; move it aside so the installer can create the release directory"
   fi
+  ensure_managed_activation_receipt "$release_meta" "$install_root" "$release_id"
   if [[ -e "$current" || -L "$current" ]]; then
     managed_symlink "$current" "$install_root" releases ||
       die "refusing to replace $current: it is not a symlink into $releases managed by this installer; move it aside before installing"

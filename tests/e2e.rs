@@ -24475,6 +24475,7 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         "physical_dir",
         "managed_symlink",
         "ensure_safe_release_view",
+        "ensure_managed_activation_receipt",
         "atomic_symlink",
         "reject_carried_release_identity",
     ] {
@@ -24627,6 +24628,159 @@ fn hig_release_script_refuses_a_package_that_carries_the_release_identity_it_der
     let meta: Value =
         serde_json::from_slice(&fs::read(installed["receipt"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(meta["releaseId"], json!(truthful_id));
+}
+
+/// `releases/<id>.receipt.json` is a managed destination, not a hint. The
+/// installer writes it only when nothing is there (`[[ ! -f "$release_meta"
+/// ]]`), so a receipt planted for a release that was never installed used to
+/// be adopted whole: the install reported the planted file back as its own
+/// receipt, and `release_entries` orders retention and rollback by the
+/// `activationSequence` it reads, so a forged 9999 pinned the forgery newest
+/// and pushed a real release out of the ten. The guard therefore checks the
+/// receipt's identity against the release being installed and its sequence
+/// against the counter this install root has actually issued.
+#[test]
+fn hig_release_script_refuses_a_planted_activation_receipt_at_the_release_receipt_path() {
+    let harness = ReleaseGuardHarness::new("hig-release-planted-receipt");
+    let release_id = release_id_from_package(&harness.package_dir);
+    // The bytes a real activation of this very release wrote, so the second
+    // forgery below is genuine in every field except the one under test.
+    let genuine: Value = serde_json::from_slice(
+        &fs::read(
+            harness
+                .hax_install_root
+                .join("releases")
+                .join(format!("{release_id}.receipt.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut resequenced = genuine.clone();
+    resequenced["activationSequence"] = json!(9999);
+
+    let forgeries = [
+        // The bug's own reproduction: a matching id, a forged sequence, and
+        // none of the provenance a receipt this installer wrote carries.
+        (
+            "bare",
+            json!({
+                "releaseId": release_id.clone(),
+                "activationSequence": 9999,
+                "installedAt": 1,
+            }),
+            true,
+        ),
+        // Every identity field genuine; only the sequence forged past
+        // anything this install root ever issued.
+        ("resequenced", resequenced, false),
+    ];
+
+    for target in ["hax", "hig"] {
+        for (slug, forgery, identity_check) in &forgeries {
+            let install_root = harness
+                .fixture
+                .root
+                .join(format!("planted-receipt-{slug}-{target}"));
+            let bin_dir = harness
+                .fixture
+                .root
+                .join(format!("planted-receipt-{slug}-bin-{target}"));
+            let releases = install_root.join("releases");
+            fs::create_dir_all(&releases).unwrap();
+            let planted = releases.join(format!("{release_id}.receipt.json"));
+            let bytes = serde_json::to_vec_pretty(forgery).unwrap();
+            fs::write(&planted, &bytes).unwrap();
+
+            let refusal = if *identity_check {
+                format!(
+                    "refusing to install: {} does not name the release being installed ({release_id}); move it aside before installing",
+                    planted.display()
+                )
+            } else {
+                format!(
+                    "refusing to install: {} carries activationSequence 9999, which is not an integer this install root has issued (its counter stands at 0); move it aside before installing",
+                    planted.display()
+                )
+            };
+            harness.assert_refused_without_mutation(
+                target,
+                &install_root,
+                &bin_dir,
+                &refusal,
+                &[&install_root, &bin_dir],
+            );
+
+            assert_eq!(
+                fs::read(&planted).unwrap(),
+                bytes,
+                "{target}: the {slug} receipt was rewritten instead of refused"
+            );
+            assert!(
+                fs::symlink_metadata(releases.join(&release_id)).is_err(),
+                "{target}: the {slug} forgery got a release directory"
+            );
+            assert!(
+                fs::symlink_metadata(install_root.join("current")).is_err(),
+                "{target}: the {slug} forgery was activated at current"
+            );
+            assert!(
+                fs::symlink_metadata(releases.join(".activation-sequence")).is_err(),
+                "{target}: the refused install issued an activation sequence"
+            );
+        }
+    }
+}
+
+/// The other half of the guard above: a receipt this installer wrote must
+/// pass it, or re-activating an already-installed release -- the ordinary
+/// idempotent case, and the one every redeploy takes -- becomes a refusal.
+/// The proof is the receipt's own bytes. ADR-039 makes the activation receipt
+/// write-once per release id, so the second install must leave its
+/// `activationSequence` and `installedAt` exactly as the first activation
+/// recorded them and must not burn a sequence off the counter.
+#[test]
+fn hig_release_script_reactivates_an_installed_release_without_touching_its_receipt() {
+    let harness = ReleaseGuardHarness::new("hig-release-reinstall-idempotent");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("reinstall-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("reinstall-bin-{target}"));
+        let first = harness.install(target, &install_root, &bin_dir);
+        assert!(
+            first.status.success(),
+            "{target}: first install failed: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let releases = install_root.join("releases");
+        let receipt_path = releases.join(format!("{release_id}.receipt.json"));
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let counter_path = releases.join(".activation-sequence");
+        let counter_before = fs::read(&counter_path).unwrap();
+
+        let again = harness.install(target, &install_root, &bin_dir);
+        assert!(
+            again.status.success(),
+            "{target}: re-activating an installed release was refused: {}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        assert_eq!(
+            fs::read(&receipt_path).unwrap(),
+            receipt_before,
+            "{target}: the second activation rewrote the write-once receipt"
+        );
+        assert_eq!(
+            fs::read(&counter_path).unwrap(),
+            counter_before,
+            "{target}: the second activation issued a new sequence"
+        );
+        assert_release_view(&install_root, &bin_dir, &releases.join(&release_id));
+        let reported: Value = serde_json::from_slice(&again.stdout).unwrap();
+        assert_eq!(
+            PathBuf::from(reported["receipt"].as_str().unwrap()),
+            receipt_path,
+            "{target}: the re-install reported a different receipt path"
+        );
+    }
 }
 
 /// `releaseId` is `sourceCommit-manifestSha256`, not the commit: two builds of
