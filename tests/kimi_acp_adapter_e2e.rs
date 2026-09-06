@@ -11,7 +11,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const EVENT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CHILD_PATH: &str = "/usr/bin:/bin";
 const NORMAL_TIMEOUT_MS: &str = "5000";
-const DEADLINE_TIMEOUT_MS: &str = "1000";
+// Long enough that a COLD SPAWN cannot lose the race, short enough that the
+// test stays quick. The fake peer hangs 30s, so an unanswered frame still
+// breaches this deterministically (6x margin) - but the test also asserts the
+// peer READ the frame, and at 1000ms a loaded full-suite run hit the deadline
+// before the fake had spawned and recorded the read. See t-0ca6de57 for the
+// same class in the dispatcher fixtures.
+const DEADLINE_TIMEOUT_MS: &str = "5000";
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 

@@ -24,7 +24,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const CREATED_AT: i64 = 1_720_000_000;
 const NORMAL_TURN_TIMEOUT_MS: &str = "10000";
 const HELD_TURN_TIMEOUT_MS: &str = "600000";
-const DEADLINE_TURN_TIMEOUT_MS: &str = "1000";
+// Long enough that a COLD SPAWN cannot lose the race, short enough that the
+// test stays quick. The fake hangs 30s, so an unbounded hang still exceeds
+// this deterministically (6x margin) - but the test also asserts the worker
+// RECORDED its start, and at 1000ms a loaded full-suite run killed the turn
+// before the fake had spawned and written its marker: the deadline behaviour
+// was right and the secondary assertion failed. See t-0ca6de57 for the same
+// class in the dispatcher fixtures.
+const DEADLINE_TURN_TIMEOUT_MS: &str = "5000";
 const NORMAL_QUEUE_WAIT_MS: &str = "10000";
 const NO_QUEUE_WAIT_MS: &str = "0";
 /// How long the `hold` scenario occupies the worker; must match the fixture.
