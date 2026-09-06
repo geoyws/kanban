@@ -2664,101 +2664,110 @@ bindQuickReplies();
 connectLive();
 "#;
 
+/// The terminal skin: phosphor green on black, one accent.
+///
+/// Amber is work that is waiting or retrying, red is the only failure states
+/// (dead letters, P0, errors, decline), and everything else is phosphor or its
+/// dim shade. Every pill variant is spelled out even where it only restates the
+/// dim default, so that adding a colour is an edit to a line that already
+/// exists rather than a new rule someone has to invent.
 const CSS: &str = "\
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');\
 *{box-sizing:border-box}\
-:root{color-scheme:dark;--canvas:#090d12;--surface:#10161f;--raised:#161e29;\
---line:#293241;--text:#f0f4f8;--muted:#9aa8b7;--accent:#58a6ff;--focus:#79c0ff}\
-body{margin:0;min-height:100vh;font:16px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;\
-color:var(--text);background:radial-gradient(circle at 50% -20rem,#172338 0,var(--canvas) 36rem)}\
+:root{color-scheme:dark;--canvas:#0a0a0a;--phosphor:#33ff33;--dim:#1e9e1e;--amber:#ffb000;\
+--red:#ff3333;--panel:rgba(51,255,51,.06)}\
+body{margin:0;min-height:100vh;color:var(--phosphor);background:var(--canvas);\
+font:14px/1.6 'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;\
+scrollbar-color:var(--dim) var(--canvas)}\
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:99;\
+background:radial-gradient(ellipse at center,rgba(51,255,51,.03) 0,transparent 70%)}\
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:100;\
+background:repeating-linear-gradient(0deg,rgba(0,0,0,.06) 0,rgba(0,0,0,.06) 1px,transparent 1px,transparent 3px)}\
 nav{z-index:10;display:flex;align-items:center;gap:.8rem;padding:.65rem max(1rem,env(safe-area-inset-right)) .65rem max(1rem,env(safe-area-inset-left));\
-background:rgba(16,22,31,.94);border-bottom:1px solid var(--line);position:sticky;top:0;backdrop-filter:blur(14px)}\
-.brand{display:grid;place-items:center;width:2.5rem;height:2.5rem;border-radius:.75rem;\
-background:#1f6feb;color:white;font:800 1rem ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.08em}\
+background:var(--canvas);border-bottom:1px solid var(--dim);position:sticky;top:0}\
+.brand,.brand:hover{padding:0;background:transparent;color:var(--phosphor);font-weight:700;\
+text-shadow:0 0 10px rgba(51,255,51,.5)}\
+.brand::before{content:'>';margin-right:.4em}\
 .nav-links{display:flex;align-items:center;gap:.15rem}\
-nav a{display:flex;align-items:center;min-height:2.5rem;padding:0 .65rem;color:var(--text);\
-text-decoration:none;font-weight:650;border-radius:.6rem;white-space:nowrap}\
-nav a:hover{color:white;background:#202a38}\
+nav a{display:flex;align-items:center;min-height:2.5rem;padding:0 .65rem;color:var(--phosphor);\
+text-decoration:none;border-radius:4px;white-space:nowrap}\
+nav a:hover{color:var(--canvas);background:var(--phosphor);text-decoration:none}\
 nav form{margin-left:auto;min-width:8rem}nav form input{width:100%}\
-input,button,textarea{min-height:2.75rem;font:inherit;color:var(--text);background:#0b1119;\
-border:1px solid var(--line);border-radius:.65rem;padding:.55rem .7rem}\
-input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}\
-button{cursor:pointer;background:#1f6feb;border-color:#388bfd;font-weight:700;box-shadow:0 1px 1px #0008}\
-button:hover{filter:brightness(1.12)}button:active{transform:translateY(1px)}\
-.quick{background:#202a38;border-color:#3a4657}.quick.approve{background:#173e27;border-color:#2ea043}\
-.quick.decline{background:#4a2023;border-color:#b3454b}.send{order:4;margin-left:auto}\
+input,button,textarea{min-height:2.75rem;font:inherit;color:var(--phosphor);background:var(--canvas);\
+border:1px solid var(--phosphor);border-radius:4px;padding:.55rem .7rem}\
+input::placeholder,textarea::placeholder{color:var(--dim)}\
+input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}\
+button{cursor:pointer;background:transparent}\
+button:hover{opacity:.85}button:active{transform:translateY(1px)}\
+.send,.quick.approve,.reply button[type=submit]{color:var(--canvas);background:var(--phosphor);font-weight:700}\
+.quick.decline,.reply .quick.decline{color:var(--red);background:transparent;border-color:var(--red);font-weight:400}\
+.send{order:4;margin-left:auto}\
 .search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
 main{max-width:64rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
-footer{max-width:64rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--muted);font-size:.85rem}\
-h1{font-size:clamp(1.65rem,5vw,2.2rem);letter-spacing:-.035em;line-height:1.15;margin:.2rem 0 1rem}\
-h2{font-size:1.05rem;margin:1.6rem 0 .5rem;color:#c9d1d9}\
-a{color:var(--accent)}\
-code{font:.85em ui-monospace,SFMono-Regular,Menlo,monospace;background:#161b22;\
-padding:.1em .35em;border-radius:4px}\
-pre{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.8rem;\
-overflow-x:auto;white-space:pre-wrap;word-break:break-word;font:.85rem/1.5 \
-ui-monospace,SFMono-Regular,Menlo,monospace}\
-table{width:100%;border-collapse:collapse;font-size:.9rem}\
-th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #21262d;\
+footer{max-width:64rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--dim);font-size:.85rem}\
+h1{font-size:1.25rem;font-weight:700;line-height:1.3;margin:.2rem 0 1rem;text-shadow:0 0 10px rgba(51,255,51,.5)}\
+h1::before{content:'> '}\
+h2{font-size:.9rem;font-weight:700;margin:1.6rem 0 .5rem;color:var(--dim)}\
+a{color:var(--phosphor);text-decoration:none}a:hover{text-decoration:underline}\
+code{color:var(--phosphor);background:rgba(51,255,51,.1);padding:.1em .35em;border-radius:2px}\
+pre{background:var(--panel);border:1px solid var(--dim);border-radius:4px;padding:.8rem;\
+overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem}\
+table{width:100%;border-collapse:collapse;font-size:.85rem}\
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--dim);\
 vertical-align:top}\
-th{color:#8b949e;font-weight:600}\
+th{color:var(--dim);font-weight:400}\
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}\
-td.waiting{color:#f0883e;font-weight:700}\
-.queued{margin-top:.25rem;font-size:.85rem;color:var(--muted)}\
-.queued .retrying{color:#ffd19a;font-weight:600}\
-.queued .dead{color:#f0883e;font-weight:700}\
-td.when{white-space:nowrap;color:#8b949e}\
-td.payload{color:#8b949e;font-size:.85rem;word-break:break-word}\
-.item,.note,.plan,.search-result{border:1px solid var(--line);border-radius:1rem;padding:clamp(.9rem,3vw,1.25rem);\
-margin:1rem 0;background:linear-gradient(145deg,var(--raised),var(--surface));box-shadow:0 12px 32px #0003}\
-.item:has(.priority-p0){border-color:#8b3232}.item:has(.priority-p1){border-color:#694521}\
+td.waiting{color:var(--amber);font-weight:700}\
+.queued{margin-top:.25rem;font-size:.85rem;color:var(--dim)}\
+.queued .retrying{color:var(--amber);font-weight:600}\
+.queued .dead{color:var(--red);font-weight:700}\
+td.when{white-space:nowrap;color:var(--dim)}\
+td.payload{color:var(--dim);font-size:.85rem;word-break:break-word}\
+.item,.note,.plan,.search-result{border:1px solid var(--dim);border-radius:4px;\
+padding:clamp(.9rem,3vw,1.25rem);margin:1rem 0;background:rgba(51,255,51,.08)}\
+.item:has(.priority-p0){border-color:var(--red)}.item:has(.priority-p1){border-color:var(--amber)}\
 .heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
-.live{color:#3fb950;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}\
-.success{background:#12351f;border:1px solid #2c7a44;border-radius:6px;padding:.6rem .75rem}\
+.live{color:var(--phosphor);font-size:.75rem}\
+.live::after{content:'_';animation:blink 1s step-end infinite}\
+@keyframes blink{50%{opacity:0}}\
+.success{background:var(--panel);border:1px solid var(--phosphor);border-radius:4px;padding:.6rem .75rem}\
 .notices{display:grid;gap:.35rem;margin:0 0 1.1rem}\
 .notice{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:0;padding:.4rem .55rem;\
-font-size:.85rem;background:var(--surface);border:1px solid var(--line);\
-border-left:3px solid var(--accent);border-radius:.5rem;animation:notice-in .18s ease-out}\
-.notice-board{color:var(--muted)}\
-.notice-what{font-weight:650}\
-.notice.summary .notice-what{font-weight:800}\
+font-size:.85rem;background:var(--canvas);border:1px solid var(--dim);\
+border-left:2px solid var(--phosphor);border-radius:4px;animation:notice-in .18s ease-out}\
+.notice-board{color:var(--dim)}\
+.notice-what{font-weight:400}\
+.notice.summary .notice-what{font-weight:700}\
 .notice .dismiss{margin-left:auto;min-height:auto;padding:.1rem .5rem;font-size:.75rem;\
-font-weight:600;background:#202a38;border-color:#3a4657;box-shadow:none}\
+color:var(--dim);border-color:var(--dim)}\
 @keyframes notice-in{from{opacity:0;transform:translateY(-.25rem)}to{opacity:1;transform:none}}\
-.reply{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--line)}.reply label{display:block;color:var(--muted);font-size:.8rem;margin-bottom:.35rem}\
-.reply textarea{display:block;width:100%;min-height:5.5rem;resize:vertical;line-height:1.45}\
+.reply{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--dim)}.reply label{display:block;color:var(--dim);font-size:.8rem;margin-bottom:.35rem}\
+.reply textarea{display:block;width:100%;min-height:5.5rem;resize:vertical}\
 .actions{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.65rem}.actions button{min-width:6.5rem}\
-.search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:#8b949e}\
-.meta{color:var(--muted);font-size:.85rem;margin:.2rem 0}\
+.search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:var(--dim)}\
+.meta{color:var(--dim);font-size:.85rem;margin:.2rem 0}\
 .body{margin:.5rem 0;white-space:pre-wrap}\
 .cmd{margin:.5rem 0 0;font-size:.85rem}\
-.empty{color:#8b949e}\
-.count{color:#8b949e;font-weight:400;font-size:.85rem}\
-.attention-count{display:inline-block;margin-left:.4rem;padding:.1rem .45rem;border-radius:999px;\
-background:#12351f;border:1px solid #2c7a44;color:#9fe6b5;font-size:.75rem;font-weight:700}\
+.empty{color:var(--dim)}\
+.count{color:var(--dim);font-weight:400;font-size:.85rem}\
+.attention-count{display:inline-block;margin-left:.4rem;padding:.05em .45em;border-radius:2px;\
+background:transparent;border:1px solid var(--phosphor);color:var(--phosphor);font-size:.75rem;font-weight:700}\
 .kind,.type,.status,.lane,.tag,.priority{display:inline-block;padding:.05em .5em;\
-border-radius:999px;font-size:.75rem;font-weight:600;border:1px solid #30363d}\
-.kind-blocking{background:#4a1d1d;border-color:#8b3232}\
-.kind-risk{background:#4a2f13;border-color:#9e5a1c}\
-.kind-approval{background:#13314a;border-color:#1c5a9e}\
-.kind-decision{background:#2a1d4a;border-color:#5a3a9e}\
-.kind-review{background:#12351f;border-color:#2c7a44}\
-.priority-p0{background:#4a1d1d;border-color:#c34a4a;color:#ffb3b3}\
-.priority-p1{background:#4a2f13;border-color:#b46a24;color:#ffd19a}\
-.priority-p2{background:#161b22;border-color:#30363d;color:#8b949e}\
-.priority-legacy{background:#2a1d4a;border-color:#5a3a9e;color:#d2b8ff}\
-.type-epic{background:#2a1d4a}.type-story{background:#13314a}\
-.tag{background:#161b22;color:#8b949e}\
-.lane{background:#161b22;color:#8b949e}\
+border-radius:2px;font-size:.75rem;color:var(--dim);background:transparent;border:1px solid var(--dim)}\
+.kind-blocking,.priority-p0{color:var(--red);border-color:var(--red)}\
+.kind-risk,.priority-p1{color:var(--amber);border-color:var(--amber)}\
+.kind-review,.kind-approval{color:var(--phosphor);border-color:var(--phosphor)}\
+.kind-decision,.priority-p2,.priority-legacy,.type-epic,.type-story,.type-task{color:var(--dim);border-color:var(--dim)}\
 ul.rows,ul.children{list-style:none;padding:0;margin:.3rem 0}\
-ul.rows li,ul.children li{padding:.3rem 0;border-bottom:1px solid #21262d}\
+ul.rows li,ul.children li{padding:.3rem 0;border-bottom:1px solid var(--dim)}\
 dl{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:.4rem 0}\
-dt{color:#8b949e;font-size:.85rem}\
+dt{color:var(--dim);font-size:.85rem}\
 dd{margin:0;font-size:.9rem;word-break:break-word}\
 .plan-body{max-height:28rem;overflow-y:auto}\
-.error{color:#f85149}\
+.error{color:var(--red)}\
 @media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.send{order:0;margin-left:0;width:100%}.actions button{flex:1}.heading{align-items:flex-start}table{min-width:38rem}}\
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
-.notice{animation:none}}\
+.notice{animation:none}.live::after{animation:none}}\
 ";
 
 #[cfg(test)]
@@ -3888,20 +3897,20 @@ mod tests {
             "a subscription with nothing waiting must render no queued line: {quiet}"
         );
 
-        // Three states, three treatments: plain muted, amber for a retry that
-        // resolves itself, and the orange bold that already means "a person
-        // has to look at this" elsewhere in this UI.
+        // Three states, three treatments: dim for the ones that are merely
+        // queued, amber for a retry that resolves itself, and red for a dead
+        // letter, because in this UI red is failure and nothing else.
         assert!(
-            CSS.contains(".queued .retrying{color:#ffd19a;font-weight:600}"),
+            CSS.contains(".queued .retrying{color:var(--amber);font-weight:600}"),
             "{CSS}"
         );
         assert!(
-            CSS.contains(".queued .dead{color:#f0883e;font-weight:700}"),
+            CSS.contains(".queued .dead{color:var(--red);font-weight:700}"),
             "{CSS}"
         );
         assert!(
-            CSS.contains("td.waiting{color:#f0883e;font-weight:700}"),
-            "the dead treatment reuses the operator-attention colour already in this UI: {CSS}"
+            CSS.contains("td.waiting{color:var(--amber);font-weight:700}"),
+            "waiting is the same amber as a retry: attention, not yet failure: {CSS}"
         );
     }
 
