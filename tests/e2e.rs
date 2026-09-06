@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use syn::parse::Parser;
@@ -24187,24 +24187,70 @@ impl ReleaseGuardHarness {
     /// `target` is `hax` for the local install path or `hig` for the embedded
     /// remote script.
     fn install(&self, target: &str, install_root: &Path, bin_dir: &Path) -> Output {
+        self.install_from(
+            target,
+            &self.package_dir,
+            &self.hax_install_root,
+            install_root,
+            bin_dir,
+        )
+    }
+
+    /// `install`, for a package other than the one the harness built: a test
+    /// that needs two distinct builds of one commit, or a second release to
+    /// install over the first, packages them itself.
+    fn install_from(
+        &self,
+        target: &str,
+        package_dir: &Path,
+        hax_install_root: &Path,
+        install_root: &Path,
+        bin_dir: &Path,
+    ) -> Output {
+        self.install_command(target, package_dir, hax_install_root, install_root, bin_dir)
+            .output()
+            .unwrap()
+    }
+
+    /// The invocation itself, so a test that must prove the installer never
+    /// blocks can spawn it against a deadline instead of waiting on it.
+    fn install_command(
+        &self,
+        target: &str,
+        package_dir: &Path,
+        hax_install_root: &Path,
+        install_root: &Path,
+        bin_dir: &Path,
+    ) -> Command {
         let mut command = self.command();
         command.args([
             "install",
             target,
             "--package",
-            self.package_dir.to_str().unwrap(),
+            package_dir.to_str().unwrap(),
             "--install-root",
             install_root.to_str().unwrap(),
             "--bin-dir",
             bin_dir.to_str().unwrap(),
         ]);
         if target == "hig" {
-            command.args([
-                "--hax-install-root",
-                self.hax_install_root.to_str().unwrap(),
-            ]);
+            command.args(["--hax-install-root", hax_install_root.to_str().unwrap()]);
         }
-        command.output().unwrap()
+        command
+    }
+
+    /// The stub tree `install_matching_hax_package` needs, so a test that must
+    /// activate its own package on HAX before installing it on HIG reuses this
+    /// harness instead of building a second set of fakes.
+    fn hax_context(&self) -> HaxInstallContext<'_> {
+        HaxInstallContext {
+            fixture: &self.fixture,
+            script: &self.script,
+            path: &self.path,
+            hostname_bin: &self.hostname_bin,
+            fake_repo_root: &self.fake_repo_root,
+            remote_root: &self.remote_root,
+        }
     }
 
     /// Runs an install that must be refused, and proves every watched tree is
@@ -24217,8 +24263,32 @@ impl ReleaseGuardHarness {
         refusal: &str,
         watched: &[&Path],
     ) {
+        self.assert_package_refused_without_mutation(
+            target,
+            &self.package_dir,
+            &self.hax_install_root,
+            install_root,
+            bin_dir,
+            refusal,
+            watched,
+        );
+    }
+
+    /// The same proof for a package the test forged itself.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_package_refused_without_mutation(
+        &self,
+        target: &str,
+        package_dir: &Path,
+        hax_install_root: &Path,
+        install_root: &Path,
+        bin_dir: &Path,
+        refusal: &str,
+        watched: &[&Path],
+    ) {
         let before: Vec<_> = watched.iter().map(|path| snapshot_tree(path)).collect();
-        let refused = self.install(target, install_root, bin_dir);
+        let refused =
+            self.install_from(target, package_dir, hax_install_root, install_root, bin_dir);
         assert!(
             !refused.status.success(),
             "{target}: install succeeded through an unsafe view\nstdout: {}",
@@ -24406,6 +24476,7 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         "managed_symlink",
         "ensure_safe_release_view",
         "atomic_symlink",
+        "reject_carried_release_identity",
     ] {
         let header = format!("\n{name}() {{\n");
         let definitions: Vec<(usize, &str)> = script
@@ -24431,6 +24502,881 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
             "{name} drifted between the local and embedded remote install paths"
         );
     }
+}
+
+/// A release's identity is derived, never carried: the id is
+/// `sourceCommit-manifestSha256`, and every activation field belongs to the
+/// installer that writes it. Before the guard this pins, a package receipt
+/// could carry a `releaseId` of its own and a manifest could carry
+/// `activationSequence`, and the installer neither refused nor honoured them:
+/// the activation receipt is `$receipt + {releaseId: ..., activationSequence:
+/// ...}`, so the installer's fields silently won the merge. An operator
+/// reading `jq -r .releaseId` off the package receipt was told one release
+/// while the store kept another, and the store was one reordered `+` away
+/// from honouring the forgery instead.
+#[test]
+fn hig_release_script_refuses_a_package_that_carries_the_release_identity_it_derives() {
+    let harness = ReleaseGuardHarness::new("hig-release-carried-identity");
+    let commit = |tag: u32| format!("0123456789abcdef0123456789abcdef{tag:08x}");
+    let patch = |path: &PathBuf, key: &str, value: Value| {
+        let mut document: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        document[key] = value;
+        fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    };
+
+    // An id that does not derive from the package's own fields.
+    let named_id = harness.fixture.root.join("carries-a-release-id");
+    clone_release_package(&harness.package_dir, &named_id, &commit(0xa1));
+    patch(
+        &named_id.with_extension("receipt.json"),
+        "releaseId",
+        json!(format!("{}-{}", commit(0xdead), "0".repeat(64))),
+    );
+
+    // An activation field on the receipt.
+    let receipt_activation = harness.fixture.root.join("receipt-carries-activation");
+    clone_release_package(&harness.package_dir, &receipt_activation, &commit(0xa2));
+    patch(
+        &receipt_activation.with_extension("receipt.json"),
+        "activationSequence",
+        json!(9999),
+    );
+
+    // An activation field on the manifest, with the receipt's manifest hash
+    // repaired so the only thing wrong with the package is the carried field.
+    let manifest_activation = harness.fixture.root.join("manifest-carries-activation");
+    clone_release_package(&harness.package_dir, &manifest_activation, &commit(0xa3));
+    patch(
+        &manifest_activation.join("manifest.json"),
+        "installedAt",
+        json!(1),
+    );
+    patch(
+        &manifest_activation.with_extension("receipt.json"),
+        "manifestSha256",
+        json!(file_sha256(&manifest_activation.join("manifest.json"))),
+    );
+
+    let forgeries = [
+        ("a receipt naming a release it is not", &named_id, "receipt"),
+        (
+            "a receipt carrying an activation field",
+            &receipt_activation,
+            "receipt",
+        ),
+        (
+            "a manifest carrying an activation field",
+            &manifest_activation,
+            "manifest",
+        ),
+    ];
+    for target in ["hax", "hig"] {
+        for (label, package, artifact) in forgeries {
+            let artifact = match artifact {
+                "receipt" => package.with_extension("receipt.json"),
+                _ => package.join("manifest.json"),
+            };
+            let slug = package.file_name().unwrap().to_str().unwrap();
+            let install_root = harness.fixture.root.join(format!("{slug}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{slug}-bin-{target}"));
+            harness.assert_package_refused_without_mutation(
+                target,
+                package,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+                &format!(
+                    "refusing {}: a release artifact must not carry the release identity the installer derives",
+                    artifact.display()
+                ),
+                &[&install_root, &bin_dir, package],
+            );
+            assert!(
+                fs::symlink_metadata(&install_root).is_err(),
+                "{target}: {label} created an install root"
+            );
+        }
+    }
+
+    // The guard is about the claim, not the key: a receipt that names the
+    // release it actually becomes still installs, so this refuses forgery
+    // rather than banning provenance an operator may legitimately record.
+    let truthful = harness.fixture.root.join("carries-its-own-id");
+    clone_release_package(&harness.package_dir, &truthful, &commit(0xa4));
+    let truthful_id = release_id_from_package(&truthful);
+    patch(
+        &truthful.with_extension("receipt.json"),
+        "releaseId",
+        json!(truthful_id),
+    );
+    let install_root = harness.fixture.root.join("carries-its-own-id-install");
+    let bin_dir = harness.fixture.root.join("carries-its-own-id-bin");
+    let installed = harness.install_from(
+        "hax",
+        &truthful,
+        &harness.hax_install_root,
+        &install_root,
+        &bin_dir,
+    );
+    assert!(
+        installed.status.success(),
+        "a truthful releaseId was refused: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    let meta: Value =
+        serde_json::from_slice(&fs::read(installed["receipt"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(meta["releaseId"], json!(truthful_id));
+}
+
+/// `releaseId` is `sourceCommit-manifestSha256`, not the commit: two builds of
+/// one commit that did not produce the same bytes are two releases. Keyed on
+/// the commit alone the second install would find the first release directory
+/// already there, skip staging entirely, and activate the first build's bytes
+/// while reporting the second build's id -- the exact shape of a rollback
+/// that lands on something nobody built.
+#[test]
+fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases() {
+    let harness = ReleaseGuardHarness::new("hig-release-same-commit");
+    let commit = "0123456789abcdef0123456789abcdef0000ab01";
+    let first = harness.fixture.root.join("build-a");
+    clone_release_package(&harness.package_dir, &first, commit);
+    let second = harness.fixture.root.join("build-b");
+    clone_release_package(&harness.package_dir, &second, commit);
+
+    // The second build ships a different `kanban` reporting a different
+    // version: one commit, two builds, which is what the manifest hash is
+    // there to tell apart.
+    let rebuilt = second.join("kanban");
+    write_executable(
+        &rebuilt,
+        "#!/bin/sh\nset -eu\nprintf 'kanban 0.3.0-rebuild\\n'\n",
+    );
+    let entry = json!({
+        "name": "kanban",
+        "sha256": file_sha256(&rebuilt),
+        "bytes": fs::metadata(&rebuilt).unwrap().len(),
+        "version": "kanban 0.3.0-rebuild",
+    });
+    for artifact in [
+        second.join("manifest.json"),
+        second.with_extension("receipt.json"),
+    ] {
+        let mut document: Value = serde_json::from_slice(&fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(
+            document["files"][0]["name"],
+            json!("kanban"),
+            "the release set no longer starts with kanban, so this rewrite patches the wrong entry"
+        );
+        document["files"][0] = entry.clone();
+        fs::write(&artifact, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    }
+    let receipt_path = second.with_extension("receipt.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["manifestSha256"] = json!(file_sha256(&second.join("manifest.json")));
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+    let ids = [
+        release_id_from_package(&first),
+        release_id_from_package(&second),
+    ];
+    assert_ne!(
+        ids[0], ids[1],
+        "two builds of one commit must derive two release ids"
+    );
+    for id in &ids {
+        assert!(id.starts_with(commit), "release id {id} lost its commit");
+    }
+
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("same-commit-{target}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("same-commit-bin-{target}"));
+        let mut release_dirs = Vec::new();
+        for (index, package) in [&first, &second].into_iter().enumerate() {
+            let hax_install_root = if target == "hig" {
+                install_matching_hax_package(
+                    &harness.hax_context(),
+                    package,
+                    commit,
+                    &format!("same-commit-{target}-{index}"),
+                )
+            } else {
+                harness.hax_install_root.clone()
+            };
+            let installed =
+                harness.install_from(target, package, &hax_install_root, &install_root, &bin_dir);
+            assert!(
+                installed.status.success(),
+                "{target}: build {index} of one commit failed to install: {}\nstderr: {}",
+                String::from_utf8_lossy(&installed.stdout),
+                String::from_utf8_lossy(&installed.stderr)
+            );
+            let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+            release_dirs.push(PathBuf::from(installed["releaseDir"].as_str().unwrap()));
+        }
+
+        // Two releases, each stored under the id its own manifest hashes to.
+        assert_ne!(release_dirs[0], release_dirs[1], "{target}: builds aliased");
+        for (release_dir, id) in release_dirs.iter().zip(&ids) {
+            assert!(
+                release_dir.is_dir(),
+                "{target}: release {id} is not a directory"
+            );
+            assert_eq!(
+                release_dir.file_name().unwrap().to_str().unwrap(),
+                id.as_str()
+            );
+            assert_eq!(
+                format!(
+                    "{commit}-{}",
+                    file_sha256(&release_dir.join("manifest.json"))
+                ),
+                *id,
+                "{target}: release {id} does not hash to the name it is stored under"
+            );
+        }
+        assert_eq!(
+            fs::read(release_dirs[0].join("kanban")).unwrap(),
+            fs::read(first.join("kanban")).unwrap(),
+            "{target}: the first build's binary was replaced by the second's"
+        );
+        assert_eq!(
+            fs::read(release_dirs[1].join("kanban")).unwrap(),
+            fs::read(second.join("kanban")).unwrap(),
+            "{target}: the second build activated the first build's binary"
+        );
+
+        // Only the newest is current, and each activation is its own event.
+        assert_release_view(&install_root, &bin_dir, &release_dirs[1]);
+        let sequences: Vec<u64> = ids
+            .iter()
+            .map(|id| {
+                let receipt: Value = serde_json::from_slice(
+                    &fs::read(
+                        install_root
+                            .join("releases")
+                            .join(format!("{id}.receipt.json")),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                receipt["activationSequence"].as_u64().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            sequences,
+            vec![1, 2],
+            "{target}: the two activations did not get their own ordered sequence"
+        );
+    }
+}
+
+/// `files[].name` is joined onto the package directory and then EXECUTED:
+/// `file_version` runs `"$dir/$name" version` to prove the binary reports what
+/// the manifest claims. A name that escapes the package directory therefore
+/// runs whatever sits at the escaped path -- and `${name##*/}` is what
+/// `release_binary_known` sees, so `../kanban` reads as the known release
+/// binary `kanban`. Pinning the name list to the release set exactly is the
+/// only thing between a hand-edited manifest and arbitrary execution.
+#[test]
+fn hig_release_script_refuses_a_manifest_file_name_that_escapes_the_package_directory() {
+    let harness = ReleaseGuardHarness::new("hig-release-manifest-traversal");
+    let escape_root = harness.fixture.root.join("escape");
+    fs::create_dir_all(&escape_root).unwrap();
+    let executed = escape_root.join("EXECUTED");
+    let planted = escape_root.join("kanban");
+    write_executable(
+        &planted,
+        &format!(
+            "#!/bin/sh\n: > {}\nprintf 'kanban 0.0.0-planted\\n'\n",
+            executed.display()
+        ),
+    );
+    let planted_entry = |name: &str| {
+        json!({
+            "name": name,
+            "sha256": file_sha256(&planted),
+            "bytes": fs::metadata(&planted).unwrap().len(),
+            "version": "kanban 0.0.0-planted",
+        })
+    };
+    let commit = |tag: u32| format!("0123456789abcdef0123456789abcdef{tag:08x}");
+
+    // Relative escape, absolute path, and a subdirectory: all three would be
+    // read and run out of the package directory's parent or off the root.
+    let mut packages = Vec::new();
+    for (index, name) in [
+        "../kanban".to_string(),
+        planted.to_str().unwrap().to_string(),
+        "sub/kanban".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let package = escape_root.join(format!("package-{index}"));
+        clone_release_package(&harness.package_dir, &package, &commit(0xb0 + index as u32));
+        let manifest_path = package.join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["files"][0] = planted_entry(&name);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let receipt_path = package.with_extension("receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        receipt["manifestSha256"] = json!(file_sha256(&manifest_path));
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        packages.push((name, package));
+    }
+
+    let before = snapshot_tree(&escape_root);
+    for target in ["hax", "hig"] {
+        for (index, (name, package)) in packages.iter().enumerate() {
+            let install_root = harness
+                .fixture
+                .root
+                .join(format!("traversal-{target}-{index}"));
+            let bin_dir = harness
+                .fixture
+                .root
+                .join(format!("traversal-bin-{target}-{index}"));
+            harness.assert_package_refused_without_mutation(
+                target,
+                package,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+                "package manifest is incomplete or mismatched",
+                &[&install_root, &bin_dir],
+            );
+            assert!(
+                !executed.exists(),
+                "{target}: manifest name {name} was executed outside the package"
+            );
+            assert!(
+                fs::symlink_metadata(&install_root).is_err(),
+                "{target}: manifest name {name} reached staging"
+            );
+        }
+    }
+    // Nothing was written outside a release directory -- there is no release
+    // directory, and the tree the escape aimed at is byte-identical.
+    assert_eq!(
+        snapshot_tree(&escape_root),
+        before,
+        "a refused traversal wrote outside the install root"
+    );
+}
+
+/// A hard link is indistinguishable from the file it shares an inode with:
+/// nothing to `readlink`, no `-L`, no target text to inspect. What refuses it
+/// is the managed-symlink rule -- a destination this installer replaces must
+/// be a symlink this installer wrote -- so an operator file that is also
+/// linked from outside the tree is neither followed nor unlinked. Without
+/// that rule the installer would `os.replace` over the name and the outside
+/// data would be silently detached from the estate that referenced it.
+#[test]
+fn hig_release_script_refuses_a_hard_link_planted_at_a_managed_destination() {
+    let harness = ReleaseGuardHarness::new("hig-release-hard-link");
+    let outside = harness.fixture.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("operator-secret");
+    fs::write(&secret, b"operator secret\n").unwrap();
+    let secret_inode = fs::symlink_metadata(&secret).unwrap().ino();
+
+    for target in ["hax", "hig"] {
+        // At a public binary destination.
+        let install_root = harness.fixture.root.join(format!("hard-link-bin-{target}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("hard-link-bin-dir-{target}"));
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::hard_link(&secret, bin_dir.join("kanban")).unwrap();
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to replace {}/kanban: it is not a symlink into {}/current managed by this installer",
+                bin_dir.display(),
+                install_root.display()
+            ),
+            &[&outside, &install_root, &bin_dir],
+        );
+        let planted = bin_dir.join("kanban");
+        assert_eq!(
+            fs::symlink_metadata(&planted).unwrap().ino(),
+            secret_inode,
+            "{target}: the planted hard link was replaced at the bin destination"
+        );
+        assert!(
+            !fs::symlink_metadata(&planted).unwrap().is_symlink(),
+            "{target}: the hard link was converted into a managed symlink"
+        );
+
+        // At `current`.
+        let install_root = harness
+            .fixture
+            .root
+            .join(format!("hard-link-current-{target}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("hard-link-current-bin-{target}"));
+        fs::create_dir_all(&install_root).unwrap();
+        fs::hard_link(&secret, install_root.join("current")).unwrap();
+        harness.assert_refused_without_mutation(
+            target,
+            &install_root,
+            &bin_dir,
+            &format!(
+                "refusing to replace {}/current: it is not a symlink into {}/releases managed by this installer",
+                install_root.display(),
+                install_root.display()
+            ),
+            &[&outside, &install_root, &bin_dir],
+        );
+        let planted = install_root.join("current");
+        assert_eq!(
+            fs::symlink_metadata(&planted).unwrap().ino(),
+            secret_inode,
+            "{target}: the planted hard link at current was replaced"
+        );
+        assert_eq!(
+            fs::read(&secret).unwrap(),
+            b"operator secret\n",
+            "{target}: the outside file behind the hard link was written"
+        );
+    }
+}
+
+/// A device node needs privileges this test does not have, so the stand-in is
+/// a FIFO -- the sharper probe anyway: `open()` on a FIFO blocks until the
+/// other end appears, so an installer that opened a destination before
+/// classifying it would hang forever rather than fail, with no output and no
+/// timeout. Every install here is therefore run against a deadline, and the
+/// deadline is the assertion.
+#[test]
+fn hig_release_script_refuses_a_fifo_at_a_managed_destination_without_opening_it() {
+    let harness = ReleaseGuardHarness::new("hig-release-fifo");
+    let refused_before_deadline = |target: &str, install_root: &Path, bin_dir: &Path| -> Output {
+        let mut child = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                install_root,
+                bin_dir,
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(_) => break,
+                None if Instant::now() >= deadline => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{target}: the installer blocked on a FIFO instead of refusing it");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{target}: a FIFO was installed through\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        output
+    };
+
+    for target in ["hax", "hig"] {
+        // Every destination an activation writes through, one at a time.
+        for spot in ["bin-link", "current", "releases", "bin-dir"] {
+            let install_root = harness
+                .fixture
+                .root
+                .join(format!("fifo-{spot}-{target}-root"));
+            let bin_dir = harness
+                .fixture
+                .root
+                .join(format!("fifo-{spot}-{target}-bin"));
+            let (fifo, refusal) = match spot {
+                "bin-link" => {
+                    fs::create_dir_all(&bin_dir).unwrap();
+                    (
+                        bin_dir.join("kanban"),
+                        format!(
+                            "refusing to replace {}/kanban: it is not a symlink into {}/current managed by this installer",
+                            bin_dir.display(),
+                            install_root.display()
+                        ),
+                    )
+                }
+                "current" => {
+                    fs::create_dir_all(&install_root).unwrap();
+                    (
+                        install_root.join("current"),
+                        format!(
+                            "refusing to replace {}/current: it is not a symlink into {}/releases managed by this installer",
+                            install_root.display(),
+                            install_root.display()
+                        ),
+                    )
+                }
+                "releases" => {
+                    fs::create_dir_all(&install_root).unwrap();
+                    (
+                        install_root.join("releases"),
+                        format!(
+                            "refusing to install: {}/releases is not a directory",
+                            install_root.display()
+                        ),
+                    )
+                }
+                _ => (
+                    bin_dir.clone(),
+                    format!("bin dir is not a directory: {}", bin_dir.display()),
+                ),
+            };
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .expect("mkfifo must be available to exercise the blocking-open case")
+                    .success(),
+                "mkfifo failed"
+            );
+
+            let output = refused_before_deadline(target, &install_root, &bin_dir);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&refusal),
+                "{target}/{spot}: expected {refusal:?} in:\n{stderr}"
+            );
+            // The FIFO is still a FIFO: it was classified, never opened and
+            // never replaced.
+            assert!(
+                fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+                "{target}/{spot}: the FIFO was replaced"
+            );
+            assert!(
+                !install_root.join("releases").is_dir(),
+                "{target}/{spot}: a refused install created releases/"
+            );
+        }
+    }
+}
+
+/// Two ways an install cannot finish, and neither may leave the estate half
+/// moved: a package binary the version probe cannot execute, and an install
+/// root that cannot be written at the moment of the cutover. The second is
+/// the interesting one -- the release directory is already staged and moved
+/// into place by then, so only the ERR-trap rollback keeps the previous view
+/// intact and the retention count honest.
+#[test]
+fn hig_release_script_fails_closed_on_an_unexecutable_binary_and_an_unwritable_install_root() {
+    let harness = ReleaseGuardHarness::new("hig-release-fails-closed");
+    let commit = |tag: u32| format!("0123456789abcdef0123456789abcdef{tag:08x}");
+    let receipt_count = |install_root: &Path| {
+        fs::read_dir(install_root.join("releases"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".receipt.json"))
+            })
+            .count()
+    };
+    // Root ignores the mode bits, so the unwritable-root scenario is
+    // unreachable when this runs privileged. Both branches then assert a true
+    // thing rather than skipping.
+    let privileged = {
+        let probe = harness.fixture.root.join("write-probe");
+        fs::create_dir_all(&probe).unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = fs::write(probe.join("probe"), b"probe").is_ok();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+        writable
+    };
+
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("fails-closed-{target}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("fails-closed-bin-{target}"));
+        let installed = harness.install(target, &install_root, &bin_dir);
+        assert!(
+            installed.status.success(),
+            "{target}: the release to protect failed to install: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        let live_release_dir = PathBuf::from(installed["releaseDir"].as_str().unwrap());
+        let live_links = capture_release_links(&install_root, &bin_dir);
+        let live_release = snapshot_tree(&live_release_dir);
+
+        // A package binary that is not executable.
+        let unexecutable = harness.fixture.root.join(format!("unexecutable-{target}"));
+        clone_release_package(&harness.package_dir, &unexecutable, &commit(0xc1));
+        fs::set_permissions(
+            &unexecutable.join("kanban"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let refused = harness.install_from(
+            target,
+            &unexecutable,
+            &harness.hax_install_root,
+            &install_root,
+            &bin_dir,
+        );
+        assert!(
+            !refused.status.success(),
+            "{target}: a package binary the installer cannot run was accepted\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        // The wording is deliberately not pinned: today the version probe is
+        // what cannot execute the file, so the message names the version. What
+        // must hold is that the refusal names the binary and nothing moved.
+        assert!(
+            stderr.contains("package binary kanban"),
+            "{target}: expected the refusal to name the binary:\n{stderr}"
+        );
+        assert_eq!(
+            capture_release_links(&install_root, &bin_dir),
+            live_links,
+            "{target}: an unexecutable package moved the public view"
+        );
+        assert_eq!(
+            receipt_count(&install_root),
+            1,
+            "{target}: an unexecutable package counted toward retention"
+        );
+        assert_eq!(
+            snapshot_tree(&live_release_dir),
+            live_release,
+            "{target}: an unexecutable package changed the live release"
+        );
+
+        // An install root that cannot be written when the cutover happens.
+        let second = harness.fixture.root.join(format!("second-build-{target}"));
+        clone_release_package(&harness.package_dir, &second, &commit(0xc2));
+        let hax_install_root = if target == "hig" {
+            install_matching_hax_package(
+                &harness.hax_context(),
+                &second,
+                &commit(0xc2),
+                &format!("fails-closed-{target}"),
+            )
+        } else {
+            harness.hax_install_root.clone()
+        };
+        fs::set_permissions(&install_root, fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome =
+            harness.install_from(target, &second, &hax_install_root, &install_root, &bin_dir);
+        fs::set_permissions(&install_root, fs::Permissions::from_mode(0o755)).unwrap();
+        if privileged {
+            assert!(
+                outcome.status.success(),
+                "{target}: running privileged, so the root was writable and the install should have finished: {}",
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            continue;
+        }
+        assert!(
+            !outcome.status.success(),
+            "{target}: an unwritable install root reported success\nstdout: {}",
+            String::from_utf8_lossy(&outcome.stdout)
+        );
+        let second_id = release_id_from_package(&second);
+        assert_eq!(
+            capture_release_links(&install_root, &bin_dir),
+            live_links,
+            "{target}: a failed cutover repointed the public view"
+        );
+        assert!(
+            !install_root.join("releases").join(&second_id).exists(),
+            "{target}: the half-installed release directory was left behind"
+        );
+        assert!(
+            !install_root
+                .join("releases")
+                .join(format!("{second_id}.receipt.json"))
+                .exists(),
+            "{target}: the half-installed release receipt was left behind"
+        );
+        assert_eq!(
+            receipt_count(&install_root),
+            1,
+            "{target}: a failed cutover counted toward retention"
+        );
+        assert_eq!(
+            snapshot_tree(&live_release_dir),
+            live_release,
+            "{target}: a failed cutover changed the live release"
+        );
+    }
+}
+
+/// Two installs of different releases, raced into one install root. The
+/// activation sequence is the release store's clock: retention keeps the
+/// newest ten by it and rollback walks it, so two activations that agree on a
+/// number are two releases nobody can order. `next_activation_sequence` takes
+/// an exclusive `flock` for exactly this. `current` is sampled throughout,
+/// because the other way to lose is to publish a staging directory: the
+/// release is assembled in `releases/.<id>.XXXXXX` and only then renamed, so
+/// `current` must never name one.
+#[test]
+fn hig_release_script_serializes_racing_activations_on_one_install_root() {
+    let harness = ReleaseGuardHarness::new("hig-release-race");
+    let commit = |tag: u32| format!("0123456789abcdef0123456789abcdef{tag:08x}");
+    // The local install path: `next_activation_sequence` is the same
+    // flock-guarded counter in the embedded remote script, but only here can
+    // two installers be started against one root with nothing between them.
+    let packages: Vec<PathBuf> = (0..2)
+        .map(|index| {
+            let package = harness.fixture.root.join(format!("race-build-{index}"));
+            clone_release_package(&harness.package_dir, &package, &commit(0xd1 + index));
+            package
+        })
+        .collect();
+    let ids: Vec<String> = packages
+        .iter()
+        .map(|package| release_id_from_package(package))
+        .collect();
+    assert_ne!(ids[0], ids[1], "the racers must be two distinct releases");
+    let install_root = harness.fixture.root.join("race-install");
+    let bin_dir = harness.fixture.root.join("race-bin");
+    let release_dirs: Vec<PathBuf> = ids
+        .iter()
+        .map(|id| install_root.join("releases").join(id))
+        .collect();
+
+    let mut children: Vec<Child> = packages
+        .iter()
+        .map(|package| {
+            harness
+                .install_command(
+                    "hax",
+                    package,
+                    &harness.hax_install_root,
+                    &install_root,
+                    &bin_dir,
+                )
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+
+    let current = install_root.join("current");
+    let mut samples: Vec<PathBuf> = Vec::new();
+    let mut settled = vec![false; children.len()];
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !settled.iter().all(|done| *done) {
+        for (index, child) in children.iter_mut().enumerate() {
+            if !settled[index] {
+                settled[index] = child.try_wait().unwrap().is_some();
+            }
+        }
+        if let Ok(target) = fs::read_link(&current) {
+            if samples.last() != Some(&target) {
+                samples.push(target);
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the racing installs never finished"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for (index, child) in children.into_iter().enumerate() {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "racer {index} failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Both releases are there, and each activation claimed its own number.
+    let mut sequences: Vec<u64> = ids
+        .iter()
+        .map(|id| {
+            let receipt: Value = serde_json::from_slice(
+                &fs::read(
+                    install_root
+                        .join("releases")
+                        .join(format!("{id}.receipt.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            receipt["activationSequence"].as_u64().unwrap()
+        })
+        .collect();
+    for release_dir in &release_dirs {
+        assert!(
+            release_dir.is_dir(),
+            "racing installs lost {}",
+            release_dir.display()
+        );
+    }
+    sequences.sort_unstable();
+    assert_eq!(
+        sequences,
+        vec![1, 2],
+        "racing activations did not take distinct, monotonic sequence numbers"
+    );
+    assert_eq!(
+        fs::read_to_string(install_root.join("releases/.activation-sequence"))
+            .unwrap()
+            .trim(),
+        "2",
+        "the activation counter does not match the activations it handed out"
+    );
+
+    // `current` only ever named a finished release, never a staging directory.
+    assert!(
+        !samples.is_empty(),
+        "current was never observed during the race"
+    );
+    for sample in &samples {
+        let name = sample.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(
+            !name.starts_with('.'),
+            "current named the staging directory {name}"
+        );
+        assert!(
+            release_dirs.contains(sample),
+            "current named {}, which is neither racer's release",
+            sample.display()
+        );
+    }
+    let settled_current = fs::read_link(&current).unwrap();
+    assert!(
+        release_dirs.contains(&settled_current),
+        "the race settled on {}",
+        settled_current.display()
+    );
+    assert_release_view(&install_root, &bin_dir, &settled_current);
 }
 
 #[test]

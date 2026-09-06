@@ -156,6 +156,28 @@ package_targets_json() {
   esac
 }
 
+# The release store's identity is derived, never carried: `releaseId` is
+# "$sourceCommit-$manifestSha256", and every activation field is written by the
+# installer when it activates. A package artifact that carries either is
+# refused here, before anything is written: otherwise the id a hand-edited
+# manifest or receipt names and the id it actually installs as disagree
+# silently, because the activation receipt is the package receipt plus the
+# installer's own fields and the installer's copy wins the merge.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+reject_carried_release_identity() {
+  local file="$1"
+  local expected_release_id="${2:-}"
+  jq -e --arg expected "$expected_release_id" '
+    (["activationSequence", "installedAt", "releaseDir", "currentLink", "binDir", "installerHost", "target"]
+      + (if $expected == "" then ["releaseId"] else [] end)) as $forbidden
+    | . as $doc
+    | (($forbidden | map(select(. as $key | $doc | has($key))) | length) == 0)
+      and (($doc | .releaseId // $expected) == $expected)
+  ' "$file" >/dev/null ||
+    die "refusing $file: a release artifact must not carry the release identity the installer derives"
+}
+
 validate_release_files() {
   local dir="$1"
   local target="$2"
@@ -186,6 +208,7 @@ validate_release_files() {
     ((.files | length) == ($expected_files | length)) and
     ([.files[].name] == $expected_files)
   ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
+  reject_carried_release_identity "$manifest"
 
   while IFS=$'\t' read -r name sha256 size version; do
     local path="$dir/$name"
@@ -237,6 +260,7 @@ validate_receipt() {
   [[ "$(jq -r '.sourceCommit' "$receipt")" == "$manifest_commit" ]] || {
     die "package receipt source commit mismatch"
   }
+  reject_carried_release_identity "$receipt" "${manifest_commit}-${manifest_sha}"
 }
 
 next_activation_sequence() {
@@ -560,6 +584,7 @@ package_validate() {
     ((.files | length) == ($expected_files | length)) and
     ([.files[].name] == $expected_files)
   ' "$manifest" >/dev/null || die "package manifest is incomplete or mismatched"
+  reject_carried_release_identity "$manifest"
 
   while IFS=$'\t' read -r name sha256 size version; do
     local path="$package_dir/$name"
@@ -969,6 +994,21 @@ binaries_json() {
   printf '%s\n' "${BINARIES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))'
 }
 
+# Verbatim copy of the local guard; see the comment above the local
+# reject_carried_release_identity for why a carried identity is refused.
+reject_carried_release_identity() {
+  local file="$1"
+  local expected_release_id="${2:-}"
+  jq -e --arg expected "$expected_release_id" '
+    (["activationSequence", "installedAt", "releaseDir", "currentLink", "binDir", "installerHost", "target"]
+      + (if $expected == "" then ["releaseId"] else [] end)) as $forbidden
+    | . as $doc
+    | (($forbidden | map(select(. as $key | $doc | has($key))) | length) == 0)
+      and (($doc | .releaseId // $expected) == $expected)
+  ' "$file" >/dev/null ||
+    die "refusing $file: a release artifact must not carry the release identity the installer derives"
+}
+
 cleanup_remote() {
   rm -rf -- "$stage_root"
 }
@@ -1183,6 +1223,7 @@ host="$("$hostname_bin" -s 2>/dev/null || "$hostname_bin")"
 [[ "$host" == "$target" ]] || die "remote host $target did not identify itself as $target"
 manifest="$package_dir/manifest.json"
 [[ -f "$manifest" ]] || die "remote package has no manifest.json"
+reject_carried_release_identity "$manifest"
 
   jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
     (.formatVersion == 1) and
@@ -1200,6 +1241,7 @@ manifest="$package_dir/manifest.json"
   ((.files | length) == ($expected_files | length)) and
   ([.files[].name] == $expected_files)
 ' "$receipt" >/dev/null || die "remote package receipt is incomplete or mismatched"
+reject_carried_release_identity "$receipt" "$(jq -r '.sourceCommit + "-" + .manifestSha256' "$receipt")"
 
 while IFS=$'\t' read -r name sha256 size version; do
   path="$package_dir/$name"
