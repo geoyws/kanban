@@ -60,7 +60,8 @@
       "tool": "attention_list",
       "args": {
         "status": "open",
-        "limit": "100"
+        "limit": "100",
+        "no-body": true
       },
       "board_scoped": true,
       "source": "session/SKILL.md:810 (`attention list --status open --json`); --limit 100 is the default that call relied on, passed explicitly per ADR-037",
@@ -91,7 +92,8 @@
       "tool": "attention_list",
       "args": {
         "status": "open",
-        "limit": "500"
+        "limit": "500",
+        "no-body": true
       },
       "board_scoped": true,
       "source": "kb-att/scripts/lane-att.sh:77",
@@ -111,7 +113,8 @@
       "tool": "attention_list",
       "args": {
         "status": "resolved",
-        "limit": "500"
+        "limit": "500",
+        "no-body": true
       },
       "board_scoped": true,
       "source": "kb-att/scripts/lane-att.sh:78",
@@ -126,7 +129,9 @@
         "id,title,status,lane,priority,tags"
       ],
       "tool": "task_list",
-      "args": {},
+      "args": {
+        "fields": "id,title,status,lane,priority,tags"
+      },
       "board_scoped": true,
       "source": "kb-att/scripts/lane-att.sh:79 (`t ls --json`, the full board)",
       "consumed": "id -> {title,status,lane,priority} index (lane-att.sh:87-88); lane rows projected to id,title,status,lane,priority,tags (lane-att.sh:124-125); blocked lane rows (lane-att.sh:104); drafts (lane-draft-classify.jq). The full list never crosses the wire in the deployed script (lane-att.sh:50-52)."
