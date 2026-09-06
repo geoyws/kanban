@@ -1303,6 +1303,260 @@ fn try_spawn_server(
     }
 }
 
+/// The `Host` a proxy in front of a socket listener would send.
+///
+/// A Unix socket has no authority of its own, so `same_origin` compares
+/// whatever nginx puts in `Host` against the browser's `Origin`. Both sides of
+/// that comparison come from here so a test cannot pass by comparing a value
+/// with itself by accident.
+const SOCKET_HTTP_HOST: &str = "kanban.internal";
+
+/// A short directory to put a test socket in, removed when the test ends.
+///
+/// Not the fixture root: `sun_path` holds 104 bytes on Darwin and 108 on
+/// Linux, and `$TMPDIR` alone is 48 of them here before the fixture's label,
+/// pid and nanosecond suffix. A bind that fails for being a few characters
+/// too long looks exactly like a bind that was refused, so socket tests get a
+/// short directory of their own.
+struct SocketDir(PathBuf);
+
+impl SocketDir {
+    fn new(label: &str) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let path =
+            PathBuf::from("/tmp").join(format!("kbs-{label}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&path)
+            .unwrap_or_else(|error| panic!("create socket directory {}: {error}", path.display()));
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The readiness line a socket listener prints, exactly.
+///
+/// A new string rather than the loopback banner reworded: the two listeners
+/// are reached differently and an operator reading `journalctl` has to be
+/// able to tell which one came up. Pinned here for the same reason
+/// [`server_ready_banner`] is -- a harness that accepted a prefix would call
+/// a server ready that had only got as far as printing.
+fn unix_server_ready_banner(socket: &Path) -> String {
+    format!(
+        "kanban serve: unix:{} (proxy-only socket; front it with nginx)",
+        socket.display()
+    )
+}
+
+struct UnixServerGuard {
+    child: Option<Child>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for UnixServerGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Start a real `kanban serve --socket` process and wait for its banner.
+///
+/// No retry loop, unlike the loopback spawner: a socket path this test owns
+/// cannot be taken by another process between choosing it and binding it, so
+/// a failure here is a failure rather than a race worth another attempt.
+fn spawn_unix_server(
+    fixture: &Fixture,
+    socket: &Path,
+    actor_header: Option<&str>,
+) -> UnixServerGuard {
+    let mut command = fixture.command(&fixture.main);
+    command.args(["serve", "--socket"]).arg(socket);
+    if let Some(name) = actor_header {
+        command.args(["--actor-header", name]);
+    }
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn kanban serve on unix:{}: {error}", socket.display()));
+    let stderr = child.stderr.take().unwrap();
+    let expected_banner = unix_server_ready_banner(socket);
+    // The channel is the only place these lines live, so nothing is shared
+    // and nothing needs locking: the reader thread forwards, this thread
+    // keeps what it has consumed, and a failure drains whatever is left.
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if stderr_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let exited = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("wait on kanban serve: {error}"))
+            .map(|status| format!("exited before readiness: {status}"));
+        let reason = match (exited, stderr_rx.recv_timeout(Duration::from_millis(50))) {
+            (None, Ok(line)) if line == expected_banner => {
+                return UnixServerGuard {
+                    child: Some(child),
+                    stderr_thread: Some(stderr_thread),
+                };
+            }
+            (None, Ok(line)) => {
+                seen.push(line);
+                if Instant::now() < deadline {
+                    continue;
+                }
+                "timed out before readiness".to_owned()
+            }
+            (Some(reason), received) => {
+                seen.extend(received);
+                reason
+            }
+            (None, Err(mpsc::RecvTimeoutError::Disconnected)) => {
+                "stopped emitting stderr before readiness".to_owned()
+            }
+            (None, Err(mpsc::RecvTimeoutError::Timeout)) => {
+                if Instant::now() < deadline {
+                    continue;
+                }
+                "timed out before readiness".to_owned()
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        seen.extend(stderr_rx.try_iter());
+        panic!(
+            "kanban serve --socket {}: {reason}\n{}",
+            socket.display(),
+            seen.join("\n")
+        );
+    }
+}
+
+/// Run `kanban serve --socket PATH` expecting a refusal, and do not wait
+/// forever for one.
+///
+/// `Command::output` waits for exit, and a `serve` that wrongly accepts its
+/// path does not exit -- it starts serving. A guard that regressed would then
+/// hang the whole suite rather than fail one test, so the wait is bounded and
+/// a process still alive at the deadline is itself the failure.
+fn serve_socket_refusal(fixture: &Fixture, socket: &Path) -> (Option<i32>, String) {
+    let mut child = fixture
+        .command(&fixture.main)
+        .args(["serve", "--socket"])
+        .arg(socket)
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn kanban serve: {error}"));
+    let stderr = child.stderr.take().unwrap();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
+        let _ = stderr_tx.send(text);
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let exited = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let text = stderr_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    let _ = stderr_thread.join();
+    assert!(
+        exited.is_some(),
+        "kanban serve --socket {} never exited: it accepted a path it should have refused\n{text}",
+        socket.display()
+    );
+    (exited.and_then(|status| status.code()), text)
+}
+
+fn unix_exchange(socket: &Path, request: &[u8]) -> (u16, String) {
+    use std::io::{Read, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .unwrap_or_else(|error| panic!("connect to unix:{}: {error}", socket.display()));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+fn unix_http_get(socket: &Path, path: &str) -> (u16, String) {
+    let (status, text) = unix_exchange(
+        socket,
+        format!("GET {path} HTTP/1.1\r\nHost: {SOCKET_HTTP_HOST}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    );
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn unix_http_post_with_headers(
+    socket: &Path,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String) {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {SOCKET_HTTP_HOST}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )
+    .into_bytes();
+    for (name, value) in headers {
+        request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    unix_exchange(socket, &request)
+}
+
 fn project_command(fixture: &Fixture, board: &str) -> Command {
     let mut command = fixture.command(&fixture.main);
     command.env("KANBAN_PROJECT", board);
@@ -20244,6 +20498,225 @@ fn the_server_refuses_a_port_it_could_not_be_found_on() {
             "--port {bad}: {error}"
         );
     }
+}
+
+#[test]
+fn a_socket_listener_serves_pages_and_the_kernel_holds_the_mode_it_was_given() {
+    // Loopback is reachable by every uid on the box. A socket at 0660 hands
+    // the boundary to the filesystem: the serving uid and one group get in --
+    // the group nginx's www-data is added to on the host -- and the kernel
+    // refuses the rest on connect. So this reads the mode off the filesystem
+    // rather than trusting the flag, and then makes the kernel demonstrate
+    // that those bits are the thing it actually checks.
+    let sockets = SocketDir::new("serve-unix");
+    let socket = sockets.join("kanban.sock");
+    let fixture = Fixture::new("serve-unix");
+    fixture.ok_json(&fixture.main, &["init", "--name", "UNIXSOCK", "--json"]);
+    let server = spawn_unix_server(&fixture, &socket, None);
+
+    let (status, home) = unix_http_get(&socket, "/");
+    assert_eq!(status, 200, "{home}");
+    assert!(home.contains("Needs you"), "{home}");
+
+    let pinned = fs::symlink_metadata(&socket).unwrap();
+    assert!(
+        pinned.file_type().is_socket(),
+        "the path the listener bound is not a socket"
+    );
+    assert_eq!(
+        pinned.permissions().mode() & 0o7777,
+        0o660,
+        "the socket is mode 0{:o}, so it is reachable by more than the serving group",
+        pinned.permissions().mode() & 0o7777
+    );
+    assert_eq!(
+        (pinned.uid(), pinned.gid()),
+        (unsafe { libc::geteuid() }, unsafe { libc::getegid() }),
+        "the socket is not owned by the serving uid and its primary group"
+    );
+
+    // STAND-IN. Proving a uid outside the group is refused needs a second
+    // uid, and this suite cannot become one without privileges it does not
+    // have. What it can prove is that `connect` is gated on these bits at
+    // all: clear group and other and the owning process is refused too, by
+    // the same check that keeps every uid outside the 0660 group out. It is
+    // evidence about the enforcement path, not about a foreign uid.
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = std::os::unix::net::UnixStream::connect(&socket)
+        .expect_err("a mode-0000 socket accepted a connection");
+    assert_eq!(denied.kind(), ErrorKind::PermissionDenied, "{denied}");
+
+    // Restored, the same listener answers again: the refusal above was the
+    // mode, not a server that had died in the meantime.
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).unwrap();
+    let (restored, home) = unix_http_get(&socket, "/");
+    assert_eq!(restored, 200, "{home}");
+    drop(server);
+}
+
+#[test]
+fn serve_refuses_two_listeners_and_no_listener_with_the_usage_status() {
+    // A port and a socket are alternatives, so both is one listener too many
+    // and neither is one too few. Both exit 64 rather than 1: a supervisor
+    // should keep retrying a listener that lost its socket and should never
+    // retry a unit file that names two, and 64 is what `sysexits.h` reserves
+    // for a command line that will still be wrong on the next attempt.
+    let sockets = SocketDir::new("serve-listener");
+    let socket = sockets.join("kanban.sock");
+    let fixture = Fixture::new("serve-listener");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LISTENER", "--json"]);
+
+    let both = fixture
+        .command(&fixture.main)
+        .args(["serve", "--port", "14200", "--socket"])
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert_eq!(
+        both.status.code(),
+        Some(64),
+        "--port with --socket: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&both.stderr);
+    assert!(
+        stderr.contains("--port N or --socket PATH, not both"),
+        "{stderr}"
+    );
+
+    let neither = fixture.run(&fixture.main, &["serve"]);
+    assert_eq!(
+        neither.status.code(),
+        Some(64),
+        "bare serve: {}",
+        String::from_utf8_lossy(&neither.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&neither.stderr);
+    assert!(stderr.contains("serve needs a listener"), "{stderr}");
+
+    assert!(
+        !socket.exists(),
+        "a refused invocation created {}",
+        socket.display()
+    );
+}
+
+#[test]
+fn serve_refuses_a_socket_path_that_holds_something_it_must_not_delete() {
+    // Binding fails on any existing path, so a restart has to remove the
+    // socket the last process left -- and must remove nothing else. An
+    // operator who typed a board file's path gets the file back and a
+    // sentence, not a truncated ledger. This is a runtime refusal rather than
+    // a usage error: the command line was usable, the world was not, so it
+    // keeps the ordinary exit 1.
+    let sockets = SocketDir::new("serve-unix-refuse");
+    let occupied = sockets.join("board.db");
+    let contents = b"an operator's ledger, not a socket\n";
+    fs::write(&occupied, contents).unwrap();
+    let fixture = Fixture::new("serve-unix-refuse");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REFUSE", "--json"]);
+
+    let (code, stderr) = serve_socket_refusal(&fixture, &occupied);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("already exists and is not a socket"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read(&occupied).unwrap(),
+        contents,
+        "the refusal replaced the operator's file"
+    );
+    assert!(
+        fs::symlink_metadata(&occupied)
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+
+    // A symlinked parent is refused for the same reason: whoever can retarget
+    // it decides where the listener lands, and the mode this path exists to
+    // enforce would then be on a file somewhere else entirely.
+    let linked = sockets.join("linked");
+    symlink(sockets.path(), &linked).unwrap();
+    let (code, stderr) = serve_socket_refusal(&fixture, &linked.join("kanban.sock"));
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("is a symlink"), "{stderr}");
+    assert!(
+        !sockets.join("kanban.sock").exists(),
+        "the refusal bound through the symlink anyway"
+    );
+
+    // A relative path binds against whatever directory the process was
+    // started in, so it is refused rather than resolved against a cwd nobody
+    // stated. nginx and the unit file both name the socket absolutely.
+    let (code, stderr) = serve_socket_refusal(&fixture, Path::new("kanban.sock"));
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("must be an absolute path"), "{stderr}");
+}
+
+#[test]
+fn the_trusted_edge_actor_header_records_the_same_actor_over_a_socket() {
+    // The header is trustworthy because nothing but the proxy can reach the
+    // listener, and a socket is strictly more local than loopback -- it takes
+    // reachability away from every uid outside the owning group and gives
+    // none back. So `--actor-header` stays allowed here, and this pins that
+    // the write it attributes, and the two refusals guarding it, are the same
+    // as on the loopback path rather than a second set of rules.
+    let sockets = SocketDir::new("serve-unix-actor");
+    let socket = sockets.join("kanban.sock");
+    let fixture = Fixture::new("serve-unix-actor");
+    let board = "SERVE-UNIX-ACTOR";
+    let seeded = seed_actor_header_fixture(&fixture, board);
+    let server = spawn_unix_server(&fixture, &socket, Some("X-Kanban-Actor"));
+    let origin = format!("http://{SOCKET_HTTP_HOST}");
+
+    let (status, response) = unix_http_post_with_headers(
+        &socket,
+        &format!("/attention/{board}/{}/reply", seeded.success_attention_id),
+        &[("Origin", &origin), ("X-Kanban-Actor", "ifca-sso")],
+        b"decision=approve&reply=done",
+    );
+    assert_eq!(status, 303, "{response}");
+    assert_attention_resolution(&fixture, board, &seeded.success_task_id, "ifca-sso");
+
+    let (status, response) = unix_http_post_with_headers(
+        &socket,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[
+            ("Origin", "https://hostile.example"),
+            ("X-Kanban-Actor", "ifca-sso"),
+        ],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(status, 403, "a socket relaxed same-origin: {response}");
+
+    let (status, response) = unix_http_post_with_headers(
+        &socket,
+        &format!("/attention/{board}/{}/reply", seeded.negative_attention_id),
+        &[("Origin", &origin)],
+        b"decision=approve&reply=still-open",
+    );
+    assert_eq!(
+        status, 400,
+        "a socket made the actor header optional: {response}"
+    );
+
+    let still_open = project_ok_json(
+        &fixture,
+        board,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "open",
+            "--task",
+            &seeded.negative_task_id,
+            "--json",
+        ],
+    );
+    assert_eq!(still_open.as_array().unwrap().len(), 1);
+    drop(server);
 }
 
 #[test]
