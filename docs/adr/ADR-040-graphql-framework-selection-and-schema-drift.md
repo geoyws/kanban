@@ -1,6 +1,17 @@
 # ADR-040: The GraphQL edge is a hand-rolled executor over apollo-compiler, not a framework
 
-**Status:** Accepted
+**Status:** Parked — GraphQL work stopped indefinitely by geoyws on 2026-09-07
+(kanban `e-321f6350` note 118: "hand rolling our own graphql is a bad idea"),
+hours after acceptance. The candidate rejections below stand on their
+measurements. The Decision's plan does not: `apollo-compiler` 1.33.0 — the
+pinned version — already ships a spec-following synchronous executor
+(`resolvers::Execution::execute_sync`, `request::coerce_variable_values`,
+introspection behind `enable_schema_introspection`), proven against a failing
+non-null leaf under nullable and non-null parents by `probe-exec` in the spike
+workspace (`t-38ee2070` note 117). If GraphQL is ever resumed, the executor is
+the crate's; the hand-written surface is look-ahead prefetch, a depth walk, a
+weighted complexity walk, and the `Int64` scalar with its coercion. Nothing else
+in this document was revised after the stop.
 **Date:** 2026-09-07
 **Deciders:** geoyws, 2026-09-07, decision `a-dba26684` — "build it first, we need
 the gql now" — selected and evidenced by claude@driver under epic `e-321f6350`,
