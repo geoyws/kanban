@@ -376,7 +376,15 @@ idempotency key in V1: **a replayed batch is not a no-op.** A replayed `claim`
 is refused, so a loop batch that starts with one fails at index 0 and lands
 nothing — good, but good by accident of `claim`'s own semantics. Two replayed
 `note` items are two notes. An agent that cannot tell whether a `transact` was
-received must read the board rather than retry blindly.
+received must read the board rather than retry blindly. `kanban mcp` offers it
+as the tool `transact`, taking `{"items": [{"name", "arguments"}]}` with
+`readOnlyHint: false` and the board selectors on the call rather than on any
+item: the server stages the list in a private temporary file it always removes,
+runs the binary **once** for the whole batch — a process per item would be a
+connection per item, and two connections cannot share a transaction — hands
+back the envelope exactly as the CLI printed it, and marks the tool result an
+error whenever `ok` is `false`; the read-only `batch` refuses `transact` as it
+refuses every other write.
 
 Project names are not unique. If two boards share one, `--project` refuses and
 names every candidate, including rootless boards; use `--workspace PATH` or a

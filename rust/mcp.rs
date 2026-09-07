@@ -14,15 +14,19 @@
 //! itself in place: see `Reload`.
 
 use crate::COMMANDS;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::fs::File;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The protocol revision this server speaks.
 ///
@@ -231,14 +235,21 @@ pub(crate) fn tool_name(command: &str, sub: Option<&str>) -> String {
 /// silently. `readOnly` travels with each tool so a harness can withhold
 /// mutation without keeping its own list of which calls write.
 ///
-/// One entry is not an operation: `batch`, which carries several of these
-/// calls on one request. It is described by hand because it describes no
-/// command, and it is appended here so `tools/list` and `tools/call` offer
-/// and answer exactly the same set.
+/// Two entries are not a command's flags: `batch`, which carries several of
+/// these calls on one request, and `transact`, which carries several writes
+/// through one transaction. Both are described by hand — an ordered list of
+/// calls is not a set of flags — and both are appended here so `tools/list`
+/// and `tools/call` offer and answer exactly the same set.
 fn tools() -> Vec<Value> {
     let mut tools = COMMANDS
         .iter()
         .filter(|(command, ..)| !crate::LONG_RUNNING.contains(command))
+        // `transact` has a `COMMANDS` row, which is what makes `schema --json`
+        // publish it and what makes the read-only `batch` refuse it with no
+        // new code (ADR-041 §11). Only its *schema* is hand-written: generated
+        // from that row it would advertise `--items` as a string an agent has
+        // to serialize by hand, and `--items-file` as a path this layer owns.
+        .filter(|(command, sub, ..)| tool_name(command, *sub) != TRANSACT)
         .map(|(command, sub, flags, positionals, read_only)| {
             let mut properties = serde_json::Map::new();
             let mut required = Vec::new();
@@ -308,6 +319,7 @@ fn tools() -> Vec<Value> {
         })
         .collect::<Vec<_>>();
     tools.push(batch_tool());
+    tools.push(transact_tool());
     tools
 }
 
@@ -401,6 +413,15 @@ fn call(path: &Path, name: &str, arguments: &Value) -> Value {
     // name that has none.
     if name == BATCH {
         return batch(path, arguments);
+    }
+    // `transact` names a command and is still answered here, because the item
+    // list has to reach the binary as a file rather than as a flag value and
+    // because the whole list is one run. A transact inside a batch is
+    // impossible for the ordinary reason — its row says it writes, and the
+    // read-only batch refuses a write — and a transact inside a transact is
+    // refused by the binary's own pre-flight (`rust/lib.rs:4740`).
+    if name == TRANSACT {
+        return transact(path, arguments);
     }
     let argv = match arguments_for(name, arguments) {
         Ok(argv) => argv,
@@ -604,6 +625,287 @@ fn batch(path: &Path, arguments: &Value) -> Value {
     })
 }
 
+/// The one writing tool whose input is a list of calls rather than flags.
+///
+/// Unlike `batch` it *is* an operation — `("transact", None, &["items",
+/// "items-file"], &[], false)` in `COMMANDS` — which is what makes
+/// `schema --json` publish it, what makes `listed_read_only` answer
+/// `Some(false)`, and therefore what makes the read-only `batch` refuse it as
+/// an entry with no code of its own (ADR-041 §6, §11).
+const TRANSACT: &str = "transact";
+
+/// The items of one `transact`, on disk for exactly as long as the call needs
+/// them.
+///
+/// A file rather than an argument, always: `--items` travels as a single argv
+/// string, Linux caps one argv string at 128 KiB (`MAX_ARG_STRLEN`) and macOS
+/// caps the whole block at `ARG_MAX`, so a full batch carrying checkpoint
+/// bodies would die as `E2BIG` before the binary saw it (ADR-041 §8). Choosing
+/// per call would mean two paths and one of them exercised rarely.
+///
+/// Created `O_EXCL` and `0600`, because the list holds a caller's writes —
+/// checkpoint prose, lease tokens — and the OS temp directory is shared. `Drop`
+/// removes it, so every way out of [`transact`] takes the file with it: a
+/// spawn that failed, a write that failed halfway, an early return, or the
+/// ordinary answer.
+struct TempItems(PathBuf);
+
+impl TempItems {
+    fn write(items: &[Value]) -> Result<Self> {
+        // The process id, a counter and the clock: two calls in one process
+        // cannot collide even inside one nanosecond, and `create_new` refuses
+        // rather than truncating if some other file already holds the name.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kanban-transact-{}-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default(),
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        // Owned before the first byte is written, so a failure mid-write
+        // removes the file too rather than leaving a half-list behind.
+        let items_file = Self(path);
+        file.write_all(serde_json::to_string(items)?.as_bytes())
+            .with_context(|| format!("write {}", items_file.0.display()))?;
+        file.flush()?;
+        Ok(items_file)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempItems {
+    fn drop(&mut self) {
+        // Best effort and unconditional. There is nothing useful to do with a
+        // failure here and nothing to report it on: stdout is the protocol
+        // channel.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The `transact` tool as `tools/list` offers it.
+///
+/// Hand-written for the same reason `batch_tool` is — its input is an ordered
+/// list of calls, not a command's flags — and hand-written *only* for that:
+/// which operations a batch may carry, the bound, and every `$ref` are still
+/// the binary's to judge at call time, so they are not written down twice.
+///
+/// The board selectors are offered because `transact` addresses one board like
+/// any other board command (its `ignoredSelectors` is empty, pinned by
+/// `the_schema_lists_transact_as_a_writing_operation`) and because an item that
+/// names a board of its own is refused with "pass the selector to `transact`
+/// itself" (`rust/lib.rs:4857`) — a refusal naming a fix this schema has to
+/// make possible.
+fn transact_tool() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "items".to_owned(),
+        json!({
+            "type": "array",
+            "maxItems": BATCH_LIMIT,
+            "description": format!("The calls to run, in order; at most {BATCH_LIMIT}."),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "A tool name from tools/list; not batch, and not transact.",
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "That tool's arguments, exactly as tools/call takes them, \
+                                        except that no item may name a board of its own. Any \
+                                        value may be {\"$ref\": {\"item\": N, \"path\": \
+                                        \"/json/pointer\"}}, replaced by the value at that RFC \
+                                        6901 pointer inside item N's result, where N is strictly \
+                                        earlier.",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": false,
+            },
+        }),
+    );
+    let ignored = crate::ignored_selectors(TRANSACT, None).0;
+    for flag in TOOL_GLOBALS.iter().filter(|flag| !ignored.contains(*flag)) {
+        properties.insert(
+            (*flag).to_owned(),
+            json!({ "type": "string", "description": format!("--{flag}.") }),
+        );
+    }
+    json!({
+        "name": TRANSACT,
+        "description": format!(
+            "kanban transact. Run up to {BATCH_LIMIT} tool calls in one request, in the order \
+             given, through one transaction on one board: either every item lands or none of \
+             them does. Each item names a tool from this list other than batch and transact, \
+             and passes no board selector of its own -- db, project and workspace belong to \
+             transact itself. Answers with one envelope, {{\"ok\", \"batchId\", \"failedIndex\", \
+             \"rolledBack\", \"results\": [{{\"index\", \"ok\", \"result\"}} | {{\"index\", \
+             \"ok\": false, \"error\"}} | {{\"index\", \"ok\": false, \"skipped\": true}}]}}, and \
+             is an error whenever ok is false. Execution stops at the first failure, every item \
+             before it is rolled back, and every item after it is skipped rather than attempted, \
+             so rolledBack true means the board is exactly where the batch found it; \
+             rolledBack false on a failure means the list was refused before anything ran. Any \
+             argument value may be {{\"$ref\": {{\"item\": N, \"path\": \"/json/pointer\"}}}}, \
+             replaced by the value at that pointer in item N's result, which is how the lease \
+             token a claim returns reaches a later checkpoint without passing through the \
+             caller. Each item is authorized exactly as if it had arrived alone. There is no \
+             idempotency key: a replayed batch is not a no-op, though one that begins with a \
+             claim is refused at index 0 and therefore lands nothing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": Value::Object(properties),
+            "required": ["items"],
+        },
+        "annotations": { "readOnlyHint": false },
+    })
+}
+
+/// Answer one writing batch by running the binary **once** for the whole list.
+///
+/// This is deliberately not `batch`'s loop, and the difference is the whole
+/// point of the tool. A process per item is a connection per item, and two
+/// connections cannot share a transaction, so a per-entry spawn would offer
+/// atomicity it could not deliver (ADR-041 §3.4). One run keeps ADR-011's
+/// invariant — "a tool call runs the binary" — literally true while the
+/// binary keeps ownership of the ordering, the rollback and the ledger stamps.
+///
+/// Only two things happen here that the binary does not do again: the item
+/// list is staged in a file, because a list is not a flag value and an argv
+/// string has a ceiling (§8); and the shape of that list is checked far enough
+/// to answer a caller who sent something that is not a list of calls at all.
+/// Names, the bound and every `$ref` are checked by the binary, pre-flight,
+/// before it opens the board — re-checking them here would be the second
+/// validation ADR-011 exists to keep out, free to drift from the first.
+fn transact(path: &Path, arguments: &Value) -> Value {
+    let empty = serde_json::Map::new();
+    let supplied = match arguments {
+        Value::Object(supplied) => supplied,
+        Value::Null => &empty,
+        other => return error_result(&format!("arguments must be an object, not {other}")),
+    };
+    // `items-file` is this layer's business and is not offered, so a caller
+    // naming it is told that rather than having it silently become a second
+    // `--items-file` on the command line.
+    if let Some(unknown) = supplied
+        .keys()
+        .find(|key| key.as_str() != "items" && !TOOL_GLOBALS.contains(&key.as_str()))
+    {
+        return error_result(&format!("{TRANSACT} has no argument {unknown}"));
+    }
+    let items = match supplied.get("items") {
+        Some(Value::Array(items)) => items,
+        Some(other) => {
+            return error_result(&format!("{TRANSACT} items must be an array, not {other}"));
+        }
+        None => return error_result(&format!("{TRANSACT} needs an items array")),
+    };
+    // The binary would refuse each of these too, in the same words, but a
+    // refusal that costs a process start is exactly what this tool exists to
+    // avoid — and a call whose `items` is not a list of calls has nothing to
+    // gain from reaching a board.
+    for (index, item) in items.iter().enumerate() {
+        let Value::Object(fields) = item else {
+            return error_result(&format!(
+                "{TRANSACT} item {index} must be an object, not {item}; nothing in it ran"
+            ));
+        };
+        if !matches!(fields.get("name"), Some(Value::String(_))) {
+            return error_result(&format!(
+                "{TRANSACT} item {index} needs a name; nothing in it ran"
+            ));
+        }
+        // Absent and null are how an item with no arguments is spelled, so
+        // they are accepted here exactly as the binary accepts them: a tool
+        // stricter than the command it runs refuses legal calls.
+        match fields.get("arguments") {
+            None | Some(Value::Null) | Some(Value::Object(_)) => {}
+            Some(other) => {
+                return error_result(&format!(
+                    "{TRANSACT} item {index} has arguments that are not an object: {other}; \
+                     nothing in it ran"
+                ));
+            }
+        }
+    }
+    // The selectors travel through `arguments_for` like every other tool's, so
+    // this layer holds no second opinion about them; only the item list is
+    // handled here.
+    let selectors = supplied
+        .iter()
+        .filter(|(key, _)| key.as_str() != "items")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<String, Value>>();
+    let argv = match arguments_for(TRANSACT, &Value::Object(selectors)) {
+        Ok(argv) => argv,
+        Err(error) => return error_result(&error.to_string()),
+    };
+    let items_file = match TempItems::write(items) {
+        Ok(items_file) => items_file,
+        Err(error) => {
+            return error_result(&format!("could not stage the {TRANSACT} items: {error:#}"));
+        }
+    };
+    // `kanban transact --items-file PATH [selectors] --json`: the list goes in
+    // beside the operation, ahead of the trailing `--json` `arguments_for`
+    // always ends with. Kept as `OsString` so a temp directory whose name is
+    // not UTF-8 still names the file it wrote rather than a lossy near-miss.
+    let mut argv = argv.into_iter().map(OsString::from).collect::<Vec<_>>();
+    argv.splice(
+        1..1,
+        [
+            OsString::from("--items-file"),
+            items_file.path().as_os_str().to_owned(),
+        ],
+    );
+    let output = match Command::new(path).args(&argv).output() {
+        Ok(output) => output,
+        Err(error) => return error_result(&format!("could not run kanban: {error}")),
+    };
+    // The envelope is the answer — `ok`, `failedIndex` and `rolledBack` are
+    // what a caller acts on — so it is passed through exactly as the CLI
+    // printed it, for both verdicts. `error_result` would replace it with a
+    // sentence and throw away the one document that says how far the batch
+    // got.
+    let envelope = String::from_utf8_lossy(&output.stdout).into_owned();
+    if envelope.trim().is_empty() {
+        // No envelope means the binary died before printing one, so its stderr
+        // line is all there is to hand back.
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return error_result(if message.is_empty() {
+            "the transact failed without a message"
+        } else {
+            &message
+        });
+    }
+    // The envelope's own verdict decides `isError`, so a caller reading the
+    // flag and a caller reading the document cannot disagree. It is also the
+    // CLI's exit status, which is nonzero exactly when `ok` is false. An
+    // answer this layer cannot parse is a failure, the same rule `batch`
+    // applies to a result it cannot read.
+    let landed = serde_json::from_str::<Value>(&envelope)
+        .ok()
+        .and_then(|parsed| parsed["ok"].as_bool())
+        .unwrap_or(false);
+    json!({
+        "content": [{ "type": "text", "text": envelope }],
+        "isError": !landed,
+    })
+}
+
 /// Answer one request, or `None` when it was a notification.
 fn respond(path: &Path, request: &Value) -> Option<Value> {
     let id = request.get("id").cloned();
@@ -689,18 +991,29 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A temp-directory name no concurrent test can also pick.
+    ///
+    /// The clock alone was not enough: `SystemTime::now()` reports
+    /// microseconds here, and two tests on two threads inside one microsecond
+    /// wrote the same script over each other.
+    fn unique_name(kind: &str, extension: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "kanban-mcp-{kind}-{}-{}-{}.{extension}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     struct TempExecutable(PathBuf);
 
     impl TempExecutable {
         fn new(body: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "kanban-mcp-{}-{}.sh",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let path = unique_name("stub", "sh");
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             Self(path)
@@ -724,6 +1037,82 @@ mod tests {
             .into_iter()
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("missing tool named {name}"))
+    }
+
+    /// A file a stub executable writes to, removed with the test.
+    struct TempLog(PathBuf);
+
+    impl TempLog {
+        fn new(label: &str) -> Self {
+            Self(unique_name(label, "log"))
+        }
+
+        fn shell_path(&self) -> String {
+            self.0.display().to_string()
+        }
+
+        /// Every line written so far; empty when the stub never ran, which is
+        /// how "without spawning" is observed.
+        fn lines(&self) -> Vec<String> {
+            fs::read_to_string(&self.0)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// A stub `kanban` that records one line per invocation — its whole
+    /// argument list, then the bytes of the file `--items-file` named — and
+    /// answers with `envelope` and `code`.
+    ///
+    /// The recorded argv is how a spawn is counted, and reading the items file
+    /// back is what proves the file existed *while* the child ran rather than
+    /// merely having been created.
+    fn counting_stub(log: &TempLog, envelope: &str, code: i32) -> TempExecutable {
+        TempExecutable::new(&format!(
+            r#"#!/bin/sh
+{{
+  printf 'argv'
+  for arg in "$@"; do printf '\t%s' "$arg"; done
+  printf '\n'
+}} >> '{log}'
+printf 'items\t%s\n' "$(cat "$3")" >> '{log}'
+printf '%s' '{envelope}'
+exit {code}
+"#,
+            log = log.shell_path(),
+        ))
+    }
+
+    /// Serializes the tests that count files in the shared temp directory, so
+    /// one test's staged items cannot be mistaken for another's leak.
+    fn temp_items_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The staged item files this process is currently holding.
+    fn staged_item_files() -> Vec<PathBuf> {
+        let prefix = format!("kanban-transact-{}-", std::process::id());
+        let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect()
     }
 
     #[test]
@@ -1048,6 +1437,290 @@ exit 7
                 .as_str()
                 .unwrap()
                 .contains("could not run kanban")
+        );
+    }
+
+    #[test]
+    fn the_transact_tool_is_hand_written_once_and_says_it_writes() {
+        let listed = tools();
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|tool| tool["name"] == TRANSACT)
+                .count(),
+            1,
+            "transact is advertised more than once, so a client sees two schemas for it"
+        );
+        let transact = tool(TRANSACT);
+        assert_eq!(transact["annotations"]["readOnlyHint"], false);
+        // Hand-written, not generated off the `COMMANDS` row: the row's flags
+        // would arrive as two strings -- `items` an array an agent has to
+        // serialize by hand, and `items-file` a path only this layer may name.
+        let properties = &transact["inputSchema"]["properties"];
+        assert_eq!(properties["items"]["type"], "array");
+        assert_eq!(properties["items"]["maxItems"], BATCH_LIMIT);
+        assert!(
+            properties.get("items-file").is_none(),
+            "the tool offers the file path this layer owns: {transact}"
+        );
+        assert_eq!(transact["inputSchema"]["required"], json!(["items"]));
+        let item = &properties["items"]["items"];
+        assert_eq!(item["required"], json!(["name"]));
+        assert_eq!(item["additionalProperties"], false);
+        assert_eq!(item["properties"]["name"]["type"], "string");
+        assert_eq!(item["properties"]["arguments"]["type"], "object");
+        // It addresses one board, and an item naming a board of its own is
+        // refused telling the caller to pass the selector to `transact`
+        // itself, so all three have to be passable.
+        for flag in TOOL_GLOBALS {
+            assert_eq!(properties[flag]["type"], "string", "--{flag}");
+        }
+        // ADR-041 freezes the read-only batch. Asserted beside the new tool
+        // because this is the pair a harness withholds mutation by.
+        assert_eq!(tool(BATCH)["annotations"]["readOnlyHint"], true);
+        assert_eq!(listed_read_only(TRANSACT), Some(false));
+    }
+
+    #[test]
+    fn a_transact_runs_the_binary_once_with_the_whole_list_in_a_file() {
+        let _serialized = temp_items_lock();
+        let log = TempLog::new("transact-once");
+        let stub = counting_stub(&log, r#"{"ok":true,"results":[]}"#, 0);
+        let items = (0..5)
+            .map(|index| json!({ "name": "note", "arguments": { "id": "t-1", "text": index } }))
+            .collect::<Vec<_>>();
+
+        let answered = transact(
+            stub.as_ref(),
+            &json!({ "items": items, "project": "BOARD" }),
+        );
+        assert_eq!(answered["isError"], false);
+        assert_eq!(
+            answered["content"][0]["text"], r#"{"ok":true,"results":[]}"#,
+            "the envelope was not passed through as the CLI printed it"
+        );
+
+        let lines = log.lines();
+        let argv = lines
+            .iter()
+            .filter(|line| line.starts_with("argv\t"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            argv.len(),
+            1,
+            "a five-item list ran the binary {} times: {lines:?}",
+            argv.len()
+        );
+        let words = argv[0].split('\t').skip(1).collect::<Vec<_>>();
+        assert_eq!(words[0], TRANSACT);
+        assert_eq!(words[1], "--items-file");
+        assert_eq!(&words[3..], ["--project", "BOARD", "--json"]);
+
+        // The child read the whole list out of the file, so the file was there
+        // while it ran -- and it is not there now.
+        let seen = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("items\t"))
+            .expect("the stub read its items file");
+        assert_eq!(
+            serde_json::from_str::<Value>(seen).unwrap(),
+            Value::Array(items)
+        );
+        assert!(
+            !Path::new(words[2]).exists(),
+            "{} outlived the call that staged it",
+            words[2]
+        );
+        assert_eq!(staged_item_files(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn the_items_file_is_gone_on_success_on_failure_and_on_an_early_return() {
+        let _serialized = temp_items_lock();
+        assert_eq!(
+            staged_item_files(),
+            Vec::<PathBuf>::new(),
+            "a previous call leaked its items file"
+        );
+        let items = vec![json!({ "name": "stale", "arguments": {} })];
+
+        // The file the guard writes: only the owner may read it, because the
+        // list holds a caller's writes and the temp directory is shared.
+        let staged = TempItems::write(&items).unwrap();
+        let path = staged.path().to_owned();
+        assert!(path.exists());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap()).unwrap(),
+            json!(items)
+        );
+        // Two calls in one process do not collide.
+        let second = TempItems::write(&items).unwrap();
+        assert_ne!(second.path(), path);
+        drop(second);
+        drop(staged);
+        assert!(!path.exists(), "the guard left {} behind", path.display());
+
+        // An early return between the write and the spawn: the guard's scope
+        // ends without a child ever running, and the file goes with it.
+        let abandoned = {
+            let staged = TempItems::write(&items).unwrap();
+            staged.path().to_owned()
+        };
+        assert!(!abandoned.exists());
+
+        // A refused batch: the binary answers nonzero with an envelope.
+        let log = TempLog::new("transact-refused");
+        let refused_stub = counting_stub(
+            &log,
+            r#"{"ok":false,"failedIndex":0,"rolledBack":true,"results":[]}"#,
+            1,
+        );
+        let refused = transact(refused_stub.as_ref(), &json!({ "items": items }));
+        assert_eq!(refused["isError"], true);
+        assert_eq!(staged_item_files(), Vec::<PathBuf>::new());
+
+        // And a spawn that never happened at all.
+        let unspawnable = transact(
+            Path::new("/definitely/not/a/binary"),
+            &json!({ "items": items }),
+        );
+        assert_eq!(unspawnable["isError"], true);
+        assert!(
+            unspawnable["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not run kanban"),
+            "{unspawnable}"
+        );
+        assert_eq!(
+            staged_item_files(),
+            Vec::<PathBuf>::new(),
+            "a failed spawn left its items file in the temp directory"
+        );
+    }
+
+    #[test]
+    fn a_list_that_is_not_a_list_of_calls_is_refused_without_running_the_binary() {
+        // Held because the staged-file snapshots in the tests above must not
+        // see this test's own temporary items.
+        let _serialized = temp_items_lock();
+        let log = TempLog::new("transact-malformed");
+        let stub = counting_stub(&log, r#"{"ok":true,"results":[]}"#, 0);
+
+        for (arguments, expected) in [
+            (json!({}), "transact needs an items array"),
+            (json!(null), "transact needs an items array"),
+            (json!("nope"), "arguments must be an object"),
+            (json!({ "items": "[]" }), "items must be an array"),
+            (
+                json!({ "items": [], "items-file": "/tmp/elsewhere.json" }),
+                "transact has no argument items-file",
+            ),
+            (json!({ "items": [], "frobnicate": true }), "no argument"),
+            (json!({ "items": ["note"] }), "item 0 must be an object"),
+            (
+                json!({ "items": [{ "arguments": {} }] }),
+                "item 0 needs a name",
+            ),
+            (
+                json!({ "items": [{ "name": ["note"] }] }),
+                "item 0 needs a name",
+            ),
+            (
+                json!({ "items": [{ "name": "note", "arguments": "id=t-1" }] }),
+                "item 0 has arguments that are not an object",
+            ),
+            (
+                json!({ "items": [{ "name": "stale" }, { "name": "note", "arguments": 7 }] }),
+                "item 1 has arguments that are not an object",
+            ),
+        ] {
+            let refused = transact(stub.as_ref(), &arguments);
+            assert_eq!(refused["isError"], true, "{arguments} was accepted");
+            let text = refused["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(expected), "{arguments}: {text}");
+            assert_eq!(
+                log.lines(),
+                Vec::<String>::new(),
+                "{arguments} cost a process start to be refused"
+            );
+        }
+
+        // An item with no arguments at all is legal -- the CLI reads absent and
+        // null the same way -- so it must reach the binary rather than be
+        // refused by a tool stricter than the command it runs.
+        let ran = transact(stub.as_ref(), &json!({ "items": [{ "name": "stale" }] }));
+        assert_eq!(ran["isError"], false, "{ran}");
+        assert_eq!(
+            log.lines()
+                .iter()
+                .filter(|line| line.starts_with("argv\t"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_envelopes_own_verdict_decides_is_error() {
+        // Same reason as above: this test stages items of its own.
+        let _serialized = temp_items_lock();
+        let log = TempLog::new("transact-verdict");
+        let items = json!({ "items": [{ "name": "stale" }] });
+
+        let landed = counting_stub(&log, r#"{"ok":true,"batchId":"b","results":[]}"#, 0);
+        assert_eq!(transact(landed.as_ref(), &items)["isError"], false);
+
+        // The failing answer keeps its envelope: `failedIndex` and
+        // `rolledBack` are how far the batch got, and a sentence in their
+        // place would throw that away.
+        let rolled_back = counting_stub(
+            &log,
+            r#"{"ok":false,"failedIndex":1,"rolledBack":true,"results":[]}"#,
+            1,
+        );
+        let failed = transact(rolled_back.as_ref(), &items);
+        assert_eq!(failed["isError"], true);
+        let envelope: Value =
+            serde_json::from_str(failed["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["failedIndex"], 1);
+        assert_eq!(envelope["rolledBack"], true);
+
+        // An answer this layer cannot read is a failure, not a success whose
+        // verdict it guessed.
+        let unreadable = counting_stub(&log, "not an envelope", 0);
+        let unreadable = transact(unreadable.as_ref(), &items);
+        assert_eq!(unreadable["isError"], true);
+        assert_eq!(unreadable["content"][0]["text"], "not an envelope");
+
+        // Nothing on stdout means the binary died before printing an
+        // envelope, so its stderr line is what the caller gets.
+        let silent = TempExecutable::new(
+            r#"#!/bin/sh
+printf 'the board is locked by another writer\n' >&2
+exit 9
+"#,
+        );
+        let silent = transact(silent.as_ref(), &items);
+        assert_eq!(silent["isError"], true);
+        assert_eq!(
+            silent["content"][0]["text"],
+            "the board is locked by another writer"
+        );
+
+        let mute = TempExecutable::new(
+            r#"#!/bin/sh
+exit 9
+"#,
+        );
+        let mute = transact(mute.as_ref(), &items);
+        assert_eq!(mute["isError"], true);
+        assert_eq!(
+            mute["content"][0]["text"],
+            "the transact failed without a message"
         );
     }
 }

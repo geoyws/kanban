@@ -12943,6 +12943,12 @@ enum ShutdownResult {
 
 impl Session {
     fn start(binary: &Path, cwd: &Path, data: &Path) -> Self {
+        Self::start_with_env(binary, cwd, data, &[])
+    }
+
+    /// A session whose server, and therefore every process it spawns to answer
+    /// a call, inherits `env` on top of the usual fixture environment.
+    fn start_with_env(binary: &Path, cwd: &Path, data: &Path, env: &[(&str, &str)]) -> Self {
         let deadline = Instant::now() + Duration::from_millis(750);
         let mut backoff = Duration::from_millis(10);
         let mut child = loop {
@@ -12952,6 +12958,7 @@ impl Session {
                 .env("KANBAN_DATA_DIR", data)
                 .env_remove("KANBAN_DB")
                 .env_remove("KANBAN_PROJECT")
+                .envs(env.iter().copied())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -15084,6 +15091,602 @@ fn add_note_is_atomic_with_its_ledger_event() {
         "the notes on the board and the note events in the ledger disagree"
     );
     assert_eq!(board_audit(&fixture)["errors"], json!([]));
+}
+
+/// One `tools/call transact` on an open session, answered as the `isError`
+/// flag and the envelope its text content carries.
+///
+/// The two are checked against each other here, so no case has to remember
+/// that they are one verdict: a client that reads the flag and a client that
+/// reads the envelope must never act differently.
+fn mcp_transact(session: &mut Session, id: i64, arguments: Value) -> (bool, Value) {
+    let answered = session.ask(json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "transact", "arguments": arguments }
+    }));
+    let text = tool_text(&answered["result"]);
+    let is_error = answered["result"]["isError"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("a tool result says whether it failed: {answered}"));
+    let envelope: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("a transact answers with its envelope ({error}): {text}"));
+    assert_eq!(
+        is_error,
+        envelope["ok"] == json!(false),
+        "isError and the envelope's own verdict disagree: {answered}"
+    );
+    assert!(
+        envelope["batchId"]
+            .as_str()
+            .is_some_and(|id| id.len() == 36),
+        "the envelope carries no batch id: {envelope}"
+    );
+    (is_error, envelope)
+}
+
+/// The refusal text of a `tools/call transact` the server answered without
+/// ever reaching an envelope.
+fn mcp_transact_refusal(session: &mut Session, id: i64, arguments: Value) -> String {
+    let answered = session.ask(json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "transact", "arguments": arguments }
+    }));
+    assert_eq!(
+        answered["result"]["isError"], true,
+        "a transact that must be refused was answered: {answered}"
+    );
+    tool_text(&answered["result"])
+}
+
+/// A `git` on PATH that records which process invoked it and what that process
+/// was running, then hands the call to the real git.
+///
+/// This is how a spawn is counted. Every provenance-bearing write asks git
+/// where it is (`rust/gitctx.rs:65`), and git is a child of whichever kanban
+/// process ran that item, so `$PPID` in the stub *is* that process: the
+/// distinct pids in the log are the kanban processes that ran items, and `ps`
+/// names what each of them was running. One pid whose command line is
+/// `transact --items-file …` is one invocation carrying the whole list; five
+/// pids would be the per-item spawn ADR-041 §3.4 refuses, which cannot share
+/// a transaction.
+///
+/// Returns the log path and the PATH the session must run with.
+fn git_caller_stub(fixture: &Fixture) -> (PathBuf, String) {
+    let found = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("look for git");
+    assert!(found.status.success(), "no git on PATH to wrap");
+    let real = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+    let stubs = fixture.root.join("stubs");
+    fs::create_dir_all(&stubs).unwrap();
+    let log = fixture.root.join("git-callers.log");
+    write_executable(
+        &stubs.join("git"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\t%s\n' "$PPID" "$(ps -ww -p "$PPID" -o command= 2>/dev/null)" >> '{log}'
+exec '{real}' "$@"
+"#,
+            log = log.display(),
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    (log, path)
+}
+
+/// One line per git invocation, as `(caller pid, caller command line)`.
+fn git_callers(log: &Path) -> Vec<(String, String)> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            (
+                parts.next().unwrap_or_default().to_owned(),
+                parts.next().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn deduped(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+#[test]
+fn the_tool_list_offers_transact_once_with_read_only_hint_false() {
+    let fixture = Fixture::new("mcp-transact-listed");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXLIST", "--json"]);
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+
+    // Once. `transact` has a `COMMANDS` row, so the generated map would emit
+    // one entry and the hand-written schema another -- two descriptions of one
+    // tool, and a client keeping the last one it read would send `--items` as
+    // a string it serialized itself.
+    let named = tools
+        .iter()
+        .filter(|tool| tool["name"] == "transact")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named.len(),
+        1,
+        "transact is advertised {} times: {listed}",
+        named.len()
+    );
+    let transact = named[0];
+    assert_eq!(transact["annotations"]["readOnlyHint"], false);
+    let properties = &transact["inputSchema"]["properties"];
+    assert_eq!(properties["items"]["type"], "array");
+    assert_eq!(properties["items"]["maxItems"], 32);
+    assert_eq!(transact["inputSchema"]["required"], json!(["items"]));
+    assert_eq!(properties["items"]["items"]["required"], json!(["name"]));
+    assert_eq!(properties["items"]["items"]["additionalProperties"], false);
+    // The entry the row would have generated offers both flags as strings;
+    // this one offers the list and keeps the file to itself.
+    assert!(
+        properties.get("items-file").is_none(),
+        "the tool offers the temporary file only the server may name: {transact}"
+    );
+    // An item may not name a board of its own, so `transact` has to take the
+    // selector -- its `ignoredSelectors` is empty for exactly this reason.
+    for flag in ["db", "project", "workspace"] {
+        assert_eq!(properties[flag]["type"], "string", "--{flag}");
+    }
+
+    // The read-only batch is frozen by ADR-041, not extended.
+    let batch = tools.iter().find(|tool| tool["name"] == "batch").unwrap();
+    assert_eq!(batch["annotations"]["readOnlyHint"], true);
+
+    // And no other name is doubled either, which is what makes `tools/list`
+    // and `tools/call` the same set.
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        deduped(names.clone()).len(),
+        names.len(),
+        "tools/list repeats a name"
+    );
+
+    session.finish();
+}
+
+#[test]
+fn a_transacted_write_is_identical_to_the_same_write_on_its_own() {
+    let fixture = Fixture::new("mcp-transact-identity");
+    // Two boards holding the same row, so the two writes cannot see each
+    // other: the standalone one lands on TXMCPA, the transacted one on TXMCPB.
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXMCPA", "--json"]);
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "TXMCPB", "--json"]);
+    for cwd in [&fixture.main, &fixture.worktree] {
+        fixture.ok_json(cwd, &["task", "add", "subject", "--id", "t-1", "--json"]);
+    }
+    let alone = fixture.ok_json(
+        &fixture.main,
+        &["note", "t-1", "one", "--as", "agent-a", "--json"],
+    );
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    // `project` names the other board, which is also the proof that a
+    // selector reaches the one process: no item may carry one.
+    let (is_error, envelope) = mcp_transact(
+        &mut session,
+        2,
+        json!({
+            "project": "TXMCPB",
+            "items": [
+                { "name": "note", "arguments": { "id": "t-1", "text": "one", "as": "agent-a" } },
+                { "name": "note", "arguments": { "id": "t-1", "text": "two", "as": "agent-a" } },
+            ],
+        }),
+    );
+    assert!(!is_error, "{envelope}");
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["failedIndex"], Value::Null, "{envelope}");
+    assert_eq!(envelope["rolledBack"], false, "{envelope}");
+    assert_eq!(envelope["results"][0]["index"], 0, "{envelope}");
+    session.finish();
+
+    // The `tests/e2e.rs:14010` property, for a write: the same command through
+    // a transacted tool call and on its own answers with the same bytes.
+    // `createdAt` is the only field dropped, and only because two writes
+    // cannot share a millisecond by construction -- nothing else in a note is
+    // per-write, no id and no sequence number, so everything else must match.
+    let volatile = vec!["createdAt".to_owned()];
+    let inside = envelope["results"][0]["result"].to_string();
+    let outside = alone.to_string();
+    for (label, body) in [
+        ("the transacted note", &inside),
+        ("the note alone", &outside),
+    ] {
+        assert!(
+            volatile_key_present(body, "createdAt"),
+            "{label} carries no createdAt, so dropping it asserts nothing: {body}"
+        );
+    }
+    let inside_canonical = normalized_body("the transacted note", &inside, &volatile);
+    let outside_canonical = normalized_body("the note alone", &outside, &volatile);
+    assert_eq!(
+        inside_canonical, outside_canonical,
+        "a transacted write answered differently from the same write alone"
+    );
+    assert_eq!(
+        body_digest(&inside_canonical),
+        body_digest(&outside_canonical)
+    );
+
+    // And the write landed on the board the selector named, both items of it.
+    let bodies = |cwd: &Path| {
+        fixture.ok_json(cwd, &["task", "show", "t-1", "--json"])["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["body"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bodies(&fixture.worktree), ["one", "two"]);
+    assert_eq!(bodies(&fixture.main), ["one"]);
+}
+
+#[test]
+fn a_failed_transact_answers_is_error_true_and_carries_the_envelope() {
+    let fixture = Fixture::new("mcp-transact-failed");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXMCPFAIL", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let tasks_before = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    // A claim and a note that both succeed, then an item naming a task that is
+    // not there: the failure has to arrive as a tool error that still carries
+    // how far the batch got, because "it failed" without `failedIndex` and
+    // `rolledBack` leaves an agent to guess what is on the board.
+    let (is_error, envelope) = mcp_transact(
+        &mut session,
+        2,
+        json!({
+            "items": [
+                { "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } },
+                { "name": "note", "arguments": { "id": "t-1", "text": "in the batch", "as": "agent-a" } },
+                { "name": "note", "arguments": { "id": "t-absent", "text": "boom", "as": "agent-a" } },
+            ],
+        }),
+    );
+    assert!(
+        is_error,
+        "a rolled-back transact reported success: {envelope}"
+    );
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["failedIndex"], 2, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    // The items before the failure ran and were undone, which is why they
+    // report `ok` and the board below reports nothing.
+    assert_eq!(envelope["results"][0]["ok"], true, "{envelope}");
+    assert_eq!(envelope["results"][1]["ok"], true, "{envelope}");
+    assert!(
+        envelope["results"][2]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("t-absent")),
+        "{envelope}"
+    );
+    let batch_id = envelope["batchId"].as_str().unwrap().to_owned();
+    session.finish();
+
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(task["status"], "todo", "the task did not go back: {task}");
+    assert_eq!(task["claim"], Value::Null, "{task}");
+    assert_eq!(task["notes"], json!([]), "{task}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        tasks_before,
+        "the board changed under a transact that rolled back"
+    );
+    let events_after = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    assert_eq!(
+        events_after, events_before,
+        "a rolled-back transact left a ledger event"
+    );
+    assert!(
+        events_after
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["payload"]["batchId"] != json!(batch_id)),
+        "a rolled-back transact stamped the ledger: {events_after}"
+    );
+}
+
+#[test]
+fn a_transact_runs_the_binary_once_for_the_whole_list() {
+    let fixture = Fixture::new("mcp-transact-one-process");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXMCPONE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let (log, path) = git_caller_stub(&fixture);
+
+    let mut session = Session::start_with_env(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+        &[("PATH", path.as_str())],
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let server = session.pid();
+    assert!(
+        git_callers(&log).is_empty(),
+        "the server asked git something before any call, so the count below is not the call's"
+    );
+
+    // Five items, four of which capture provenance and therefore run git:
+    // claim, checkpoint and heartbeat all ask where they are.
+    let (is_error, envelope) = mcp_transact(
+        &mut session,
+        2,
+        json!({
+            "items": [
+                { "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } },
+                { "name": "note", "arguments": { "id": "t-1", "text": "first", "as": "agent-a" } },
+                checkpoint_item("t-1", json!({ "$ref": { "item": 0, "path": "/leaseToken" } }), "agent-a"),
+                { "name": "heartbeat", "arguments": { "id": "t-1", "lease": { "$ref": { "item": 0, "path": "/leaseToken" } } } },
+                { "name": "note", "arguments": { "id": "t-1", "text": "last", "as": "agent-a" } },
+            ],
+        }),
+    );
+    assert!(!is_error, "{envelope}");
+    assert_eq!(
+        envelope["results"].as_array().unwrap().len(),
+        5,
+        "{envelope}"
+    );
+    let batch_id = envelope["batchId"].as_str().unwrap().to_owned();
+    session.finish();
+
+    // One process ran all five items.
+    let callers = git_callers(&log);
+    assert!(
+        callers.len() >= 3,
+        "git never ran, so this counts nothing: {callers:?}"
+    );
+    let pids = deduped(callers.iter().map(|(pid, _)| pid.clone()).collect());
+    assert_eq!(
+        pids.len(),
+        1,
+        "the five items ran in {} processes: {callers:?}",
+        pids.len()
+    );
+    assert_ne!(
+        pids[0],
+        server.to_string(),
+        "the server answered in its own process instead of running the binary"
+    );
+    let commands = deduped(callers.iter().map(|(_, command)| command.clone()).collect());
+    assert_eq!(commands.len(), 1, "{callers:?}");
+    let command = &commands[0];
+    assert!(command.contains(" transact "), "{command}");
+    assert!(command.contains("--items-file"), "{command}");
+    assert!(
+        !command.contains("--items "),
+        "the list travelled as an argv string, which has a ceiling: {command}"
+    );
+
+    // And the ledger agrees, from the other side: `batchId` is minted once per
+    // `transact` process, so one id across every stamped event is one process,
+    // and one transaction is what makes the batch atomic at all.
+    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    let stamped = deduped(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["payload"]["batchId"].as_str())
+            .map(str::to_owned)
+            .collect(),
+    );
+    assert_eq!(stamped, vec![batch_id], "{events}");
+
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(task["claim"]["agentID"], "agent-a", "{task}");
+    assert_eq!(task["checkpoints"].as_array().unwrap().len(), 1, "{task}");
+    assert_eq!(task["notes"].as_array().unwrap().len(), 2, "{task}");
+}
+
+#[test]
+fn a_malformed_transact_is_refused_without_running_the_binary() {
+    let fixture = Fixture::new("mcp-transact-malformed");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXMCPBAD", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let (log, path) = git_caller_stub(&fixture);
+
+    let mut session = Session::start_with_env(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+        &[("PATH", path.as_str())],
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+
+    // The binary would refuse each of these in the same words. Refusing them
+    // here is the point: a call that is not a list of calls at all has nothing
+    // to gain from a process start, which is the cost this tool exists to
+    // remove.
+    for (index, (arguments, expected)) in [
+        (json!({}), "transact needs an items array"),
+        (json!({ "items": "[]" }), "items must be an array"),
+        (
+            json!({ "items": [{ "arguments": { "id": "t-1" } }] }),
+            "item 0 needs a name",
+        ),
+        (
+            json!({ "items": [{ "name": "note", "arguments": "id=t-1" }] }),
+            "item 0 has arguments that are not an object",
+        ),
+        (
+            json!({ "items": [], "items-file": "/tmp/elsewhere.json" }),
+            "transact has no argument items-file",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refusal = mcp_transact_refusal(&mut session, 10 + index as i64, arguments.clone());
+        assert!(refusal.contains(expected), "{arguments}: {refusal}");
+        assert!(
+            git_callers(&log).is_empty(),
+            "{arguments} cost a process start to be refused: {:?}",
+            git_callers(&log)
+        );
+    }
+
+    // A legal list does reach the binary, so the emptiness above is a refusal
+    // rather than a stub that never worked.
+    let (is_error, envelope) = mcp_transact(
+        &mut session,
+        20,
+        json!({ "items": [{ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }] }),
+    );
+    assert!(!is_error, "{envelope}");
+    session.finish();
+    assert!(
+        !git_callers(&log).is_empty(),
+        "the counting git stub never ran even for a legal transact"
+    );
+
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(task["claim"]["agentID"], "agent-a", "{task}");
+    assert_eq!(task["notes"], json!([]), "a refused transact wrote: {task}");
+}
+
+#[test]
+fn the_read_only_batch_still_refuses_transact_and_every_other_writing_tool() {
+    let fixture = Fixture::new("mcp-batch-refuses-transact");
+    fixture.ok_json(&fixture.main, &["init", "--name", "BATCHFROZEN", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "already here", "--id", "t-before", "--json"],
+    );
+    let before = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+
+    // By name, because a batch carrying `transact` would be the whole
+    // read-only argument undone in one entry: the batch is safe *because* it
+    // refuses a write, and `transact` is the write worth smuggling.
+    let refusal = batch_refusal(
+        &mut session,
+        3,
+        vec![
+            json!({ "name": "task_list", "arguments": {} }),
+            json!({ "name": "transact", "arguments": { "items": [] } }),
+        ],
+    );
+    assert!(refusal.contains("call 1"), "{refusal}");
+    assert!(refusal.contains("transact"), "{refusal}");
+    assert!(refusal.contains("writes"), "{refusal}");
+    assert!(refusal.contains("nothing in it ran"), "{refusal}");
+
+    // And every other writing tool the list advertises, so the refusal is the
+    // `COMMANDS` row it reads rather than a list of names kept by hand.
+    let writing = tools
+        .iter()
+        .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(false))
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        writing.contains(&"transact".to_owned()),
+        "transact is not advertised as writing, so nothing above was refused for writing"
+    );
+    assert!(
+        writing.len() > 40,
+        "only {} writing tools were listed: {writing:?}",
+        writing.len()
+    );
+    for (index, name) in writing.iter().enumerate() {
+        let refusal = batch_refusal(
+            &mut session,
+            100 + index as i64,
+            vec![
+                json!({ "name": "stale", "arguments": {} }),
+                json!({ "name": name, "arguments": {} }),
+            ],
+        );
+        assert!(refusal.contains("call 1"), "{name}: {refusal}");
+        assert!(refusal.contains(name.as_str()), "{name}: {refusal}");
+        assert!(refusal.contains("writes"), "{name}: {refusal}");
+        assert!(refusal.contains("nothing in it ran"), "{name}: {refusal}");
+    }
+
+    session.finish();
+
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        before,
+        "the board changed under batches that were refused whole"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+        events_before,
+        "a refused batch wrote to the ledger"
+    );
 }
 
 #[test]
