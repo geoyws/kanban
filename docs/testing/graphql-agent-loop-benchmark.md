@@ -226,3 +226,231 @@ driver as a fourth transport with its own reuse proof, run all four arms in one
 receipt in one session against the frozen board, and let `verdict.comparable`
 decide whether the numbers may be compared. A GraphQL receipt with no ssh
 arms beside it is not a comparison.
+
+## 8. The write half — `kanban-agent-loop-v3`
+
+The read half above is half a loop. A `/kb` worker also writes: it claims a
+task, checkpoints under that lease, leaves a note and releases. Four board
+writes, and until kanban `2815693` four round trips, because the lease token
+the last three need is minted by the first. `kanban transact` (ADR-041) carries
+the whole unit in one ordered, all-or-nothing request and resolves that token on
+the host with a `$ref`. Section 8 is how that claim is measured.
+
+`docs/testing/bench/fixture-v3.json` is v2's twelve reads carried over byte for
+byte — `diff <(jq -S .reads fixture-v2.json) <(jq -S .reads fixture-v3.json)` is
+empty, which is what keeps a v3 receipt's read numbers comparable with a v2
+receipt's — plus one new `writes` section. The write numbers have no earlier
+baseline; v3 is their first.
+
+### 8.1 The unit of work
+
+One write iteration, in this order, as `writes.transact_items`:
+
+| # | operation | arguments that matter |
+|---|---|---|
+| 0 | `claim` | `id` TASK, `as` `bench@driver` |
+| 1 | `checkpoint` | `lease` `{"$ref": {"item": 0, "path": "/leaseToken"}}`, `state` `continue`, `summary`, `intent`, `next-action`, and explicit `repo`/`branch`/`head`/`dirty` |
+| 2 | `note` | `text`, `as`, `kind` `progress` |
+| 3 | `release` | the same `$ref` lease |
+
+`writes.per_command` is the same four writes as four separate argv/tool forms
+with a `TOKEN` placeholder the driver fills in from the claim's own answer. That
+hand-threading is the thing being compared: `transact` needs one request where
+the per-command form needs four.
+
+The checkpoint carries its git provenance explicitly. ADR-008
+(`rust/lib.rs:3576`) refuses a checkpoint whose provenance would be blank and
+captures it from the caller's checkout otherwise; `ssh host kb …` lands in
+`$HOME`, so capture would either fail or record whatever checkout happens to be
+there. Explicit values make the write identical on every arm and on every host.
+
+**TASK is never hardcoded.** A frozen id may already be claimed or done, so the
+driver picks one at run time: `claim --candidates --as bench@driver --lane
+driver --limit 5 --json` on a scratch copy, first candidate whose status is
+`todo` (`claim --candidates` already excludes rows with unmet dependencies and
+rows someone holds). No candidate fails the run loudly — `writes.error` in the
+receipt, a `verdict` reason, and a non-zero exit.
+
+### 8.2 The scratch-copy rule
+
+**No arm ever writes the frozen fixture.** Per iteration, per arm:
+
+```
+scratch=$(mktemp -d /tmp/kb-bench-scratch-XXXXXXXX)
+cp -r /root/bench-fixture/. "$scratch/"
+chmod -R u+w "$scratch"                 # the fixture is 0400; a copy of a read-only file is read-only
+… the four writes, against $scratch …
+kb --db $scratch/boards/<board>.db task show TASK --json    # the readback
+rm -rf "$scratch"                       # guarded by the /tmp/kb-bench-scratch- prefix, here and on the host
+```
+
+The copy and the readback each travel over their own cold ssh — on every arm,
+the MCP ones included — and are timed separately as `scratch_copy_ms` and
+`readback_ms`. They are **excluded from `write_loop_ms`**, and reported so that
+their exclusion is checkable rather than promised. Keeping them off the arm's
+own channel also keeps its reuse proof honest: a readback down the MCP pipe
+would make `requests_answered` disagree with `requests_per_write_loop`.
+
+Writes address the copy with `--db $scratch/boards/<board>.db`, never with
+`--project kanban`. `registry.db` stores absolute board paths, so a copied
+registry still names the frozen board: the board name would open the very file
+this rule exists to protect. `--db` addresses the copy itself, and a board
+outside the data root takes no data-root lock (`rust/lock.rs:130-147`), so a
+temp directory needs no registry surgery. `KANBAN_DATA_DIR` is deliberately not
+overridden per iteration, because it could not be — an MCP arm is one persistent
+`ssh host kb mcp` child whose environment is fixed when the session opens, while
+a per-iteration `--db` reaches every arm identically. The board file's basename
+is discovered from the frozen registry at run time and never hardcoded.
+
+The rule is argued above and **evidenced** in the receipt: the frozen board's
+path, size and mtime are probed before and after every write arm, and a change
+disqualifies the receipt.
+
+### 8.3 Arms
+
+| arm | halves | the write half |
+|---|---|---|
+| ssh | reads + writes | four writes, one fresh ssh each |
+| ssh-controlmaster | reads + writes | four writes over one master |
+| mcp-over-ssh | reads + writes | four `tools/call` on one pipe |
+| mcp-batch | reads only | none: `batch` refuses a tool that is not `readOnlyHint` true |
+| mcp-transact | writes only | one `tools/call transact` on one pipe |
+| ssh-transact | writes only | one cold ssh, `transact --items-file /dev/stdin`, items on stdin |
+
+`requests_per_write_loop` is 4, 4, 4, —, 1, 1. The two transact arms verify the
+whole envelope — `ok`, one result per item, every result `ok`, and a non-zero
+exit exactly when `ok` is false — because a rolled-back batch reporting success
+would leave every arm's state equal *and wrong*. The item list travels on stdin
+rather than in `--items` because an argv string has a size limit a batch does
+not (ADR-041 §8), and the board selector travels on the `transact` call itself:
+an item naming a board of its own is refused (`rust/lib.rs:4856`).
+
+Each half is its own pass with its own cold setup per arm, so a read receipt is
+shaped exactly as v2 left it and an arm with only one half needs no special
+case.
+
+### 8.4 Write equivalence — what makes the write half comparable
+
+The read half compares response digests. The write half compares **the state
+the board was left in**. After each arm's write half, the readback projects
+`task show TASK --json` to four values: `status`, `claim_released` (the claim
+row is gone), `notes` (count) and `checkpoints` (count). Counts are absolute
+rather than deltas because every iteration starts from a fresh copy of the same
+frozen board, so the baseline is a constant.
+
+The write half is comparable iff every arm left the same projected state on
+every iteration. Two questions are kept apart, because they have different
+answers: whether an arm agreed with itself (`drift_within_an_arm`) and whether
+the arms agreed with each other (`all_equivalent`). The fixture also states the
+state it expects — `status: todo`, `claim_released: true` — and an iteration
+that ends anywhere else fails, so five arms that are wrong in the same way
+cannot pass as equivalent.
+
+### 8.5 Receipt — `writes` beside the read half
+
+The read half's schema is unchanged. A v3 receipt adds one top-level `writes`
+object, self-identifying as `kanban-agent-loop-benchmark-writes/1`:
+
+```
+"writes": {
+  "writes_schema": "kanban-agent-loop-benchmark-writes/1",
+  "scratch_rule": …, "excluded_from_write_loop_ms": ["scratch_copy_ms", "readback_ms"],
+  "board_file": …, "frozen_source": …,
+  "task": { task, selected_index, required_status, candidates[], command },
+  "arms": [ { arm, half: "writes", transport, description, writes_per_loop,
+              requests_per_write_loop, setup, host_before, host_after,
+              warmups{…},
+              measured{ iterations_ok, failures,
+                        write_loop_ms{n,min,p50,p95,p99,max,mean,stdev},
+                        write_loop_ms_samples[], scratch_copy_ms{…}, readback_ms{…},
+                        bytes_sent_per_write_loop{…}, bytes_received_per_write_loop{…},
+                        per_step{ id: {ms{…}, bytes_sent, bytes_received} },
+                        state{ distinct[], value } },
+              connection_reuse{…}, frozen_board{ before, after, unchanged },
+              scratch_leaked[], failure_detail[], valid } ],
+  "equivalence": { state_by_arm, projection, all_equivalent, drift_within_an_arm }
+}
+```
+
+A run with only one half says so rather than leaving a key out: the other half
+carries `not_run` with the reason. `verdict.reasons` prefixes every write-half
+reason with `writes:` or `writes/<arm>:`, so one merged verdict still names
+which half disqualified the receipt.
+
+### 8.6 Running it
+
+```
+python3 docs/testing/bench/agent-loop-bench.py \
+  --fixture docs/testing/bench/fixture-v3.json \
+  --out docs/testing/graphql-agent-loop-benchmark-v3-<date>.json
+```
+
+Both halves run by default, reads first; `--reads-only` and `--writes-only`
+select one. `--warmups`, `--iterations`, `--arms`, `--out` and `--quiet` are
+unchanged, and lowering either count still disqualifies the receipt.
+
+`--dry-run` prints the exact remote command lines and JSON-RPC frames one
+iteration of every selected arm would issue — placeholders substituted from a
+fake candidate `t-dry` — and exits 0 without contacting any host. It is built
+from the same code the measured run uses, which is the only reason a printed
+line is worth reading, and it is how this driver is reviewed before it is ever
+pointed at the board home.
+
+## 9. Receipt, 2026-09-07 — the write half in one request
+
+`docs/testing/graphql-agent-loop-benchmark-v3-2026-09-07.json`, run from the
+MBP against the frozen fixture on hax, bench binary built from kanban
+`2815693` (the served release stayed at `1de9bbf`), 5 warmups + 30 measured
+iterations per arm per half, task `t-38ee2070` selected by `claim --candidates`
+on a throwaway copy. Every arm 30/30, one distinct end state across all five
+arms (`status: todo`, claim released, 2 notes, 1 checkpoint), the frozen board
+byte-identical before and after every arm, no scratch directory leaked.
+
+### 9.1 The write half — claim, checkpoint by `$ref`, note, release
+
+| arm | requests | p50 | p95 | p99 | per step p50 |
+|---|---|---|---|---|---|
+| ssh, cold per command | 4 | **10,698 ms** | 12,091 | 12,625 | 2.5–2.6 s each |
+| ssh ControlMaster, per command | 4 | **2,223 ms** | 2,776 | 3,540 | ~0.5 s each |
+| MCP over ssh, per command | 4 | **1,081 ms** | 1,506 | 1,557 | ~0.26 s each |
+| MCP `transact`, one call | 1 | **312 ms** | 343 | 571 | 312 |
+| ssh `transact --items-file /dev/stdin`, one cold ssh | 1 | **2,741 ms** | 4,644 | 6,721 | 2,740 |
+
+The write half costs one request on both surfaces. On the persistent MCP
+session that is 312 ms where four calls cost 1,081 ms — the difference is
+three round trips, exactly as ADR-041 predicted, and the atomic batch is the
+only arm that can fail cleanly. On the cold-ssh CLI path a single `transact`
+is one ssh setup (2.7 s) where four commands cost four (10.7 s); it is not
+faster than one command, and it was never going to be — the CLI arm's floor is
+the ssh handshake, which is why the persistent MCP session exists.
+
+### 9.2 The read half, and why this run's read numbers are not comparable to v2
+
+| arm | requests | p50 v2 (2026-09-07 morning) | p50 v3 (2026-09-07 afternoon) |
+|---|---|---|---|
+| ssh, cold per read | 12 | 26,582 ms | 31,659 ms |
+| ssh ControlMaster | 12 | 4,686 ms | 10,110 ms |
+| MCP over ssh | 12 | 2,451 ms | 8,637 ms |
+| MCP `batch` | 2 | **424 ms** | 6,776 ms |
+
+The reads are byte-identical to v2 and the bench binary answers `task list` in
+9 ms on hax under both builds (`kb-bench-9d9685d` and `kb-bench-2815693`,
+measured back to back). What changed is the link: the run's own `rtt` block
+records 190.9 ms mean with 10.9 ms jitter against v2's 168.6 ms with 0.5 ms,
+and the heavy reads moved at ~30–35 KB/s (`attention_resolved_500`, 72 KB, in
+2,357 ms on the per-command MCP arm; the 238 KB batch in ~6.5 s) where the
+morning run moved them at ~180 KB/s. A cold ssh pulling 240 KB measured 9.4 s
+after the run, so the link had not recovered when this was written. Within the
+run the ordering holds — `batch` is still the fastest read arm — but the
+absolute read numbers here are a measurement of the afternoon's route, not of
+the code, and v2's read half remains the reference until a reads-only re-run
+on a healthy link replaces it. The write arms are unaffected as a comparison:
+all five ran on the same link in the same hour, and their payloads are small
+enough (a few KB) that bandwidth was not the term.
+
+### 9.3 What a loop costs now
+
+Two requests for the reads (`batch`) and one for the writes (`transact`) on
+the MCP session; on the cold-ssh CLI path, the same three requests are three
+ssh setups instead of sixteen. The idempotency gap stands as ADR-041 §9
+states it: a replayed START batch is refused at its claim and lands nothing.
