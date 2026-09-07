@@ -786,6 +786,9 @@ install_release_tree() {
 
   if [[ ! -d "$release_path" ]]; then
     staging="$(mktemp -d "$install_root/releases/.${release_id}.XXXXXX")"
+    # mktemp makes 0700; the release dir it becomes must be traversable by the
+    # service identity, which is no longer the installing root (hax, 2026-09-06).
+    chmod 0755 "$staging"
     track_temp "$staging"
     for binary in "${BINARIES[@]}"; do
       install -m 0755 "$package_dir/$binary" "$staging/$binary"
@@ -1347,6 +1350,9 @@ if [[ -L "$install_root/current" ]]; then
 fi
 if [[ ! -d "$release_path" ]]; then
   staging="$(mktemp -d "$install_root/releases/.${release_id}.XXXXXX")"
+  # mktemp makes 0700; the release dir it becomes must be traversable by the
+  # service identity, which is no longer the installing root (hax, 2026-09-06).
+  chmod 0755 "$staging"
   for binary in "${BINARIES[@]}"; do
     install -m 0755 "$package_dir/$binary" "$staging/$binary"
   done
