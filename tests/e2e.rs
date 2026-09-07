@@ -28191,6 +28191,70 @@ fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases
     }
 }
 
+/// A release directory is born from `mktemp -d`, which makes 0700, and `mv`
+/// carries that mode onto the release. That was invisible while root both
+/// installed the release and ran the service; since the hax identity cutover
+/// (2026-09-06) `kanban-serve` runs as the `kanban` user, and installing a
+/// 0700 release on 2026-09-07 09:27 CEST left systemd unable to reach the new
+/// binary at all: 203/EXEC, restart loop, loopback down for about three and a
+/// half minutes until the directory was chmod'ed by hand. The mode bits are
+/// exactly what the service identity sees, so they are what this asserts:
+/// this test cannot switch uid, but a directory missing its world execute bit
+/// is unreachable to every identity except its owner, whoever that is.
+#[test]
+fn hig_release_script_installs_a_release_directory_another_identity_can_traverse() {
+    let harness = ReleaseGuardHarness::new("hig-release-traversable");
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("traversable-{target}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("traversable-bin-{target}"));
+        let installed = harness.install(target, &install_root, &bin_dir);
+        assert!(
+            installed.status.success(),
+            "{target}: install failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+
+        // The directory the activated view resolves to, not the one the
+        // installer reported: what the service execs is `current/<binary>`.
+        let release_dir = fs::read_link(install_root.join("current")).unwrap();
+        assert_release_view(&install_root, &bin_dir, &release_dir);
+
+        let dir_mode = fs::metadata(&release_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode,
+            0o755,
+            "{target}: release directory {} installed 0{dir_mode:o}, not 0755",
+            release_dir.display()
+        );
+        // Restated as the service identity experiences it: a non-owner must be
+        // able to traverse into the release at all.
+        assert_eq!(
+            dir_mode & 0o005,
+            0o005,
+            "{target}: release directory {} cannot be traversed without owner rights (0{dir_mode:o})",
+            release_dir.display()
+        );
+
+        for name in declared_bin_names() {
+            let binary = release_dir.join(&name);
+            let mode = fs::metadata(&binary).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o755,
+                "{target}: installed {name} is 0{mode:o}, not 0755"
+            );
+            assert_ne!(
+                mode & 0o001,
+                0,
+                "{target}: installed {name} is not executable without owner rights (0{mode:o})"
+            );
+        }
+    }
+}
+
 /// `files[].name` is joined onto the package directory and then EXECUTED:
 /// `file_version` runs `"$dir/$name" version` to prove the binary reports what
 /// the manifest claims. A name that escapes the package directory therefore
