@@ -345,6 +345,39 @@ than sinking the batch. `claim --candidates` is read-only in the CLI but shares
 a command row with the `claim` that writes a lease, so a batch refuses it and a
 caller issues that one read on its own.
 
+`kanban transact` is the writing half, and the thing it adds is not speed but
+failure: it takes the same items, `(--items JSON_ARRAY | --items-file PATH)`
+holding `[{"name": TOOL, "arguments": {…}}]`, runs up to 32 of them in order
+against one open board inside one `BEGIN IMMEDIATE`, and either all of them
+land or none of them do. It answers with one envelope — `{"ok", "batchId",
+"failedIndex", "rolledBack", "results": [{"index", "ok", "result"} |
+{"index", "ok": false, "error"} | {"index", "ok": false, "skipped": true}]}` —
+and exits non-zero whenever `ok` is `false`. Execution stops at the first
+failure, every item before it is rolled back, and every item after it is
+`skipped` rather than attempted, so `rolledBack: true` means the board is
+exactly where the batch found it. `rolledBack: false` on a failure means the
+opposite and only one thing: the list was refused before anything ran, because
+an item was malformed, named an operation a batch may not carry, named a second
+board, or carried a back-reference that could not resolve. Any argument value
+may be `{"$ref": {"item": N, "path": "/json/pointer"}}`, replaced by the value
+at that RFC 6901 pointer inside item `N`'s result, where `N` is strictly
+earlier — which is how the lease token a `claim` returns reaches the
+`checkpoint` three items later without the agent handling it. Each item is
+authorized exactly as if it had arrived alone, and each landed item's ledger
+event carries `batchId` and `batchIndex`, so the order is reconstructable from
+the ledger and a `batchId` there always means a batch that landed whole. Two
+things a rollback does not undo, stated because they are invisible otherwise.
+Opening the board retires expired claims and commits that sweep before any
+batch scope exists, so a `transact` that rolled back may still have retired
+somebody else's lapsed lease and appended those events — correct, because the
+sweep is not part of the caller's batch, but it means a rolled-back `transact`
+is not a no-op on the ledger in every possible sense. And there is no
+idempotency key in V1: **a replayed batch is not a no-op.** A replayed `claim`
+is refused, so a loop batch that starts with one fails at index 0 and lands
+nothing — good, but good by accident of `claim`'s own semantics. Two replayed
+`note` items are two notes. An agent that cannot tell whether a `transact` was
+received must read the board rather than retry blindly.
+
 Project names are not unique. If two boards share one, `--project` refuses and
 names every candidate, including rootless boards; use `--workspace PATH` or a
 registered path to pick one. `workspace attach --to .` and similar path-like

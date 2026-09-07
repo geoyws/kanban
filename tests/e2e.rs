@@ -14218,6 +14218,874 @@ fn a_batched_read_is_byte_identical_to_the_same_read_on_its_own() {
     session.finish();
 }
 
+/// One `kanban transact`, answered as its envelope.
+///
+/// Modelled on `batch_results`, and it hands back the whole envelope rather
+/// than only `results` because for `transact` the envelope IS the answer:
+/// `ok`, `failedIndex` and `rolledBack` are what a caller acts on. The exit
+/// status is checked against the envelope's own verdict here, so no case has
+/// to remember to.
+fn transact_results(fixture: &Fixture, cwd: &Path, items: &[Value]) -> Value {
+    let list = serde_json::to_string(items).unwrap();
+    let output = fixture.run(cwd, &["transact", "--items", &list, "--json"]);
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "transact stdout is not JSON: {error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(
+        output.status.success(),
+        envelope["ok"] == json!(true),
+        "the exit status and the envelope disagree: {envelope}"
+    );
+    assert!(
+        envelope["batchId"]
+            .as_str()
+            .is_some_and(|id| id.len() == 36),
+        "the envelope carries no batch id: {envelope}"
+    );
+    envelope
+}
+
+/// The refusal text of a transact rejected before any of it ran.
+fn transact_refusal(fixture: &Fixture, cwd: &Path, items: &[Value]) -> String {
+    let envelope = transact_results(fixture, cwd, items);
+    assert_eq!(
+        envelope["ok"], false,
+        "a transact that must be refused ran: {envelope}"
+    );
+    // The one failure that reports no rollback: nothing was attempted.
+    assert_eq!(
+        envelope["rolledBack"], false,
+        "a pre-flight refusal reported a rollback: {envelope}"
+    );
+    assert_eq!(
+        envelope["results"],
+        json!([]),
+        "a pre-flight refusal carried results: {envelope}"
+    );
+    let text = envelope["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a refusal names itself: {envelope}"))
+        .to_owned();
+    assert!(text.ends_with("nothing in it ran"), "{text}");
+    text
+}
+
+/// A checkpoint item's arguments, which every case spells the same way.
+fn checkpoint_item(id: &str, lease: Value, actor: &str) -> Value {
+    json!({ "name": "checkpoint", "arguments": {
+        "id": id,
+        "lease": lease,
+        "as": actor,
+        "summary": "did the thing",
+        "intent": "do the thing",
+        "next-action": "do the next thing",
+        "state": "continue",
+    }})
+}
+
+/// The board journal's report inside `audit verify --json`.
+fn board_audit(fixture: &Fixture) -> Value {
+    let report = fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
+    assert_eq!(report["healthy"], true, "the ledger is unhealthy: {report}");
+    report["boards"][0]["audit"].clone()
+}
+
+#[test]
+fn transact_runs_its_items_in_order_and_each_result_matches_the_same_command_alone() {
+    let fixture = Fixture::new("transact-order");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXALONE", "--json"]);
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "TXBATCH", "--json"]);
+    for cwd in [&fixture.main, &fixture.worktree] {
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+        fixture.ok_json(cwd, &["task", "add", "subject", "--id", "t-1", "--json"]);
+    }
+
+    // The same write, once on its own and once as an item. Only `createdAt`
+    // is dropped, because two writes cannot share a millisecond by
+    // construction; everything else must be equal or the batch is a second
+    // way to write the board.
+    let alone = fixture.ok_json(
+        &fixture.main,
+        &["note", "t-1", "one", "--as", "agent-a", "--json"],
+    );
+    let envelope = transact_results(
+        &fixture,
+        &fixture.worktree,
+        &[
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "one", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "two", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "three", "as": "agent-a" } }),
+        ],
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["failedIndex"], Value::Null, "{envelope}");
+    assert_eq!(envelope["rolledBack"], false, "{envelope}");
+
+    let mut batched = envelope["results"][0]["result"].clone();
+    let mut alone = alone;
+    for shape in [&mut batched, &mut alone] {
+        shape.as_object_mut().unwrap().remove("createdAt");
+    }
+    assert_eq!(
+        batched, alone,
+        "a transacted write answered differently from the same command alone"
+    );
+
+    // In order, and the board agrees: the notes come back oldest first.
+    let indices = envelope["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["index"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(indices, vec![json!(0), json!(1), json!(2)]);
+    let bodies = fixture.ok_json(&fixture.worktree, &["task", "show", "t-1", "--json"])["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| note["body"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies, ["one", "two", "three"]);
+}
+
+#[test]
+fn a_transact_that_fails_midway_rolls_back_every_item_before_it() {
+    let fixture = Fixture::new("transact-rollback");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXROLL", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let tasks_before = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+
+    // A claim, a note and a checkpoint that all succeed, then an item that
+    // names a task that is not there. Today's per-command commit would leave
+    // the first three landed with nothing to say so.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "in the batch", "as": "agent-a" } }),
+            checkpoint_item(
+                "t-1",
+                json!({ "$ref": { "item": 0, "path": "/leaseToken" } }),
+                "agent-a",
+            ),
+            json!({ "name": "note", "arguments": { "id": "t-absent", "text": "boom", "as": "agent-a" } }),
+        ],
+    );
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["failedIndex"], 3, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    assert!(
+        envelope["results"][3]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("t-absent")),
+        "{envelope}"
+    );
+
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(task["status"], "todo", "the task did not go back: {task}");
+    assert_eq!(
+        task["claim"],
+        Value::Null,
+        "a rolled-back batch left a claim"
+    );
+    assert_eq!(
+        task["notes"],
+        json!([]),
+        "a rolled-back batch left a note: {task}"
+    );
+    assert_eq!(
+        task["checkpoints"],
+        json!([]),
+        "a rolled-back batch left a checkpoint: {task}"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        tasks_before,
+        "the board changed under a batch that rolled back"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+        events_before,
+        "a rolled-back batch left a ledger event"
+    );
+}
+
+#[test]
+fn a_failed_transact_leaves_the_audit_chain_healthy_and_its_sequence_unbroken() {
+    let fixture = Fixture::new("transact-chain");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXCHAIN", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let before = board_audit(&fixture);
+
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "one", "as": "agent-a" } }),
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-b" } }),
+        ],
+    );
+    assert_eq!(envelope["failedIndex"], 2, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+
+    // Rolling back frees the sequence numbers rather than skipping them, so
+    // the chain is intact rather than merely unbroken-looking (ADR-029).
+    let after = board_audit(&fixture);
+    assert_eq!(after["lastSeq"], before["lastSeq"], "{after}");
+    assert_eq!(after["entries"], before["entries"], "{after}");
+    assert_eq!(after["head"], before["head"], "{after}");
+    assert_eq!(after["errors"], json!([]), "{after}");
+}
+
+#[test]
+fn a_transact_reports_failed_index_rolled_back_and_skips_every_later_item() {
+    let fixture = Fixture::new("transact-skips");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXSKIP", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "first", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "third", "as": "agent-a" } }),
+            json!({ "name": "task_list", "arguments": {} }),
+            json!({ "name": "stale", "arguments": {} }),
+        ],
+    );
+    assert_eq!(envelope["failedIndex"], 1, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    let results = envelope["results"].as_array().unwrap();
+    assert_eq!(results.len(), 5, "{envelope}");
+    assert_eq!(results[0]["ok"], true, "{envelope}");
+    assert_eq!(results[1]["ok"], false, "{envelope}");
+    assert_eq!(
+        results[1]["skipped"],
+        Value::Null,
+        "an item that ran was reported as never tried"
+    );
+    // `skipped` is its own field, so an agent tells "refused" from "never
+    // tried" without parsing prose.
+    for index in 2..5 {
+        assert_eq!(results[index]["index"], index, "{envelope}");
+        assert_eq!(results[index]["skipped"], true, "{envelope}");
+        assert_eq!(results[index]["error"], Value::Null, "{envelope}");
+    }
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["notes"],
+        json!([]),
+        "the item before the failure landed"
+    );
+}
+
+#[test]
+fn a_transact_resolves_a_back_reference_to_an_earlier_items_result() {
+    let fixture = Fixture::new("transact-ref");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXREF", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+
+    // The lease token a claim at index 0 returns reaches a checkpoint at
+    // index 2 without the agent ever seeing it.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "working", "as": "agent-a" } }),
+            checkpoint_item(
+                "t-1",
+                json!({ "$ref": { "item": 0, "path": "/leaseToken" } }),
+                "agent-a",
+            ),
+        ],
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let token = envelope["results"][0]["result"]["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(token.len(), 36, "a claim answers with a lease token");
+
+    // `task show` withholds the token, so the proof that the reference
+    // resolved to the RIGHT value is the checkpoint: `require_lease` refuses
+    // any token but the live one, and a wrong token would have failed the
+    // item and rolled the claim back with it.
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(task["claim"]["agentID"], "agent-a", "{task}");
+    assert_eq!(task["status"], "in_progress", "{task}");
+    let checkpoints = task["checkpoints"].as_array().unwrap();
+    assert_eq!(checkpoints.len(), 1, "{task}");
+    assert_eq!(checkpoints[0]["summary"], "did the thing", "{task}");
+    assert_eq!(task["notes"].as_array().unwrap().len(), 1, "{task}");
+
+    // And a token that is not the one item 0 returned is refused, so the
+    // reference above cannot have been resolving to something inert.
+    let wrong = transact_results(
+        &fixture,
+        &fixture.main,
+        &[checkpoint_item(
+            "t-1",
+            json!(token.replace('a', "b")),
+            "agent-a",
+        )],
+    );
+    assert_eq!(wrong["failedIndex"], 0, "{wrong}");
+}
+
+#[test]
+fn a_transact_with_an_unresolvable_reference_is_refused_whole_and_runs_nothing() {
+    let fixture = Fixture::new("transact-bad-ref");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXBADREF", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let tasks_before = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+
+    // Each list puts a real write first, so a reference validated as it ran
+    // would have landed one.
+    let write = json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } });
+    for (label, reference, expected) in [
+        (
+            "forward",
+            json!({ "item": 2, "path": "/leaseToken" }),
+            "item 2",
+        ),
+        (
+            "self",
+            json!({ "item": 1, "path": "/leaseToken" }),
+            "item 1",
+        ),
+        (
+            "out of range",
+            json!({ "item": 9, "path": "/leaseToken" }),
+            "item 9",
+        ),
+        (
+            "malformed pointer",
+            json!({ "item": 0, "path": "leaseToken" }),
+            "JSON Pointer",
+        ),
+    ] {
+        let refusal = transact_refusal(
+            &fixture,
+            &fixture.main,
+            &[
+                write.clone(),
+                checkpoint_item("t-1", json!({ "$ref": reference }), "agent-a"),
+            ],
+        );
+        // The offending item is item 1 in every list, and the refusal names it.
+        assert!(refusal.contains("transact item 1"), "{label}: {refusal}");
+        assert!(refusal.contains(expected), "{label}: {refusal}");
+
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+            tasks_before,
+            "{label}: the board changed under a refused batch"
+        );
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+            events_before,
+            "{label}: a refused batch wrote to the ledger"
+        );
+    }
+}
+
+#[test]
+fn a_read_inside_a_transact_observes_the_earlier_writes() {
+    let fixture = Fixture::new("transact-read");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXREAD", "--json"]);
+
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "task_add", "arguments": { "title": "made here", "id": "t-new", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-new", "text": "written here", "as": "agent-a" } }),
+            json!({ "name": "task_show", "arguments": { "id": "t-new" } }),
+            json!({ "name": "events", "arguments": { "task": "t-new", "limit": "10" } }),
+        ],
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+
+    // A read item sees the uncommitted writes of the items before it: within
+    // one transaction on one connection, a statement sees that transaction's
+    // own writes. A second, read-only connection would answer from the
+    // pre-batch snapshot and say nothing about it.
+    let shown = &envelope["results"][2]["result"];
+    assert_eq!(shown["id"], "t-new", "{envelope}");
+    assert_eq!(shown["notes"][0]["body"], "written here", "{envelope}");
+    let kinds = envelope["results"][3]["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["note_added", "task_added"], "{envelope}");
+}
+
+#[test]
+fn a_transact_naming_batch_or_transact_is_refused_whole() {
+    let fixture = Fixture::new("transact-nested");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXNEST", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let events_before = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+
+    let write =
+        json!({ "name": "note", "arguments": { "id": "t-1", "text": "before", "as": "agent-a" } });
+    // Its own name is refused by name, because `transact` has a COMMANDS row.
+    let itself = transact_refusal(
+        &fixture,
+        &fixture.main,
+        &[
+            write.clone(),
+            json!({ "name": "transact", "arguments": { "items": "[]" } }),
+        ],
+    );
+    assert!(itself.contains("transact item 1"), "{itself}");
+    assert!(itself.contains("may not carry a batch"), "{itself}");
+
+    // The read-only batch needs no code of its own: it has no COMMANDS row,
+    // so it resolves to no operation, exactly as `batch`'s own validation
+    // refuses a nested batch.
+    let read_batch = transact_refusal(
+        &fixture,
+        &fixture.main,
+        &[
+            write.clone(),
+            json!({ "name": "batch", "arguments": { "calls": [] } }),
+        ],
+    );
+    assert!(read_batch.contains("transact item 1"), "{read_batch}");
+    assert!(
+        read_batch.contains("no such operation batch"),
+        "{read_batch}"
+    );
+
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["notes"],
+        json!([]),
+        "the write before the nested item landed"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]),
+        events_before,
+        "a refused batch wrote to the ledger"
+    );
+}
+
+#[test]
+fn a_transact_over_the_bound_is_refused_naming_the_bound() {
+    let fixture = Fixture::new("transact-bound");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXBOUND", "--json"]);
+
+    let stale_items = |count: usize| vec![json!({ "name": "stale", "arguments": {} }); count];
+
+    let refusal = transact_refusal(&fixture, &fixture.main, &stale_items(33));
+    assert!(refusal.contains("at most 32"), "{refusal}");
+    assert!(
+        refusal.contains("33"),
+        "the refusal did not say how many were sent: {refusal}"
+    );
+
+    // The bound is the bound, not one short of it: 32 runs.
+    let envelope = transact_results(&fixture, &fixture.main, &stale_items(32));
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    let results = envelope["results"].as_array().unwrap();
+    assert_eq!(results.len(), 32);
+    assert!(
+        results.iter().all(|entry| entry["ok"] == true),
+        "a batch at the bound did not run: {envelope}"
+    );
+}
+
+#[test]
+fn every_item_of_a_transact_is_authorized_as_if_it_arrived_alone() {
+    let fixture = Fixture::new("transact-authz");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXAUTHZ", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+
+    // The actor is the item's own, and a batch confers nothing: agent-b
+    // holding agent-a's lease token is refused inside a batch exactly as it
+    // is on its own, and the refusal rolls agent-a's claim back with it.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+            checkpoint_item(
+                "t-1",
+                json!({ "$ref": { "item": 0, "path": "/leaseToken" } }),
+                "agent-b",
+            ),
+        ],
+    );
+    assert_eq!(envelope["failedIndex"], 1, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    let batched = envelope["results"][1]["error"].as_str().unwrap().to_owned();
+    assert!(batched.contains("lease belongs to agent-a"), "{batched}");
+
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    assert_eq!(
+        task["claim"],
+        Value::Null,
+        "the batch kept the claim its own failure rolled back: {task}"
+    );
+
+    // The same item alone refuses in the same words, which is the property
+    // "authorized as if it arrived alone" means.
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-1", "--as", "agent-a", "--json"],
+    );
+    let alone = fixture.run(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-1",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "agent-b",
+            "--summary",
+            "did the thing",
+            "--intent",
+            "do the thing",
+            "--next-action",
+            "do the next thing",
+            "--state",
+            "continue",
+            "--json",
+        ],
+    );
+    assert!(!alone.status.success(), "the same item alone was accepted");
+    assert!(
+        String::from_utf8_lossy(&alone.stderr).contains("lease belongs to agent-a"),
+        "stderr: {}",
+        String::from_utf8_lossy(&alone.stderr)
+    );
+}
+
+#[test]
+fn a_landed_transact_stamps_batch_id_and_batch_index_on_every_event_and_a_rolled_back_one_stamps_none()
+ {
+    let fixture = Fixture::new("transact-stamps");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXSTAMP", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+
+    let landed = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "stamped", "as": "agent-a" } }),
+        ],
+    );
+    assert_eq!(landed["ok"], true, "{landed}");
+    let batch_id = landed["batchId"].as_str().unwrap().to_owned();
+
+    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "100", "--json"]);
+    let stamped = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["payload"]["batchId"] == json!(batch_id))
+        .map(|event| {
+            (
+                event["kind"].as_str().unwrap().to_owned(),
+                event["payload"]["batchIndex"].clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Newest first, so the batch reads backwards: the index is what puts the
+    // order back, from the ledger alone.
+    assert_eq!(
+        stamped,
+        vec![
+            ("note_added".to_owned(), json!(1)),
+            ("task_claimed".to_owned(), json!(0)),
+        ],
+        "{events}"
+    );
+    // The events the batch did not append carry no stamp -- including the
+    // ones the board open wrote on its way in.
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["payload"]["batchId"] == Value::Null)
+            .count()
+            >= 2,
+        "{events}"
+    );
+
+    let rolled_back = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "note", "arguments": { "id": "t-1", "text": "never", "as": "agent-a" } }),
+            json!({ "name": "note", "arguments": { "id": "t-absent", "text": "boom", "as": "agent-a" } }),
+        ],
+    );
+    assert_eq!(rolled_back["rolledBack"], true, "{rolled_back}");
+    let rolled_back_id = rolled_back["batchId"].as_str().unwrap().to_owned();
+    // A batchId in the ledger always means a batch that landed whole.
+    assert!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--limit", "100", "--json"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["payload"]["batchId"] != json!(rolled_back_id)),
+        "a rolled-back batch stamped the ledger"
+    );
+}
+
+#[test]
+fn the_schema_lists_transact_as_a_writing_operation() {
+    let fixture = Fixture::new("transact-schema");
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operation = schema["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["name"] == "transact")
+        .unwrap_or_else(|| panic!("the manifest does not publish transact: {schema}"));
+    assert_eq!(operation["readOnly"], false);
+    assert_eq!(operation["longRunning"], false);
+    assert_eq!(operation["positionals"], json!([]));
+    assert_eq!(operation["createsBoard"], false);
+    // It addresses one board like every other board command, so an adapter
+    // may offer all three selectors on it.
+    assert_eq!(operation["ignoredSelectors"], json!([]));
+    let flags = operation["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|flag| (flag["name"].clone(), flag["kind"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flags,
+        vec![
+            (json!("items"), json!("value")),
+            (json!("items-file"), json!("value")),
+        ]
+    );
+}
+
+#[test]
+fn a_transact_whose_items_exceed_one_argv_string_still_runs() {
+    let fixture = Fixture::new("transact-argv");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXARGV", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+
+    // Bodies large enough that the list cannot travel as arguments at all:
+    // Linux caps one argv string at 128 KiB (`MAX_ARG_STRLEN`) and macOS caps
+    // the whole block at `ARG_MAX`, so 2.5 MB is over both.
+    let body = "x".repeat(80_000);
+    let items = (0..32)
+        .map(|index| {
+            json!({ "name": "note", "arguments": {
+                "id": "t-1",
+                "text": format!("{index}:{body}"),
+                "as": "agent-a",
+            }})
+        })
+        .collect::<Vec<_>>();
+    let list = serde_json::to_string(&items).unwrap();
+    assert!(
+        list.len() > 256 * 1024,
+        "the list is only {} bytes",
+        list.len()
+    );
+
+    // `--items` cannot carry it: either the kernel refuses the exec or the
+    // binary never sees the argument. Both are the same answer, and the
+    // spawn error is not an assertion failure -- it is the ceiling.
+    let attempted = fixture
+        .command(&fixture.main)
+        .args(["transact", "--items", &list, "--json"])
+        .output();
+    let refused = match &attempted {
+        Err(_) => true,
+        Ok(output) => !output.status.success(),
+    };
+    assert!(
+        refused,
+        "a {} byte item list travelled as one argv string",
+        list.len()
+    );
+
+    // `--items-file` carries the same list, and every item lands.
+    let path = fixture.root.join("items.json");
+    fs::write(&path, &list).unwrap();
+    let output = fixture.run(
+        &fixture.main,
+        &["transact", "--items-file", path.to_str().unwrap(), "--json"],
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["ok"], true, "{}", envelope["error"]);
+    assert!(output.status.success());
+    assert_eq!(envelope["results"].as_array().unwrap().len(), 32);
+    let notes = fixture.ok_json(
+        &fixture.main,
+        &["task", "show", "t-1", "--limit", "40", "--json"],
+    );
+    assert_eq!(
+        notes["notes"].as_array().unwrap().len(),
+        32,
+        "{}",
+        notes["notes"]
+    );
+
+    // And the two selectors are two answers to one question.
+    let both = fixture.run(
+        &fixture.main,
+        &[
+            "transact",
+            "--items",
+            "[]",
+            "--items-file",
+            path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("pass one"),
+        "stderr: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+}
+
+#[test]
+fn add_note_is_atomic_with_its_ledger_event() {
+    let fixture = Fixture::new("transact-note-atomic");
+    let record = fixture.ok_json(&fixture.main, &["init", "--name", "TXNOTE", "--json"]);
+    let board = PathBuf::from(record["boardPath"].as_str().unwrap());
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-1",
+            "the one that landed",
+            "--as",
+            "agent-a",
+            "--json",
+        ],
+    );
+
+    // Break the chain head so the ledger append is the statement that fails,
+    // AFTER the note row has been written. Until ADR-041 §3.3 `add_note` took
+    // no transaction at all: the note committed on its own and the refusal
+    // left a note the ledger has no record of -- the one write path on the
+    // board that was not atomic even with itself.
+    let connection = Connection::open(&board).unwrap();
+    let head: (i64, String) = connection
+        .query_row(
+            "SELECT seq,event_hash FROM events ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE events SET event_hash=NULL WHERE seq=?", [head.0])
+        .unwrap();
+
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "note",
+            "t-1",
+            "the one that must not land",
+            "--as",
+            "agent-a",
+            "--json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "the note was accepted with the ledger unable to record it: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+
+    // Put the chain back, so the assertions below are about the note and not
+    // about the tamper.
+    connection
+        .execute(
+            "UPDATE events SET event_hash=? WHERE seq=?",
+            params![head.1, head.0],
+        )
+        .unwrap();
+    drop(connection);
+
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"]);
+    let bodies = task["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| note["body"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies,
+        ["the one that landed"],
+        "a note landed without its ledger event"
+    );
+    let notes_logged = fixture
+        .ok_json(
+            &fixture.main,
+            &["events", "--kind", "note_added", "--limit", "100", "--json"],
+        )
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        notes_logged,
+        bodies.len(),
+        "the notes on the board and the note events in the ledger disagree"
+    );
+    assert_eq!(board_audit(&fixture)["errors"], json!([]));
+}
+
 #[test]
 fn the_mcp_server_replaces_itself_without_dropping_the_session() {
     let fixture = Fixture::new("mcp-reload");

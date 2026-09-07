@@ -7,9 +7,7 @@ use crate::db::{
 use crate::model::*;
 use crate::registry::now_ms;
 use anyhow::{Context, Result, bail};
-use rusqlite::{
-    Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter, types::Type,
-};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Type};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1580,6 +1578,16 @@ pub(crate) fn event_at(
     } else if payload.get("_semanticV1").is_none() {
         payload["_semanticV1"] = Value::Null;
     }
+    // The one funnel every audited board mutation passes through, which is
+    // why the batch stamp is applied here rather than per write path: an item
+    // that landed inside a `transact` cannot forget to say so (ADR-041 §7).
+    // Two keys on the existing payload, beside `_semanticV1`; no new event
+    // kind, table or column. The claim sweep on the way into the board runs
+    // before any batch sets the stamp, so its events carry none.
+    if let Some((batch_id, batch_index)) = current_batch() {
+        payload["batchId"] = json!(batch_id);
+        payload["batchIndex"] = json!(batch_index);
+    }
     let actor = actor.context("actor is required for audited mutation")?;
     crate::audit::append_board_event(
         connection,
@@ -1589,6 +1597,44 @@ pub(crate) fn event_at(
         &payload.to_string(),
         created_at,
     )
+}
+
+thread_local! {
+    /// The batch this thread's writes belong to while `kanban transact` runs
+    /// one item, as `(batchId, batchIndex)`.
+    ///
+    /// Thread-local rather than threaded through forty write signatures: the
+    /// stamp is a property of the invocation, not of any one write, and a
+    /// parameter would have to be added to every method for the benefit of
+    /// the one caller that sets it — including the methods a future item
+    /// reaches. `transact` runs its items on the calling thread, one at a
+    /// time, so nothing else can be running under a stamp of its own.
+    static BATCH: std::cell::RefCell<Option<(String, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_batch() -> Option<(String, usize)> {
+    BATCH.with_borrow(Clone::clone)
+}
+
+/// Stamp every event appended on this thread with the batch and the item,
+/// until this guard drops.
+///
+/// A guard rather than a pair of calls, so an item that returns early — every
+/// refusal does — cannot leave the next item's events wearing its index.
+pub(crate) struct BatchStamp;
+
+impl BatchStamp {
+    pub(crate) fn set(batch_id: &str, index: usize) -> Self {
+        BATCH.with_borrow_mut(|slot| *slot = Some((batch_id.to_owned(), index)));
+        Self
+    }
+}
+
+impl Drop for BatchStamp {
+    fn drop(&mut self) {
+        BATCH.with_borrow_mut(|slot| *slot = None);
+    }
 }
 
 /// A board written by the released TypeScript implementation can sit at
@@ -2030,6 +2076,117 @@ fn eligible_claim_candidates(
     })
 }
 
+/// One write scope on a board connection: `BEGIN IMMEDIATE` at the top level,
+/// a `SAVEPOINT` inside a scope that is already open.
+///
+/// This replaces `Connection::transaction_with_behavior(Immediate)` at every
+/// write path in this file, and the difference is the whole reason
+/// `kanban transact` can exist (ADR-041 §3). `transaction_with_behavior`
+/// takes `&mut` on the connection and hands back a Rust value that owns the
+/// scope, so an outer scope held across several write calls does not even
+/// borrow-check — `error[E0502]`, measured at `58129a6` — and SQLite refuses
+/// the nested `BEGIN` in any case. A scope opened here is raw SQL on
+/// `&Connection`: what holds it open is a statement SQLite is remembering,
+/// not a value this process is holding, so `transact` can open one, run the
+/// unchanged write methods below inside it, and roll all of them back
+/// together.
+///
+/// Whether a scope nests is asked of SQLite rather than tracked here.
+/// `Connection::is_autocommit` is false exactly while a transaction is open,
+/// so no bookkeeping of ours can disagree with the connection's real state —
+/// and the disagreement is the failure that matters: a `SAVEPOINT` issued
+/// where no transaction is open commits on `RELEASE`, which would make a
+/// rolled-back batch land its items anyway.
+///
+/// It derefs to `Connection`, so every `&transaction` call site inside the
+/// write paths is unchanged. [`WriteScope::commit`] is `COMMIT` or `RELEASE`;
+/// dropping without it rolls back, which is the `DropBehavior::Rollback` the
+/// read path already relies on (`rust/db.rs:2239`).
+pub(crate) struct WriteScope<'a> {
+    connection: &'a Connection,
+    /// The savepoint this scope is, or `None` when it is the transaction.
+    savepoint: Option<String>,
+    finished: bool,
+}
+
+/// Distinct savepoint names, so `RELEASE` names exactly the scope that opened.
+///
+/// Reusing one name would work for a single level and silently release two at
+/// once the moment a write path grew a nested scope, which is the kind of
+/// defect that only shows up later as a batch that half-landed.
+static WRITE_SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl<'a> WriteScope<'a> {
+    fn open(connection: &'a Connection) -> Result<Self> {
+        if connection.is_autocommit() {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            return Ok(Self {
+                connection,
+                savepoint: None,
+                finished: false,
+            });
+        }
+        let name = format!(
+            "kanban_write_{}",
+            WRITE_SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        connection.execute_batch(&format!("SAVEPOINT {name}"))?;
+        Ok(Self {
+            connection,
+            savepoint: Some(name),
+            finished: false,
+        })
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        self.finished = true;
+        match &self.savepoint {
+            Some(name) => self.connection.execute_batch(&format!("RELEASE {name}")),
+            None => self.connection.execute_batch("COMMIT"),
+        }
+        .map_err(Into::into)
+    }
+
+    /// Undo this scope and say whether the undo itself worked, for the paths
+    /// that decide against their own writes: `archive --dry-run`, and a
+    /// deployment start that turns out to be an idempotent replay.
+    pub(crate) fn rollback(mut self) -> Result<()> {
+        self.finished = true;
+        self.undo().map_err(Into::into)
+    }
+
+    fn undo(&self) -> rusqlite::Result<()> {
+        match &self.savepoint {
+            // Inside a batch this undoes THIS item and leaves the batch's own
+            // scope open, which is what makes a dry run composable.
+            Some(name) => self
+                .connection
+                .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}")),
+            None => self.connection.execute_batch("ROLLBACK"),
+        }
+    }
+}
+
+impl std::ops::Deref for WriteScope<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.connection
+    }
+}
+
+impl Drop for WriteScope<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Discarded exactly as `rusqlite::Transaction`'s own drop discards it:
+        // there is no caller left to tell, and a scope that will not roll back
+        // is a connection this process is about to close.
+        let _ = self.undo();
+    }
+}
+
 impl SnapshotSource for Store {
     fn snapshot_connection(&self) -> &Connection {
         &self.connection
@@ -2037,6 +2194,53 @@ impl SnapshotSource for Store {
 }
 
 impl Store {
+    /// Open a write scope: the one way a write path in this file takes the
+    /// mutation lock.
+    ///
+    /// `&self` rather than `&mut self`, which is the point: the scope is SQL
+    /// SQLite is holding rather than a borrow this process is holding, so a
+    /// `&mut self` write method can open one and still read through `&self`
+    /// helpers inside it, and `kanban transact` can hold an outer scope open
+    /// across several of those methods (ADR-041 §3). See [`WriteScope`].
+    pub(crate) fn begin_write(&self) -> Result<WriteScope<'_>> {
+        WriteScope::open(&self.connection)
+    }
+
+    /// Take the batch's outer scope: `BEGIN IMMEDIATE` once, at the start, so
+    /// every item's own [`Store::begin_write`] is a savepoint inside it.
+    ///
+    /// ADR-041 §3.2: this is strictly stronger than a write per command, not
+    /// weaker. Every item's check-then-write runs under a write lock that was
+    /// already held when the batch began, which is the property the
+    /// `BEGIN IMMEDIATE` at each write path is protecting (see
+    /// [`deployment_subject_tags_on`] and [`whole_board_read_on`]). A
+    /// savepoint-only batch that skipped this would weaken it.
+    ///
+    /// Returns nothing to hold, deliberately: a guard held here would be the
+    /// live borrow that cannot coexist with the `&mut self` write methods the
+    /// items call.
+    pub(crate) fn begin_batch(&self) -> Result<()> {
+        if !self.connection.is_autocommit() {
+            bail!("a write scope is already open on this board");
+        }
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    /// Land every item of a batch.
+    pub(crate) fn commit_batch(&self) -> Result<()> {
+        self.connection.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Undo every item of a batch, including their ledger events: the chain
+    /// is written on this same connection, so the freed sequence numbers
+    /// leave no hole (ADR-041 §3, Probe B; ADR-029).
+    pub(crate) fn rollback_batch(&self) -> Result<()> {
+        self.connection.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
     /// Open a board file DIRECTLY: POSIX file permission is the only
     /// authorization, no policy row is consulted, and the guard no-ops. That
     /// is ADR-038 clause 9's direct open, stated as a constructor.
@@ -2273,9 +2477,7 @@ impl Store {
             bail!("subscription id must start with sub- and include a suffix");
         }
 
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock: a concurrent write cannot slip between this
         // check and the INSERT below.
         self.authz.check_write(&[], &[])?;
@@ -2569,9 +2771,7 @@ impl Store {
         actor: &str,
     ) -> Result<Subscription> {
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock: a concurrent write cannot slip between this
         // check and the UPDATE below.
         self.authz.check_write(&[], &[])?;
@@ -2760,9 +2960,7 @@ impl Store {
         validate_delivery_lease_duration(lease_duration_ms)?;
         validate_nonnegative_now(now, "dispatcher now")?;
         self.authz.check_read(&[])?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         let delivery = transaction
             .query_row(
                 "SELECT * FROM subscription_deliveries \
@@ -2876,9 +3074,7 @@ impl Store {
     pub(crate) fn recover_expired_subscription_deliveries(&mut self, now: i64) -> Result<usize> {
         validate_nonnegative_now(now, "dispatcher now")?;
         self.authz.check_write(&[], &[])?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         let deliveries = transaction
             .prepare(
                 "SELECT * FROM subscription_deliveries \
@@ -2975,9 +3171,7 @@ impl Store {
     ) -> Result<bool> {
         validate_nonnegative_now(now, "dispatcher now")?;
         self.authz.check_write(&[], &[])?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         let delivery = transaction
             .query_row(
                 "SELECT * FROM subscription_deliveries \
@@ -3057,9 +3251,7 @@ impl Store {
         let error_code = validate_delivery_error_code(error_code)?;
         validate_nonnegative_now(now, "dispatcher now")?;
         self.authz.check_write(&[], &[])?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         let delivery = transaction
             .query_row(
                 "SELECT * FROM subscription_deliveries \
@@ -3176,9 +3368,7 @@ impl Store {
         if expired == 0 {
             return Ok(0);
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         expire_claims(&transaction, now_ms())?;
         transaction.commit()?;
         Ok(expired as usize)
@@ -3402,9 +3592,7 @@ impl Store {
     /// reaches a consumer.
     pub(crate) fn materialize_subscriptions(&mut self) -> Result<usize> {
         self.authz.check_write(&[], &[])?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         let global_cursor: i64 = transaction.query_row(
             "SELECT event_seq FROM board_materialization_cursor WHERE id=1",
             [],
@@ -3553,9 +3741,7 @@ impl Store {
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
         let name = nonempty(name, "name")?;
         let actor = nonempty(actor, "actor")?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         transaction.execute(
             "INSERT INTO board_meta(key,value) VALUES('name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [name],
@@ -3596,9 +3782,7 @@ impl Store {
             format!("{prefix}-{}", &Uuid::new_v4().simple().to_string()[..8])
         });
         let title = nonempty(&input.title, "title")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // A new row has no old tag set; the resulting set is what the caller
         // asked for. Under the mutation lock.
         self.authz.check_write(&[], &input.tags)?;
@@ -3834,9 +4018,7 @@ impl Store {
     ) -> Result<Task> {
         validate(status, &TASK_STATUSES, "task status")?;
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, and before the row is opened: a status move
         // does not retag, so the old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
@@ -3899,9 +4081,7 @@ impl Store {
 
     pub fn remove_task(&mut self, id: &str, actor: &str, force: bool) -> Result<()> {
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: removal leaves no
         // row, so the resulting tag set is empty.
         let old_tags = task_tags(&transaction, id)?;
@@ -3961,9 +4141,7 @@ impl Store {
 
     pub fn patch_metadata(&mut self, id: &str, patch: Value, actor: &str) -> Result<Task> {
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: a metadata patch
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
@@ -4001,9 +4179,7 @@ impl Store {
         if input.stale_minutes.flatten().is_some_and(|value| value < 0) {
             bail!("stale minutes must be non-negative");
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: a retag is
         // permitted only to a caller who could see the row before AND after,
         // so the old and resulting tag sets are both checked at `write`.
@@ -4114,9 +4290,7 @@ impl Store {
         if options.lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Claims carry no tags of their own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
@@ -4240,9 +4414,7 @@ impl Store {
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Board scope, under the lock: a heartbeat moves a claim row.
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
@@ -4280,9 +4452,7 @@ impl Store {
     }
 
     pub fn release(&mut self, id: &str, token: &str, keep_status: bool) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Board scope, under the lock: a release drops a claim row.
         self.authz.check_write(&[], &[])?;
         let claim = require_lease(&transaction, id, token, now_ms())?;
@@ -4311,12 +4481,21 @@ impl Store {
         Ok(())
     }
 
+    /// A note and its ledger event, atomically.
+    ///
+    /// The scope is not decoration. Until ADR-041 §3.3 this method took no
+    /// transaction at all: the `INSERT` and the `append_board_event` beneath
+    /// it each ran in their own autocommit, so a failure between them left a
+    /// note the ledger has no record of — the one write path on the board
+    /// that was not atomic even with itself.
     pub fn add_note(&mut self, id: &str, author: &str, kind: &str, body: &str) -> Result<TaskNote> {
         validate(kind, &NOTE_KINDS, "note kind")?;
+        let transaction = self.begin_write()?;
+        // Notes carry no tags of their own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
-        require_active_task(&self.connection, id)?;
+        require_active_task(&transaction, id)?;
         let now = now_ms();
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO task_notes(task_id,author,kind,body,created_at) VALUES(?,?,?,?,?)",
             params![
                 id,
@@ -4327,12 +4506,13 @@ impl Store {
             ],
         )?;
         event(
-            &self.connection,
+            &transaction,
             Some(id),
             "note_added",
             Some(author),
             json!({"kind":kind}),
         )?;
+        transaction.commit()?;
         self.notes(id, 1)?.pop().context("note was not created")
     }
 
@@ -4366,9 +4546,7 @@ impl Store {
 
     pub fn checkpoint(&mut self, input: CheckpointInput) -> Result<Checkpoint> {
         validate(&input.state, &CHECKPOINT_STATES, "checkpoint state")?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Checkpoints carry no tags of their own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
@@ -4432,9 +4610,7 @@ impl Store {
         actor: Option<&str>,
     ) -> Result<Tag> {
         let name = validate_tag_name(name)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // The master file has no tags of its own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let exists: Option<String> = transaction
@@ -4493,9 +4669,7 @@ impl Store {
 
     /// Retire a tag. One still in use needs `--force`, and says how many rows.
     pub fn remove_tag(&mut self, name: &str, actor: Option<&str>, force: bool) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let rule_uses: i64 = transaction.query_row(
@@ -4560,9 +4734,7 @@ impl Store {
     /// Retire a rule from the active set without erasing it.
     pub fn retire_rule(&mut self, id: &str, actor: &str) -> Result<Rule> {
         let actor = validate_rule_actor(actor)?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let changed = transaction.execute(
@@ -4614,9 +4786,7 @@ impl Store {
         let lane = nonempty(lane, "lane")?.to_owned();
         let body = nonempty(body, "sitrep body")?.to_owned();
         let author = nonempty(author, "author")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         if let Some(id) = task_id {
             require_active_task(&transaction, id)?;
         }
@@ -4718,9 +4888,7 @@ impl Store {
         validate_priority(Some(priority))?;
         let body = nonempty(body, "attention body")?.to_owned();
         let raised_by = nonempty(raised_by, "raised by")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // A new attention row has no old tag set; the resulting set is the
         // tags the caller asked for. Under the mutation lock.
         self.authz.check_write(&[], tags)?;
@@ -4909,9 +5077,7 @@ impl Store {
             .map(|value| nonempty(value, "attention body"))
             .transpose()?;
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: a retag is
         // permitted only to a caller who could see the row before AND after.
         let old_tags = attention_tags(&transaction, id)?;
@@ -4995,9 +5161,7 @@ impl Store {
     ) -> Result<Attention> {
         let authorization_actor = nonempty(authorization_actor, "actor")?.to_owned();
         let audit_actor = nonempty(audit_actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: settling an item
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
@@ -5064,9 +5228,7 @@ impl Store {
     pub fn reopen_attention(&mut self, id: &str, actor: &str, note: &str) -> Result<Attention> {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "reopen note")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: reopening does
         // not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
@@ -5172,9 +5334,7 @@ impl Store {
         {
             bail!("a session handoff needs an addressee: pass --to LANE (e.g. --to driver-2)");
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Handoffs carry no tags of their own: board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
@@ -5267,9 +5427,7 @@ impl Store {
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
@@ -5412,9 +5570,7 @@ impl Store {
     pub fn retire_handoff(&mut self, id: &str, actor: &str, note: &str) -> Result<Handoff> {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "retire note")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Board scope, under the lock.
         self.authz.check_write(&[], &[])?;
         let existing = transaction
@@ -5459,9 +5615,7 @@ impl Store {
         note: Option<&str>,
     ) -> Result<Value> {
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: signoff does not
         // retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
@@ -5526,9 +5680,7 @@ impl Store {
         committer: Option<&str>,
     ) -> Result<Value> {
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         // Under the mutation lock, before the row is opened: advancing a story
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
@@ -5932,9 +6084,7 @@ impl Store {
         let host = nonempty(&input.host, "host")?.to_owned();
         let url = nonempty(&input.url, "url")?.to_owned();
         let actor = nonempty(&input.actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         let subject_tags = match input.task_id.as_deref() {
             Some(task_id) => task_tags(&transaction, task_id)?,
             None => Vec::new(),
@@ -6155,9 +6305,7 @@ impl Store {
         if input.result == "succeeded" && phase != "verification" {
             bail!("a succeeded deployment requires --phase verification");
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         self.authz.check_write(&[], &[])?;
         let subject_tags = deployment_subject_tags_on(&transaction, &input.id)?;
         self.authz.check_write(&subject_tags, &subject_tags)?;
@@ -6219,9 +6367,7 @@ impl Store {
     ) -> Result<DeploymentAttempt> {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "abandon note")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         self.authz.check_write(&[], &[])?;
         let subject_tags = deployment_subject_tags_on(&transaction, id)?;
         self.authz.check_write(&subject_tags, &subject_tags)?;
@@ -6283,9 +6429,7 @@ impl Store {
         dry_run: bool,
     ) -> Result<ArchiveReport> {
         let actor = nonempty(actor, "actor")?.to_owned();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.begin_write()?;
         whole_board_write_on(&self.authz, &transaction)?;
         let archived_at = now_ms();
 

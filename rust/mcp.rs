@@ -216,7 +216,7 @@ fn scalar(name: &str, value: &Value) -> Result<String> {
 /// A subcommand may itself be multi-word ("principal bind"), so both the
 /// separator (`_` becomes a space in the name) and any inner spaces are
 /// flattened to `_`; `access principal bind` is one tool, `access_principal_bind`.
-fn tool_name(command: &str, sub: Option<&str>) -> String {
+pub(crate) fn tool_name(command: &str, sub: Option<&str>) -> String {
     match sub {
         Some(sub) => format!("{command}_{sub}"),
         None => command.to_owned(),
@@ -312,7 +312,7 @@ fn tools() -> Vec<Value> {
 }
 
 /// Turn a tool call into the argument list the CLI would have been given.
-fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
+pub(crate) fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>> {
     let Some((command, sub, flags, positionals, _)) = COMMANDS
         .iter()
         .find(|(command, sub, ..)| tool_name(command, *sub) == name)
@@ -438,7 +438,7 @@ fn error_result(message: &str) -> Value {
 /// empty the moment it has answered. The representative agent loop is twelve
 /// reads (`docs/testing/graphql-agent-loop-benchmark.md`); this leaves room
 /// above it without letting one frame become a job.
-const BATCH_LIMIT: usize = 32;
+pub(crate) const BATCH_LIMIT: usize = 32;
 
 /// The one tool name that is not an operation.
 const BATCH: &str = "batch";

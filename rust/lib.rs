@@ -221,6 +221,7 @@ Usage:
              --confirm prepared [--json]
   kanban access enforcement activate --expected-epoch EPOCH --prepare-receipt RECEIPT
              --as ACTOR --reason TEXT --confirm no-direct-fallback [--json]
+  kanban transact (--items JSON_ARRAY | --items-file PATH) [--json]
   kanban schema [--json]
   kanban mcp
 
@@ -1031,6 +1032,12 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["path"],
         false,
     ),
+    // ADR-041 §11. Its input is a list of operations rather than a set of
+    // flags, and the row is what makes every generated surface follow:
+    // `schema --json` publishes it as a writing operation, and
+    // `mcp::listed_read_only` answers `Some(false)`, which is what makes the
+    // read-only `batch` refuse `transact` as an entry with no new code.
+    ("transact", None, &["items", "items-file"], &[], false),
     ("schema", None, &[], &[], true),
     ("mcp", None, &[], &[], false),
     ("tag", Some("add"), &["as", "description"], &["name"], false),
@@ -2170,6 +2177,21 @@ static STDOUT_WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// pipe from a real failure. Every Unix tool ends quietly when its reader
 /// leaves; the error is returned here and recognised in [`entrypoint`].
 fn emit(text: &str) -> Result<()> {
+    // A transacted item's answer belongs in that item's `result` inside the
+    // envelope, not on stdout beside it: `transact` prints one document.
+    // Collected here rather than at each `print` call site so an item reaches
+    // it through the same dispatch it takes when it arrives alone, which is
+    // the property `transact` rests on (ADR-041 §2). `STDOUT_WRITTEN` stays
+    // where it is, because nothing was written there.
+    if CAPTURED.with_borrow_mut(|slot| {
+        slot.as_mut().map(|buffer| {
+            buffer.push_str(text);
+            buffer.push('\n');
+        })
+    }) == Some(())
+    {
+        return Ok(());
+    }
     use std::io::Write as _;
     let mut out = io::stdout().lock();
     writeln!(out, "{text}")?;
@@ -3128,8 +3150,97 @@ fn missing_board_error(board_path: &str) -> anyhow::Error {
     )
 }
 
-fn open_store(args: &Args, creation: BoardCreation) -> Result<Store> {
-    Store::open_as_caller(&store_path(args, creation)?)
+thread_local! {
+    /// The board `kanban transact` opened, on loan to whichever item is
+    /// running.
+    ///
+    /// ADR-041 §3.4: one `Store` per `transact`, opened once, because a
+    /// process per item is a connection per item and two connections cannot
+    /// share a transaction. The dispatch opens the addressed board in exactly
+    /// two places — [`open_store`] and [`open_store_for_read`] — and both
+    /// consult this first, so an item reaches the batch's connection, and
+    /// therefore the batch's uncommitted writes (§5), through the same code
+    /// path it takes when it arrives alone.
+    static LENT_BOARD: std::cell::RefCell<Option<Store>> = const { std::cell::RefCell::new(None) };
+    /// Where [`emit`] writes while a transacted item is running.
+    static CAPTURED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A board open for one command: its own, or the batch's on loan.
+///
+/// The loan is returned on drop rather than at each dispatch arm's end, so an
+/// item that refuses part way through — every refusal does — still hands the
+/// board back for the item after it and for the rollback.
+struct BoardLease {
+    store: Option<Store>,
+    lent: bool,
+}
+
+impl BoardLease {
+    fn own(store: Store) -> Self {
+        Self {
+            store: Some(store),
+            lent: false,
+        }
+    }
+
+    /// The batch's board, when this invocation is one of its items.
+    fn lent() -> Option<Self> {
+        LENT_BOARD.with_borrow_mut(Option::take).map(|store| Self {
+            store: Some(store),
+            lent: true,
+        })
+    }
+}
+
+impl std::ops::Deref for BoardLease {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        self.store.as_ref().expect("a lease holds its board")
+    }
+}
+
+impl std::ops::DerefMut for BoardLease {
+    fn deref_mut(&mut self) -> &mut Store {
+        self.store.as_mut().expect("a lease holds its board")
+    }
+}
+
+impl Drop for BoardLease {
+    fn drop(&mut self) {
+        if !self.lent {
+            return;
+        }
+        if let Some(store) = self.store.take() {
+            LENT_BOARD.with_borrow_mut(|slot| *slot = Some(store));
+        }
+    }
+}
+
+fn open_store(args: &Args, creation: BoardCreation) -> Result<BoardLease> {
+    if let Some(lease) = BoardLease::lent() {
+        return Ok(lease);
+    }
+    Ok(BoardLease::own(Store::open_as_caller(&store_path(
+        args, creation,
+    )?)?))
+}
+
+/// The read-only open for a command that answers about ONE addressed board.
+///
+/// Inside a `transact` this hands back the batch's writable board instead,
+/// which is what makes ADR-041 §5 true: a read item observes the items before
+/// it, because within one transaction on one connection a statement sees that
+/// transaction's own uncommitted writes. A second, read-only connection would
+/// answer from the pre-batch snapshot and say nothing about it.
+fn open_store_for_read(args: &Args) -> Result<BoardLease> {
+    if let Some(lease) = BoardLease::lent() {
+        return Ok(lease);
+    }
+    Ok(BoardLease::own(Store::open_for_read_as_caller(
+        &store_path_readonly(args)?,
+    )?))
 }
 
 /// The board selectors this command discards, and what it addresses instead.
@@ -3306,7 +3417,7 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
 
     let registry = Registry::open_for_read()?;
     let board_name = selected_board_name(args)?;
-    let store = Store::open_for_read_as_caller(&store_path_readonly(args)?)?;
+    let store = open_store_for_read(args)?;
     let board = board_name
         .clone()
         .or(store.board_name()?)
@@ -4564,8 +4675,450 @@ fn read_transfer_bundle(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The items of a `transact`, from `--items` or from a file.
+///
+/// The pair is modelled on `--body`/`--body-file`, refusing both at once
+/// included, and it exists for a measured reason: with `--items` the list
+/// travels as a single argv string, and one argv string is capped at 128 KiB
+/// on Linux (`MAX_ARG_STRLEN`), so a full batch carrying checkpoint bodies
+/// would die as `E2BIG` before the binary saw it (ADR-041 §8).
+fn transact_items(args: &Args) -> Result<Vec<Value>> {
+    let text = match (args.one("items"), args.one("items-file")) {
+        (Some(_), Some(_)) => bail!(
+            "--items and --items-file both give the item list; pass one, because picking \
+             between them is not something a receipt can explain"
+        ),
+        (Some(text), None) => text.to_owned(),
+        (None, Some(path)) => {
+            fs::read_to_string(path).with_context(|| format!("read transact items from {path}"))?
+        }
+        (None, None) => bail!(
+            "transact needs its item list: --items JSON_ARRAY, or --items-file PATH for a list \
+             too long for one argv string"
+        ),
+    };
+    let parsed: Value = serde_json::from_str(&text).context(
+        "transact items must be a JSON array of {\"name\": TOOL, \"arguments\": {…}} objects",
+    )?;
+    match parsed {
+        Value::Array(items) => Ok(items),
+        other => bail!("transact items must be a JSON array, not {other}; nothing in it ran"),
+    }
+}
+
+/// The two board operations that open a transaction of their own on the board
+/// connection instead of taking [`Store::begin_write`]: `import` (see
+/// `rust/import.rs:430`) and `search-rebuild` (through `rust/search.rs:776`).
+///
+/// SQLite refuses the nested `BEGIN`, so either one as an item would fail and
+/// roll the batch back — fail-closed, but reported in SQLite's words rather
+/// than in words that name the fix. Refused pre-flight instead. Both are
+/// whole-board bulk operations rather than the row writes a `/kb` loop
+/// batches, so nothing an agent wants to batch is lost; when their
+/// transactions move to the write-scope guard they compose and this table
+/// empties.
+const NOT_TRANSACTABLE: [(&str, Option<&str>); 3] = [
+    ("import", Some("atmux-json")),
+    ("import", Some("atmux-sqlite")),
+    ("search-rebuild", None),
+];
+
+/// Whether an item may name this operation, and why not when it may not.
+///
+/// Read off the same two tables `tools/list` and the CLI parser read, so what
+/// the surface offers and what a batch accepts cannot answer differently.
+///
+/// ADR-041 §1: a batch may not carry a batch, in either direction. Only
+/// `transact` needs saying here — the read-only `batch` has no `COMMANDS`
+/// row, so it already resolves to no operation below, exactly as it does for
+/// `batch`'s own validation (`rust/mcp.rs:451`).
+fn transactable(name: &str) -> Result<()> {
+    if name == "transact" {
+        bail!("names {name}, and a batch may not carry a batch");
+    }
+    let Some((command, sub, ..)) = COMMANDS
+        .iter()
+        .filter(|(command, ..)| !LONG_RUNNING.contains(command))
+        .find(|(command, sub, ..)| mcp::tool_name(command, *sub) == name)
+    else {
+        bail!("names no such operation {name}");
+    };
+    let (ignored, subject) = ignored_selectors(command, *sub);
+    if !ignored.is_empty() {
+        bail!(
+            "names {name}, which {subject} rather than addressing one board's rows, so its \
+             write would land outside the batch's transaction and could not be rolled back \
+             with it"
+        );
+    }
+    if NOT_TRANSACTABLE.contains(&(command, *sub)) {
+        bail!(
+            "names {name}, which opens a board-wide transaction of its own and so cannot run \
+             inside one; run it as its own command"
+        );
+    }
+    Ok(())
+}
+
+/// Why a `transact` was refused before any of it ran.
+///
+/// Distinct from an item that ran and refused, deliberately: nothing was
+/// attempted, so there is nothing to undo, and the envelope says so rather
+/// than leaving it to be inferred (ADR-041 §2, §3).
+#[derive(Debug)]
+struct TransactRefusal {
+    /// The item it is about, when it is about one.
+    index: Option<usize>,
+    message: String,
+}
+
+impl TransactRefusal {
+    fn at(index: usize, reason: &str) -> Self {
+        Self {
+            index: Some(index),
+            message: format!("transact item {index} {reason}; nothing in it ran"),
+        }
+    }
+
+    fn whole(message: String) -> Self {
+        Self {
+            index: None,
+            message,
+        }
+    }
+}
+
+/// Whether an item really passes this flag, by the same rule `arguments_for`
+/// coerces it with: `null` is absence, and so is `false` on a boolean flag,
+/// because a boolean flag is present or absent rather than valued.
+fn item_passes(arguments: &Value, flag: &str) -> bool {
+    !matches!(
+        arguments.get(flag),
+        None | Some(Value::Null) | Some(Value::Bool(false))
+    )
+}
+
+/// Check the whole list before any of it runs, and answer with the operations
+/// to run in order.
+///
+/// Shape, names, the bound and every back-reference, which is exactly the set
+/// ADR-041 §2 calls pre-flight. An item's own arguments are NOT checked here:
+/// a `$ref` is not a value yet, and an argument a command refuses is that
+/// command's refusal, reported as that item's failure.
+fn plan_transact(items: &[Value]) -> std::result::Result<Vec<(&str, &Value)>, TransactRefusal> {
+    if items.len() > mcp::BATCH_LIMIT {
+        return Err(TransactRefusal::whole(format!(
+            "transact takes at most {} items and was given {}; nothing in it ran",
+            mcp::BATCH_LIMIT,
+            items.len()
+        )));
+    }
+    let mut planned = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Value::Object(fields) = item else {
+            return Err(TransactRefusal::at(
+                index,
+                &format!("must be an object, not {item}"),
+            ));
+        };
+        if let Some(unknown) = fields
+            .keys()
+            .find(|key| !matches!(key.as_str(), "name" | "arguments"))
+        {
+            return Err(TransactRefusal::at(
+                index,
+                &format!("has no field {unknown}"),
+            ));
+        }
+        let Some(name) = fields.get("name").and_then(Value::as_str) else {
+            return Err(TransactRefusal::at(index, "needs a name"));
+        };
+        transactable(name).map_err(|error| TransactRefusal::at(index, &format!("{error:#}")))?;
+        let arguments = fields.get("arguments").unwrap_or(&Value::Null);
+        match arguments {
+            Value::Object(_) | Value::Null => {}
+            other => {
+                return Err(TransactRefusal::at(
+                    index,
+                    &format!("has arguments that are not an object: {other}"),
+                ));
+            }
+        }
+        // A batch addresses one board -- the one `transact` itself resolved --
+        // and every item runs against it. An item naming a second one would
+        // have that selector silently discarded, which is the wrong-board
+        // defect ADR-007 exists to prevent. `--all-boards` is the same
+        // refusal for the same reason it is not a selector: `search
+        // --all-boards` opens every registered board on a connection of its
+        // own, so as an item it would answer about boards outside the batch
+        // and, for the batch's own board, from the pre-batch snapshot --
+        // silently contradicting ADR-041 §5.
+        if let Some(named) = BOARD_SELECTORS
+            .iter()
+            .chain(std::iter::once(&"all-boards"))
+            .find(|flag| item_passes(arguments, flag))
+        {
+            return Err(TransactRefusal::at(
+                index,
+                &format!(
+                    "names --{named}, and a batch addresses one board: pass the selector to \
+                     `transact` itself"
+                ),
+            ));
+        }
+        validate_refs(arguments, index)
+            .map_err(|error| TransactRefusal::at(index, &format!("{error:#}")))?;
+        planned.push((name, arguments));
+    }
+    Ok(planned)
+}
+
+/// Every `$ref` an item's arguments carry, checked for shape.
+///
+/// ADR-041 §4: the whole list is checked before any of it runs, and one
+/// unresolvable reference refuses the batch whole — the same fail-closed rule
+/// the read-only batch applies to a forbidden name. A reference may sit
+/// anywhere in the arguments, so the walk is the whole value.
+fn validate_refs(value: &Value, index: usize) -> Result<()> {
+    match value {
+        Value::Object(fields) => {
+            let Some(reference) = fields.get("$ref") else {
+                return fields
+                    .values()
+                    .try_for_each(|nested| validate_refs(nested, index));
+            };
+            if fields.len() != 1 {
+                bail!("holds a $ref beside other keys, so what the value should be is undecided");
+            }
+            validate_ref(reference, index)
+        }
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|nested| validate_refs(nested, index)),
+        _ => Ok(()),
+    }
+}
+
+fn validate_ref(reference: &Value, index: usize) -> Result<()> {
+    let Value::Object(fields) = reference else {
+        bail!("has a $ref that is not an object: {reference}");
+    };
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "item" | "path"))
+    {
+        bail!("has a $ref with no field {unknown}");
+    }
+    let item = fields
+        .get("item")
+        .context("has a $ref that names no item")?
+        .as_u64()
+        .context("has a $ref whose item is not a whole number of zero or more")?;
+    if item as usize >= index {
+        bail!(
+            "has a $ref to item {item}, but this is item {index} and a reference may only name \
+             an item that already ran"
+        );
+    }
+    let path = fields
+        .get("path")
+        .and_then(Value::as_str)
+        .context("has a $ref that names no path string")?;
+    valid_pointer(path)
+}
+
+/// RFC 6901: a pointer is empty or a run of `/`-prefixed tokens, and `~` only
+/// ever escapes as `~0` or `~1`.
+///
+/// Checked rather than left to `Value::pointer`, which answers `None` for a
+/// malformed pointer exactly as it does for one that finds nothing. Without
+/// this, a typo would surface as an execution failure at run time instead of
+/// the pre-flight refusal ADR-041 §4 requires.
+fn valid_pointer(path: &str) -> Result<()> {
+    if !path.is_empty() && !path.starts_with('/') {
+        bail!(
+            "has a $ref whose path {path:?} is not a JSON Pointer: one is empty or starts with /"
+        );
+    }
+    let mut characters = path.chars();
+    while let Some(character) = characters.next() {
+        if character == '~' && !matches!(characters.next(), Some('0' | '1')) {
+            bail!(
+                "has a $ref whose path {path:?} is not a JSON Pointer: ~ escapes only as ~0 or ~1"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Replace every `$ref` in one item's arguments with the value it names.
+///
+/// Shape was settled pre-flight, so the only thing that can fail here is the
+/// pointer finding nothing in a result that did arrive — an execution failure
+/// at this item, which rolls the batch back like any other (ADR-041 §4).
+fn resolve_refs(value: &Value, results: &[Value]) -> Result<Value> {
+    match value {
+        Value::Object(fields) => {
+            let Some(Value::Object(reference)) = fields.get("$ref") else {
+                let mut resolved = Map::new();
+                for (key, nested) in fields {
+                    resolved.insert(key.clone(), resolve_refs(nested, results)?);
+                }
+                return Ok(Value::Object(resolved));
+            };
+            let item = reference["item"].as_u64().unwrap_or_default() as usize;
+            let path = reference["path"].as_str().unwrap_or_default();
+            let result = results
+                .get(item)
+                .with_context(|| format!("item {item} produced no result to refer to"))?;
+            result
+                .pointer(path)
+                .cloned()
+                .with_context(|| format!("item {item}'s result has nothing at {path}: {result}"))
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|nested| resolve_refs(nested, results))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        other => Ok(other.clone()),
+    }
+}
+
+/// One item, through the whole dispatch, with its answer collected instead of
+/// printed.
+fn run_transact_item(
+    name: &str,
+    arguments: &Value,
+    index: usize,
+    results: &[Value],
+    batch_id: &str,
+) -> Result<Value> {
+    let arguments = resolve_refs(arguments, results)?;
+    let argv = mcp::arguments_for(name, &arguments)?;
+    let _stamp = store::BatchStamp::set(batch_id, index);
+    CAPTURED.with_borrow_mut(|slot| *slot = Some(String::new()));
+    let outcome = run_argv(argv);
+    let captured = CAPTURED.with_borrow_mut(Option::take).unwrap_or_default();
+    outcome?;
+    if captured.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&captured)
+        .with_context(|| format!("{name} answered with something that is not JSON: {captured}"))
+}
+
+/// A pre-flight refusal: the envelope says nothing ran, and the exit status
+/// says the batch failed.
+fn refuse_transact(batch_id: &str, refusal: TransactRefusal) -> Result<()> {
+    print(
+        &json!({
+            "ok": false,
+            "batchId": batch_id,
+            "failedIndex": refusal.index,
+            // The one failure that reports `false`: nothing was attempted, so
+            // there is nothing to undo (ADR-041 §3).
+            "rolledBack": false,
+            // Empty rather than absent. ADR-041 §2 says a pre-flight refusal
+            // has no results because there are none; an empty array says
+            // exactly that in the field an agent already reads, and keeps one
+            // envelope shape for every answer.
+            "results": [],
+            "error": refusal.message,
+        }),
+        true,
+    )?;
+    Err(anyhow::anyhow!(refusal.message))
+}
+
+/// `kanban transact`: one ordered list of operations, all of which land or
+/// none of which do.
+///
+/// The shape of an item is the read-only batch's shape, `{"name": TOOL,
+/// "arguments": {…}}`, for the reason ADR-010 exists: two spellings of one
+/// concept means an agent that has learned to build a batched read cannot
+/// reuse the item it just built (ADR-041 §1).
+fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
+    let items = transact_items(args)?;
+    // Minted once, before the outer scope opens, in a lease token's format and
+    // by the same mint (ADR-041 §7). A rolled-back batch appends nothing, so a
+    // `batchId` in the ledger always means a batch that landed whole.
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let planned = match plan_transact(&items) {
+        Ok(planned) => planned,
+        // Before the board is even opened: a refused batch must not have swept
+        // a lease on its way to saying so.
+        Err(refusal) => return refuse_transact(&batch_id, refusal),
+    };
+
+    let store = Store::open_as_caller(&store_path(args, creation)?)?;
+    store.begin_batch()?;
+    LENT_BOARD.with_borrow_mut(|slot| *slot = Some(store));
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut reported: Vec<Value> = Vec::new();
+    let mut failed = None;
+    for (index, (name, arguments)) in planned.iter().enumerate() {
+        match run_transact_item(name, arguments, index, &results, &batch_id) {
+            Ok(result) => {
+                reported.push(json!({ "index": index, "ok": true, "result": result }));
+                results.push(result);
+            }
+            Err(error) => {
+                reported
+                    .push(json!({ "index": index, "ok": false, "error": format!("{error:#}") }));
+                failed = Some(index);
+                break;
+            }
+        }
+    }
+    // `skipped` is its own field rather than an `error` string, so an agent
+    // can tell "refused" from "never tried" without parsing prose.
+    for index in reported.len()..planned.len() {
+        reported.push(json!({ "index": index, "ok": false, "skipped": true }));
+    }
+
+    let store = LENT_BOARD
+        .with_borrow_mut(Option::take)
+        .context("the batch's board was not handed back")?;
+    match failed {
+        Some(_) => store.rollback_batch()?,
+        None => store.commit_batch()?,
+    }
+    print(
+        &json!({
+            "ok": failed.is_none(),
+            "batchId": batch_id,
+            "failedIndex": failed,
+            "rolledBack": failed.is_some(),
+            "results": reported,
+        }),
+        true,
+    )?;
+    match failed {
+        None => Ok(()),
+        // The envelope is already on stdout, so this only sets the exit
+        // status and the stderr line -- `STDOUT_WRITTEN` keeps `entrypoint`
+        // from printing a second document over it.
+        Some(index) => Err(anyhow::anyhow!(
+            "transact rolled back: item {index} failed, so nothing in the batch landed"
+        )),
+    }
+}
+
 fn run() -> Result<()> {
-    let args = Args::parse(env::args().skip(1).collect())?;
+    run_argv(env::args().skip(1).collect())
+}
+
+/// The whole dispatch, from an argument list rather than from the process's.
+///
+/// `kanban transact` runs each of its items through here, which is what makes
+/// a transacted write byte-identical to the same command alone: same parse,
+/// same refusals, same authorization, same store method (ADR-041 §2). The
+/// only two things an item does not repeat are the board open and the
+/// stdout write, and both are intercepted below rather than bypassed.
+fn run_argv(argv: Vec<String>) -> Result<()> {
+    let args = Args::parse(argv)?;
     if args.has("version") {
         emit(&version_string())?;
         return Ok(());
@@ -5379,7 +5932,7 @@ fn run() -> Result<()> {
                 "claim --candidates creates no lease; --session and --lease-minutes do not apply"
             );
         }
-        let store = Store::open_for_read_as_caller(&store_path_readonly(&args)?)?;
+        let store = open_store_for_read(&args)?;
         let options = ClaimOptions {
             git: None,
             agent_id: args.require("as")?.into(),
@@ -5402,14 +5955,14 @@ fn run() -> Result<()> {
     }
 
     if command == "subscription" && sub == Some("list") {
-        let store = Store::open_for_read_as_caller(&store_path_readonly(&args)?)?;
+        let store = open_store_for_read(&args)?;
         return print(
             &store.subscriptions(args.one("status"), args.one("consumer"), args.has("all"))?,
             args.has("json"),
         );
     }
     if command == "subscription" && sub == Some("show") {
-        let store = Store::open_for_read_as_caller(&store_path_readonly(&args)?)?;
+        let store = open_store_for_read(&args)?;
         return print(
             &store.require_subscription(rest.first().context("subscription id is required")?)?,
             args.has("json"),
@@ -5423,13 +5976,21 @@ fn run() -> Result<()> {
         return run_access(&args, spec_sub.as_deref());
     }
 
+    // Before the single open site, because a batch opens the board itself and
+    // lends it to every item (ADR-041 §3.4), and after the data-root lock,
+    // because the batch holds that lock for the whole list rather than once
+    // per item.
+    if command == "transact" {
+        return run_transact(&args, creation);
+    }
+
     // One open site for the whole rest of the surface, and the only place that
     // decides between reading and writing the board. `mut` is for the writing
     // arms below; a read-only connection carries `PRAGMA query_only`, so a
     // command mis-filed in `READ_ONLY_BOARD_COMMANDS` fails loudly on its
     // first write rather than silently dropping it.
     let mut store = if reads_only_one_board(command, sub) {
-        Store::open_for_read_as_caller(&store_path_readonly(&args)?)?
+        open_store_for_read(&args)?
     } else {
         open_store(&args, creation)?
     };
@@ -6905,6 +7466,335 @@ mod tests {
         // A command with no row is untouched.
         assert!(
             reject_ignored_selectors(&args(&["--db", "/tmp/b.db"]), "task", Some("list")).is_ok()
+        );
+    }
+
+    /// Every way the item list can arrive, and every way it can be wrong.
+    #[test]
+    fn a_transact_takes_its_items_from_one_place_or_refuses() {
+        assert_eq!(
+            transact_items(&args(&["--items", "[]"])).unwrap(),
+            Vec::<Value>::new()
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "kanban-transact-items-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, r#"[{"name":"stale"}]"#).unwrap();
+        let from_file = transact_items(&args(&["--items-file", path.to_str().unwrap()])).unwrap();
+        assert_eq!(from_file, vec![json!({ "name": "stale" })]);
+        fs::remove_file(&path).unwrap();
+
+        for (label, arguments, expected) in [
+            (
+                "both",
+                vec!["--items", "[]", "--items-file", "/tmp/nope.json"],
+                "pass one",
+            ),
+            ("neither", vec![], "transact needs its item list"),
+            (
+                "unreadable file",
+                vec!["--items-file", "/tmp/kanban-no-such-item-list.json"],
+                "read transact items from",
+            ),
+            ("not JSON", vec!["--items", "{oops"], "must be a JSON array"),
+            (
+                "not an array",
+                vec!["--items", "{\"name\":\"stale\"}"],
+                "not {\"name\":\"stale\"}",
+            ),
+        ] {
+            let error = format!("{:#}", transact_items(&args(&arguments)).expect_err(label));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    /// The names an item may carry are read off `COMMANDS`, so what the
+    /// surface offers and what a batch accepts cannot disagree.
+    #[test]
+    fn a_transact_item_may_only_name_a_row_operation_on_the_addressed_board() {
+        for name in ["task_add", "claim", "note", "checkpoint", "task_show"] {
+            transactable(name).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        }
+        for (name, expected) in [
+            // Its own name: the one nesting refusal that needs stating.
+            ("transact", "may not carry a batch"),
+            // The read-only batch has no row, so it resolves to nothing.
+            ("batch", "names no such operation batch"),
+            ("frobnicate", "names no such operation frobnicate"),
+            // Withheld from `tools/list`, and withheld here for the same
+            // reason: an unbounded follow inside a write scope is not an item.
+            ("watch", "names no such operation watch"),
+            ("serve", "names no such operation serve"),
+            // Addresses the registry or the data root, so its write would
+            // land outside the batch's transaction.
+            ("doctor", "rather than addressing one board's rows"),
+            ("rule_add", "rather than addressing one board's rows"),
+            ("restore", "rather than addressing one board's rows"),
+            (
+                "workspace_retire",
+                "rather than addressing one board's rows",
+            ),
+            // Addresses one board, but opens its own transaction on it.
+            ("import_atmux_json", "board-wide transaction of its own"),
+            ("search_rebuild", "board-wide transaction of its own"),
+        ] {
+            let error = format!("{:#}", transactable(name).expect_err(name));
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_transact_is_planned_whole_before_any_of_it_runs() {
+        let good = vec![
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "a" } }),
+            json!({ "name": "note", "arguments": {
+                "id": "t-1", "text": "x", "as": "a",
+                "kind": { "$ref": { "item": 0, "path": "/leaseToken" } },
+            }}),
+            // Arguments may be absent entirely.
+            json!({ "name": "stale" }),
+            // `false` and `null` are absence, not a flag this refuses: they
+            // are exactly what `arguments_for` drops.
+            json!({ "name": "search", "arguments": {
+                "query": "x", "all-boards": false, "db": null,
+            }}),
+        ];
+        let planned = plan_transact(&good).expect("a well-formed list plans");
+        assert_eq!(
+            planned.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["claim", "note", "stale", "search"]
+        );
+        assert_eq!(planned[2].1, &Value::Null);
+
+        // The bound is the bound, not one short of it.
+        let at_bound = vec![json!({ "name": "stale" }); mcp::BATCH_LIMIT];
+        assert_eq!(plan_transact(&at_bound).unwrap().len(), mcp::BATCH_LIMIT);
+        let over = vec![json!({ "name": "stale" }); mcp::BATCH_LIMIT + 1];
+        let refusal = plan_transact(&over).expect_err("33 is over the bound");
+        assert_eq!(refusal.index, None);
+        assert!(
+            refusal.message.contains("at most 32"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("33"), "{}", refusal.message);
+        assert!(
+            refusal.message.contains("nothing in it ran"),
+            "{}",
+            refusal.message
+        );
+
+        for (label, items, expected) in [
+            (
+                "not an object",
+                vec![json!({ "name": "stale" }), json!(7)],
+                "item 1 must be an object, not 7",
+            ),
+            (
+                "stray field",
+                vec![json!({ "name": "stale", "tool": "stale" })],
+                "item 0 has no field tool",
+            ),
+            (
+                "no name",
+                vec![json!({ "arguments": {} })],
+                "item 0 needs a name",
+            ),
+            (
+                "name is not a string",
+                vec![json!({ "name": 3 })],
+                "item 0 needs a name",
+            ),
+            (
+                "forbidden name",
+                vec![json!({ "name": "stale" }), json!({ "name": "transact" })],
+                "item 1 names transact",
+            ),
+            (
+                "arguments are not an object",
+                vec![json!({ "name": "stale", "arguments": [1] })],
+                "item 0 has arguments that are not an object: [1]",
+            ),
+            (
+                "names a second board",
+                vec![json!({ "name": "task_list", "arguments": { "db": "/tmp/other.db" } })],
+                "item 0 names --db",
+            ),
+            (
+                "reads every board",
+                vec![
+                    json!({ "name": "search", "arguments": { "query": "x", "all-boards": true } }),
+                ],
+                "item 0 names --all-boards",
+            ),
+        ] {
+            let refusal = plan_transact(&items).expect_err(label);
+            assert!(
+                refusal.message.contains(expected),
+                "{label}: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.ends_with("nothing in it ran"),
+                "{label}: {}",
+                refusal.message
+            );
+        }
+    }
+
+    /// Every reference in the list is checked for shape before any item runs,
+    /// and one that cannot be resolved refuses the batch whole (ADR-041 §4).
+    #[test]
+    fn a_back_reference_is_checked_for_shape_before_anything_runs() {
+        // Found wherever it sits: at the top, nested in an object, and inside
+        // an array.
+        for arguments in [
+            json!({ "lease": { "$ref": { "item": 0, "path": "/leaseToken" } } }),
+            json!({ "outer": { "inner": { "$ref": { "item": 0, "path": "" } } } }),
+            json!({ "list": [1, { "$ref": { "item": 1, "path": "/0/taskID" } }] }),
+            json!({ "plain": "no reference here" }),
+            json!({}),
+        ] {
+            validate_refs(&arguments, 2).unwrap_or_else(|error| panic!("{arguments}: {error:#}"));
+        }
+        // A pointer's escapes are the only two RFC 6901 defines.
+        valid_pointer("/a~0b/c~1d").unwrap();
+
+        for (label, arguments, expected) in [
+            (
+                "beside other keys",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/x" }, "or": "this" } }),
+                "beside other keys",
+            ),
+            (
+                "not an object",
+                json!({ "lease": { "$ref": "/leaseToken" } }),
+                "$ref that is not an object",
+            ),
+            (
+                "stray field",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/x", "from": "0" } } }),
+                "$ref with no field from",
+            ),
+            (
+                "no item",
+                json!({ "lease": { "$ref": { "path": "/x" } } }),
+                "names no item",
+            ),
+            (
+                "item is not a number",
+                json!({ "lease": { "$ref": { "item": "0", "path": "/x" } } }),
+                "not a whole number",
+            ),
+            (
+                "item is negative",
+                json!({ "lease": { "$ref": { "item": -1, "path": "/x" } } }),
+                "not a whole number",
+            ),
+            (
+                "forward reference",
+                json!({ "lease": { "$ref": { "item": 3, "path": "/x" } } }),
+                "$ref to item 3, but this is item 2",
+            ),
+            (
+                "self reference",
+                json!({ "lease": { "$ref": { "item": 2, "path": "/x" } } }),
+                "$ref to item 2, but this is item 2",
+            ),
+            (
+                "no path",
+                json!({ "lease": { "$ref": { "item": 0 } } }),
+                "names no path string",
+            ),
+            (
+                "path is not a string",
+                json!({ "lease": { "$ref": { "item": 0, "path": 1 } } }),
+                "names no path string",
+            ),
+            (
+                "not a pointer",
+                json!({ "lease": { "$ref": { "item": 0, "path": "leaseToken" } } }),
+                "is empty or starts with /",
+            ),
+            (
+                "dangling escape",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/a~" } } }),
+                "escapes only as ~0 or ~1",
+            ),
+            (
+                "unknown escape",
+                json!({ "lease": { "$ref": { "item": 0, "path": "/a~2b" } } }),
+                "escapes only as ~0 or ~1",
+            ),
+            (
+                "nested inside an array",
+                json!({ "list": [{ "$ref": { "item": 9, "path": "/x" } }] }),
+                "$ref to item 9",
+            ),
+        ] {
+            let error = format!("{:#}", validate_refs(&arguments, 2).expect_err(label));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    /// Resolution reaches every value shape, and a pointer that finds nothing
+    /// is this item's failure rather than a silent absence.
+    #[test]
+    fn a_back_reference_resolves_to_the_value_the_earlier_item_returned() {
+        let results = vec![
+            json!({ "leaseToken": "tok", "nested": { "deep": [1, 2] } }),
+            json!([{ "taskID": "t-1" }]),
+        ];
+        assert_eq!(
+            resolve_refs(
+                &json!({
+                    "lease": { "$ref": { "item": 0, "path": "/leaseToken" } },
+                    "deep": { "$ref": { "item": 0, "path": "/nested/deep/1" } },
+                    "first": { "$ref": { "item": 1, "path": "/0/taskID" } },
+                    "whole": { "$ref": { "item": 1, "path": "" } },
+                    "kept": "plain",
+                    "list": [7, { "$ref": { "item": 0, "path": "/leaseToken" } }],
+                }),
+                &results
+            )
+            .unwrap(),
+            json!({
+                "lease": "tok",
+                "deep": 2,
+                "first": "t-1",
+                "whole": [{ "taskID": "t-1" }],
+                "kept": "plain",
+                "list": [7, "tok"],
+            })
+        );
+        // Nothing to resolve is the value itself, whatever shape it is.
+        for value in [json!("text"), json!(3), json!(null), json!(true)] {
+            assert_eq!(resolve_refs(&value, &results).unwrap(), value);
+        }
+
+        let missing = resolve_refs(
+            &json!({ "lease": { "$ref": { "item": 0, "path": "/notThere" } } }),
+            &results,
+        )
+        .expect_err("a pointer that finds nothing fails the item");
+        assert!(
+            format!("{missing:#}").contains("has nothing at /notThere"),
+            "{missing:#}"
+        );
+
+        // Pre-flight makes this unreachable through the CLI; it is still the
+        // fail-closed answer rather than a silent `null`.
+        let absent = resolve_refs(
+            &json!({ "lease": { "$ref": { "item": 4, "path": "/x" } } }),
+            &results,
+        )
+        .expect_err("a result that is not there cannot be referred to");
+        assert!(
+            format!("{absent:#}").contains("item 4 produced no result"),
+            "{absent:#}"
         );
     }
 
