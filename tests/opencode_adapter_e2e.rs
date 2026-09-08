@@ -2,7 +2,6 @@ use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -239,14 +238,29 @@ fn an_accepted_post_carries_the_delivery_and_returns_the_endpoint_acknowledgemen
     assert_eq!(serde_json::from_str::<Value>(body).unwrap(), request());
 }
 
+/// The port the adapter must find closed, chosen so that nothing in this
+/// binary can be listening on it.
+///
+/// The earlier premise -- bind `127.0.0.1:0`, read the port, drop the listener
+/// -- hands the port straight back to the ephemeral pool, and every other test
+/// here binds `127.0.0.1:0` from a parallel thread. On 2026-09-08 one of them
+/// took the freed port between the drop and the POST: the adapter connected,
+/// was reset, and reported `opencode_endpoint_failed (retryable)` with exit 12
+/// where 10 was expected, then passed 3/3 in isolation.
+///
+/// Port 1 cannot be taken by that race. It sits below every ephemeral range
+/// (49152.. on macOS, 32768.. on Linux) so the kernel never hands it out, and
+/// binding it needs root, so no fake in this suite can occupy it. Loopback
+/// refuses it immediately -- a connect to `127.0.0.1:1` returned ECONNREFUSED
+/// in 0.20ms on Darwin 25.6.0 (arm64) on 2026-09-09 -- so the test still
+/// exercises a refused connect and not a timeout.
+const CLOSED_PORT: u16 = 1;
+
 #[test]
 fn an_unreachable_endpoint_reports_the_retryable_unreachable_code() {
     let fixture = Fixture::new();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
 
-    let output = fixture.post(port, NORMAL_TIMEOUT_MS);
+    let output = fixture.post(CLOSED_PORT, NORMAL_TIMEOUT_MS);
     let stderr = stderr(&output);
     assert_eq!(code(&output), 10, "{stderr}");
     assert!(
