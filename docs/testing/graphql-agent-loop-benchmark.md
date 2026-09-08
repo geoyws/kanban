@@ -448,6 +448,26 @@ on a healthy link replaces it. The write arms are unaffected as a comparison:
 all five ran on the same link in the same hour, and their payloads are small
 enough (a few KB) that bandwidth was not the term.
 
+### 9.2.1 Reads-only re-run, 2026-09-09 — the healthy link confirms v2
+
+`docs/testing/graphql-agent-loop-benchmark-v3-reads-2026-09-09.json`, run from
+the MBP against the frozen fixture on hax at 02:39–03:01 MYT with
+`--reads-only`, once the link had recovered: rtt 168.1 ms mean with 0.46 ms
+jitter (v2: 168.6 / 0.5), a cold ssh pulling 240 KB in 1.03 s (the 2026-09-07
+afternoon: 9.4–10.8 s). The verdict block says `comparable: true`.
+
+| arm | requests | p50 v2 (2026-09-07) | p50 v3 reads (2026-09-09) |
+|---|---|---|---|
+| ssh, cold per read | 12 | 26,111 ms | 26,218 ms |
+| ssh ControlMaster | 12 | 4,371 ms | 4,235 ms |
+| MCP over ssh | 12 | 2,108 ms | 2,086 ms |
+| MCP `batch` | 2 | 424 ms | **427 ms** |
+
+Every arm lands within 3% of v2 (p95 on `batch`: 441 ms). So §9.2's afternoon
+numbers were the route and nothing else; the read half is unchanged by the v3
+binary, and this receipt replaces v2 as the read reference. Served binary
+during the run: kanban `b048e02` on hax, unchanged between probes.
+
 ### 9.3 What a loop costs now
 
 Two requests for the reads (`batch`) and one for the writes (`transact`) on
