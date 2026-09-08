@@ -33,8 +33,9 @@
 //! does not relax it.
 
 use crate::model::{
-    Attention, AttentionAnswer, DeadLetterCode, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord,
-    SearchOptions, Sitrep, Subscription, SubscriptionPosition, Task,
+    ATTENTION_OUTCOMES, Attention, AttentionAnswer, AttentionChoice, CUSTOM_CHOICE, DeadLetterCode,
+    DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep, Subscription,
+    SubscriptionPosition, Task,
 };
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
@@ -74,7 +75,6 @@ const DETAIL_ROWS: i64 = 50;
 const MAX_REPLY_BYTES: usize = 4_096;
 /// The configured actor header is an email-sized audit identity, not a blob.
 const MAX_ACTOR_BYTES: usize = 254;
-const COMMENT_RESOLVE_LABEL: &str = "Comment and Resolve";
 
 enum WebResponse {
     Html(u16, String),
@@ -525,13 +525,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
     }
     let length = request.body_length().unwrap_or(0);
     if length == 0 || length > MAX_REPLY_BYTES {
-        return Ok(WebResponse::Html(
-            400,
-            page(
-                "Reply required",
-                "<h1>Reply required</h1><p class=error>Write a short reply before resolving this item.</p>",
-            ),
-        ));
+        return Ok(WebResponse::Html(400, choice_required()));
     }
     let mut bytes = Vec::with_capacity(length);
     request
@@ -550,53 +544,62 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
             page("Invalid reply", "<h1>Invalid reply</h1>"),
         ));
     };
-    let Ok(decision) = strict_form_value(body, "decision") else {
-        return Ok(WebResponse::Html(
-            400,
-            page("Invalid reply", "<h1>Invalid reply</h1>"),
-        ));
-    };
-    let decision = decision.unwrap_or_else(|| "reply".to_owned());
-    let Ok(reply) = strict_form_value(body, "reply") else {
-        return Ok(WebResponse::Html(
-            400,
-            page("Invalid reply", "<h1>Invalid reply</h1>"),
-        ));
-    };
-    let reply = reply
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    // The three shipped buttons, expressed as the card answers they are.
-    // `approve` and `reject` name the default pair's keys, which every row
-    // with no authored card is served as; the free-text button becomes the
-    // custom answer, which carries a verdict rather than closing an item
-    // with none. The card itself, its authored keys and the outcome picker
-    // are Phase 3 (ADR-042 §5); until then a row with authored choices is
-    // refused by name here rather than mapped to a key it does not carry.
-    let answer = match decision.as_str() {
-        "approve" | "reject" => AttentionAnswer {
-            choice: Some(&decision),
-            outcome: None,
-            note: reply.as_deref(),
-        },
-        "reply" => {
-            let Some(note) = reply.as_deref() else {
-                return Ok(WebResponse::Html(
-                    400,
-                    page("Invalid reply", "<h1>Invalid reply</h1>"),
-                ));
-            };
-            AttentionAnswer::custom("other", note)
-        }
-        _ => {
-            return Ok(WebResponse::Html(
-                400,
-                page("Invalid reply", "<h1>Invalid reply</h1>"),
-            ));
-        }
-    };
     let [_, project, id, _] = parts.as_slice() else {
         unreachable!("the route shape was checked above")
+    };
+    let (Ok(decision), Ok(outcome), Ok(reply)) = (
+        strict_form_value(body, "decision"),
+        strict_form_value(body, "outcome"),
+        strict_form_value(body, "reply"),
+    ) else {
+        return Ok(WebResponse::Html(
+            400,
+            page("Invalid reply", "<h1>Invalid reply</h1>"),
+        ));
+    };
+    let trimmed = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let (outcome, reply) = (trimmed(outcome), trimmed(reply));
+    let Some(decision) = trimmed(decision) else {
+        return Ok(WebResponse::Html(400, choice_required()));
+    };
+    // The card posts the key it rendered, or the reserved `custom`. A key the
+    // row no longer carries is refused by name by the store (ADR-042 §4
+    // refusal 13) rather than mapped onto whatever now sits in that
+    // position, which is what makes a card left open in a tab safe.
+    let answer = if decision == CUSTOM_CHOICE {
+        let (Some(outcome), Some(note)) = (outcome.as_deref(), reply.as_deref()) else {
+            // The form is wrong rather than the row, so this is a 400 and not
+            // the 409 a settled row gets.
+            return Ok(WebResponse::Html(
+                400,
+                page(
+                    "Answer incomplete",
+                    &format!(
+                        "<h1>Answer incomplete</h1><p class=error>{}</p>",
+                        escape(&incomplete_answer_refusal(
+                            id,
+                            &actor,
+                            outcome.as_deref(),
+                            reply.as_deref()
+                        ))
+                    ),
+                ),
+            ));
+        };
+        AttentionAnswer::custom(outcome, note)
+    } else {
+        AttentionAnswer {
+            choice: Some(&decision),
+            // The picker belongs to the free-text answer. An authored choice
+            // carries its own verdict, so a picker the operator left set is
+            // not forwarded onto a choice that would refuse it.
+            outcome: None,
+            note: reply.as_deref(),
+        }
     };
     let Ok((_, mut store)) = project_named(project) else {
         return Ok(WebResponse::Html(
@@ -608,9 +611,9 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
         return Ok(WebResponse::Html(
             409,
             page(
-                "Reply not recorded",
+                "Decision not recorded",
                 &format!(
-                    "<h1>Reply not recorded</h1><p class=error>{}</p>",
+                    "<h1>Decision not recorded</h1><p class=error>{}</p>",
                     escape(&error.to_string())
                 ),
             ),
@@ -620,6 +623,39 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
         "/?replied={}",
         url_encode(id)
     )))
+}
+
+/// A POST that named no choice at all: an empty body, or a form with no
+/// `decision`. Both are the same missing thing, so they read the same.
+fn choice_required() -> String {
+    page(
+        "Choice required",
+        "<h1>Choice required</h1><p class=error>Pick one of the item's choices, \
+         or write your own answer.</p>",
+    )
+}
+
+/// The composer's own words for a free-text answer missing its verdict or
+/// its words.
+///
+/// One wording for the CLI, the MCP tool and this page: the page asks for it
+/// rather than restating it, so a change to the refusal cannot leave a stale
+/// copy behind here. The composer never consults the row's choices on this
+/// path, which is why it can be asked before the board is opened.
+fn incomplete_answer_refusal(
+    id: &str,
+    actor: &str,
+    outcome: Option<&str>,
+    note: Option<&str>,
+) -> String {
+    AttentionAnswer {
+        choice: Some(CUSTOM_CHOICE),
+        outcome,
+        note,
+    }
+    .decide(id, &[], actor, now_ms())
+    .expect_err("a custom answer missing its verdict or its words is refused")
+    .to_string()
 }
 
 fn query_value(query: &str, name: &str) -> Option<String> {
@@ -1290,14 +1326,6 @@ fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
     }
 }
 
-fn reply_button_labels(has_comment: bool) -> (&'static str, &'static str) {
-    if has_comment {
-        ("Comment and Approve", "Comment and Reject")
-    } else {
-        ("Approve", "Reject")
-    }
-}
-
 fn task_open_attention(store: &Store, task_id: &str) -> Result<Vec<Attention>> {
     store.attention(Some("open"), None, Some(task_id), None, None, 1000, false)
 }
@@ -1394,7 +1422,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     );
     if let Some(id) = replied {
         html.push_str(&format!(
-            "<p class=success>Reply recorded for <code>{}</code>.</p>",
+            "<p class=success>Decision recorded for <code>{}</code>.</p>",
             escape(id)
         ));
     }
@@ -1405,61 +1433,144 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
         );
         return Ok(page("Needs you", &html));
     }
+    let boards = items
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     html.push_str(&format!(
-        "<p class=count>{} open across {} boards.</p>",
+        "<p class=count><span data-open-count>{}</span> open across {boards} {plural}.</p>",
         items.len(),
-        items
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
+        plural = if boards == 1 { "board" } else { "boards" },
     ));
     for (project, item) in &items {
         let store = stores
             .get(project)
             .expect("project store map built from same iterator");
-        let (approve_label, reject_label) = reply_button_labels(false);
-        html.push_str("<article class=item>");
-        html.push_str(&format!(
-            "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
-             <a href=\"/board/{project_url}\">{project}</a> \
-             · raised by {who} · waiting {age}{tags}</p>",
-            kind = escape(&item.kind),
-            priority = priority_badge(item.priority, item.priority_level.as_deref()),
-            project_url = escape(project),
-            project = escape(project),
-            who = escape(&item.raised_by),
-            age = age(item.created_at),
-            tags = tag_list(&item.tags),
-        ));
-        html.push_str(&format!("<p class=body>{}</p>", escape(&item.body)));
-        if let Some(task) = &item.task_id {
-            html.push_str(&format!(
-                "<p class=meta>about {}</p>",
-                task_reference(project, store, task)
-            ));
-        }
-        html.push_str(&format!(
-            "<form class=reply method=post action=\"/attention/{project}/{id}/reply\">\
-             <label for=\"reply-{id}\">Your reply</label>\
-             <textarea id=\"reply-{id}\" name=reply maxlength={max} \
-             placeholder=\"Answer this item…\"></textarea>\
-             <div class=actions><button type=submit class=send name=decision value=reply>{resolve_label}</button>\
-             <button type=submit class=\"quick approve\" name=decision value=approve \
-             data-empty-label=\"{approve_label}\" data-comment-label=\"Comment and Approve\">{approve_label}</button>\
-             <button type=submit class=\"quick decline\" name=decision value=reject \
-             data-empty-label=\"{reject_label}\" data-comment-label=\"Comment and Reject\">{reject_label}</button>\
-             </div></form>",
-            project = escape(&url_encode(project)),
-            id = escape(&url_encode(&item.id)),
-            max = MAX_REPLY_BYTES,
-            resolve_label = COMMENT_RESOLVE_LABEL,
-            approve_label = approve_label,
-            reject_label = reject_label,
-        ));
-        html.push_str("</article>");
+        html.push_str(&decision_card(project, store, item));
     }
+    html.push_str(
+        "<p class=keys>Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on, \
+         or <kbd>c</kbd> to write your own answer.</p>",
+    );
     Ok(page("Needs you", &html))
+}
+
+/// One item as the card geoyws decides from (ADR-042 §5).
+///
+/// The order is the whole point, and it is the reverse of what this page used
+/// to render: the question, then what is true and what waiting costs, then
+/// the answers with the recommendation first — so `1` is always the
+/// recommendation. The body is the long form and is folded, and the meta line
+/// that used to lead now trails, because a priority pill is not a decision.
+/// A row that authored no card is this same card with the default pair and
+/// its first body line as the question, not a second template.
+fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
+    let id = escape(&item.id);
+    let id_url = escape(&url_encode(&item.id));
+    let project_url = escape(&url_encode(project));
+    let mut html = format!(
+        "<article class=item tabindex=0 data-item=\"{id}\" aria-labelledby=\"q-{id}\">\
+         <h2 id=\"q-{id}\">{question}</h2>",
+        question = escape(&card_question(item)),
+    );
+    if let Some(context) = &item.context {
+        html.push_str(&format!("<p class=context>{}</p>", escape(context)));
+    }
+    let mut recommended = String::new();
+    let mut alternatives = String::new();
+    for (index, choice) in ordered_choices(item).iter().enumerate() {
+        let rendered = format!(
+            "<button type=submit class=\"choice outcome-{outcome}\" name=decision \
+             value=\"{key}\" data-label=\"{label}\"><span class=key>{digit}</span>{label}</button>\
+             <p class=consequence>{consequence}</p>",
+            outcome = escape(&choice.outcome),
+            key = escape(&choice.key),
+            label = escape(&choice.label),
+            consequence = escape(&choice.consequence),
+            digit = index + 1,
+        );
+        if choice.recommended {
+            recommended = format!(
+                "<fieldset class=recommended><legend>recommended</legend>{rendered}</fieldset>"
+            );
+        } else {
+            alternatives.push_str(&format!("<div class=alternative>{rendered}</div>"));
+        }
+    }
+    html.push_str(&format!(
+        "<form class=decide method=post action=\"/attention/{project_url}/{id_url}/reply\">\
+         {recommended}"
+    ));
+    if !alternatives.is_empty() {
+        html.push_str(&format!("<div class=alternatives>{alternatives}</div>"));
+    }
+    html.push_str(&format!(
+        "<div class=custom><fieldset class=outcomes>\
+         <legend>Answer in your own words, recorded as</legend><div class=picks>{picks}</div>\
+         </fieldset>\
+         <textarea id=\"answer-{id_url}\" name=reply maxlength={max} aria-label=\"Your answer\" \
+         placeholder=\"What should happen instead?\"></textarea>\
+         <div class=actions>\
+         <button type=submit class=record name=decision value=custom disabled>Record this answer</button>\
+         <p class=hint data-hint>Pick one of the four and write the answer.</p>\
+         </div></div></form>",
+        picks = ATTENTION_OUTCOMES
+            .iter()
+            .map(|outcome| format!(
+                "<label><input type=radio name=outcome value={outcome}>{outcome}</label>"
+            ))
+            .collect::<String>(),
+        max = MAX_REPLY_BYTES,
+    ));
+    html.push_str(&format!(
+        "<details class=full><summary>show the full item</summary>\
+         <p class=body>{}</p></details>",
+        escape(&item.body)
+    ));
+    html.push_str(&format!(
+        "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
+         <a href=\"/board/{project_url}\">{project}</a> \
+         · raised by {who} · waiting {age}{about}{tags}</p></article>",
+        kind = escape(&item.kind),
+        priority = priority_badge(item.priority, item.priority_level.as_deref()),
+        project = escape(project),
+        who = escape(&item.raised_by),
+        age = age(item.created_at),
+        about = item
+            .task_id
+            .as_ref()
+            .map(|task| format!(" · about {}", task_reference(project, store, task)))
+            .unwrap_or_default(),
+        tags = tag_list(&item.tags),
+    ));
+    html
+}
+
+/// What the card asks, which for a row that authored no question is the first
+/// line of its body — the sentence a raiser puts the verdict in — bounded to
+/// the same 160 characters a question is bounded to.
+fn card_question(item: &Attention) -> String {
+    if let Some(question) = &item.question {
+        return question.clone();
+    }
+    let first = item.body.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= 160 {
+        return first.to_owned();
+    }
+    format!("{}…", first.chars().take(159).collect::<String>())
+}
+
+/// The choices in the order the card lists them: the recommendation first,
+/// then the alternatives as the raiser declared them.
+///
+/// The order is what the keyboard numbers, so it is decided once here rather
+/// than in the renderer and again in the script.
+fn ordered_choices(item: &Attention) -> Vec<&AttentionChoice> {
+    let mut ordered = Vec::with_capacity(item.choices.len());
+    ordered.extend(item.choices.iter().filter(|choice| choice.recommended));
+    ordered.extend(item.choices.iter().filter(|choice| !choice.recommended));
+    ordered
 }
 
 /// Cross-board retrieval for people who should not need to know which board
@@ -2758,23 +2869,108 @@ const NOTICE_MEMORY = 200;
 const NOTICE_SHOWN = 8;
 const seenNotices = new Set();
 let liveConnects = 0;
+// A decision is one click and no page load, because the list is long: a
+// reload after every answer would throw the reader back to the top of it.
+// The card posts its own form, is replaced in place by its receipt, and the
+// open count drops by one.
+const CHOICE_KEYS = ['1', '2', '3', '4'];
 const hasDraftReply = () => [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim());
-function bindQuickReplies() {
-  document.querySelectorAll('form.reply').forEach(form => {
-    const textarea = form.querySelector('textarea[name=reply]');
-    if (!textarea || form.dataset.quickRepliesBound) {
-      return;
-    }
-    form.dataset.quickRepliesBound = '1';
-    const sync = () => {
-      const hasReply = textarea.value.trim().length > 0;
-      form.querySelectorAll('button.quick').forEach(button => {
-        button.textContent = hasReply ? button.dataset.commentLabel : button.dataset.emptyLabel;
-      });
-    };
-    textarea.addEventListener('input', sync);
-    sync();
+const cardOf = node => (node && node.closest ? node.closest('article.item') : null);
+// The free-text answer carries a verdict or it is not an answer, so the
+// button is dead until both halves are there. The board refuses the same
+// thing in the same words; this only saves the round trip.
+function syncAnswer(form) {
+  const text = form.querySelector('textarea[name=reply]');
+  const record = form.querySelector('button.record');
+  if (!text || !record) return;
+  const ready = Boolean(form.querySelector('input[name=outcome]:checked')) && text.value.trim().length > 0;
+  record.disabled = !ready;
+  const hint = form.querySelector('[data-hint]');
+  if (hint) hint.hidden = ready;
+}
+function bindCards() {
+  document.querySelectorAll('form.decide').forEach(form => {
+    if (form.dataset.cardBound) return;
+    form.dataset.cardBound = '1';
+    form.addEventListener('input', () => syncAnswer(form));
+    form.addEventListener('change', () => syncAnswer(form));
+    form.addEventListener('submit', event => { event.preventDefault(); decide(form, event.submitter); });
+    syncAnswer(form);
   });
+}
+// The form's fields plus the button that was pressed. A submit button is
+// only submitted when it is the submitter, and the pressed button is the
+// whole decision, so it is named here rather than left to the newer
+// FormData(form, submitter) overload that a phone's browser may not have.
+function decisionBody(form, submitter) {
+  const body = new URLSearchParams(new FormData(form));
+  if (submitter) body.set('decision', submitter.value);
+  return body;
+}
+// What the receipt says, in the words the ledger will use for the same
+// decision: the choice's own label, or the custom answer with its verdict.
+function decidedLabel(form, submitter) {
+  if (!submitter) return 'Custom answer';
+  if (submitter.value !== 'custom') return submitter.dataset.label;
+  const outcome = form.querySelector('input[name=outcome]:checked');
+  return outcome ? `Custom answer, recorded as ${outcome.value}` : 'Custom answer';
+}
+function showReceipt(card, label) {
+  const receipt = document.createElement('p');
+  receipt.className = 'receipt';
+  receipt.dataset.receipt = card.dataset.item;
+  receipt.setAttribute('role', 'status');
+  const decided = document.createElement('span');
+  decided.className = 'decided';
+  decided.textContent = `Decided: ${label}.`;
+  const command = document.createElement('code');
+  command.textContent = `kanban attention reopen ${card.dataset.item}`;
+  receipt.append(decided, document.createTextNode(' Reopen it with '), command);
+  const following = card.nextElementSibling;
+  const held = card.contains(document.activeElement);
+  card.replaceWith(receipt);
+  const counter = document.querySelector('[data-open-count]');
+  if (counter) counter.textContent = Math.max(0, Number(counter.textContent) - 1);
+  // Keep the keyboard where the work is: the next card, so 1-4 keeps deciding.
+  if (held && following && following.matches('article.item')) following.focus();
+}
+function showRefusal(form, text) {
+  let refusal = form.querySelector('[data-refusal]');
+  if (!refusal) {
+    refusal = document.createElement('p');
+    refusal.className = 'error';
+    refusal.setAttribute('data-refusal', '');
+    refusal.setAttribute('role', 'alert');
+    form.append(refusal);
+  }
+  refusal.textContent = text;
+}
+async function decide(form, submitter) {
+  const card = cardOf(form);
+  if (!card || form.dataset.deciding) return;
+  form.dataset.deciding = '1';
+  const label = decidedLabel(form, submitter);
+  try {
+    const response = await fetch(form.action, {
+      method: 'POST',
+      body: decisionBody(form, submitter),
+      credentials: 'same-origin',
+      redirect: 'manual',
+    });
+    // The route answers a recorded decision with a redirect and every
+    // refusal with a page, so an opaque redirect is the receipt. A refusal
+    // is shown in the card's own words -- a card left open while the item
+    // was rewritten names a choice the row no longer carries, and that is
+    // refused by name rather than mapped onto whatever now sits there.
+    if (response.type === 'opaqueredirect' || response.ok) { showReceipt(card, label); return; }
+    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const refused = page.querySelector('.error');
+    showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`);
+  } catch (error) {
+    showRefusal(form, 'The decision did not reach the board. Try again.');
+  } finally {
+    delete form.dataset.deciding;
+  }
 }
 async function refreshProjection() {
   if (hasDraftReply()) { setLive('update waiting'); return; }
@@ -2783,8 +2979,17 @@ async function refreshProjection() {
   const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
   const strip = document.querySelector('[data-notices]');
   if (strip) next.prepend(strip);
+  // A receipt outlives the projection it was decided in. The row is gone
+  // from the new one, so the receipts move to the head of the list in the
+  // order they were decided; an undo that vanished a second after the click
+  // would be no undo at all.
+  let cursor = next.querySelector('.count');
+  document.querySelectorAll('[data-receipt]').forEach(receipt => {
+    if (cursor) cursor.after(receipt); else next.prepend(receipt);
+    cursor = receipt;
+  });
   document.querySelector('main').replaceWith(next);
-  bindQuickReplies();
+  bindCards();
   setLive('live');
 }
 function noticeStrip() {
@@ -2858,7 +3063,28 @@ document.addEventListener('click', event => {
   const dismiss = event.target.closest('.notice > .dismiss');
   if (dismiss) dismiss.parentElement.remove();
 });
-bindQuickReplies();
+// 1-4 answer the card that has focus, in the order it lists them, so 1 is
+// always the recommendation -- the muscle memory that makes a long list
+// tractable. `c` writes an answer instead. Both are inert while an answer is
+// being typed, and while no card has focus.
+document.addEventListener('keydown', event => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target;
+  if (target && target.matches && target.matches('textarea, input:not([type=radio])')) return;
+  const card = cardOf(document.activeElement);
+  if (!card) return;
+  const digit = CHOICE_KEYS.indexOf(event.key);
+  if (digit >= 0) {
+    const choices = card.querySelectorAll('form.decide button.choice');
+    if (digit < choices.length) { event.preventDefault(); choices[digit].click(); }
+    return;
+  }
+  if (event.key === 'c') {
+    const text = card.querySelector('textarea[name=reply]');
+    if (text) { event.preventDefault(); text.focus(); }
+  }
+});
+bindCards();
 connectLive();
 "#;
 
@@ -2897,9 +3123,6 @@ input::placeholder,textarea::placeholder{color:var(--dim)}\
 input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}\
 button{cursor:pointer;background:transparent}\
 button:hover{opacity:.85}button:active{transform:translateY(1px)}\
-.send,.quick.approve,.reply button[type=submit]{color:var(--canvas);background:var(--phosphor);font-weight:700}\
-.quick.decline,.reply .quick.decline{color:var(--red);background:transparent;border-color:var(--red);font-weight:400}\
-.send{order:4;margin-left:auto}\
 .search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
 main{max-width:64rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
 footer{max-width:64rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--dim);font-size:.85rem}\
@@ -2907,7 +3130,7 @@ h1{font-size:1.25rem;font-weight:700;line-height:1.3;margin:.2rem 0 1rem;text-sh
 h1::before{content:'> '}\
 h2{font-size:.9rem;font-weight:700;margin:1.6rem 0 .5rem;color:var(--dim)}\
 a{color:var(--phosphor);text-decoration:none}a:hover{text-decoration:underline}\
-code{color:var(--phosphor);background:rgba(51,255,51,.1);padding:.1em .35em;border-radius:2px}\
+code,kbd{color:var(--phosphor);background:rgba(51,255,51,.1);padding:.1em .35em;border-radius:2px}\
 pre{background:var(--panel);border:1px solid var(--dim);border-radius:4px;padding:.8rem;\
 overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem}\
 table{width:100%;border-collapse:collapse;font-size:.85rem}\
@@ -2939,9 +3162,50 @@ border-left:2px solid var(--phosphor);border-radius:4px;animation:notice-in .18s
 .notice .dismiss{margin-left:auto;min-height:auto;padding:.1rem .5rem;font-size:.75rem;\
 color:var(--dim);border-color:var(--dim)}\
 @keyframes notice-in{from{opacity:0;transform:translateY(-.25rem)}to{opacity:1;transform:none}}\
-.reply{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--dim)}.reply label{display:block;color:var(--dim);font-size:.8rem;margin-bottom:.35rem}\
-.reply textarea{display:block;width:100%;min-height:5.5rem;resize:vertical}\
-.actions{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.65rem}.actions button{min-width:6.5rem}\
+.decide textarea{display:block;width:100%;min-height:2.9rem;resize:vertical}\
+.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.6rem}\
+.actions button{min-width:6.5rem}\
+.item h2{max-width:72ch;margin:0 0 .6rem;padding-left:1.15em;text-indent:-1.15em;\
+color:var(--phosphor);font-size:1.0625rem;line-height:1.45;text-shadow:0 0 10px rgba(51,255,51,.35)}\
+.item h2::before{content:'> '}\
+.item:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}\
+.context{max-width:72ch;margin:0 0 1.1rem}\
+.decide{margin:0}\
+fieldset{min-width:0;margin:0;padding:0;border:0}\
+legend{padding:0;color:var(--dim);font-size:.8rem}\
+.recommended{padding:.2rem .85rem .9rem;border:1px solid var(--phosphor);border-radius:4px}\
+.recommended legend{padding:0 .45em;color:var(--phosphor)}\
+.choice{display:block;width:100%;margin:0;text-align:left;line-height:1.45;white-space:normal}\
+.choice .key{display:inline-block;min-width:1.6em;margin-right:.5em;padding:0 .2em;\
+border:1px solid currentColor;border-radius:2px;font-size:.75rem;text-align:center}\
+.choice.outcome-approve{color:var(--phosphor);border-color:var(--phosphor)}\
+.choice.outcome-defer{color:var(--amber);border-color:var(--amber)}\
+.choice.outcome-reject{color:var(--red);border-color:var(--red)}\
+.choice.outcome-other{color:var(--dim);border-color:var(--dim)}\
+.recommended .choice{color:var(--canvas);background:var(--phosphor);border-color:var(--phosphor);font-weight:700}\
+.consequence{max-width:72ch;margin:.5rem 0 0;color:var(--dim)}\
+.recommended .consequence{color:var(--phosphor)}\
+.alternatives{display:grid;gap:1.15rem;margin:1.15rem 0 0}\
+.alternative .consequence{margin-top:.4rem}\
+.custom{margin-top:1.3rem;padding-top:1.1rem;border-top:1px solid var(--dim)}\
+.picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
+.picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.5rem;\
+padding:.25rem .6rem;color:var(--dim);border:1px solid var(--dim);border-radius:4px;cursor:pointer}\
+.picks label:has(input:checked){color:var(--phosphor);border-color:var(--phosphor)}\
+.picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;border:0;accent-color:var(--phosphor)}\
+.record{color:var(--phosphor);border-color:var(--phosphor)}\
+.record[disabled]{color:var(--dim);border-color:var(--dim);cursor:not-allowed}\
+.hint{margin:0;color:var(--dim);font-size:.8rem}\
+.receipt{margin:1rem 0;padding:.55rem .75rem;color:var(--dim);background:var(--canvas);\
+border:1px solid var(--dim);border-left:2px solid var(--phosphor);border-radius:4px}\
+.receipt .decided{color:var(--phosphor)}\
+.full{margin:1.2rem 0 0}\
+.full summary{color:var(--dim);cursor:pointer;list-style:none}\
+.full summary::-webkit-details-marker{display:none}\
+.full summary::before{content:'+ '}\
+.full[open] summary::before{content:'- '}\
+.full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--dim)}\
+.keys{margin:1.6rem 0 0;color:var(--dim);font-size:.85rem}\
 .search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:var(--dim)}\
 .meta{color:var(--dim);font-size:.85rem;margin:.2rem 0}\
 .body{margin:.5rem 0;white-space:pre-wrap}\
@@ -2963,7 +3227,7 @@ dt{color:var(--dim);font-size:.85rem}\
 dd{margin:0;font-size:.9rem;word-break:break-word}\
 .plan-body{max-height:28rem;overflow-y:auto}\
 .error{color:var(--red)}\
-@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.send{order:0;margin-left:0;width:100%}.actions button{flex:1}.heading{align-items:flex-start}table{min-width:38rem}}\
+@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.actions button{flex:1}.picks{display:grid;grid-template-columns:1fr 1fr}.heading{align-items:flex-start}table{min-width:38rem}}\
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
 .notice{animation:none}.live::after{animation:none}}\
 ";
@@ -3258,22 +3522,9 @@ mod tests {
         assert!(CSS.contains(".attention-count"));
         assert!(CSS.contains("@media(max-width:700px)"));
         assert!(CSS.contains(":focus-visible"));
-        assert_eq!(COMMENT_RESOLVE_LABEL, "Comment and Resolve");
-        assert!(JS.contains("button.dataset.commentLabel"));
-        assert!(JS.contains("button.dataset.emptyLabel"));
-        assert!(JS.contains("dataset.quickRepliesBound"));
-    }
-
-    /// The two quick buttons still say both things. What they *write* is no
-    /// longer composed here: the resolution text moved inside the store's
-    /// write path so no caller can produce a different trail (ADR-042 §3).
-    #[test]
-    fn reply_labels_preserve_both_facts() {
-        assert_eq!(reply_button_labels(false), ("Approve", "Reject"));
-        assert_eq!(
-            reply_button_labels(true),
-            ("Comment and Approve", "Comment and Reject")
-        );
+        assert!(JS.contains("input[name=outcome]:checked"));
+        assert!(JS.contains("dataset.cardBound"));
+        assert!(JS.contains("data-receipt"));
     }
 
     #[test]
@@ -3330,14 +3581,21 @@ mod tests {
             &home,
             "Please review &lt;strong&gt;before release&lt;/strong&gt;",
         );
-        assert_html_contains(&home, "data-comment-label=\"Comment and Approve\"");
-        assert_html_contains(&home, "data-comment-label=\"Comment and Reject\"");
+        assert_html_contains(
+            &home,
+            "<legend>Answer in your own words, recorded as</legend>",
+        );
+        assert_html_contains(&home, "value=\"approve\" data-label=\"Approve - proceed\"");
+        assert_html_contains(&home, "name=decision value=custom disabled");
         assert_html_contains(&home, "/board/SERVE-RENDER");
         assert!(!home.contains("<strong>before release</strong>"));
 
         let replied = render(&format!("/?replied={}", fixture.epic_id)).expect("render replied");
         assert_page_title(&replied, "Needs you");
-        assert_html_contains(&replied, "Reply recorded for <code>e-serve-render</code>.");
+        assert_html_contains(
+            &replied,
+            "Decision recorded for <code>e-serve-render</code>.",
+        );
 
         let boards = render("/boards").expect("render boards");
         assert_page_title(&boards, "Boards");

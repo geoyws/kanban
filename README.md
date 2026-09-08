@@ -752,19 +752,34 @@ browser would be a claim the server must trust, and a stale one silently skips
 rows (`docs/ui-pubsub-consumption-seams.md`).
 
 The **Needs you** page is the deliberately narrow exception to the read-only
-surface: reply inline to resolve an attention item as `geoyws`. Same-origin checks,
-strict bounded form decoding and the Store's duplicate-resolution refusal guard
-the write. Quick replies are available on a phone without removing free text.
-The rendered decision card — the question as the heading, the recommendation
-first and one-click, the four-value outcome picker beside the textarea, and
-`1`-`4` keyboard picks — ships in Phase 3 of
-[ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md);
-today the three buttons answer through the default `approve`/`reject` pair and
-the custom answer, so an item whose raiser authored other keys is refused by
-name until that card lands. Every other route remains read-only: the browser
-can resolve an attention item, open a draft plan, and pause or resume a
-subscription, and nothing else, enforced by the source mutator allowlist and
-byte-for-byte process-boundary tests.
+surface: every open item renders as a decision card and one click settles it as
+`geoyws`. Same-origin checks, strict bounded form decoding and the Store's
+duplicate-resolution refusal guard the write.
+
+A card reads top to bottom in the order it is decided in
+([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)
+§5): the question as the heading, the context, then the recommended choice
+first — marked `recommended` and the first interactive element in the card —
+with each choice's consequence beneath its button, then the free-text answer
+with its four-value outcome picker, then the body folded under `show the full
+item`, then the meta line. `1`–`4` answer the card that has focus in the order
+it lists them, so `1` is always the recommendation, and `c` reaches the answer
+field; both are inert while an answer is being typed. A row whose raiser
+authored no card is the same card with the `approve`/`reject` default pair, its
+first body line as the question and nothing marked recommended.
+
+One click posts `decision=<key>`, the free-text answer posts
+`decision=custom&outcome=<verdict>&reply=<text>`, and the answer is refused
+without both by the page and by the composer that writes the trail. Nothing
+navigates: the card is replaced in place by a one-line receipt naming the
+choice and the `kanban attention reopen <id>` that undoes it, the open count
+drops, and the receipt survives the live refresh — a reload on a 133-item list
+would throw the reader back to the top of it. A key the row no longer carries
+is refused by name rather than mapped onto whatever now sits in that position,
+so a card left open in a tab is safe to click. Every other route remains
+read-only: the browser can resolve an attention item, open a draft plan, and
+pause or resume a subscription, and nothing else, enforced by the source
+mutator allowlist and byte-for-byte process-boundary tests.
 
 `/live` is a WebSocket notification channel. It sends only revision notices and
 heartbeats; the browser fetches the canonical server-rendered page after a board

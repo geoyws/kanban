@@ -681,25 +681,6 @@ fn browser_sandbox_enabled(effective_uid: u32) -> bool {
     effective_uid != 0
 }
 
-fn assert_reply_recorded(tab: &headless_chrome::Tab, origin: &str, reply_id: &str, label: &str) {
-    let success = tab
-        .wait_for_element("p.success")
-        .unwrap_or_else(|error| panic!("{label} success element: {error}"));
-    let success_text = success
-        .get_inner_text()
-        .unwrap_or_else(|error| panic!("{label} success text: {error}"));
-    let expected_url = format!("{origin}?replied={reply_id}");
-    assert!(
-        success_text == format!("Reply recorded for {reply_id}."),
-        "{label} success text: {success_text}"
-    );
-    assert!(
-        tab.get_url() == expected_url,
-        "{label} redirect url: {}",
-        tab.get_url()
-    );
-}
-
 #[test]
 fn chrome_discovery_prefers_explicit_then_platform_then_path_then_defaults() {
     let cache_root = unique_test_dir("chrome-discovery-cache-root");
@@ -22572,6 +22553,34 @@ fn http_post(port: u16, path: &str, origin: &str, body: &[u8]) -> (u16, String) 
     (status, text)
 }
 
+/// One card's markup, from its `<article>` to its close.
+///
+/// Slicing the page rather than searching all of it is the point: an
+/// assertion about the order of a card's parts must not be satisfied by a
+/// neighbouring card that happens to carry the same text.
+fn card_markup<'a>(html: &'a str, id: &str) -> &'a str {
+    let opening = format!("<article class=item tabindex=0 data-item=\"{id}\"");
+    let start = html
+        .find(&opening)
+        .unwrap_or_else(|| panic!("no card for {id} in {html}"));
+    let card = &html[start..];
+    let end = card
+        .find("</article>")
+        .unwrap_or_else(|| panic!("the card for {id} never closed"));
+    &card[..end]
+}
+
+/// Every needle appears in `html`, each one after the last.
+fn assert_in_order(html: &str, needles: &[&str]) {
+    let mut cursor = 0;
+    for needle in needles {
+        let found = html[cursor..].find(needle).unwrap_or_else(|| {
+            panic!("{needle:?} is missing or out of order after byte {cursor} in {html}")
+        });
+        cursor += found + needle.len();
+    }
+}
+
 fn read_http_head(stream: &mut std::net::TcpStream) -> String {
     use std::io::Read as _;
     let mut bytes = Vec::new();
@@ -23912,26 +23921,76 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "--json",
         ],
     );
+    let carded = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
     let approve_id = approve["id"].as_str().unwrap();
     let reply_id = reply["id"].as_str().unwrap();
     let reject_id = reject["id"].as_str().unwrap();
+    let carded_id = carded["id"].as_str().unwrap();
     let server = spawn_server(&fixture);
     let port = server.port;
 
     let (status, home) = http_get(port, "/");
     assert_eq!(status, 200, "{home}");
-    assert!(home.contains("Your reply"), "{home}");
-    assert!(home.contains("Approve"), "{home}");
-    assert!(home.contains("Reject"), "{home}");
-    assert!(
-        home.contains("data-comment-label=\"Comment and Approve\""),
-        "{home}"
+    // The card's order is the contract (ADR-042 §5), and it is the order the
+    // server renders rather than anything the script arranges: the question,
+    // the context, the recommendation and its consequence, the alternatives
+    // in the order they were declared, the free-text answer, the folded body,
+    // and only then the meta line a priority pill used to lead with.
+    let card = card_markup(&home, carded_id);
+    assert_in_order(
+        card,
+        &[
+            &format!("<h2 id=\"q-{carded_id}\">"),
+            "hax has no logged-in Claude account",
+            "<p class=context>",
+            "Claude Code 2.1.236 is installed on hax",
+            "<fieldset class=recommended><legend>recommended</legend>",
+            "value=\"assign-and-login\" data-label=\"Assign a Claude seat to hax and log in\"",
+            "<span class=key>1</span>",
+            "<p class=consequence>You buy or free one Claude seat",
+            "<div class=alternatives>",
+            "value=\"keep-parked\"",
+            "<span class=key>2</span>",
+            "value=\"drop-receipt\"",
+            "<span class=key>3</span>",
+            "<div class=custom>",
+            "<legend>Answer in your own words, recorded as</legend>",
+            "<input type=radio name=outcome value=approve>",
+            "<input type=radio name=outcome value=other>",
+            "name=decision value=custom disabled",
+            "<details class=full><summary>show the full item</summary>",
+            "<p class=body>PARKED - until an account is assigned",
+            "<p class=meta>",
+            "raised by codex@driver",
+        ],
+    );
+    // A row that authored no card is the same card with the default pair:
+    // its first body line as the question, two choices, and nothing marked
+    // recommended, because nobody authored the pair.
+    let default_card = card_markup(&home, approve_id);
+    assert_in_order(
+        default_card,
+        &[
+            &format!("<h2 id=\"q-{approve_id}\">Choose the rollout window</h2>"),
+            "value=\"approve\" data-label=\"Approve - proceed\"",
+            "<p class=consequence>The work the body describes goes ahead as written.</p>",
+            "value=\"reject\" data-label=\"Reject - do not proceed\"",
+            "<div class=custom>",
+        ],
     );
     assert!(
-        home.contains("data-comment-label=\"Comment and Reject\""),
-        "{home}"
+        !default_card.contains("class=recommended"),
+        "a synthesized pair marked a recommendation: {default_card}"
     );
-    assert!(home.contains("Comment and Resolve"), "{home}");
+    assert!(
+        !default_card.contains("<p class=context>"),
+        "{default_card}"
+    );
     assert!(home.contains("new WebSocket"), "{home}");
     assert!(
         home.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
@@ -23949,6 +24008,10 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         home.contains("about <a href=\"/task/SERVEWRITE/s-web-open\">Ship the rollout task</a>"),
         "{home}"
     );
+    assert!(
+        home.contains("Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on"),
+        "{home}"
+    );
 
     let path = format!("/attention/SERVEWRITE/{approve_id}/reply");
     let (status, _) = http_post(
@@ -23962,7 +24025,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         &fixture.main,
         &["attention", "list", "--status", "open", "--json"],
     );
-    assert_eq!(still_open.as_array().unwrap().len(), 3);
+    assert_eq!(still_open.as_array().unwrap().len(), 4);
 
     let origin = format!("http://127.0.0.1:{port}");
     let (status, plans) = http_get(port, "/plans");
@@ -23993,7 +24056,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     );
     assert_eq!(status, 404, "an unknown board write was accepted");
     let unresolved = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
-    assert_eq!(unresolved.as_array().unwrap().len(), 3);
+    assert_eq!(unresolved.as_array().unwrap().len(), 4);
     let (status, task_page) = http_get(port, "/task/SERVEWRITE/e-web-open");
     assert_eq!(status, 200, "{task_page}");
     assert!(task_page.contains("Open attention"), "{task_page}");
@@ -24051,11 +24114,47 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         format!("{REJECT}\nNote: Needs another reviewer")
     );
     let reply_path = format!("/attention/SERVEWRITE/{reply_id}/reply");
+    // The vocabulary is the key, or `custom` with a verdict and words. A form
+    // that names no choice is refused rather than defaulted to one, and a key
+    // the row does not carry is refused by name (ADR-042 §4 refusal 13) —
+    // which is what makes a card left open in a tab safe to click.
+    let (status, refused) = http_post(port, &reply_path, &origin, b"reply=No+choice+named");
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.contains("Pick one of the item's choices"),
+        "{refused}"
+    );
+    let (status, refused) = http_post(
+        port,
+        &reply_path,
+        &origin,
+        b"decision=assign-and-login&reply=A+key+this+row+never+carried",
+    );
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused.contains(&format!(
+            "attention {reply_id} has no choice assign-and-login; its choices are approve, reject"
+        )),
+        "{refused}"
+    );
+    let (status, refused) = http_post(
+        port,
+        &reply_path,
+        &origin,
+        b"decision=custom&reply=A+note+with+no+verdict",
+    );
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.contains(
+            "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note"
+        ),
+        "{refused}"
+    );
     let (status, response) = http_post(
         port,
         &reply_path,
         &origin,
-        b"decision=reply&reply=This+is+the+durable+note",
+        b"decision=custom&outcome=other&reply=This+is+the+durable+note",
     );
     assert_eq!(status, 303, "{response}");
     let resolved = fixture.ok_json(
@@ -24063,15 +24162,18 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         &["attention", "list", "--status", "resolved", "--json"],
     );
     assert_eq!(resolved.as_array().unwrap().len(), 3);
+    let reply_resolved = resolved
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == reply_id)
+        .expect("reply resolution");
     assert_eq!(
-        resolved
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["id"] == reply_id)
-            .expect("reply resolution")["resolution"],
+        reply_resolved["resolution"],
         "Decision: Custom answer, recorded as other.\nNote: This is the durable note"
     );
+    assert_eq!(reply_resolved["decision"]["choice"], "custom");
+    assert_eq!(reply_resolved["decision"]["outcome"], "other");
     let (status, _) = http_post(
         port,
         &path,
@@ -24133,8 +24235,409 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_ne!(changed["revision"], ready["revision"]);
 }
 
+/// A Chrome tab on "Needs you", carrying the trusted edge actor header the
+/// resolve gate accepts.
+///
+/// `geoyws` is the only actor that may settle another agent's item
+/// (`rust/model.rs` `OPERATOR_ACTOR`), and the header is how a deployment
+/// behind SSO says who is reading. Configured here so the recorded
+/// `decision.by` is the header's value rather than the process default.
+fn decision_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
+    let tab = chrome.new_tab().expect("browser tab");
+    tab.set_extra_http_headers(std::collections::HashMap::from([(
+        "X-Auth-Request-Email",
+        "geoyws",
+    )]))
+    .expect("set the trusted edge actor header");
+    tab.navigate_to(origin).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+    tab.wait_for_element("article.item")
+        .expect("a decision card");
+    tab
+}
+
+/// What the card became after a decision: one line naming the choice in the
+/// same words the ledger uses, and the command that undoes it.
+fn assert_receipt(tab: &headless_chrome::Tab, id: &str, label: &str) {
+    let receipt = tab
+        .wait_for_element(&format!("p.receipt[data-receipt=\"{id}\"]"))
+        .unwrap_or_else(|error| panic!("receipt for {id}: {error}"));
+    assert_eq!(
+        receipt.get_inner_text().expect("receipt text").trim(),
+        format!("Decided: {label}. Reopen it with kanban attention reopen {id}")
+    );
+}
+
+/// The row the browser settled, read back through the binary.
+fn settled_row(fixture: &Fixture, id: &str) -> Value {
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "resolved",
+            "--limit",
+            "50",
+            "--json",
+        ],
+    );
+    resolved
+        .as_array()
+        .expect("resolved rows")
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap_or_else(|| panic!("{id} is not resolved: {resolved}"))
+        .clone()
+}
+
+fn js_value(tab: &headless_chrome::Tab, expression: &str) -> Value {
+    tab.evaluate(expression, false)
+        .unwrap_or_else(|error| panic!("evaluate {expression}: {error}"))
+        .value
+        .unwrap_or(Value::Null)
+}
+
+/// `attention raise` argv for one card: the fixed flags, then the card's own.
+fn card_args<'a>(fixed: &[&'a str], card: &[&'a str]) -> Vec<&'a str> {
+    let mut args = fixed.to_vec();
+    args.extend_from_slice(card);
+    args
+}
+
+/// Tag the projection the page is holding, so the swap that replaces it is
+/// observable rather than guessed at.
+fn hold_projection(tab: &headless_chrome::Tab) {
+    js_value(
+        tab,
+        "(() => { document.querySelector('main').dataset.generation = 'held'; return true; })()",
+    );
+}
+
+/// Block until the tagged projection has been replaced by a freshly rendered
+/// one.
+///
+/// Not a sleep in disguise: a decision changes the board, the live socket
+/// says so, and the page fetches the canonical projection again. Anything
+/// that has to outlive that — a receipt and its undo — is only proved to
+/// after it happened.
+fn wait_for_projection_swap(tab: &headless_chrome::Tab) {
+    for _ in 0..200 {
+        if js_value(tab, "!document.querySelector('main').dataset.generation") == Value::Bool(true)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the live socket never re-rendered the projection");
+}
+
+/// Block until the live status line reads `text`.
+fn wait_for_live(tab: &headless_chrome::Tab, text: &str) {
+    for _ in 0..200 {
+        if js_value(tab, "document.querySelector('[data-live]').textContent") == text {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "the live status never read {text:?}; it reads {}",
+        js_value(tab, "document.querySelector('[data-live]').textContent")
+    );
+}
+
+/// One click on the recommendation settles the item, and the row afterwards
+/// names the choice, its verdict and who pressed it.
+///
+/// This is the feature: the recommendation is the first interactive element
+/// in the card, so the fastest thing available is also the thing the raiser
+/// advises. Nothing navigates — the card is replaced by its receipt in place
+/// and the open count drops — because a reload on a 133-item list throws the
+/// reader back to the top of it.
 #[test]
-fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
+fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_outcome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-click");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDCLICK", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    // A second row, so the count has somewhere to drop to: deciding the last
+    // open item replaces the list with its empty state, which is a different
+    // assertion than the one this case is making.
+    raise_carded(
+        &fixture,
+        "Waiting behind the P0: nothing to decide here yet.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "6"],
+    );
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDCLICK/{id}/reply\"]");
+
+    // The question is the heading, and the body is folded beneath the card.
+    assert_eq!(
+        tab.wait_for_element(&format!("article.item[data-item=\"{id}\"] h2"))
+            .expect("the question")
+            .get_inner_text()
+            .expect("question text")
+            .trim(),
+        item["question"].as_str().unwrap()
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('article.item[data-item=\"{id}\"] details.full > summary').textContent"
+            )
+        ),
+        "show the full item"
+    );
+    // The recommendation is marked, and it is the first thing a keyboard or a
+    // thumb reaches in the card.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} fieldset.recommended > legend').textContent")
+        ),
+        "recommended"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('article.item[data-item=\"{id}\"]')\
+                 .querySelector('button, input, textarea, select, a').value"
+            )
+        ),
+        "assign-and-login"
+    );
+    let recommended = tab
+        .wait_for_element(&format!("{form} fieldset.recommended button.choice"))
+        .expect("the recommended button");
+    let choice = card_choices()[0].clone();
+    let label = choice["label"].as_str().unwrap();
+    assert!(
+        recommended
+            .get_inner_text()
+            .expect("recommended label")
+            .contains(label),
+        "the recommended button does not carry its label"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "2"
+    );
+
+    hold_projection(&tab);
+    recommended
+        .click()
+        .expect("one click on the recommendation");
+
+    assert_receipt(&tab, id, label);
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "1",
+        "the live count did not drop"
+    );
+    // The live socket then delivers the change this decision made, and the
+    // page re-renders the projection it is holding. The receipt has to
+    // survive that: the row is gone from the new projection, and an undo
+    // that vanished a second after the click would be no undo at all.
+    wait_for_projection_swap(&tab);
+    assert_receipt(&tab, id, label);
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "1",
+        "the server-rendered count disagrees with the decision"
+    );
+    assert_eq!(
+        tab.get_url(),
+        origin,
+        "a decision navigated instead of replacing the card in place"
+    );
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["status"], "resolved", "{row}");
+    assert_eq!(row["decision"]["choice"], "assign-and-login", "{row}");
+    assert_eq!(row["decision"]["outcome"], "approve", "{row}");
+    assert_eq!(row["decision"]["by"], "geoyws", "{row}");
+    assert_eq!(row["decision"]["note"], Value::Null, "{row}");
+    assert_eq!(
+        row["resolution"],
+        format!(
+            "Decision: {label}. {}",
+            choice["consequence"].as_str().unwrap()
+        ),
+        "{row}"
+    );
+}
+
+/// The free-text answer carries a verdict, and both the page and the board
+/// refuse it when it does not.
+///
+/// A note with no verdict is the thing ADR-042 exists to remove: a lane
+/// reading `Comment: do it after the pin lands` afterwards has to guess
+/// whether that was a yes. So the submit is dead until an outcome is picked
+/// and something is written, and a hand-made POST that skips the picker is
+/// refused in the composer's own words.
+#[test]
+fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-custom");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDCUSTOM", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - pgadmin.geoy.ws answers HTTP 502 behind the SSO proxy since 2026-09-07 21:40 MYT.",
+        "codex@driver-2",
+        &["--kind", "risk", "--priority", "4"],
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let port = server.port;
+    let origin = server.origin();
+
+    // The page is not the only refusal: the same words come back from the
+    // composer for a POST that never rendered the picker.
+    let (status, refused) = http_post_with_headers(
+        port,
+        &format!("/attention/CARDCUSTOM/{id}/reply"),
+        &[
+            ("Origin", origin.trim_end_matches('/')),
+            ("X-Auth-Request-Email", "geoyws"),
+        ],
+        b"decision=custom&reply=Do+it+after+the+pin+lands",
+    );
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.contains(
+            "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note"
+        ),
+        "{refused}"
+    );
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--status", "open", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "a refused answer settled the item"
+    );
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDCUSTOM/{id}/reply\"]");
+    let record = format!("{form} button.record");
+    let disabled = |tab: &headless_chrome::Tab| {
+        js_value(tab, &format!("document.querySelector('{record}').disabled"))
+    };
+    let hint_shown = |tab: &headless_chrome::Tab| {
+        js_value(
+            tab,
+            &format!("!document.querySelector('{form} [data-hint]').hidden"),
+        )
+    };
+    // Nothing picked and nothing written: no answer.
+    assert_eq!(disabled(&tab), true);
+    assert_eq!(hint_shown(&tab), true);
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} [data-hint]').textContent")
+        ),
+        "Pick one of the four and write the answer."
+    );
+    // Words alone are not an answer either.
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer
+        .type_into("  Buy the seat on 2026-09-09 and log in from the laptop.  ")
+        .expect("type the answer");
+    assert_eq!(
+        disabled(&tab),
+        true,
+        "words with no verdict enabled the submit"
+    );
+    assert_eq!(hint_shown(&tab), true);
+    // The verdict completes it.
+    tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
+        .expect("the other outcome")
+        .click()
+        .expect("pick other");
+    assert_eq!(
+        disabled(&tab),
+        false,
+        "a verdict and words did not enable the submit"
+    );
+    assert_eq!(hint_shown(&tab), false);
+
+    tab.wait_for_element(&record)
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+
+    assert_receipt(&tab, id, "Custom answer, recorded as other");
+    // That was the last open item, so the live refresh brings back the empty
+    // state — and the receipt, with its undo, stays on the page through it.
+    assert_eq!(
+        tab.wait_for_element("p.empty")
+            .expect("the empty state")
+            .get_inner_text()
+            .expect("empty text")
+            .trim(),
+        "Nothing is waiting. An empty list here means every raised item has been settled."
+    );
+    assert_receipt(&tab, id, "Custom answer, recorded as other");
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "other", "{row}");
+    assert_eq!(row["decision"]["by"], "geoyws", "{row}");
+    assert_eq!(
+        row["decision"]["note"], "Buy the seat on 2026-09-09 and log in from the laptop.",
+        "{row}"
+    );
+    assert_eq!(
+        row["resolution"],
+        "Decision: Custom answer, recorded as other.\nNote: Buy the seat on 2026-09-09 and log in \
+         from the laptop.",
+        "{row}"
+    );
+}
+
+/// Three decisions on one page load, each through a different surface: an
+/// alternative with a note, the keyboard, and a deferral written by hand.
+///
+/// Retargeted from the case that pinned "Comment and Approve" / "Comment and
+/// Reject" / "Comment and Resolve": those buttons changed meaning when the
+/// textarea had text, and they are gone. What is worth keeping is the flow
+/// they exercised — three items settled in one sitting without a reload —
+/// plus the three things nothing else covers: a note attached to an authored
+/// choice, `2` picking the second listed choice, and `c` reaching the answer
+/// field while digits stay inert inside it.
+#[test]
+fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     browser_loopback_reservation_supported()
         .expect("reserve loopback port for browser-backed server tests");
     let fixture = Fixture::new("serve-browser");
@@ -24142,230 +24645,165 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
         &fixture.main,
         &["init", "--name", "SERVE-BROWSER", "--json"],
     );
-    fixture.ok_json(
-        &fixture.main,
-        &[
-            "task",
-            "add",
-            "Approve this release",
-            "--type",
-            "epic",
-            "--status",
-            "draft",
-            "--id",
-            "e-browser-approve",
-            "--json",
-        ],
+    let noted = raise_carded(
+        &fixture,
+        "The parked P0 body, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
     );
-    fixture.ok_json(
-        &fixture.main,
-        &[
-            "task",
-            "add",
-            "Reject this release",
-            "--type",
-            "epic",
-            "--status",
-            "draft",
-            "--id",
-            "e-browser-reject",
-            "--json",
-        ],
+    let keyed = raise_carded(
+        &fixture,
+        "Reject from the keyboard: the release needs a second reviewer.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "2"],
     );
-    fixture.ok_json(
-        &fixture.main,
-        &[
-            "task",
-            "add",
-            "Comment and resolve this",
-            "--type",
-            "epic",
-            "--status",
-            "draft",
-            "--id",
-            "e-browser-reply",
-            "--json",
-        ],
+    let deferred = raise_carded(
+        &fixture,
+        "Use the free-form answer: nothing on this card fits.",
+        "codex@driver",
+        &["--kind", "decision", "--priority", "4"],
     );
-    let approve = fixture.ok_json(
-        &fixture.main,
-        &[
-            "attention",
-            "raise",
-            "Approve from the browser",
-            "--as",
-            "codex@driver",
-            "--kind",
-            "decision",
-            "--task",
-            "e-browser-approve",
-            "--json",
-        ],
-    );
-    let reply = fixture.ok_json(
-        &fixture.main,
-        &[
-            "attention",
-            "raise",
-            "Use the free-form note",
-            "--as",
-            "codex@driver",
-            "--kind",
-            "decision",
-            "--task",
-            "e-browser-reply",
-            "--json",
-        ],
-    );
-    let reject = fixture.ok_json(
-        &fixture.main,
-        &[
-            "attention",
-            "raise",
-            "Reject from the browser",
-            "--as",
-            "codex@driver-2",
-            "--kind",
-            "review",
-            "--task",
-            "e-browser-reject",
-            "--json",
-        ],
-    );
-    let approve_id = approve["id"].as_str().unwrap();
-    let reply_id = reply["id"].as_str().unwrap();
-    let reject_id = reject["id"].as_str().unwrap();
-
-    let server = spawn_server(&fixture);
+    let noted_id = noted["id"].as_str().unwrap();
+    let keyed_id = keyed["id"].as_str().unwrap();
+    let deferred_id = deferred["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
     let origin = server.origin();
-
     let chrome = launch_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("initial tab");
-    tab.navigate_to(&origin).expect("load Needs you");
-    tab.wait_until_navigated().expect("initial navigation");
-
-    let approve_textarea = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{approve_id}/reply\"] textarea[name=reply]"
-        ))
-        .expect("approve textarea");
-    approve_textarea.click().expect("focus approve textarea");
-    approve_textarea
-        .type_into(" Approved. Proceed after the review. ")
-        .expect("type approve comment");
-    let approve_button = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{approve_id}/reply\"] button.quick.approve"
-        ))
-        .expect("approve button");
+    let tab = decision_tab(&chrome, &origin);
+    let card_form =
+        |id: &str| format!("form.decide[action=\"/attention/SERVE-BROWSER/{id}/reply\"]");
+    let answer_field = |id: &str| format!("{} textarea[name=reply]", card_form(id));
+    let field_value = |tab: &headless_chrome::Tab, id: &str| {
+        js_value(
+            tab,
+            &format!("document.querySelector('{}').value", answer_field(id)),
+        )
+    };
     assert_eq!(
-        approve_button.get_inner_text().expect("approve label"),
-        "Comment and Approve"
-    );
-    let reject_button = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{approve_id}/reply\"] button.quick.decline"
-        ))
-        .expect("reject button");
-    assert_eq!(
-        reject_button.get_inner_text().expect("reject label"),
-        "Comment and Reject"
-    );
-    approve_button.click().expect("submit approve");
-    assert_reply_recorded(&tab, &origin, approve_id, "approve");
-    let resolved = fixture.ok_json(
-        &fixture.main,
-        &["attention", "list", "--status", "resolved", "--json"],
-    );
-    assert_eq!(resolved.as_array().unwrap().len(), 1);
-    assert_eq!(resolved[0]["resolvedBy"], "geoyws");
-    assert_eq!(
-        resolved[0]["resolution"],
-        format!("{APPROVE}\nNote: Approved. Proceed after the review.")
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "3"
     );
 
-    tab.navigate_to(&origin).expect("reload Needs you");
-    tab.wait_until_navigated().expect("reload navigation");
-    let reject_textarea = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{reject_id}/reply\"] textarea[name=reply]"
-        ))
-        .expect("reject textarea");
-    reject_textarea.click().expect("focus reject textarea");
-    reject_textarea
-        .type_into(" Needs a second reviewer ")
-        .expect("type reject comment");
-    let reject_approve = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{reject_id}/reply\"] button.quick.approve"
-        ))
-        .expect("reject approve button");
+    // A draft answer holds the live projection where it is, so that a
+    // decision landing on another card cannot throw away what is being
+    // typed here. Every decision below therefore runs against one stable
+    // page, which is also what makes the element handles safe to hold.
+    let draft = "Ask again when the migration lands on 2026-09-15.";
+    let deferred_answer = tab
+        .wait_for_element(&answer_field(deferred_id))
+        .expect("the answer field");
+    deferred_answer.click().expect("focus the answer field");
+    deferred_answer.type_into(draft).expect("type the draft");
+
+    // A note plus an authored choice: the trail carries the label, then the
+    // consequence, then the note.
+    let note_field = tab
+        .wait_for_element(&answer_field(noted_id))
+        .expect("the answer field");
+    note_field.click().expect("focus");
+    note_field
+        .type_into(" Parked again; a seat frees up on 2026-10-01. ")
+        .expect("type the note");
+    tab.wait_for_element(&format!(
+        "{} .alternative button.choice[value=keep-parked]",
+        card_form(noted_id)
+    ))
+    .expect("the deferral alternative")
+    .click()
+    .expect("pick the alternative");
+    assert_receipt(&tab, noted_id, "Keep it parked until a seat frees up");
+    let row = settled_row(&fixture, noted_id);
+    assert_eq!(row["decision"]["choice"], "keep-parked", "{row}");
+    assert_eq!(row["decision"]["outcome"], "defer", "{row}");
     assert_eq!(
-        reject_approve
-            .get_inner_text()
-            .expect("reject approve label"),
-        "Comment and Approve"
+        row["resolution"],
+        format!("{KEEP_PARKED}\nNote: Parked again; a seat frees up on 2026-10-01."),
+        "{row}"
     );
-    let reject_quick = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{reject_id}/reply\"] button.quick.decline"
-        ))
-        .expect("reject quick button");
+    // The live socket saw that write and the page said so rather than
+    // re-rendering over the draft.
+    wait_for_live(&tab, "update waiting");
+    assert_eq!(field_value(&tab, deferred_id), draft);
+
+    // `2` picks the second choice of the card that has focus. This row
+    // authored none, so its second choice is the default pair's rejection.
+    tab.wait_for_element(&format!("article.item[data-item=\"{keyed_id}\"]"))
+        .expect("the card")
+        .focus()
+        .expect("focus the card");
+    tab.press_key("2").expect("press 2");
+    assert_receipt(&tab, keyed_id, "Reject - do not proceed");
+    let row = settled_row(&fixture, keyed_id);
+    assert_eq!(row["decision"]["choice"], "reject", "{row}");
+    assert_eq!(row["decision"]["outcome"], "reject", "{row}");
+    assert_eq!(row["resolution"], REJECT, "{row}");
+
+    // `c` reaches the answer field, and a digit typed there is a digit
+    // rather than a decision.
+    tab.wait_for_element(&format!("article.item[data-item=\"{deferred_id}\"]"))
+        .expect("the card")
+        .focus()
+        .expect("focus the card");
+    tab.press_key("c").expect("press c");
     assert_eq!(
-        reject_quick.get_inner_text().expect("reject quick label"),
-        "Comment and Reject"
+        js_value(&tab, "document.activeElement.name"),
+        "reply",
+        "c did not reach the answer field"
     );
-    reject_quick.click().expect("submit reject");
-    assert_reply_recorded(&tab, &origin, reject_id, "reject");
-    let resolved = fixture.ok_json(
-        &fixture.main,
-        &["attention", "list", "--status", "resolved", "--json"],
-    );
-    assert_eq!(resolved.as_array().unwrap().len(), 2);
+    tab.press_key("2").expect("press 2 while typing");
     assert_eq!(
-        resolved[1]["resolution"],
-        format!("{REJECT}\nNote: Needs a second reviewer")
+        field_value(&tab, deferred_id),
+        format!("{draft}2"),
+        "a digit typed into the answer field was taken as a decision"
+    );
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--status", "open", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "a keystroke inside the answer field settled an item"
+    );
+    tab.press_key("Backspace").expect("delete the digit");
+    assert_eq!(field_value(&tab, deferred_id), draft);
+    tab.wait_for_element(&format!(
+        "{} input[name=outcome][value=defer]",
+        card_form(deferred_id)
+    ))
+    .expect("the defer outcome")
+    .click()
+    .expect("pick defer");
+    hold_projection(&tab);
+    tab.wait_for_element(&format!("{} button.record", card_form(deferred_id)))
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+    assert_receipt(&tab, deferred_id, "Custom answer, recorded as defer");
+    let row = settled_row(&fixture, deferred_id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "defer", "{row}");
+    assert_eq!(row["decision"]["note"], draft, "{row}");
+    assert_eq!(
+        row["resolution"],
+        format!("Decision: Custom answer, recorded as defer.\nNote: {draft}"),
+        "{row}"
     );
 
-    tab.navigate_to(&origin)
-        .expect("reload Needs you for reply");
-    tab.wait_until_navigated().expect("reply reload navigation");
-    let reply_textarea = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{reply_id}/reply\"] textarea[name=reply]"
-        ))
-        .expect("reply textarea");
-    reply_textarea.click().expect("focus reply textarea");
-    reply_textarea
-        .type_into("  This is the durable note  ")
-        .expect("type reply comment");
-    let reply_button = tab
-        .wait_for_element(&format!(
-            "form.reply[action=\"/attention/SERVE-BROWSER/{reply_id}/reply\"] button.send"
-        ))
-        .expect("reply button");
+    // Three decisions, three receipts, no navigation. With the draft gone the
+    // projection refreshes again, and the receipts outlive it.
+    wait_for_projection_swap(&tab);
     assert_eq!(
-        reply_button.get_inner_text().expect("reply label"),
-        "Comment and Resolve"
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        3
     );
-    reply_button.click().expect("submit reply");
-    assert_reply_recorded(&tab, &origin, reply_id, "reply");
-    let resolved = fixture.ok_json(
-        &fixture.main,
-        &["attention", "list", "--status", "resolved", "--json"],
-    );
-    let reply_resolved = resolved
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["id"] == reply_id)
-        .expect("reply resolution")
-        .clone();
-    assert_eq!(resolved.as_array().unwrap().len(), 3);
-    assert_eq!(
-        reply_resolved["resolution"],
-        "Decision: Custom answer, recorded as other.\nNote: This is the durable note"
-    );
+    assert_eq!(tab.get_url(), origin);
 }
 
 /// Dead-letter one delivery of `event_seq` with `code`, by walking the
