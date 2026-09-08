@@ -23958,8 +23958,12 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "<span class=key>2</span>",
             "value=\"drop-receipt\"",
             "<span class=key>3</span>",
+            "<div class=reply><label for=\"answer-",
+            ">Your reply</label>",
+            "<textarea id=\"answer-",
+            "Sent with whichever choice you click; required for your own answer.",
             "<div class=custom>",
-            "<legend>Answer in your own words, recorded as</legend>",
+            "<legend>Or answer in your own words, recorded as</legend>",
             "<input type=radio name=outcome value=approve>",
             "<input type=radio name=outcome value=other>",
             "name=decision value=custom disabled",
@@ -23980,6 +23984,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "value=\"approve\" data-label=\"Approve - proceed\"",
             "<p class=consequence>The work the body describes goes ahead as written.</p>",
             "value=\"reject\" data-label=\"Reject - do not proceed\"",
+            "<div class=reply>",
             "<div class=custom>",
         ],
     );
@@ -24256,15 +24261,31 @@ fn decision_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
     tab
 }
 
-/// What the card became after a decision: one line naming the choice in the
-/// same words the ledger uses, and the command that undoes it.
+/// What the card became after a decision that carried no words: one line
+/// naming the choice in the same words the ledger uses, and the command that
+/// undoes it.
 fn assert_receipt(tab: &headless_chrome::Tab, id: &str, label: &str) {
+    assert_receipt_reads(tab, id, &format!("Decided: {label}."));
+}
+
+/// The same receipt for a decision that carried a reply: the operator typed
+/// words and clicked a choice, so the receipt has to say the words landed —
+/// otherwise the only way to know is to go and read the row.
+fn assert_noted_receipt(tab: &headless_chrome::Tab, id: &str, label: &str) {
+    assert_receipt_reads(
+        tab,
+        id,
+        &format!("Decided: {label}. Your reply is recorded."),
+    );
+}
+
+fn assert_receipt_reads(tab: &headless_chrome::Tab, id: &str, decided: &str) {
     let receipt = tab
         .wait_for_element(&format!("p.receipt[data-receipt=\"{id}\"]"))
         .unwrap_or_else(|error| panic!("receipt for {id}: {error}"));
     assert_eq!(
         receipt.get_inner_text().expect("receipt text").trim(),
-        format!("Decided: {label}. Reopen it with kanban attention reopen {id}")
+        format!("{decided} Reopen it with kanban attention reopen {id}")
     );
 }
 
@@ -24488,6 +24509,92 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
     );
 }
 
+/// Words typed into the card's one reply field ride with whichever choice is
+/// clicked, and the receipt says they landed.
+///
+/// The data path already carried this — the route forwards `reply` as the
+/// note for an authored key — but nothing on the page offered it and nothing
+/// afterwards confirmed it, so a reply was only ever discoverable by reading
+/// the row back. This is that round trip: one field, one click, the note on
+/// the row and in the composed trail, and a receipt that names it.
+#[test]
+fn a_choice_clicked_with_a_reply_records_the_note_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-reply");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDREPLY", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    // A second row, so the list outlives the decision: settling the last open
+    // item swaps in the empty state, which is a different assertion.
+    raise_carded(
+        &fixture,
+        "Waiting behind the P0: nothing to decide here yet.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "6"],
+    );
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDREPLY/{id}/reply\"]");
+    let choice = card_choices()[0].clone();
+    let label = choice["label"].as_str().unwrap();
+
+    let reply = tab
+        .wait_for_element(&format!("{form} .reply textarea[name=reply]"))
+        .expect("the reply field");
+    reply.click().expect("focus the reply field");
+    let typed = "Seat is on the 2026-09-09 invoice; I log in the same evening.";
+    reply.type_into(typed).expect("type the reply");
+    // No verdict is picked and none is needed: this is a click on an authored
+    // choice that happens to carry words, and the choice brings its own.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} button.record').disabled")
+        ),
+        true,
+        "typing a reply armed the free-text answer, which has no verdict"
+    );
+
+    hold_projection(&tab);
+    tab.wait_for_element(&format!("{form} fieldset.recommended button.choice"))
+        .expect("the recommended button")
+        .click()
+        .expect("one click on the recommendation");
+
+    assert_noted_receipt(&tab, id, label);
+    // The live socket then re-renders the projection, and the receipt — the
+    // only place the reply is confirmed — has to survive it.
+    wait_for_projection_swap(&tab);
+    assert_noted_receipt(&tab, id, label);
+    assert_eq!(
+        tab.get_url(),
+        origin,
+        "a decision navigated instead of replacing the card in place"
+    );
+
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "assign-and-login", "{row}");
+    assert_eq!(row["decision"]["outcome"], "approve", "{row}");
+    assert_eq!(row["decision"]["by"], "geoyws", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+    assert_eq!(
+        row["resolution"],
+        format!(
+            "Decision: {label}. {}\nNote: {typed}",
+            choice["consequence"].as_str().unwrap()
+        ),
+        "{row}"
+    );
+}
+
 /// The free-text answer carries a verdict, and both the page and the board
 /// refuse it when it does not.
 ///
@@ -24565,7 +24672,7 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
             &tab,
             &format!("document.querySelector('{form} [data-hint]').textContent")
         ),
-        "Pick one of the four and write the answer."
+        "Pick a verdict and write your reply above."
     );
     // Words alone are not an answer either.
     let answer = tab
@@ -24714,7 +24821,7 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     .expect("the deferral alternative")
     .click()
     .expect("pick the alternative");
-    assert_receipt(&tab, noted_id, "Keep it parked until a seat frees up");
+    assert_noted_receipt(&tab, noted_id, "Keep it parked until a seat frees up");
     let row = settled_row(&fixture, noted_id);
     assert_eq!(row["decision"]["choice"], "keep-parked", "{row}");
     assert_eq!(row["decision"]["outcome"], "defer", "{row}");

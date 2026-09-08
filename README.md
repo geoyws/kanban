@@ -760,20 +760,26 @@ A card reads top to bottom in the order it is decided in
 ([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)
 §5): the question as the heading, the context, then the recommended choice
 first — marked `recommended` and the first interactive element in the card —
-with each choice's consequence beneath its button, then the free-text answer
-with its four-value outcome picker, then the body folded under `show the full
-item`, then the meta line. `1`–`4` answer the card that has focus in the order
-it lists them, so `1` is always the recommendation, and `c` reaches the answer
-field; both are inert while an answer is being typed. A row whose raiser
-authored no card is the same card with the `approve`/`reject` default pair, its
-first body line as the question and nothing marked recommended.
+with each choice's consequence beneath its button, then the card's one reply
+field, then the free-text answer with its four-value outcome picker, then the
+body folded under `show the full item`, then the meta line. The reply field
+sits with the choices, above the rule that starts the free-text answer,
+because it serves both: whatever is written in it rides with whichever choice
+is clicked, and the free-text answer is that same field plus a verdict.
+`1`–`4` answer the card that has focus in the order it lists them, so `1` is
+always the recommendation, and `c` reaches the reply field; both are inert
+while a reply is being typed. A row whose raiser authored no card is the same
+card with the `approve`/`reject` default pair, its first body line as the
+question and nothing marked recommended.
 
-One click posts `decision=<key>`, the free-text answer posts
-`decision=custom&outcome=<verdict>&reply=<text>`, and the answer is refused
-without both by the page and by the composer that writes the trail. Nothing
-navigates: the card is replaced in place by a one-line receipt naming the
-choice and the `kanban attention reopen <id>` that undoes it, the open count
-drops, and the receipt survives the live refresh — a reload on a 133-item list
+One click posts `decision=<key>`, carrying `reply=<text>` as that decision's
+note when the field has words in it; the free-text answer posts
+`decision=custom&outcome=<verdict>&reply=<text>` and is refused without both
+by the page and by the composer that writes the trail. Nothing navigates: the
+card is replaced in place by a one-line receipt naming the choice — and saying
+the reply is recorded when one rode with it — plus the
+`kanban attention reopen <id>` that undoes it, the open count drops, and the
+receipt survives the live refresh — a reload on a 133-item list
 would throw the reader back to the top of it. A key the row no longer carries
 is refused by name rather than mapped onto whatever now sits in that position,
 so a card left open in a tab is safe to click. Every other route remains

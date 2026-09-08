@@ -1451,7 +1451,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     }
     html.push_str(
         "<p class=keys>Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on, \
-         or <kbd>c</kbd> to write your own answer.</p>",
+         or <kbd>c</kbd> to write a reply.</p>",
     );
     Ok(page("Needs you", &html))
 }
@@ -1465,6 +1465,11 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
 /// that used to lead now trails, because a priority pill is not a decision.
 /// A row that authored no card is this same card with the default pair and
 /// its first body line as the question, not a second template.
+///
+/// One reply field serves the whole card, and it sits with the choices rather
+/// than inside the free-text answer: whatever is written in it rides with
+/// whichever choice is clicked, and the free-text answer is that same field
+/// plus a verdict. Two fields would be two drafts to lose.
 fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     let id = escape(&item.id);
     let id_url = escape(&url_encode(&item.id));
@@ -1506,14 +1511,17 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         html.push_str(&format!("<div class=alternatives>{alternatives}</div>"));
     }
     html.push_str(&format!(
-        "<div class=custom><fieldset class=outcomes>\
-         <legend>Answer in your own words, recorded as</legend><div class=picks>{picks}</div>\
+        "<div class=reply><label for=\"answer-{id_url}\">Your reply</label>\
+         <textarea id=\"answer-{id_url}\" name=reply maxlength={max} \
+         aria-describedby=\"reply-hint-{id_url}\"></textarea>\
+         <p class=hint id=\"reply-hint-{id_url}\">Sent with whichever choice you click; \
+         required for your own answer.</p></div>\
+         <div class=custom><fieldset class=outcomes>\
+         <legend>Or answer in your own words, recorded as</legend><div class=picks>{picks}</div>\
          </fieldset>\
-         <textarea id=\"answer-{id_url}\" name=reply maxlength={max} aria-label=\"Your answer\" \
-         placeholder=\"What should happen instead?\"></textarea>\
          <div class=actions>\
          <button type=submit class=record name=decision value=custom disabled>Record this answer</button>\
-         <p class=hint data-hint>Pick one of the four and write the answer.</p>\
+         <p class=hint data-hint>Pick a verdict and write your reply above.</p>\
          </div></div></form>",
         picks = ATTENTION_OUTCOMES
             .iter()
@@ -2915,14 +2923,20 @@ function decidedLabel(form, submitter) {
   const outcome = form.querySelector('input[name=outcome]:checked');
   return outcome ? `Custom answer, recorded as ${outcome.value}` : 'Custom answer';
 }
-function showReceipt(card, label) {
+// Whether the body about to be posted carries words as well as a choice. The
+// custom answer IS those words and its label already says so, so only an
+// authored key earns the extra sentence.
+function replySent(body) {
+  return body.get('decision') !== 'custom' && (body.get('reply') || '').trim().length > 0;
+}
+function showReceipt(card, label, noted) {
   const receipt = document.createElement('p');
   receipt.className = 'receipt';
   receipt.dataset.receipt = card.dataset.item;
   receipt.setAttribute('role', 'status');
   const decided = document.createElement('span');
   decided.className = 'decided';
-  decided.textContent = `Decided: ${label}.`;
+  decided.textContent = noted ? `Decided: ${label}. Your reply is recorded.` : `Decided: ${label}.`;
   const command = document.createElement('code');
   command.textContent = `kanban attention reopen ${card.dataset.item}`;
   receipt.append(decided, document.createTextNode(' Reopen it with '), command);
@@ -2949,11 +2963,13 @@ async function decide(form, submitter) {
   const card = cardOf(form);
   if (!card || form.dataset.deciding) return;
   form.dataset.deciding = '1';
+  const body = decisionBody(form, submitter);
   const label = decidedLabel(form, submitter);
+  const noted = replySent(body);
   try {
     const response = await fetch(form.action, {
       method: 'POST',
-      body: decisionBody(form, submitter),
+      body,
       credentials: 'same-origin',
       redirect: 'manual',
     });
@@ -2962,7 +2978,7 @@ async function decide(form, submitter) {
     // is shown in the card's own words -- a card left open while the item
     // was rewritten names a choice the row no longer carries, and that is
     // refused by name rather than mapped onto whatever now sits there.
-    if (response.type === 'opaqueredirect' || response.ok) { showReceipt(card, label); return; }
+    if (response.type === 'opaqueredirect' || response.ok) { showReceipt(card, label, noted); return; }
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const refused = page.querySelector('.error');
     showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`);
@@ -3065,8 +3081,8 @@ document.addEventListener('click', event => {
 });
 // 1-4 answer the card that has focus, in the order it lists them, so 1 is
 // always the recommendation -- the muscle memory that makes a long list
-// tractable. `c` writes an answer instead. Both are inert while an answer is
-// being typed, and while no card has focus.
+// tractable. `c` reaches that card's reply field instead. Both are inert
+// while a reply is being typed, and while no card has focus.
 document.addEventListener('keydown', event => {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const target = event.target;
@@ -3187,7 +3203,10 @@ border:1px solid currentColor;border-radius:2px;font-size:.75rem;text-align:cent
 .recommended .consequence{color:var(--phosphor)}\
 .alternatives{display:grid;gap:1.15rem;margin:1.15rem 0 0}\
 .alternative .consequence{margin-top:.4rem}\
-.custom{margin-top:1.3rem;padding-top:1.1rem;border-top:1px solid var(--dim)}\
+.reply{margin-top:1.15rem}\
+.reply>label{display:block;margin:0 0 .35rem;color:var(--phosphor);font-size:.8rem}\
+.reply .hint{margin-top:.4rem}\
+.custom{margin-top:1.7rem;padding-top:1rem;border-top:1px solid var(--dim)}\
 .picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
 .picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.5rem;\
 padding:.25rem .6rem;color:var(--dim);border:1px solid var(--dim);border-radius:4px;cursor:pointer}\
@@ -3583,7 +3602,12 @@ mod tests {
         );
         assert_html_contains(
             &home,
-            "<legend>Answer in your own words, recorded as</legend>",
+            "<legend>Or answer in your own words, recorded as</legend>",
+        );
+        assert_html_contains(&home, "<div class=reply><label for=\"answer-");
+        assert_html_contains(
+            &home,
+            "Sent with whichever choice you click; required for your own answer.",
         );
         assert_html_contains(&home, "value=\"approve\" data-label=\"Approve - proceed\"");
         assert_html_contains(&home, "name=decision value=custom disabled");
