@@ -600,44 +600,58 @@ serve_restart_and_prove() {
   if [[ "$exec_start" =~ --port[[:space:]=]+([0-9]+) ]]; then
     port="${BASH_REMATCH[1]}"
   fi
+  # One deadline for both proofs, overridable so a test that measures the
+  # timeout itself does not have to wait out the real one.
+  local wait_seconds="${HIG_RELEASE_SERVE_DEADLINE_SECONDS:-15}"
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=15
   systemctl restart "$unit" || {
     printf 'hig-release: serve restart failed: systemctl restart %s exited non-zero\n' "$unit" >&2
     return 1
   }
-  local deadline=$(( SECONDS + 15 )) state="" main_pid=0
+  # Readiness and the exe are ONE poll, because a unit that reports active
+  # with a MainPID is not yet running its own ExecStart: in that window
+  # /proc/<MainPID>/exe resolves to systemd's pre-exec helper,
+  # /usr/lib/systemd/systemd-executor. Reading the exe once, straight after
+  # an active-poll, refused a correct install of 8332e03 on hax at 03:10 MYT
+  # on 2026-09-09 and rolled it back. So an exe that is empty, unreadable or
+  # outside the release is `not yet`, never a verdict - the loop sleeps and
+  # looks again, and only the deadline is fatal, naming the last state, pid
+  # and exe it saw. /proc/<pid>/exe is the only witness that survives a
+  # symlink swap, and it exists on the hosts this installs to but not on every
+  # host that runs the tests, so the probe is overridable and the default is
+  # the real one.
+  local release_physical=""
+  release_physical="$(physical_dir "$release_path" || true)"
+  local deadline=$(( SECONDS + wait_seconds ))
+  local state="" main_pid=0 exe="" exe_dir="" exe_physical=""
   while :; do
     state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
     main_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
     [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || main_pid=0
-    [[ "$state" != active || "$main_pid" == 0 ]] || break
+    exe=""
+    exe_dir=""
+    exe_physical=""
+    if [[ "$state" == active && "$main_pid" != 0 ]]; then
+      if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+        exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
+      else
+        exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
+      fi
+      if [[ -n "$exe" ]]; then
+        exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
+      fi
+      if [[ -n "$exe_dir" ]]; then
+        exe_physical="$exe_dir/${exe##*/}"
+      fi
+      [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]] || break
+    fi
     if (( SECONDS >= deadline )); then
-      printf 'hig-release: serve restart did not come back within 15s: %s ActiveState=%s MainPID=%s\n' "$unit" "${state:-unknown}" "$main_pid" >&2
+      printf 'hig-release: serve is not running the release just installed within %ss: %s ActiveState=%s MainPID=%s exe=%s resolved=%s release=%s\n' "$wait_seconds" "$unit" "${state:-unknown}" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
       return 1
     fi
     sleep 0.5
   done
-  # /proc/<pid>/exe is the only witness that survives a symlink swap, and it
-  # exists on the hosts this installs to but not on every host that runs the
-  # tests, so the probe is overridable and the default is the real one.
-  local exe=""
-  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
-    exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
-  else
-    exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
-  fi
-  local exe_dir="" exe_physical="" release_physical=""
-  release_physical="$(physical_dir "$release_path" || true)"
-  if [[ -n "$exe" ]]; then
-    exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
-  fi
-  if [[ -n "$exe_dir" ]]; then
-    exe_physical="$exe_dir/${exe##*/}"
-  fi
-  if [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]]; then
-    printf 'hig-release: serve is not running the release just installed: %s MainPID=%s exe=%s resolved=%s release=%s\n' "$unit" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
-    return 1
-  fi
-  local http="" http_deadline=$(( SECONDS + 15 ))
+  local http="" http_deadline=$(( SECONDS + wait_seconds ))
   while :; do
     http="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
     [[ "$http" != 200 ]] || break
@@ -1359,44 +1373,58 @@ serve_restart_and_prove() {
   if [[ "$exec_start" =~ --port[[:space:]=]+([0-9]+) ]]; then
     port="${BASH_REMATCH[1]}"
   fi
+  # One deadline for both proofs, overridable so a test that measures the
+  # timeout itself does not have to wait out the real one.
+  local wait_seconds="${HIG_RELEASE_SERVE_DEADLINE_SECONDS:-15}"
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=15
   systemctl restart "$unit" || {
     printf 'hig-release: serve restart failed: systemctl restart %s exited non-zero\n' "$unit" >&2
     return 1
   }
-  local deadline=$(( SECONDS + 15 )) state="" main_pid=0
+  # Readiness and the exe are ONE poll, because a unit that reports active
+  # with a MainPID is not yet running its own ExecStart: in that window
+  # /proc/<MainPID>/exe resolves to systemd's pre-exec helper,
+  # /usr/lib/systemd/systemd-executor. Reading the exe once, straight after
+  # an active-poll, refused a correct install of 8332e03 on hax at 03:10 MYT
+  # on 2026-09-09 and rolled it back. So an exe that is empty, unreadable or
+  # outside the release is `not yet`, never a verdict - the loop sleeps and
+  # looks again, and only the deadline is fatal, naming the last state, pid
+  # and exe it saw. /proc/<pid>/exe is the only witness that survives a
+  # symlink swap, and it exists on the hosts this installs to but not on every
+  # host that runs the tests, so the probe is overridable and the default is
+  # the real one.
+  local release_physical=""
+  release_physical="$(physical_dir "$release_path" || true)"
+  local deadline=$(( SECONDS + wait_seconds ))
+  local state="" main_pid=0 exe="" exe_dir="" exe_physical=""
   while :; do
     state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
     main_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
     [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || main_pid=0
-    [[ "$state" != active || "$main_pid" == 0 ]] || break
+    exe=""
+    exe_dir=""
+    exe_physical=""
+    if [[ "$state" == active && "$main_pid" != 0 ]]; then
+      if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+        exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
+      else
+        exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
+      fi
+      if [[ -n "$exe" ]]; then
+        exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
+      fi
+      if [[ -n "$exe_dir" ]]; then
+        exe_physical="$exe_dir/${exe##*/}"
+      fi
+      [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]] || break
+    fi
     if (( SECONDS >= deadline )); then
-      printf 'hig-release: serve restart did not come back within 15s: %s ActiveState=%s MainPID=%s\n' "$unit" "${state:-unknown}" "$main_pid" >&2
+      printf 'hig-release: serve is not running the release just installed within %ss: %s ActiveState=%s MainPID=%s exe=%s resolved=%s release=%s\n' "$wait_seconds" "$unit" "${state:-unknown}" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
       return 1
     fi
     sleep 0.5
   done
-  # /proc/<pid>/exe is the only witness that survives a symlink swap, and it
-  # exists on the hosts this installs to but not on every host that runs the
-  # tests, so the probe is overridable and the default is the real one.
-  local exe=""
-  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
-    exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
-  else
-    exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
-  fi
-  local exe_dir="" exe_physical="" release_physical=""
-  release_physical="$(physical_dir "$release_path" || true)"
-  if [[ -n "$exe" ]]; then
-    exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
-  fi
-  if [[ -n "$exe_dir" ]]; then
-    exe_physical="$exe_dir/${exe##*/}"
-  fi
-  if [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]]; then
-    printf 'hig-release: serve is not running the release just installed: %s MainPID=%s exe=%s resolved=%s release=%s\n' "$unit" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
-    return 1
-  fi
-  local http="" http_deadline=$(( SECONDS + 15 ))
+  local http="" http_deadline=$(( SECONDS + wait_seconds ))
   while :; do
     http="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
     [[ "$http" != 200 ]] || break

@@ -74,15 +74,26 @@ migrated the first board the old server was asked for, it could not open it,
 and every route answered 500 for about two minutes until
 `systemctl restart kanban-serve` was run by hand. `hig` carried the same stale
 exe. Both install paths therefore restart `kanban-serve` after `current` and
-the public links are in place and then PROVE the result: the unit reaches
-`ActiveState=active` with a `MainPID` within 15 s, that pid's executable
-resolves (realpath) inside the `releases/<id>` this run activated, and
-`http://127.0.0.1:<port>/` answers 200, where `<port>` is read from the unit's
-own `ExecStart --port` and defaults to 14200. A failed measurement is not a
-warning: it names what was measured — pid, exe, resolved path, release, status
-code — and falls into the previous-view rollback an activation failure already
-performs, so the operator keeps the release that is actually serving. A host
-without the unit is not a failure and is not silent either: it prints
+the public links are in place and then PROVE the result in ONE poll: until a
+deadline of 15 s — overridable through `HIG_RELEASE_SERVE_DEADLINE_SECONDS`,
+which only the tests set — each tick reads `ActiveState` and `MainPID`, and
+when the unit is active with a pid it resolves that pid's executable and
+checks it sits (realpath) inside the `releases/<id>` this run activated. Once
+that holds, `http://127.0.0.1:<port>/` must answer 200 within the same
+deadline, where `<port>` is read from the unit's own `ExecStart --port` and
+defaults to 14200. Readiness and the exe are one poll rather than two steps
+because they are one window: a unit reports `active` with a `MainPID` before
+the service binary has exec'd, and in that window `/proc/<MainPID>/exe` is
+systemd's pre-exec helper, `/usr/lib/systemd/systemd-executor`. The first cut
+read the exe once, straight after the active-poll, and at 03:10 MYT on
+2026-09-09 it refused a CORRECT install of 8332e03 on hax on
+`MainPID=3963673 exe=/usr/lib/systemd/systemd-executor` and rolled it back. So
+an exe that is empty, unreadable or outside the release is `not yet`: the loop
+sleeps 0.5 s and looks again. Only the deadline is fatal, and it is not a
+warning: it names what was last measured — state, pid, exe, resolved path,
+release — and falls into the previous-view rollback an activation failure
+already performs, so the operator keeps the release that is actually serving.
+A host without the unit is not a failure and is not silent either: it prints
 `serve restart skipped: <reason>` once and the install receipt says
 `serve: {skipped: <reason>}`, so a release report can never read as proof of a
 restart that did not happen. The probe that reads a pid's executable is
@@ -92,9 +103,10 @@ host that runs the tests; the default is the real `readlink /proc/<pid>/exe`.
 pinned by `hig_release_script_local_and_remote_install_guards_are_identical`
 alongside the other guards, and
 `hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe`,
+`hig_release_script_install_waits_out_systemd_executor_before_judging_the_served_exe`,
 `hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_release`
 and `hig_release_script_install_skips_the_restart_when_the_unit_is_absent`
-drive the three outcomes through both install legs.
+drive the four outcomes through both install legs.
 
 ## References
 

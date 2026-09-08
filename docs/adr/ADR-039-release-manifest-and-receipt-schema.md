@@ -486,11 +486,12 @@ is why this ADR does not pre-allocate one.
 Addendum 2026-09-09: §5's publication sequence gains one step and the freeze
 is untouched. After the public links and the `current` flip, both install
 paths call `serve_restart_and_prove`, which restarts `kanban-serve` and then
-measures the process that came back — `ActiveState=active` with a `MainPID`
-within 15 s, that pid's executable resolving inside the `releases/<id>` this
-run activated, and a 200 from the port the unit's own `ExecStart` names. It
-runs before the activation receipt locally and after it remotely, which is the
-same asymmetry §5 already froze, and a failed measurement takes the `ERR` trap
+measures the process that came back in one poll — `ActiveState=active` with a
+`MainPID` whose executable resolves inside the `releases/<id>` this run
+activated, within a 15 s deadline — and then requires a 200 from the port the
+unit's own `ExecStart` names. It runs before the activation receipt locally
+and after it remotely, which is the same asymmetry §5 already froze, and a
+failed measurement takes the `ERR` trap
 into `rollback_activation_view` exactly like any other post-`current` failure.
 No stored artifact changes: `manifest.json` and both receipts carry the same
 fields with the same invariants, so no `releaseId` moves. The measurement is

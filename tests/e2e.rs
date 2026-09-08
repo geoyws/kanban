@@ -13694,13 +13694,27 @@ printf '%s' "${FAKE_SERVE_HTTP:-200}"
         &stubs.join("serve-exe-of-pid"),
         // Stands in for `readlink /proc/<pid>/exe`, which does not exist on
         // macOS. It refuses any pid but the one the unit reported: an exe
-        // proof taken against some other process proves nothing.
+        // proof taken against some other process proves nothing. Every call
+        // is appended to FAKE_SERVE_EXE_CALL_LOG when a test sets one, and
+        // the first FAKE_SERVE_EXE_EARLY_CALLS of them answer
+        // FAKE_SERVE_EXE_EARLY instead, which is how a test reproduces the
+        // window where the unit is already active with a MainPID whose exe is
+        // still systemd's pre-exec helper rather than the service binary.
         r#"#!/bin/sh
 set -eu
 [ "${1:-}" = "${FAKE_SERVE_MAIN_PID:?}" ] || {
   printf 'exe probe asked about pid %s, not the unit MainPID %s\n' "${1:-}" "$FAKE_SERVE_MAIN_PID" >&2
   exit 1
 }
+calls=1
+if [ -n "${FAKE_SERVE_EXE_CALL_LOG:-}" ]; then
+  printf '%s\n' "$1" >> "$FAKE_SERVE_EXE_CALL_LOG"
+  calls=$(( $(wc -l < "$FAKE_SERVE_EXE_CALL_LOG") ))
+fi
+if [ "$calls" -le "${FAKE_SERVE_EXE_EARLY_CALLS:-0}" ]; then
+  printf '%s\n' "${FAKE_SERVE_EXE_EARLY:?}"
+  exit 0
+fi
 printf '%s\n' "${FAKE_SERVE_EXE:?}"
 "#,
     );
@@ -30633,9 +30647,10 @@ fn hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe() 
     }
 }
 
-/// The exact shape of the 2026-09-09 incident: the unit comes back running
-/// the PREVIOUS release's binary. A restart that lands on the old exe is not
-/// a green install, so the activation is refused and the previous view is
+/// The exact shape of the 2026-09-09 01:55 MYT incident: the unit comes back
+/// running the PREVIOUS release's binary. A restart that lands on the old exe
+/// is not a green install, so when the exe proof's deadline passes with the
+/// old exe still serving the activation is refused and the previous view is
 /// restored - the operator keeps the release that is actually serving instead
 /// of a `current` link that lies about it. The refusal names what it
 /// measured, because "install failed" without the pid and the exe is not a
@@ -30693,6 +30708,11 @@ fn hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_r
             .env("FAKE_SERVE_EXE", &stale_exe)
             .env("FAKE_SERVE_RESTART_LOG", &restart_log)
             .env("FAKE_SERVE_CURL_LOG", &curl_log)
+            // The exe proof is a poll, so a stale exe is only fatal once the
+            // deadline passes. Two seconds instead of the operator's fifteen
+            // measures the same refusal without spending half a minute of
+            // suite time waiting for a verdict that cannot change.
+            .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
             .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
             .output()
             .unwrap();
@@ -30742,6 +30762,79 @@ fn hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_r
                 .join(format!("{release_id_b}.receipt.json"))
                 .exists(),
             "{target}: the refused activation left an activation receipt behind"
+        );
+    }
+}
+
+/// systemd reports a unit `active` with a `MainPID` before the service binary
+/// has exec'd, and in that window `/proc/<MainPID>/exe` resolves to systemd's
+/// own pre-exec helper, `/usr/lib/systemd/systemd-executor`. Reading the exe
+/// once, straight after an active-poll, refused a CORRECT install of 8332e03
+/// on hax at 03:10 MYT on 2026-09-09 - it measured `MainPID=3963673
+/// exe=/usr/lib/systemd/systemd-executor` and rolled the release back. So
+/// readiness and the exe are ONE poll: an exe outside the release is `not
+/// yet`, the loop looks again, and the release binary that follows the helper
+/// is what the install proves and records.
+#[test]
+fn hig_release_script_install_waits_out_systemd_executor_before_judging_the_served_exe() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-executor-window");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("executor-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("executor-bin-{target}"));
+        let served_exe = install_root
+            .join("releases")
+            .join(&release_id)
+            .join("kanban");
+        let exe_calls = harness
+            .fixture
+            .root
+            .join(format!("executor-exe-calls-{target}.log"));
+        let installed = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "3963673")
+            .env("FAKE_SERVE_EXE", &served_exe)
+            // The two reads the live refusal died on, answered before the
+            // release binary the third read finds.
+            .env("FAKE_SERVE_EXE_EARLY", "/usr/lib/systemd/systemd-executor")
+            .env("FAKE_SERVE_EXE_EARLY_CALLS", "2")
+            .env("FAKE_SERVE_EXE_CALL_LOG", &exe_calls)
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{target}: the install refused a release the unit was still exec'ing: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        assert_release_view(
+            &install_root,
+            &bin_dir,
+            &PathBuf::from(installed_json["releaseDir"].as_str().unwrap()),
+        );
+        assert_eq!(
+            installed_json["serve"],
+            json!({
+                "restarted": true,
+                "mainPid": 3963673,
+                "exe": served_exe.to_str().unwrap(),
+                "http": 200,
+            }),
+            "{target}: the install receipt does not carry the exe the poll waited for"
+        );
+        let probes = fs::read_to_string(&exe_calls).unwrap().lines().count();
+        assert!(
+            probes >= 3,
+            "{target}: the exe was judged on {probes} read(s); the pre-exec window was never waited out"
         );
     }
 }
