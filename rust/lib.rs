@@ -171,12 +171,22 @@ Usage:
   kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
              [--priority P0|P1|P2|0-9]
              [--task ID] [--tag NAME ...] [--json]
+             [--question TEXT --context TEXT]
+             [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
+             (a card is 2-4 choices, one --consequence each, exactly one
+             --recommend; OUTCOME is approve|reject|defer|other; a row with no
+             choices reads as the Approve/Reject pair)
   kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk] [--task ID] [--tag NAME]
              [--lane LANE] [--all] [--limit N]
              [--fields id,kind,status,... | --no-body] [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
-  kanban attention resolve ID --as ACTOR --note TEXT [--json]
+             [--question TEXT --context TEXT]
+             [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
+             [--clear-card]
+  kanban attention resolve ID --as ACTOR --choice KEY [--note TEXT] [--json]
+  kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
+             --note TEXT [--json]
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
   kanban sitrep post TEXT --as AGENT --lane LANE [--task ID]
              [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
@@ -269,7 +279,7 @@ the first page off as the whole.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 30] = [
+pub(crate) const BOOLEAN: [&str; 31] = [
     "help",
     "json",
     "version",
@@ -300,6 +310,7 @@ pub(crate) const BOOLEAN: [&str; 30] = [
     "registry",
     "follow",
     "no-body",
+    "clear-card",
 ];
 
 /// Removed boolean flags that remain recognizable only to return an actionable
@@ -336,6 +347,67 @@ pub(crate) const SUBSCRIPTION_REPEATABLE: [&str; 4] =
 /// are: those flags are scalar everywhere else, and the access command's
 /// collection code is a separate slice.
 pub(crate) const ACCESS_REPEATABLE: [&str; 2] = ["scope", "replaces"];
+
+/// Attention's card flags, list-valued on `raise` and `update` and single
+/// on `resolve` — `--choice` names the authored options in one place and the
+/// one answer in the other (ADR-042 §4).
+pub(crate) const CARD_REPEATABLE: [&str; 2] = ["choice", "consequence"];
+
+/// One operation's list-valued flags, keyed on the command AND the
+/// subcommand.
+///
+/// The command alone cannot express `attention`, whose `raise` takes a list
+/// of authored choices and whose `resolve` takes exactly one answer: a second
+/// `--choice` there is two answers to one question. `sub: None` means every
+/// subcommand of that command, which is what `watch`, `subscription` and
+/// `access` mean.
+struct ListValued {
+    command: &'static str,
+    sub: Option<&'static str>,
+    flags: &'static [&'static str],
+}
+
+const LIST_VALUED: [ListValued; 5] = [
+    ListValued {
+        command: "watch",
+        sub: None,
+        flags: &WATCH_REPEATABLE,
+    },
+    ListValued {
+        command: "subscription",
+        sub: None,
+        flags: &SUBSCRIPTION_REPEATABLE,
+    },
+    ListValued {
+        command: "access",
+        sub: None,
+        flags: &ACCESS_REPEATABLE,
+    },
+    ListValued {
+        command: "attention",
+        sub: Some("raise"),
+        flags: &CARD_REPEATABLE,
+    },
+    ListValued {
+        command: "attention",
+        sub: Some("update"),
+        flags: &CARD_REPEATABLE,
+    },
+];
+
+/// Whether this operation takes this flag more than once.
+///
+/// One predicate, read by the parser's refusal, by `schema --json`'s flag
+/// kind and by the MCP layer's array coercion, so the three cannot disagree
+/// about whether a flag is a list.
+pub(crate) fn repeatable(command: &str, sub: Option<&str>, flag: &str) -> bool {
+    REPEATABLE.contains(&flag)
+        || LIST_VALUED.iter().any(|entry| {
+            entry.command == command
+                && (entry.sub.is_none() || entry.sub == sub)
+                && entry.flags.contains(&flag)
+        })
+}
 
 /// Commands that are processes rather than operations.
 ///
@@ -1080,7 +1152,18 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("raise"),
-        &["as", "kind", "task", "priority", "tag"],
+        &[
+            "as",
+            "kind",
+            "task",
+            "priority",
+            "tag",
+            "question",
+            "context",
+            "choice",
+            "consequence",
+            "recommend",
+        ],
         &["text"],
         false,
     ),
@@ -1096,14 +1179,26 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("update"),
-        &["as", "body", "body-file", "tag", "clear-tags"],
+        &[
+            "as",
+            "body",
+            "body-file",
+            "tag",
+            "clear-tags",
+            "question",
+            "context",
+            "choice",
+            "consequence",
+            "recommend",
+            "clear-card",
+        ],
         &["id"],
         false,
     ),
     (
         "attention",
         Some("resolve"),
-        &["as", "note"],
+        &["as", "note", "choice", "outcome"],
         &["id"],
         false,
     ),
@@ -1411,6 +1506,13 @@ pub(crate) const ENUM_ARGUMENTS: &[EnumArgument] = &[
         slot: ArgSlot::Flag,
         name: "status",
         values: &ATTENTION_STATUSES,
+    },
+    EnumArgument {
+        command: "attention",
+        sub: Some("resolve"),
+        slot: ArgSlot::Flag,
+        name: "outcome",
+        values: &ATTENTION_OUTCOMES,
     },
     EnumArgument {
         command: "deploy",
@@ -1829,6 +1931,22 @@ impl Args {
         }
     }
 
+    /// The decision card these flags describe, parsed and refused as one
+    /// (ADR-042 §4).
+    ///
+    /// The tokens go to one validator so `attention raise`, `attention
+    /// update` and every generated adapter read the same refusal for the
+    /// same mistake.
+    fn decision_card(&self) -> Result<DecisionCard> {
+        DecisionCard::parse(
+            self.one("question"),
+            self.one("context"),
+            &self.many("choice"),
+            &self.many("consequence"),
+            self.one("recommend"),
+        )
+    }
+
     /// `--limit`, refusing a value SQL would read as the opposite of a bound.
     ///
     /// `LIMIT -1` means *no limit* in SQLite, so `--limit -1` returned every
@@ -1989,16 +2107,12 @@ impl Args {
     /// Taking the last occurrence is a common convention and the wrong one
     /// here: the values disagree, only one of them is what the caller meant,
     /// and nothing in the receipt says which was used.
-    fn reject_repeated_for(&self, command: Option<&str>) -> Result<()> {
+    fn reject_repeated_for(&self, command: Option<&str>, sub: Option<&str>) -> Result<()> {
         let mut repeated = self
             .flags
             .iter()
             .filter(|(name, values)| {
-                let repeatable = REPEATABLE.contains(&name.as_str())
-                    || (command == Some("watch") && WATCH_REPEATABLE.contains(&name.as_str()))
-                    || (command == Some("subscription")
-                        && SUBSCRIPTION_REPEATABLE.contains(&name.as_str()))
-                    || (command == Some("access") && ACCESS_REPEATABLE.contains(&name.as_str()));
+                let repeatable = repeatable(command.unwrap_or_default(), sub, name.as_str());
                 values.len() > 1 && !repeatable
             })
             .map(|(name, values)| format!("--{name} ({})", values.join(", ")))
@@ -2349,11 +2463,7 @@ pub(crate) fn schema() -> Value {
             let flags = flags
                 .iter()
                 .map(|flag| {
-                    let kind = if REPEATABLE.contains(flag)
-                        || (*command == "watch" && WATCH_REPEATABLE.contains(flag))
-                        || (*command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag))
-                        || (*command == "access" && ACCESS_REPEATABLE.contains(flag))
-                    {
+                    let kind = if repeatable(command, *sub, flag) {
                         "list"
                     } else if BOOLEAN.contains(flag) {
                         "boolean"
@@ -3744,11 +3854,14 @@ const TASK_GATED_FIELDS: [(&str, &str); 2] = [
 ];
 
 /// The keys of one `attention list` row, exactly as a caller sees them.
-const ATTENTION_FIELDS: [&str; 17] = [
+const ATTENTION_FIELDS: [&str; 21] = [
     "id",
     "taskID",
     "kind",
     "body",
+    "question",
+    "context",
+    "choices",
     "raisedBy",
     "createdAt",
     "status",
@@ -3757,6 +3870,7 @@ const ATTENTION_FIELDS: [&str; 17] = [
     "resolvedAt",
     "resolvedBy",
     "resolution",
+    "decision",
     "reopenedAt",
     "reopenedBy",
     "reopenNote",
@@ -5195,7 +5309,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     match command_spec(command, spec_sub.as_deref()) {
         Some((allowed, positionals)) => {
             args.reject_unknown(allowed, ignored_selectors(command, spec_sub.as_deref()).0)?;
-            args.reject_repeated_for(Some(command))?;
+            args.reject_repeated_for(Some(command), spec_sub.as_deref())?;
             args.reject_extra_positionals(arity(spec_sub.as_deref(), positionals))?;
             // Before the data-root lock and before any store: a command that
             // cannot run must not have created a board on its way to saying so.
@@ -6578,6 +6692,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 args.one("task"),
                 args.priority(6)?,
                 &args.many("tag"),
+                &args.decision_card()?,
             )?,
             args.has("json"),
         );
@@ -6602,9 +6717,23 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         return print(&rows, args.has("json"));
     }
     if command == "attention" && sub == Some("update") {
-        if args.has("tag") && args.has("clear-tags") {
-            bail!("--tag and --clear-tags are mutually exclusive");
+        // Each clearing flag is refused beside the flag it undoes: two
+        // answers to one question, and the receipt would not say which was
+        // stored. `--clear-card` undoes the whole card, so it contradicts
+        // every card flag.
+        for (a, b) in [
+            ("tag", "clear-tags"),
+            ("question", "clear-card"),
+            ("context", "clear-card"),
+            ("choice", "clear-card"),
+            ("consequence", "clear-card"),
+            ("recommend", "clear-card"),
+        ] {
+            if args.has(a) && args.has(b) {
+                bail!("--{a} and --{b} are mutually exclusive");
+            }
         }
+        let card = args.decision_card()?;
         let id = rest.first().context("attention id is required")?;
         let body = args.body()?;
         let tags = if args.has("clear-tags") {
@@ -6615,14 +6744,29 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             None
         };
         return print(
-            &store.update_attention(id, body.as_deref(), tags.as_deref(), args.require("as")?)?,
+            &store.update_attention(
+                id,
+                body.as_deref(),
+                tags.as_deref(),
+                Some(&card),
+                args.has("clear-card"),
+                args.require("as")?,
+            )?,
             args.has("json"),
         );
     }
     if command == "attention" && sub == Some("resolve") {
         let id = rest.first().context("attention id is required")?;
         return print(
-            &store.resolve_attention(id, args.require("as")?, args.one("note"))?,
+            &store.resolve_attention(
+                id,
+                args.require("as")?,
+                &AttentionAnswer {
+                    choice: args.one("choice"),
+                    outcome: args.one("outcome"),
+                    note: args.one("note"),
+                },
+            )?,
             args.has("json"),
         );
     }
@@ -8202,15 +8346,15 @@ mod tests {
         const SOURCE: &str = include_str!("lib.rs");
         for (command, sub, flags, ..) in COMMANDS {
             for flag in *flags {
-                // Watch owns additional list-valued filters while `--kind`
-                // remains scalar on notes, events and other operations.
-                if *command == "watch" && WATCH_REPEATABLE.contains(flag) {
-                    continue;
-                }
-                if *command == "subscription" && SUBSCRIPTION_REPEATABLE.contains(flag) {
-                    continue;
-                }
-                if *command == "access" && ACCESS_REPEATABLE.contains(flag) {
+                // A flag that is list-valued for SOME operation is outside
+                // this scan by construction: `--kind` repeats on watch and is
+                // scalar on notes and events, and `--choice` repeats on
+                // `attention raise` and is one answer on `attention resolve`.
+                // The scan reads the whole file at once, so it cannot tell
+                // which operation a `many()` call belongs to. `repeatable` is
+                // the authority for those, pinned per operation by the schema
+                // and parser cases.
+                if LIST_VALUED.iter().any(|entry| entry.flags.contains(flag)) {
                     continue;
                 }
                 let collected = SOURCE.contains(&format!("many(\"{flag}\")"));
@@ -8230,13 +8374,22 @@ mod tests {
                 "--{flag} is repeatable but no command accepts it"
             );
         }
-        for flag in ACCESS_REPEATABLE {
-            assert!(
-                COMMANDS
-                    .iter()
-                    .any(|(command, _, flags, ..)| *command == "access" && flags.contains(&flag)),
-                "--{flag} is access-repeatable but no access command accepts it"
-            );
+        // And every per-operation list is claimed by an operation that
+        // actually declares the flag, so a renamed subcommand cannot leave a
+        // list-valued flag pointing at nothing.
+        for entry in &LIST_VALUED {
+            for flag in entry.flags {
+                assert!(
+                    COMMANDS.iter().any(|(command, sub, flags, ..)| {
+                        *command == entry.command
+                            && (entry.sub.is_none() || entry.sub == *sub)
+                            && flags.contains(flag)
+                    }),
+                    "--{flag} is list-valued for {} {:?} but no such operation accepts it",
+                    entry.command,
+                    entry.sub
+                );
+            }
         }
     }
 
@@ -8403,7 +8556,7 @@ mod tests {
             assert_eq!(emitted.len(), flags.len(), "{name} flag count");
             for (emitted, expected_flag) in emitted.iter().zip(flags) {
                 assert_eq!(emitted["name"], *expected_flag, "{name}");
-                let kind = if ACCESS_REPEATABLE.contains(expected_flag) {
+                let kind = if repeatable("access", Some(sub), expected_flag) {
                     "list"
                 } else if BOOLEAN.contains(expected_flag) {
                     "boolean"
@@ -8488,7 +8641,7 @@ mod tests {
         ] {
             assert_eq!(parsed.many(flag).len(), expected, "--{flag} was not parsed");
             assert!(
-                REPEATABLE.contains(&flag) || WATCH_REPEATABLE.contains(&flag),
+                repeatable("watch", None, flag),
                 "--{flag} is not repeatable"
             );
         }
@@ -8510,30 +8663,70 @@ mod tests {
     fn repeating_a_single_valued_flag_is_refused() {
         assert!(
             args(&["--project", "alpha"])
-                .reject_repeated_for(None)
+                .reject_repeated_for(None, None)
                 .is_ok()
         );
-        assert!(args(&[]).reject_repeated_for(None).is_ok());
+        assert!(args(&[]).reject_repeated_for(None, None).is_ok());
         // A list-valued flag is exactly what repeating is for.
         assert!(
             args(&["--blocker", "a", "--blocker", "b"])
-                .reject_repeated_for(None)
+                .reject_repeated_for(None, None)
                 .is_ok()
         );
         let error = args(&["--project", "alpha", "--project", "beta"])
-            .reject_repeated_for(None)
+            .reject_repeated_for(None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("--project (alpha, beta)"), "{error}");
     }
 
+    /// `--choice` is a list of authored options on `attention raise` and
+    /// `attention update`, and exactly one answer on `attention resolve`.
+    /// Both live under the command `attention`, which is why the predicate
+    /// reads the subcommand.
+    #[test]
+    fn choice_is_repeatable_on_raise_and_update_and_single_on_resolve() {
+        let twice = args(&["--choice", "a=A|approve", "--choice", "b=B|reject"]);
+        for sub in ["raise", "update"] {
+            assert!(
+                twice
+                    .reject_repeated_for(Some("attention"), Some(sub))
+                    .is_ok(),
+                "--choice must repeat on attention {sub}"
+            );
+        }
+        let error = twice
+            .reject_repeated_for(Some("attention"), Some("resolve"))
+            .expect_err("a second --choice is two answers to one question")
+            .to_string();
+        assert!(
+            error.contains("--choice (a=A|approve, b=B|reject)"),
+            "{error}"
+        );
+        // And `--consequence` follows it.
+        assert!(
+            args(&["--consequence", "a=x", "--consequence", "b=y"])
+                .reject_repeated_for(Some("attention"), Some("raise"))
+                .is_ok()
+        );
+        assert!(
+            args(&["--consequence", "a=x", "--consequence", "b=y"])
+                .reject_repeated_for(Some("attention"), Some("resolve"))
+                .is_err()
+        );
+    }
+
     #[test]
     fn kind_is_repeatable_only_for_watch_and_subscription_add() {
         let repeated = args(&["--kind", "a", "--kind", "b"]);
-        assert!(repeated.reject_repeated_for(Some("watch")).is_ok());
-        assert!(repeated.reject_repeated_for(Some("subscription")).is_ok());
+        assert!(repeated.reject_repeated_for(Some("watch"), None).is_ok());
+        assert!(
+            repeated
+                .reject_repeated_for(Some("subscription"), Some("add"))
+                .is_ok()
+        );
         let error = repeated
-            .reject_repeated_for(Some("events"))
+            .reject_repeated_for(Some("events"), None)
             .expect_err("events --kind must remain scalar")
             .to_string();
         assert!(error.contains("--kind (a, b)"), "{error}");
@@ -8693,6 +8886,9 @@ mod tests {
             task_id: Some("t-1".into()),
             kind: "decision".into(),
             body: "long body".into(),
+            question: Some("Assign a Claude seat to hax, or drop that receipt?".into()),
+            context: Some("A real turn answers HTTP 401 and nobody is waiting on it.".into()),
+            choices: crate::model::default_choice_pair(),
             raised_by: "worker@driver-2".into(),
             created_at: 1,
             status: "open".into(),
@@ -8701,6 +8897,7 @@ mod tests {
             resolved_at: None,
             resolved_by: None,
             resolution: None,
+            decision: None,
             reopened_at: None,
             reopened_by: None,
             reopen_note: None,

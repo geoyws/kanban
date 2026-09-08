@@ -33,8 +33,8 @@
 //! does not relax it.
 
 use crate::model::{
-    Attention, DeadLetterCode, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions,
-    Sitrep, Subscription, SubscriptionPosition, Task,
+    Attention, AttentionAnswer, DeadLetterCode, DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord,
+    SearchOptions, Sitrep, Subscription, SubscriptionPosition, Task,
 };
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
@@ -566,11 +566,34 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
     let reply = reply
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let Ok(reply) = compose_resolution_note(&decision, reply.as_deref()) else {
-        return Ok(WebResponse::Html(
-            400,
-            page("Invalid reply", "<h1>Invalid reply</h1>"),
-        ));
+    // The three shipped buttons, expressed as the card answers they are.
+    // `approve` and `reject` name the default pair's keys, which every row
+    // with no authored card is served as; the free-text button becomes the
+    // custom answer, which carries a verdict rather than closing an item
+    // with none. The card itself, its authored keys and the outcome picker
+    // are Phase 3 (ADR-042 §5); until then a row with authored choices is
+    // refused by name here rather than mapped to a key it does not carry.
+    let answer = match decision.as_str() {
+        "approve" | "reject" => AttentionAnswer {
+            choice: Some(&decision),
+            outcome: None,
+            note: reply.as_deref(),
+        },
+        "reply" => {
+            let Some(note) = reply.as_deref() else {
+                return Ok(WebResponse::Html(
+                    400,
+                    page("Invalid reply", "<h1>Invalid reply</h1>"),
+                ));
+            };
+            AttentionAnswer::custom("other", note)
+        }
+        _ => {
+            return Ok(WebResponse::Html(
+                400,
+                page("Invalid reply", "<h1>Invalid reply</h1>"),
+            ));
+        }
     };
     let [_, project, id, _] = parts.as_slice() else {
         unreachable!("the route shape was checked above")
@@ -581,7 +604,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
             page("Board not found", "<h1>Board not found</h1>"),
         ));
     };
-    if let Err(error) = store.resolve_attention_from_trusted_edge(id, &actor, Some(&reply)) {
+    if let Err(error) = store.resolve_attention_from_trusted_edge(id, &actor, &answer) {
         return Ok(WebResponse::Html(
             409,
             page(
@@ -1272,27 +1295,6 @@ fn reply_button_labels(has_comment: bool) -> (&'static str, &'static str) {
         ("Comment and Approve", "Comment and Reject")
     } else {
         ("Approve", "Reject")
-    }
-}
-
-fn compose_resolution_note(decision: &str, reply: Option<&str>) -> Result<String> {
-    let reply = reply.map(str::trim).filter(|value| !value.is_empty());
-    match decision {
-        "approve" => Ok(match reply {
-            Some(comment) => format!("Decision: Approved. Proceed.\nComment: {comment}"),
-            None => "Decision: Approved. Proceed.".to_owned(),
-        }),
-        "reject" => Ok(match reply {
-            Some(comment) => format!("Decision: Declined. Do not proceed.\nComment: {comment}"),
-            None => "Decision: Declined. Do not proceed.".to_owned(),
-        }),
-        "reply" => {
-            let Some(reply) = reply else {
-                anyhow::bail!("reply text is required when sending a reply");
-            };
-            Ok(format!("Comment: {reply}"))
-        }
-        other => anyhow::bail!("invalid decision {other}"),
     }
 }
 
@@ -2970,7 +2972,7 @@ dd{margin:0;font-size:.9rem;word-break:break-word}\
 mod tests {
     use super::*;
     use crate::authz::AuthzContext;
-    use crate::model::{AddSubscription, AddTask, FinishDeployment, StartDeployment};
+    use crate::model::{AddSubscription, AddTask, DecisionCard, FinishDeployment, StartDeployment};
     use crate::policy::{Capability, ScopeTuple, authority};
     use crate::routing::Enforcement;
     use std::env;
@@ -3143,6 +3145,7 @@ mod tests {
                 Some(&epic.id),
                 0,
                 &["ops".to_owned(), "release".to_owned()],
+                &DecisionCard::default(),
             )
             .expect("raise attention");
         store
@@ -3261,31 +3264,16 @@ mod tests {
         assert!(JS.contains("dataset.quickRepliesBound"));
     }
 
+    /// The two quick buttons still say both things. What they *write* is no
+    /// longer composed here: the resolution text moved inside the store's
+    /// write path so no caller can produce a different trail (ADR-042 §3).
     #[test]
-    fn reply_labels_and_resolution_notes_preserve_both_facts() {
+    fn reply_labels_preserve_both_facts() {
         assert_eq!(reply_button_labels(false), ("Approve", "Reject"));
         assert_eq!(
             reply_button_labels(true),
             ("Comment and Approve", "Comment and Reject")
         );
-        assert_eq!(
-            compose_resolution_note("approve", None).unwrap(),
-            "Decision: Approved. Proceed."
-        );
-        assert_eq!(
-            compose_resolution_note("approve", Some("  Ship it  ")).unwrap(),
-            "Decision: Approved. Proceed.\nComment: Ship it"
-        );
-        assert_eq!(
-            compose_resolution_note("reject", Some("Needs another pass")).unwrap(),
-            "Decision: Declined. Do not proceed.\nComment: Needs another pass"
-        );
-        assert_eq!(
-            compose_resolution_note("reply", Some("  Keep the note exactly  ")).unwrap(),
-            "Comment: Keep the note exactly"
-        );
-        assert!(compose_resolution_note("reply", Some("   ")).is_err());
-        assert!(compose_resolution_note("banana", Some("nope")).is_err());
     }
 
     #[test]
@@ -4730,6 +4718,7 @@ mod tests {
                         None,
                         0,
                         &[AUTHZ_TAG.to_owned()],
+                        &DecisionCard::default(),
                     )
                     .expect("raise an open item")
                     .id
@@ -4835,7 +4824,11 @@ mod tests {
             );
             let mut store = managed_store(&board, board_scope_only(&board));
             let error = store
-                .resolve_attention_from_trusted_edge(&board.attention[index], &actor, Some("done"))
+                .resolve_attention_from_trusted_edge(
+                    &board.attention[index],
+                    &actor,
+                    &AttentionAnswer::custom("other", "done"),
+                )
                 .expect_err("a header value must not grant a scope the principal lacks");
             assert_eq!(
                 error.to_string(),
@@ -4863,7 +4856,7 @@ mod tests {
             .resolve_attention_from_trusted_edge(
                 board.attention.last().expect("a spare row"),
                 "ifca-sso",
-                Some("done"),
+                &AttentionAnswer::custom("other", "done"),
             )
             .expect("the principal's own authority permits this write");
         assert_eq!(
@@ -4903,7 +4896,11 @@ mod tests {
         let mut nothing = managed_store(&board, vec![]);
         assert_eq!(
             nothing
-                .resolve_attention_from_trusted_edge(&board.attention[0], &actor, Some("done"))
+                .resolve_attention_from_trusted_edge(
+                    &board.attention[0],
+                    &actor,
+                    &AttentionAnswer::custom("other", "done"),
+                )
                 .expect_err("same-origin must not authorize a principal holding nothing")
                 .to_string(),
             AUTHZ_DENIAL,
@@ -4912,7 +4909,11 @@ mod tests {
         let mut board_scope = managed_store(&board, board_scope_only(&board));
         assert_eq!(
             board_scope
-                .resolve_attention_from_trusted_edge(&board.attention[0], &actor, Some("done"))
+                .resolve_attention_from_trusted_edge(
+                    &board.attention[0],
+                    &actor,
+                    &AttentionAnswer::custom("other", "done"),
+                )
                 .expect_err("same-origin must not authorize past the tag scope")
                 .to_string(),
             AUTHZ_DENIAL,
@@ -4953,7 +4954,11 @@ mod tests {
 
         let mut granted = managed_store(&board, board_and_tag_scope(&board));
         let resolved = granted
-            .resolve_attention_from_trusted_edge(&board.attention[0], &actor, Some("done"))
+            .resolve_attention_from_trusted_edge(
+                &board.attention[0],
+                &actor,
+                &AttentionAnswer::custom("other", "done"),
+            )
             .expect("the principal holds this row");
         assert_eq!(
             resolved.resolved_by.as_deref(),
@@ -4976,7 +4981,11 @@ mod tests {
         let mut deprived = managed_store(&board, board_scope_only(&board));
         assert_eq!(
             deprived
-                .resolve_attention_from_trusted_edge(&board.attention[1], &actor, Some("done"))
+                .resolve_attention_from_trusted_edge(
+                    &board.attention[1],
+                    &actor,
+                    &AttentionAnswer::custom("other", "done"),
+                )
                 .expect_err("an audit identity cannot authorize anything")
                 .to_string(),
             AUTHZ_DENIAL,
@@ -4988,7 +4997,7 @@ mod tests {
             .resolve_attention_from_trusted_edge(
                 &board.attention[1],
                 "other@edge.test",
-                Some("done"),
+                &AttentionAnswer::custom("other", "done"),
             )
             .expect("the principal holds this row");
         assert_eq!(

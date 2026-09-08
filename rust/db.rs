@@ -1418,6 +1418,203 @@ CREATE TRIGGER search_handoffs_ad AFTER DELETE ON handoffs BEGIN
 END;
 "#;
 
+/// An attention item becomes a decision card: a question, the context needed
+/// to answer it, two to four authored choices, and the decision that settled
+/// it (ADR-042 §2).
+///
+/// The four columns land on the attention row, with the exact CHECKs ADR-042
+/// specifies: the length bounds and the shape of the two JSON documents,
+/// which a caller cannot corrupt past. The cross-field invariants (the
+/// question/context pairing, exactly-one-recommended, key uniqueness, the
+/// reserved `custom`, a consequence per choice) are deliberately NOT here:
+/// `CHECK constraint failed` names no fix, and ADR-008 requires a refusal
+/// that does, so those live in the store and only in the store.
+///
+/// **A rebuild rather than four `ALTER TABLE ADD COLUMN` statements**, which
+/// is the one place this differs from ADR-042 §2's stated mechanism. The
+/// ADR's reason for preferring `ADD COLUMN` was that the rebuild `BOARD_V17`
+/// had to do was forced by an unalterable CHECK and that added columns "need
+/// none of that". They need one thing: the ladder's LAST step must survive
+/// being re-run, because `compiled_binary_still_migrates_a_board_that_is_behind`
+/// lowers `user_version` by one WITHOUT reverting the schema, and
+/// `ADD COLUMN` answers a re-run with `duplicate column name`. `BOARD_V24`
+/// already carries that property and says so; this reproduces it the same
+/// way, by naming every copied column so a re-run against a table that
+/// already has the four copies the original fifteen and leaves the new four
+/// NULL rather than failing. Nothing else about the table changes: the
+/// rebuilt shape is `BOARD_V17`'s plus the four columns.
+///
+/// The three `search_attention_*` triggers follow their table and are
+/// recreated here, as `BOARD_V17` did. `search_source_rows` is dropped first
+/// and recreated last so that no statement is prepared against a view whose
+/// attention arm names a column that does not exist yet, and its new arm
+/// indexes the question, the context and the choices' labels and
+/// consequences. Existing `search_documents` rows keep the old text until
+/// their row is next written, which is why the release runs
+/// `kanban search-rebuild` per board.
+const BOARD_V25: &str = r#"
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+DROP VIEW search_source_rows;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE attention RENAME TO attention_v24;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk')),
+ body TEXT NOT NULL,
+ raised_by TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority
+FROM attention_v24;
+DROP TABLE attention_v24;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE VIEW search_source_rows AS
+SELECT
+ 'task' AS source_kind,
+ t.id AS source_id,
+ t.id AS task_id,
+ t.title AS title,
+ COALESCE(t.body,'') || char(10) || COALESCE(t.deliverable,'') || char(10) || t.metadata AS body,
+ t.status AS status,
+ t.lane AS lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=t.id AND archived=0 ORDER BY tag)), '') AS tags,
+ t.created_at AS created_at,
+ t.updated_at AS updated_at,
+ t.archived AS archived
+FROM tasks t
+UNION ALL
+SELECT
+ 'note', CAST(n.seq AS TEXT), n.task_id,
+ n.kind || ' note on ' || n.task_id,
+ n.author || char(10) || n.body,
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=n.task_id AND archived=0 ORDER BY tag)), ''),
+ n.created_at, n.created_at, n.archived
+FROM task_notes n JOIN tasks t ON t.id=n.task_id
+UNION ALL
+SELECT
+ 'checkpoint', CAST(c.seq AS TEXT), c.task_id,
+ 'checkpoint: ' || c.summary,
+ c.author || char(10) || c.summary || char(10) || c.intent || char(10) || c.next_action ||
+   char(10) || c.blockers || char(10) || c.validations || char(10) ||
+   COALESCE(c.repo_path,'') || char(10) || COALESCE(c.branch,''),
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=c.task_id AND archived=0 ORDER BY tag)), ''),
+ c.created_at, c.created_at, c.archived
+FROM checkpoints c JOIN tasks t ON t.id=c.task_id
+UNION ALL
+SELECT
+ 'handoff', h.id, h.task_id,
+ 'handoff: ' || h.summary,
+ h.from_agent || char(10) || COALESCE(h.to_agent,'') || char(10) || h.summary ||
+   char(10) || h.intent || char(10) || h.next_action || char(10) || h.blockers ||
+   char(10) || h.validations || char(10) || COALESCE(h.repo_path,'') ||
+   char(10) || COALESCE(h.branch,''),
+ h.status,
+ (SELECT lane FROM tasks WHERE id=h.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=h.task_id AND archived=0 ORDER BY tag)), ''),
+ h.created_at, COALESCE(h.accepted_at,h.created_at), h.archived
+FROM handoffs h
+UNION ALL
+SELECT
+ 'attention', a.id, a.task_id,
+ 'attention: ' || a.kind,
+ a.raised_by || char(10) || a.body || char(10) || COALESCE(a.resolution,'') ||
+   char(10) || COALESCE(a.question,'') || char(10) || COALESCE(a.context,'') ||
+   char(10) || COALESCE((SELECT group_concat(
+     json_extract(choice.value,'$.label') || char(10) ||
+     json_extract(choice.value,'$.consequence'), char(10))
+     FROM json_each(a.choices) choice), ''),
+ a.status,
+ (SELECT lane FROM tasks WHERE id=a.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=a.task_id AND archived=0 ORDER BY tag)), ''),
+ a.created_at, COALESCE(a.resolved_at,a.created_at), a.archived
+FROM attention a
+UNION ALL
+SELECT
+ 'sitrep', s.id, s.task_id,
+ 'sitrep: ' || s.lane,
+ s.author || char(10) || s.body || char(10) || COALESCE(s.worktree,'') ||
+   char(10) || COALESCE(s.branch,''),
+ NULL, s.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=s.task_id AND archived=0 ORDER BY tag)), ''),
+ s.created_at, s.created_at, s.archived
+FROM sitreps s
+UNION ALL
+SELECT
+ 'rule', r.id, NULL,
+ substr(r.body,1,instr(r.body || char(10),char(10))-1),
+ r.body,
+ CASE WHEN r.archived=0 THEN 'active' ELSE 'retired' END,
+ NULL, '', r.created_at, r.updated_at, r.archived
+FROM rules r
+UNION ALL
+SELECT
+ 'event', CAST(e.seq AS TEXT), e.task_id,
+ 'event: ' || e.kind,
+ COALESCE(e.actor,'') || char(10) || e.payload,
+ (SELECT status FROM tasks WHERE id=e.task_id),
+ (SELECT lane FROM tasks WHERE id=e.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=e.task_id AND archived=0 ORDER BY tag)), ''),
+ e.created_at, e.created_at, e.archived
+FROM events e
+WHERE e.kind IN (
+ 'task_added','task_updated','task_moved','note_added','checkpoint_added',
+ 'handoff_created','handoff_accepted','attention_raised','attention_resolved',
+ 'sitrep_posted','rule_added','rule_updated','rule_retired','archive_swept'
+);
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1719,7 +1916,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 24;
+pub const BOARD_SCHEMA_VERSION: usize = 25;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2178,7 +2375,7 @@ pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
 const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
-    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24,
+    BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -3877,7 +4074,7 @@ mod tests {
 
         migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 24);
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
         assert_eq!(
             index_sql(&connection, "idx_tasks_priority_created_id"),
             "CREATE INDEX idx_tasks_priority_created_id ON tasks(priority,created_at,id)"
@@ -3927,7 +4124,7 @@ mod tests {
         );
 
         migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 24);
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
 
         // The row survived the rebuild, byte for byte.
         let (id, status): (String, String) = connection

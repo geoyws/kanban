@@ -227,34 +227,66 @@ put credentials or secret values in the plaintext board database. See
 [ADR-018](docs/adr/ADR-018-project-rules-frame-work-without-replacing-private-memory.md)
 and its superseding [ADR-027](docs/adr/ADR-027-rules-are-one-tag-scoped-kb-document.md).
 
+An attention item is a **decision card**: a question, the context needed to
+answer it, and two to four authored choices, each with the consequence of
+picking it and a machine-readable `outcome` of `approve`, `reject`, `defer` or
+`other`, exactly one marked as the recommendation. Every item also offers an
+implicit `custom` answer that needs its own `--outcome` and a note, so nothing
+closes an item without a verdict; a row that authored no choices is served as
+the `approve`/`reject` default pair with no recommendation, and the body stays
+what it always was — the long form
+([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)).
 Attention rows carry the same registered subsystem vocabulary as tasks:
 
 ```bash
-kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer
+kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag queuer \
+  --question "The queuer is deployed but unproven - review it now, or ship and review after?" \
+  --context "The queuer has been live on staging since 2026-09-05 with no errors. One task waits on the review, and waiting costs a day of feedback." \
+  --choice "review-now=Review the deployed queuer today|approve" \
+  --consequence "review-now=You spend about twenty minutes reading it today and the waiting task unblocks this afternoon." \
+  --choice "ship-first=Ship it and review after the release|defer" \
+  --consequence "ship-first=The release goes out unreviewed and a task is filed to review it on 2026-09-12." \
+  --recommend review-now
 kb att list --status open --tag queuer
 kb att update a-12345678 --body "Corrected request." --as codex@driver
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
-kb att resolve a-12345678 --as geoyws --note "Approved after review."
+kb att update a-12345678 --clear-card --as codex@driver
+kb att resolve a-12345678 --as geoyws --choice review-now
+kb att resolve a-12345678 --as geoyws --choice custom --outcome defer --note "After the aix pin lands."
 kb att reopen a-12345678 --as geoyws --note "Resolved the wrong item."
 ```
 
-Several tags describe several touched subsystems. An agent may correct the body
-or tags only while the item remains open; the prior body and tags stay on the
-event trail, and the update does not settle the request. Resolving it freezes
-the row with the rest of the historical receipt. Unknown tags are refused
-rather than producing an empty-looking filter result.
+Several tags describe several touched subsystems. An agent may correct the body,
+tags or card only while the item remains open; the prior body, tags and card
+stay on the event trail, and the update does not settle the request. Resolving
+it freezes the row with the rest of the historical receipt. Unknown tags are
+refused rather than producing an empty-looking filter result. Every card refusal
+names its fix — an undeclared `--consequence` key, a duplicate key, a count
+outside two to four, no recommendation or two, a choice with no consequence,
+half a question/context pair, the reserved `custom` key, a `--recommend` with no
+choices, and each length bound — and refusals are store-level, so the CLI, the
+MCP tools and the web read the same wording.
 
 Resolution is deliberately asymmetric: the operator actor `geoyws` may settle
 any item, while an agent may settle only an item whose `raisedBy` is that exact
-actor, and every resolution requires a non-empty note. `geoyws` is the one
+actor, and every resolution requires a `--choice`. `geoyws` is the one
 operator spelling (`OPERATOR_ACTOR` in `rust/model.rs`); `geo` is not an alias
 and is refused like any other non-raiser. Rows resolved before 2026-09-05 carry
 `geo` in `resolvedBy` and `raisedBy` as the historical spelling; they are left
-as recorded. If a resolution was mistaken, only `geoyws` or the recorded
-resolver may reopen it. Reopening returns the item to the open queue without
-clearing `resolvedAt`, `resolvedBy` or `resolution`; it adds `reopenedAt`,
-`reopenedBy` and `reopenNote`, and the transition is audited.
+as recorded. Settling writes a `decision` of
+`{choice, outcome, note, by, at}` on the row and into the `attention_resolved`
+event, and composes `resolution` itself as `Decision: <label>. <consequence>`
+plus a `Note: <note>` line when a note was given — one composer inside the
+write path, so no caller can produce a different trail. A `--choice` naming a
+key the row does not carry is refused by name, which is what makes a card a
+browser is still holding safe. Rows settled before 2026-09-08 keep their exact
+resolution bytes, including the `Comment: ` second line the web used to write.
+If a resolution was mistaken, only `geoyws` or the recorded resolver may reopen
+it. Reopening returns the item to the open queue without clearing `resolvedAt`,
+`resolvedBy` or `resolution`; it clears `decision` from the row and keeps it in
+the `attention_reopened` event, adds `reopenedAt`, `reopenedBy` and
+`reopenNote`, and the transition is audited.
 
 ## Working from anywhere
 
@@ -723,10 +755,16 @@ The **Needs you** page is the deliberately narrow exception to the read-only
 surface: reply inline to resolve an attention item as `geoyws`. Same-origin checks,
 strict bounded form decoding and the Store's duplicate-resolution refusal guard
 the write. Quick replies are available on a phone without removing free text.
-Every other route remains read-only: the browser can resolve an attention item,
-open a draft plan, and pause or resume a subscription, and nothing else,
-enforced by the source mutator allowlist and byte-for-byte process-boundary
-tests.
+The rendered decision card — the question as the heading, the recommendation
+first and one-click, the four-value outcome picker beside the textarea, and
+`1`-`4` keyboard picks — ships in Phase 3 of
+[ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md);
+today the three buttons answer through the default `approve`/`reject` pair and
+the custom answer, so an item whose raiser authored other keys is refused by
+name until that card lands. Every other route remains read-only: the browser
+can resolve an attention item, open a draft plan, and pause or resume a
+subscription, and nothing else, enforced by the source mutator allowlist and
+byte-for-byte process-boundary tests.
 
 `/live` is a WebSocket notification channel. It sends only revision notices and
 heartbeats; the browser fetches the canonical server-rendered page after a board

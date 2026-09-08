@@ -23,6 +23,14 @@ use uuid::Uuid;
 
 const MAX_CFG_ATOMS: usize = 12;
 
+/// What resolving through the default pair composes (ADR-042 §2 and §3): the
+/// synthesized choice's label, then its consequence. Written out rather than
+/// imported, so a change to either is visible in a diff of this file.
+const APPROVE: &str =
+    "Decision: Approve - proceed. The work the body describes goes ahead as written.";
+const REJECT: &str = "Decision: Reject - do not proceed. The work the body describes does not \
+                      happen; whoever raised it needs a new plan.";
+
 struct Fixture {
     root: PathBuf,
     data: PathBuf,
@@ -2008,7 +2016,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|project| project["schemaVersion"] == 24)
+            .all(|project| project["schemaVersion"] == 25)
     );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -2204,9 +2212,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 24);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 24);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 24);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 25);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 25);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 25);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -3059,7 +3067,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        24
+        25
     );
     assert_eq!(
         reopened
@@ -7115,7 +7123,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 24"),
+        version.contains("board schema 25"),
         "version output: {version}"
     );
     assert!(
@@ -14209,6 +14217,8 @@ fn a_batched_read_is_byte_identical_to_the_same_read_on_its_own() {
             resolved["id"].as_str().unwrap(),
             "--as",
             "geoyws",
+            "--choice",
+            "approve",
             "--note",
             "resolved for the identity fixture",
             "--json",
@@ -16559,6 +16569,8 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             blocking["id"].as_str().unwrap(),
             "--as",
             "claude/driver-2",
+            "--choice",
+            "reject",
             "--note",
             "The raiser withdrew its own item after verification.",
             "--json",
@@ -16580,9 +16592,13 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     );
     assert_eq!(self_reopened["status"], "open");
     assert_eq!(self_reopened["resolvedBy"], "claude/driver-2");
+    // The resolution is composed from the choice, not passed in: the label
+    // and consequence of the default pair, then the note.
     assert_eq!(
         self_reopened["resolution"],
-        "The raiser withdrew its own item after verification."
+        "Decision: Reject - do not proceed. The work the body describes does not happen; \
+         whoever raised it needs a new plan.\nNote: The raiser withdrew its own item after \
+         verification."
     );
     assert_eq!(self_reopened["reopenedBy"], "claude/driver-2");
     assert_eq!(
@@ -16633,6 +16649,8 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             approval["id"].as_str().unwrap(),
             "--as",
             "claude/driver-3",
+            "--choice",
+            "approve",
             "--note",
             "Probe",
             "--json",
@@ -16640,7 +16658,9 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     );
     assert!(!unauthorized.status.success());
     assert!(String::from_utf8_lossy(&unauthorized.stderr).contains("only geoyws"));
-    let missing_note = fixture.run(
+    // A note is optional on an authored choice; a CHOICE never is, because a
+    // resolve with no verdict is what ADR-042 removed.
+    let missing_choice = fixture.run(
         &fixture.main,
         &[
             "attention",
@@ -16651,8 +16671,11 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             "--json",
         ],
     );
-    assert!(!missing_note.status.success());
-    assert!(String::from_utf8_lossy(&missing_note.stderr).contains("--note is required"));
+    assert!(!missing_choice.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_choice.stderr)
+            .contains("attention resolve requires --choice KEY")
+    );
 
     // Settling one keeps it: the trail is the feature.
     let settled = fixture.ok_json(
@@ -16663,6 +16686,8 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             approval["id"].as_str().unwrap(),
             "--as",
             "geoyws",
+            "--choice",
+            "approve",
             "--note",
             "approved and pushed",
             "--json",
@@ -16670,7 +16695,14 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     );
     assert_eq!(settled["status"], "resolved");
     assert_eq!(settled["resolvedBy"], "geoyws");
-    assert_eq!(settled["resolution"], "approved and pushed");
+    assert_eq!(
+        settled["resolution"],
+        "Decision: Approve - proceed. The work the body describes goes ahead as written.\n\
+         Note: approved and pushed"
+    );
+    assert_eq!(settled["decision"]["choice"], "approve");
+    assert_eq!(settled["decision"]["outcome"], "approve");
+    assert_eq!(settled["decision"]["by"], "geoyws");
     assert!(!settled["resolvedAt"].is_null());
 
     let wrong_reopener = fixture.run(
@@ -16703,7 +16735,16 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     );
     assert_eq!(reopened["status"], "open");
     assert_eq!(reopened["resolvedBy"], "geoyws");
-    assert_eq!(reopened["resolution"], "approved and pushed");
+    assert!(
+        reopened["resolution"]
+            .as_str()
+            .unwrap()
+            .starts_with("Decision: Approve - proceed."),
+        "the reopened row keeps the resolution it undid: {}",
+        reopened["resolution"]
+    );
+    // The decision left the row and stayed in the ledger.
+    assert!(reopened["decision"].is_null());
     assert!(!reopened["reopenedAt"].is_null());
     assert_eq!(reopened["reopenedBy"], "geoyws");
     let settled = fixture.ok_json(
@@ -16714,6 +16755,8 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             approval["id"].as_str().unwrap(),
             "--as",
             "geoyws",
+            "--choice",
+            "approve",
             "--note",
             "Approved after reopening the mistaken transition.",
             "--json",
@@ -16767,6 +16810,8 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             approval["id"].as_str().unwrap(),
             "--as",
             "someone-else",
+            "--choice",
+            "approve",
             "--json",
         ],
     );
@@ -16820,6 +16865,8 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
             blocking["id"].as_str().unwrap(),
             "--as",
             "geoyws",
+            "--choice",
+            "approve",
             "--note",
             "Settled before simulating the v16 migration boundary.",
             "--json",
@@ -16843,8 +16890,1547 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        24
+        25
     );
+}
+
+/// The card ADR-042 §7 works through, converted from a-347ff24c, as argv.
+///
+/// One place, because several cases raise the same item and a card is a piece
+/// of writing rather than a fixture field. Bounds: question 133 of 160,
+/// context 452 of 800, labels 37, 35 and 44 of 60, consequences 130, 108 and
+/// 104 of 200, three choices within 2-4, exactly one recommended.
+const CARD: [&str; 18] = [
+    "--question",
+    "hax has no logged-in Claude account, so the pubsub adapter cannot record one real Claude reply - assign a seat, or drop that receipt?",
+    "--context",
+    "Claude Code 2.1.236 is installed on hax and its dispatcher config loads, but the saved login is revoked and a real turn answers HTTP 401. Only you can finish it: it needs a paid seat and a browser login nobody else can complete. One task is waiting, and nothing is waiting on that task. References: t-8c656910.",
+    "--choice",
+    "assign-and-login=Assign a Claude seat to hax and log in|approve",
+    "--consequence",
+    "assign-and-login=You buy or free one Claude seat and finish the browser login: ten minutes of your time plus the seat's monthly cost.",
+    "--choice",
+    "keep-parked=Keep it parked until a seat frees up|defer",
+    "--consequence",
+    "keep-parked=Nothing changes and nobody waits on you; a task is filed to re-raise this the day a seat frees up.",
+    "--choice",
+    "drop-receipt=Drop the live-Claude receipt from the adapter|reject",
+    "--consequence",
+    "drop-receipt=The adapter is proven against the other providers only and the install task closes as cancelled.",
+    "--recommend",
+    "assign-and-login",
+];
+
+/// What `--choice keep-parked` composes from [`CARD`]: the label, then the
+/// consequence.
+const KEEP_PARKED: &str = "Decision: Keep it parked until a seat frees up. Nothing changes and \
+                           nobody waits on you; a task is filed to re-raise this the day a seat \
+                           frees up.";
+
+/// The three choices [`CARD`] declares, exactly as a caller reads them back.
+fn card_choices() -> Value {
+    json!([
+        {
+            "key": "assign-and-login",
+            "label": "Assign a Claude seat to hax and log in",
+            "consequence": "You buy or free one Claude seat and finish the browser login: ten minutes of your time plus the seat's monthly cost.",
+            "outcome": "approve",
+            "recommended": true,
+        },
+        {
+            "key": "keep-parked",
+            "label": "Keep it parked until a seat frees up",
+            "consequence": "Nothing changes and nobody waits on you; a task is filed to re-raise this the day a seat frees up.",
+            "outcome": "defer",
+            "recommended": false,
+        },
+        {
+            "key": "drop-receipt",
+            "label": "Drop the live-Claude receipt from the adapter",
+            "consequence": "The adapter is proven against the other providers only and the install task closes as cancelled.",
+            "outcome": "reject",
+            "recommended": false,
+        },
+    ])
+}
+
+/// The pair a row with no authored choices is served as.
+fn default_pair() -> Value {
+    json!([
+        {
+            "key": "approve",
+            "label": "Approve - proceed",
+            "consequence": "The work the body describes goes ahead as written.",
+            "outcome": "approve",
+            "recommended": false,
+        },
+        {
+            "key": "reject",
+            "label": "Reject - do not proceed",
+            "consequence": "The work the body describes does not happen; whoever raised it needs a new plan.",
+            "outcome": "reject",
+            "recommended": false,
+        },
+    ])
+}
+
+/// `attention raise BODY --as ACTOR <extra> --json`.
+fn raise_carded(fixture: &Fixture, body: &str, actor: &str, extra: &[&str]) -> Value {
+    let mut args = vec!["attention", "raise", body, "--as", actor];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    fixture.ok_json(&fixture.main, &args)
+}
+
+/// One `attention …` command that must be refused, and the message it gave.
+fn attention_refusal(fixture: &Fixture, args: &[&str]) -> String {
+    let mut full = vec!["attention"];
+    full.extend_from_slice(args);
+    full.push("--json");
+    refusal_object(&fixture.run(&fixture.main, &full))
+}
+
+/// Every attention row plus the board's audit head: what a refusal must leave
+/// exactly as it found it. The chain head is a stronger statement than the
+/// file's bytes, which a WAL checkpoint can move without any write.
+fn attention_and_chain(fixture: &Fixture) -> (Value, Value) {
+    (
+        fixture.ok_json(
+            &fixture.main,
+            &["attention", "list", "--all", "--limit", "500", "--json"],
+        ),
+        board_audit(fixture),
+    )
+}
+
+/// Return a current fixture to the exact pre-card schema shape before a
+/// historical migration test lowers `user_version` below V25.
+///
+/// The v24 search view indexed the raiser, the body and the resolution and
+/// nothing from the card, so its attention arm is put back before the columns
+/// go: SQLite re-prepares every trigger after a `DROP COLUMN`, and the three
+/// `search_attention_*` triggers read the view by name, so a view still
+/// naming `a.question` refuses the drop. The arm is rewritten in place rather
+/// than restated, so this fixture cannot drift from the view the ladder
+/// actually ships.
+fn remove_v25_attention_card_schema(connection: &Connection) {
+    let shipped: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='view' AND name='search_source_rows'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let head = "'attention: ' || a.kind,\n";
+    let tail = "\n a.status,";
+    let start = shipped.find(head).expect("the attention arm's title") + head.len();
+    let end = shipped[start..]
+        .find(tail)
+        .expect("the attention arm's status")
+        + start;
+    let v24 = format!(
+        "{}{}{}",
+        &shipped[..start],
+        " a.raised_by || char(10) || a.body || char(10) || COALESCE(a.resolution,''),",
+        &shipped[end..]
+    );
+    assert!(
+        !v24.contains("a.question") && !v24.contains("a.choices"),
+        "the v24 view still names the card: {v24}"
+    );
+    connection
+        .execute_batch(&format!(
+            "DROP VIEW search_source_rows;\n{v24};\n\
+             ALTER TABLE attention DROP COLUMN question;\
+             ALTER TABLE attention DROP COLUMN context;\
+             ALTER TABLE attention DROP COLUMN choices;\
+             ALTER TABLE attention DROP COLUMN decision;"
+        ))
+        .unwrap();
+}
+
+#[test]
+fn an_attention_raised_with_choices_round_trips_every_field_through_list_and_json() {
+    let fixture = Fixture::new("card-round-trip");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARD", "--json"]);
+
+    let raised = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to hax. Not engineering.",
+        "claude@driver",
+        &CARD,
+    );
+    assert_eq!(raised["question"], CARD[1]);
+    assert_eq!(raised["context"], CARD[3]);
+    assert_eq!(raised["choices"], card_choices());
+    assert!(raised["decision"].is_null(), "an open row has no decision");
+
+    // The listing is the same row, not a second rendering of it.
+    let listed = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0], raised);
+
+    // And the four keys are addressable by `--fields`, which validates
+    // against the published field list rather than against the row.
+    let projected = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--fields",
+            "id,question,context,choices,decision",
+            "--json",
+        ],
+    );
+    let keys = projected[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(keys, ["choices", "context", "decision", "id", "question"]);
+    assert_eq!(projected[0]["choices"], card_choices());
+
+    // The card survives an update that rewrites only the body, and an update
+    // may replace the choices without touching the question.
+    let rebodied = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            raised["id"].as_str().unwrap(),
+            "--as",
+            "claude@driver",
+            "--body",
+            "PARKED - still waiting on a seat.",
+            "--json",
+        ],
+    );
+    assert_eq!(rebodied["question"], CARD[1]);
+    assert_eq!(rebodied["choices"], card_choices());
+
+    let recarded = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            raised["id"].as_str().unwrap(),
+            "--as",
+            "claude@driver",
+            "--choice",
+            "assign-and-login=Assign a Claude seat to hax and log in|approve",
+            "--consequence",
+            "assign-and-login=One seat is bought and the login is finished today.",
+            "--choice",
+            "wait=Wait for the 2026-10-01 renewal|defer",
+            "--consequence",
+            "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+            "--recommend",
+            "assign-and-login",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        recarded["question"], CARD[1],
+        "replacing the choices must not clear the question"
+    );
+    assert_eq!(recarded["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(recarded["choices"][1]["key"], "wait");
+
+    // `--clear-card` is the one way back to the default pair.
+    let cleared = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            raised["id"].as_str().unwrap(),
+            "--as",
+            "claude@driver",
+            "--clear-card",
+            "--json",
+        ],
+    );
+    assert!(cleared["question"].is_null());
+    assert!(cleared["context"].is_null());
+    assert_eq!(cleared["choices"], default_pair());
+
+    // The ledger kept every superseded card.
+    let updates = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_updated", "--json"],
+    );
+    let cleared_event = updates
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["payload"]["previousChoices"][1]["key"] == "wait")
+        .expect("the clearing update kept the card it removed");
+    assert_eq!(cleared_event["payload"]["changed"], json!(["card"]));
+    assert_eq!(cleared_event["payload"]["previousQuestion"], CARD[1]);
+}
+
+#[test]
+fn an_attention_raised_without_choices_reads_as_the_default_approve_reject_pair_with_no_recommendation()
+ {
+    let fixture = Fixture::new("card-default-pair");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PAIR", "--json"]);
+
+    let raised = raise_carded(
+        &fixture,
+        "Two commits are ready for staging.",
+        "geoyws",
+        &[],
+    );
+    assert!(raised["question"].is_null(), "the body serves as both");
+    assert!(raised["context"].is_null());
+    assert_eq!(raised["choices"], default_pair());
+    assert_eq!(
+        raised["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|choice| choice["recommended"] == json!(true))
+            .count(),
+        0,
+        "nobody authored this pair, so nothing may be marked"
+    );
+
+    // NULL stays NULL in storage, so a backfilled row is distinguishable
+    // from a never-authored one for as long as any remain.
+    let board = board_path_for_project(&fixture, &fixture.main, "PAIR");
+    let stored: Option<String> = Connection::open(&board)
+        .unwrap()
+        .query_row("SELECT choices FROM attention", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, None, "the default pair must not be written down");
+
+    // And the pair is answerable: both keys resolve.
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            raised["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--choice",
+            "reject",
+            "--json",
+        ],
+    );
+    assert_eq!(resolved["decision"]["choice"], "reject");
+    assert_eq!(resolved["decision"]["outcome"], "reject");
+    assert_eq!(resolved["resolution"], REJECT);
+}
+
+#[test]
+fn resolving_with_a_choice_records_the_decision_object_and_composes_the_resolution_text() {
+    let fixture = Fixture::new("card-decision");
+    fixture.ok_json(&fixture.main, &["init", "--name", "DECIDE", "--json"]);
+    let first = raise_carded(&fixture, "The P0 body.", "claude@driver", &CARD);
+    let second = raise_carded(&fixture, "The second P0 body.", "claude@driver", &CARD);
+
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            first["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--choice",
+            "keep-parked",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["decision"]["choice"], "keep-parked");
+    assert_eq!(settled["decision"]["outcome"], "defer");
+    assert!(
+        settled["decision"]["note"].is_null(),
+        "a note is optional on an authored choice"
+    );
+    assert_eq!(settled["decision"]["by"], "geoyws");
+    assert_eq!(settled["decision"]["at"], settled["resolvedAt"]);
+    assert_eq!(settled["resolution"], KEEP_PARKED);
+
+    // A note rides on a second line, and only when one was given.
+    let noted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            second["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--choice",
+            "assign-and-login",
+            "--note",
+            "Buying the seat this afternoon.",
+            "--json",
+        ],
+    );
+    assert_eq!(noted["decision"]["outcome"], "approve");
+    assert_eq!(noted["decision"]["note"], "Buying the seat this afternoon.");
+    assert_eq!(
+        noted["resolution"],
+        "Decision: Assign a Claude seat to hax and log in. You buy or free one Claude seat and \
+         finish the browser login: ten minutes of your time plus the seat's monthly cost.\n\
+         Note: Buying the seat this afternoon."
+    );
+
+    // The same object is on the ledger, where a lane reads it.
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_resolved", "--json"],
+    );
+    let recorded = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["payload"]["attentionID"] == first["id"])
+        .expect("the resolve event");
+    assert_eq!(recorded["payload"]["decision"], settled["decision"]);
+    assert!(recorded["payload"]["previousDecision"].is_null());
+}
+
+#[test]
+fn resolving_with_custom_requires_an_outcome_and_a_note_and_records_both() {
+    let fixture = Fixture::new("card-custom");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CUSTOM", "--json"]);
+    let item = raise_carded(&fixture, "The P0 body.", "claude@driver", &CARD);
+    let id = item["id"].as_str().unwrap();
+    let needs_both =
+        "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note";
+
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &["resolve", id, "--as", "geoyws", "--choice", "custom"]
+        ),
+        needs_both
+    );
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "resolve",
+                id,
+                "--as",
+                "geoyws",
+                "--choice",
+                "custom",
+                "--outcome",
+                "defer",
+            ]
+        ),
+        needs_both
+    );
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "resolve", id, "--as", "geoyws", "--choice", "custom", "--note", "later",
+            ]
+        ),
+        needs_both
+    );
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--status", "open", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "a refused custom answer must leave the item open"
+    );
+
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "custom",
+            "--outcome",
+            "defer",
+            "--note",
+            "Do it after the aix pin lands.",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["decision"]["choice"], "custom");
+    assert_eq!(settled["decision"]["outcome"], "defer");
+    assert_eq!(
+        settled["decision"]["note"],
+        "Do it after the aix pin lands."
+    );
+    assert_eq!(settled["decision"]["by"], "geoyws");
+    assert_eq!(
+        settled["resolution"],
+        "Decision: Custom answer, recorded as defer.\nNote: Do it after the aix pin lands."
+    );
+    // The reserved key is not one of the row's choices and never became one.
+    assert_eq!(settled["choices"], card_choices());
+}
+
+#[test]
+fn resolve_without_a_choice_is_refused_and_the_item_stays_open() {
+    let fixture = Fixture::new("card-no-choice");
+    fixture.ok_json(&fixture.main, &["init", "--name", "NOCHOICE", "--json"]);
+    let item = raise_carded(&fixture, "Needs a verdict.", "geoyws", &[]);
+    let id = item["id"].as_str().unwrap();
+    let before = attention_and_chain(&fixture);
+
+    for args in [
+        vec!["resolve", id, "--as", "geoyws"],
+        vec!["resolve", id, "--as", "geoyws", "--note", "looks fine"],
+    ] {
+        assert_eq!(
+            attention_refusal(&fixture, &args),
+            "attention resolve requires --choice KEY or \
+             --choice custom --outcome X --note TEXT"
+        );
+    }
+    assert_eq!(
+        attention_and_chain(&fixture),
+        before,
+        "a refused resolve wrote something"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["attention", "list", "--json"])[0]["status"],
+        "open"
+    );
+}
+
+#[test]
+fn every_card_refusal_names_its_fix() {
+    let fixture = Fixture::new("card-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REFUSE", "--json"]);
+    let open = raise_carded(&fixture, "An open item with no card.", "geoyws", &[]);
+    let open_id = open["id"].as_str().unwrap().to_owned();
+    let settled = raise_carded(&fixture, "A settled item.", "geoyws", &[]);
+    let settled_id = settled["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &settled_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    let before = attention_and_chain(&fixture);
+
+    // Two well-formed choices, which every raise case below breaks in exactly
+    // one way.
+    let pair: [&str; 8] = [
+        "--choice",
+        "assign=Assign a seat|approve",
+        "--consequence",
+        "assign=One seat is bought and the login is finished today.",
+        "--choice",
+        "wait=Wait for the renewal|defer",
+        "--consequence",
+        "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+    ];
+    fn raise<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut args = vec!["raise", "a body", "--as", "claude@driver"];
+        args.extend_from_slice(extra);
+        args
+    }
+    let long_question = "q".repeat(161);
+
+    // 1. `--consequence` names a key no `--choice` declared.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "assign=Assign a seat|approve",
+                "--choice",
+                "wait=Wait for the renewal|defer",
+                "--consequence",
+                "typo=Something happens.",
+            ])
+        ),
+        "attention: no choice named typo; declared keys are assign, wait"
+    );
+    // 2. Two `--choice` share a key.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "assign=Assign a seat|approve",
+                "--choice",
+                "assign=Assign two seats|approve",
+            ])
+        ),
+        "attention: choice key assign is given twice; keys must be unique within an item"
+    );
+    // 3. Choices given and the count is not 2-4.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "assign=Assign a seat|approve",
+                "--consequence",
+                "assign=One seat is bought and the login is finished today.",
+                "--recommend",
+                "assign",
+            ])
+        ),
+        "attention: an item carries 2 to 4 choices; 1 were given"
+    );
+    // 4. Choices given and nothing is recommended.
+    assert_eq!(
+        attention_refusal(&fixture, &raise(&pair)),
+        "attention: exactly one choice is recommended; 0 were"
+    );
+    // 5. A declared choice has no `--consequence`.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "assign=Assign a seat|approve",
+                "--consequence",
+                "assign=One seat is bought and the login is finished today.",
+                "--choice",
+                "wait=Wait for the renewal|defer",
+                "--recommend",
+                "assign",
+            ])
+        ),
+        "attention: choice wait has no --consequence; every choice must say what happens if \
+         it is picked"
+    );
+    // 6. `--question` without `--context`, and the reverse.
+    let paired = "attention: --question and --context are one card; give both or neither";
+    assert_eq!(
+        attention_refusal(&fixture, &raise(&["--question", "Assign a seat?"])),
+        paired
+    );
+    assert_eq!(
+        attention_refusal(&fixture, &raise(&["--context", "A turn answers HTTP 401."])),
+        paired
+    );
+    // 7. `--choice custom` on resolve without `--outcome` or without `--note`.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &["resolve", &open_id, "--as", "geoyws", "--choice", "custom"]
+        ),
+        "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note"
+    );
+    // 8. Any card flag on a resolved item.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "update",
+                &settled_id,
+                "--as",
+                "geoyws",
+                "--question",
+                "Too late?",
+                "--context",
+                "The item is already history.",
+            ]
+        ),
+        format!("attention {settled_id} is resolved history; its card cannot be rewritten")
+    );
+    // 9. `--choice custom=…` on raise or update.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "custom=Write your own|other",
+                "--consequence",
+                "custom=Whatever you type is the verdict.",
+                "--choice",
+                "wait=Wait for the renewal|defer",
+                "--consequence",
+                "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+                "--recommend",
+                "wait",
+            ])
+        ),
+        "attention: custom is reserved for the free-text answer and cannot be a choice key"
+    );
+    // 10. `--outcome` on resolve without `--choice custom`.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "resolve",
+                &open_id,
+                "--as",
+                "geoyws",
+                "--choice",
+                "approve",
+                "--outcome",
+                "reject",
+            ]
+        ),
+        "attention: --outcome applies only to --choice custom; an authored choice carries its \
+         own outcome"
+    );
+    // 11. `--recommend` with no `--choice`.
+    assert_eq!(
+        attention_refusal(&fixture, &raise(&["--recommend", "assign"])),
+        "attention: --recommend needs choices; give --choice or drop it"
+    );
+    // 12. Every bound names the field, the bound and what it got.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--question",
+                &long_question,
+                "--context",
+                "A turn answers HTTP 401.",
+            ])
+        ),
+        "attention: --question is 161 characters; the bound is 160"
+    );
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--question",
+                "Assign a seat?",
+                "--context",
+                &"c".repeat(801),
+            ])
+        ),
+        "attention: --context is 801 characters; the bound is 800"
+    );
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                &format!("assign={}|approve", "L".repeat(61)),
+                "--consequence",
+                "assign=One seat is bought and the login is finished today.",
+                "--choice",
+                "wait=Wait for the renewal|defer",
+                "--consequence",
+                "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+                "--recommend",
+                "assign",
+            ])
+        ),
+        "attention: choice assign label is 61 characters; the bound is 60"
+    );
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "assign=Assign a seat|approve",
+                "--consequence",
+                &format!("assign={}", "C".repeat(201)),
+                "--choice",
+                "wait=Wait for the renewal|defer",
+                "--consequence",
+                "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+                "--recommend",
+                "assign",
+            ])
+        ),
+        "attention: choice assign consequence is 201 characters; the bound is 200"
+    );
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &raise(&[
+                "--choice",
+                "assign=Assign a seat|and log in|approve",
+                "--consequence",
+                "assign=One seat is bought and the login is finished today.",
+                "--choice",
+                "wait=Wait for the renewal|defer",
+                "--consequence",
+                "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+                "--recommend",
+                "assign",
+            ])
+        ),
+        "attention: choice assign label contains '|', which separates the label from the \
+         outcome in --choice KEY=LABEL|OUTCOME; write the label without it"
+    );
+    let bad_key = attention_refusal(
+        &fixture,
+        &raise(&[
+            "--choice",
+            "Assign Seat=Assign a seat|approve",
+            "--consequence",
+            "Assign Seat=One seat is bought and the login is finished today.",
+            "--choice",
+            "wait=Wait for the renewal|defer",
+            "--consequence",
+            "wait=Nothing changes until 2026-10-01, when this is re-raised.",
+            "--recommend",
+            "Assign Seat",
+        ]),
+    );
+    assert!(
+        bad_key.starts_with("attention: choice key \"Assign Seat\" is not a slug;"),
+        "{bad_key}"
+    );
+    assert!(bad_key.contains("[a-z0-9][a-z0-9-]{0,31}"), "{bad_key}");
+    // 13. Resolve naming a key the row does not carry -- what makes a stale
+    // card safe: the click names a key that no longer exists and is refused
+    // rather than mapped to whatever now sits in that position.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "resolve",
+                &open_id,
+                "--as",
+                "geoyws",
+                "--choice",
+                "keep-parked",
+            ]
+        ),
+        format!("attention {open_id} has no choice keep-parked; its choices are approve, reject")
+    );
+    // 14. Resolve with no `--choice`.
+    assert_eq!(
+        attention_refusal(&fixture, &["resolve", &open_id, "--as", "geoyws"]),
+        "attention resolve requires --choice KEY or --choice custom --outcome X --note TEXT"
+    );
+
+    assert_eq!(
+        attention_and_chain(&fixture),
+        before,
+        "a refusal wrote to the board or to the ledger"
+    );
+}
+
+#[test]
+fn a_resolved_item_refuses_every_card_flag() {
+    let fixture = Fixture::new("card-resolved-history");
+    fixture.ok_json(&fixture.main, &["init", "--name", "HISTORY", "--json"]);
+    let item = raise_carded(&fixture, "A settled item.", "claude@driver", &CARD);
+    let id = item["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "drop-receipt",
+            "--json",
+        ],
+    );
+    let before = attention_and_chain(&fixture);
+    let expected = format!("attention {id} is resolved history; its card cannot be rewritten");
+
+    for extra in [
+        vec![
+            "--question",
+            "A new question?",
+            "--context",
+            "New context for it.",
+        ],
+        vec![
+            "--choice",
+            "assign=Assign a seat|approve",
+            "--consequence",
+            "assign=One seat is bought today.",
+            "--choice",
+            "wait=Wait for the renewal|defer",
+            "--consequence",
+            "wait=Nothing changes until 2026-10-01.",
+            "--recommend",
+            "assign",
+        ],
+        vec!["--clear-card"],
+        vec!["--body", "A rewritten body."],
+    ] {
+        let mut args = vec!["update", id.as_str(), "--as", "geoyws"];
+        args.extend_from_slice(&extra);
+        assert_eq!(attention_refusal(&fixture, &args), expected, "{extra:?}");
+    }
+    assert_eq!(
+        attention_and_chain(&fixture),
+        before,
+        "a refused rewrite touched resolved history"
+    );
+}
+
+#[test]
+fn reopening_keeps_the_previous_decision_in_the_ledger_and_clears_it_from_the_row() {
+    let fixture = Fixture::new("card-reopen");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REOPEN", "--json"]);
+    let item = raise_carded(&fixture, "The P0 body.", "claude@driver", &CARD);
+    let id = item["id"].as_str().unwrap().to_owned();
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "keep-parked",
+            "--note",
+            "Not this week.",
+            "--json",
+        ],
+    );
+    let decision = settled["decision"].clone();
+    assert_eq!(decision["choice"], "keep-parked");
+
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            &id,
+            "--as",
+            "geoyws",
+            "--note",
+            "A seat freed up sooner than expected.",
+            "--json",
+        ],
+    );
+    assert_eq!(reopened["status"], "open");
+    assert!(
+        reopened["decision"].is_null(),
+        "an open row must carry no decision: {reopened}"
+    );
+    // The resolution it undid is still on the row, as it was before ADR-042.
+    assert_eq!(
+        reopened["resolution"],
+        format!("{KEEP_PARKED}\nNote: Not this week.")
+    );
+    assert_eq!(reopened["resolvedBy"], "geoyws");
+
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_reopened", "--json"],
+    );
+    assert_eq!(events.as_array().unwrap().len(), 1);
+    assert_eq!(
+        events[0]["payload"]["decision"], decision,
+        "the ledger is where the decision history lives"
+    );
+    assert_eq!(
+        events[0]["payload"]["resolution"],
+        format!("{KEEP_PARKED}\nNote: Not this week.")
+    );
+}
+
+#[test]
+fn re_resolving_a_reopened_item_records_the_new_decision_and_the_previous_one_survives_in_the_ledger()
+ {
+    let fixture = Fixture::new("card-re-resolve");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RERESOLVE", "--json"]);
+    let item = raise_carded(&fixture, "The P0 body.", "claude@driver", &CARD);
+    let id = item["id"].as_str().unwrap().to_owned();
+    let first = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "keep-parked",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            &id,
+            "--as",
+            "geoyws",
+            "--note",
+            "A seat freed up.",
+            "--json",
+        ],
+    );
+    let second = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "assign-and-login",
+            "--note",
+            "Seat assigned; logging in now.",
+            "--json",
+        ],
+    );
+    assert_eq!(second["decision"]["choice"], "assign-and-login");
+    assert_eq!(second["decision"]["outcome"], "approve");
+    assert!(
+        second["reopenedAt"].is_null(),
+        "a re-resolve clears the reopen marks"
+    );
+
+    // Both decisions are reachable, and only the newer one is on the row.
+    let resolves = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_resolved", "--json"],
+    );
+    let payloads = resolves
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["payload"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    let latest = payloads
+        .iter()
+        .find(|payload| payload["decision"]["choice"] == json!("assign-and-login"))
+        .expect("the second resolve");
+    // `previousDecision` mirrors the ROW, and the reopen cleared it from
+    // there; the decision it undid is in the reopen event below. The row's
+    // resolution survived the reopen, so that one is carried.
+    assert!(
+        latest["previousDecision"].is_null(),
+        "the row carried no decision to supersede: {latest}"
+    );
+    assert_eq!(latest["previousResolution"], KEEP_PARKED);
+    let earliest = payloads
+        .iter()
+        .find(|payload| payload["decision"]["choice"] == json!("keep-parked"))
+        .expect("the first resolve");
+    assert_eq!(earliest["decision"], first["decision"]);
+    let reopen = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_reopened", "--json"],
+    );
+    assert_eq!(reopen[0]["payload"]["decision"], first["decision"]);
+    assert_eq!(board_audit(&fixture)["errors"], json!([]));
+}
+
+#[test]
+fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as_the_default_pair()
+{
+    let fixture = Fixture::new("card-migration");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MIGRATE", "--json"]);
+    let open = raise_carded(&fixture, "An open v24 item.", "claude@driver", &[]);
+    let closed = raise_carded(&fixture, "A settled v24 item.", "claude@driver", &[]);
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            closed["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--note",
+            "Historical bytes, preserved.",
+            "--json",
+        ],
+    );
+    let historical_resolution = settled["resolution"].as_str().unwrap().to_owned();
+
+    let board = board_path_for_project(&fixture, &fixture.main, "MIGRATE");
+    {
+        let connection = Connection::open(&board).unwrap();
+        remove_v25_attention_card_schema(&connection);
+        connection.execute_batch("PRAGMA user_version=24;").unwrap();
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('attention')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for gone in ["question", "context", "choices", "decision"] {
+            assert!(
+                !columns.contains(&gone.to_owned()),
+                "the v24 fixture still has {gone}"
+            );
+        }
+    }
+
+    // Any ordinary command migrates it.
+    let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
+        25
+    );
+    for row in migrated.as_array().unwrap() {
+        assert!(row["question"].is_null());
+        assert!(row["context"].is_null());
+        assert_eq!(
+            row["choices"],
+            default_pair(),
+            "a migrated row must read as the default pair"
+        );
+        assert!(
+            row["decision"].is_null(),
+            "the migration must not invent a decision for a row settled before it"
+        );
+    }
+    let survivor = migrated
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == closed["id"])
+        .expect("the settled row survived");
+    assert_eq!(
+        survivor["resolution"], historical_resolution,
+        "no historical resolution is rewritten"
+    );
+    assert_eq!(survivor["status"], "resolved");
+    assert_eq!(survivor["resolvedBy"], "geoyws");
+
+    // And the migrated open row is answerable through the pair it now reads as.
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            open["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert_eq!(resolved["decision"]["outcome"], "approve");
+    assert_eq!(resolved["resolution"], APPROVE);
+
+    // The search projection the migration rebuilt is usable, and a rebuild
+    // over a migrated board reports every document embedded.
+    let rebuilt = fixture.ok_json(
+        &fixture.main,
+        &["search-rebuild", "--as", "tester", "--json"],
+    );
+    assert_eq!(rebuilt["documents"], rebuilt["embedded"]);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["searchIndex"]["healthy"],
+        true
+    );
+}
+
+#[test]
+fn the_audit_chain_stays_healthy_across_the_card_migration() {
+    let fixture = Fixture::new("card-migration-chain");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CHAIN", "--json"]);
+    raise_carded(&fixture, "An open v24 item.", "claude@driver", &[]);
+    let before = board_audit(&fixture);
+
+    let board = board_path_for_project(&fixture, &fixture.main, "CHAIN");
+    {
+        let connection = Connection::open(&board).unwrap();
+        remove_v25_attention_card_schema(&connection);
+        connection.execute_batch("PRAGMA user_version=24;").unwrap();
+    }
+    fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+
+    // The migration is a schema change and nothing else: it appends no event,
+    // so the chain's head and length are exactly what they were (ADR-029).
+    let after = board_audit(&fixture);
+    assert_eq!(after["lastSeq"], before["lastSeq"], "{after}");
+    assert_eq!(after["entries"], before["entries"], "{after}");
+    assert_eq!(after["head"], before["head"], "{after}");
+    assert_eq!(after["errors"], json!([]), "{after}");
+    let report = fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
+    assert_eq!(report["healthy"], true, "{report}");
+}
+
+#[test]
+fn search_finds_an_item_by_its_question_and_by_a_choice_consequence() {
+    let fixture = Fixture::new("card-search");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDSEARCH", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "PARKED - waiting on a seat.",
+        "claude@driver",
+        &CARD,
+    );
+    let id = item["id"].as_str().unwrap().to_owned();
+
+    // A freshly raised row needs no rebuild: its own trigger indexed the card.
+    let found = |query: &str| -> bool {
+        fixture.ok_json(&fixture.main, &["search", query, "--json"])["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["sourceId"] == json!(id) && hit["sourceKind"] == json!("attention"))
+    };
+    assert!(found("logged-in Claude account"), "the question is indexed");
+    assert!(
+        found("seat's monthly cost"),
+        "a choice's consequence is indexed"
+    );
+    assert!(
+        found("Keep it parked until a seat frees up"),
+        "a choice's label is indexed"
+    );
+    assert!(found("PARKED waiting seat"), "the body is still indexed");
+
+    // A row whose document predates the card -- the state every board is in
+    // immediately after the migration -- is found again once rebuilt.
+    let board = board_path_for_project(&fixture, &fixture.main, "CARDSEARCH");
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE search_documents SET body='stale' WHERE source_kind='attention'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !found("seat's monthly cost"),
+        "the fixture did not go stale"
+    );
+    let rebuilt = fixture.ok_json(
+        &fixture.main,
+        &["search-rebuild", "--as", "tester", "--json"],
+    );
+    assert_eq!(rebuilt["documents"], rebuilt["embedded"]);
+    assert!(
+        found("seat's monthly cost"),
+        "search-rebuild must index the card"
+    );
+    assert!(found("logged-in Claude account"));
+}
+
+#[test]
+fn the_schema_publishes_the_card_flags_with_the_right_kinds() {
+    let fixture = Fixture::new("card-schema");
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operation = |name: &str| -> Value {
+        schema["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no {name} operation"))
+            .clone()
+    };
+    let flag = |operation: &Value, name: &str| -> Option<Value> {
+        operation["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|flag| flag["name"] == json!(name))
+            .cloned()
+    };
+
+    for name in ["attention raise", "attention update"] {
+        let operation = operation(name);
+        for listed in ["choice", "consequence"] {
+            assert_eq!(
+                flag(&operation, listed).unwrap_or_else(|| panic!("{name} has no --{listed}"))["kind"],
+                "list",
+                "{name} --{listed}"
+            );
+        }
+        for valued in ["question", "context", "recommend"] {
+            assert_eq!(flag(&operation, valued).unwrap()["kind"], "value");
+        }
+        assert!(
+            flag(&operation, "outcome").is_none(),
+            "{name} must not offer --outcome"
+        );
+    }
+    let update = operation("attention update");
+    assert_eq!(flag(&update, "clear-card").unwrap()["kind"], "boolean");
+
+    let resolve = operation("attention resolve");
+    assert_eq!(
+        flag(&resolve, "choice").unwrap()["kind"],
+        "value",
+        "a resolve takes exactly one answer"
+    );
+    assert!(
+        flag(&resolve, "consequence").is_none(),
+        "a resolve authors nothing"
+    );
+    assert!(flag(&resolve, "recommend").is_none());
+    let outcome = flag(&resolve, "outcome").expect("attention resolve publishes --outcome");
+    assert_eq!(outcome["kind"], "value");
+    assert_eq!(
+        outcome["values"],
+        json!(["approve", "reject", "defer", "other"])
+    );
+    assert_eq!(flag(&resolve, "note").unwrap()["kind"], "value");
+}
+
+#[test]
+fn attention_resolve_refuses_a_second_choice_flag() {
+    let fixture = Fixture::new("card-one-answer");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ONEANSWER", "--json"]);
+    let item = raise_carded(&fixture, "The P0 body.", "claude@driver", &CARD);
+    let id = item["id"].as_str().unwrap().to_owned();
+    let before = attention_and_chain(&fixture);
+
+    // Two answers to one question. The parser refuses it rather than keeping
+    // the last, which is what makes the schema's `value` kind true.
+    let refusal = attention_refusal(
+        &fixture,
+        &[
+            "resolve",
+            &id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "keep-parked",
+            "--choice",
+            "drop-receipt",
+        ],
+    );
+    assert!(
+        refusal.contains("--choice (keep-parked, drop-receipt) given more than once"),
+        "{refusal}"
+    );
+    assert_eq!(attention_and_chain(&fixture), before);
+
+    // The same flag repeats on raise, where it is a list of authored options.
+    let repeated = raise_carded(&fixture, "Repeats on raise.", "claude@driver", &CARD);
+    assert_eq!(repeated["choices"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn the_mcp_attention_tools_mirror_every_card_flag_one_to_one() {
+    let fixture = Fixture::new("card-mcp");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDMCP", "--json"]);
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let tool = |name: &str| -> Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no {name} tool"))
+            .clone()
+    };
+
+    for name in ["attention_raise", "attention_update"] {
+        let properties = tool(name)["inputSchema"]["properties"].clone();
+        for listed in ["choice", "consequence"] {
+            assert_eq!(
+                properties[listed]["type"], "array",
+                "{name} {listed} must accept the list the CLI repeats"
+            );
+            assert_eq!(properties[listed]["items"]["type"], "string");
+        }
+        for valued in ["question", "context", "recommend"] {
+            assert_eq!(properties[valued]["type"], "string", "{name} {valued}");
+        }
+        assert!(properties.get("outcome").is_none(), "{name} outcome");
+    }
+    assert_eq!(
+        tool("attention_update")["inputSchema"]["properties"]["clear-card"]["type"],
+        "boolean"
+    );
+    let resolve = tool("attention_resolve")["inputSchema"]["properties"].clone();
+    assert_eq!(resolve["choice"]["type"], "string");
+    assert_eq!(resolve["outcome"]["type"], "string");
+    assert_eq!(resolve["note"]["type"], "string");
+    assert!(resolve.get("consequence").is_none());
+    assert!(resolve.get("recommend").is_none());
+
+    // A call over the wire, with arrays, equals the same card raised through
+    // the CLI -- everything but the id and the millisecond it was written in.
+    let over_the_wire = session.ask(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "attention_raise", "arguments": {
+            "text": "The P0 body.",
+            "as": "claude@driver",
+            "question": CARD[1],
+            "context": CARD[3],
+            "choice": [CARD[5], CARD[9], CARD[13]],
+            "consequence": [CARD[7], CARD[11], CARD[15]],
+            "recommend": "assign-and-login",
+        }}
+    }));
+    assert_eq!(
+        over_the_wire["result"]["isError"],
+        false,
+        "{}",
+        tool_text(&over_the_wire["result"])
+    );
+    let mut through_mcp: Value =
+        serde_json::from_str(&tool_text(&over_the_wire["result"])).expect("a tool answers JSON");
+    let mut through_cli = raise_carded(&fixture, "The P0 body.", "claude@driver", &CARD);
+    let mcp_id = through_mcp["id"].as_str().unwrap().to_owned();
+    for row in [&mut through_mcp, &mut through_cli] {
+        let object = row.as_object_mut().unwrap();
+        object.remove("id");
+        object.remove("createdAt");
+    }
+    assert_eq!(
+        through_mcp, through_cli,
+        "the generated tool wrote a different row from the CLI"
+    );
+    assert_eq!(through_mcp["choices"], card_choices());
+
+    // And a resolve takes scalars, not arrays.
+    let answered = session.ask(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "attention_resolve", "arguments": {
+            "id": mcp_id, "as": "geoyws", "choice": "keep-parked",
+        }}
+    }));
+    assert_eq!(
+        answered["result"]["isError"],
+        false,
+        "{}",
+        tool_text(&answered["result"])
+    );
+    let resolved: Value = serde_json::from_str(&tool_text(&answered["result"])).unwrap();
+    assert_eq!(resolved["decision"]["choice"], "keep-parked");
+    assert_eq!(resolved["decision"]["outcome"], "defer");
+    assert_eq!(resolved["resolution"], KEEP_PARKED);
+
+    // An array where the CLI takes one value is refused, not silently joined.
+    let two_answers = session.ask(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": { "name": "attention_resolve", "arguments": {
+            "id": mcp_id, "as": "geoyws", "choice": ["keep-parked", "drop-receipt"],
+        }}
+    }));
+    assert_eq!(two_answers["result"]["isError"], true);
+    session.finish();
+}
+
+#[test]
+fn a_transact_of_thirty_two_attention_updates_lands_or_rolls_back_whole() {
+    let fixture = Fixture::new("card-transact");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDTX", "--json"]);
+    let ids = (0..32)
+        .map(|index| {
+            raise_carded(
+                &fixture,
+                &format!("A body needing a card ({index})."),
+                "claude@driver",
+                &[],
+            )["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+
+    let item = |id: &str, index: usize| -> Value {
+        json!({ "name": "attention_update", "arguments": {
+            "id": id,
+            "as": "claude@driver",
+            "question": format!("Does row {index} ship as written, or wait for the pin?"),
+            "context": format!("Row {index} is measured and ready; nothing else waits on it, and waiting costs one day."),
+            "choice": [
+                "ship=Ship it as written|approve",
+                "wait=Wait for the aix pin|defer",
+            ],
+            "consequence": [
+                "ship=It goes out today and the receipt lands the same hour.",
+                "wait=Nothing ships until the pin lands, and this is re-raised then.",
+            ],
+            "recommend": "ship",
+        }})
+    };
+
+    // The backfill's batch shape: 32 cards, one transaction.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &ids.iter()
+            .enumerate()
+            .map(|(index, id)| item(id, index))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(envelope["results"].as_array().unwrap().len(), 32);
+    let carded = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--limit", "100", "--json"],
+    );
+    assert_eq!(carded.as_array().unwrap().len(), 32);
+    for row in carded.as_array().unwrap() {
+        assert!(
+            row["question"].as_str().unwrap().starts_with("Does row "),
+            "{row}"
+        );
+        assert_eq!(row["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(row["choices"][0]["key"], "ship");
+        assert!(row["choices"][0]["recommended"].as_bool().unwrap());
+    }
+    let landed = carded.clone();
+    let before = board_audit(&fixture);
+
+    // And one bad card takes the whole batch with it: a card with no
+    // recommendation at index 17, refused by the same validator.
+    let mut items = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| item(id, index + 100))
+        .collect::<Vec<_>>();
+    items[17]["arguments"]
+        .as_object_mut()
+        .unwrap()
+        .remove("recommend");
+    let envelope = transact_results(&fixture, &fixture.main, &items);
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["failedIndex"], 17, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    assert!(
+        envelope["results"][17]["error"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one choice is recommended; 0 were"),
+        "{envelope}"
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["attention", "list", "--limit", "100", "--json"]
+        ),
+        landed,
+        "a rolled-back batch left one of its 32 updates behind"
+    );
+    let after = board_audit(&fixture);
+    assert_eq!(after["lastSeq"], before["lastSeq"], "{after}");
+    assert_eq!(after["head"], before["head"], "{after}");
+    assert_eq!(after["errors"], json!([]), "{after}");
 }
 
 #[test]
@@ -16880,6 +18466,8 @@ fn the_operator_actor_is_geoyws_and_geo_is_not_an_alias() {
             retired["id"].as_str().unwrap(),
             "--as",
             "geo",
+            "--choice",
+            "approve",
             "--note",
             "Approved.",
             "--json",
@@ -16915,6 +18503,8 @@ fn the_operator_actor_is_geoyws_and_geo_is_not_an_alias() {
             operator["id"].as_str().unwrap(),
             "--as",
             "geoyws",
+            "--choice",
+            "approve",
             "--note",
             "Approved.",
             "--json",
@@ -16932,6 +18522,8 @@ fn the_operator_actor_is_geoyws_and_geo_is_not_an_alias() {
             retired["id"].as_str().unwrap(),
             "--as",
             "someone@lane",
+            "--choice",
+            "reject",
             "--note",
             "Withdrawn by the raiser.",
             "--json",
@@ -17176,6 +18768,25 @@ struct CappedListing {
     prepare: fn(&Fixture) -> String,
     /// Add one more row the listing would return.
     seed: fn(&Fixture, &str, usize),
+}
+
+/// One open attention item, so a resolve reaches its own validation instead
+/// of "not found".
+fn seed_open_attention(fixture: &Fixture) -> String {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "needs a verdict",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn seed_nothing(_: &Fixture) -> String {
@@ -18059,6 +19670,27 @@ const ENUM_ARGUMENTS: &[EnumArgument] = &[
         ],
     },
     EnumArgument {
+        label: "attention-resolve-outcome",
+        operation: "attention resolve",
+        argument: "outcome",
+        positional: false,
+        prepare: seed_open_attention,
+        argv: &[
+            "attention",
+            "resolve",
+            "@ctx@",
+            "--as",
+            "geoyws",
+            "--choice",
+            "custom",
+            "--note",
+            "a note the custom answer requires",
+            "--outcome",
+            "@bogus@",
+            "--json",
+        ],
+    },
+    EnumArgument {
         label: "access-audit-capability",
         operation: "access audit",
         argument: "capability",
@@ -18640,7 +20272,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        24
+        25
     );
     assert_eq!(
         connection
@@ -20798,7 +22430,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 25_i64)
+        .pragma_update(None, "user_version", 26_i64)
         .unwrap();
     drop(newer_connection);
 
@@ -21913,6 +23545,8 @@ fn serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests() {
             &seeded.default_attention_id,
             "--as",
             "ifca-sso",
+            "--choice",
+            "approve",
             "--note",
             "still blocked",
             "--json",
@@ -22397,7 +24031,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(resolved[0]["resolvedBy"], "geoyws");
     assert_eq!(
         resolved[0]["resolution"],
-        "Decision: Approved. Proceed.\nComment: Approved. Proceed after the backup."
+        format!("{APPROVE}\nNote: Approved. Proceed after the backup.")
     );
     let reject_path = format!("/attention/SERVEWRITE/{reject_id}/reply");
     let (status, response) = http_post(
@@ -22414,7 +24048,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(resolved.as_array().unwrap().len(), 2);
     assert_eq!(
         resolved[1]["resolution"],
-        "Decision: Declined. Do not proceed.\nComment: Needs another reviewer"
+        format!("{REJECT}\nNote: Needs another reviewer")
     );
     let reply_path = format!("/attention/SERVEWRITE/{reply_id}/reply");
     let (status, response) = http_post(
@@ -22436,7 +24070,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             .iter()
             .find(|item| item["id"] == reply_id)
             .expect("reply resolution")["resolution"],
-        "Comment: This is the durable note"
+        "Decision: Custom answer, recorded as other.\nNote: This is the durable note"
     );
     let (status, _) = http_post(
         port,
@@ -22647,7 +24281,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
     assert_eq!(resolved[0]["resolvedBy"], "geoyws");
     assert_eq!(
         resolved[0]["resolution"],
-        "Decision: Approved. Proceed.\nComment: Approved. Proceed after the review."
+        format!("{APPROVE}\nNote: Approved. Proceed after the review.")
     );
 
     tab.navigate_to(&origin).expect("reload Needs you");
@@ -22690,7 +24324,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
     assert_eq!(resolved.as_array().unwrap().len(), 2);
     assert_eq!(
         resolved[1]["resolution"],
-        "Decision: Declined. Do not proceed.\nComment: Needs a second reviewer"
+        format!("{REJECT}\nNote: Needs a second reviewer")
     );
 
     tab.navigate_to(&origin)
@@ -22730,7 +24364,7 @@ fn needs_you_comment_buttons_and_resolve_flow_work_in_real_chrome() {
     assert_eq!(resolved.as_array().unwrap().len(), 3);
     assert_eq!(
         reply_resolved["resolution"],
-        "Comment: This is the durable note"
+        "Decision: Custom answer, recorded as other.\nNote: This is the durable note"
     );
 }
 
@@ -29073,6 +30707,8 @@ fn compiled_binary_archives_settled_history_without_deleting_it() {
             attention["id"].as_str().unwrap(),
             "--as",
             "geoyws",
+            "--choice",
+            "approve",
             "--note",
             "accepted",
             "--json",

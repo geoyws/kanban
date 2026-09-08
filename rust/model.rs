@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -817,6 +818,456 @@ pub const ATTENTION_KINDS: [&str; 5] = ["blocking", "decision", "approval", "rev
 /// rather than deleted — so a resolved row is closed until reopened.
 pub const ATTENTION_STATUSES: [&str; 2] = ["open", "resolved"];
 
+/// The machine-readable verdicts a choice can carry (ADR-042 §1).
+///
+/// Beside [`ATTENTION_KINDS`] and [`ATTENTION_STATUSES`] and for the same
+/// reason: a closed set the schema publishes rather than a convention. The
+/// label is what geoyws reads; this is what a lane branches on.
+pub const ATTENTION_OUTCOMES: [&str; 4] = ["approve", "reject", "defer", "other"];
+
+/// The reserved key of the free-text answer every item offers. Never stored
+/// in `choices`, and refused as an authored key (ADR-042 §4 refusal 9).
+pub const CUSTOM_CHOICE: &str = "custom";
+
+const QUESTION_MAX: usize = 160;
+const CONTEXT_MAX: usize = 800;
+const LABEL_MAX: usize = 60;
+const CONSEQUENCE_MAX: usize = 200;
+const KEY_MAX: usize = 32;
+
+/// "approve, reject, defer, or other" — the four values, for a refusal that
+/// names them rather than leaving the caller to guess.
+fn outcome_list() -> String {
+    let (last, rest) = ATTENTION_OUTCOMES.split_last().expect("four outcomes");
+    format!("{}, or {last}", rest.join(", "))
+}
+
+/// One authored answer to an attention item's question.
+///
+/// `key` is what the CLI, the MCP tool, the form POST and the ledger all
+/// name, so it is a slug rather than prose; `label` is the button text and
+/// `consequence` is what happens if it is picked, including its cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionChoice {
+    pub key: String,
+    pub label: String,
+    pub consequence: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+/// What resolving recorded: the key that was picked, its verdict, any note,
+/// and who settled it when (ADR-042 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionDecision {
+    /// An authored key, or the literal [`CUSTOM_CHOICE`].
+    pub choice: String,
+    pub outcome: String,
+    pub note: Option<String>,
+    pub by: String,
+    pub at: i64,
+}
+
+/// The pair a row with no authored choices is served as (ADR-042 §2).
+///
+/// Nobody authored it, so nothing is recommended — the one place in the model
+/// where zero recommendations is legal. Labels are ASCII because they travel
+/// through argv, a form POST and a terminal.
+pub fn default_choice_pair() -> Vec<AttentionChoice> {
+    vec![
+        AttentionChoice {
+            key: "approve".to_owned(),
+            label: "Approve - proceed".to_owned(),
+            consequence: "The work the body describes goes ahead as written.".to_owned(),
+            outcome: "approve".to_owned(),
+            recommended: false,
+        },
+        AttentionChoice {
+            key: "reject".to_owned(),
+            label: "Reject - do not proceed".to_owned(),
+            consequence:
+                "The work the body describes does not happen; whoever raised it needs a new plan."
+                    .to_owned(),
+            outcome: "reject".to_owned(),
+            recommended: false,
+        },
+    ]
+}
+
+/// The authored card an `attention raise` or `attention update` carries: the
+/// question, the context needed to answer it, and two to four choices with
+/// exactly one recommendation.
+///
+/// Every ADR-042 §4 refusal that is about the card lives here and nowhere
+/// else, so the CLI, the MCP tool and the web edge share one wording. The
+/// schema cannot express these — a `CHECK constraint failed` names no fix
+/// (ADR-008) — so the columns bound lengths and this bounds the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionCard {
+    pub question: Option<String>,
+    pub context: Option<String>,
+    /// Empty when the raiser authored none; such a row reads as
+    /// [`default_choice_pair`].
+    pub choices: Vec<AttentionChoice>,
+}
+
+impl DecisionCard {
+    /// Whether this card asks for nothing to be written.
+    pub fn is_empty(&self) -> bool {
+        self.question.is_none() && self.context.is_none() && self.choices.is_empty()
+    }
+
+    /// Bind the CLI's tokens into a card, then validate it.
+    ///
+    /// `--choice KEY=LABEL|OUTCOME` splits on its FIRST `=` and its LAST `|`,
+    /// so a label may contain `=` and may not contain `|`.
+    /// `--consequence KEY=TEXT` is separate because a consequence is a
+    /// sentence that will contain `|`, `=`, commas and colons.
+    pub fn parse(
+        question: Option<&str>,
+        context: Option<&str>,
+        choices: &[String],
+        consequences: &[String],
+        recommend: Option<&str>,
+    ) -> Result<Self> {
+        let mut parsed: Vec<AttentionChoice> = Vec::with_capacity(choices.len());
+        for token in choices {
+            let Some((key, rest)) = token.split_once('=') else {
+                bail!(
+                    "attention: --choice {token:?} must read KEY=LABEL|OUTCOME, \
+                     such as --choice \"assign=Assign a Claude seat|approve\""
+                );
+            };
+            let Some((label, outcome)) = rest.rsplit_once('|') else {
+                bail!(
+                    "attention: --choice {token:?} names no outcome; it must read \
+                     KEY=LABEL|OUTCOME with the outcome one of {}",
+                    outcome_list()
+                );
+            };
+            parsed.push(AttentionChoice {
+                key: key.trim().to_owned(),
+                label: label.trim().to_owned(),
+                consequence: String::new(),
+                outcome: outcome.trim().to_owned(),
+                recommended: false,
+            });
+        }
+        // Before the consequences bind: a repeated key would take the first
+        // choice's consequence and leave the second without one, so the
+        // refusal would name a missing consequence rather than the duplicate
+        // that caused it.
+        unique_keys(&parsed)?;
+        let declared = |choices: &[AttentionChoice]| {
+            choices
+                .iter()
+                .map(|choice| choice.key.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for token in consequences {
+            let Some((key, text)) = token.split_once('=') else {
+                bail!(
+                    "attention: --consequence {token:?} must read KEY=TEXT, naming the \
+                     choice it belongs to"
+                );
+            };
+            let key = key.trim();
+            if !parsed.iter().any(|choice| choice.key == key) {
+                bail!(
+                    "attention: no choice named {key}; declared keys are {}",
+                    declared(&parsed)
+                );
+            }
+            let choice = parsed
+                .iter_mut()
+                .find(|choice| choice.key == key)
+                .expect("the key was just found");
+            if !choice.consequence.is_empty() {
+                bail!(
+                    "attention: choice {key} is given two --consequence values; \
+                     give one per choice"
+                );
+            }
+            choice.consequence = text.trim().to_owned();
+            if choice.consequence.is_empty() {
+                bail!(
+                    "attention: choice {key} has an empty --consequence; every choice must \
+                     say what happens if it is picked"
+                );
+            }
+        }
+        if let Some(key) = parsed
+            .iter()
+            .find(|choice| choice.consequence.is_empty())
+            .map(|choice| choice.key.clone())
+        {
+            bail!(
+                "attention: choice {key} has no --consequence; every choice must say what \
+                 happens if it is picked"
+            );
+        }
+        if let Some(key) = recommend {
+            let key = key.trim();
+            if parsed.is_empty() {
+                bail!("attention: --recommend needs choices; give --choice or drop it");
+            }
+            if !parsed.iter().any(|choice| choice.key == key) {
+                bail!(
+                    "attention: no choice named {key}; declared keys are {}",
+                    declared(&parsed)
+                );
+            }
+            for choice in parsed.iter_mut().filter(|choice| choice.key == key) {
+                choice.recommended = true;
+            }
+        }
+        let card = Self {
+            question: question.map(str::trim).map(str::to_owned),
+            context: context.map(str::trim).map(str::to_owned),
+            choices: parsed,
+        };
+        card.validate()?;
+        Ok(card)
+    }
+
+    /// Every cross-field and per-field invariant of a card, in one place.
+    pub fn validate(&self) -> Result<()> {
+        match (&self.question, &self.context) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => bail!("attention: --question and --context are one card; give both or neither"),
+        }
+        if let Some(question) = &self.question {
+            bounded(question, "--question", QUESTION_MAX)?;
+        }
+        if let Some(context) = &self.context {
+            bounded(context, "--context", CONTEXT_MAX)?;
+        }
+        if self.choices.is_empty() {
+            return Ok(());
+        }
+        if !(2..=4).contains(&self.choices.len()) {
+            bail!(
+                "attention: an item carries 2 to 4 choices; {} were given",
+                self.choices.len()
+            );
+        }
+        for choice in &self.choices {
+            valid_key(&choice.key)?;
+            if choice.key == CUSTOM_CHOICE {
+                bail!(
+                    "attention: {CUSTOM_CHOICE} is reserved for the free-text answer and \
+                     cannot be a choice key"
+                );
+            }
+            bounded(
+                &choice.label,
+                &format!("choice {} label", choice.key),
+                LABEL_MAX,
+            )?;
+            if choice.label.contains('|') {
+                bail!(
+                    "attention: choice {} label contains '|', which separates the label from \
+                     the outcome in --choice KEY=LABEL|OUTCOME; write the label without it",
+                    choice.key
+                );
+            }
+            bounded(
+                &choice.consequence,
+                &format!("choice {} consequence", choice.key),
+                CONSEQUENCE_MAX,
+            )?;
+            if !ATTENTION_OUTCOMES.contains(&choice.outcome.as_str()) {
+                bail!(
+                    "attention: choice {} has outcome {}; an outcome is one of {}",
+                    choice.key,
+                    choice.outcome,
+                    outcome_list()
+                );
+            }
+        }
+        unique_keys(&self.choices)?;
+        let recommended = self
+            .choices
+            .iter()
+            .filter(|choice| choice.recommended)
+            .count();
+        if recommended != 1 {
+            bail!("attention: exactly one choice is recommended; {recommended} were");
+        }
+        Ok(())
+    }
+
+    /// The `choices` column's value, or `NULL` when nothing was authored.
+    pub fn choices_json(&self) -> Option<String> {
+        if self.choices.is_empty() {
+            return None;
+        }
+        Some(serde_json::to_string(&self.choices).expect("choices serialize"))
+    }
+}
+
+/// Keys are unique within an item: the CLI, the form POST and the ledger all
+/// name a choice by its key, and two choices answering to one name make the
+/// decision ambiguous.
+fn unique_keys(choices: &[AttentionChoice]) -> Result<()> {
+    for (index, choice) in choices.iter().enumerate() {
+        if choices[..index]
+            .iter()
+            .any(|earlier| earlier.key == choice.key)
+        {
+            bail!(
+                "attention: choice key {} is given twice; keys must be unique within an item",
+                choice.key
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A field's length bound, named with what it got (ADR-042 §4 refusal 12).
+///
+/// Characters rather than bytes, because the columns' CHECKs use SQLite
+/// `length()`, which counts characters on TEXT.
+fn bounded(value: &str, field: &str, max: usize) -> Result<()> {
+    if value.is_empty() {
+        bail!("attention: {field} is empty; give it a value or drop it");
+    }
+    let length = value.chars().count();
+    if length > max {
+        bail!("attention: {field} is {length} characters; the bound is {max}");
+    }
+    Ok(())
+}
+
+/// `[a-z0-9][a-z0-9-]{0,31}`, checked without a regex dependency.
+fn valid_key(key: &str) -> Result<()> {
+    let shaped = key
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && key.len() <= KEY_MAX
+        && key
+            .chars()
+            .all(|letter| letter.is_ascii_lowercase() || letter.is_ascii_digit() || letter == '-');
+    if !shaped {
+        bail!(
+            "attention: choice key {key:?} is not a slug; a key matches \
+             [a-z0-9][a-z0-9-]{{0,31}} so it stays typeable in argv, a form POST and the ledger"
+        );
+    }
+    Ok(())
+}
+
+/// What a resolve names: an authored choice by key, or the reserved custom
+/// answer with its own outcome and a required note.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionAnswer<'a> {
+    pub choice: Option<&'a str>,
+    pub outcome: Option<&'a str>,
+    pub note: Option<&'a str>,
+}
+
+impl<'a> AttentionAnswer<'a> {
+    /// The custom answer, which every item offers and which always carries a
+    /// verdict and a note.
+    pub fn custom(outcome: &'a str, note: &'a str) -> Self {
+        Self {
+            choice: Some(CUSTOM_CHOICE),
+            outcome: Some(outcome),
+            note: Some(note),
+        }
+    }
+
+    /// The decision this answer records against a row's choices, and the
+    /// resolution text it composes.
+    ///
+    /// One composer inside the write path, so no caller can produce a
+    /// different trail and `resolution` is derived state rather than an
+    /// independent input (ADR-042 §3).
+    pub fn decide(
+        &self,
+        id: &str,
+        choices: &[AttentionChoice],
+        by: &str,
+        at: i64,
+    ) -> Result<(AttentionDecision, String)> {
+        let note = self
+            .note
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_owned);
+        let Some(key) = self.choice.map(str::trim).filter(|key| !key.is_empty()) else {
+            bail!(
+                "attention resolve requires --choice KEY or \
+                 --choice {CUSTOM_CHOICE} --outcome X --note TEXT"
+            );
+        };
+        if key == CUSTOM_CHOICE {
+            let outcome = self
+                .outcome
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let (Some(outcome), Some(note)) = (outcome, note) else {
+                bail!(
+                    "attention: a custom answer needs --outcome ({}) and --note",
+                    ATTENTION_OUTCOMES.join(", ")
+                );
+            };
+            if !ATTENTION_OUTCOMES.contains(&outcome) {
+                bail!(
+                    "attention: --outcome {outcome} is not a verdict; an outcome is one of {}",
+                    outcome_list()
+                );
+            }
+            let resolution =
+                format!("Decision: Custom answer, recorded as {outcome}.\nNote: {note}");
+            return Ok((
+                AttentionDecision {
+                    choice: CUSTOM_CHOICE.to_owned(),
+                    outcome: outcome.to_owned(),
+                    note: Some(note),
+                    by: by.to_owned(),
+                    at,
+                },
+                resolution,
+            ));
+        }
+        if self.outcome.is_some_and(|value| !value.trim().is_empty()) {
+            bail!(
+                "attention: --outcome applies only to --choice {CUSTOM_CHOICE}; \
+                 an authored choice carries its own outcome"
+            );
+        }
+        let Some(choice) = choices.iter().find(|choice| choice.key == key) else {
+            bail!(
+                "attention {id} has no choice {key}; its choices are {}",
+                choices
+                    .iter()
+                    .map(|choice| choice.key.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        };
+        let mut resolution = format!("Decision: {}. {}", choice.label, choice.consequence);
+        if let Some(note) = &note {
+            resolution.push_str("\nNote: ");
+            resolution.push_str(note);
+        }
+        Ok((
+            AttentionDecision {
+                choice: choice.key.clone(),
+                outcome: choice.outcome.clone(),
+                note,
+                by: by.to_owned(),
+                at,
+            },
+            resolution,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attention {
@@ -825,6 +1276,14 @@ pub struct Attention {
     pub task_id: Option<String>,
     pub kind: String,
     pub body: String,
+    /// What geoyws is deciding, in his terms; `None` on a row with no
+    /// authored card, where the body serves as both question and context.
+    pub question: Option<String>,
+    pub context: Option<String>,
+    /// The answers on offer: what the raiser authored, or
+    /// [`default_choice_pair`] materialized on read for a row that authored
+    /// none. Never empty, and never carries the reserved `custom` key.
+    pub choices: Vec<AttentionChoice>,
     pub raised_by: String,
     pub created_at: i64,
     pub status: String,
@@ -833,6 +1292,9 @@ pub struct Attention {
     pub resolved_at: Option<i64>,
     pub resolved_by: Option<String>,
     pub resolution: Option<String>,
+    /// What settling it recorded, or `None` while it is open — a reopen
+    /// clears it from the row and keeps it in the ledger (ADR-042 §3).
+    pub decision: Option<AttentionDecision>,
     pub reopened_at: Option<i64>,
     pub reopened_by: Option<String>,
     pub reopen_note: Option<String>,
@@ -1080,7 +1542,7 @@ pub struct HandoffInput {
 
 #[cfg(test)]
 mod tests {
-    use super::board_id_from_path;
+    use super::*;
 
     #[test]
     fn board_id_from_path_reads_the_uuid_stem_and_ignores_extension() {
@@ -1093,5 +1555,609 @@ mod tests {
         // never consults.
         assert_eq!(board_id_from_path("/"), None);
         assert_eq!(board_id_from_path(""), None);
+    }
+
+    /// One well-formed pair of tokens, which every refusal case breaks in
+    /// exactly one way.
+    fn tokens() -> (Vec<String>, Vec<String>) {
+        (
+            vec![
+                "assign=Assign a Claude seat to hax and log in|approve".to_owned(),
+                "keep-parked=Keep it parked until a seat frees up|defer".to_owned(),
+            ],
+            vec![
+                "assign=You buy or free one seat and finish the login: ten minutes.".to_owned(),
+                "keep-parked=Nothing changes; a task is filed to re-raise it.".to_owned(),
+            ],
+        )
+    }
+
+    fn refusal(
+        question: Option<&str>,
+        context: Option<&str>,
+        choices: &[String],
+        consequences: &[String],
+        recommend: Option<&str>,
+    ) -> String {
+        DecisionCard::parse(question, context, choices, consequences, recommend)
+            .expect_err("the card must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_well_formed_card_parses_into_its_choices_and_one_recommendation() {
+        let (choices, consequences) = tokens();
+        let card = DecisionCard::parse(
+            Some("  hax has no logged-in Claude account - assign a seat, or drop it?  "),
+            Some("  A real turn answers HTTP 401.  "),
+            &choices,
+            &consequences,
+            Some("assign"),
+        )
+        .expect("a well-formed card");
+        assert_eq!(
+            card.question.as_deref(),
+            Some("hax has no logged-in Claude account - assign a seat, or drop it?"),
+            "the question is stored trimmed"
+        );
+        assert_eq!(
+            card.context.as_deref(),
+            Some("A real turn answers HTTP 401.")
+        );
+        assert_eq!(card.choices.len(), 2);
+        assert_eq!(card.choices[0].key, "assign");
+        assert_eq!(
+            card.choices[0].label,
+            "Assign a Claude seat to hax and log in"
+        );
+        assert_eq!(card.choices[0].outcome, "approve");
+        assert!(card.choices[0].recommended, "--recommend marks its choice");
+        assert_eq!(card.choices[1].outcome, "defer");
+        assert!(!card.choices[1].recommended);
+        assert!(!card.is_empty());
+        // The column's value is the array, in declared order.
+        let stored: Vec<AttentionChoice> =
+            serde_json::from_str(&card.choices_json().expect("authored choices")).unwrap();
+        assert_eq!(stored, card.choices);
+    }
+
+    #[test]
+    fn an_empty_card_is_empty_and_stores_no_choices() {
+        let card = DecisionCard::parse(None, None, &[], &[], None).expect("nothing authored");
+        assert!(card.is_empty());
+        assert_eq!(card.choices_json(), None);
+    }
+
+    /// A label may contain `=` because the key splits on the FIRST one, and
+    /// the outcome splits on the LAST `|`.
+    #[test]
+    fn a_label_may_contain_an_equals_sign() {
+        let card = DecisionCard::parse(
+            None,
+            None,
+            &[
+                "pin=Set retries=3 and ship it|approve".to_owned(),
+                "hold=Hold the release|defer".to_owned(),
+            ],
+            &[
+                "pin=The queue retries three times and the release ships today.".to_owned(),
+                "hold=Nothing ships until 2026-09-15, when this is re-raised.".to_owned(),
+            ],
+            Some("pin"),
+        )
+        .expect("an `=` in a label is legal");
+        assert_eq!(card.choices[0].label, "Set retries=3 and ship it");
+    }
+
+    #[test]
+    fn a_consequence_naming_no_declared_choice_is_refused_with_the_declared_keys() {
+        let (choices, _) = tokens();
+        let error = refusal(
+            None,
+            None,
+            &choices,
+            &["typo=A consequence for a key nobody declared.".to_owned()],
+            None,
+        );
+        assert_eq!(
+            error,
+            "attention: no choice named typo; declared keys are assign, keep-parked"
+        );
+        // The same refusal covers --recommend, which names a key the same way.
+        let (_, consequences) = tokens();
+        assert_eq!(
+            refusal(None, None, &choices, &consequences, Some("typo")),
+            "attention: no choice named typo; declared keys are assign, keep-parked"
+        );
+    }
+
+    #[test]
+    fn a_repeated_choice_key_is_refused_rather_than_the_last_one_winning() {
+        let error = refusal(
+            None,
+            None,
+            &[
+                "assign=Assign a seat|approve".to_owned(),
+                "assign=Assign two seats|approve".to_owned(),
+            ],
+            &[
+                "assign=One seat is bought and the login is finished today.".to_owned(),
+                "assign=Two seats are bought and both logins are finished.".to_owned(),
+            ],
+            Some("assign"),
+        );
+        assert_eq!(
+            error,
+            "attention: choice key assign is given twice; keys must be unique within an item"
+        );
+    }
+
+    #[test]
+    fn a_choice_count_outside_two_to_four_is_refused_with_the_count() {
+        let one = refusal(
+            None,
+            None,
+            &["assign=Assign a seat|approve".to_owned()],
+            &["assign=One seat is bought and the login is finished today.".to_owned()],
+            Some("assign"),
+        );
+        assert_eq!(
+            one,
+            "attention: an item carries 2 to 4 choices; 1 were given"
+        );
+        let mut choices = Vec::new();
+        let mut consequences = Vec::new();
+        for index in 0..5 {
+            choices.push(format!("k{index}=Take option {index}|other"));
+            consequences.push(format!(
+                "k{index}=Option {index} happens and costs nothing."
+            ));
+        }
+        assert_eq!(
+            refusal(None, None, &choices, &consequences, Some("k0")),
+            "attention: an item carries 2 to 4 choices; 5 were given"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_recommendation_or_two_is_refused_with_the_count() {
+        let (choices, consequences) = tokens();
+        assert_eq!(
+            refusal(None, None, &choices, &consequences, None),
+            "attention: exactly one choice is recommended; 0 were"
+        );
+        // Two is unreachable through a single-valued --recommend and is still
+        // the invariant, so the validator is asserted directly.
+        let mut card =
+            DecisionCard::parse(None, None, &choices, &consequences, Some("assign")).unwrap();
+        card.choices[1].recommended = true;
+        assert_eq!(
+            card.validate()
+                .expect_err("two recommendations")
+                .to_string(),
+            "attention: exactly one choice is recommended; 2 were"
+        );
+    }
+
+    #[test]
+    fn a_choice_with_no_consequence_is_refused_naming_the_choice() {
+        let (choices, consequences) = tokens();
+        assert_eq!(
+            refusal(None, None, &choices, &consequences[..1], Some("assign")),
+            "attention: choice keep-parked has no --consequence; every choice must say what \
+             happens if it is picked"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &choices,
+                &["assign=   ".to_owned()],
+                Some("assign")
+            ),
+            "attention: choice assign has an empty --consequence; every choice must say what \
+             happens if it is picked"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &choices,
+                &[consequences[0].clone(), consequences[0].clone()],
+                Some("assign")
+            ),
+            "attention: choice assign is given two --consequence values; give one per choice"
+        );
+    }
+
+    #[test]
+    fn a_question_without_a_context_is_refused_as_half_a_card() {
+        let paired = "attention: --question and --context are one card; give both or neither";
+        assert_eq!(
+            refusal(Some("Assign a seat?"), None, &[], &[], None),
+            paired
+        );
+        assert_eq!(
+            refusal(None, Some("A turn answers 401."), &[], &[], None),
+            paired
+        );
+    }
+
+    #[test]
+    fn the_reserved_custom_key_cannot_be_authored() {
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "custom=Write your own answer|other".to_owned(),
+                    "assign=Assign a seat|approve".to_owned(),
+                ],
+                &[
+                    "custom=Whatever you type is recorded as the verdict.".to_owned(),
+                    "assign=One seat is bought and the login is finished today.".to_owned(),
+                ],
+                Some("assign"),
+            ),
+            "attention: custom is reserved for the free-text answer and cannot be a choice key"
+        );
+    }
+
+    #[test]
+    fn recommend_without_choices_is_refused() {
+        assert_eq!(
+            refusal(None, None, &[], &[], Some("assign")),
+            "attention: --recommend needs choices; give --choice or drop it"
+        );
+    }
+
+    #[test]
+    fn every_bound_is_refused_naming_the_field_the_bound_and_what_it_got() {
+        let (choices, consequences) = tokens();
+        let long = "x".repeat(161);
+        assert_eq!(
+            refusal(Some(&long), Some("A turn answers 401."), &[], &[], None),
+            "attention: --question is 161 characters; the bound is 160"
+        );
+        let long_context = "y".repeat(801);
+        assert_eq!(
+            refusal(Some("Assign a seat?"), Some(&long_context), &[], &[], None),
+            "attention: --context is 801 characters; the bound is 800"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    format!("assign={}|approve", "L".repeat(61)),
+                    "keep-parked=Keep it parked|defer".to_owned(),
+                ],
+                &consequences,
+                Some("assign"),
+            ),
+            "attention: choice assign label is 61 characters; the bound is 60"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &choices,
+                &[
+                    format!("assign={}", "C".repeat(201)),
+                    consequences[1].clone(),
+                ],
+                Some("assign"),
+            ),
+            "attention: choice assign consequence is 201 characters; the bound is 200"
+        );
+        // An empty question is refused as empty rather than as a length.
+        assert_eq!(
+            refusal(Some("   "), Some("A turn answers 401."), &[], &[], None),
+            "attention: --question is empty; give it a value or drop it"
+        );
+        // A label carrying `|` after the last-`|` split is refused by name.
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "assign=Assign a seat|and log in|approve".to_owned(),
+                    "keep-parked=Keep it parked|defer".to_owned(),
+                ],
+                &consequences,
+                Some("assign"),
+            ),
+            "attention: choice assign label contains '|', which separates the label from the \
+             outcome in --choice KEY=LABEL|OUTCOME; write the label without it"
+        );
+        // An empty label is empty, not zero-length-bounded.
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "assign= |approve".to_owned(),
+                    "keep=Keep it|defer".to_owned()
+                ],
+                &[
+                    consequences[0].clone(),
+                    "keep=Nothing changes and it is re-raised on 2026-09-15.".to_owned(),
+                ],
+                Some("assign"),
+            ),
+            "attention: choice assign label is empty; give it a value or drop it"
+        );
+    }
+
+    #[test]
+    fn a_malformed_choice_token_names_the_shape_it_must_take() {
+        assert_eq!(
+            refusal(None, None, &["assign".to_owned()], &[], None),
+            "attention: --choice \"assign\" must read KEY=LABEL|OUTCOME, such as \
+             --choice \"assign=Assign a Claude seat|approve\""
+        );
+        assert_eq!(
+            refusal(None, None, &["assign=Assign a seat".to_owned()], &[], None),
+            "attention: --choice \"assign=Assign a seat\" names no outcome; it must read \
+             KEY=LABEL|OUTCOME with the outcome one of approve, reject, defer, or other"
+        );
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &["assign=Assign a seat|approve".to_owned()],
+                &["a consequence with no key".to_owned()],
+                None
+            ),
+            "attention: --consequence \"a consequence with no key\" must read KEY=TEXT, \
+             naming the choice it belongs to"
+        );
+    }
+
+    #[test]
+    fn an_outcome_outside_the_closed_set_is_refused_with_the_four_values() {
+        let (_, consequences) = tokens();
+        assert_eq!(
+            refusal(
+                None,
+                None,
+                &[
+                    "assign=Assign a seat|vibes".to_owned(),
+                    "keep-parked=Keep it parked|defer".to_owned(),
+                ],
+                &consequences,
+                Some("assign"),
+            ),
+            "attention: choice assign has outcome vibes; an outcome is one of approve, \
+             reject, defer, or other"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_slug_is_refused_with_the_pattern() {
+        let (_, consequences) = tokens();
+        let error = refusal(
+            None,
+            None,
+            &[
+                "Assign Seat=Assign a seat|approve".to_owned(),
+                "keep-parked=Keep it parked|defer".to_owned(),
+            ],
+            &[
+                "Assign Seat=One seat is bought and the login is finished today.".to_owned(),
+                consequences[1].clone(),
+            ],
+            Some("Assign Seat"),
+        );
+        assert!(
+            error.starts_with("attention: choice key \"Assign Seat\" is not a slug;"),
+            "{error}"
+        );
+        assert!(error.contains("[a-z0-9][a-z0-9-]{0,31}"), "{error}");
+        // A 33-character key exceeds the bound the pattern names.
+        let long = "k".repeat(33);
+        let over = refusal(
+            None,
+            None,
+            &[
+                format!("{long}=Assign a seat|approve"),
+                "keep-parked=Keep it parked|defer".to_owned(),
+            ],
+            &[
+                format!("{long}=One seat is bought and the login is finished today."),
+                consequences[1].clone(),
+            ],
+            Some(&long),
+        );
+        assert!(over.contains("is not a slug"), "{over}");
+        // A leading hyphen is refused; a digit start is not.
+        assert!(
+            refusal(
+                None,
+                None,
+                &[
+                    "-assign=Assign a seat|approve".to_owned(),
+                    "keep=Keep it parked|defer".to_owned(),
+                ],
+                &[
+                    "-assign=One seat is bought and the login is finished today.".to_owned(),
+                    "keep=Nothing changes and it is re-raised on 2026-09-15.".to_owned(),
+                ],
+                Some("-assign"),
+            )
+            .contains("is not a slug")
+        );
+        DecisionCard::parse(
+            None,
+            None,
+            &[
+                "2fa=Turn on two-factor|approve".to_owned(),
+                "keep=Keep it parked|defer".to_owned(),
+            ],
+            &[
+                "2fa=Every login needs a second factor from today.".to_owned(),
+                "keep=Nothing changes and it is re-raised on 2026-09-15.".to_owned(),
+            ],
+            Some("2fa"),
+        )
+        .expect("a key may start with a digit");
+    }
+
+    #[test]
+    fn an_authored_choice_composes_its_label_and_consequence_and_carries_its_outcome() {
+        let (choices, consequences) = tokens();
+        let card =
+            DecisionCard::parse(None, None, &choices, &consequences, Some("assign")).unwrap();
+        let (decision, resolution) = AttentionAnswer {
+            choice: Some("keep-parked"),
+            ..Default::default()
+        }
+        .decide("a-1", &card.choices, "geoyws", 1788805112431)
+        .expect("an authored key resolves");
+        assert_eq!(decision.choice, "keep-parked");
+        assert_eq!(decision.outcome, "defer");
+        assert_eq!(decision.note, None);
+        assert_eq!(decision.by, "geoyws");
+        assert_eq!(decision.at, 1788805112431);
+        assert_eq!(
+            resolution,
+            "Decision: Keep it parked until a seat frees up. \
+             Nothing changes; a task is filed to re-raise it."
+        );
+        // A note is appended on its own line, and only when one was given.
+        let noted = AttentionAnswer {
+            choice: Some("assign"),
+            outcome: None,
+            note: Some("  after the pin lands  "),
+        }
+        .decide("a-1", &card.choices, "geoyws", 7)
+        .expect("a note is optional on an authored choice");
+        assert_eq!(noted.0.note.as_deref(), Some("after the pin lands"));
+        assert!(
+            noted.1.ends_with("\nNote: after the pin lands"),
+            "{}",
+            noted.1
+        );
+    }
+
+    #[test]
+    fn the_custom_answer_needs_an_outcome_and_a_note_and_records_both() {
+        let needs_both = "attention: a custom answer needs --outcome \
+                          (approve, reject, defer, other) and --note";
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("custom"),
+                outcome: Some("defer"),
+                note: None,
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("a custom answer with no note")
+            .to_string(),
+            needs_both
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("custom"),
+                outcome: None,
+                note: Some("do it after the pin lands"),
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("a custom answer with no outcome")
+            .to_string(),
+            needs_both
+        );
+        assert_eq!(
+            AttentionAnswer::custom("vibes", "do it")
+                .decide("a-1", &default_choice_pair(), "geoyws", 1)
+                .expect_err("an invented outcome")
+                .to_string(),
+            "attention: --outcome vibes is not a verdict; an outcome is one of approve, \
+             reject, defer, or other"
+        );
+        let (decision, resolution) = AttentionAnswer::custom("defer", "  after the pin lands  ")
+            .decide("a-1", &default_choice_pair(), "geoyws", 42)
+            .expect("a custom answer with both");
+        assert_eq!(decision.choice, "custom");
+        assert_eq!(decision.outcome, "defer");
+        assert_eq!(decision.note.as_deref(), Some("after the pin lands"));
+        assert_eq!(
+            resolution,
+            "Decision: Custom answer, recorded as defer.\nNote: after the pin lands"
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_choice_or_a_stale_one_or_a_stray_outcome_is_refused() {
+        assert_eq!(
+            AttentionAnswer::default()
+                .decide("a-1", &default_choice_pair(), "geoyws", 1)
+                .expect_err("no choice at all")
+                .to_string(),
+            "attention resolve requires --choice KEY or \
+             --choice custom --outcome X --note TEXT"
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("   "),
+                ..Default::default()
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("an empty choice is no choice")
+            .to_string(),
+            "attention resolve requires --choice KEY or \
+             --choice custom --outcome X --note TEXT"
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("keep-parked"),
+                ..Default::default()
+            }
+            .decide("a-347ff24c", &default_choice_pair(), "geoyws", 1)
+            .expect_err("a key the row does not carry")
+            .to_string(),
+            "attention a-347ff24c has no choice keep-parked; its choices are approve, reject"
+        );
+        assert_eq!(
+            AttentionAnswer {
+                choice: Some("approve"),
+                outcome: Some("reject"),
+                note: None,
+            }
+            .decide("a-1", &default_choice_pair(), "geoyws", 1)
+            .expect_err("an outcome on an authored choice")
+            .to_string(),
+            "attention: --outcome applies only to --choice custom; an authored choice \
+             carries its own outcome"
+        );
+    }
+
+    #[test]
+    fn the_default_pair_is_two_choices_with_no_recommendation() {
+        let pair = default_choice_pair();
+        assert_eq!(
+            pair.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+            ["approve", "reject"]
+        );
+        assert_eq!(pair.iter().filter(|c| c.recommended).count(), 0);
+        // ASCII only: these labels travel through argv, a form POST and a
+        // terminal.
+        for choice in &pair {
+            assert!(choice.label.is_ascii(), "{}", choice.label);
+            assert!(choice.consequence.is_ascii(), "{}", choice.consequence);
+        }
+        // Synthesized rather than chosen, so the one card the model refuses
+        // to author is the one it serves by default.
+        let synthesized = DecisionCard {
+            question: None,
+            context: None,
+            choices: pair,
+        };
+        assert_eq!(
+            synthesized
+                .validate()
+                .expect_err("nothing authored it, so nothing may be marked")
+                .to_string(),
+            "attention: exactly one choice is recommended; 0 were"
+        );
     }
 }

@@ -274,9 +274,8 @@ fn tools() -> Vec<Value> {
                 .chain(TOOL_GLOBALS.iter())
                 .filter(|flag| !ignored.contains(*flag))
             {
-                let (kind, description): (Value, String) = if crate::REPEATABLE.contains(flag)
-                    || (*command == "access" && crate::ACCESS_REPEATABLE.contains(flag))
-                {
+                let (kind, description): (Value, String) =
+                    if crate::repeatable(command, *sub, flag) {
                     (
                         json!({ "type": "array", "items": { "type": "string" } }),
                         format!("--{flag}, repeatable."),
@@ -373,8 +372,7 @@ pub(crate) fn arguments_for(name: &str, arguments: &Value) -> Result<Vec<String>
             // the refusal somewhere less obvious.
             bail!("{name} has no argument {key}");
         }
-        let repeatable = crate::REPEATABLE.contains(&key.as_str())
-            || (*command == "access" && crate::ACCESS_REPEATABLE.contains(&key.as_str()));
+        let repeatable = crate::repeatable(command, *sub, key.as_str());
         match value {
             Value::Null => {}
             // A boolean flag is present or absent; false means absent.

@@ -1034,12 +1034,31 @@ fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
     })
 }
 
+/// A stored JSON document, refused rather than swallowed.
+///
+/// The columns' CHECKs guarantee valid JSON of the right type, so a parse
+/// failure here means the file was edited outside kanban. Reading it as
+/// "no card" would present an authored decision as an unauthored row.
+fn parse_card_json<T: serde::de::DeserializeOwned>(text: String) -> rusqlite::Result<T> {
+    serde_json::from_str(&text)
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
+}
+
 fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
         kind: row.get("kind")?,
         body: row.get("body")?,
+        question: row.get("question")?,
+        context: row.get("context")?,
+        // A row that authored none is SERVED as the default approve/reject
+        // pair and STORED as NULL, so a backfilled row stays distinguishable
+        // from a never-authored one for as long as any remain (ADR-042 §2).
+        choices: match row.get::<_, Option<String>>("choices")? {
+            Some(text) => parse_card_json(text)?,
+            None => default_choice_pair(),
+        },
         raised_by: row.get("raised_by")?,
         created_at: row.get("created_at")?,
         status: row.get("status")?,
@@ -1048,6 +1067,10 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         resolved_at: row.get("resolved_at")?,
         resolved_by: row.get("resolved_by")?,
         resolution: row.get("resolution")?,
+        decision: row
+            .get::<_, Option<String>>("decision")?
+            .map(parse_card_json)
+            .transpose()?,
         reopened_at: row.get("reopened_at")?,
         reopened_by: row.get("reopened_by")?,
         reopen_note: row.get("reopen_note")?,
@@ -4875,6 +4898,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn raise_attention(
         &mut self,
         body: &str,
@@ -4883,11 +4907,15 @@ impl Store {
         task_id: Option<&str>,
         priority: i64,
         tags: &[String],
+        card: &DecisionCard,
     ) -> Result<Attention> {
         validate(kind, &ATTENTION_KINDS, "attention kind")?;
         validate_priority(Some(priority))?;
         let body = nonempty(body, "attention body")?.to_owned();
         let raised_by = nonempty(raised_by, "raised by")?.to_owned();
+        // Before the write lock: a malformed card is refused without taking
+        // it, and the refusal is the same one every other surface reads.
+        card.validate()?;
         let transaction = self.begin_write()?;
         // A new attention row has no old tag set; the resulting set is the
         // tags the caller asked for. Under the mutation lock.
@@ -4898,8 +4926,19 @@ impl Store {
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?)",
-            params![id, task_id, kind, body, raised_by, now, priority],
+            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL)",
+            params![
+                id,
+                task_id,
+                kind,
+                body,
+                raised_by,
+                now,
+                priority,
+                card.question,
+                card.context,
+                card.choices_json()
+            ],
         )?;
         set_attention_tags(&transaction, &id, tags)?;
         event(
@@ -4907,7 +4946,7 @@ impl Store {
             task_id,
             "attention_raised",
             Some(&raised_by),
-            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority), "tags": tags}),
+            json!({"attentionID": id, "kind": kind, "priority": priority, "priorityLevel": priority_level(priority), "tags": tags, "choices": card.choices}),
         )?;
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [&id], attention_row)?;
@@ -5062,16 +5101,33 @@ impl Store {
     }
 
     /// Correct an open attention row without settling it. The event retains
-    /// the text and tags that were superseded; resolved rows are immutable.
+    /// the text, tags and card that were superseded; resolved rows are
+    /// immutable.
+    ///
+    /// A card arrives as the halves the caller named: the question/context
+    /// pair replaces the row's pair when it is given, and the choices replace
+    /// the row's choices when they are given. Nothing is removed implicitly —
+    /// `clear_card` is the one way back to the default pair, because
+    /// question, context, choices and recommendation are one card and
+    /// clearing half of it would leave the pairing rule violated
+    /// (ADR-042 §4).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_attention(
         &mut self,
         id: &str,
         body: Option<&str>,
         tags: Option<&[String]>,
+        card: Option<&DecisionCard>,
+        clear_card: bool,
         actor: &str,
     ) -> Result<Attention> {
-        if body.is_none() && tags.is_none() {
-            bail!("attention update requires --body/--body-file, --tag, or --clear-tags");
+        let authored = card.is_some_and(|card| !card.is_empty());
+        if body.is_none() && tags.is_none() && !authored && !clear_card {
+            bail!(
+                "attention update requires --body/--body-file, --tag, --clear-tags, \
+                 --question and --context, --choice with --consequence and --recommend, \
+                 or --clear-card"
+            );
         }
         let body = body
             .map(|value| nonempty(value, "attention body"))
@@ -5090,13 +5146,54 @@ impl Store {
             .optional()?
             .with_context(|| format!("attention {id} not found"))?;
         if existing.status != "open" {
-            bail!("attention {id} is resolved history; its tags cannot be rewritten");
+            bail!("attention {id} is resolved history; its card cannot be rewritten");
         }
+        // The column, not the served row: a row that authored no choices is
+        // served as the default pair, and merging that pair in would turn a
+        // never-authored row into an authored one on a body-only update.
+        let stored_choices: Option<String> =
+            transaction.query_row("SELECT choices FROM attention WHERE id=?", [id], |row| {
+                row.get(0)
+            })?;
+        let mut question = existing.question.clone();
+        let mut context = existing.context.clone();
+        let mut choices = stored_choices.clone();
+        if clear_card {
+            question = None;
+            context = None;
+            choices = None;
+        }
+        if let Some(card) = card {
+            if card.question.is_some() {
+                question = card.question.clone();
+                context = card.context.clone();
+            }
+            if let Some(json) = card.choices_json() {
+                choices = Some(json);
+            }
+        }
+        // What the row will carry, checked by the same validator that checked
+        // what the caller typed.
+        DecisionCard {
+            question: question.clone(),
+            context: context.clone(),
+            choices: match &choices {
+                Some(text) => serde_json::from_str(text)?,
+                None => Vec::new(),
+            },
+        }
+        .validate()?;
         let mut previous = vec![existing.clone()];
         attach_attention_tags(&transaction, &mut previous)?;
         transaction.execute(
-            "UPDATE attention SET body=? WHERE id=?",
-            params![body.unwrap_or(&existing.body), id],
+            "UPDATE attention SET body=?,question=?,context=?,choices=? WHERE id=?",
+            params![
+                body.unwrap_or(&existing.body),
+                question,
+                context,
+                choices,
+                id
+            ],
         )?;
         if let Some(tags) = tags {
             set_attention_tags(&transaction, id, tags)?;
@@ -5108,6 +5205,9 @@ impl Store {
         if tags.is_some() {
             changed.push("tags");
         }
+        if authored || clear_card {
+            changed.push("card");
+        }
         event(
             &transaction,
             existing.task_id.as_deref(),
@@ -5118,6 +5218,14 @@ impl Store {
                 "changed": changed,
                 "previousBody": existing.body,
                 "previousTags": previous[0].tags,
+                "previousQuestion": existing.question,
+                "previousContext": existing.context,
+                // The column as it stood: null where the row authored none,
+                // so the trail says which of the two it was.
+                "previousChoices": stored_choices
+                    .as_deref()
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?,
             }),
         )?;
         let result =
@@ -5133,9 +5241,9 @@ impl Store {
         &mut self,
         id: &str,
         actor: &str,
-        resolution: Option<&str>,
+        answer: &AttentionAnswer<'_>,
     ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(id, actor, actor, resolution, false)
+        self.resolve_attention_with_authorization(id, actor, actor, answer, false)
     }
 
     /// Settle an item from the trusted web edge.
@@ -5146,9 +5254,9 @@ impl Store {
         &mut self,
         id: &str,
         actor: &str,
-        resolution: Option<&str>,
+        answer: &AttentionAnswer<'_>,
     ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(id, actor, actor, resolution, true)
+        self.resolve_attention_with_authorization(id, actor, actor, answer, true)
     }
 
     fn resolve_attention_with_authorization(
@@ -5156,7 +5264,7 @@ impl Store {
         id: &str,
         authorization_actor: &str,
         audit_actor: &str,
-        resolution: Option<&str>,
+        answer: &AttentionAnswer<'_>,
         trusted_edge: bool,
     ) -> Result<Attention> {
         let authorization_actor = nonempty(authorization_actor, "actor")?.to_owned();
@@ -5188,16 +5296,17 @@ impl Store {
                 existing.raised_by
             );
         }
-        let resolution = nonempty(
-            resolution.context("--note is required so the resolution is auditable")?,
-            "resolution note",
-        )?
-        .to_owned();
         let now = now_ms();
+        // The composer lives here and nowhere else, so no caller can produce
+        // a different trail and `resolution` is derived rather than passed
+        // (ADR-042 §3). `existing.choices` is the served card, so a row that
+        // authored none is answered through the default pair.
+        let (decision, resolution) = answer.decide(id, &existing.choices, &audit_actor, now)?;
+        let decision_json = serde_json::to_string(&decision)?;
         transaction.execute(
             "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=?,\
-             reopened_at=NULL,reopened_by=NULL,reopen_note=NULL WHERE id=?",
-            params![now, audit_actor, resolution, id],
+             decision=?,reopened_at=NULL,reopened_by=NULL,reopen_note=NULL WHERE id=?",
+            params![now, audit_actor, resolution, decision_json, id],
         )?;
         event(
             &transaction,
@@ -5207,9 +5316,11 @@ impl Store {
             json!({
                 "attentionID": id,
                 "kind": existing.kind,
+                "decision": decision,
                 "previousResolvedAt": existing.resolved_at,
                 "previousResolvedBy": existing.resolved_by,
                 "previousResolution": existing.resolution,
+                "previousDecision": existing.decision,
                 "reopenedAt": existing.reopened_at,
                 "reopenedBy": existing.reopened_by,
                 "reopenNote": existing.reopen_note,
@@ -5247,8 +5358,14 @@ impl Store {
             );
         }
         let now = now_ms();
+        // The decision leaves the ROW and stays in the LEDGER: the row's
+        // contract is what is true now, and an open item has no decision.
+        // The event below is the hash-chained copy, so nothing is lost
+        // (ADR-042 §3). `resolved_at`, `resolved_by` and `resolution` stay
+        // where BOARD_V17's CHECK requires them.
         transaction.execute(
-            "UPDATE attention SET status='open',reopened_at=?,reopened_by=?,reopen_note=? WHERE id=?",
+            "UPDATE attention SET status='open',reopened_at=?,reopened_by=?,reopen_note=?,\
+             decision=NULL WHERE id=?",
             params![now, actor, note, id],
         )?;
         event(
@@ -5261,6 +5378,7 @@ impl Store {
                 "resolvedAt": existing.resolved_at,
                 "resolvedBy": existing.resolved_by,
                 "resolution": existing.resolution,
+                "decision": existing.decision,
                 "note": note,
             }),
         )?;
@@ -6766,6 +6884,7 @@ mod tests {
                 Some("t-b"),
                 3,
                 &["beta".to_owned()],
+                &DecisionCard::default(),
             )
             .expect("seed attention");
             b.add_note("t-b", "seed", "progress", "a note on the other board")
@@ -6872,15 +6991,30 @@ mod tests {
             "story advance",
         );
         assert_denied(
-            store.raise_attention("body", "blocking", "actor", None, 3, &[]),
+            store.raise_attention(
+                "body",
+                "blocking",
+                "actor",
+                None,
+                3,
+                &[],
+                &DecisionCard::default(),
+            ),
             "attention raise",
         );
         assert_denied(
-            store.update_attention("a-x", None, Some(&["beta".to_owned()]), "actor"),
+            store.update_attention(
+                "a-x",
+                None,
+                Some(&["beta".to_owned()]),
+                None,
+                false,
+                "actor",
+            ),
             "attention update",
         );
         assert_denied(
-            store.resolve_attention("a-x", "actor", Some("done")),
+            store.resolve_attention("a-x", "actor", &AttentionAnswer::custom("other", "done")),
             "attention resolve",
         );
         assert_denied(
@@ -7021,6 +7155,7 @@ mod tests {
                 None,
                 3,
                 &["alpha".to_owned()],
+                &DecisionCard::default(),
             )
             .expect("seed attention")
         };
@@ -7054,6 +7189,8 @@ mod tests {
                 &raised.id,
                 Some("rewritten"),
                 Some(&["beta".to_owned()]),
+                None,
+                false,
                 "actor",
             )
             .expect_err("a retag to an unseen tag must be denied");
@@ -7170,6 +7307,7 @@ mod tests {
                 Some("t-web"),
                 0,
                 &[],
+                &DecisionCard::default(),
             )
             .expect("raise web attention");
         let cli_attention = store
@@ -7180,6 +7318,7 @@ mod tests {
                 Some("t-cli"),
                 0,
                 &[],
+                &DecisionCard::default(),
             )
             .expect("raise cli attention");
         let forbidden_attention = store
@@ -7190,11 +7329,16 @@ mod tests {
                 Some("t-forbidden"),
                 0,
                 &[],
+                &DecisionCard::default(),
             )
             .expect("raise forbidden attention");
 
         let resolved = store
-            .resolve_attention_from_trusted_edge(&web_attention.id, "ifca-sso", Some("done"))
+            .resolve_attention_from_trusted_edge(
+                &web_attention.id,
+                "ifca-sso",
+                &AttentionAnswer::custom("other", "done"),
+            )
             .expect("trusted edge resolution");
         assert_eq!(resolved.resolved_by.as_deref(), Some("ifca-sso"));
 
@@ -7205,7 +7349,11 @@ mod tests {
         assert_eq!(resolved_events[0].actor.as_deref(), Some("ifca-sso"));
 
         let cli_resolved = store
-            .resolve_attention(&cli_attention.id, "ifca-sso", Some("done"))
+            .resolve_attention(
+                &cli_attention.id,
+                "ifca-sso",
+                &AttentionAnswer::custom("other", "done"),
+            )
             .expect("ordinary cli resolution");
         assert_eq!(cli_resolved.resolved_by.as_deref(), Some("ifca-sso"));
 
@@ -7216,7 +7364,11 @@ mod tests {
         assert_eq!(cli_events[0].actor.as_deref(), Some("ifca-sso"));
 
         let forbidden = store
-            .resolve_attention(&forbidden_attention.id, "ifca-sso", Some("not allowed"))
+            .resolve_attention(
+                &forbidden_attention.id,
+                "ifca-sso",
+                &AttentionAnswer::custom("other", "not allowed"),
+            )
             .expect_err("CLI resolve must still reject a non-geoyws, non-raiser actor")
             .to_string();
         assert!(
@@ -10095,6 +10247,7 @@ mod tests {
                 Some("t-embed"),
                 3,
                 &[],
+                &DecisionCard::default(),
             )
             .unwrap();
 
@@ -10596,7 +10749,15 @@ mod tests {
         insert_lane_task(&store, "t-other", Some("driver-3"));
         let raise = |store: &mut Store, body: &str, raiser: &str, task: Option<&str>| {
             store
-                .raise_attention(body, "decision", raiser, task, 6, &[])
+                .raise_attention(
+                    body,
+                    "decision",
+                    raiser,
+                    task,
+                    6,
+                    &[],
+                    &DecisionCard::default(),
+                )
                 .expect("raise")
                 .id
         };
