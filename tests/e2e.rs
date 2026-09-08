@@ -6160,6 +6160,142 @@ impl SealedEstate {
     }
 }
 
+/// Every path the ownership rule could reach, and what it looks like now.
+///
+/// `databases` are swept with their WAL sidecars; `plain` are files that have
+/// none — the data root's `.lock` and `.init.lock`, which every command opens
+/// before it reaches SQLite.
+///
+/// A sidecar that is not there between commands is not a gap: SQLite removes
+/// `-wal` and `-shm` when the last connection closes cleanly, so what exists
+/// depends on what else has the board open. The record is therefore of what
+/// is on disk, keyed by path, and the assertions below compare like with like.
+fn ownership_snapshot(databases: &[&Path], plain: &[&Path]) -> BTreeMap<PathBuf, (u32, u32, u32)> {
+    let mut seen = BTreeMap::new();
+    let mut record = |path: PathBuf| {
+        if let Ok(metadata) = fs::metadata(&path) {
+            seen.insert(
+                path,
+                (
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.permissions().mode() & 0o777,
+                ),
+            );
+        }
+    };
+    for base in databases {
+        for suffix in ["", "-wal", "-shm"] {
+            record(PathBuf::from(format!("{}{suffix}", base.display())));
+        }
+    }
+    for path in plain {
+        record(PathBuf::from(path));
+    }
+    seen
+}
+
+/// A run that is not root leaves every ownership bit exactly as it found it.
+///
+/// The change this guards makes a ROOT cli hand the files it touches to the
+/// owner of the directory they live in. kb.geoy.ws answered 500 on every
+/// route on the morning of 2026-09-08 because one board was `root:root 0600`
+/// while the web service runs as `kanban`: the board had been created by a
+/// root `kb init` over ssh, and a later root read left root-owned `-wal` and
+/// `-shm` beside it. The data root's `.lock` and `.init.lock` are in here for
+/// the same reason and cost a second outage to find: mirroring only the
+/// databases left the marker every command opens before SQLite at
+/// `root:root`, and the service met `open lock file <root>/.lock: Permission
+/// denied` instead of a 500.
+///
+/// The root half cannot be measured from a test — a process cannot become
+/// root, and one already running as root cannot conjure a directory owned by
+/// somebody else — so it is proved on the pure decision function in
+/// `db::tests::ownership_target_mirrors_only_what_root_left_in_another_user_s_directory`.
+/// This is the other half, and it is the one that would regress for every
+/// ordinary user at once: on a read and on a write, through the compiled
+/// binary, nothing about the board's ownership or its mode may move.
+///
+/// Mode is asserted beside ownership because they fail together. `chown` and
+/// `chmod` are both writes to the inode, the seal tests below exist because a
+/// stray `chmod` once undid an operator's 0400, and a board this process can
+/// no longer open is the same outage whichever bit caused it.
+#[test]
+fn a_non_root_open_leaves_board_ownership_and_mode_untouched() {
+    let fixture = Fixture::new("ownership-untouched");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OWNED", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Seed", "--id", "t-own-seed", "--json"],
+    );
+    let board = board_path_for_project(&fixture, &fixture.main, "OWNED");
+    let registry = fixture.data.join("registry.db");
+
+    // Who this process is, read off a file it just created rather than from
+    // `geteuid`, so the expectation is stated in the same terms as the
+    // measurement. Correct for root too: root's own files come out `0:0`, and
+    // the temp tree is root's, so the rule is a no-op there as well.
+    let probe = fixture.root.join("identity-probe");
+    fs::write(&probe, b"probe").unwrap();
+    let identity = fs::metadata(&probe).unwrap();
+    let (my_uid, my_gid) = (identity.uid(), identity.gid());
+    fs::remove_file(&probe).unwrap();
+
+    // Both lock files, because they are what a root `init` leaves behind
+    // ahead of any database and what the service opens first.
+    let lock = fixture.data.join(".lock");
+    let init_lock = fixture.data.join(".init.lock");
+    let before = ownership_snapshot(&[&board, &registry], &[&lock, &init_lock]);
+    for required in [&board, &registry, &lock, &init_lock] {
+        assert!(
+            before.contains_key(required),
+            "{} was not on disk, so this measured nothing about it: {before:?}",
+            required.display()
+        );
+    }
+
+    // A read and a write, because they take different opens: the read-only
+    // one, and `db::open` through the store.
+    let listed = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == "t-own-seed"),
+        "the read answered nothing, so it exercised no open: {listed}"
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "After", "--id", "t-own-after", "--json"],
+    );
+
+    let after = ownership_snapshot(&[&board, &registry], &[&lock, &init_lock]);
+    for (path, now) in &after {
+        assert_eq!(
+            (now.0, now.1),
+            (my_uid, my_gid),
+            "{} changed hands during a non-root run",
+            path.display()
+        );
+        assert_eq!(
+            now.2,
+            0o600,
+            "{} came out of a non-root run at mode {:04o}",
+            path.display(),
+            now.2
+        );
+        if let Some(then) = before.get(path) {
+            assert_eq!(
+                now,
+                then,
+                "{} was re-owned or re-permissioned",
+                path.display()
+            );
+        }
+    }
+}
+
 /// A board and a registry the caller cannot write are still a board and a
 /// registry the caller can read.
 ///

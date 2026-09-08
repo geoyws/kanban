@@ -451,6 +451,11 @@ mode `0600` before SQLite opens them, so they are never briefly world-readable.
 Directories Kanban creates are `0700` from creation. Kanban never re-permissions
 a directory it did not create, so pointing `--db` at a shared path leaves that
 path alone ([ADR-008](docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md)).
+When the CLI runs as root inside a data directory owned by somebody else — the
+shape on hax, where `kb` over ssh is root while `kanban serve` runs as the
+`kanban` user — every file it creates or opens there, the `-wal` and `-shm`
+beside a board included, is given that directory's owner, so a root command
+cannot leave the service unable to open its own data.
 Check and back up all registered boards with:
 
 ```bash

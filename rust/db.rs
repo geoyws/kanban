@@ -6,8 +6,8 @@ use serde_json::json;
 use std::cell::Cell;
 use std::fs::{self, Permissions};
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, chown};
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1737,7 +1737,9 @@ pub fn create_private_dir_all(dir: &Path) -> Result<()> {
         create_private_dir_all(parent)?;
     }
     match fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => Ok(()),
+        // A directory root creates inside a tree it does not own belongs to
+        // that tree's owner, not to root. See [`ownership_target`].
+        Ok(()) => mirror_directory_owner(dir),
         // A concurrent kanban process won the race; its mode is ours.
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("create directory {}", dir.display())),
@@ -1780,6 +1782,160 @@ fn tighten_to(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("tighten {} to mode {tightened:04o}", path.display()))
 }
 
+/// The uid and gid a file must end up with, or `None` to leave it alone.
+///
+/// Pure, because this is the entire rule and it has to be readable as one.
+///
+/// kb.geoy.ws answered 500 on every route on the morning of 2026-09-08 with
+/// one board file `root:root 0600`. The web service has run as the `kanban`
+/// user since the 2026-09-06 identity cutover; the CLI over ssh runs as root,
+/// so the board root created with `kb init` was born root-owned, and a later
+/// root read left root-owned `-wal`/`-shm` beside it. Boards are 0600 and
+/// `tighten_to` keeps them there on purpose, so the service could not open
+/// its own data and every route answered 500 until the files were chowned by
+/// hand.
+///
+/// So: when root writes into a directory that belongs to somebody else, the
+/// files it leaves belong to that somebody. Ownership of the bytes and ONLY
+/// that — the audit principal, the actor on every event, and every
+/// authorization decision stay exactly as they were, because who ran the
+/// command is a different question from who owns the file it touched.
+///
+/// `None` four ways, each for its own reason: a non-root process cannot
+/// chown and its own uid is the directory's business; a directory root owns
+/// has nothing to mirror; a file that already matches needs no syscall; and
+/// gid is included because `root:root` beside a `kanban:kanban` directory is
+/// wrong in both halves.
+fn ownership_target(
+    euid: u32,
+    dir_uid: u32,
+    dir_gid: u32,
+    file_uid: u32,
+    file_gid: u32,
+) -> Option<(u32, u32)> {
+    if euid != 0 || dir_uid == 0 || (file_uid == dir_uid && file_gid == dir_gid) {
+        return None;
+    }
+    Some((dir_uid, dir_gid))
+}
+
+/// What SQLite appends to a database's own name in WAL mode.
+const WAL_SIBLING_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
+
+/// `x.db` -> `x.db-wal`, `x.db-shm`.
+///
+/// Concatenation onto the whole file name, never `with_extension`, which
+/// would replace `.db` and name two files SQLite has never heard of.
+fn wal_siblings(path: &Path) -> [PathBuf; 2] {
+    WAL_SIBLING_SUFFIXES.map(|suffix| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    })
+}
+
+/// This process's euid and the owner of the directory `path` lives in, or
+/// `None` when the rule cannot apply at all.
+///
+/// The `geteuid` comes first so the entire non-root world — every ordinary
+/// run of this binary — pays one syscall and no `stat`.
+fn directory_owner(path: &Path) -> Result<Option<(u32, u32, u32)>> {
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        return Ok(None);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = fs::metadata(parent)
+        .with_context(|| format!("read the owner of directory {}", parent.display()))?;
+    Ok(Some((euid, directory.uid(), directory.gid())))
+}
+
+/// Hand one path to the directory's owner, if [`ownership_target`] says so.
+///
+/// A path that is not there is not an error: `-wal` and `-shm` exist only
+/// while the database is open, and asking is how we find out. A `chown` that
+/// FAILS is an error and is reported as one — a root process that cannot
+/// chown has a real problem, and swallowing it is how a board goes back to
+/// being unopenable by the service that owns it.
+///
+/// `fs::metadata` rather than `symlink_metadata`, because `chown` follows
+/// symlinks: the two have to be asking about the same inode, and a dangling
+/// link reads as absent, which is the right answer for one.
+fn mirror_owner_onto(path: &Path, euid: u32, dir_uid: u32, dir_gid: u32) -> Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read the owner of {}", path.display()));
+        }
+    };
+    let Some((uid, gid)) = ownership_target(euid, dir_uid, dir_gid, metadata.uid(), metadata.gid())
+    else {
+        return Ok(());
+    };
+    chown(path, Some(uid), Some(gid)).with_context(|| {
+        format!(
+            "give {} to the owner of its directory, uid {uid} gid {gid}",
+            path.display()
+        )
+    })
+}
+
+/// Give `path` and any WAL sidecar beside it the owner of the directory they
+/// live in. See [`ownership_target`] for the rule and the outage behind it.
+///
+/// Called AFTER a database has been opened AND used, never only before.
+/// Measured on this crate's own `open`: `-wal` and `-shm` do not exist when
+/// the `journal_mode=WAL` pragma batch finishes, and both appear at the first
+/// statement that touches pages — the migration read, or a plain `SELECT` on
+/// a read-only connection. So the calls that cover the sidecars are the ones
+/// at the end of `open_board`, `open_registry`, each read-only open once its
+/// queries have run, and [`checkpoint`], which `Store::drop` and
+/// `Registry::drop` run on the way out of every command and which is what
+/// catches a sidecar a later write was the first to create. The call inside
+/// `open` itself covers the database file and nothing else.
+fn mirror_database_directory_owner(path: &Path) -> Result<()> {
+    let Some((euid, dir_uid, dir_gid)) = directory_owner(path)? else {
+        return Ok(());
+    };
+    mirror_owner_onto(path, euid, dir_uid, dir_gid)?;
+    for sibling in wal_siblings(path) {
+        mirror_owner_onto(&sibling, euid, dir_uid, dir_gid)?;
+    }
+    Ok(())
+}
+
+/// [`mirror_database_directory_owner`] for a connection whose path we do not
+/// otherwise hold. `None` for an in-memory or temporary database, which has
+/// no file.
+fn mirror_connection_directory_owner(connection: &Connection) -> Result<()> {
+    match connection.path() {
+        Some(path) if !path.is_empty() => mirror_database_directory_owner(Path::new(path)),
+        _ => Ok(()),
+    }
+}
+
+/// The rule for ONE path, with no sidecar sweep.
+///
+/// Two callers: a directory Kanban just created inside a tree it does not
+/// own, and the data root's `.lock` / `.init.lock`, which root creates the
+/// same way and which locks the service out exactly as a root-owned board
+/// does — measured as root on hax against the first cut of this fix, where
+/// the databases were mirrored, the lock file was not, and the `kanban` user
+/// met `open lock file <root>/.lock: Permission denied`.
+///
+/// Neither kind has WAL sidecars, and a file that merely happens to sit
+/// beside one under a matching name is not ours to re-own.
+pub(crate) fn mirror_directory_owner(path: &Path) -> Result<()> {
+    let Some((euid, dir_uid, dir_gid)) = directory_owner(path)? else {
+        return Ok(());
+    };
+    mirror_owner_onto(path, euid, dir_uid, dir_gid)
+}
+
 /// Create `dir` if missing and tighten it to mode 0700. Only for the private
 /// data root, which Kanban owns outright; never for an operator-supplied path.
 ///
@@ -1804,7 +1960,10 @@ fn create_private_file(path: &Path) -> Result<()> {
         .mode(0o600)
         .open(path)
     {
-        Ok(_) => Ok(()),
+        // Given away at BIRTH rather than at the end of `open`: an open that
+        // fails anywhere after this must not leave a root-owned board behind
+        // for the service that owns the directory to trip over.
+        Ok(_) => mirror_database_directory_owner(path),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
     }
@@ -1892,6 +2051,14 @@ fn open(path: &Path) -> Result<Connection> {
     )?;
     // Replaces `busy_timeout`, which installs SQLite's own unjittered handler.
     connection.busy_handler(Some(busy_backoff))?;
+    // The file itself, and any sidecar an earlier session left beside it.
+    // Measured: neither `-wal` nor `-shm` exists yet at this point — SQLite
+    // creates both on the first statement that reads or writes pages, which
+    // is after this whole pragma batch — so the calls at the end of
+    // `open_board`, `open_registry` and `checkpoint` are the ones that cover
+    // them, not this one. This one is here because an `open` that fails later
+    // must still not leave a root-owned database behind.
+    mirror_database_directory_owner(path)?;
     Ok(connection)
 }
 
@@ -1912,7 +2079,10 @@ pub fn create_backup_target(path: &Path) -> Result<Connection> {
             }
             _ => anyhow::Error::new(error).context(format!("create {}", path.display())),
         })?;
-    Connection::open(path).with_context(|| format!("open backup target {}", path.display()))
+    let connection =
+        Connection::open(path).with_context(|| format!("open backup target {}", path.display()))?;
+    mirror_database_directory_owner(path)?;
+    Ok(connection)
 }
 
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
@@ -1975,6 +2145,10 @@ pub fn open_board(path: &Path) -> Result<Connection> {
     if before != after || chained {
         crate::search::embed_missing(&connection)?;
     }
+    // The migrations and the chain read and wrote, so `-wal` and `-shm` exist
+    // now even though they did not when `open` returned. Every writable board
+    // open comes through here.
+    mirror_database_directory_owner(path)?;
     Ok(connection)
 }
 
@@ -1986,6 +2160,10 @@ pub fn finalize_adopted_board(connection: &mut Connection) -> Result<()> {
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
     )?;
     connection.busy_handler(Some(busy_backoff))?;
+    // Turning the copied target into a WAL database creates its sidecars, and
+    // an adoption run by root into a directory it does not own must not leave
+    // them root's.
+    mirror_connection_directory_owner(connection)?;
     connection.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate(connection, BOARD_MIGRATIONS);
     connection.pragma_update(None, "foreign_keys", true)?;
@@ -2040,7 +2218,9 @@ const BOARD_TASK_COLUMNS: [&str; 5] = ["id", "status", "priority", "parent_id", 
 /// cannot migrate it. It is not side-effect free, and the difference matters:
 /// opening a WAL database read-only can create and map its `-shm` sidecar. That
 /// is acceptable here because the caller has already matched the SQLite header,
-/// so this only ever runs against something that is a database.
+/// so this only ever runs against something that is a database — and a sidecar
+/// a root probe leaves behind is handed to the directory's owner before this
+/// returns, so the probe cannot be the thing that locks the service out.
 ///
 /// # Errors
 ///
@@ -2048,7 +2228,9 @@ const BOARD_TASK_COLUMNS: [&str; 5] = ["id", "status", "priority", "parent_id", 
 /// determine" and "is not a board" are different answers and only one of them is
 /// safe to act on: a `SQLITE_BUSY` reported as "not a board" is a false
 /// statement about healthy data, made to a caller that will act on it.
-pub fn probe_board_schema(path: &Path) -> rusqlite::Result<BoardSchema> {
+/// A failed ownership mirror arrives the same way and for the same reason: it
+/// is not a statement about what the file holds either.
+pub fn probe_board_schema(path: &Path) -> Result<BoardSchema> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2070,17 +2252,15 @@ pub fn probe_board_schema(path: &Path) -> rusqlite::Result<BoardSchema> {
     // board state has tables without a version, or a version without tables.
     // Requiring both excludes a database that stamps `user_version` before
     // writing its schema, at no cost to the case this is for.
-    if tables == 0 && version == 0 {
-        return Ok(BoardSchema::Unwritten);
-    }
-    if version < 1 {
-        return Ok(BoardSchema::Other);
-    }
-    let mut statement = connection.prepare("SELECT name FROM pragma_table_info('tasks')")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    Ok(
+    let schema = if tables == 0 && version == 0 {
+        BoardSchema::Unwritten
+    } else if version < 1 {
+        BoardSchema::Other
+    } else {
+        let mut statement = connection.prepare("SELECT name FROM pragma_table_info('tasks')")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
         if BOARD_TASK_COLUMNS
             .iter()
             .all(|wanted| columns.iter().any(|name| name == wanted))
@@ -2088,8 +2268,12 @@ pub fn probe_board_schema(path: &Path) -> rusqlite::Result<BoardSchema> {
             BoardSchema::Board
         } else {
             BoardSchema::Other
-        },
-    )
+        }
+    };
+    // Last, and with the connection still open: the `-shm` those reads may
+    // have created exists now, and closing the database is what takes it away.
+    mirror_database_directory_owner(path)?;
+    Ok(schema)
 }
 
 /// What a readable SQLite file at a board path turned out to be.
@@ -2131,6 +2315,10 @@ pub fn open_board_readonly(path: &Path) -> Result<Connection> {
     connection.pragma_update(None, "query_only", true)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     let version = schema_version(&connection)?;
+    // Before the refusal below, not after `Ok`: the read above created the
+    // `-shm` if it was not there, and a refused inspection leaves the same
+    // root-owned sidecar an accepted one would.
+    mirror_database_directory_owner(path)?;
     if version != BOARD_MIGRATIONS.len() {
         bail!(
             "board schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
@@ -2163,7 +2351,13 @@ pub fn stored_schema_version(path: &Path) -> Option<usize> {
     // exclusive WAL locks, so `SQLITE_BUSY` is routine.
     connection.busy_handler(Some(busy_backoff)).ok()?;
     connection.pragma_update(None, "query_only", true).ok()?;
-    schema_version(&connection).ok()
+    let version = schema_version(&connection).ok()?;
+    // The probe's read created the `-shm` if it was not there. A chown that
+    // fails answers `None`, which is this function's documented "ask the
+    // writable open": that open mirrors ownership too, and reports the real
+    // error, rather than a probe inventing a diagnosis of its own.
+    mirror_database_directory_owner(path).ok()?;
+    Some(version)
 }
 
 /// Whether this registry file can be opened by [`open_registry_readonly`] as
@@ -2403,6 +2597,9 @@ pub fn open_registry(path: &Path) -> Result<Connection> {
     crate::audit::initialize_registry_chain(&mut connection)?;
     record_workspace_name_drift(&mut connection)?;
     ensure_registry_uuid(&mut connection)?;
+    // As in `open_board`: the sidecars exist by now, and every writable
+    // registry open comes through here.
+    mirror_database_directory_owner(path)?;
     Ok(connection)
 }
 
@@ -2521,6 +2718,8 @@ pub fn open_registry_readonly(path: &Path) -> Result<Connection> {
     connection.busy_handler(Some(busy_backoff))?;
     connection.pragma_update(None, "query_only", true)?;
     let version = schema_version(&connection)?;
+    // Before the refusal, for the reason given in `open_board_readonly`.
+    mirror_database_directory_owner(path)?;
     if version != REGISTRY_MIGRATIONS.len() {
         bail!(
             "registry schema is {version}, but read-only inspection requires {}; run any ordinary kanban command once to migrate it",
@@ -2566,7 +2765,13 @@ pub fn foreign_key_violations(connection: &Connection) -> Result<Vec<String>> {
 
 pub fn checkpoint(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    Ok(())
+    // The last reachable moment for a sidecar this process created late.
+    // `Store::drop` and `Registry::drop` both come through here on the way out
+    // of every command, and the `-wal` a write created after `open` returned
+    // is still on disk at this point: closing the connection is what removes
+    // it, and only when no other process has the database open — which is
+    // exactly the case where a root-owned sidecar would otherwise survive.
+    mirror_connection_directory_owner(connection)
 }
 
 /// Integrity-check a database file without registering or migrating it.
@@ -2574,7 +2779,11 @@ pub fn checkpoint(connection: &Connection) -> Result<()> {
 pub fn verify(path: &Path) -> Result<Vec<String>> {
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open snapshot {}", path.display()))?;
-    integrity(&connection)
+    let report = integrity(&connection)?;
+    // While the connection is open, so an `-shm` this read created is still
+    // there to be handed over.
+    mirror_database_directory_owner(path)?;
+    Ok(report)
 }
 
 /// Put `source` in place of `destination`, atomically as far as readers are
@@ -2601,6 +2810,10 @@ pub fn replace_database(source: &Path, destination: &Path) -> Result<()> {
         sidecar.push(suffix);
         let _ = fs::remove_file(Path::new(&sidecar));
     }
+    // The staging copy was created by THIS process and renamed into place, so
+    // a restore run by root has just put a root-owned inode where the board
+    // was. The sidecars were removed above, so this is the main file only.
+    mirror_database_directory_owner(destination)?;
     Ok(())
 }
 
@@ -3438,6 +3651,162 @@ mod tests {
             probe_board_schema(&half).expect("probe the finished board"),
             BoardSchema::Board
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The whole ownership rule, at the inputs that decide it.
+    ///
+    /// Unit-tested rather than measured end to end because the case that
+    /// matters cannot be produced by a test: a process cannot become root,
+    /// and a test running as root cannot conjure a directory owned by the
+    /// service user. So the decision is a pure function and this is where it
+    /// is proved; the compiled-process test proves the non-root half.
+    #[test]
+    fn ownership_target_mirrors_only_what_root_left_in_another_user_s_directory() {
+        const KANBAN: u32 = 998;
+        const KANBAN_GROUP: u32 = 997;
+
+        // A non-root process. It cannot chown, and what it owns is between it
+        // and the directory.
+        assert_eq!(
+            ownership_target(KANBAN, KANBAN, KANBAN_GROUP, KANBAN, KANBAN_GROUP),
+            None
+        );
+        assert_eq!(ownership_target(KANBAN, KANBAN, KANBAN_GROUP, 0, 0), None);
+
+        // Root in root's own tree. Root-owned files are the correct result.
+        assert_eq!(ownership_target(0, 0, 0, 0, 0), None);
+
+        // The outage: root created a file inside the service's data root.
+        assert_eq!(
+            ownership_target(0, KANBAN, KANBAN_GROUP, 0, 0),
+            Some((KANBAN, KANBAN_GROUP))
+        );
+
+        // Already the service's. No syscall to make.
+        assert_eq!(
+            ownership_target(0, KANBAN, KANBAN_GROUP, KANBAN, KANBAN_GROUP),
+            None
+        );
+
+        // Right uid, wrong group is still not what the directory says.
+        assert_eq!(
+            ownership_target(0, KANBAN, KANBAN_GROUP, KANBAN, 0),
+            Some((KANBAN, KANBAN_GROUP))
+        );
+    }
+
+    #[test]
+    fn wal_siblings_append_to_the_whole_database_name() {
+        assert_eq!(
+            wal_siblings(Path::new("/srv/kanban/boards/vidgen.db")),
+            [
+                PathBuf::from("/srv/kanban/boards/vidgen.db-wal"),
+                PathBuf::from("/srv/kanban/boards/vidgen.db-shm"),
+            ],
+            "a sidecar is the database's whole name plus a suffix; replacing \
+             the extension would name two files SQLite never opens"
+        );
+    }
+
+    /// The chown itself: the right file, the right ids, in the right order.
+    ///
+    /// Everything else here measures the DECISION, and a decision that is
+    /// correct in front of a `chown(path, gid, uid)` is worth nothing. The
+    /// root case cannot be produced by a test, but the syscall can: `euid` is
+    /// a parameter, and POSIX lets the owner of a file move it into any group
+    /// it belongs to, so aiming the mirror at a secondary group of this
+    /// process exercises the same call with the same arguments.
+    #[test]
+    fn mirroring_performs_the_chown_and_steps_over_a_sidecar_that_is_not_there() {
+        let root = std::env::temp_dir().join(format!("kanban-chown-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp chown dir");
+        let path = root.join("board.db");
+        fs::write(&path, b"not really a database").expect("create the file to hand over");
+        let before = fs::metadata(&path).expect("stat the file");
+
+        let mut groups = [0u32; 64];
+        let count = unsafe { libc::getgroups(64, groups.as_mut_ptr().cast::<libc::gid_t>()) };
+        let target = (0..count.max(0) as usize)
+            .map(|index| groups[index])
+            .find(|group| *group != before.gid());
+        let Some(target) = target else {
+            // One group, so there is no gid this process may move a file to
+            // and nothing here would be evidence either way.
+            eprintln!("skipped: this process belongs to no group other than its own");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+
+        mirror_owner_onto(&path, 0, before.uid(), target).expect("hand the file to the group");
+        let after = fs::metadata(&path).expect("re-stat the file");
+        assert_eq!(
+            (after.uid(), after.gid()),
+            (before.uid(), target),
+            "the chown did not land, or landed with its arguments the wrong way round"
+        );
+        assert_eq!(
+            after.permissions().mode(),
+            before.permissions().mode(),
+            "the chown moved the mode bits"
+        );
+
+        // A `-wal` that is not there is the ordinary case, not a failure.
+        mirror_owner_onto(&root.join("absent.db-wal"), 0, before.uid(), target)
+            .expect("a sidecar that does not exist must not be an error");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A board and every sidecar beside it belong to their directory's owner
+    /// once `open` returns, and `open` did not have to touch anything to make
+    /// that true here.
+    ///
+    /// The invariant is stated as "matches the directory" rather than "is
+    /// uid N" so it is the same assertion whoever runs the suite: as an
+    /// ordinary user the temp directory and the board are both that user's,
+    /// and as root they are both root's. Either way a mirror that fired when
+    /// it should not have, or a chown that went to the wrong id, breaks it.
+    #[test]
+    fn an_open_leaves_the_board_and_its_sidecars_owned_by_their_directory() {
+        let root = std::env::temp_dir().join(format!("kanban-owner-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp ownership dir");
+        let path = root.join("board.db");
+        let directory = fs::metadata(&root).expect("stat the directory");
+
+        let connection = open_board(&path).expect("open a writable board");
+        crate::audit::append_board_event(&connection, None, "board_changed", "codex", "{}", 1)
+            .expect("write, so the -wal exists");
+        checkpoint(&connection).expect("checkpoint, which mirrors late sidecars");
+
+        let mut checked = 0;
+        for candidate in std::iter::once(path.clone()).chain(wal_siblings(&path)) {
+            let Ok(metadata) = fs::metadata(&candidate) else {
+                continue;
+            };
+            checked += 1;
+            assert_eq!(
+                (metadata.uid(), metadata.gid()),
+                (directory.uid(), directory.gid()),
+                "{} is not owned by the directory it lives in",
+                candidate.display()
+            );
+        }
+        assert!(
+            checked >= 1,
+            "nothing was checked, so this measured nothing"
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat the board")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "mirroring ownership changed the mode"
+        );
+
+        drop(connection);
         let _ = fs::remove_dir_all(&root);
     }
 

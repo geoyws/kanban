@@ -15,7 +15,7 @@
 //! first" and enforce nothing. A flag that implies more safety than it
 //! delivers is worse than no flag, because the operator stops checking.
 
-use crate::db::own_private_dir;
+use crate::db::{mirror_directory_owner, own_private_dir};
 use crate::registry::data_root;
 use anyhow::{Context, Result, bail};
 use std::env;
@@ -44,6 +44,14 @@ pub struct DataRootLock {
 /// The file is not removed afterwards on purpose: unlinking it would let the
 /// next process create a *different* inode and take a lock that excludes
 /// nobody. It is an empty 0600 marker whose only content is its identity.
+///
+/// And because it is 0600 like every other file here, root creating it inside
+/// a data root owned by somebody else locks that somebody out of their own
+/// tree: measured on hax, the `kanban` user met `open lock file
+/// <root>/.lock: Permission denied` after a root `kanban init`, with the
+/// board and registry already mirrored and this marker still `root:root`.
+/// Every command takes one of these before it reaches SQLite, so this is the
+/// FIRST file to get the rule, not an afterthought to it.
 fn open_lock_file(name: &str) -> Result<(PathBuf, File)> {
     let root = data_root()?;
     own_private_dir(&root)?;
@@ -58,6 +66,7 @@ fn open_lock_file(name: &str) -> Result<(PathBuf, File)> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("open lock file {}", path.display()))?;
+    mirror_directory_owner(&path)?;
     Ok((path, file))
 }
 
