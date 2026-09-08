@@ -1343,6 +1343,362 @@ pub const MBP_TIERS: [&str; 2] = ["@_bdt", "@_bd"];
 /// tier on `geoywsMBP` is refused as the mirror image.
 pub const MBP_HOSTS: [&str; 2] = ["geoywsMBP", "geoywsMBA"];
 
+/// A full Git commit: 40 lowercase hexadecimal characters, and nothing
+/// shorter.
+///
+/// Lives here rather than in the store because it is a value rule the model
+/// enforces before a write is composed: [`DeployIdentity::parse`] uses it to
+/// tell a caller who knows the build commit from one who does not, and the
+/// store uses it for the served commit.
+pub(crate) fn full_commit(value: &str, label: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must be a full 40-character hexadecimal commit");
+    }
+    Ok(value)
+}
+
+/// The ordinary identity: a build commit, verified at finish against the
+/// commit the tier actually served. Every deploy that has Git provenance uses
+/// this and nothing about it changes.
+pub const IDENTITY_MODE_GIT: &str = "git";
+
+/// The recovery identity, for a retained artifact whose build provenance is
+/// genuinely lost: the attempt proves role-qualified artifact identities and
+/// states that the build commit is unknown, rather than borrowing a plausible
+/// SHA (ADR-043).
+///
+/// The mode is never parsed from a caller's argument — it is decided by which
+/// flags the caller passed ([`DeployIdentity::parse`]) — so these two are
+/// named constants rather than a validated closed set. The column's CHECK
+/// holds the same two values.
+pub const IDENTITY_MODE_ARTIFACT: &str = "artifact";
+
+/// A Docker config/image ID: the digest of an image's own config, computed
+/// locally by the engine that holds it.
+pub const ARTIFACT_KIND_IMAGE_ID: &str = "docker-image-id";
+
+/// An OCI registry manifest digest: the digest of the manifest a registry
+/// serves, which is not the image ID of the same image.
+pub const ARTIFACT_KIND_MANIFEST_DIGEST: &str = "oci-manifest-digest";
+
+/// The typed artifact-identity kinds.
+///
+/// Both are spelled `sha256:<64 hex>` and they are digests of different
+/// documents, so one is never evidence for the other. The kind therefore
+/// travels as part of the identity rather than as a comment beside it, and a
+/// finish that offers one where the other was expected is refused (ADR-043
+/// §3).
+pub const ARTIFACT_IDENTITY_KINDS: [&str; 2] =
+    [ARTIFACT_KIND_IMAGE_ID, ARTIFACT_KIND_MANIFEST_DIGEST];
+
+/// What `--build-commit` must say in artifact mode.
+///
+/// The literal, required rather than defaulted: a row whose build commit is
+/// unknown because the caller said so must not be reachable by a caller who
+/// simply omitted the flag.
+pub const UNKNOWN_BUILD_COMMIT: &str = "unknown";
+
+/// The words every surface prints where a build SHA would be, so that an
+/// unknown build commit never renders as a blank and never reads as verified.
+pub const UNKNOWN_BUILD_COMMIT_WORDS: &str =
+    "build commit unknown - recovered by artifact identity";
+
+const ROLE_MAX: usize = 32;
+const DIGEST_HEX: usize = 64;
+
+/// "docker-image-id (a Docker config or image ID) or oci-manifest-digest (a
+/// registry manifest digest)" — the two kinds, for a refusal that names them
+/// and says which is which.
+fn kind_list() -> String {
+    format!(
+        "{ARTIFACT_KIND_IMAGE_ID} (a Docker config or image ID) or \
+         {ARTIFACT_KIND_MANIFEST_DIGEST} (a registry manifest digest)"
+    )
+}
+
+/// `[a-z0-9][a-z0-9-]{0,31}`, the shape of a component role.
+///
+/// Same rule as an attention choice key and for the same reason: a role is
+/// named in argv, in JSON and in a refusal, so it stays typeable.
+fn valid_role(flag: &str, role: &str) -> Result<()> {
+    let shaped = role
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && role.len() <= ROLE_MAX
+        && role
+            .chars()
+            .all(|letter| letter.is_ascii_lowercase() || letter.is_ascii_digit() || letter == '-');
+    if !shaped {
+        bail!(
+            "deploy: {flag} role {role:?} is not a slug; a role names one component and \
+             matches [a-z0-9][a-z0-9-]{{0,{}}}, such as api or web",
+            ROLE_MAX - 1
+        );
+    }
+    Ok(())
+}
+
+/// One role-qualified artifact identity: which component, which typed kind,
+/// and the value.
+///
+/// This is what is stored, both as the attempt's expectation and as what its
+/// finish observed. The two are separate columns rather than one document a
+/// finish rewrites, so nothing a finish writes can edit what the start
+/// claimed (ADR-043 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactIdentity {
+    pub role: String,
+    pub kind: String,
+    pub value: String,
+}
+
+impl ArtifactIdentity {
+    /// Parse `ROLE=KIND:VALUE` tokens, named by the flag that carried them.
+    ///
+    /// Splits on the FIRST `=` and then the FIRST `:`: the value is itself
+    /// `sha256:<64 hex>` and owns every remaining colon. One identity per
+    /// role, because two identities for one component make "did it match"
+    /// unanswerable.
+    pub fn parse(tokens: &[String], flag: &str) -> Result<Vec<Self>> {
+        let mut parsed: Vec<Self> = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let Some((role, rest)) = token.split_once('=') else {
+                bail!(
+                    "deploy: {flag} {token:?} must read ROLE=KIND:VALUE, such as \
+                     {flag} \"api={ARTIFACT_KIND_IMAGE_ID}:sha256:<{DIGEST_HEX} hex>\""
+                );
+            };
+            let role = role.trim();
+            valid_role(flag, role)?;
+            let Some((kind, value)) = rest.split_once(':') else {
+                bail!(
+                    "deploy: {flag} role {role} names no typed value; it must read \
+                     ROLE=KIND:VALUE with KIND one of {}",
+                    kind_list()
+                );
+            };
+            let kind = kind.trim();
+            if !ARTIFACT_IDENTITY_KINDS.contains(&kind) {
+                bail!(
+                    "deploy: {flag} role {role} has kind {kind:?}; a kind is one of {}",
+                    kind_list()
+                );
+            }
+            let value = value.trim().to_ascii_lowercase();
+            let shaped = value.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == DIGEST_HEX && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if !shaped {
+                bail!(
+                    "deploy: {flag} role {role} value {value:?} is not an identity; a {kind} is \
+                     sha256: followed by {DIGEST_HEX} hexadecimal characters"
+                );
+            }
+            if parsed.iter().any(|earlier| earlier.role == role) {
+                bail!("deploy: {flag} names role {role} twice; give one identity per role");
+            }
+            parsed.push(Self {
+                role: role.to_owned(),
+                kind: kind.to_owned(),
+                value,
+            });
+        }
+        Ok(parsed)
+    }
+
+    /// `kind value`, for a refusal that names both halves of an identity.
+    fn named(&self) -> String {
+        format!("{} {}", self.kind, self.value)
+    }
+}
+
+/// One expected artifact identity and what the attempt's finish observed for
+/// it — the shape every surface renders (ADR-043 §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactVerification {
+    pub role: String,
+    pub kind: String,
+    pub expected: String,
+    /// `None` until a terminal finish records what was measured.
+    pub observed: Option<String>,
+}
+
+/// Match what a finish observed against what the attempt expected, per role
+/// and per kind, and answer with the observations in the attempt's own
+/// expected order (ADR-043 §3).
+///
+/// Extra roles are refused before missing ones: a caller who misspelled a
+/// role produces both, and "this attempt does not expect ROLE, its roles are
+/// …" names the fix, while "ROLE was not observed" names the symptom.
+pub fn verify_artifacts(
+    id: &str,
+    expected: &[ArtifactIdentity],
+    observed: &[ArtifactIdentity],
+) -> Result<Vec<ArtifactIdentity>> {
+    let roles = expected
+        .iter()
+        .map(|artifact| artifact.role.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for offered in observed {
+        if !expected
+            .iter()
+            .any(|artifact| artifact.role == offered.role)
+        {
+            bail!(
+                "deployment {id} does not expect artifact role {}; its expected roles are {roles}",
+                offered.role
+            );
+        }
+    }
+    let mut verified = Vec::with_capacity(expected.len());
+    for artifact in expected {
+        let Some(offered) = observed
+            .iter()
+            .find(|offered| offered.role == artifact.role)
+        else {
+            bail!(
+                "deployment {id} expects artifact role {} ({}) and --observed named no \
+                 identity for it",
+                artifact.role,
+                artifact.named()
+            );
+        };
+        if offered.kind != artifact.kind {
+            bail!(
+                "deployment {id} artifact role {} expects {} but --observed offered {}; \
+                 a {ARTIFACT_KIND_IMAGE_ID} and an {ARTIFACT_KIND_MANIFEST_DIGEST} are \
+                 never compared to each other",
+                artifact.role,
+                artifact.named(),
+                offered.named()
+            );
+        }
+        if offered.value != artifact.value {
+            bail!(
+                "deployment {id} artifact role {} expects {} but --observed offered {}",
+                artifact.role,
+                artifact.named(),
+                offered.named()
+            );
+        }
+        verified.push(offered.clone());
+    }
+    Ok(verified)
+}
+
+/// The identity one attempt proves itself with: exactly one mode, named by
+/// the caller rather than inferred (ADR-043 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployIdentity {
+    /// `--commit FULL_SHA`: the ordinary verified-Git path, unchanged.
+    Git(String),
+    /// `--artifact ROLE=KIND:VALUE` with `--build-commit unknown`: at least
+    /// one typed identity, and the absence of a build commit stated out loud.
+    Artifact(Vec<ArtifactIdentity>),
+}
+
+impl DeployIdentity {
+    /// Resolve the flags a caller passed into exactly one mode.
+    ///
+    /// Every mode refusal lives here, so the CLI, the MCP tool and any later
+    /// surface share one wording, and none of them can compose a write the
+    /// others would have refused.
+    pub fn parse(
+        commit: Option<&str>,
+        build_commit: Option<&str>,
+        artifacts: &[String],
+    ) -> Result<Self> {
+        match (commit, artifacts.is_empty()) {
+            (Some(_), false) => bail!(
+                "deploy: --commit names a Git-mode attempt and --artifact names an \
+                 artifact-identity attempt; one mode per attempt, so pass one or the other"
+            ),
+            (Some(commit), true) => {
+                if let Some(stated) = build_commit {
+                    bail!(
+                        "deploy: --build-commit {stated:?} belongs to artifact mode; the Git \
+                         path names its commit with --commit FULL_SHA"
+                    );
+                }
+                Ok(Self::Git(full_commit(commit, "commit")?))
+            }
+            (None, false) => {
+                let Some(stated) = build_commit.map(str::trim) else {
+                    bail!(
+                        "deploy: artifact mode requires --build-commit {UNKNOWN_BUILD_COMMIT}, \
+                         so a missing build commit is stated rather than defaulted"
+                    );
+                };
+                if let Ok(commit) = full_commit(stated, "build commit") {
+                    bail!(
+                        "deploy: --build-commit {commit} is a full Git commit, so this build's \
+                         provenance is known; use the Git mode with --commit {commit} instead \
+                         of --artifact"
+                    );
+                }
+                if stated != UNKNOWN_BUILD_COMMIT {
+                    bail!(
+                        "deploy: --build-commit must be the literal {UNKNOWN_BUILD_COMMIT} in \
+                         artifact mode, got {stated:?}"
+                    );
+                }
+                Ok(Self::Artifact(ArtifactIdentity::parse(
+                    artifacts,
+                    "--artifact",
+                )?))
+            }
+            (None, true) => bail!(
+                "deploy start requires --commit FULL_SHA (the verified Git path) or \
+                 --artifact ROLE=KIND:VALUE with --build-commit {UNKNOWN_BUILD_COMMIT} \
+                 (the artifact-identity recovery path)"
+            ),
+        }
+    }
+
+    /// What the row records and every surface publishes.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Git(_) => IDENTITY_MODE_GIT,
+            Self::Artifact(_) => IDENTITY_MODE_ARTIFACT,
+        }
+    }
+
+    /// The build commit column's value: the 40-character commit in Git mode,
+    /// the literal `unknown` in artifact mode.
+    pub fn build_commit(&self) -> &str {
+        match self {
+            Self::Git(commit) => commit,
+            Self::Artifact(_) => UNKNOWN_BUILD_COMMIT,
+        }
+    }
+
+    /// The expected identities, empty in Git mode.
+    pub fn artifacts(&self) -> &[ArtifactIdentity] {
+        match self {
+            Self::Git(_) => &[],
+            Self::Artifact(artifacts) => artifacts,
+        }
+    }
+}
+
+/// What a surface prints for one attempt's build commit: the commit itself,
+/// or the words that say there is none.
+///
+/// Derived on read beside `priorityLevel` on a task, so the CLI, the MCP
+/// layer and the web page cannot each invent their own phrasing and none of
+/// them can leave the column blank.
+pub fn build_commit_label(identity_mode: &str, build_commit: &str) -> String {
+    if identity_mode == IDENTITY_MODE_ARTIFACT {
+        UNKNOWN_BUILD_COMMIT_WORDS.to_owned()
+    } else {
+        build_commit.to_owned()
+    }
+}
+
 /// One immutable deployment attempt. Terminal completion only fills the
 /// result columns; a retry is always a new row linked through `retry_of`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1352,7 +1708,18 @@ pub struct DeploymentAttempt {
     #[serde(rename = "taskID")]
     pub task_id: Option<String>,
     pub repo: String,
-    pub commit_sha: String,
+    /// `git` or `artifact`: which identity this attempt proves itself with.
+    pub identity_mode: String,
+    /// The build commit, or the literal [`UNKNOWN_BUILD_COMMIT`] in artifact
+    /// mode. Never a blank and never a borrowed SHA.
+    pub build_commit: String,
+    /// Derived on read, never stored: what a surface prints where a build SHA
+    /// would be. Beside a task's `priorityLevel`, and for the same reason —
+    /// one derivation every surface reads instead of its own.
+    pub build_commit_label: String,
+    /// The checkout the deployer ran from, when it stated one. Recorded
+    /// separately and never presented as the build commit.
+    pub deployer_checkout: Option<String>,
     pub branch: Option<String>,
     pub tier: String,
     pub environment: String,
@@ -1368,6 +1735,9 @@ pub struct DeploymentAttempt {
     pub receipt: Option<String>,
     pub artifact_uri: Option<String>,
     pub served_commit: Option<String>,
+    /// The expected identities and what the finish observed for each, in the
+    /// attempt's own expected order. Empty in Git mode.
+    pub artifacts: Vec<ArtifactVerification>,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
@@ -1388,7 +1758,9 @@ pub struct DeploymentStartReceipt {
 pub struct StartDeployment {
     pub task_id: Option<String>,
     pub repo: String,
-    pub commit_sha: String,
+    /// Exactly one identity mode, already resolved and validated.
+    pub identity: DeployIdentity,
+    pub deployer_checkout: Option<String>,
     pub branch: Option<String>,
     pub tier: String,
     pub environment: String,
@@ -1410,6 +1782,9 @@ pub struct FinishDeployment {
     pub receipt: Option<String>,
     pub artifact_uri: Option<String>,
     pub served_commit: Option<String>,
+    /// What the finish measured, per role. Empty in Git mode, and one
+    /// identity per expected role for a succeeded artifact-mode attempt.
+    pub observed: Vec<ArtifactIdentity>,
     pub actor: String,
 }
 
@@ -2158,6 +2533,283 @@ mod tests {
                 .expect_err("nothing authored it, so nothing may be marked")
                 .to_string(),
             "attention: exactly one choice is recommended; 0 were"
+        );
+    }
+
+    const API_ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const WEB_DIGEST: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const OTHER_ID: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    const FULL_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn expected_pair() -> Vec<ArtifactIdentity> {
+        ArtifactIdentity::parse(
+            &[
+                format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}"),
+                format!("web={ARTIFACT_KIND_MANIFEST_DIGEST}:{WEB_DIGEST}"),
+            ],
+            "--artifact",
+        )
+        .expect("two well-formed identities")
+    }
+
+    fn token_refusal(token: &str) -> String {
+        ArtifactIdentity::parse(&[token.to_owned()], "--artifact")
+            .expect_err("the token must be refused")
+            .to_string()
+    }
+
+    fn mode_refusal(
+        commit: Option<&str>,
+        build_commit: Option<&str>,
+        artifacts: &[String],
+    ) -> String {
+        DeployIdentity::parse(commit, build_commit, artifacts)
+            .expect_err("the identity must be refused")
+            .to_string()
+    }
+
+    fn verify_refusal(observed: &[ArtifactIdentity]) -> String {
+        verify_artifacts("d-1", &expected_pair(), observed)
+            .expect_err("the observation must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn an_artifact_token_parses_into_a_role_a_typed_kind_and_a_lowercased_digest() {
+        let parsed = ArtifactIdentity::parse(
+            &[format!(
+                "  api = {ARTIFACT_KIND_IMAGE_ID}:{}",
+                API_ID.to_uppercase()
+            )],
+            "--artifact",
+        )
+        .expect("a well-formed token");
+        assert_eq!(
+            parsed,
+            vec![ArtifactIdentity {
+                role: "api".to_owned(),
+                kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+                value: API_ID.to_owned(),
+            }],
+            "the role and kind are trimmed and the digest is lowercased, so the same \
+             identity typed two ways compares equal"
+        );
+    }
+
+    #[test]
+    fn a_malformed_artifact_token_is_refused_naming_the_shape_the_role_or_the_kind() {
+        assert_eq!(
+            token_refusal("docker-image-id:sha256:x"),
+            format!(
+                "deploy: --artifact \"docker-image-id:sha256:x\" must read ROLE=KIND:VALUE, \
+                 such as --artifact \"api={ARTIFACT_KIND_IMAGE_ID}:sha256:<64 hex>\""
+            )
+        );
+        assert_eq!(
+            token_refusal(&format!("Api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}")),
+            "deploy: --artifact role \"Api\" is not a slug; a role names one component and \
+             matches [a-z0-9][a-z0-9-]{0,31}, such as api or web"
+        );
+        assert_eq!(
+            token_refusal("api=docker-image-id"),
+            format!(
+                "deploy: --artifact role api names no typed value; it must read \
+                 ROLE=KIND:VALUE with KIND one of {}",
+                kind_list()
+            )
+        );
+        assert_eq!(
+            token_refusal(&format!("api=image-id:{API_ID}")),
+            format!(
+                "deploy: --artifact role api has kind \"image-id\"; a kind is one of {}",
+                kind_list()
+            )
+        );
+        // A short digest, a missing algorithm, and a Git commit offered as an
+        // image identity are all the same refusal, because all three are "not
+        // an identity of this kind".
+        for value in ["sha256:abcd", "1111111111111111", FULL_SHA] {
+            assert_eq!(
+                token_refusal(&format!("api={ARTIFACT_KIND_IMAGE_ID}:{value}")),
+                format!(
+                    "deploy: --artifact role api value {value:?} is not an identity; a \
+                     {ARTIFACT_KIND_IMAGE_ID} is sha256: followed by 64 hexadecimal characters"
+                )
+            );
+        }
+        assert_eq!(
+            ArtifactIdentity::parse(
+                &[
+                    format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}"),
+                    format!("api={ARTIFACT_KIND_IMAGE_ID}:{OTHER_ID}"),
+                ],
+                "--artifact",
+            )
+            .expect_err("one identity per role")
+            .to_string(),
+            "deploy: --artifact names role api twice; give one identity per role"
+        );
+        // The flag is named by the caller, so `finish`'s refusals read as
+        // `--observed` rather than as the flag `start` happens to use.
+        assert_eq!(
+            ArtifactIdentity::parse(&["api".to_owned()], "--observed")
+                .expect_err("the token must be refused")
+                .to_string(),
+            format!(
+                "deploy: --observed \"api\" must read ROLE=KIND:VALUE, such as \
+                 --observed \"api={ARTIFACT_KIND_IMAGE_ID}:sha256:<64 hex>\""
+            )
+        );
+    }
+
+    #[test]
+    fn each_identity_mode_refuses_the_other_mode_s_flags_and_names_the_one_to_use() {
+        let artifacts = vec![format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}")];
+        assert_eq!(
+            mode_refusal(Some(FULL_SHA), None, &artifacts),
+            "deploy: --commit names a Git-mode attempt and --artifact names an \
+             artifact-identity attempt; one mode per attempt, so pass one or the other"
+        );
+        assert_eq!(
+            mode_refusal(Some(FULL_SHA), Some(UNKNOWN_BUILD_COMMIT), &[]),
+            "deploy: --build-commit \"unknown\" belongs to artifact mode; the Git path \
+             names its commit with --commit FULL_SHA"
+        );
+        assert_eq!(
+            mode_refusal(Some("aaaaaaa"), None, &[]),
+            "commit must be a full 40-character hexadecimal commit"
+        );
+        assert_eq!(
+            mode_refusal(None, None, &artifacts),
+            "deploy: artifact mode requires --build-commit unknown, so a missing build \
+             commit is stated rather than defaulted"
+        );
+        // The one that matters most: a caller who knows the build commit is
+        // sent to the Git path rather than allowed to record it as unknown.
+        assert_eq!(
+            mode_refusal(None, Some(&FULL_SHA.to_uppercase()), &artifacts),
+            format!(
+                "deploy: --build-commit {FULL_SHA} is a full Git commit, so this build's \
+                 provenance is known; use the Git mode with --commit {FULL_SHA} instead \
+                 of --artifact"
+            )
+        );
+        assert_eq!(
+            mode_refusal(None, Some("none"), &artifacts),
+            "deploy: --build-commit must be the literal unknown in artifact mode, got \"none\""
+        );
+        assert_eq!(
+            mode_refusal(None, None, &[]),
+            "deploy start requires --commit FULL_SHA (the verified Git path) or \
+             --artifact ROLE=KIND:VALUE with --build-commit unknown (the artifact-identity \
+             recovery path)"
+        );
+    }
+
+    #[test]
+    fn a_resolved_identity_carries_its_mode_its_build_commit_and_its_expectations() {
+        let git =
+            DeployIdentity::parse(Some(&FULL_SHA.to_uppercase()), None, &[]).expect("the Git path");
+        assert_eq!(git.mode(), IDENTITY_MODE_GIT);
+        assert_eq!(git.build_commit(), FULL_SHA);
+        assert!(git.artifacts().is_empty());
+        assert_eq!(build_commit_label(git.mode(), git.build_commit()), FULL_SHA);
+
+        let recovery = DeployIdentity::parse(
+            None,
+            Some(UNKNOWN_BUILD_COMMIT),
+            &[format!("api={ARTIFACT_KIND_IMAGE_ID}:{API_ID}")],
+        )
+        .expect("the recovery path");
+        assert_eq!(recovery.mode(), IDENTITY_MODE_ARTIFACT);
+        assert_eq!(recovery.build_commit(), UNKNOWN_BUILD_COMMIT);
+        assert_eq!(recovery.artifacts().len(), 1);
+        // Where a SHA would be, a reader gets words rather than the bare
+        // literal or a blank.
+        assert_eq!(
+            build_commit_label(recovery.mode(), recovery.build_commit()),
+            "build commit unknown - recovered by artifact identity"
+        );
+    }
+
+    #[test]
+    fn an_observation_verifies_only_when_every_role_matches_by_kind_and_value() {
+        let expected = expected_pair();
+        let matched =
+            verify_artifacts("d-1", &expected, &expected).expect("the same identities verify");
+        assert_eq!(
+            matched, expected,
+            "the observations keep the expected order"
+        );
+        // Observed out of order still verifies: a role is matched by name,
+        // not by position, and the answer is in the attempt's own order.
+        let reversed = vec![expected[1].clone(), expected[0].clone()];
+        assert_eq!(
+            verify_artifacts("d-1", &expected, &reversed).expect("order is not identity"),
+            expected
+        );
+
+        let mut extra = expected.clone();
+        extra.push(ArtifactIdentity {
+            role: "worker".to_owned(),
+            kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+            value: OTHER_ID.to_owned(),
+        });
+        assert_eq!(
+            verify_refusal(&extra),
+            "deployment d-1 does not expect artifact role worker; its expected roles are api, web"
+        );
+        assert_eq!(
+            verify_refusal(&expected[..1]),
+            format!(
+                "deployment d-1 expects artifact role web ({ARTIFACT_KIND_MANIFEST_DIGEST} \
+                 {WEB_DIGEST}) and --observed named no identity for it"
+            )
+        );
+        // A config ID offered where a manifest digest was expected, with the
+        // value of the OTHER kind: refused on the kind, naming both.
+        let wrong_kind = vec![
+            expected[0].clone(),
+            ArtifactIdentity {
+                role: "web".to_owned(),
+                kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+                value: OTHER_ID.to_owned(),
+            },
+        ];
+        assert_eq!(
+            verify_refusal(&wrong_kind),
+            format!(
+                "deployment d-1 artifact role web expects {ARTIFACT_KIND_MANIFEST_DIGEST} \
+                 {WEB_DIGEST} but --observed offered {ARTIFACT_KIND_IMAGE_ID} {OTHER_ID}; \
+                 a {ARTIFACT_KIND_IMAGE_ID} and an {ARTIFACT_KIND_MANIFEST_DIGEST} are \
+                 never compared to each other"
+            )
+        );
+        let wrong_value = vec![
+            ArtifactIdentity {
+                role: "api".to_owned(),
+                kind: ARTIFACT_KIND_IMAGE_ID.to_owned(),
+                value: OTHER_ID.to_owned(),
+            },
+            expected[1].clone(),
+        ];
+        assert_eq!(
+            verify_refusal(&wrong_value),
+            format!(
+                "deployment d-1 artifact role api expects {ARTIFACT_KIND_IMAGE_ID} {API_ID} \
+                 but --observed offered {ARTIFACT_KIND_IMAGE_ID} {OTHER_ID}"
+            )
+        );
+        // And nothing observed at all is the missing-role refusal for the
+        // first expected role, not a silent pass.
+        assert_eq!(
+            verify_refusal(&[]),
+            format!(
+                "deployment d-1 expects artifact role api ({ARTIFACT_KIND_IMAGE_ID} \
+                 {API_ID}) and --observed named no identity for it"
+            )
         );
     }
 }

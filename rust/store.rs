@@ -166,14 +166,6 @@ fn validate_delivery_error_code(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn full_commit(value: &str, label: &str) -> Result<String> {
-    let value = value.trim().to_ascii_lowercase();
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("{label} must be a full 40-character hexadecimal commit");
-    }
-    Ok(value)
-}
-
 /// Queue position: 0 is the most urgent, 9 the least, 3 the default.
 ///
 /// The band follows what the ledger already means by the field rather than
@@ -899,12 +891,50 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+/// The expected identities paired with what the finish observed for each, in
+/// the attempt's own expected order.
+///
+/// Two columns rather than one document the finish rewrites, so what the
+/// start claimed stays exactly as it was written (ADR-043 §2). A role with no
+/// observation reads as `null` — a started attempt, or a terminal one that
+/// did not succeed.
+fn artifact_verifications(
+    expected: Vec<ArtifactIdentity>,
+    observed: Vec<ArtifactIdentity>,
+) -> Vec<ArtifactVerification> {
+    expected
+        .into_iter()
+        .map(|artifact| ArtifactVerification {
+            observed: observed
+                .iter()
+                .find(|offered| offered.role == artifact.role)
+                .map(|offered| offered.value.clone()),
+            role: artifact.role,
+            kind: artifact.kind,
+            expected: artifact.value,
+        })
+        .collect()
+}
+
 fn deployment_row(row: &Row<'_>) -> rusqlite::Result<DeploymentAttempt> {
+    let identity_mode: String = row.get("identity_mode")?;
+    let build_commit: String = row.get("commit_sha")?;
+    let expected = match row.get::<_, Option<String>>("expected_artifacts")? {
+        Some(text) => parse_json_column::<Vec<ArtifactIdentity>>(text)?,
+        None => Vec::new(),
+    };
+    let observed = match row.get::<_, Option<String>>("observed_artifacts")? {
+        Some(text) => parse_json_column::<Vec<ArtifactIdentity>>(text)?,
+        None => Vec::new(),
+    };
     Ok(DeploymentAttempt {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
         repo: row.get("repo")?,
-        commit_sha: row.get("commit_sha")?,
+        build_commit_label: build_commit_label(&identity_mode, &build_commit),
+        identity_mode,
+        build_commit,
+        deployer_checkout: row.get("deployer_checkout")?,
         branch: row.get("branch")?,
         tier: row.get("tier")?,
         environment: row.get("environment")?,
@@ -920,6 +950,7 @@ fn deployment_row(row: &Row<'_>) -> rusqlite::Result<DeploymentAttempt> {
         receipt: row.get("receipt")?,
         artifact_uri: row.get("artifact_uri")?,
         served_commit: row.get("served_commit")?,
+        artifacts: artifact_verifications(expected, observed),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
@@ -1044,8 +1075,9 @@ fn rule_row(row: &Row<'_>) -> rusqlite::Result<Rule> {
 ///
 /// The columns' CHECKs guarantee valid JSON of the right type, so a parse
 /// failure here means the file was edited outside kanban. Reading it as
-/// "no card" would present an authored decision as an unauthored row.
-fn parse_card_json<T: serde::de::DeserializeOwned>(text: String) -> rusqlite::Result<T> {
+/// "absent" would present an authored decision as an unauthored row, or an
+/// attempt's expected artifact identities as an attempt that expected none.
+fn parse_json_column<T: serde::de::DeserializeOwned>(text: String) -> rusqlite::Result<T> {
     serde_json::from_str(&text)
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }
@@ -1062,7 +1094,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         // pair and STORED as NULL, so a backfilled row stays distinguishable
         // from a never-authored one for as long as any remain (ADR-042 §2).
         choices: match row.get::<_, Option<String>>("choices")? {
-            Some(text) => parse_card_json(text)?,
+            Some(text) => parse_json_column(text)?,
             None => default_choice_pair(),
         },
         raised_by: row.get("raised_by")?,
@@ -1075,7 +1107,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         resolution: row.get("resolution")?,
         decision: row
             .get::<_, Option<String>>("decision")?
-            .map(parse_card_json)
+            .map(parse_json_column)
             .transpose()?,
         reopened_at: row.get("reopened_at")?,
         reopened_by: row.get("reopened_by")?,
@@ -6200,10 +6232,24 @@ impl Store {
     /// check runs under the mutation lock against that task's real tags — a
     /// caller who cannot see the task cannot record a deployment of it, and
     /// cannot use the deployment table to learn that the task exists.
+    ///
+    /// The identity arrives already resolved to exactly one mode
+    /// ([`DeployIdentity`]), so nothing here decides between a build commit
+    /// and an artifact identity: the row records what the caller named.
     pub fn start_deployment(&mut self, input: StartDeployment) -> Result<DeploymentStartReceipt> {
         validate(&input.tier, &DEPLOYMENT_TIERS, "deployment tier")?;
         let repo = nonempty(&input.repo, "repo")?.to_owned();
-        let commit_sha = full_commit(&input.commit_sha, "commit")?;
+        let identity_mode = input.identity.mode();
+        let build_commit = input.identity.build_commit().to_owned();
+        let expected = input.identity.artifacts().to_vec();
+        let expected_json = (!expected.is_empty())
+            .then(|| serde_json::to_string(&expected))
+            .transpose()?;
+        let deployer_checkout = input
+            .deployer_checkout
+            .as_deref()
+            .map(|value| full_commit(value, "deployer checkout"))
+            .transpose()?;
         let environment = nonempty(&input.environment, "environment")?.to_owned();
         let host = nonempty(&input.host, "host")?.to_owned();
         let url = nonempty(&input.url, "url")?.to_owned();
@@ -6241,7 +6287,26 @@ impl Store {
             if let Some((deployment, capability_token)) = replay {
                 let same = deployment.task_id == input.task_id
                     && deployment.repo == repo
-                    && deployment.commit_sha == commit_sha
+                    && deployment.identity_mode == identity_mode
+                    && deployment.build_commit == build_commit
+                    && deployment.deployer_checkout == deployer_checkout
+                    && deployment
+                        .artifacts
+                        .iter()
+                        .map(|artifact| {
+                            (
+                                artifact.role.as_str(),
+                                artifact.kind.as_str(),
+                                artifact.expected.as_str(),
+                            )
+                        })
+                        .eq(expected.iter().map(|artifact| {
+                            (
+                                artifact.role.as_str(),
+                                artifact.kind.as_str(),
+                                artifact.value.as_str(),
+                            )
+                        }))
                     && deployment.branch == input.branch
                     && deployment.tier == input.tier
                     && deployment.environment == environment
@@ -6269,15 +6334,15 @@ impl Store {
         let capability_token = Uuid::new_v4().to_string();
         let now = now_ms();
         transaction.execute(
-            "INSERT INTO deployments(id,task_id,repo,commit_sha,branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,actor,lane,capability_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'started',?,?,?,?,?)",
-            params![id,input.task_id,repo,commit_sha,input.branch,input.tier,environment,host,url,input.mechanism,input.operation_id,input.retry_of,actor,input.lane,capability_token,now,now],
+            "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,actor,lane,capability_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'started',?,?,?,?,?)",
+            params![id,input.task_id,repo,identity_mode,build_commit,deployer_checkout,expected_json,input.branch,input.tier,environment,host,url,input.mechanism,input.operation_id,input.retry_of,actor,input.lane,capability_token,now,now],
         )?;
         event(
             &transaction,
             input.task_id.as_deref(),
             "deployment_started",
             Some(&actor),
-            json!({"deploymentID":id,"repo":repo,"commit":commit_sha,"tier":input.tier,"environment":environment,"host":host,"url":url,"retryOf":input.retry_of}),
+            json!({"deploymentID":id,"repo":repo,"identityMode":identity_mode,"buildCommit":build_commit,"deployerCheckout":deployer_checkout,"expectedArtifacts":expected,"tier":input.tier,"environment":environment,"host":host,"url":url,"retryOf":input.retry_of}),
         )?;
         let deployment = transaction.query_row(
             "SELECT * FROM deployments WHERE id=?",
@@ -6409,6 +6474,12 @@ impl Store {
     /// oracle, and then the attempt's subject task. The capability token
     /// proves ownership of the ATTEMPT; it is not authority over the board and
     /// never substitutes for the check.
+    ///
+    /// The verdict is proved in the mode the attempt was STARTED in, which
+    /// the row already carries: a Git attempt against its served commit, an
+    /// artifact attempt against every expected role. Neither mode's flag is
+    /// accepted for the other, so a digest-only success can never be recorded
+    /// as a verified Git commit (ADR-043 §3).
     pub fn finish_deployment(&mut self, input: FinishDeployment) -> Result<DeploymentAttempt> {
         validate(&input.result, &DEPLOYMENT_RESULTS, "deployment result")?;
         if input.result == "abandoned" {
@@ -6433,27 +6504,62 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let subject_tags = deployment_subject_tags_on(&transaction, &input.id)?;
         self.authz.check_write(&subject_tags, &subject_tags)?;
-        let current: (String, String, Option<String>) = transaction
+        let current: (String, String, String, String, Option<String>) = transaction
             .query_row(
-                "SELECT status,capability_token,commit_sha FROM deployments WHERE id=?",
+                "SELECT status,capability_token,identity_mode,commit_sha,expected_artifacts FROM deployments WHERE id=?",
                 [&input.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?
             .with_context(|| format!("deployment {} not found", input.id))?;
-        if current.0 != "started" {
-            bail!("deployment {} is already {}", input.id, current.0);
+        let (status, token, identity_mode, build_commit, expected_json) = current;
+        if status != "started" {
+            bail!("deployment {} is already {}", input.id, status);
         }
-        if current.1 != input.capability_token {
+        if token != input.capability_token {
             bail!("capability token does not own deployment {}", input.id);
         }
-        if input.result == "succeeded" && served_commit.as_deref() != current.2.as_deref() {
+        let artifact_mode = identity_mode == IDENTITY_MODE_ARTIFACT;
+        if artifact_mode && served_commit.is_some() {
+            bail!(
+                "deployment {} was started in artifact-identity mode, where no Git commit was \
+                 proved; --served-commit cannot be recorded for it — verify it with --observed \
+                 ROLE=KIND:VALUE for every expected role",
+                input.id
+            );
+        }
+        if !artifact_mode && !input.observed.is_empty() {
+            bail!(
+                "deployment {} was started in Git mode; --observed belongs to artifact-identity \
+                 mode — verify it with --served-commit FULL_SHA",
+                input.id
+            );
+        }
+        let observed_json = if artifact_mode && input.result == "succeeded" {
+            let expected: Vec<ArtifactIdentity> = match expected_json.as_deref() {
+                Some(text) => serde_json::from_str(text)?,
+                None => Vec::new(),
+            };
+            let verified = verify_artifacts(&input.id, &expected, &input.observed)?;
+            Some(serde_json::to_string(&verified)?)
+        } else if artifact_mode && !input.observed.is_empty() {
+            // An attempt that did not succeed still records what it measured:
+            // the mismatch is the evidence, and the row's status already says
+            // that nothing here was verified against the expectation.
+            Some(serde_json::to_string(&input.observed)?)
+        } else {
+            None
+        };
+        if !artifact_mode
+            && input.result == "succeeded"
+            && served_commit.as_deref() != Some(build_commit.as_str())
+        {
             bail!("served commit must exactly match the requested deployment commit");
         }
         let now = now_ms();
         transaction.execute(
-            "UPDATE deployments SET status=?,phase=?,receipt=?,artifact_uri=?,served_commit=?,updated_at=?,completed_at=? WHERE id=?",
-            params![input.result,input.phase,input.receipt,input.artifact_uri,served_commit,now,now,input.id],
+            "UPDATE deployments SET status=?,phase=?,receipt=?,artifact_uri=?,served_commit=?,observed_artifacts=?,updated_at=?,completed_at=? WHERE id=?",
+            params![input.result,input.phase,input.receipt,input.artifact_uri,served_commit,observed_json,now,now,input.id],
         )?;
         let task_id: Option<String> = transaction.query_row(
             "SELECT task_id FROM deployments WHERE id=?",
@@ -6465,7 +6571,7 @@ impl Store {
             task_id.as_deref(),
             "deployment_finished",
             Some(&actor),
-            json!({"deploymentID":input.id,"result":input.result,"phase":input.phase,"servedCommit":served_commit,"receipt":input.receipt,"artifactURI":input.artifact_uri}),
+            json!({"deploymentID":input.id,"result":input.result,"phase":input.phase,"identityMode":identity_mode,"servedCommit":served_commit,"observedArtifacts":input.observed,"receipt":input.receipt,"artifactURI":input.artifact_uri}),
         )?;
         let deployment = transaction.query_row(
             "SELECT * FROM deployments WHERE id=?",
@@ -10799,5 +10905,162 @@ mod tests {
         assert!(expected.contains(&ids(Some("driver-2"), 1)[0]));
         assert_eq!(ids(Some("driver-3"), 100).len(), 1);
         assert_eq!(ids(None, 100).len(), 4, "no filter is every row");
+    }
+
+    /// One artifact-identity attempt and one Git attempt on the same board,
+    /// so the mode refusals below are read off real rows.
+    fn deploy_identity_fixture(
+        name: &str,
+    ) -> (Store, DeploymentStartReceipt, DeploymentStartReceipt) {
+        let mut store = test_store(name);
+        store.initialize(name, "test@driver").unwrap();
+        let start = |store: &mut Store, identity: DeployIdentity, environment: &str| {
+            store
+                .start_deployment(StartDeployment {
+                    task_id: None,
+                    repo: "geoyws/legacy-stack".to_owned(),
+                    identity,
+                    deployer_checkout: None,
+                    branch: None,
+                    tier: "@_p".to_owned(),
+                    environment: environment.to_owned(),
+                    host: "hax".to_owned(),
+                    url: "https://legacy.geoy.ws".to_owned(),
+                    mechanism: None,
+                    operation_id: None,
+                    retry_of: None,
+                    actor: "geoyws".to_owned(),
+                    lane: None,
+                })
+                .expect("start the attempt")
+        };
+        let artifact = start(
+            &mut store,
+            DeployIdentity::Artifact(
+                ArtifactIdentity::parse(
+                    &[format!(
+                        "api={ARTIFACT_KIND_IMAGE_ID}:sha256:{}",
+                        "1".repeat(64)
+                    )],
+                    "--artifact",
+                )
+                .unwrap(),
+            ),
+            "recovery",
+        );
+        let git = start(
+            &mut store,
+            DeployIdentity::Git("a".repeat(40)),
+            "production",
+        );
+        (store, artifact, git)
+    }
+
+    fn finish_input(receipt: &DeploymentStartReceipt) -> FinishDeployment {
+        FinishDeployment {
+            id: receipt.deployment.id.clone(),
+            capability_token: receipt.capability_token.clone(),
+            result: "succeeded".to_owned(),
+            phase: Some("verification".to_owned()),
+            receipt: Some("read both identities off the running tier".to_owned()),
+            artifact_uri: None,
+            served_commit: None,
+            observed: Vec::new(),
+            actor: "geoyws".to_owned(),
+        }
+    }
+
+    /// The refusal ADR-043 exists for: a success proved by a digest may not be
+    /// recorded as a verified Git commit, and the Git path may not be proved
+    /// by a digest either.
+    #[test]
+    fn a_finish_refuses_the_other_identity_mode_s_proof_by_name() {
+        let (mut store, artifact, git) = deploy_identity_fixture("deploy-identity-modes");
+
+        let mut served = finish_input(&artifact);
+        served.served_commit = Some("a".repeat(40));
+        assert_eq!(
+            error_string(store.finish_deployment(served)),
+            format!(
+                "deployment {} was started in artifact-identity mode, where no Git commit \
+                 was proved; --served-commit cannot be recorded for it — verify it with \
+                 --observed ROLE=KIND:VALUE for every expected role",
+                artifact.deployment.id
+            )
+        );
+
+        let mut observed = finish_input(&git);
+        observed.served_commit = Some("a".repeat(40));
+        observed.observed = ArtifactIdentity::parse(
+            &[format!(
+                "api={ARTIFACT_KIND_IMAGE_ID}:sha256:{}",
+                "1".repeat(64)
+            )],
+            "--observed",
+        )
+        .unwrap();
+        assert_eq!(
+            error_string(store.finish_deployment(observed)),
+            format!(
+                "deployment {} was started in Git mode; --observed belongs to \
+                 artifact-identity mode — verify it with --served-commit FULL_SHA",
+                git.deployment.id
+            )
+        );
+
+        // Both attempts are still open: a refused finish writes nothing.
+        for receipt in [&artifact, &git] {
+            assert_eq!(
+                store
+                    .require_deployment(&receipt.deployment.id)
+                    .unwrap()
+                    .status,
+                "started"
+            );
+        }
+    }
+
+    /// A recovery attempt's row says `unknown` where a build SHA would be, in
+    /// storage and in every projection, and records what was observed per
+    /// role once it succeeds.
+    #[test]
+    fn a_succeeded_artifact_attempt_records_unknown_provenance_and_its_observations() {
+        let (mut store, artifact, _) = deploy_identity_fixture("deploy-identity-recovery");
+        let mut finish = finish_input(&artifact);
+        finish.observed = ArtifactIdentity::parse(
+            &[format!(
+                "api={ARTIFACT_KIND_IMAGE_ID}:sha256:{}",
+                "1".repeat(64)
+            )],
+            "--observed",
+        )
+        .unwrap();
+        let done = store
+            .finish_deployment(finish)
+            .expect("the identities match");
+        assert_eq!(done.identity_mode, IDENTITY_MODE_ARTIFACT);
+        assert_eq!(done.build_commit, UNKNOWN_BUILD_COMMIT);
+        assert_eq!(done.build_commit_label, UNKNOWN_BUILD_COMMIT_WORDS);
+        assert_eq!(done.served_commit, None);
+        assert_eq!(
+            done.artifacts
+                .iter()
+                .map(|artifact| (
+                    artifact.role.as_str(),
+                    artifact.expected.as_str(),
+                    artifact.observed.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                "api",
+                format!("sha256:{}", "1".repeat(64)).as_str(),
+                Some(format!("sha256:{}", "1".repeat(64)).as_str())
+            )]
+        );
+        // The projection every "what is live where" reader takes carries the
+        // words, so nothing downstream has to know what `unknown` means.
+        let live = store.current_deployments().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].build_commit_label, UNKNOWN_BUILD_COMMIT_WORDS);
     }
 }

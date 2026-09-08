@@ -34,8 +34,8 @@
 
 use crate::model::{
     ATTENTION_OUTCOMES, Attention, AttentionAnswer, AttentionChoice, CUSTOM_CHOICE, DeadLetterCode,
-    DeploymentAttempt, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep, Subscription,
-    SubscriptionPosition, Task,
+    DeploymentAttempt, IDENTITY_MODE_ARTIFACT, OPERATOR_ACTOR, ProjectRecord, SearchOptions,
+    Sitrep, Subscription, SubscriptionPosition, Task,
 };
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
@@ -1700,6 +1700,23 @@ fn deployment_link(project: &str, deployment: &DeploymentAttempt) -> String {
     )
 }
 
+/// What one attempt's build-commit cell says.
+///
+/// A Git attempt shows the first twelve characters of its commit, as it
+/// always has. An artifact-identity attempt shows the words, never a blank
+/// and never a truncated `unknown` that could be mistaken for a short SHA
+/// (ADR-043 §4).
+fn build_commit_cell(deployment: &DeploymentAttempt) -> String {
+    if deployment.identity_mode == IDENTITY_MODE_ARTIFACT {
+        format!(
+            "<span class=meta>{}</span>",
+            escape(&deployment.build_commit_label)
+        )
+    } else {
+        format!("<code>{}</code>", escape(&deployment.build_commit[..12]))
+    }
+}
+
 /// Current releases and the attempts that still need operational attention.
 fn deployments() -> Result<String> {
     let mut current = Vec::new();
@@ -1749,9 +1766,9 @@ fn deployments() -> Result<String> {
         html.push_str("<table><thead><tr><th>Repository</th><th>Tier</th><th>Environment</th><th>Commit</th><th>Host</th><th>Attempt</th><th>Verified</th></tr></thead><tbody>");
         for (project, row) in &current {
             html.push_str(&format!(
-                "<tr><td>{repo}<div class=meta>{project}</div></td><td><span class=tag>{tier}</span></td><td>{environment}</td><td><code>{commit}</code></td><td>{host}</td><td>{attempt}</td><td class=when>{when}</td></tr>",
+                "<tr><td>{repo}<div class=meta>{project}</div></td><td><span class=tag>{tier}</span></td><td>{environment}</td><td>{commit}</td><td>{host}</td><td>{attempt}</td><td class=when>{when}</td></tr>",
                 repo = escape(&row.repo), project = escape(project), tier = escape(&row.tier),
-                environment = escape(&row.environment), commit = escape(&row.commit_sha[..12]),
+                environment = escape(&row.environment), commit = build_commit_cell(row),
                 host = escape(&row.host), attempt = deployment_link(project, row),
                 when = escape(&ago(row.completed_at.unwrap_or(row.updated_at))),
             ));
@@ -1766,7 +1783,7 @@ fn deployments() -> Result<String> {
         html.push_str(&format!(
             "<article class=item><p>{attempt} <strong>{repo}</strong> → <span class=tag>{tier}</span> {environment}</p><p class=meta>{commit} · {host} · started {when} by {actor}</p></article>",
             attempt = deployment_link(project, row), repo = escape(&row.repo), tier = escape(&row.tier),
-            environment = escape(&row.environment), commit = escape(&row.commit_sha[..12]),
+            environment = escape(&row.environment), commit = build_commit_cell(row),
             host = escape(&row.host), when = escape(&ago(row.created_at)), actor = escape(&row.actor),
         ));
     }
@@ -1805,9 +1822,24 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
         ("Board", escape(project)),
         ("Status", escape(&row.status)),
         ("Repository", escape(&row.repo)),
+        ("Identity mode", escape(&row.identity_mode)),
         (
-            "Commit",
-            format!("<code>{}</code>", escape(&row.commit_sha)),
+            "Build commit",
+            if row.identity_mode == IDENTITY_MODE_ARTIFACT {
+                format!(
+                    "<span class=meta>{}</span>",
+                    escape(&row.build_commit_label)
+                )
+            } else {
+                format!("<code>{}</code>", escape(&row.build_commit))
+            },
+        ),
+        (
+            "Deployer checkout",
+            row.deployer_checkout
+                .as_ref()
+                .map(|value| format!("<code>{}</code>", escape(value)))
+                .unwrap_or_else(|| "—".to_owned()),
         ),
         ("Branch", escape(row.branch.as_deref().unwrap_or("—"))),
         ("Tier", escape(&row.tier)),
@@ -1822,10 +1854,13 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
         ("Phase", escape(row.phase.as_deref().unwrap_or("—"))),
         (
             "Served commit",
-            row.served_commit
-                .as_ref()
-                .map(|value| format!("<code>{}</code>", escape(value)))
-                .unwrap_or_else(|| "—".to_owned()),
+            match (&row.served_commit, row.identity_mode.as_str()) {
+                (Some(value), _) => format!("<code>{}</code>", escape(value)),
+                (None, IDENTITY_MODE_ARTIFACT) => {
+                    "not applicable - proved by artifact identity".to_owned()
+                }
+                (None, _) => "—".to_owned(),
+            },
         ),
         ("Started", escape(&stamp(row.created_at))),
         (
@@ -1847,7 +1882,28 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
     for (label, value) in fields {
         html.push_str(&format!("<dt>{}</dt><dd>{}</dd>", escape(label), value));
     }
-    html.push_str("</dl><h2>Receipt</h2>");
+    html.push_str("</dl>");
+    if !row.artifacts.is_empty() {
+        html.push_str(
+            "<h2>Artifact identities</h2><table><thead><tr><th>Role</th><th>Kind</th>\
+             <th>Expected</th><th>Observed</th></tr></thead><tbody>",
+        );
+        for artifact in &row.artifacts {
+            html.push_str(&format!(
+                "<tr><td>{role}</td><td>{kind}</td><td><code>{expected}</code></td><td>{observed}</td></tr>",
+                role = escape(&artifact.role),
+                kind = escape(&artifact.kind),
+                expected = escape(&artifact.expected),
+                observed = artifact
+                    .observed
+                    .as_ref()
+                    .map(|value| format!("<code>{}</code>", escape(value)))
+                    .unwrap_or_else(|| "not yet observed".to_owned()),
+            ));
+        }
+        html.push_str("</tbody></table>");
+    }
+    html.push_str("<h2>Receipt</h2>");
     html.push_str(&format!(
         "<pre>{}</pre>",
         escape(row.receipt.as_deref().unwrap_or("No terminal receipt yet."))
@@ -3255,7 +3311,9 @@ dd{margin:0;font-size:.9rem;word-break:break-word}\
 mod tests {
     use super::*;
     use crate::authz::AuthzContext;
-    use crate::model::{AddSubscription, AddTask, DecisionCard, FinishDeployment, StartDeployment};
+    use crate::model::{
+        AddSubscription, AddTask, DecisionCard, DeployIdentity, FinishDeployment, StartDeployment,
+    };
     use crate::policy::{Capability, ScopeTuple, authority};
     use crate::routing::Enforcement;
     use std::env;
@@ -3453,7 +3511,10 @@ mod tests {
             .start_deployment(StartDeployment {
                 task_id: Some(epic.id.clone()),
                 repo: "geoyws/kanban".to_owned(),
-                commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                identity: DeployIdentity::Git(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                ),
+                deployer_checkout: None,
                 branch: Some("feature/render".to_owned()),
                 tier: "@_s".to_owned(),
                 environment: "staging".to_owned(),
@@ -3475,6 +3536,7 @@ mod tests {
                 receipt: Some("served <release> successfully".to_owned()),
                 artifact_uri: Some("artifact://kanban/<render>".to_owned()),
                 served_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                observed: Vec::new(),
                 actor: "geoyws".to_owned(),
             })
             .expect("finish current deployment");
@@ -3482,7 +3544,10 @@ mod tests {
             .start_deployment(StartDeployment {
                 task_id: Some(story.id.clone()),
                 repo: "geoyws/kanban".to_owned(),
-                commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                identity: DeployIdentity::Git(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                ),
+                deployer_checkout: None,
                 branch: Some("feature/render-failure".to_owned()),
                 tier: "@_bs".to_owned(),
                 environment: "staging".to_owned(),
@@ -3504,6 +3569,7 @@ mod tests {
                 receipt: Some("build <failed> because the render check did not pass".to_owned()),
                 artifact_uri: None,
                 served_commit: None,
+                observed: Vec::new(),
                 actor: "geoyws".to_owned(),
             })
             .expect("finish failed deployment");

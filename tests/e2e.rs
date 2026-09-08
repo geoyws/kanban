@@ -1997,7 +1997,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|project| project["schemaVersion"] == 25)
+            .all(|project| project["schemaVersion"] == 26)
     );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -2193,9 +2193,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 25);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 25);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 25);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 26);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 26);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 26);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -3048,7 +3048,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     assert_eq!(
         reopened
@@ -7104,7 +7104,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 25"),
+        version.contains("board schema 26"),
         "version output: {version}"
     );
     assert!(
@@ -16884,7 +16884,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        25
+        26
     );
 }
 
@@ -17978,7 +17978,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        25
+        26
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -19698,7 +19698,11 @@ const ENUM_ARGUMENTS: &[EnumArgument] = &[
             "--repo",
             "r",
             "--commit",
-            "c",
+            // A real commit, because the identity is resolved before the
+            // board is opened: a malformed one would be refused by
+            // `DeployIdentity::parse` and this row would prove nothing about
+            // --tier.
+            "1111111111111111111111111111111111111111",
             "--tier",
             "@bogus@",
             "--environment",
@@ -20581,7 +20585,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     assert_eq!(
         connection
@@ -22739,7 +22743,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 26_i64)
+        .pragma_update(None, "user_version", 27_i64)
         .unwrap();
     drop(newer_connection);
 
@@ -31950,6 +31954,632 @@ fn compiled_binary_tracks_verified_deployments_and_self_archives_only_non_curren
         [], |row| row.get(0),
     ).unwrap();
     assert!(index_sql.contains("WHERE archived=0"));
+}
+
+/// The two retained legacy images px `t-15121f7e` has to restore: one known
+/// by its Docker config/image ID, one by the manifest digest a registry
+/// served. Distinct values, so a test that compared the wrong pair would say
+/// so.
+const RECOVERY_API_IMAGE_ID: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const RECOVERY_WEB_MANIFEST: &str =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+const RECOVERY_WEB_IMAGE_ID: &str =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+const RECOVERY_CHECKOUT: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+/// Open one artifact-identity attempt for two roles, with the deployer's own
+/// checkout recorded beside — never as — the build commit.
+fn start_recovery_deployment(fixture: &Fixture, environment: &str) -> Value {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/legacy-stack",
+            "--artifact",
+            &format!("api=docker-image-id:{RECOVERY_API_IMAGE_ID}"),
+            "--artifact",
+            &format!("web=oci-manifest-digest:{RECOVERY_WEB_MANIFEST}"),
+            "--build-commit",
+            "unknown",
+            "--deployer-checkout",
+            RECOVERY_CHECKOUT,
+            "--tier",
+            "@_p",
+            "--environment",
+            environment,
+            "--host",
+            "hax",
+            "--url",
+            "https://legacy.geoy.ws",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    )
+}
+
+/// `deploy finish` for a recovery attempt, with whatever `--observed` tokens
+/// the caller wants to try.
+fn finish_recovery_deployment<'a>(
+    fixture: &'a Fixture,
+    id: &'a str,
+    token: &'a str,
+    observed: &[&'a str],
+) -> Output {
+    let mut args = vec![
+        "deploy",
+        "finish",
+        id,
+        "--token",
+        token,
+        "--result",
+        "succeeded",
+        "--phase",
+        "verification",
+        "--receipt",
+        "pulled both images on the tier and read their identities",
+        "--as",
+        "codex@e2e",
+        "--json",
+    ];
+    for token in observed {
+        args.push("--observed");
+        args.push(token);
+    }
+    fixture.run(&fixture.main, &args)
+}
+
+/// The whole point of ADR-043, through the compiled binary: an image whose
+/// build commit nobody knows can be recorded as a verified release of the
+/// ARTIFACT, with the missing provenance stated in words rather than filled
+/// in with a plausible SHA.
+#[test]
+fn a_recovery_deploy_records_typed_artifact_identities_and_an_unknown_build_commit() {
+    let fixture = Fixture::new("deploy-recovery");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RECOVERY", "--json"]);
+    let started = start_recovery_deployment(&fixture, "production");
+    let id = started["id"].as_str().unwrap().to_owned();
+    let token = started["capabilityToken"].as_str().unwrap().to_owned();
+
+    assert_eq!(started["identityMode"], "artifact");
+    assert_eq!(started["buildCommit"], "unknown");
+    assert_eq!(
+        started["buildCommitLabel"],
+        "build commit unknown - recovered by artifact identity"
+    );
+    // The deployer's checkout is recorded and is NOT the build commit: the
+    // whole failure mode this row exists to prevent is one being read as the
+    // other.
+    assert_eq!(started["deployerCheckout"], RECOVERY_CHECKOUT);
+    assert_ne!(started["buildCommit"], started["deployerCheckout"]);
+    assert_eq!(
+        started["artifacts"],
+        json!([
+            {"role": "api", "kind": "docker-image-id",
+             "expected": RECOVERY_API_IMAGE_ID, "observed": null},
+            {"role": "web", "kind": "oci-manifest-digest",
+             "expected": RECOVERY_WEB_MANIFEST, "observed": null},
+        ])
+    );
+
+    let finished = finish_recovery_deployment(
+        &fixture,
+        &id,
+        &token,
+        &[
+            &format!("api=docker-image-id:{RECOVERY_API_IMAGE_ID}"),
+            &format!("web=oci-manifest-digest:{RECOVERY_WEB_MANIFEST}"),
+        ],
+    );
+    assert!(
+        finished.status.success(),
+        "a matching recovery finish was refused: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+
+    // Every projection a reader takes says the same thing.
+    for row in [
+        fixture.ok_json(&fixture.main, &["deploy", "show", &id, "--json"]),
+        fixture.ok_json(&fixture.main, &["deploy", "current", "--json"])[0].clone(),
+        fixture.ok_json(&fixture.main, &["deploy", "list", "--json"])[0].clone(),
+    ] {
+        assert_eq!(row["id"], id.as_str());
+        assert_eq!(row["status"], "succeeded");
+        assert_eq!(row["identityMode"], "artifact");
+        assert_eq!(row["buildCommit"], "unknown");
+        assert_eq!(
+            row["buildCommitLabel"],
+            "build commit unknown - recovered by artifact identity"
+        );
+        // No Git commit was proved, so none is presented as served.
+        assert_eq!(row["servedCommit"], Value::Null);
+        assert_eq!(
+            row["artifacts"],
+            json!([
+                {"role": "api", "kind": "docker-image-id",
+                 "expected": RECOVERY_API_IMAGE_ID, "observed": RECOVERY_API_IMAGE_ID},
+                {"role": "web", "kind": "oci-manifest-digest",
+                 "expected": RECOVERY_WEB_MANIFEST, "observed": RECOVERY_WEB_MANIFEST},
+            ])
+        );
+    }
+
+    // The literal is in storage too, so nothing reconstructs it on read and
+    // no row carries a SHA nobody proved.
+    let board = board_path_for_project(&fixture, &fixture.main, "RECOVERY");
+    let (identity_mode, commit, deployer_checkout): (String, String, String) =
+        Connection::open(&board)
+            .unwrap()
+            .query_row(
+                "SELECT identity_mode,commit_sha,deployer_checkout FROM deployments WHERE id=?",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(identity_mode, "artifact");
+    assert_eq!(commit, "unknown");
+    assert_eq!(deployer_checkout, RECOVERY_CHECKOUT);
+
+    // And the schema publishes the flags an adapter needs to reach this path.
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let flags = |operation: &str| {
+        schema["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == operation)
+            .unwrap_or_else(|| panic!("{operation} is not published"))["flags"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    for (operation, flag, kind) in [
+        ("deploy start", "artifact", "list"),
+        ("deploy start", "build-commit", "value"),
+        ("deploy start", "deployer-checkout", "value"),
+        ("deploy finish", "observed", "list"),
+    ] {
+        let published = flags(operation)
+            .into_iter()
+            .find(|row| row["name"] == flag)
+            .unwrap_or_else(|| panic!("{operation} does not publish --{flag}"));
+        assert_eq!(published["kind"], kind, "{operation} --{flag}");
+    }
+}
+
+/// Each way an observation can fail to be the expected identity, refused by
+/// name with both values, through the compiled binary.
+#[test]
+fn a_recovery_finish_refuses_a_missing_role_a_kind_mismatch_and_a_value_mismatch_by_name() {
+    let fixture = Fixture::new("deploy-recovery-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REFUSE", "--json"]);
+    let started = start_recovery_deployment(&fixture, "production");
+    let id = started["id"].as_str().unwrap().to_owned();
+    let token = started["capabilityToken"].as_str().unwrap().to_owned();
+    let api = format!("api=docker-image-id:{RECOVERY_API_IMAGE_ID}");
+    let web = format!("web=oci-manifest-digest:{RECOVERY_WEB_MANIFEST}");
+
+    // 1. A role the attempt expects, and nothing observed for it.
+    assert_eq!(
+        refusal_object(&finish_recovery_deployment(&fixture, &id, &token, &[&api])),
+        format!(
+            "deployment {id} expects artifact role web (oci-manifest-digest \
+             {RECOVERY_WEB_MANIFEST}) and --observed named no identity for it"
+        )
+    );
+
+    // 2. A role the attempt does not expect.
+    assert_eq!(
+        refusal_object(&finish_recovery_deployment(
+            &fixture,
+            &id,
+            &token,
+            &[
+                &api,
+                &web,
+                &format!("worker=docker-image-id:{RECOVERY_WEB_IMAGE_ID}"),
+            ],
+        )),
+        format!(
+            "deployment {id} does not expect artifact role worker; \
+             its expected roles are api, web"
+        )
+    );
+
+    // 3. The config ID of the web image offered where the manifest digest
+    //    was expected: the two kinds are different numbers of different
+    //    things, so this is refused on the kind and never compared.
+    assert_eq!(
+        refusal_object(&finish_recovery_deployment(
+            &fixture,
+            &id,
+            &token,
+            &[
+                &api,
+                &format!("web=docker-image-id:{RECOVERY_WEB_IMAGE_ID}")
+            ],
+        )),
+        format!(
+            "deployment {id} artifact role web expects oci-manifest-digest \
+             {RECOVERY_WEB_MANIFEST} but --observed offered docker-image-id \
+             {RECOVERY_WEB_IMAGE_ID}; a docker-image-id and an oci-manifest-digest are \
+             never compared to each other"
+        )
+    );
+
+    // 4. The right kind, the wrong image.
+    assert_eq!(
+        refusal_object(&finish_recovery_deployment(
+            &fixture,
+            &id,
+            &token,
+            &[
+                &format!("api=docker-image-id:{RECOVERY_WEB_IMAGE_ID}"),
+                &web,
+            ],
+        )),
+        format!(
+            "deployment {id} artifact role api expects docker-image-id \
+             {RECOVERY_API_IMAGE_ID} but --observed offered docker-image-id \
+             {RECOVERY_WEB_IMAGE_ID}"
+        )
+    );
+
+    // Four refusals later the attempt is still open and unproved: nothing a
+    // refused finish touched became a release.
+    let row = fixture.ok_json(&fixture.main, &["deploy", "show", &id, "--json"]);
+    assert_eq!(row["status"], "started");
+    assert_eq!(row["artifacts"][0]["observed"], Value::Null);
+    assert_eq!(row["artifacts"][1]["observed"], Value::Null);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["deploy", "current", "--json"]),
+        json!([]),
+        "a refused finish must not publish a current release"
+    );
+
+    // And the same attempt still finishes when the identities do match, so
+    // the refusals above are about the observation and not about the row.
+    assert!(
+        finish_recovery_deployment(&fixture, &id, &token, &[&api, &web])
+            .status
+            .success()
+    );
+}
+
+/// One mode per attempt, named: neither mode accepts the other's proof, at
+/// `start` or at `finish`.
+#[test]
+fn artifact_mode_and_git_mode_refuse_each_others_flags() {
+    let fixture = Fixture::new("deploy-identity-modes");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MODES", "--json"]);
+    let full_sha = "1111111111111111111111111111111111111111";
+    let artifact = format!("api=docker-image-id:{RECOVERY_API_IMAGE_ID}");
+    let start = |extra: &[&str]| {
+        let mut args = vec![
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/legacy-stack",
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://legacy.geoy.ws",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        fixture.run(&fixture.main, &args)
+    };
+
+    assert_eq!(
+        refusal_object(&start(&["--commit", full_sha, "--artifact", &artifact])),
+        "deploy: --commit names a Git-mode attempt and --artifact names an \
+         artifact-identity attempt; one mode per attempt, so pass one or the other"
+    );
+    assert_eq!(
+        refusal_object(&start(&["--commit", full_sha, "--build-commit", "unknown"])),
+        "deploy: --build-commit \"unknown\" belongs to artifact mode; the Git path names \
+         its commit with --commit FULL_SHA"
+    );
+    assert_eq!(
+        refusal_object(&start(&["--artifact", &artifact])),
+        "deploy: artifact mode requires --build-commit unknown, so a missing build commit \
+         is stated rather than defaulted"
+    );
+    assert_eq!(
+        refusal_object(&start(&[
+            "--artifact",
+            &artifact,
+            "--build-commit",
+            full_sha
+        ])),
+        format!(
+            "deploy: --build-commit {full_sha} is a full Git commit, so this build's \
+             provenance is known; use the Git mode with --commit {full_sha} instead of \
+             --artifact"
+        )
+    );
+    assert_eq!(
+        refusal_object(&start(&[])),
+        "deploy start requires --commit FULL_SHA (the verified Git path) or --artifact \
+         ROLE=KIND:VALUE with --build-commit unknown (the artifact-identity recovery path)"
+    );
+
+    // At finish: a digest-only success may not be dressed as a verified Git
+    // commit, and a Git attempt may not be proved by a digest.
+    let recovery = start_recovery_deployment(&fixture, "recovery");
+    let recovery_id = recovery["id"].as_str().unwrap().to_owned();
+    let served = fixture.run(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &recovery_id,
+            "--token",
+            recovery["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            full_sha,
+            "--receipt",
+            "the bundle was served",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&served),
+        format!(
+            "deployment {recovery_id} was started in artifact-identity mode, where no Git \
+             commit was proved; --served-commit cannot be recorded for it — verify it with \
+             --observed ROLE=KIND:VALUE for every expected role"
+        )
+    );
+
+    let git = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/legacy-stack",
+            "--commit",
+            full_sha,
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://legacy.geoy.ws",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    let git_id = git["id"].as_str().unwrap().to_owned();
+    let observed = fixture.run(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &git_id,
+            "--token",
+            git["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            full_sha,
+            "--observed",
+            &artifact,
+            "--receipt",
+            "the bundle was served",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&observed),
+        format!(
+            "deployment {git_id} was started in Git mode; --observed belongs to \
+             artifact-identity mode — verify it with --served-commit FULL_SHA"
+        )
+    );
+}
+
+/// The existing path, unchanged: a Git-mode attempt still proves itself with
+/// its served commit, still refuses a mismatching one, and carries no
+/// artifact identity at all.
+#[test]
+fn the_git_deploy_path_is_unchanged_by_artifact_mode() {
+    let fixture = Fixture::new("deploy-git-unchanged");
+    fixture.ok_json(&fixture.main, &["init", "--name", "GITPATH", "--json"]);
+    let full_sha = "1111111111111111111111111111111111111111";
+    let started = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban",
+            "--commit",
+            full_sha,
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--operation-id",
+            "git-path-1",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    let id = started["id"].as_str().unwrap().to_owned();
+    let token = started["capabilityToken"].as_str().unwrap().to_owned();
+    assert_eq!(started["identityMode"], "git");
+    assert_eq!(started["buildCommit"], full_sha);
+    assert_eq!(started["buildCommitLabel"], full_sha);
+    assert_eq!(started["deployerCheckout"], Value::Null);
+    assert_eq!(started["artifacts"], json!([]));
+
+    let finish = |served: &str| {
+        fixture.run(
+            &fixture.main,
+            &[
+                "deploy",
+                "finish",
+                &id,
+                "--token",
+                &token,
+                "--result",
+                "succeeded",
+                "--phase",
+                "verification",
+                "--served-commit",
+                served,
+                "--receipt",
+                "the served bundle carried the exact release",
+                "--as",
+                "codex@e2e",
+                "--json",
+            ],
+        )
+    };
+    assert_eq!(
+        refusal_object(&finish("2222222222222222222222222222222222222222")),
+        "served commit must exactly match the requested deployment commit"
+    );
+    assert!(finish(full_sha).status.success());
+
+    let row = fixture.ok_json(&fixture.main, &["deploy", "show", &id, "--json"]);
+    assert_eq!(row["status"], "succeeded");
+    assert_eq!(row["identityMode"], "git");
+    assert_eq!(row["buildCommit"], full_sha);
+    assert_eq!(row["servedCommit"], full_sha);
+    assert_eq!(
+        row["artifacts"],
+        json!([]),
+        "a Git attempt carries no artifact identity"
+    );
+    // The idempotent replay still answers with the same attempt, identity
+    // included, rather than treating the new mode fields as a difference.
+    let replay = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban",
+            "--commit",
+            full_sha,
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--operation-id",
+            "git-path-1",
+            "--as",
+            "codex@e2e",
+            "--json",
+        ],
+    );
+    assert_eq!(replay["id"], id.as_str());
+    assert_eq!(replay["idempotentReplay"], true);
+    assert_eq!(replay["identityMode"], "git");
+}
+
+/// The served page says it in words. A blank where a SHA would be, or the
+/// bare literal `unknown`, both read as "nobody looked"; the page has to say
+/// that the release was recovered by artifact identity.
+#[test]
+fn the_deployments_page_says_build_commit_unknown_in_words() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("deploy-recovery-page");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PAGE", "--json"]);
+    let started = start_recovery_deployment(&fixture, "production");
+    let id = started["id"].as_str().unwrap().to_owned();
+    let token = started["capabilityToken"].as_str().unwrap().to_owned();
+    assert!(
+        finish_recovery_deployment(
+            &fixture,
+            &id,
+            &token,
+            &[
+                &format!("api=docker-image-id:{RECOVERY_API_IMAGE_ID}"),
+                &format!("web=oci-manifest-digest:{RECOVERY_WEB_MANIFEST}"),
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let server = spawn_server(&fixture);
+    let (status, page) = http_get(server.port, "/deployments");
+    assert_eq!(status, 200, "{page}");
+    assert!(
+        page.contains("build commit unknown - recovered by artifact identity"),
+        "the current-releases table must say it in words: {page}"
+    );
+    assert!(
+        !page.contains(">unknown<"),
+        "the bare literal must never be the whole cell: {page}"
+    );
+    assert!(
+        !page.contains("<td><code></code></td>"),
+        "no cell may be blank where a commit would be: {page}"
+    );
+
+    let (status, detail) = http_get(server.port, &format!("/deployment/PAGE/{id}"));
+    assert_eq!(status, 200, "{detail}");
+    assert!(
+        detail.contains("build commit unknown - recovered by artifact identity"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("<dt>Identity mode</dt><dd>artifact</dd>"),
+        "{detail}"
+    );
+    // The deployer's checkout is shown as itself, in its own field, and the
+    // served-commit field says why there is none rather than showing a dash.
+    assert!(detail.contains(RECOVERY_CHECKOUT), "{detail}");
+    assert!(
+        detail.contains("not applicable - proved by artifact identity"),
+        "{detail}"
+    );
+    // And both typed identities are on the page, expected beside observed.
+    assert!(detail.contains("Artifact identities"), "{detail}");
+    assert!(detail.contains("docker-image-id"), "{detail}");
+    assert!(detail.contains("oci-manifest-digest"), "{detail}");
+    assert_eq!(
+        detail.matches(RECOVERY_API_IMAGE_ID).count(),
+        2,
+        "expected and observed must both be shown: {detail}"
+    );
 }
 
 #[test]

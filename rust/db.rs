@@ -1615,6 +1615,124 @@ CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
 END;
 "#;
 
+/// A deployment attempt names its identity mode, and an artifact-identity
+/// attempt states that its build commit is unknown (ADR-043 §2).
+///
+/// **A rebuild, because `commit_sha`'s CHECK has to be widened.** The column
+/// admits only 40 hexadecimal characters, so the literal `unknown` cannot be
+/// stored beside it, and a CHECK cannot be altered in place — the same reason
+/// `BOARD_V17` rebuilt `attention`. Storing forty zeroes or the deployer's
+/// own checkout instead would be the invented provenance this migration
+/// exists to make unnecessary.
+///
+/// `identity_mode` is reconstructed from `commit_sha` in the copy rather than
+/// read from the old table, which is what lets the ladder's last step survive
+/// being re-run: `compiled_binary_still_migrates_a_board_that_is_behind`
+/// lowers `user_version` WITHOUT reverting the schema, so the SELECT may only
+/// name columns the pre-rebuild table already had. A re-run therefore keeps
+/// every row and every mode, and loses only the two artifact documents, which
+/// are nullable — the same bounded degradation `BOARD_V24` and `BOARD_V25`
+/// accept and state.
+///
+/// **What stays in the schema is shape; what moves to the store is fit.** The
+/// mode/commit pairing, the digest shapes and "no served commit in artifact
+/// mode" are column CHECKs because they are true of one row read alone. The
+/// per-role expected-versus-observed match is not: it needs a refusal naming
+/// the role and both values (ADR-008), so it lives in `finish_deployment` and
+/// only there. A succeeded artifact attempt is held to phase, receipt and a
+/// recorded observation here, and to the match there.
+///
+/// `search_deployments_au` follows its table — a trigger is dropped with the
+/// table it watches — and is recreated here byte-for-byte from `BOARD_V20`,
+/// as `BOARD_V17` and `BOARD_V25` recreate `attention`'s. Without it an
+/// archived attempt's event documents stay in the hot search corpus, which
+/// `compiled_binary_tracks_verified_deployments_and_self_archives_only_non_current_history`
+/// measures. `search_deployment_event_rows` is a view over this table and is
+/// left alone: it is resolved when used, not when defined.
+const BOARD_V26: &str = r#"
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE deployments RENAME TO deployments_v25;
+CREATE TABLE deployments (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ repo TEXT NOT NULL,
+ identity_mode TEXT NOT NULL DEFAULT 'git' CHECK(identity_mode IN ('git','artifact')),
+ commit_sha TEXT NOT NULL CHECK(
+   (identity_mode='git' AND length(commit_sha)=40 AND commit_sha NOT GLOB '*[^0-9a-f]*')
+   OR
+   (identity_mode='artifact' AND commit_sha='unknown')
+ ),
+ deployer_checkout TEXT CHECK(deployer_checkout IS NULL OR (length(deployer_checkout)=40 AND deployer_checkout NOT GLOB '*[^0-9a-f]*')),
+ expected_artifacts TEXT CHECK(expected_artifacts IS NULL OR (json_valid(expected_artifacts)
+   AND json_type(expected_artifacts)='array' AND json_array_length(expected_artifacts)>=1)),
+ observed_artifacts TEXT CHECK(observed_artifacts IS NULL OR (json_valid(observed_artifacts)
+   AND json_type(observed_artifacts)='array' AND json_array_length(observed_artifacts)>=1)),
+ branch TEXT,
+ tier TEXT NOT NULL CHECK(tier IN ('@_bdt','@_bd','@_bst','@_bs','@_s','@_uat','@_p')),
+ environment TEXT NOT NULL,
+ host TEXT NOT NULL,
+ url TEXT NOT NULL,
+ mechanism TEXT,
+ operation_id TEXT UNIQUE,
+ retry_of TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+ status TEXT NOT NULL CHECK(status IN ('started','succeeded','failed','cancelled','abandoned')),
+ phase TEXT CHECK(phase IS NULL OR phase IN ('build','publish','start','verification')),
+ actor TEXT NOT NULL,
+ lane TEXT,
+ capability_token TEXT NOT NULL UNIQUE,
+ receipt TEXT,
+ artifact_uri TEXT,
+ served_commit TEXT CHECK(served_commit IS NULL OR (length(served_commit)=40 AND served_commit NOT GLOB '*[^0-9a-f]*')),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ completed_at INTEGER,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ archived_at INTEGER,
+ CHECK(identity_mode='git' OR served_commit IS NULL),
+ CHECK(
+   (status='started' AND completed_at IS NULL)
+   OR
+   (status<>'started' AND completed_at IS NOT NULL)
+ ),
+ CHECK(status<>'succeeded' OR (phase='verification' AND receipt IS NOT NULL AND length(trim(receipt))>0 AND (
+   (identity_mode='git' AND served_commit=commit_sha)
+   OR
+   (identity_mode='artifact' AND observed_artifacts IS NOT NULL)
+ )))
+) STRICT;
+INSERT INTO deployments(
+ id,task_id,repo,identity_mode,commit_sha,branch,tier,environment,host,url,mechanism,
+ operation_id,retry_of,status,phase,actor,lane,capability_token,receipt,artifact_uri,
+ served_commit,created_at,updated_at,completed_at,archived,archived_at
+)
+SELECT id,task_id,repo,
+ CASE WHEN commit_sha='unknown' THEN 'artifact' ELSE 'git' END,
+ commit_sha,branch,tier,environment,host,url,mechanism,
+ operation_id,retry_of,status,phase,actor,lane,capability_token,receipt,artifact_uri,
+ served_commit,created_at,updated_at,completed_at,archived,archived_at
+FROM deployments_v25;
+DROP TABLE deployments_v25;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_deployments_hot_target ON deployments(repo,tier,environment,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_hot_status ON deployments(status,created_at DESC,id) WHERE archived=0;
+CREATE INDEX idx_deployments_task ON deployments(task_id,created_at DESC) WHERE archived=0;
+CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
+ DELETE FROM search_documents
+ WHERE source_kind='event' AND source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID') IN (old.id,new.id)
+ );
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_deployment_event_rows
+ WHERE source_id IN (
+   SELECT CAST(seq AS TEXT) FROM events
+   WHERE kind IN ('deployment_started','deployment_finished','deployment_abandoned')
+     AND json_extract(payload,'$.deploymentID')=new.id
+ );
+END;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -1916,7 +2034,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 25;
+pub const BOARD_SCHEMA_VERSION: usize = 26;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2376,6 +2494,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
+    BOARD_V26,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still

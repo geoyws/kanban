@@ -684,6 +684,47 @@ is a new attempt linked with `--retry-of`; an idempotent caller supplies
 `--operation-id`. See ADR-030. The cross-board live matrix is at
 `https://kb.geoy.ws/deployments`.
 
+### Recovering an artifact whose build commit is unknown
+
+Some releases are a retained image and nothing else: no build SHA anyone can
+trust, and inventing one is the failure the ledger exists to prevent. Such an
+attempt names its identity explicitly instead.
+
+```bash
+kb deploy start --repo geoyws/legacy-stack \
+  --artifact "api=docker-image-id:sha256:$API_IMAGE_ID" \
+  --artifact "web=oci-manifest-digest:sha256:$WEB_MANIFEST_DIGEST" \
+  --build-commit unknown --deployer-checkout "$FULL_SHA" \
+  --tier @_p --environment production --host hax --url https://legacy.geoy.ws \
+  --as codex@driver --json
+
+kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
+  --result succeeded --phase verification \
+  --observed "api=docker-image-id:sha256:$API_IMAGE_ID" \
+  --observed "web=oci-manifest-digest:sha256:$WEB_MANIFEST_DIGEST" \
+  --receipt "pulled both images on the tier and read their identities" \
+  --as codex@driver --json
+```
+
+One mode per attempt, named by the caller: `--commit` is refused in artifact
+mode and `--artifact` in Git mode. `--build-commit unknown` is required rather
+than defaulted, so the absence is stated; a full 40-character SHA there is
+refused and sends you to `--commit`. A `KIND` is `docker-image-id` (a Docker
+config/image ID) or `oci-manifest-digest` (a registry manifest digest), and the
+two are never compared to each other. A succeeded finish needs one `--observed`
+per expected role, exact per role and per kind; a missing role, an extra role, a
+kind mismatch or a value mismatch is refused naming the role and both values,
+and `--served-commit` is refused outright, so a digest-only success cannot be
+recorded as a verified Git commit.
+
+`--deployer-checkout` is the checkout the deployer ran from. It is stored in its
+own field and is never presented as the build commit. Every projection —
+`deploy show/list/current --json`, the MCP tools, `kanban schema` and the
+Deployments page — carries `identityMode`, `buildCommit` (`unknown` here),
+`buildCommitLabel`, `deployerCheckout` and `artifacts[{role, kind, expected,
+observed}]`, and renders `build commit unknown - recovered by artifact identity`
+in words rather than a blank where a SHA would be. See ADR-043.
+
 ## Off-site backup
 
 ```bash

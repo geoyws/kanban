@@ -96,9 +96,26 @@ Usage:
   kanban deploy start --repo REPO --commit FULL_SHA --tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p --environment NAME
              --host HOST --url URL --as ACTOR [--task ID] [--branch NAME]
              [--lane LANE] [--mechanism NAME] [--operation-id ID] [--retry-of ID]
+             [--deployer-checkout FULL_SHA]
+  kanban deploy start --repo REPO --artifact ROLE=KIND:VALUE ... --build-commit unknown
+             --tier TIER --environment NAME --host HOST --url URL --as ACTOR
+             [--deployer-checkout FULL_SHA] [--task ID] [--branch NAME]
+             [--lane LANE] [--mechanism NAME] [--operation-id ID] [--retry-of ID]
+             (the recovery path for an artifact whose build commit is genuinely
+             unknown. ROLE names one component, KIND is docker-image-id or
+             oci-manifest-digest and the two are never compared to each other,
+             and the literal unknown is required so the absence is stated. One
+             mode per attempt: --commit is refused here and --artifact is
+             refused on the Git line above.)
   kanban deploy finish ID --token TOKEN --result succeeded|failed|cancelled|abandoned --as ACTOR
              --phase build|publish|start|verification --receipt TEXT
              [--served-commit FULL_SHA] [--artifact-uri URI]
+  kanban deploy finish ID --token TOKEN --result succeeded --phase verification
+             --receipt TEXT --observed ROLE=KIND:VALUE ... --as ACTOR
+             (an artifact-identity attempt: one --observed per expected role,
+             matched exactly per role and per kind. --served-commit is refused
+             here and --observed is refused on a Git attempt, so a digest-only
+             success is never recorded as a verified Git commit.)
   kanban deploy abandon ID --as ACTOR --note TEXT [--token TOKEN | --force]
   kanban deploy show ID | list [--status started|succeeded|failed|cancelled|abandoned] [--tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p] [--limit N] [--all]
   kanban deploy current
@@ -360,6 +377,13 @@ pub(crate) const ACCESS_REPEATABLE: [&str; 2] = ["scope", "replaces"];
 /// one answer in the other (ADR-042 §4).
 pub(crate) const CARD_REPEATABLE: [&str; 2] = ["choice", "consequence"];
 
+/// The artifact-identity flags, list-valued on the one subcommand each
+/// belongs to: a `deploy start` expects one identity per component role and a
+/// `deploy finish` observes one per role (ADR-043 §2). Neither flag exists on
+/// the other subcommand, so each is claimed once.
+pub(crate) const ARTIFACT_EXPECTED_REPEATABLE: [&str; 1] = ["artifact"];
+pub(crate) const ARTIFACT_OBSERVED_REPEATABLE: [&str; 1] = ["observed"];
+
 /// One operation's list-valued flags, keyed on the command AND the
 /// subcommand.
 ///
@@ -374,7 +398,7 @@ struct ListValued {
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 5] = [
+const LIST_VALUED: [ListValued; 7] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -399,6 +423,16 @@ const LIST_VALUED: [ListValued; 5] = [
         command: "attention",
         sub: Some("update"),
         flags: &CARD_REPEATABLE,
+    },
+    ListValued {
+        command: "deploy",
+        sub: Some("start"),
+        flags: &ARTIFACT_EXPECTED_REPEATABLE,
+    },
+    ListValued {
+        command: "deploy",
+        sub: Some("finish"),
+        flags: &ARTIFACT_OBSERVED_REPEATABLE,
     },
 ];
 
@@ -845,6 +879,9 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "task",
             "repo",
             "commit",
+            "artifact",
+            "build-commit",
+            "deployer-checkout",
             "branch",
             "tier",
             "environment",
@@ -867,6 +904,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "result",
             "phase",
             "served-commit",
+            "observed",
             "receipt",
             "artifact-uri",
             "as",
@@ -6243,7 +6281,12 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             &store.start_deployment(StartDeployment {
                 task_id: option_string(&args, "task"),
                 repo: args.require("repo")?.to_owned(),
-                commit_sha: args.require("commit")?.to_owned(),
+                identity: DeployIdentity::parse(
+                    args.one("commit"),
+                    args.one("build-commit"),
+                    &args.many("artifact"),
+                )?,
+                deployer_checkout: option_string(&args, "deployer-checkout"),
                 branch: option_string(&args, "branch"),
                 tier: args.require("tier")?.to_owned(),
                 environment: args.require("environment")?.to_owned(),
@@ -6268,6 +6311,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 receipt: option_string(&args, "receipt"),
                 artifact_uri: option_string(&args, "artifact-uri"),
                 served_commit: option_string(&args, "served-commit"),
+                observed: ArtifactIdentity::parse(&args.many("observed"), "--observed")?,
                 actor: args.require("as")?.to_owned(),
             })?,
             args.has("json"),
