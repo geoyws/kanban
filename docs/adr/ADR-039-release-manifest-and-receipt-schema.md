@@ -483,6 +483,25 @@ lock spans an activation, ownership is mode-only, and publication emits no board
 event. Each is a script or coupling change and none needs a schema field, which
 is why this ADR does not pre-allocate one.
 
+Addendum 2026-09-09: §5's publication sequence gains one step and the freeze
+is untouched. After the public links and the `current` flip, both install
+paths call `serve_restart_and_prove`, which restarts `kanban-serve` and then
+measures the process that came back — `ActiveState=active` with a `MainPID`
+within 15 s, that pid's executable resolving inside the `releases/<id>` this
+run activated, and a 200 from the port the unit's own `ExecStart` names. It
+runs before the activation receipt locally and after it remotely, which is the
+same asymmetry §5 already froze, and a failed measurement takes the `ERR` trap
+into `rollback_activation_view` exactly like any other post-`current` failure.
+No stored artifact changes: `manifest.json` and both receipts carry the same
+fields with the same invariants, so no `releaseId` moves. The measurement is
+reported as `serve: {restarted, mainPid, exe, http}` — or
+`serve: {skipped: <reason>}` on a host with no such unit — on the install
+summary printed to stdout, which §2 states is command output for the caller
+rather than a stored artifact and is not covered by this freeze. Reason and
+incident: ADR-034, addendum 2026-09-09. The bare `:NNN` citations above were
+written against the 2026-09-06 revision of `scripts/hig-release.sh` and were
+already offset before this change; they locate a claim by name, not by line.
+
 ## References
 
 - `scripts/hig-release.sh` — the whole release path; every citation above

@@ -13465,6 +13465,19 @@ fn assert_release_view(install_root: &Path, bin_dir: &Path, release_dir: &Path) 
     }
 }
 
+/// The one diagnostic an install writes on a host with no `kanban-serve`
+/// unit: it names the restart proof it skipped and why. Everything else on
+/// stderr is still unexpected output from a successful install.
+fn stderr_beyond_the_serve_skip_notice(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !line.starts_with("hig-release: serve restart skipped: "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn write_release_tool_stubs(
     fixture: &Fixture,
     fake_repo_root: &Path,
@@ -13584,6 +13597,111 @@ dest="$2"
 mkdir -p "$(dirname "$dest")"
 cp "$src" "$dest"
 chmod "$mode" "$dest"
+"#,
+    );
+    write_executable(
+        &stubs.join("systemctl"),
+        // A `kanban-serve` unit exists only for a test that asks for one, and
+        // the stub decides that, never the host: this suite runs on hax and
+        // hig, where a real kanban-serve is serving the authoritative boards,
+        // and a test that reached the real systemctl would restart it.
+        r#"#!/bin/sh
+set -eu
+present="${FAKE_SERVE_UNIT_PRESENT:-}"
+case "${1:-}" in
+  is-enabled)
+    [ -n "$present" ] || {
+      printf 'Failed to get unit file state for %s.service: No such file or directory\n' "${2:-}" >&2
+      exit 4
+    }
+    printf 'enabled\n'
+    ;;
+  is-active)
+    [ -n "$present" ] || {
+      printf 'inactive\n'
+      exit 3
+    }
+    printf 'active\n'
+    ;;
+  restart)
+    [ -n "$present" ] || {
+      printf 'Failed to restart %s.service: Unit not found.\n' "${2:-}" >&2
+      exit 5
+    }
+    if [ -n "${FAKE_SERVE_RESTART_LOG:-}" ]; then
+      printf 'restart %s\n' "${2:-}" >> "$FAKE_SERVE_RESTART_LOG"
+    fi
+    ;;
+  show)
+    [ -n "$present" ] || exit 4
+    shift
+    property=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -p)
+          property="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    case "$property" in
+      ExecStart)
+        printf '{ path=/root/.local/bin/kanban ; argv[]=/root/.local/bin/kanban serve --port %s --actor-header X-Auth-Request-Email ; ignore_errors=no }\n' "${FAKE_SERVE_PORT:-14200}"
+        ;;
+      ActiveState)
+        printf 'active\n'
+        ;;
+      MainPID)
+        printf '%s\n' "${FAKE_SERVE_MAIN_PID:-0}"
+        ;;
+      *)
+        printf 'unexpected systemctl show -p %s\n' "$property" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected systemctl %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_executable(
+        &stubs.join("curl"),
+        // Answers the release script's status probe, and records the URL it
+        // was asked for so a test can prove the port came from the unit.
+        r#"#!/bin/sh
+set -eu
+url=""
+for arg in "$@"; do
+  case "$arg" in
+    http://*)
+      url="$arg"
+      ;;
+  esac
+done
+if [ -n "${FAKE_SERVE_CURL_LOG:-}" ]; then
+  printf '%s\n' "$url" >> "$FAKE_SERVE_CURL_LOG"
+fi
+printf '%s' "${FAKE_SERVE_HTTP:-200}"
+"#,
+    );
+    write_executable(
+        &stubs.join("serve-exe-of-pid"),
+        // Stands in for `readlink /proc/<pid>/exe`, which does not exist on
+        // macOS. It refuses any pid but the one the unit reported: an exe
+        // proof taken against some other process proves nothing.
+        r#"#!/bin/sh
+set -eu
+[ "${1:-}" = "${FAKE_SERVE_MAIN_PID:?}" ] || {
+  printf 'exe probe asked about pid %s, not the unit MainPID %s\n' "${1:-}" "$FAKE_SERVE_MAIN_PID" >&2
+  exit 1
+}
+printf '%s\n' "${FAKE_SERVE_EXE:?}"
 "#,
     );
     write_executable(
@@ -28792,7 +28910,12 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         "fake SSH did not restore the hidden HAX install root"
     );
     assert!(
-        String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
+        String::from_utf8_lossy(&installed.stderr).contains("hig-release: serve restart skipped: "),
+        "HIG install did not report the kanban-serve restart it skipped: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        stderr_beyond_the_serve_skip_notice(&installed.stderr).is_empty(),
         "HIG install wrote unexpected stderr: {}",
         String::from_utf8_lossy(&installed.stderr)
     );
@@ -29072,7 +29195,7 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         String::from_utf8_lossy(&installed.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&installed.stderr).trim().is_empty(),
+        stderr_beyond_the_serve_skip_notice(&installed.stderr).is_empty(),
         "HIG install wrote unexpected stderr: {}",
         String::from_utf8_lossy(&installed.stderr)
     );
@@ -30163,6 +30286,12 @@ impl ReleaseGuardHarness {
         }
     }
 
+    /// The stub that stands in for `readlink /proc/<pid>/exe`, so a test can
+    /// point the installer's exe proof at a binary it controls.
+    fn exe_probe(&self) -> PathBuf {
+        self.hostname_bin.parent().unwrap().join("serve-exe-of-pid")
+    }
+
     /// Runs an install that must be refused, and proves every watched tree is
     /// byte-identical afterwards: the refusal happened before any mutation.
     fn assert_refused_without_mutation(
@@ -30388,6 +30517,7 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         "ensure_managed_activation_receipt",
         "atomic_symlink",
         "reject_carried_release_identity",
+        "serve_restart_and_prove",
     ] {
         let header = format!("\n{name}() {{\n");
         let definitions: Vec<(usize, &str)> = script
@@ -30411,6 +30541,264 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         assert_eq!(
             definitions[0].1, definitions[1].1,
             "{name} drifted between the local and embedded remote install paths"
+        );
+    }
+}
+
+/// An install is not green until the process answering the port is the
+/// release it just activated. On 2026-09-09 around 01:55 MYT an install on
+/// hax swapped `current` and `/root/.local/bin/kanban` and stopped there:
+/// `/proc/<MainPID>/exe` still resolved under the previous release, so when
+/// the new release's board schema 26 migrated the first board it was asked
+/// for, the old server could not open it and every route answered 500 for
+/// about two minutes until `systemctl restart kanban-serve` was run by hand.
+/// hig carried the same stale exe. So the install restarts the unit and then
+/// MEASURES the result, and every part of the measurement is pinned here: the
+/// pid it proves is the MainPID the unit reported, the exe that pid runs
+/// resolves inside the release directory just installed, and the port it
+/// probes is the one the unit's own ExecStart names.
+#[test]
+fn hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-restart");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("serve-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("serve-bin-{target}"));
+        let served_exe = install_root
+            .join("releases")
+            .join(&release_id)
+            .join("kanban");
+        let restart_log = harness
+            .fixture
+            .root
+            .join(format!("serve-restart-{target}.log"));
+        let curl_log = harness
+            .fixture
+            .root
+            .join(format!("serve-curl-{target}.log"));
+        let installed = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "4242")
+            // Not the 14200 default: the probe has to read the port off the
+            // unit's ExecStart, or an operator who moves the port is proved
+            // green by a request to a port nothing is listening on.
+            .env("FAKE_SERVE_PORT", "14311")
+            .env("FAKE_SERVE_EXE", &served_exe)
+            .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+            .env("FAKE_SERVE_CURL_LOG", &curl_log)
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{target}: install failed: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        let release_dir = PathBuf::from(installed_json["releaseDir"].as_str().unwrap());
+        assert_release_view(&install_root, &bin_dir, &release_dir);
+        assert_eq!(
+            installed_json["serve"],
+            json!({
+                "restarted": true,
+                "mainPid": 4242,
+                "exe": served_exe.to_str().unwrap(),
+                "http": 200,
+            }),
+            "{target}: the install receipt does not carry the restart it proved"
+        );
+        assert!(
+            PathBuf::from(installed_json["serve"]["exe"].as_str().unwrap())
+                .starts_with(&release_dir),
+            "{target}: the proved exe is outside the release just installed"
+        );
+        assert_eq!(
+            fs::read_to_string(&restart_log).unwrap(),
+            "restart kanban-serve\n",
+            "{target}: the install did not restart the unit exactly once"
+        );
+        assert_eq!(
+            fs::read_to_string(&curl_log).unwrap(),
+            "http://127.0.0.1:14311/\n",
+            "{target}: the HTTP proof did not use the port the unit's ExecStart names"
+        );
+    }
+}
+
+/// The exact shape of the 2026-09-09 incident: the unit comes back running
+/// the PREVIOUS release's binary. A restart that lands on the old exe is not
+/// a green install, so the activation is refused and the previous view is
+/// restored - the operator keeps the release that is actually serving instead
+/// of a `current` link that lies about it. The refusal names what it
+/// measured, because "install failed" without the pid and the exe is not a
+/// diagnosis. The HTTP probe never runs: a 200 from the old exe would be the
+/// most convincing wrong answer available.
+#[test]
+fn hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_release() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-stale-exe");
+    let commit_a = "0123456789abcdef0123456789abcdef0000aa01";
+    let commit_b = "0123456789abcdef0123456789abcdef0000bb02";
+    let first = harness.fixture.root.join("release-a");
+    clone_release_package(&harness.package_dir, &first, commit_a);
+    let second = harness.fixture.root.join("release-b");
+    clone_release_package(&harness.package_dir, &second, commit_b);
+    let release_id_b = release_id_from_package(&second);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("stale-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("stale-bin-{target}"));
+        let hax_for = |package: &Path, commit: &str, label: &str| {
+            if target == "hig" {
+                install_matching_hax_package(&harness.hax_context(), package, commit, label)
+            } else {
+                harness.hax_install_root.clone()
+            }
+        };
+
+        // Release A activates on a host with no unit, so there is a previous
+        // view for the refused activation to fall back to.
+        let hax_a = hax_for(&first, commit_a, &format!("stale-a-{target}"));
+        let activated = harness.install_from(target, &first, &hax_a, &install_root, &bin_dir);
+        assert!(
+            activated.status.success(),
+            "{target}: release A failed to install: {}\nstderr: {}",
+            String::from_utf8_lossy(&activated.stdout),
+            String::from_utf8_lossy(&activated.stderr)
+        );
+        let activated_json: Value = serde_json::from_slice(&activated.stdout).unwrap();
+        let release_a_dir = PathBuf::from(activated_json["releaseDir"].as_str().unwrap());
+        let previous_links = capture_release_links(&install_root, &bin_dir);
+
+        let stale_exe = release_a_dir.join("kanban");
+        let restart_log = harness
+            .fixture
+            .root
+            .join(format!("stale-restart-{target}.log"));
+        let curl_log = harness
+            .fixture
+            .root
+            .join(format!("stale-curl-{target}.log"));
+        let hax_b = hax_for(&second, commit_b, &format!("stale-b-{target}"));
+        let refused = harness
+            .install_command(target, &second, &hax_b, &install_root, &bin_dir)
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "3131")
+            .env("FAKE_SERVE_EXE", &stale_exe)
+            .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+            .env("FAKE_SERVE_CURL_LOG", &curl_log)
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{target}: install went green while the previous release's exe was serving\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        for measured in [
+            "serve is not running the release just installed".to_string(),
+            "MainPID=3131".to_string(),
+            format!("exe={}", stale_exe.display()),
+            release_id_b.clone(),
+        ] {
+            assert!(
+                stderr.contains(&measured),
+                "{target}: the refusal does not name {measured:?}:\n{stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&restart_log).unwrap(),
+            "restart kanban-serve\n",
+            "{target}: the refusal happened without restarting the unit at all"
+        );
+        assert!(
+            !curl_log.exists(),
+            "{target}: the HTTP probe ran against an exe that had already failed its proof"
+        );
+        assert_eq!(
+            capture_release_links(&install_root, &bin_dir),
+            previous_links,
+            "{target}: the refused activation left the public view pointing at the new release"
+        );
+        assert_eq!(
+            fs::read_link(install_root.join("current")).unwrap(),
+            release_a_dir,
+            "{target}: current does not point at the release that is serving"
+        );
+        assert!(
+            !install_root.join("releases").join(&release_id_b).exists(),
+            "{target}: the refused activation left its release directory behind"
+        );
+        assert!(
+            !install_root
+                .join("releases")
+                .join(format!("{release_id_b}.receipt.json"))
+                .exists(),
+            "{target}: the refused activation left an activation receipt behind"
+        );
+    }
+}
+
+/// Not every host that installs a release runs the unit - a build box, this
+/// test suite. A missing unit is not a failed install, but it is never
+/// silent: the install says which restart it skipped and why, and the receipt
+/// records the same reason, so a release report can never read as proof of a
+/// restart that did not happen.
+#[test]
+fn hig_release_script_install_skips_the_restart_when_the_unit_is_absent() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-absent");
+    let absent = "the kanban-serve unit is not present on this host";
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("absent-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("absent-bin-{target}"));
+        let restart_log = harness
+            .fixture
+            .root
+            .join(format!("absent-restart-{target}.log"));
+        let installed = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{target}: a host without the unit failed the install: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&installed.stderr)
+                .contains(&format!("hig-release: serve restart skipped: {absent}")),
+            "{target}: the install skipped the restart without saying so: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        assert_eq!(
+            installed_json["serve"],
+            json!({ "skipped": absent }),
+            "{target}: the install receipt does not record why the restart was skipped"
+        );
+        assert!(
+            !restart_log.exists(),
+            "{target}: the install restarted a unit it reported as absent"
+        );
+        assert_release_view(
+            &install_root,
+            &bin_dir,
+            &PathBuf::from(installed_json["releaseDir"].as_str().unwrap()),
         );
     }
 }

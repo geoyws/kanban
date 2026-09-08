@@ -64,6 +64,38 @@ name instead of silently missing the package, and
 count that would go stale) drives package, HAX activation, HIG install and a
 partial-package refusal across the full declared set.
 
+Addendum 2026-09-09: activation now ends in a measurement of the running
+service, because swapping the pointers is not the same as changing what
+serves. On 2026-09-09 around 01:55 MYT an install on `hax` replaced
+`/root/.local/bin/kanban` and the `current` link and stopped there;
+`kanban-serve.service` was never restarted, so `/proc/<MainPID>/exe` still
+resolved under the previous release. When that release's board schema 26
+migrated the first board the old server was asked for, it could not open it,
+and every route answered 500 for about two minutes until
+`systemctl restart kanban-serve` was run by hand. `hig` carried the same stale
+exe. Both install paths therefore restart `kanban-serve` after `current` and
+the public links are in place and then PROVE the result: the unit reaches
+`ActiveState=active` with a `MainPID` within 15 s, that pid's executable
+resolves (realpath) inside the `releases/<id>` this run activated, and
+`http://127.0.0.1:<port>/` answers 200, where `<port>` is read from the unit's
+own `ExecStart --port` and defaults to 14200. A failed measurement is not a
+warning: it names what was measured — pid, exe, resolved path, release, status
+code — and falls into the previous-view rollback an activation failure already
+performs, so the operator keeps the release that is actually serving. A host
+without the unit is not a failure and is not silent either: it prints
+`serve restart skipped: <reason>` once and the install receipt says
+`serve: {skipped: <reason>}`, so a release report can never read as proof of a
+restart that did not happen. The probe that reads a pid's executable is
+overridable (`HIG_RELEASE_EXE_OF_PID`) because `/proc` does not exist on every
+host that runs the tests; the default is the real `readlink /proc/<pid>/exe`.
+`serve_restart_and_prove` is embedded verbatim in the remote installer and is
+pinned by `hig_release_script_local_and_remote_install_guards_are_identical`
+alongside the other guards, and
+`hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe`,
+`hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_release`
+and `hig_release_script_install_skips_the_restart_when_the_unit_is_absent`
+drive the three outcomes through both install legs.
+
 ## References
 
 - `scripts/hig-release.sh`

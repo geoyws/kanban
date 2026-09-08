@@ -563,6 +563,93 @@ maybe_fail_after_current() {
   return 0
 }
 
+# An install is not green until the process answering the port is the release
+# it just activated. On 2026-09-09 an install on hax swapped `current` and the
+# bin links without restarting kanban-serve: the previous exe kept serving,
+# the new release's board schema migrated the first board it was asked for,
+# and every route answered 500 for two minutes until the unit was restarted by
+# hand. So activation restarts the unit and then MEASURES the result - the
+# unit is active with a MainPID, that pid's executable resolves inside the
+# release directory just installed, and the port its ExecStart names answers
+# 200 - and carries the measurement into the install receipt through
+# SERVE_RESTART_JSON. A failed measurement returns non-zero naming what was
+# measured, which the caller's ERR trap turns into the same previous-view
+# rollback a failed activation already performs: a release whose exe is not
+# serving is not installed. A host with no kanban-serve unit (a build box, the
+# e2e harness) is not a failure - it says so once and records why.
+# The identical-guards test in tests/e2e.rs fails when the two copies drift.
+serve_restart_and_prove() {
+  local release_path="$1"
+  local unit=kanban-serve
+  local skipped=""
+  if ! command -v systemctl >/dev/null 2>&1; then
+    skipped="systemctl is not on PATH"
+  elif ! systemctl is-enabled "$unit" >/dev/null 2>&1 && ! systemctl is-active "$unit" >/dev/null 2>&1; then
+    skipped="the $unit unit is not present on this host"
+  fi
+  if [[ -n "$skipped" ]]; then
+    printf 'hig-release: serve restart skipped: %s\n' "$skipped" >&2
+    SERVE_RESTART_JSON="$(jq -n -S --arg skipped "$skipped" '{skipped:$skipped}')"
+    return 0
+  fi
+  # The port is the unit's own, never a second literal: reading it from
+  # ExecStart means an operator who moves the port cannot be proved green by
+  # a probe still asking about the old one.
+  local exec_start port=14200
+  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+  if [[ "$exec_start" =~ --port[[:space:]=]+([0-9]+) ]]; then
+    port="${BASH_REMATCH[1]}"
+  fi
+  systemctl restart "$unit" || {
+    printf 'hig-release: serve restart failed: systemctl restart %s exited non-zero\n' "$unit" >&2
+    return 1
+  }
+  local deadline=$(( SECONDS + 15 )) state="" main_pid=0
+  while :; do
+    state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+    main_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+    [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || main_pid=0
+    [[ "$state" != active || "$main_pid" == 0 ]] || break
+    if (( SECONDS >= deadline )); then
+      printf 'hig-release: serve restart did not come back within 15s: %s ActiveState=%s MainPID=%s\n' "$unit" "${state:-unknown}" "$main_pid" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  # /proc/<pid>/exe is the only witness that survives a symlink swap, and it
+  # exists on the hosts this installs to but not on every host that runs the
+  # tests, so the probe is overridable and the default is the real one.
+  local exe=""
+  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+    exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
+  else
+    exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
+  fi
+  local exe_dir="" exe_physical="" release_physical=""
+  release_physical="$(physical_dir "$release_path" || true)"
+  if [[ -n "$exe" ]]; then
+    exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
+  fi
+  if [[ -n "$exe_dir" ]]; then
+    exe_physical="$exe_dir/${exe##*/}"
+  fi
+  if [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]]; then
+    printf 'hig-release: serve is not running the release just installed: %s MainPID=%s exe=%s resolved=%s release=%s\n' "$unit" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
+    return 1
+  fi
+  local http="" http_deadline=$(( SECONDS + 15 ))
+  while :; do
+    http="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
+    [[ "$http" != 200 ]] || break
+    if (( SECONDS >= http_deadline )); then
+      printf 'hig-release: serve did not answer 200 after restart: %s MainPID=%s exe=%s url=http://127.0.0.1:%s/ status=%s\n' "$unit" "$main_pid" "$exe" "$port" "${http:-<none>}" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  SERVE_RESTART_JSON="$(jq -n -S --argjson main_pid "$main_pid" --arg exe "$exe" --argjson http "$http" '{restarted:true, mainPid:$main_pid, exe:$exe, http:$http}')"
+}
+
 release_entries() {
   local root="$1"
   local files=()
@@ -830,6 +917,8 @@ install_release_tree() {
     return 1
   fi
 
+  serve_restart_and_prove "$release_path"
+
   if [[ ! -f "$release_meta" ]]; then
     receipt_json="$(jq -c '.' "$receipt")"
     activation_sequence="$(next_activation_sequence "$install_root")"
@@ -867,7 +956,8 @@ install_release_tree() {
     --arg receipt "$release_meta" \
     --arg binDir "$bin_dir" \
     --arg target "$target" \
-    '{installRoot:$installRoot, releaseDir:$releaseDir, current:$current, receipt:$receipt, binDir:$binDir, target:$target}'
+    --argjson serve "$SERVE_RESTART_JSON" \
+    '{installRoot:$installRoot, releaseDir:$releaseDir, current:$current, receipt:$receipt, binDir:$binDir, target:$target, serve:$serve}'
   trap - ERR
 }
 
@@ -985,7 +1075,8 @@ install_remote() {
   remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
   tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
   ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
-  HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
+  local remote_serve
+  remote_serve="$(HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
 set -Eeuo pipefail
 
 stage_root="$1"
@@ -1244,6 +1335,80 @@ maybe_fail_after_current() {
   return 0
 }
 
+# Verbatim copy of the local guard; see the comment above the local
+# serve_restart_and_prove for the stale-exe incident it measures against.
+serve_restart_and_prove() {
+  local release_path="$1"
+  local unit=kanban-serve
+  local skipped=""
+  if ! command -v systemctl >/dev/null 2>&1; then
+    skipped="systemctl is not on PATH"
+  elif ! systemctl is-enabled "$unit" >/dev/null 2>&1 && ! systemctl is-active "$unit" >/dev/null 2>&1; then
+    skipped="the $unit unit is not present on this host"
+  fi
+  if [[ -n "$skipped" ]]; then
+    printf 'hig-release: serve restart skipped: %s\n' "$skipped" >&2
+    SERVE_RESTART_JSON="$(jq -n -S --arg skipped "$skipped" '{skipped:$skipped}')"
+    return 0
+  fi
+  # The port is the unit's own, never a second literal: reading it from
+  # ExecStart means an operator who moves the port cannot be proved green by
+  # a probe still asking about the old one.
+  local exec_start port=14200
+  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+  if [[ "$exec_start" =~ --port[[:space:]=]+([0-9]+) ]]; then
+    port="${BASH_REMATCH[1]}"
+  fi
+  systemctl restart "$unit" || {
+    printf 'hig-release: serve restart failed: systemctl restart %s exited non-zero\n' "$unit" >&2
+    return 1
+  }
+  local deadline=$(( SECONDS + 15 )) state="" main_pid=0
+  while :; do
+    state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+    main_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+    [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || main_pid=0
+    [[ "$state" != active || "$main_pid" == 0 ]] || break
+    if (( SECONDS >= deadline )); then
+      printf 'hig-release: serve restart did not come back within 15s: %s ActiveState=%s MainPID=%s\n' "$unit" "${state:-unknown}" "$main_pid" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  # /proc/<pid>/exe is the only witness that survives a symlink swap, and it
+  # exists on the hosts this installs to but not on every host that runs the
+  # tests, so the probe is overridable and the default is the real one.
+  local exe=""
+  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+    exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
+  else
+    exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
+  fi
+  local exe_dir="" exe_physical="" release_physical=""
+  release_physical="$(physical_dir "$release_path" || true)"
+  if [[ -n "$exe" ]]; then
+    exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
+  fi
+  if [[ -n "$exe_dir" ]]; then
+    exe_physical="$exe_dir/${exe##*/}"
+  fi
+  if [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]]; then
+    printf 'hig-release: serve is not running the release just installed: %s MainPID=%s exe=%s resolved=%s release=%s\n' "$unit" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
+    return 1
+  fi
+  local http="" http_deadline=$(( SECONDS + 15 ))
+  while :; do
+    http="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
+    [[ "$http" != 200 ]] || break
+    if (( SECONDS >= http_deadline )); then
+      printf 'hig-release: serve did not answer 200 after restart: %s MainPID=%s exe=%s url=http://127.0.0.1:%s/ status=%s\n' "$unit" "$main_pid" "$exe" "$port" "${http:-<none>}" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  SERVE_RESTART_JSON="$(jq -n -S --argjson main_pid "$main_pid" --arg exe "$exe" --argjson http "$http" '{restarted:true, mainPid:$main_pid, exe:$exe, http:$http}')"
+}
+
 next_activation_sequence() {
   local install_root="$1"
   local sequence_path
@@ -1416,6 +1581,8 @@ if (( activation_status != 0 )); then
   exit 1
 fi
 
+serve_restart_and_prove "$release_path"
+
 jq -e --arg target "$target" '
   (.targets | type == "array") and
   (.targets | length == 2) and
@@ -1438,7 +1605,10 @@ if (( ${#releases[@]} > keep )); then
   done
 fi
 trap - ERR
+printf '%s\n' "$SERVE_RESTART_JSON"
 REMOTE
+)"
+  [[ -n "$remote_serve" ]] || die "remote install did not report the kanban-serve restart proof"
 
   jq -n -S \
     --arg installRoot "$install_root" \
@@ -1449,7 +1619,8 @@ REMOTE
     --arg packageDir "$package_dir" \
     --arg target "$target" \
     --arg binDir "$bin_dir" \
-    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, receipt:$receipt, packageDir:$packageDir, target:$target, binDir:$binDir}'
+    --argjson serve "$remote_serve" \
+    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, receipt:$receipt, packageDir:$packageDir, target:$target, binDir:$binDir, serve:$serve}'
 }
 
 rollback_release() {

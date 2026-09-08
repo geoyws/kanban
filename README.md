@@ -987,6 +987,17 @@ The crate installs ten executables, and the HIG release package ships all ten:
 real binary rather than a shell alias because agents invoke it from
 non-interactive cages that never source a shell profile.
 
+Installing a release flips `current`, relinks all ten public binaries, then
+restarts `kanban-serve` and proves the process that came back is the release
+it just installed: the unit reports `active` with a `MainPID`, that pid's
+`/proc/<MainPID>/exe` resolves inside the new `releases/<id>`, and the port its
+own `ExecStart` names answers 200. The measurement lands in the install
+receipt as `serve: {restarted, mainPid, exe, http}`. A proof that fails is not
+a warning — the activation is rolled back to the previous `current`, because a
+release whose binary is not the one serving is not installed. A host with no
+such unit prints `serve restart skipped: <reason>` and records
+`serve: {skipped: <reason>}` instead of claiming a restart that never happened.
+
 Commands and subcommands have short forms:
 
 | Scope | Aliases |
