@@ -12947,9 +12947,22 @@ fn watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits() {
     assert!(heartbeat["scope"]["selectorValue"].is_null());
     assert!(bounded.finish().is_empty());
 
+    // The old thousand-row watch cap is gone: a thousand events is a real
+    // page on a board with a year of history, so `watch` now shares the one
+    // ceiling with every other `--limit` surface.
+    let at_the_ceiling = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "1000000", "--json"],
+    );
+    assert!(
+        at_the_ceiling.status.success(),
+        "the ceiling itself was refused: {}",
+        String::from_utf8_lossy(&at_the_ceiling.stderr)
+    );
+
     let huge_limit = fixture.run(
         &fixture.main,
-        &["watch", "--cursor", "0", "--limit", "1001", "--json"],
+        &["watch", "--cursor", "0", "--limit", "1000001", "--json"],
     );
     assert!(
         !huge_limit.status.success(),
@@ -12957,8 +12970,8 @@ fn watch_drains_backlogs_in_bounded_batches_and_rejects_invalid_limits() {
     );
     let huge_limit_stderr = String::from_utf8_lossy(&huge_limit.stderr);
     assert!(
-        huge_limit_stderr.contains("1000"),
-        "stderr did not name the exact watch limit cap: {huge_limit_stderr}"
+        huge_limit_stderr.contains(&over_ceiling_refusal("1000001")),
+        "stderr did not carry the shared ceiling refusal: {huge_limit_stderr}"
     );
 
     let zero_follow = fixture.run(
@@ -19220,6 +19233,321 @@ fn every_capped_listing_refuses_a_default_it_would_exceed_and_answers_one_it_mee
             listing.label
         );
     }
+}
+
+/// The one refusal every `--limit` surface answers an over-ceiling value
+/// with. Assembled rather than substring-matched so a surface that grows its
+/// own private wording fails here instead of quietly diverging.
+fn over_ceiling_refusal(value: &str) -> String {
+    format!(
+        "--limit must be between 0 and 1000000, got {value}; the ceiling exists so a mistyped \
+         value is refused, not to imply a page this size is wise"
+    )
+}
+
+/// The ceiling is 1,000,000 on every surface that takes `--limit`, and it is
+/// the same refusal on each.
+///
+/// Read bottom-up: the row past the ceiling is refused with one wording, and
+/// the ceiling itself answers. Before t-5d38449a `search` stopped at 100,
+/// `watch` at 1000 and every other listing had no ceiling at all, so an agent
+/// asking for a board's whole history had to know which surface it was on.
+#[test]
+fn every_limit_surface_accepts_one_million_and_refuses_one_more() {
+    let fixture = Fixture::new("limit-ceiling");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CEILING", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "ceiling probe",
+            "--id",
+            "t-ceiling",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "needs a verdict",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "still going",
+            "--as",
+            "agent",
+            "--lane",
+            "driver",
+            "--json",
+        ],
+    );
+
+    // `watch` is here without `--follow`: it drains the backlog and exits, so
+    // the batch size is exercised without the loop.
+    let surfaces: [&[&str]; 6] = [
+        &["events"],
+        &["search", "ceiling"],
+        &["attention", "list"],
+        &["sitrep", "list"],
+        &["watch", "--cursor", "0"],
+        &["deploy", "list"],
+    ];
+    for surface in surfaces {
+        let mut accepted = surface.to_vec();
+        accepted.extend(["--limit", "1000000", "--json"]);
+        let answered = fixture.run(&fixture.main, &accepted);
+        assert!(
+            answered.status.success(),
+            "{surface:?} refused the ceiling itself\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&answered.stdout),
+            String::from_utf8_lossy(&answered.stderr)
+        );
+
+        let mut refused_argv = surface.to_vec();
+        refused_argv.extend(["--limit", "1000001", "--json"]);
+        let refused = fixture.run(&fixture.main, &refused_argv);
+        assert!(
+            !refused.status.success(),
+            "{surface:?} accepted a limit past the ceiling"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+        assert!(
+            stderr.contains(&over_ceiling_refusal("1000001")),
+            "{surface:?} refused with its own wording instead of the shared one: {stderr}"
+        );
+    }
+}
+
+/// `ev --limit N` that cut names the cut on stderr; stdout and the exit
+/// status are exactly what ADR-037 §3 promised.
+///
+/// Read bottom-up: with five events on the board, `--limit 5` and `--limit 6`
+/// say nothing, because a page that reached the end of history is not a
+/// truncated one — the notice is driven by the row that came back, not by the
+/// count matching the flag.
+#[test]
+fn ev_with_an_explicit_limit_that_cuts_names_the_cut_on_stderr_and_keeps_stdout_exact() {
+    const NOTICE: &str =
+        "events: showing 3 of more than 3; pass --limit above 3 for the rest (ceiling 1000000)";
+    let fixture = Fixture::new("ev-explicit-cut");
+    fixture.ok_json(&fixture.main, &["init", "--name", "EVCUT", "--json"]);
+    // `init` writes one event and each `task add` writes one more: five.
+    for index in 0..4 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("row {index}"),
+                "--id",
+                &format!("t-{index}"),
+                "--json",
+            ],
+        );
+    }
+    let total = fixture
+        .ok_json(&fixture.main, &["events", "--limit", "1000", "--json"])
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(total, 5, "the seed did not leave exactly five events");
+
+    let cut = fixture.run(&fixture.main, &["events", "--limit", "3", "--json"]);
+    assert!(
+        cut.status.success(),
+        "a cut page exited non-zero: {}",
+        String::from_utf8_lossy(&cut.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&cut.stdout).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        3,
+        "stdout carried something other than the three rows asked for: {rows}"
+    );
+    let cut_stderr = String::from_utf8_lossy(&cut.stderr).to_string();
+    assert!(
+        cut_stderr.contains(NOTICE),
+        "the cut was not named on stderr: {cut_stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&cut.stdout).contains("showing 3 of more than 3"),
+        "the notice leaked into the parsed payload"
+    );
+    assert_eq!(
+        cut_stderr
+            .lines()
+            .filter(|line| line.contains("showing"))
+            .count(),
+        1,
+        "the cut was named more than once: {cut_stderr}"
+    );
+
+    // The text form is the same contract: rows on stdout, notice on stderr.
+    let cut_text = fixture.run(&fixture.main, &["events", "--limit", "3"]);
+    assert!(cut_text.status.success());
+    assert!(
+        String::from_utf8_lossy(&cut_text.stderr).contains(NOTICE),
+        "the text form did not name the cut"
+    );
+    assert!(
+        !String::from_utf8_lossy(&cut_text.stdout).contains("showing 3 of more than 3"),
+        "the notice reached the text payload"
+    );
+
+    // Exactly the whole history, and one more than it: nothing was cut, so
+    // nothing is said.
+    for limit in ["5", "6"] {
+        let whole = fixture.run(&fixture.main, &["events", "--limit", limit, "--json"]);
+        assert!(whole.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&whole.stdout)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            5,
+            "--limit {limit} did not return the whole history"
+        );
+        let stderr = String::from_utf8_lossy(&whole.stderr).to_string();
+        assert!(
+            stderr.is_empty(),
+            "--limit {limit} cut nothing and said something anyway: {stderr}"
+        );
+    }
+}
+
+/// Raising the ceiling changed no default and softened no refusal.
+///
+/// Read bottom-up: each case here is a refusal that a "limits are bigger now"
+/// change is most likely to have relaxed by accident — the ADR-037 default
+/// refusals, verbatim, and the unknown-flag refusal on a listing that takes
+/// no `--limit` at all.
+#[test]
+fn defaults_and_default_refusals_are_unchanged_by_the_ceiling() {
+    let fixture = Fixture::new("ceiling-defaults");
+    fixture.ok_json(&fixture.main, &["init", "--name", "DEFAULTS", "--json"]);
+
+    // One lane each, because a lane keeps only its ten newest current.
+    for index in 0..21 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "sitrep",
+                "post",
+                &format!("sitrep {index}"),
+                "--as",
+                "agent",
+                "--lane",
+                &format!("lane-{index}"),
+                "--json",
+            ],
+        );
+    }
+    let sitreps = fixture.run(&fixture.main, &["sitrep", "list", "--json"]);
+    assert_eq!(
+        refusal_object(&sitreps),
+        "found more than 20 sitreps and no --limit was given — a page cut at the default would \
+         read as the whole; pass --limit N, above 20 to see more or exactly 20 to take the \
+         first 20 knowingly",
+        "the sitrep default refusal changed wording"
+    );
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["sitrep", "list", "--limit", "20", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        20,
+        "the sitrep default is no longer 20"
+    );
+
+    // `init` and the sitreps have already written events; top up to 51 so the
+    // events default of 50 is the thing that is exceeded.
+    let mut events = fixture
+        .ok_json(&fixture.main, &["events", "--limit", "1000", "--json"])
+        .as_array()
+        .unwrap()
+        .len();
+    let mut index = 0;
+    while events < 51 {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("filler {index}"),
+                "--id",
+                &format!("t-fill-{index}"),
+                "--json",
+            ],
+        );
+        index += 1;
+        events = fixture
+            .ok_json(&fixture.main, &["events", "--limit", "1000", "--json"])
+            .as_array()
+            .unwrap()
+            .len();
+    }
+    let bare_events = fixture.run(&fixture.main, &["events", "--json"]);
+    assert_eq!(
+        refusal_object(&bare_events),
+        "found more than 50 events and no --limit was given — a page cut at the default would \
+         read as the whole; pass --limit N, above 50 to see more or exactly 50 to take the \
+         first 50 knowingly",
+        "the events default refusal changed wording"
+    );
+
+    // `task list` never took `--limit`, and a bigger ceiling is no reason for
+    // it to start: the refusal still names what it does take.
+    let task_list = fixture.run(&fixture.main, &["task", "list", "--limit", "5"]);
+    assert!(!task_list.status.success(), "task list accepted --limit");
+    let stderr = String::from_utf8_lossy(&task_list.stderr).to_string();
+    assert!(stderr.contains("unknown flag --limit"), "{stderr}");
+    assert!(stderr.contains("accepted here:"), "{stderr}");
+    assert!(stderr.contains("--with-claims"), "{stderr}");
+}
+
+/// A follow that fetches nothing per poll would sit there reporting nothing,
+/// so `--follow --limit 0` is refused before the loop starts. The ceiling
+/// moved the top of the band; the bottom of it is unchanged.
+#[test]
+fn watch_follow_still_refuses_a_zero_limit() {
+    let fixture = Fixture::new("watch-zero-follow");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ZEROFOLLOW", "--json"]);
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "watch", "--cursor", "0", "--follow", "--limit", "0", "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&refused),
+        "--follow requires --limit to be at least 1"
+    );
+
+    // Without `--follow`, zero is a legitimate "ask for nothing".
+    let drained = fixture.run(
+        &fixture.main,
+        &["watch", "--cursor", "0", "--limit", "0", "--json"],
+    );
+    assert!(
+        drained.status.success(),
+        "a non-follow zero limit was refused: {}",
+        String::from_utf8_lossy(&drained.stderr)
+    );
 }
 
 /// One enum-valued argument, for the ADR-008 property below. Adding one is a

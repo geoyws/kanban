@@ -1,4 +1,4 @@
-use crate::WATCH_BATCH_LIMIT;
+use crate::LIMIT_CEILING;
 use crate::authz::AuthzContext;
 use crate::db::{
     SnapshotSource, checkpoint as wal_checkpoint, create_backup_target, integrity, open_board,
@@ -301,10 +301,16 @@ fn article(word: &str) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
+/// The store-layer band on an event read's `LIMIT`.
+///
+/// Not a duplicate of `Args::limit`: `LIMIT -1` means *no limit* in SQLite,
+/// and these two reads are reached by `watch`'s poll loop and by the MCP and
+/// serve adapters as well as by the CLI, so the floor lives where the query
+/// is built rather than only where a flag is parsed. It shares
+/// [`crate::LIMIT_CEILING`] so the two cannot disagree about the top.
 fn validate_event_limit(limit: i64) -> Result<()> {
-    if !(0..=WATCH_BATCH_LIMIT).contains(&limit) {
-        bail!("--limit must be between 0 and {WATCH_BATCH_LIMIT}, got {limit}");
+    if !(0..=LIMIT_CEILING).contains(&limit) {
+        bail!("--limit must be between 0 and {LIMIT_CEILING}, got {limit}");
     }
     Ok(())
 }
@@ -10646,13 +10652,17 @@ mod tests {
             .events_since(None, 0, -1, true)
             .expect_err("negative limits must be rejected")
             .to_string();
-        assert!(negative.contains("1000"), "{negative}");
+        assert!(negative.contains("1000000"), "{negative}");
 
+        // The ceiling itself is a legal page, and only the row past it is not.
+        store
+            .events_since(None, 0, crate::LIMIT_CEILING, true)
+            .expect("the ceiling is a limit, not a refusal");
         let over = store
-            .events_since(None, 0, crate::WATCH_BATCH_LIMIT + 1, true)
-            .expect_err("over-cap limits must be rejected")
+            .events_since(None, 0, crate::LIMIT_CEILING + 1, true)
+            .expect_err("over-ceiling limits must be rejected")
             .to_string();
-        assert!(over.contains("1000"), "{over}");
+        assert!(over.contains("1000000"), "{over}");
     }
 
     fn insert_lane_task(store: &Store, id: &str, lane: Option<&str>) {

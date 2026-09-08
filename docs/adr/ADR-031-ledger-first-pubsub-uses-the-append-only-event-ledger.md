@@ -108,10 +108,13 @@ Semantics:
   synchronously with no intermediate queue, and then closes before the next
   poll. The runtime requires `--limit` to be at least `1` whenever `--follow`
   is set, so `--follow --limit 0` fails.
-- `--limit` bounds replay work and must be within `0..1000` in every mode;
+- `--limit` bounds replay work and must be within `0..1000000` in every mode;
   follow mode additionally rejects `0`. Sparse filtering happens before
   `--limit`, so the limit slices the filtered result set rather than the raw
-  rows.
+  rows. (Historical: this read `0..1000` until 2026-09-08, when t-5d38449a
+  retired `watch`'s private cap in favour of the one `LIMIT_CEILING` every
+  `--limit` surface shares. A batch is a SQL `LIMIT`, never a preallocated
+  buffer, so the higher bound costs nothing on a small board.)
 - `--db PATH` opens that exact database file rather than re-resolving a board.
 - `--json` is the machine contract. The stream stays NDJSON on stdout; errors
   and diagnostics belong on stderr.

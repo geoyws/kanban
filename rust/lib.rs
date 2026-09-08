@@ -271,11 +271,18 @@ second board inside a registered project tree (init). claim has no --force, and
 that died holding the lease, task move ID todo --as ACTOR --force, then claim it
 again for a fresh token. Unknown flags are errors.
 
---limit N is honoured exactly. Without it a listing is capped -- events 50,
-sitrep list 20, search 10, attention list, deploy list, handoff list and
+--limit N is honoured exactly, up to 1000000 -- effectively unbounded for any
+board this tool holds, and a ceiling only so a mistyped value is refused rather
+than answered. It applies to every surface that takes the flag: events, search,
+watch, attention list, sitrep list, deploy list, handoff list, claim
+--candidates and task show. Without it a listing is capped -- events 50, watch
+50, sitrep list 20, search 10, attention list, deploy list, handoff list and
 claim --candidates 100, task show 100 notes, 20 checkpoints and 100 handoffs --
 and one that would exceed its cap refuses and names --limit rather than passing
-the first page off as the whole.
+the first page off as the whole. events goes one step further: an explicit
+--limit that cut the page is named on stderr, because a page of history that
+stops at the limit reads as the whole history. stdout and the exit status are
+unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
@@ -425,11 +432,20 @@ pub(crate) const LONG_RUNNING: [&str; 3] = ["mcp", "serve", "watch"];
 /// Accepted on every board command; see `store_path`.
 pub(crate) const GLOBAL_FLAGS: [&str; 5] = ["help", "json", "db", "project", "workspace"];
 
-/// Upper bound for a watch replay batch.
+/// The upper bound every `--limit` is held to, on every surface.
 ///
-/// The reader can ask for nothing or a small bounded batch, but a caller
-/// cannot request an unbounded `Vec` through `--limit`.
-pub(crate) const WATCH_BATCH_LIMIT: i64 = 1_000;
+/// A million rows is more than any board this tool holds, so the ceiling is
+/// not a page-size policy — `Args::limit` is where a mistyped `--limit
+/// 100000000` is caught before SQLite is asked to materialise it, and where
+/// the caller learns that from a refusal rather than from a stall. The bound
+/// used to be a thousand and lived only on `watch`; a thousand is a real page
+/// on a board with a year of events, and every other listing had no ceiling
+/// at all.
+///
+/// One constant, read by `Args::limit` and by the store-layer floors that
+/// guard the event reads, so the number cannot drift between the CLI and the
+/// query it turns into.
+pub(crate) const LIMIT_CEILING: i64 = 1_000_000;
 
 /// The flags that each select a board. At most one may be given explicitly.
 const BOARD_SELECTORS: [&str; 3] = ["db", "project", "workspace"];
@@ -1963,11 +1979,24 @@ impl Args {
     /// Zero is allowed. It asks for nothing and returns nothing, which is
     /// exactly what it says; a script computing a limit that comes out zero is
     /// not making a mistake the way a negative one is.
+    ///
+    /// [`LIMIT_CEILING`] is the other end, and it is a typo guard rather than
+    /// a page-size opinion: a million rows is past every board this tool
+    /// holds, so a value above it is a slipped keystroke or a bad
+    /// multiplication, and answering it means building a `Vec` nobody asked
+    /// for. Enforced here, once, so the ceiling reaches every surface that
+    /// takes the flag instead of the one that was patched first.
     fn limit(&self, fallback: i64) -> Result<i64> {
         let value = self.integer("limit", fallback)?;
         if value < 0 {
             bail!(
                 "--limit must be zero or more, got {value}: a negative limit reads as no limit at all"
+            );
+        }
+        if value > LIMIT_CEILING {
+            bail!(
+                "--limit must be between 0 and {LIMIT_CEILING}, got {value}; the ceiling exists \
+                 so a mistyped value is refused, not to imply a page this size is wise"
             );
         }
         Ok(value)
@@ -2006,6 +2035,42 @@ impl Args {
                 "found more than {limit} {what} and no --limit was given — a page cut at the \
                  default would read as the whole; pass --limit N, above {limit} to see more \
                  or exactly {limit} to take the first {limit} knowingly"
+            );
+        }
+        Ok(rows)
+    }
+
+    /// [`Args::bounded_page`], plus one stderr line when an EXPLICIT
+    /// `--limit` was the thing that cut the page (ADR-037 addendum,
+    /// 2026-09-08).
+    ///
+    /// ADR-037 §3 stands: stdout is exactly the N rows asked for, in the same
+    /// shape, and the exit status stays zero — a consumer parses what it
+    /// always parsed. The notice goes to stderr because a page of history
+    /// that stops at the limit reads as the whole history, and `events` is
+    /// the surface an agent reaches for when it wants to know what happened
+    /// rather than to page through a list.
+    ///
+    /// The cut is observed, not inferred: `fetch` is asked for `limit + 1`
+    /// and the notice fires only if that row came back, so exactly N rows
+    /// with nothing behind them says nothing. `limit` is at most
+    /// [`LIMIT_CEILING`], so `+ 1` and the cast cannot overflow.
+    fn bounded_page_naming_explicit_cuts<T>(
+        &self,
+        fallback: i64,
+        what: &str,
+        fetch: impl FnOnce(i64) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        if self.one("limit").is_none() {
+            return self.bounded_page(fallback, what, fetch);
+        }
+        let limit = self.limit(fallback)?;
+        let mut rows = fetch(limit + 1)?;
+        if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            eprintln!(
+                "{what}: showing {limit} of more than {limit}; pass --limit above {limit} \
+                 for the rest (ceiling {LIMIT_CEILING})"
             );
         }
         Ok(rows)
@@ -3429,8 +3494,12 @@ fn reject_all_boards_selector(args: &Args) -> Result<()> {
 fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
     let limit = args.limit(10)?;
     let max_chars = args.integer("max-chars", 12_000)?;
-    if !(1..=100).contains(&limit) {
-        bail!("--limit must be between 1 and 100, got {limit}");
+    // `Args::limit` has already refused anything above the ceiling with the
+    // one shared wording; what is left here is `search`'s own floor of one,
+    // which is not shared: a search for nothing is a mistake, where an
+    // `attention list --limit 0` is a legitimate "just tell me it worked".
+    if !(1..=LIMIT_CEILING).contains(&limit) {
+        bail!("--limit must be between 1 and {LIMIT_CEILING}, got {limit}");
     }
     if !(256..=100_000).contains(&max_chars) {
         bail!("--max-chars must be between 256 and 100000, got {max_chars}");
@@ -5935,7 +6004,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         }
         let registry = Registry::open_readonly()?;
         return print(
-            &args.bounded_page(50, "events", |limit| {
+            &args.bounded_page_naming_explicit_cuts(50, "events", |limit| {
                 registry.rule_events(args.one("rule"), args.one("kind"), limit)
             })?,
             args.has("json"),
@@ -6817,7 +6886,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             bail!("--after must not be later than --before");
         }
         return print(
-            &args.bounded_page(50, "events", |limit| {
+            &args.bounded_page_naming_explicit_cuts(50, "events", |limit| {
                 store.events_with_bounds(
                     args.one("task"),
                     args.one("kind"),
@@ -7386,7 +7455,37 @@ mod tests {
                 .to_string();
             assert!(error.contains("--limit"), "{error}");
             assert!(error.contains(bad), "{error}");
+            assert!(
+                error.contains("negative limit reads as no limit at all"),
+                "the negative refusal changed wording: {error}"
+            );
         }
+    }
+
+    /// The ceiling is a typo guard, so the boundary is the whole behaviour:
+    /// the millionth row is a legal page and the one past it is not.
+    #[test]
+    fn a_limit_above_the_ceiling_is_refused_and_the_ceiling_itself_is_not() {
+        assert_eq!(
+            args(&["--limit", "1000000"]).limit(9).unwrap(),
+            LIMIT_CEILING
+        );
+        let error = args(&["--limit", "1000001"])
+            .limit(9)
+            .expect_err("a limit past the ceiling must be refused")
+            .to_string();
+        assert_eq!(
+            error,
+            "--limit must be between 0 and 1000000, got 1000001; the ceiling exists so a \
+             mistyped value is refused, not to imply a page this size is wise"
+        );
+        // A slipped keystroke is the case this exists for, and it is refused
+        // rather than turned into a query.
+        assert!(
+            args(&["--limit", "100000000"]).limit(9).is_err(),
+            "a mistyped limit was accepted"
+        );
+        assert!(args(&["--limit", &i64::MAX.to_string()]).limit(9).is_err());
     }
 
     #[test]

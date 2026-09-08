@@ -1089,8 +1089,18 @@ interpreted unambiguously is refused rather than guessed
   report called "100 open attention" when there were 157. Exactly the default
   with nothing past it is complete and answered as such — the extra row is
   looked for, never inferred from the count — and an explicit `--limit` is
-  honoured as stated, with no marker
+  honoured as stated, with no marker in the payload
   ([ADR-037](docs/adr/ADR-037-truncated-listings-refuse-a-default-limit-they-exceed.md)).
+- **`--limit` is bounded at 1000000, and that is a typo guard.** Every surface
+  that takes the flag — `events`, `search`, `watch`, `attention list`,
+  `sitrep list`, `deploy list`, `handoff list`, `claim --candidates`,
+  `task show` — refuses a value above the ceiling with one wording, and the
+  ceiling is past every board this tool holds, so it is effectively unbounded
+  for real use and catches a slipped keystroke rather than turning it into a
+  query. Defaults are unchanged. `events` alone names an explicit `--limit`
+  that cut, on stderr, in one line; stdout stays exactly the rows asked for and
+  the exit status stays zero, because a page of history that stops at the limit
+  reads as the whole history (ADR-037 addendum, 2026-09-08).
 - **A restore cannot race live work.** `restore` is the one operation that goes
   around SQLite, renaming whole database files into place. It now takes the
   data root exclusively and refuses while anything else holds it; board

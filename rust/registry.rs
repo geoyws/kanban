@@ -1,4 +1,4 @@
-use crate::WATCH_BATCH_LIMIT;
+use crate::LIMIT_CEILING;
 use crate::db::{
     SnapshotSource, checkpoint, create_backup_target, create_private_dir_all,
     finalize_adopted_board, foreign_key_violations, integrity, open_board, open_registry,
@@ -318,10 +318,12 @@ fn rule_tags_apply(
     !saw_subsystem
 }
 
-#[allow(dead_code)]
+/// The registry twin of [`crate::store::validate_event_limit`]'s band: the
+/// same reasoning about `LIMIT -1`, on the rule-event trail, sharing
+/// [`crate::LIMIT_CEILING`].
 fn validate_event_limit(limit: i64) -> Result<()> {
-    if !(0..=WATCH_BATCH_LIMIT).contains(&limit) {
-        bail!("--limit must be between 0 and {WATCH_BATCH_LIMIT}, got {limit}");
+    if !(0..=LIMIT_CEILING).contains(&limit) {
+        bail!("--limit must be between 0 and {LIMIT_CEILING}, got {limit}");
     }
     Ok(())
 }
@@ -4820,13 +4822,17 @@ mod tests {
             .rule_events_since(None, None, 0, -1)
             .expect_err("negative limits must be rejected")
             .to_string();
-        assert!(negative.contains("1000"), "{negative}");
+        assert!(negative.contains("1000000"), "{negative}");
 
+        // The ceiling itself is a legal page, and only the row past it is not.
+        registry
+            .rule_events_since(None, None, 0, crate::LIMIT_CEILING)
+            .expect("the ceiling is a limit, not a refusal");
         let over = registry
-            .rule_events_since(None, None, 0, crate::WATCH_BATCH_LIMIT + 1)
-            .expect_err("over-cap limits must be rejected")
+            .rule_events_since(None, None, 0, crate::LIMIT_CEILING + 1)
+            .expect_err("over-ceiling limits must be rejected")
             .to_string();
-        assert!(over.contains("1000"), "{over}");
+        assert!(over.contains("1000000"), "{over}");
     }
 
     #[test]

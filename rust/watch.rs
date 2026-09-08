@@ -1,4 +1,3 @@
-use crate::WATCH_BATCH_LIMIT;
 use crate::db::read_snapshot;
 use crate::model::{BOARD_EVENT_KINDS, Event, TASK_STATUSES};
 use crate::registry::{BoardPathState, Registry, data_root, retired_board_message};
@@ -148,10 +147,12 @@ fn resolve_with_source(
     let current_statuses = normalize_statuses(args.many("current-status"), "--current-status")?;
     let tags = normalized(args.many("tag"));
     let follow = args.has("follow");
+    // `Args::limit` holds this to LIMIT_CEILING like every other surface; a
+    // batch is a SQL `LIMIT`, not a preallocated buffer, so a caller who asks
+    // for a million gets whatever the board actually has. Zero under
+    // `--follow` is the one shape that is refused: a follow that fetches
+    // nothing per poll would sit there forever reporting nothing.
     let limit = args.limit(50)?;
-    if limit > WATCH_BATCH_LIMIT {
-        bail!("--limit must be between 0 and {WATCH_BATCH_LIMIT}, got {limit}");
-    }
     if follow && limit == 0 {
         bail!("--follow requires --limit to be at least 1");
     }

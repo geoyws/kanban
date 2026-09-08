@@ -103,6 +103,24 @@ t-5d3c540c, t-ab9b86ea and t-06149df3 land the `limit + 1` fetch and the
 refusal per listing. This ADR fixes the shape they implement; it does not
 implement it.
 
+## Addendum: 2026-09-08 — `events` names an explicit cut on stderr
+
+Raising the `--limit` ceiling to 1,000,000 (t-5d38449a) makes an explicit bound
+the normal way to read history rather than the rare one, and §3 above leaves an
+explicit bound entirely silent. Explicit limits stay honoured as-is on stdout —
+exactly the N rows asked for, in the same shape, exit status zero, no envelope
+and no marker in the payload, so §3 and the A-not-B migration path of §4 are
+untouched. `ev` additionally names an explicit cut on stderr, in one line
+(`events: showing N of more than N; pass --limit above N for the rest (ceiling
+1000000)`), because a page of history that stops at the limit reads as the whole
+history: `events` is the surface an agent reads to find out what happened, not
+to page through a list, and a resuming agent that asked for thirty and got
+thirty has no way to tell a quiet week from a truncated one. The cut is observed
+the way §1 requires — `limit + 1` is fetched and the notice fires only if that
+row came back — so exactly N rows with nothing behind them says nothing. Only
+`events` does this; every other listing keeps the silence of §3, because a
+listing is read as a page and history is read as a record.
+
 ## References
 
 - `docs/adr/ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md`

@@ -1,3 +1,4 @@
+use crate::LIMIT_CEILING;
 use crate::authz::AuthzContext;
 use crate::model::{
     Rule, SearchIndexHealth, SearchIndexReport, SearchOptions, SearchReceipt, SearchResult,
@@ -465,8 +466,12 @@ pub fn search(
     if options.query.trim().is_empty() {
         bail!("search query is required");
     }
-    if options.limit == 0 || options.limit > 100 {
-        bail!("search limit must be between 1 and 100");
+    // The band the CLI states in `search_options`, restated here because the
+    // MCP and serve adapters build a `SearchOptions` without going through
+    // it. `limit` only truncates the ranked results, so the ceiling is a typo
+    // guard rather than a memory bound.
+    if options.limit == 0 || options.limit > LIMIT_CEILING as usize {
+        bail!("search limit must be between 1 and {LIMIT_CEILING}");
     }
     if options.max_chars < 256 || options.max_chars > 100_000 {
         bail!("search max chars must be between 256 and 100000");
