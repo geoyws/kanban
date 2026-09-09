@@ -3,10 +3,18 @@
 **Status:** Accepted
 **Date:** 2026-09-03
 **Deciders:** Team
+**Superseded in part by:** [ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md) (2026-09-10) — the build-host clause only. Everything else decided here stays in force.
 
 ## Context
 
 The release path needs a deterministic package that is built on `hax`, carries an explicit ordered install-target set for `hax` and `hig`, and includes every declared Rust executable. Rule movement also needs a safe, auditable path between registries without mutating source rules in place.
+
+> **HISTORICAL from 2026-09-10.** "built on `hax`" in the sentence above is
+> superseded by
+> [ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md):
+> packaging is now permitted wherever a genuine linux x86-64 artifact can be
+> produced. The rest of the paragraph stands. See the addendum dated
+> 2026-09-10 at the end of this document.
 
 ## Decision
 
@@ -17,6 +25,11 @@ Every package and activation validation path probes `kanban` and `kb` with
 `--version`.
 
 The release script itself is intended to ship as an executable shell script with mode `0755`. `package` is HAX-only; `install` and `rollback` accept `hax` and `hig`.
+
+> **HISTORICAL from 2026-09-10.** "`package` is HAX-only" is superseded by
+> [ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md);
+> `install` and `rollback` are still launched on `hax` for both targets, and
+> the mode `0755` sentence stands.
 
 Registry rule transfer is now explicit:
 
@@ -204,6 +217,30 @@ unbalanced quote or a trailing escape refuses the install naming the argv it
 could not read, rather than guessing or reaching for `eval`. The ExecStart a
 live host actually reports is worth capturing against this the first time it
 runs there.
+
+Addendum 2026-09-10 (build host superseded, the rest untouched): two sentences
+above are now HISTORY and are kept as written rather than edited — "The
+release path needs a deterministic package that is built on `hax`" in
+§Context, and "`package` is HAX-only" in §Decision. They record what the
+release path did from 2026-09-03 until 2026-09-10, when George chose
+`mbp-path` on attention `a-4741a3c3` and
+[ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md)
+replaced the packaging host gate with a capability gate: packaging is
+permitted wherever a genuine linux x86-64 artifact can be produced — natively
+on `hax` as before, or on the MacBook Pro inside a digest-pinned container
+image — and refused elsewhere with a sentence naming what was missing. Every
+release binary is verified to be an ELF 64-bit little-endian x86-64
+executable before the manifest is written, and again ahead of the per-file
+size and hash comparisons on both install legs, so a forged package whose
+manifest agrees with a foreign binary is refused before it reaches a release
+store. The package receipt records
+the real build host, the build machine's platform, the artifact's platform,
+the build kind, the builder image digest, the toolchain and which branch
+measured the version strings, instead of the
+literal `"hax"`. What did NOT move: `install` and `rollback` are still
+launched on `hax` for both targets, the local and embedded-remote install
+guards are still byte-identical twins, the served-exe proof and its recovery
+are unchanged, and retention, rollback and the release identity are unchanged.
 
 ## References
 
