@@ -635,13 +635,17 @@ fn choice_required() -> String {
     )
 }
 
-/// The composer's own words for a free-text answer missing its verdict or
-/// its words.
+/// The ROUTE's words for a free-text answer missing its verdict or its words.
 ///
-/// One wording for the CLI, the MCP tool and this page: the page asks for it
-/// rather than restating it, so a change to the refusal cannot leave a stale
-/// copy behind here. The composer never consults the row's choices on this
-/// path, which is why it can be asked before the board is opened.
+/// One wording for the CLI, the MCP tool and this route: the route asks for
+/// it rather than restating it, so a change to the refusal cannot leave a
+/// stale copy behind here. The composer never consults the row's choices on
+/// this path, which is why it can be asked before the board is opened.
+///
+/// The CARD does not speak these words. It has its own sentence for the same
+/// case, in the page's language (`INCOMPLETE_ANSWER` in [`JS`]); flags belong
+/// to the surface that has them. What the card quotes verbatim is what this
+/// route, or the network, actually said about an attempt that was made.
 fn incomplete_answer_refusal(
     id: &str,
     actor: &str,
@@ -1451,7 +1455,7 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     }
     html.push_str(
         "<p class=keys>Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on, \
-         or <kbd>c</kbd> to write a reply.</p>",
+         or <kbd>c</kbd> to write a reply. <kbd>Esc</kbd> clears a verdict you picked.</p>",
     );
     Ok(page("Needs you", &html))
 }
@@ -1520,7 +1524,8 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
          <legend>Or answer in your own words, recorded as</legend><div class=picks>{picks}</div>\
          </fieldset>\
          <div class=actions>\
-         <button type=submit class=record name=decision value=custom disabled>Record this answer</button>\
+         <button type=submit class=record name=decision value=custom>Record this answer</button>\
+         <button type=button class=clear data-clear hidden>Clear verdict</button>\
          <p class=hint data-hint>Pick a verdict and write your reply above.</p>\
          </div></div></form>",
         picks = ATTENTION_OUTCOMES
@@ -2938,19 +2943,77 @@ let liveConnects = 0;
 // The card posts its own form, is replaced in place by its receipt, and the
 // open count drops by one.
 const CHOICE_KEYS = ['1', '2', '3', '4'];
-const hasDraftReply = () => [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim());
+// An answer in progress anywhere on the page: words typed into a reply, or a
+// verdict picked for a free-text answer. Both halves are lost the moment the
+// projection is swapped -- the server renders every card empty, with no
+// verdict checked -- so both halves hold the swap. A picked verdict with
+// nothing typed yet is an answer being written, not an idle page.
+const answerInProgress = () =>
+  [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim().length > 0)
+  || Boolean(document.querySelector('input[name=outcome]:checked'));
 const cardOf = node => (node && node.closest ? node.closest('article.item') : null);
-// The free-text answer carries a verdict or it is not an answer, so the
-// button is dead until both halves are there. The board refuses the same
-// thing in the same words; this only saves the round trip.
+// What the composer says when it refuses to post a half-written answer, in
+// the page's language.
+//
+// Two voices, deliberately. This one is the CARD refusing to send an answer
+// it can see is half-written, so it speaks to somebody holding a phone: the
+// picker's own verdicts and the reply field's own name, no flags for a
+// command line they are not using. What the ROUTE or the network said is
+// quoted verbatim instead, flags and all, because that is a different thing
+// being reported and the operator may have to act on the exact words. The
+// route's wording for this same case is `incomplete_answer_refusal`, which
+// the CLI and the MCP tool share and which a no-script POST still lands on.
+const INCOMPLETE_ANSWER = 'Your own answer needs both halves: pick a verdict (approve, reject, defer or other) and write your reply.';
+// The free-text answer carries a verdict or it is not an answer, and the hint
+// keeps asking for both halves until both are there. It does NOT say which
+// half is missing -- it is one fixed sentence; what identifies the missing
+// half is the cursor, which a refused submit moves onto it. The button stays
+// live either way: a disabled button is the one control that cannot report
+// its own refusal, and it was the card's only feedback channel.
+// `aria-disabled` is not set for the same reason -- the control does respond,
+// in the card's own words, so announcing it as unavailable would be a lie.
+// The release shows up exactly while there is a verdict to release, and a
+// refusal never outlives what it refused.
 function syncAnswer(form) {
   const text = form.querySelector('textarea[name=reply]');
-  const record = form.querySelector('button.record');
-  if (!text || !record) return;
-  const ready = Boolean(form.querySelector('input[name=outcome]:checked')) && text.value.trim().length > 0;
-  record.disabled = !ready;
   const hint = form.querySelector('[data-hint]');
-  if (hint) hint.hidden = ready;
+  if (!text || !hint) return;
+  const verdict = Boolean(form.querySelector('input[name=outcome]:checked'));
+  const ready = verdict && text.value.trim().length > 0;
+  hint.hidden = ready;
+  const clear = form.querySelector('[data-clear]');
+  if (clear) clear.hidden = !verdict;
+  if (ready) clearRefusal(form);
+}
+// Only the composer's own pre-flight sentence, never the board's. What the
+// route or the network said is not the operator's to type away. Both callers
+// here are about the composer's own: either it has stopped being true, or the
+// answer it was asking for has just been abandoned.
+function clearRefusal(form) {
+  const refusal = form.querySelector('[data-refusal=incomplete]');
+  if (refusal) refusal.remove();
+}
+// The way back out of an answer that was started and is not wanted. HTML
+// offers no way to un-check a radio group, and a picked verdict holds the
+// live projection for the WHOLE page while this release sits on one card:
+// the swap replaces all of `<main>`, so there is nothing narrower than the
+// page to hold, and the only honest place for the button is beside the
+// verdict it clears. A card scrolled out of view holds the page with its own
+// release off screen, which is what the page-wide `update waiting` line is
+// for. The release therefore has to be reachable by a thumb as well as a
+// keyboard: this control, and `Escape` inside the card.
+//
+// The typed words are NOT cleared -- losing them is the thing the hold exists
+// to prevent. The composer's own refusal IS, even though it is still true:
+// it was asking for the two halves of an answer the operator has just said
+// they are not giving, and a red alert standing over an abandoned answer
+// reads as a failure rather than a prompt. Nothing is lost by removing it --
+// the hint under the submit comes straight back and asks for the same two
+// halves in calmer words. What the BOARD refused stays.
+function clearVerdict(form) {
+  form.querySelectorAll('input[name=outcome]:checked').forEach(input => { input.checked = false; });
+  clearRefusal(form);
+  syncAnswer(form);
 }
 function bindCards() {
   document.querySelectorAll('form.decide').forEach(form => {
@@ -2958,6 +3021,9 @@ function bindCards() {
     form.dataset.cardBound = '1';
     form.addEventListener('input', () => syncAnswer(form));
     form.addEventListener('change', () => syncAnswer(form));
+    form.addEventListener('click', event => {
+      if (event.target.closest('[data-clear]')) clearVerdict(form);
+    });
     form.addEventListener('submit', event => { event.preventDefault(); decide(form, event.submitter); });
     syncAnswer(form);
   });
@@ -3004,12 +3070,24 @@ function showReceipt(card, label, noted) {
   // Keep the keyboard where the work is: the next card, so 1-4 keeps deciding.
   if (held && following && following.matches('article.item')) following.focus();
 }
-function showRefusal(form, text) {
-  let refusal = form.querySelector('[data-refusal]');
+// One refusal line per KIND, and no kind ever takes another's line.
+// `incomplete` is the composer's own sentence, true only while a half is
+// missing, and cleared the moment it stops being true or the answer is
+// abandoned. `board` is what the route or the network said about an attempt
+// that was actually made: no amount of typing can make it untrue and only
+// another attempt may replace it.
+//
+// Separate nodes because one shared node was a hole. The composer reused and
+// retagged it, so a pre-flight refusal OVERWROTE the board's sentence and the
+// next keystroke then removed it as the composer's own -- leaving a card that
+// looked as though the board had never refused anything, with nothing
+// recorded anywhere.
+function showRefusal(form, text, kind) {
+  let refusal = form.querySelector(`[data-refusal="${kind}"]`);
   if (!refusal) {
     refusal = document.createElement('p');
     refusal.className = 'error';
-    refusal.setAttribute('data-refusal', '');
+    refusal.setAttribute('data-refusal', kind);
     refusal.setAttribute('role', 'alert');
     form.append(refusal);
   }
@@ -3018,6 +3096,29 @@ function showRefusal(form, text) {
 async function decide(form, submitter) {
   const card = cardOf(form);
   if (!card || form.dataset.deciding) return;
+  // A free-text answer missing a half is refused here, in the card's own
+  // words, with the focus moved to the half that is missing. Nothing is
+  // posted. The alternative was a disabled button, which produced no event,
+  // no request and no sentence at all: the click simply did nothing. An
+  // authored choice carries its own verdict and is never held here, with or
+  // without a note.
+  if (submitter && submitter.value === 'custom') {
+    const text = form.querySelector('textarea[name=reply]');
+    const verdict = form.querySelector('input[name=outcome]:checked');
+    if (!verdict || !text || text.value.trim().length === 0) {
+      showRefusal(form, INCOMPLETE_ANSWER, 'incomplete');
+      const missing = verdict ? text : form.querySelector('input[name=outcome]');
+      if (missing) missing.focus();
+      return;
+    }
+  }
+  // An authored choice carries its own verdict and the route forwards no
+  // picker value onto it, so a verdict the operator left picked is not part
+  // of THIS decision. The card must not go on showing it as though it were:
+  // the release runs before the body is built, so what is posted, what the
+  // ledger records and what is on screen say the same thing whether the
+  // attempt lands or comes back refused.
+  if (submitter && submitter.value !== 'custom') clearVerdict(form);
   form.dataset.deciding = '1';
   const body = decisionBody(form, submitter);
   const label = decidedLabel(form, submitter);
@@ -3037,18 +3138,24 @@ async function decide(form, submitter) {
     if (response.type === 'opaqueredirect' || response.ok) { showReceipt(card, label, noted); return; }
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const refused = page.querySelector('.error');
-    showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`);
+    showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board');
   } catch (error) {
-    showRefusal(form, 'The decision did not reach the board. Try again.');
+    showRefusal(form, 'The decision did not reach the board. Try again.', 'board');
   } finally {
     delete form.dataset.deciding;
   }
 }
 async function refreshProjection() {
-  if (hasDraftReply()) { setLive('update waiting'); return; }
+  if (answerInProgress()) { setLive('update waiting'); return; }
   const response = await fetch(location.pathname + location.search, {credentials: 'same-origin'});
   if (!response.ok) throw new Error(`refresh ${response.status}`);
   const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
+  // The same gate again, and it has to sit exactly here. An answer can be
+  // started while the projection is in flight -- the first gate ran a
+  // network round trip ago -- and everything below MOVES live nodes into
+  // the detached document: the notices strip, then every receipt. Bailing
+  // out after that point would delete them instead of preserving a draft.
+  if (answerInProgress()) { setLive('update waiting'); return; }
   const strip = document.querySelector('[data-notices]');
   if (strip) next.prepend(strip);
   // A receipt outlives the projection it was decided in. The row is gone
@@ -3137,16 +3244,49 @@ document.addEventListener('click', event => {
 });
 // 1-4 answer the card that has focus, in the order it lists them, so 1 is
 // always the recommendation -- the muscle memory that makes a long list
-// tractable. `c` reaches that card's reply field instead. Both are inert
-// while a reply is being typed, and while no card has focus.
+// tractable. `c` reaches that card's reply field instead.
+//
+// The digits are inert while no card has focus, and inert on a card that is
+// COMPOSING ITS OWN ANSWER, which is decided by the card and not by what
+// happens to have focus: one Tab from the verdict picker lands on the
+// submit, and from there `1` used to click the recommendation and record it
+// -- dropping the operator's picked verdict on the way, because the route
+// forwards no picker value onto an authored key. A picked verdict is that
+// signal. A typed reply is NOT: it rides with whichever choice is clicked,
+// which is the contract the reply field itself states.
+//
+// Enter from the verdict picker has to be aimed for the same reason: the
+// browser's own implicit submission would pick the form's first submit
+// button, which is that same recommendation. It goes to the card's own
+// submit instead, which records the free-text answer or refuses it in the
+// board's words.
+//
+// `Escape` is the release, and it works while composing because that is
+// where it is needed: a picked verdict holds the live projection and HTML
+// has no other way to un-check a radio group. An `Escape` that is ending an
+// IME composition is the input method's, not ours.
 document.addEventListener('keydown', event => {
-  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing) return;
   const target = event.target;
-  if (target && target.matches && target.matches('textarea, input:not([type=radio])')) return;
+  const composing = Boolean(target && target.matches && target.matches('textarea, input'));
+  if (event.key === 'Escape') {
+    const escaped = cardOf(target) || cardOf(document.activeElement);
+    const form = escaped && escaped.querySelector('form.decide');
+    if (form) { event.preventDefault(); clearVerdict(form); }
+    return;
+  }
+  if (composing) {
+    if (event.key === 'Enter' && target.matches('input[name=outcome]') && target.form) {
+      const record = target.form.querySelector('button.record');
+      if (record) { event.preventDefault(); record.click(); }
+    }
+    return;
+  }
   const card = cardOf(document.activeElement);
   if (!card) return;
   const digit = CHOICE_KEYS.indexOf(event.key);
   if (digit >= 0) {
+    if (card.querySelector('form.decide input[name=outcome]:checked')) return;
     const choices = card.querySelectorAll('form.decide button.choice');
     if (digit < choices.length) { event.preventDefault(); choices[digit].click(); }
     return;
@@ -3269,7 +3409,7 @@ padding:.25rem .6rem;color:var(--dim);border:1px solid var(--dim);border-radius:
 .picks label:has(input:checked){color:var(--phosphor);border-color:var(--phosphor)}\
 .picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;border:0;accent-color:var(--phosphor)}\
 .record{color:var(--phosphor);border-color:var(--phosphor)}\
-.record[disabled]{color:var(--dim);border-color:var(--dim);cursor:not-allowed}\
+.clear{color:var(--dim);border-color:var(--dim)}\
 .hint{margin:0;color:var(--dim);font-size:.8rem}\
 .receipt{margin:1rem 0;padding:.55rem .75rem;color:var(--dim);background:var(--canvas);\
 border:1px solid var(--dim);border-left:2px solid var(--phosphor);border-radius:4px}\
@@ -3593,6 +3733,41 @@ mod tests {
         assert_html_contains(html, &format!("<title>{title} · kanban</title>"));
     }
 
+    /// The ROUTE's refusal for a half-written custom answer is ONE sentence,
+    /// whatever the row, the actor or the missing half.
+    ///
+    /// It is the wording the CLI and the MCP tool refuse with, it is the page
+    /// a no-script POST lands on, and the card quotes it verbatim when the
+    /// route says it. So it has to be stable: the refusal is decided before
+    /// the id, the actor or either half is read. If that ever stops being
+    /// true, this fails rather than the card quoting a sentence that varies
+    /// by row.
+    #[test]
+    fn the_routes_refusal_is_one_sentence_for_every_id_actor_and_missing_half() {
+        let sentence = incomplete_answer_refusal("", "", None, None);
+        assert_eq!(
+            sentence,
+            "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note"
+        );
+        for id in ["", "a-1", "e-88cd75c1", "a-\"><script>"] {
+            for actor in ["", OPERATOR_ACTOR, "codex@driver-2"] {
+                // The three ways an answer can be incomplete. Both halves
+                // present is the recorded answer and has no refusal at all.
+                for (outcome, note) in [
+                    (None, None),
+                    (Some("approve"), None),
+                    (None, Some("after the pin lands")),
+                ] {
+                    assert_eq!(
+                        incomplete_answer_refusal(id, actor, outcome, note),
+                        sentence,
+                        "the refusal varied for id {id:?} actor {actor:?} outcome {outcome:?} note {note:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn operator_shell_keeps_phone_touch_and_live_status_contract() {
         let rendered = page(
@@ -3676,7 +3851,38 @@ mod tests {
             "Sent with whichever choice you click; required for your own answer.",
         );
         assert_html_contains(&home, "value=\"approve\" data-label=\"Approve - proceed\"");
-        assert_html_contains(&home, "name=decision value=custom disabled");
+        // The submit is live in the markup: a rendered `disabled` made the
+        // click do nothing at all, and with no script the native POST has to
+        // reach the route's own validation.
+        assert_html_contains(
+            &home,
+            "<button type=submit class=record name=decision value=custom>Record this answer</button>",
+        );
+        // Two voices. The card refuses in the page's language, naming both
+        // halves the way the card itself names them, and nothing served here
+        // speaks CLI flags: the route's wording is quoted only when the route
+        // has actually said it.
+        assert_html_contains(
+            &home,
+            "Your own answer needs both halves: pick a verdict \
+             (approve, reject, defer or other) and write your reply.",
+        );
+        assert!(
+            !home.contains("--outcome"),
+            "the card is refusing in command-line flags to somebody on a phone: {home}"
+        );
+        // The release for a picked verdict, rendered away until there is one
+        // to release. It is a control and not only a keystroke because this
+        // shell is phone-first and a phone has no Escape key.
+        assert_html_contains(
+            &home,
+            "<button type=button class=clear data-clear hidden>Clear verdict</button>",
+        );
+        assert_html_contains(&home, "<kbd>Esc</kbd> clears a verdict you picked.");
+        assert!(
+            !home.contains("value=custom disabled"),
+            "the free-text submit is rendered disabled, so a click reports nothing: {home}"
+        );
         assert_html_contains(&home, "/board/SERVE-RENDER");
         assert!(!home.contains("<strong>before release</strong>"));
 

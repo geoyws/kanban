@@ -112,9 +112,63 @@ lease token, or write capability.
 
 The server fingerprints the registered SQLite database, WAL and rollback
 journal file states. When one changes, the browser fetches and swaps in the
-canonical server-rendered projection. A draft reply blocks that swap so an
-agent update cannot erase text George is typing. This preserves one read path
-and makes the socket a notification channel rather than replicated state.
+canonical server-rendered projection. An answer in progress blocks that swap
+— words typed into a reply or a verdict picked for a free-text answer, both
+of which the re-rendered projection would come back empty — and the block is
+re-checked when the projection arrives, because an answer can be started
+while it is in flight. This preserves one read path and makes the socket a
+notification channel rather than replicated state.
+
+Every hold is releasable, because one that is not is a frozen page: the card
+carries a `Clear verdict` control, shown exactly while a verdict is picked,
+and `Esc` inside the card does the same. HTML offers no other way to
+un-check a radio group. Typed words are never cleared for the operator —
+losing them is what the hold exists to prevent — so the release takes the
+verdict and the composer's own refusal and nothing else; what the board
+refused stays on the card until another attempt replaces it.
+
+Clicking an authored choice releases the picker too, before the body is
+built. An authored choice carries its own verdict and the route forwards no
+picker value onto it, so a verdict the operator happened to leave picked is
+not part of that decision — and a card that went on showing it would be
+claiming a verdict the ledger does not carry, which is exactly what the
+operator would check the card to find out.
+
+The two refusals a card can show are separate lines with separate voices,
+because they are separate claims. The composer's own is the card declining to
+post an answer it can see is half-written, and it speaks the page's language:
+pick a verdict, write your reply. What the route or the network said is
+quoted verbatim, flags and all, because the operator may have to act on the
+exact words. Neither can overwrite the other's line: one shared line meant a
+pre-flight refusal could take the board's sentence and the next keystroke
+could then clear it as the composer's own, leaving a card that looked
+unrefused with nothing recorded anywhere.
+
+The hold is page-wide and the release is per-card, and that asymmetry is real
+rather than an oversight: the swap replaces the whole `<main>`, so there is
+nothing narrower than the page to hold, while the only honest place for a
+`Clear verdict` button is beside the verdict it clears. A verdict picked on a
+card that is then scrolled out of view therefore holds the whole page's
+projection with its own release off screen. What is on screen in that state is
+the page-wide live line reading `update waiting`, for as long as the hold
+lasts; the way back is to reach that card and release it there.
+
+What no keystroke from outside the verdict picker can do is overwrite a
+verdict the operator picked. Inside it the browser's own keys still apply —
+the arrow keys move the verdict and `Space` picks one, which is how a radio
+group is operated — and `Esc` releases it, as above. The digits need a focused
+card to answer at all, and any field that takes text keeps them; on top of
+that they are inert on a card whose verdict picker has a checked radio — a
+property of the CARD rather than of whatever has focus inside it, because one
+`Tab` from the picker lands on the submit and a digit pressed there would
+otherwise reach the recommendation. `Enter` in the picker is aimed at that
+card's own submit for the same reason: the browser's implicit submission would
+pick the form's first submit button, which is that same recommendation. A
+typed reply alone does not disarm the digits, deliberately — a reply rides
+with whichever choice is clicked, which is what the field above it says it
+does — so `1` on a card with words typed, no verdict picked and the cursor
+outside the reply field records the recommendation and sends those words with
+it.
 
 Reply forms are bounded and strictly decoded. Browser POSTs require the Origin
 authority to equal Host and all browser attention resolution calls

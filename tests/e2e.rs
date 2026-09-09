@@ -1495,7 +1495,8 @@ fn serve_socket_refusal(fixture: &Fixture, socket: &Path) -> (Option<i32>, Strin
     (exited.and_then(|status| status.code()), text)
 }
 
-fn unix_exchange(socket: &Path, request: &[u8]) -> (u16, String) {
+/// One request over a unix socket, and every byte that came back.
+fn unix_exchange_raw(socket: &Path, request: &[u8]) -> Vec<u8> {
     use std::io::{Read, Write as _};
     let mut stream = std::os::unix::net::UnixStream::connect(socket)
         .unwrap_or_else(|error| panic!("connect to unix:{}: {error}", socket.display()));
@@ -1505,6 +1506,13 @@ fn unix_exchange(socket: &Path, request: &[u8]) -> (u16, String) {
     stream.write_all(request).unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
+    raw
+}
+
+/// The same conversation as text, head included, for the callers whose
+/// subject is the response itself rather than the page inside it.
+fn unix_exchange(socket: &Path, request: &[u8]) -> (u16, String) {
+    let raw = unix_exchange_raw(socket, request);
     let text = String::from_utf8_lossy(&raw).into_owned();
     let status = text
         .split_whitespace()
@@ -1515,16 +1523,30 @@ fn unix_exchange(socket: &Path, request: &[u8]) -> (u16, String) {
 }
 
 fn unix_http_get(socket: &Path, path: &str) -> (u16, String) {
-    let (status, text) = unix_exchange(
-        socket,
-        format!("GET {path} HTTP/1.1\r\nHost: {SOCKET_HTTP_HOST}\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
-    );
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
+    let (status, _head, body) = unix_http_get_with_head(socket, path, "");
     (status, body)
+}
+
+/// A page over a unix socket, with the response head kept and extra request
+/// headers allowed.
+///
+/// Decoded by the same [`decode_http_response`] the loopback helper uses,
+/// because it is the same server writing the same pages: the big ones arrive
+/// chunked over this listener too, and a page read over a socket has to equal
+/// the same page read over a port.
+fn unix_http_get_with_head(
+    socket: &Path,
+    path: &str,
+    extra_headers: &str,
+) -> (u16, String, String) {
+    decode_http_response(&unix_exchange_raw(
+        socket,
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {SOCKET_HTTP_HOST}\r\n{extra_headers}\
+             Connection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    ))
 }
 
 fn unix_http_post_with_headers(
@@ -23083,6 +23105,18 @@ fn workspace_adopt_rejects_a_duplicate_active_board_name_across_processes() {
 /// wire, and a test dependency that speaks HTTP for us would be one more thing
 /// between the assertion and what the server actually wrote.
 fn http_get(port: u16, path: &str) -> (u16, String) {
+    let (status, _head, body) = http_get_with_head(port, path, "");
+    (status, body)
+}
+
+/// The same request, with the response head kept and extra request headers
+/// allowed.
+///
+/// The head is the only place the server's choice of transfer encoding is
+/// visible, and a `TE:` header is the only way to ask it for a different one,
+/// so the two together are what let a test prove the decoding below instead of
+/// assuming it.
+fn http_get_with_head(port: u16, path: &str, extra_headers: &str) -> (u16, String, String) {
     use std::io::{Read, Write as _};
     use std::net::TcpStream;
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
@@ -23091,22 +23125,182 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
         .unwrap();
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_headers}Connection: close\r\n\r\n"
     )
     .unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let status = text
+    decode_http_response(&raw)
+}
+
+/// A response cut into its head and the body the server meant to send.
+///
+/// Cut on bytes rather than on a lossily decoded string, so the boundary
+/// cannot move, and both socket helpers come through here so that one page
+/// reads the same over a port and over a unix socket.
+///
+/// The chunked branch is not hypothetical, and not for a body this server
+/// could not pre-measure -- it measures every one of them, since each page is
+/// built with `Response::from_string`. tiny_http 0.12 picks chunked anyway for
+/// any response at or above its default `chunked_threshold` of 32768 bytes
+/// (`choose_transfer_encoding`, response.rs:175), and every page here carries
+/// the inline stylesheet and script before it carries any rows, so the pages
+/// with cards on them clear that. Measured, head included, by
+/// `the_socket_helpers_decode_the_chunked_pages_this_server_really_sends`.
+/// Left encoded, those hex sizes and CRLFs land in the middle of the markup,
+/// and an assertion about a needle passes or fails on where a boundary
+/// happened to fall.
+fn decode_http_response(raw: &[u8]) -> (u16, String, String) {
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4)
+        .unwrap_or(raw.len());
+    let (head, body) = raw.split_at(split);
+    let head = String::from_utf8_lossy(head).into_owned();
+    let status = head
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse().ok())
         .unwrap_or(0);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
-    (status, body)
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
+    (status, head, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A chunked body put back together, byte for byte.
+///
+/// Decoded on bytes, because a boundary can also split a multi-byte
+/// character. Strict on purpose: a short read or a malformed frame panics
+/// here rather than returning the prefix it managed to decode, which is the
+/// one failure mode that would leave assertions passing against markup that
+/// never arrived.
+fn dechunk(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    loop {
+        let eol = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a chunked body ended after {} bytes with no size line: {:?}",
+                    body.len(),
+                    String::from_utf8_lossy(body)
+                )
+            });
+        let line = String::from_utf8_lossy(&body[..eol]).into_owned();
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or(&line).trim(), 16)
+            .unwrap_or_else(|error| panic!("chunk size {line:?} is not hexadecimal: {error}"));
+        let rest = &body[eol + 2..];
+        if size == 0 {
+            return out;
+        }
+        assert!(
+            rest.len() >= size + 2,
+            "a chunk of {size} bytes arrived with {} bytes behind its size line",
+            rest.len()
+        );
+        out.extend_from_slice(&rest[..size]);
+        assert_eq!(
+            &rest[size..size + 2],
+            b"\r\n",
+            "a chunk of {size} bytes did not end where its size line said it would"
+        );
+        body = &rest[size + 2..];
+    }
+}
+
+/// The pages this server sends really are chunked, and both socket helpers put
+/// them back together byte for byte.
+///
+/// This is the measurement [`decode_http_response`] rests on, rather than a
+/// belief about tiny_http: `/` comes back `Transfer-Encoding: chunked`, the
+/// same page asked for with `TE: identity` comes back with a `Content-Length`,
+/// and the decoded chunked body has to equal that unchunked one exactly --
+/// over a port and over a unix socket, because the two helpers must not
+/// disagree about what a page says.
+///
+/// The unchunked page is fetched on both sides of the chunked one because a
+/// card renders how long it has been waiting: an age ticking over between two
+/// requests changes the page honestly, while a framing bug matches neither
+/// copy.
+#[test]
+fn the_socket_helpers_decode_the_chunked_pages_this_server_really_sends() {
+    let fixture = Fixture::new("serve-chunked");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CHUNKED", "--json"]);
+    // Enough cards to clear tiny_http's threshold with room to spare: the
+    // shell with its inline stylesheet and script is a few kilobytes short of
+    // it on its own.
+    for lane in ["driver", "driver-2", "driver-3", "driver-4"] {
+        raise_carded(
+            &fixture,
+            &format!("BLOCKED - {lane} is waiting on a decision as of 2026-09-10."),
+            &format!("codex@{lane}"),
+            &card_args(&["--kind", "decision", "--priority", "2"], &CARD),
+        );
+    }
+
+    let server = spawn_server(&fixture);
+    let (_, _, before) = http_get_with_head(server.port, "/", "TE: identity\r\n");
+    let (status, head, chunked) = http_get_with_head(server.port, "/", "");
+    let (identity_status, identity_head, after) =
+        http_get_with_head(server.port, "/", "TE: identity\r\n");
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head.contains("Transfer-Encoding: chunked"),
+        "this page is not chunked, so nothing here proves the decoder; if the \
+         pages have shrunk back under tiny_http's 32768-byte threshold then \
+         the dechunking is dead code and belongs deleted: {head}"
+    );
+    assert_eq!(identity_status, 200, "{identity_head}");
+    assert!(
+        !identity_head.contains("Transfer-Encoding: chunked")
+            && identity_head.contains("Content-Length: "),
+        "TE: identity did not produce an unchunked page to compare against: {identity_head}"
+    );
+    assert!(
+        chunked == before || chunked == after,
+        "the decoded page is not the page the server sent"
+    );
+    // And it is a whole page rather than a prefix of one, which an assertion
+    // about an early needle would not have noticed.
+    assert!(chunked.starts_with("<!doctype html>"), "{chunked}");
+    assert!(chunked.trim_end().ends_with("</html>"), "{chunked}");
+    assert!(
+        !chunked.contains('\r'),
+        "chunk framing survived into the page: the markup carries no CR of its own"
+    );
+
+    let sockets = SocketDir::new("serve-chunked");
+    let socket = sockets.join("kanban.sock");
+    let unix = spawn_unix_server(&fixture, &socket, None);
+    let (_, _, socket_before) = unix_http_get_with_head(&socket, "/", "TE: identity\r\n");
+    let (socket_status, socket_head, over_socket) = unix_http_get_with_head(&socket, "/", "");
+    let (_, socket_identity_head, socket_after) =
+        unix_http_get_with_head(&socket, "/", "TE: identity\r\n");
+    assert_eq!(socket_status, 200, "{socket_head}");
+    assert!(
+        socket_head.contains("Transfer-Encoding: chunked"),
+        "the socket listener sent this page unchunked: {socket_head}"
+    );
+    assert!(
+        socket_identity_head.contains("Content-Length: "),
+        "TE: identity over the socket did not produce a measured page: {socket_identity_head}"
+    );
+    assert!(
+        over_socket == socket_before || over_socket == socket_after,
+        "the decoded page over the socket is not the page the server sent"
+    );
+    assert!(over_socket.starts_with("<!doctype html>"), "{over_socket}");
+    assert!(over_socket.trim_end().ends_with("</html>"), "{over_socket}");
+    drop(unix);
+    drop(server);
 }
 
 fn http_post(port: u16, path: &str, origin: &str, body: &[u8]) -> (u16, String) {
@@ -24547,7 +24741,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "<legend>Or answer in your own words, recorded as</legend>",
             "<input type=radio name=outcome value=approve>",
             "<input type=radio name=outcome value=other>",
-            "name=decision value=custom disabled",
+            "name=decision value=custom>Record this answer",
             "<details class=full><summary>show the full item</summary>",
             "<p class=body>PARKED - until an account is assigned",
             "<p class=meta>",
@@ -25134,14 +25328,16 @@ fn a_choice_clicked_with_a_reply_records_the_note_in_real_chrome() {
     let typed = "Seat is on the 2026-09-09 invoice; I log in the same evening.";
     reply.type_into(typed).expect("type the reply");
     // No verdict is picked and none is needed: this is a click on an authored
-    // choice that happens to carry words, and the choice brings its own.
+    // choice that happens to carry words, and the choice brings its own. The
+    // free-text answer beside it is still incomplete, and the card says so
+    // where the operator reads it.
     assert_eq!(
         js_value(
             &tab,
-            &format!("document.querySelector('{form} button.record').disabled")
+            &format!("!document.querySelector('{form} [data-hint]').hidden")
         ),
         true,
-        "typing a reply armed the free-text answer, which has no verdict"
+        "typing a reply stopped the card asking for the verdict it still needs"
     );
 
     hold_projection(&tab);
@@ -25176,14 +25372,33 @@ fn a_choice_clicked_with_a_reply_records_the_note_in_real_chrome() {
     );
 }
 
+/// The one sentence the ROUTE says for a free-text answer missing either
+/// half, which the CLI, the MCP tool and the route all reuse — and which the
+/// card quotes verbatim only when the route or the network has actually said
+/// it.
+const INCOMPLETE_ANSWER: &str =
+    "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note";
+
+/// What the CARD says for the same case, in the page's language.
+///
+/// A different voice on purpose: the composer's own pre-flight refusal is the
+/// card declining to post a half-written answer to somebody holding a phone,
+/// who has no command line to put `--outcome` on. The route keeps its flags
+/// for the surfaces that have them.
+const INCOMPLETE_ANSWER_ON_THE_CARD: &str = "Your own answer needs both halves: pick a verdict (approve, reject, defer or other) \
+     and write your reply.";
+
 /// The free-text answer carries a verdict, and both the page and the board
 /// refuse it when it does not.
 ///
 /// A note with no verdict is the thing ADR-042 exists to remove: a lane
 /// reading `Comment: do it after the pin lands` afterwards has to guess
-/// whether that was a yes. So the submit is dead until an outcome is picked
-/// and something is written, and a hand-made POST that skips the picker is
-/// refused in the composer's own words.
+/// whether that was a yes. So the card keeps asking for both halves in its
+/// hint, a hand-made POST that skips the picker is refused by the route in
+/// its own words, and a click on an incomplete answer is refused by the card
+/// in the page's words rather than swallowed by a dead button -- that last
+/// one is
+/// `a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it`.
 #[test]
 fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
     browser_loopback_reservation_supported()
@@ -25213,12 +25428,7 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
         b"decision=custom&reply=Do+it+after+the+pin+lands",
     );
     assert_eq!(status, 400, "{refused}");
-    assert!(
-        refused.contains(
-            "attention: a custom answer needs --outcome (approve, reject, defer, other) and --note"
-        ),
-        "{refused}"
-    );
+    assert!(refused.contains(INCOMPLETE_ANSWER), "{refused}");
     assert_eq!(
         fixture
             .ok_json(
@@ -25236,9 +25446,6 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
     let tab = decision_tab(&chrome, &origin);
     let form = format!("form.decide[action=\"/attention/CARDCUSTOM/{id}/reply\"]");
     let record = format!("{form} button.record");
-    let disabled = |tab: &headless_chrome::Tab| {
-        js_value(tab, &format!("document.querySelector('{record}').disabled"))
-    };
     let hint_shown = |tab: &headless_chrome::Tab| {
         js_value(
             tab,
@@ -25246,7 +25453,6 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
         )
     };
     // Nothing picked and nothing written: no answer.
-    assert_eq!(disabled(&tab), true);
     assert_eq!(hint_shown(&tab), true);
     assert_eq!(
         js_value(
@@ -25263,22 +25469,12 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
     answer
         .type_into("  Buy the seat on 2026-09-09 and log in from the laptop.  ")
         .expect("type the answer");
-    assert_eq!(
-        disabled(&tab),
-        true,
-        "words with no verdict enabled the submit"
-    );
     assert_eq!(hint_shown(&tab), true);
     // The verdict completes it.
     tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
         .expect("the other outcome")
         .click()
         .expect("pick other");
-    assert_eq!(
-        disabled(&tab),
-        false,
-        "a verdict and words did not enable the submit"
-    );
     assert_eq!(hint_shown(&tab), false);
 
     tab.wait_for_element(&record)
@@ -25312,6 +25508,1118 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
          from the laptop.",
         "{row}"
     );
+}
+
+/// A verdict picked before a single word is typed is an answer in progress,
+/// and the live refresh must not throw it away.
+///
+/// This is the reported failure. `/live` re-renders the projection about once
+/// a second on a busy estate, the server renders every card with an empty
+/// textarea and no verdict checked, and the hold guard looked at typed text
+/// only -- so a verdict picked while the words were still being thought
+/// about was wiped by the next write anywhere on the ledger. The revision is
+/// bumped here from OUTSIDE the browser, because that is what bumps it in
+/// production: some other lane writing to some other board.
+#[test]
+fn a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-verdict-live");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDLIVE", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - the pin lands on 2026-09-12 and nothing on this card fits.",
+        "codex@driver",
+        &["--kind", "decision", "--priority", "2"],
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDLIVE/{id}/reply\"]");
+    let picked = format!("{form} input[name=outcome][value=other]");
+
+    // A verdict, and not one word yet.
+    tab.wait_for_element(&picked)
+        .expect("the other outcome")
+        .click()
+        .expect("pick other");
+    hold_projection(&tab);
+
+    // A write from outside this browser. Any board write moves the coarse
+    // revision, and the coarse revision is all the socket watches.
+    raise_carded(
+        &fixture,
+        "An unrelated item, raised only to move the ledger revision.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "6"],
+    );
+    // The socket ticks once a second, so this is two chances to swap.
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(
+        js_value(&tab, "document.querySelector('main').dataset.generation"),
+        "held",
+        "the live refresh swapped the projection out from under a picked verdict"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{picked}').checked")),
+        true,
+        "a live refresh cleared the picked verdict"
+    );
+    // Held deliberately, rather than never attempted.
+    wait_for_live(&tab, "update waiting");
+
+    // A hold nobody can release is a frozen page, so Escape inside the card
+    // unpicks the verdict -- the cursor is still on the radio the click put
+    // it on -- and the projection this one write was holding then lands. The
+    // swap is provoked by a second write, so the refresh being waited for is
+    // one that could not already have happened.
+    tab.press_key("Escape")
+        .expect("escape releases the verdict");
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{picked}').checked")),
+        false,
+        "escape left the verdict picked"
+    );
+    raise_carded(
+        &fixture,
+        "A third item, raised only to move the ledger revision again.",
+        "codex@driver-3",
+        &["--kind", "review", "--priority", "6"],
+    );
+    wait_for_projection_swap(&tab);
+    wait_for_live(&tab, "live");
+
+    // Pick it again, on the projection that just landed.
+    tab.wait_for_element(&picked)
+        .expect("the other outcome")
+        .click()
+        .expect("pick other again");
+
+    // Both halves now, and the field is focused rather than clicked: picking
+    // the verdict scrolled the page, and a headless click's coordinates are
+    // computed against the layout before that scroll. The keystrokes are
+    // real either way -- what is being proved here is the answer surviving,
+    // not that a click focuses a textarea.
+    let typed = "Ask again once the pin lands on 2026-09-12.";
+    tab.wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field")
+        .focus()
+        .expect("focus the answer field");
+    tab.type_str(typed).expect("type the answer");
+    tab.wait_for_element(&format!("{form} button.record"))
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+
+    assert_receipt(&tab, id, "Custom answer, recorded as other");
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "other", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+}
+
+/// An answer started while the projection is already in flight is not
+/// discarded when that projection arrives.
+///
+/// The hold guard ran a whole network round trip before the new projection
+/// was applied, and it was never asked again, so an answer begun inside that
+/// window was swept away by a swap that had been cleared to proceed when
+/// there was nothing to lose. The projection GET is held open here with
+/// test-only instrumentation -- the product code has no hook for this, and
+/// must not grow one -- so the window is a fact of the test rather than a
+/// race it hopes to win.
+#[test]
+fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-inflight");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDFLIGHT", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - the seat request is still with finance as of 2026-09-10.",
+        "codex@driver",
+        &["--kind", "blocking", "--priority", "1"],
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDFLIGHT/{id}/reply\"]");
+    let picked = format!("{form} input[name=outcome][value=defer]");
+    // Test-only, and the projection GET only: the POST a decision makes is a
+    // different method and passes straight through to the network. The
+    // release records that the held response was actually DELIVERED, so the
+    // barrier below cannot be satisfied by a gate that ran before it.
+    let hold_the_get = r#"(() => {
+  const real = window.fetch;
+  window.__gate = {started: 0, delivered: false, release: null};
+  window.fetch = (input, init) => {
+    const call = real.call(window, input, init);
+    if (((init && init.method) || 'GET').toUpperCase() !== 'GET') return call;
+    window.__gate.started += 1;
+    return new Promise((resolve, reject) => {
+      window.__gate.release = () => {
+        call.then(
+          value => { window.__gate.delivered = true; resolve(value); },
+          error => { window.__gate.delivered = true; reject(error); },
+        );
+        return true;
+      };
+    });
+  };
+  return true;
+})()"#;
+
+    assert_eq!(js_value(&tab, hold_the_get), true);
+    hold_projection(&tab);
+    raise_carded(
+        &fixture,
+        "An unrelated item, raised only to move the ledger revision.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "6"],
+    );
+    for _ in 0..200 {
+        if js_value(&tab, "window.__gate.started > 0") == Value::Bool(true) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        js_value(&tab, "window.__gate.started > 0"),
+        true,
+        "the live socket never fetched the projection, so nothing was in flight"
+    );
+
+    // Both halves, typed and picked while that fetch is still open.
+    let typed = "Chase finance on 2026-09-11 and answer the same day.";
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the answer");
+    tab.wait_for_element(&picked)
+        .expect("the defer outcome")
+        .click()
+        .expect("pick defer");
+    // The live line is stamped with a sentinel first, the way hold_projection
+    // pokes the DOM: 'update waiting' is written by BOTH gates, so without
+    // this the barrier could be satisfied by the first gate refusing a later
+    // refresh frame while the typing was still going on -- and would then
+    // pass with the second gate deleted.
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { document.querySelector('[data-live]').textContent = 'gate sentinel'; \
+             return true; })()"
+        ),
+        true
+    );
+    assert_eq!(js_value(&tab, "window.__gate.release()"), true);
+    for _ in 0..200 {
+        if js_value(
+            &tab,
+            "window.__gate.delivered && document.querySelector('[data-live]').textContent === 'update waiting'",
+        ) == Value::Bool(true)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        js_value(&tab, "window.__gate.delivered"),
+        true,
+        "the held projection response never reached the page"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelector('[data-live]').textContent"),
+        "update waiting",
+        "the delivered projection was not held back by the gate after the fetch"
+    );
+    // And it stays unswapped: two more socket ticks with the answer in hand.
+    let deadline = Instant::now() + Duration::from_millis(2_500);
+    while Instant::now() < deadline {
+        assert_eq!(
+            js_value(&tab, "document.querySelector('main').dataset.generation"),
+            "held",
+            "the in-flight projection was applied over an answer started while it was fetching"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} textarea[name=reply]').value")
+        ),
+        typed,
+        "the arriving projection discarded the typed reply"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{picked}').checked")),
+        true,
+        "the arriving projection cleared the picked verdict"
+    );
+
+    tab.wait_for_element(&format!("{form} button.record"))
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+    assert_receipt(&tab, id, "Custom answer, recorded as defer");
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "defer", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+}
+
+/// A click on an incomplete free-text answer says what is missing, puts the
+/// cursor on it, and settles nothing -- and the verdict it asks for can be
+/// taken back.
+///
+/// The submit used to be rendered `disabled`, which made this the one
+/// interaction on the page with no observable result whatsoever: a disabled
+/// control fires no event, so there was no request, no refusal and no
+/// sentence. The button simply did nothing, which is exactly what was
+/// reported. The words are the board's own, so the page and the route cannot
+/// drift apart, and with the attribute gone the card also works with no
+/// script at all -- the native POST then reaches the route's own validation.
+///
+/// Pointer only. The keyboard paths are
+/// `a_digit_in_the_verdict_picker_records_nothing_in_real_chrome` and
+/// `enter_in_the_verdict_picker_records_the_free_text_answer_in_real_chrome`.
+#[test]
+fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-missing-half");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDMISSING", "--json"]);
+    let words = raise_carded(
+        &fixture,
+        "BLOCKED - no Claude seat is assigned to @@hax as of 2026-09-10.",
+        "codex@driver",
+        &["--kind", "decision", "--priority", "2"],
+    );
+    let verdict = raise_carded(
+        &fixture,
+        "BLOCKED - the release needs a second reviewer before 2026-09-12.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "4"],
+    );
+    let words_id = words["id"].as_str().unwrap();
+    let verdict_id = verdict["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = |id: &str| format!("form.decide[action=\"/attention/CARDMISSING/{id}/reply\"]");
+    let refusal = |tab: &headless_chrome::Tab, id: &str| {
+        js_value(
+            tab,
+            &format!(
+                "(() => {{ const el = document.querySelector('{} [data-refusal]'); \
+                 return el && el.offsetParent !== null ? el.textContent : null; }})()",
+                form(id)
+            ),
+        )
+    };
+
+    // Words, no verdict.
+    let typed = "Buy the seat on 2026-09-11 and log in the same evening.";
+    let answer = tab
+        .wait_for_element(&format!("{} textarea[name=reply]", form(words_id)))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the answer");
+    tab.wait_for_element(&format!("{} button.record", form(words_id)))
+        .expect("the submit")
+        .click()
+        .expect("click the submit");
+    assert_eq!(
+        refusal(&tab, words_id),
+        INCOMPLETE_ANSWER_ON_THE_CARD,
+        "a click on a verdictless answer said nothing the operator can see"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.activeElement === document.querySelector('{} input[name=outcome]')",
+                form(words_id)
+            )
+        ),
+        true,
+        "the refusal did not move the cursor to the missing verdict"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{} textarea[name=reply]').value",
+                form(words_id)
+            )
+        ),
+        typed,
+        "the refusal ate the reply it was refusing to send"
+    );
+
+    // Verdict, no words: the same sentence, the other half focused.
+    tab.wait_for_element(&format!(
+        "{} input[name=outcome][value=approve]",
+        form(verdict_id)
+    ))
+    .expect("the approve outcome")
+    .click()
+    .expect("pick approve");
+    tab.wait_for_element(&format!("{} button.record", form(verdict_id)))
+        .expect("the submit")
+        .click()
+        .expect("click the submit");
+    assert_eq!(
+        refusal(&tab, verdict_id),
+        INCOMPLETE_ANSWER_ON_THE_CARD,
+        "a click on a wordless answer said nothing the operator can see"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.activeElement === document.querySelector('{} textarea[name=reply]')",
+                form(verdict_id)
+            )
+        ),
+        true,
+        "the refusal did not move the cursor to the missing words"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{} input[name=outcome][value=approve]').checked",
+                form(verdict_id)
+            )
+        ),
+        true,
+        "the refusal cleared the verdict that was picked"
+    );
+
+    // Two refusals, nothing settled, and no verdict invented for either row.
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "an incomplete answer produced a receipt"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "2"
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array().expect("open rows").len(),
+        2,
+        "an incomplete answer settled an item: {open}"
+    );
+    for row in open.as_array().expect("open rows") {
+        assert!(
+            row["decision"].is_null(),
+            "an incomplete answer recorded a verdict: {row}"
+        );
+    }
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--status", "resolved", "--json"]
+            )
+            .as_array()
+            .expect("resolved rows")
+            .is_empty(),
+        "an incomplete answer resolved a row"
+    );
+
+    // The verdict is releasable, by a control and not only by a keystroke:
+    // this shell is phone-first and a phone has no Escape key. While one is
+    // picked the live projection is held for the whole page, and HTML offers
+    // no other way to un-check a radio group.
+    let clear = format!("{} [data-clear]", form(verdict_id));
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{clear}').hidden")),
+        false,
+        "the release is hidden while there is a verdict to release"
+    );
+    tab.wait_for_element(&clear)
+        .expect("the release")
+        .click()
+        .expect("release the verdict");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelectorAll('{} input[name=outcome]:checked').length",
+                form(verdict_id)
+            )
+        ),
+        0,
+        "the release left the verdict picked"
+    );
+    assert_eq!(
+        refusal(&tab, verdict_id),
+        Value::Null,
+        "the release left its refusal on screen"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{clear}').hidden")),
+        true,
+        "the release stayed on screen with nothing left to release"
+    );
+
+    // The other card still holds its words, and completing it clears the
+    // refusal rather than leaving a red alert over a recorded answer.
+    tab.wait_for_element(&format!(
+        "{} input[name=outcome][value=defer]",
+        form(words_id)
+    ))
+    .expect("the defer outcome")
+    .click()
+    .expect("pick defer");
+    assert_eq!(
+        refusal(&tab, words_id),
+        Value::Null,
+        "the refusal outlived the answer it refused"
+    );
+    tab.wait_for_element(&format!("{} button.record", form(words_id)))
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+    assert_receipt(&tab, words_id, "Custom answer, recorded as defer");
+    let row = settled_row(&fixture, words_id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "defer", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+
+    // And the released card is still open, with no verdict on it.
+    let still_open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        still_open.as_array().expect("open rows").len(),
+        1,
+        "a refusal or a release settled a row: {still_open}"
+    );
+    assert_eq!(still_open[0]["id"], verdict_id, "{still_open}");
+    assert!(
+        still_open[0]["decision"].is_null(),
+        "the released card kept a verdict: {still_open}"
+    );
+}
+
+/// A digit pressed in the verdict picker records nothing.
+///
+/// Reproduced by hand on the fixed binary before this existed: the refusal
+/// puts the cursor on the first verdict, `1` there reached the card's
+/// keyboard shortcut, and the shortcut clicked the first choice -- so one
+/// keystroke recorded a decision the operator never chose, carrying the
+/// half-written reply as its note. A focused verdict radio is composing
+/// exactly like the textarea is, so the digit is inert.
+///
+/// One `Tab::press_key` on a digit was not one keydown on this path, measured
+/// rather than argued: with a page-side counter around each press on
+/// 2026-09-10, through headless_chrome 1.0.22's `Tab::press_key` against the
+/// Chrome this suite launches, a single `press_key("1")` arrived 1208 times
+/// within 100ms and 10848 times within 2800ms, all of them `key === '1'` with
+/// `event.repeat === false`, while `press_key("Tab")` arrived exactly once.
+/// The driver sends one keyDown and one keyUp for both
+/// (browser/tab/mod.rs:950-983), so the repetition comes from somewhere in
+/// the CDP path rather than from the test. A reviewer driving the same
+/// browser through puppeteer measured exactly one keydown for the same keys,
+/// so this is a fact about THIS driver on THAT date and nothing to design
+/// around. The figures and the command that produced them are on
+/// `a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome`.
+///
+/// So what this case relies on is that the digit reached the page at all --
+/// asserted below, since a keystroke that never arrived would make the
+/// negatives vacuous -- and that not one of those deliveries recorded
+/// anything. Keeping the keystroke last in the tab is a convenience here, not
+/// a requirement: the case named above presses two keys and then records a
+/// real answer in the same tab.
+#[test]
+fn a_digit_in_the_verdict_picker_records_nothing_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-digit");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDDIGIT", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - is it safe to restart the proxy during business hours?",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDDIGIT/{id}/reply\"]");
+
+    let typed = "Restart it after 19:00 MYT, not during the day.";
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the answer");
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { window.__k = 0; \
+             document.addEventListener('keydown', () => { window.__k += 1; }, true); \
+             return true; })()"
+        ),
+        true
+    );
+    tab.wait_for_element(&format!("{form} button.record"))
+        .expect("the submit")
+        .click()
+        .expect("click the submit");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.activeElement === document.querySelector('{form} input[name=outcome]')"
+            )
+        ),
+        true,
+        "the refusal did not move the cursor to the missing verdict"
+    );
+
+    tab.press_key("1").expect("press 1 in the verdict picker");
+    // A decision posts and renders its receipt asynchronously, so a snapshot
+    // taken the instant after the keystroke would pass while the wrong POST
+    // was still in flight.
+    std::thread::sleep(Duration::from_millis(1_500));
+    // The digit reached the page. Once is what the operator does; this driver
+    // delivers the same press thousands of times, and the guard has to hold
+    // for every one of them.
+    assert!(
+        js_value(&tab, "window.__k").as_u64().unwrap_or(0) >= 1,
+        "the digit never reached the page, so nothing here was actually guarded"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a digit pressed in the verdict picker recorded a decision"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelectorAll('{form} input[name=outcome]:checked').length")
+        ),
+        0,
+        "a digit pressed in the verdict picker picked a verdict"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} textarea[name=reply]').value")
+        ),
+        typed,
+        "a digit pressed in the verdict picker rewrote the reply"
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array().expect("open rows").len(),
+        1,
+        "a digit pressed in the verdict picker settled the row: {open}"
+    );
+    assert!(
+        open[0]["decision"].is_null(),
+        "a digit pressed in the verdict picker recorded a verdict: {open}"
+    );
+}
+
+/// Enter in the verdict picker submits the card's own answer.
+///
+/// The browser's implicit submission would pick the form's FIRST submit
+/// button, which is the recommendation: Enter in the picker used to record
+/// the recommended choice with the operator's reply attached. It is aimed at
+/// the card's own submit instead, which records a complete answer and
+/// refuses an incomplete one in the card's own words.
+///
+/// One card, so the receipt this waits for can only have come from the card
+/// the keystroke was aimed at.
+#[test]
+fn enter_in_the_verdict_picker_records_the_free_text_answer_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-enter");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDENTER", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - is it safe to restart the proxy during business hours?",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDENTER/{id}/reply\"]");
+
+    let typed = "Restart it after 19:00 MYT, not during the day.";
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the answer");
+    // Clicking the verdict leaves the cursor on it, which is where Enter is
+    // pressed from.
+    tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
+        .expect("the other outcome")
+        .click()
+        .expect("pick other");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.activeElement === \
+                 document.querySelector('{form} input[name=outcome][value=other]')"
+            )
+        ),
+        true,
+        "the cursor is not in the verdict picker, so this proves nothing"
+    );
+
+    tab.press_key("Enter").expect("enter submits the answer");
+    assert_receipt(&tab, id, "Custom answer, recorded as other");
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "other", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+}
+
+/// One `Tab` off a picked verdict, then a digit: nothing is posted.
+///
+/// This is the exact path both earlier guards missed, reproduced on the built
+/// binary before it was closed. `Tab` from the verdict picker lands on the
+/// card's own submit, which is a BUTTON: the guard that keeps digits out of a
+/// textarea does not see it, and the guard that aims `Enter` at the card's
+/// submit is about a different key. From there `1` reached the card's
+/// shortcut and clicked the recommendation -- recording a choice the operator
+/// never picked, over the verdict they did pick, with the half-written reply
+/// riding along as its note. What makes the digit inert is the CARD carrying a
+/// picked verdict, which is true wherever focus sits inside it.
+///
+/// The POSTs are counted in the page rather than inferred from the ledger: a
+/// wrong decision that was posted and refused for some unrelated reason would
+/// leave the row exactly as open as one that was never posted at all. The
+/// counter is then proved to be watching something by the real answer at the
+/// end, which has to come through as exactly one POST. Both counters are read
+/// as numbers and strings, because `Tab::evaluate` is called with
+/// `return_by_value: false` (headless_chrome 1.0.22, browser/tab/mod.rs:1481)
+/// and an array or object comes back as no value at all -- an assertion that
+/// compared `window.__posts` to `[]` would hold with a hundred POSTs in it.
+///
+/// What a keystroke costs on this path was measured on 2026-09-10 with a
+/// page-side keydown counter around each press, through headless_chrome
+/// 1.0.22's `Tab::press_key` against the Chrome this suite launches, by
+/// `cargo test --locked --test e2e -- --test-threads=1 --nocapture --exact
+/// a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome`:
+/// `press_key("Tab")` arrived as exactly ONE keydown, while a single
+/// `press_key("1")` kept arriving -- 1208 keydowns 100ms after the call, 3696
+/// by 500ms, 8492 by 1300ms, 10848 by 2800ms, every one of them `key === '1'`
+/// with `event.repeat === false` on the button. The driver sends one keyDown
+/// and one keyUp either way (browser/tab/mod.rs:950-983), so the repetition
+/// comes from somewhere in the CDP path and not from the test. A reviewer
+/// driving the same browser through puppeteer measured exactly one keydown
+/// for the same keys, so this is a property of THIS driver on THAT date --
+/// recorded because it explains the assertions below, not to be designed
+/// around.
+///
+/// So what this case relies on is that the digit reached the page at all --
+/// asserted, because a keystroke that never arrived would make every negative
+/// below vacuous -- and that NONE of those deliveries posted anything. The
+/// flood makes that negative stronger rather than weaker, and it does not stop
+/// the answer being recorded afterwards in the same tab, which is what the
+/// last third of this case does.
+#[test]
+fn a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-tab-digit");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDTAB", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - is it safe to restart the proxy during business hours?",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDTAB/{id}/reply\"]");
+    let picked = format!("{form} input[name=outcome][value=other]");
+
+    // Every POST this page makes, recorded where it is made. The projection
+    // GET goes through the same `fetch` and is deliberately not counted.
+    assert_eq!(
+        js_value(
+            &tab,
+            r#"(() => {
+  const real = window.fetch;
+  window.__posts = [];
+  window.fetch = (input, init) => {
+    if (((init && init.method) || 'GET').toUpperCase() === 'POST') {
+      window.__posts.push(String((input && input.url) || input));
+    }
+    return real.call(window, input, init);
+  };
+  return true;
+})()"#
+        ),
+        true
+    );
+
+    let typed = "Restart it after 19:00 MYT, not during the day.";
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the answer");
+    tab.wait_for_element(&picked)
+        .expect("the other outcome")
+        .click()
+        .expect("pick other");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.activeElement === document.querySelector('{picked}')")
+        ),
+        true,
+        "the cursor is not on the verdict, so the Tab below starts somewhere else"
+    );
+    // Every keydown the page sees, and the digits among them.
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { window.__keys = 0; window.__digits = 0; \
+             document.addEventListener('keydown', event => { window.__keys += 1; \
+             if (event.key === '1') window.__digits += 1; }, true); return true; })()"
+        ),
+        true
+    );
+
+    tab.press_key("Tab").expect("tab off the verdict picker");
+    assert_eq!(
+        js_value(&tab, "window.__keys"),
+        1,
+        "Tab did not arrive as exactly one keydown, so the focus below moved for another reason"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.activeElement === document.querySelector('{form} button.record')")
+        ),
+        true,
+        "Tab did not land on the card's submit, so this is not the reported path"
+    );
+    tab.press_key("1").expect("press 1 on the card's submit");
+    // A decision posts and renders its receipt asynchronously, so a snapshot
+    // taken the instant after the keystroke would pass while the wrong POST
+    // was still in flight.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert!(
+        js_value(&tab, "window.__digits").as_u64().unwrap_or(0) >= 1,
+        "the digit never reached the page, so nothing below was actually guarded"
+    );
+    assert_eq!(
+        js_value(&tab, "window.__posts.length"),
+        0,
+        "a digit pressed on the card's submit posted a decision: {}",
+        js_value(&tab, "JSON.stringify(window.__posts)")
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a digit pressed on the card's submit recorded a decision"
+    );
+    // The answer is untouched: both halves still there, and the row still
+    // open with nothing decided on it.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} textarea[name=reply]').value")
+        ),
+        typed,
+        "the digit rewrote or cleared the reply"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{picked}').checked")),
+        true,
+        "the digit dropped the verdict the operator picked"
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array().expect("open rows").len(),
+        1,
+        "the digit settled the row: {open}"
+    );
+    assert!(
+        open[0]["decision"].is_null(),
+        "the digit recorded a verdict: {open}"
+    );
+
+    // And the answer the operator did write still records, as one POST --
+    // which is what makes the empty count above a measurement rather than a
+    // wrapper that never saw anything.
+    tab.wait_for_element(&format!("{form} button.record"))
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+    assert_receipt(&tab, id, "Custom answer, recorded as other");
+    assert_eq!(
+        js_value(&tab, "window.__posts.length"),
+        1,
+        "the recorded answer did not go through the counted fetch"
+    );
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "other", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+}
+
+/// What the board refused stays on the card, whatever the operator types,
+/// submits or releases next.
+///
+/// A refusal that came from the route is not the composer's to withdraw: the
+/// answer was posted, the board would not take it, and nothing the operator
+/// does next makes that untrue or records anything. Two holes led here, and
+/// both are reproduced below in the order they were found. First the composer
+/// cleared any refusal it found as soon as the card looked complete, so one
+/// keystroke erased the board's sentence. Then, with the clearing narrowed by
+/// kind, the composer still REUSED the single refusal line and only retagged
+/// it -- so a second submit with a half-written answer overwrote the board's
+/// sentence with the composer's own, and picking a verdict then removed that
+/// as `incomplete`, leaving a card that had silently stopped saying the board
+/// refused it with nothing recorded anywhere.
+///
+/// The refusal is a real one: the row is resolved from outside the browser
+/// between the page load and the click, which is the ordinary way a card left
+/// open in a tab goes stale, and the route answers 409 in the store's own
+/// words. The card quotes those words verbatim; its own pre-flight sentence
+/// is the page's language, and the two are asserted apart.
+#[test]
+fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-board-refusal");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDREFUSED", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - is it safe to restart the proxy during business hours?",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDREFUSED/{id}/reply\"]");
+    let board_refusal = format!("{form} [data-refusal=board]");
+    let own_refusal = format!("{form} [data-refusal=incomplete]");
+    // Read as text rather than through an element handle, so that a missing
+    // line comes back as null instead of a panic and every comparison below
+    // is against the same kind of value.
+    let still_the_boards = format!(
+        "(() => {{ const el = document.querySelector('{board_refusal}'); \
+         return el ? el.textContent : null; }})()"
+    );
+
+    let typed = "Restart it after 19:00 MYT, not during the day.";
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the answer");
+    tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
+        .expect("the other outcome")
+        .click()
+        .expect("pick other");
+
+    // The lane that raised it answers it from the CLI while this card sits
+    // open. The raiser, rather than a third lane, because the ledger lets
+    // only George or the raiser close a row George is queued to answer.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "codex@driver",
+            "--choice",
+            "keep-parked",
+            "--note",
+            "Answered from the lane before the browser got to it.",
+            "--json",
+        ],
+    );
+
+    tab.wait_for_element(&format!("{form} button.record"))
+        .expect("the submit")
+        .click()
+        .expect("record the answer");
+    tab.wait_for_element(&board_refusal)
+        .expect("the board's refusal");
+    let refused = js_value(&tab, &still_the_boards);
+    assert!(
+        refused
+            .as_str()
+            .unwrap_or_default()
+            .contains("was already resolved by codex@driver"),
+        "the card is not showing what the board said: {refused:?}"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelectorAll('{own_refusal}').length")
+        ),
+        0,
+        "the composer refused an answer it had both halves of"
+    );
+    // No receipt: a refusal is not a decision.
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a refused decision rendered a receipt"
+    );
+
+    // More words, which is exactly what an operator does next. The card is
+    // complete by the composer's own reckoning after every one of them.
+    let more = " Ask the lane that answered it.";
+    tab.wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field")
+        .type_into(more)
+        .expect("keep typing");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} textarea[name=reply]').value")
+        ),
+        format!("{typed}{more}"),
+        "the extra words did not reach the reply"
+    );
+    assert_eq!(
+        js_value(&tab, &still_the_boards),
+        refused,
+        "typing removed or rewrote the board's refusal"
+    );
+
+    // Now the sequence that survived the first fix. Release the verdict, so
+    // the card is half-written again, and submit: the composer refuses in its
+    // own words, on its OWN line. The board's sentence has to still be there,
+    // saying the thing that actually happened.
+    tab.wait_for_element(&format!("{form} [data-clear]"))
+        .expect("the release")
+        .click()
+        .expect("release the verdict");
+    assert_eq!(
+        js_value(&tab, &still_the_boards),
+        refused,
+        "the release took the board's refusal with it"
+    );
+    tab.wait_for_element(&format!("{form} button.record"))
+        .expect("the submit")
+        .click()
+        .expect("submit the half-written answer");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{own_refusal}').textContent")
+        ),
+        INCOMPLETE_ANSWER_ON_THE_CARD,
+        "the composer did not refuse the half-written answer in the page's words"
+    );
+    assert_eq!(
+        js_value(&tab, &still_the_boards),
+        refused,
+        "the composer's own refusal took over the board's line"
+    );
+
+    // And picking a verdict clears the composer's line only. This is where
+    // the card used to end up saying nothing at all about a decision that
+    // never landed.
+    tab.wait_for_element(&format!("{form} input[name=outcome][value=defer]"))
+        .expect("the defer outcome")
+        .click()
+        .expect("pick defer");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelectorAll('{own_refusal}').length")
+        ),
+        0,
+        "the composer's own refusal outlived the half it was asking for"
+    );
+    assert_eq!(
+        js_value(&tab, &still_the_boards),
+        refused,
+        "the card stopped saying the board refused this, with nothing recorded"
+    );
+
+    // A pointer click on an authored choice releases the picker before it
+    // posts, because the route forwards no picker value onto a named choice.
+    // This POST is refused too, so the card stays and the picker is
+    // observable: what is on screen must not claim a verdict that was never
+    // part of the decision.
+    tab.wait_for_element(&format!("{form} button.choice"))
+        .expect("the recommendation")
+        .click()
+        .expect("click the recommendation");
+    // The POST is asynchronous, so this waits long enough for a receipt to
+    // have rendered if the board had taken it.
+    std::thread::sleep(Duration::from_millis(1_500));
+    tab.wait_for_element(&board_refusal)
+        .expect("the board's refusal after the choice");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelectorAll('{form} input[name=outcome]:checked').length")
+        ),
+        0,
+        "the card is still showing a verdict the ledger does not carry"
+    );
+    assert_eq!(
+        js_value(&tab, &still_the_boards),
+        refused,
+        "the second refusal lost the board's sentence"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a refused decision rendered a receipt"
+    );
+
+    // And the ledger still carries the answer the lane gave, not the one the
+    // browser was refused.
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "keep-parked", "{row}");
+    assert_eq!(row["decision"]["by"], "codex@driver", "{row}");
 }
 
 /// Three decisions on one page load, each through a different surface: an
@@ -25468,7 +26776,6 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     .expect("the defer outcome")
     .click()
     .expect("pick defer");
-    hold_projection(&tab);
     tab.wait_for_element(&format!("{} button.record", card_form(deferred_id)))
         .expect("the submit")
         .click()
@@ -25485,7 +26792,17 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     );
 
     // Three decisions, three receipts, no navigation. With the draft gone the
-    // projection refreshes again, and the receipts outlive it.
+    // projection refreshes again, and the receipts outlive it: the tag goes on
+    // AFTER the last decision and the swap is then provoked from outside the
+    // browser, so the refresh being waited for cannot be one that already
+    // happened while the answer was still being written.
+    hold_projection(&tab);
+    raise_carded(
+        &fixture,
+        "A fourth item, raised only to move the ledger revision.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "6"],
+    );
     wait_for_projection_swap(&tab);
     assert_eq!(
         js_value(&tab, "document.querySelectorAll('p.receipt').length"),
