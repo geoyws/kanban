@@ -10,6 +10,7 @@ supersede it by a later ADR.
 [ADR-034](ADR-034-hig-release-packages-and-board-rule-transfer.md) introduced
 the behaviour and stays in force; this ADR only freezes the schema that
 behaviour already emits.
+**Superseded in part by:** [ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md) (2026-09-10) — the two receipts of §2 and §3 are at `formatVersion` 2 there. §1's `manifest.json` stays frozen exactly as written below, so no `releaseId` moves. See the addendum dated 2026-09-10 at the end of this document for which rows became history.
 
 ## Context
 
@@ -526,6 +527,41 @@ override, so a fixture's answer can never be presented as the kernel's;
 `listener` is `{port: N}` or `{socket: PATH}`, read from the unit's own
 `ExecStart`, because `kanban serve` has no default listener to fall back to.
 Reason and incidents: ADR-034, addendum 2026-09-09 (second).
+
+Addendum 2026-09-10 (the receipts are at `formatVersion` 2; the manifest is
+not): George chose `mbp-path` on attention `a-4741a3c3` and
+[ADR-044](ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md)
+spends the bump this document said a provenance field would cost. Three
+passages above are now HISTORY, kept as written rather than edited:
+
+- §2's `host` row — "exactly `"hax"` — the build host, forced by
+  `require_host hax`" — and the same literal in §3's discussion of `host`
+  versus `installerHost`. Under `formatVersion` 2 `host` is the measured short
+  hostname of the machine that ran `package`, asserted for shape and never for
+  identity; `installerHost` and `target` still assert `hax` exactly as
+  described here, and the rule that the two are different facts is unchanged.
+- §8's provenance paragraph, whose "Not covered: no signature, no builder
+  identity beyond a short hostname, no toolchain version. Those would be new
+  fields and therefore a `formatVersion` bump" is now half spent: the
+  toolchain and the builder identity ARE covered at `formatVersion` 2, through
+  `buildPlatform`, `artifactPlatform`, `buildKind`, `builderImage`,
+  `toolchain.{rustc,cargo}` and `versionProbe` on the package receipt,
+  inherited by the
+  activation receipt through the `$receipt + { … }` writer §3 describes. A
+  signature is still not covered.
+- §8's "build host pinned to `hax`", which is now a capability gate:
+  packaging is permitted wherever a genuine linux x86-64 artifact can be
+  produced and refused elsewhere by name.
+
+Everything else below is current. §1's manifest keeps its five fields and its
+`formatVersion` 1, which is why the bump costs no `releaseId` churn — the
+field-goes-in-a-receipt rule of §4 applied, not evaded. §5's publication
+sequence, §6's refusal set, §7's retention and store path, and the identity
+and circularity rules of §4 are untouched. Reading an older receipt: ADR-044
+§5 states it — a `formatVersion` 1 `host` is an assertion, not a measurement,
+nothing is backfilled, and a v1 activation receipt already in the store stays
+listable, prunable and rollback-able because the store's own readers never
+look at `formatVersion`.
 
 ## References
 
