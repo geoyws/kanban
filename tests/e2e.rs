@@ -13390,6 +13390,10 @@ fn install_matching_hax_package(
         .current_dir(&ctx.fixture.main)
         .env("PATH", ctx.path)
         .env("HOSTNAME_BIN", ctx.hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(ctx.hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", ctx.fake_repo_root)
         .env("FAKE_GIT_HEAD", commit)
@@ -13500,6 +13504,75 @@ fn stderr_beyond_the_serve_skip_notice(stderr: &[u8]) -> String {
         .to_string()
 }
 
+/// The twenty header bytes that make a file the platform a Kanban release
+/// targets: ELF magic, 64-bit class, little-endian data, `ET_DYN` in
+/// `e_type` - a release-profile Rust binary on linux is PIE - and
+/// `EM_X86_64` in `e_machine`. The one place in this suite that writes that
+/// header, so the containerised build that will eventually produce the real
+/// thing has one place to meet.
+fn linux_x86_64_elf_header() -> [u8; 20] {
+    elf_header(2, 1, 0x3e, 3)
+}
+
+/// An ELF header with the class, data encoding, machine and object type a
+/// case asks for, so a fixture can be an image no host could run - a
+/// relocatable object, a core dump - while the gate still reads a true
+/// header off it.
+fn elf_header(class: u8, data: u8, machine: u16, etype: u16) -> [u8; 20] {
+    let mut header = [0_u8; 20];
+    header[..4].copy_from_slice(b"\x7fELF");
+    header[4] = class;
+    header[5] = data;
+    header[6] = 1; // EV_CURRENT
+    header[16..18].copy_from_slice(&etype.to_le_bytes());
+    header[18..20].copy_from_slice(&machine.to_le_bytes());
+    header
+}
+
+/// `MH_MAGIC_64` as it sits on disk here. The realistic wrong answer: it is
+/// what `cargo build --release` produces on this Mac.
+fn mach_o_header() -> [u8; 20] {
+    let mut header = [0_u8; 20];
+    header[..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
+    header
+}
+
+/// `FAT_MAGIC` as it sits on disk: a universal binary, which is what a Mac
+/// build that was asked for two architectures produces.
+fn universal_mach_o_header() -> [u8; 20] {
+    let mut header = [0_u8; 20];
+    header[..4].copy_from_slice(&0xcafe_babe_u32.to_be_bytes());
+    header
+}
+
+/// A build output for a case whose binaries must not be the release platform:
+/// the crafted header, then enough payload that the file is a whole image
+/// rather than a truncated one.
+fn write_release_image(path: &Path, header: &[u8]) {
+    let mut image = header.to_vec();
+    image.extend_from_slice(b"payload that is not an executable\n");
+    fs::write(path, &image).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A build output that IS the release platform, carrying `payload` under the
+/// header: what the fake build produces, and what a case needs when it ships
+/// a rebuilt binary that has to report something of its own. The runner runs
+/// the payload, so the payload is what answers `version`.
+fn write_release_platform_image(path: &Path, payload: &[u8]) {
+    let mut image = linux_x86_64_elf_header().to_vec();
+    image.extend_from_slice(payload);
+    fs::write(path, &image).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The program the suite hands the release script as
+/// `HIG_RELEASE_TARGET_RUNNER`: this host cannot execute a linux x86-64
+/// image, so it names what runs one. Written beside the other release stubs.
+fn release_target_runner(hostname_bin: &Path) -> PathBuf {
+    hostname_bin.parent().unwrap().join("target-runner")
+}
+
 fn write_release_tool_stubs(
     fixture: &Fixture,
     fake_repo_root: &Path,
@@ -13551,11 +13624,21 @@ case "${1:-}" in
 esac
 "#,
     );
+    let platform_header = stubs.join("release-platform-header");
+    fs::write(&platform_header, linux_x86_64_elf_header()).unwrap();
     write_executable(
         &stubs.join("cargo"),
         // `cargo build --bins` produces every declared executable, so the stub
         // stands in for all of them: a release script that enumerates fewer
         // must still be caught by what it packages, not by a short fake build.
+        //
+        // What it produces is a linux x86-64 image, because that is what a
+        // release is. This host builds Mach-O, so the stub stamps the header a
+        // real linux build would carry onto the executable it copies: the
+        // script's platform gate then reads a true ELF header off the build
+        // output, and HIG_RELEASE_TARGET_RUNNER is what runs the executable
+        // underneath it. FAKE_RELEASE_IMAGE hands the whole image over
+        // instead, for a case whose build must produce something else.
         &[
             r#"#!/bin/sh
 set -eu
@@ -13576,9 +13659,82 @@ for binary in "#,
   if [ -n "${FAKE_RELEASE_BINARY_DIR:-}" ]; then
     source="$FAKE_RELEASE_BINARY_DIR/$binary"
   fi
-  cp "$source" "$target_root/$binary"
+  if [ -n "${FAKE_RELEASE_FIFO:-}" ]; then
+    # A build output nothing can read to the end: reading it to judge it is
+    # what hangs, so the script has to refuse it on its type instead.
+    mkfifo "$target_root/$binary"
+  elif [ -n "${FAKE_RELEASE_SYMLINK:-}" ]; then
+    ln -s "$FAKE_RELEASE_SYMLINK" "$target_root/$binary"
+    continue
+  elif [ -n "${FAKE_RELEASE_IMAGE:-}" ]; then
+    cp "$FAKE_RELEASE_IMAGE" "$target_root/$binary"
+  else
+    cat ""#,
+            platform_header.to_str().unwrap(),
+            r#"" "$source" > "$target_root/$binary"
+  fi
   chmod 0755 "$target_root/$binary"
 done
+"#,
+        ]
+        .concat(),
+    );
+    write_executable(
+        &stubs.join("target-runner"),
+        // Stands in for executing a release binary, which this host cannot do:
+        // a linux x86-64 ELF is not loadable here, and bash refuses to fall
+        // back to running an ELF-magic file as a script. So it runs what is
+        // inside the image it was handed - the header off, the executable
+        // underneath run - which is why the version the script records is the
+        // packaged bytes' own answer and not this stub's opinion. A case that
+        // ships a rebuilt binary reporting a different version is answered
+        // correctly without telling the runner anything.
+        //
+        // Mode bits are honoured: a package binary the installer could not
+        // have executed must fail here too. FAKE_TARGET_RUNNER_FAILS and
+        // FAKE_TARGET_RUNNER_SILENT are the two ways a runner can let the
+        // script down - it cannot run the image, or it runs it and says
+        // nothing - and the attempt is logged before either, so a case
+        // asserting what was attempted asserts something that could be false.
+        &[
+            r#"#!/bin/sh
+set -eu
+binary="$1"
+shift
+[ -x "$binary" ] || {
+  printf '%s: cannot execute\n' "$binary" >&2
+  exit 126
+}
+if [ -n "${FAKE_TARGET_RUNNER_LOG:-}" ]; then
+  printf '%s %s\n' "${binary##*/}" "$*" >> "$FAKE_TARGET_RUNNER_LOG"
+fi
+if [ -n "${FAKE_TARGET_RUNNER_FAILS:-}" ]; then
+  printf 'cannot run %s on this host\n' "$binary" >&2
+  exit 1
+fi
+if [ -n "${FAKE_TARGET_RUNNER_SILENT:-}" ]; then
+  exit 0
+fi
+# Content-addressed, because an install probes the same image several times
+# and copying it out again each time is the slowest thing in these cases. The
+# key is the image's own hash, so a rebuilt binary is never answered by the
+# payload of the one it replaced.
+payload_cache=""#,
+            stubs.join("target-payloads").to_str().unwrap(),
+            r#""
+mkdir -p "$payload_cache"
+payload="$payload_cache/$(sha256sum "$binary" | awk '{print $1}')"
+if [ ! -x "$payload" ]; then
+  staged="$payload.$$"
+  tail -c +"#,
+            (linux_x86_64_elf_header().len() + 1).to_string().as_str(),
+            r#" "$binary" > "$staged"
+  chmod 0755 "$staged"
+  mv "$staged" "$payload"
+fi
+status=0
+"$payload" "$@" || status=$?
+exit "$status"
 "#,
         ]
         .concat(),
@@ -13888,6 +14044,14 @@ case "${1:-}" in
       mv "$FAKE_SSH_HIDE_PATH" "$hidden_path"
       [ ! -e "$FAKE_SSH_HIDE_PATH" ]
       trap restore_hidden_path EXIT HUP INT TERM
+    fi
+    if [ -n "${FAKE_SSH_SWAP_STAGED:-}" ]; then
+      # What arrived on the remote host is not what hax validated: a transfer
+      # that garbled a binary, or a package staged by hand. The remote leg has
+      # to judge the bytes it actually holds, so the staged copy is replaced
+      # after the transfer and before the remote script runs. "$1" is the
+      # stage root and "$2" the staged package, the argv install_remote uses.
+      cp "$FAKE_SSH_SWAP_STAGED" "$2/${FAKE_SSH_SWAP_NAME:-kanban}"
     fi
     FAKE_HOST="$host" bash -s -- "$@"
     ;;
@@ -30054,6 +30218,10 @@ fn hig_release_script_requires_the_initialized_kb_skill_submodule() {
             .current_dir(&fixture.main)
             .env("PATH", &path)
             .env("HOSTNAME_BIN", &hostname_bin)
+            .env(
+                "HIG_RELEASE_TARGET_RUNNER",
+                release_target_runner(&hostname_bin),
+            )
             .env("FAKE_HOST", "hax")
             .env("FAKE_REPO_ROOT", &fake_repo_root)
             .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30172,6 +30340,10 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30221,9 +30393,15 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
     for (name, source) in &release_binaries {
         let packaged_binary = output_dir.join(name);
         assert!(packaged_binary.is_file(), "missing package binary {name}");
+        // The fake build stamps the linux x86-64 header a real release build
+        // would carry onto each Cargo binary, so what the package must hold is
+        // that header followed by THIS target's bytes: a stub standing in for
+        // all ten still fails here.
+        let mut expected = linux_x86_64_elf_header().to_vec();
+        expected.extend_from_slice(&fs::read(source).unwrap());
         assert_eq!(
             fs::read(&packaged_binary).unwrap(),
-            fs::read(source).unwrap(),
+            expected,
             "package binary {name} did not come from its Cargo binary target"
         );
     }
@@ -30232,6 +30410,10 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30281,6 +30463,10 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30325,6 +30511,10 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30419,6 +30609,10 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30465,6 +30659,10 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30569,6 +30767,10 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30588,6 +30790,10 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30616,6 +30822,10 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30656,6 +30866,10 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30766,6 +30980,10 @@ fn hig_release_script_rejects_package_target_hig() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30784,6 +31002,653 @@ fn hig_release_script_rejects_package_target_hig() {
         String::from_utf8_lossy(&packaged.stderr).contains("package target must be hax"),
         "stderr: {}",
         String::from_utf8_lossy(&packaged.stderr)
+    );
+}
+
+/// A packaging run whose fake build can be pointed at any image, so a case
+/// can make `cargo build --release` produce something other than the platform
+/// a Kanban release targets and watch the script refuse it.
+struct ReleasePackagingCase {
+    fixture: Fixture,
+    script: PathBuf,
+    path: String,
+    hostname_bin: PathBuf,
+    fake_repo_root: PathBuf,
+    remote_root: PathBuf,
+}
+
+impl ReleasePackagingCase {
+    fn new(label: &str) -> Self {
+        let fixture = Fixture::new(label);
+        let fake_repo_root = fixture.root.join("fake-repo");
+        fs::create_dir_all(&fake_repo_root).unwrap();
+        let remote_root = fixture.root.join("remote-root");
+        fs::create_dir_all(&remote_root).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hig-release.sh");
+        let stubs = write_release_tool_stubs(
+            &fixture,
+            &fake_repo_root,
+            "0123456789abcdef0123456789abcdef01234567",
+            env!("CARGO_BIN_EXE_kanban"),
+            "hax",
+        );
+        let hostname_bin = stubs.join("hostname");
+        let path = format!("{}:{}", stubs.display(), env::var("PATH").unwrap());
+        Self {
+            fixture,
+            script,
+            path,
+            hostname_bin,
+            fake_repo_root,
+            remote_root,
+        }
+    }
+
+    fn package(&self, output: &Path) -> Command {
+        let mut command = Command::new("bash");
+        command
+            .current_dir(&self.fixture.main)
+            .env("PATH", &self.path)
+            .env("HOSTNAME_BIN", &self.hostname_bin)
+            .env(
+                "HIG_RELEASE_TARGET_RUNNER",
+                release_target_runner(&self.hostname_bin),
+            )
+            .env("FAKE_HOST", "hax")
+            .env("FAKE_REPO_ROOT", &self.fake_repo_root)
+            .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
+            .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
+            .env("FAKE_REMOTE_ROOT", &self.remote_root)
+            .arg(&self.script)
+            .args(["package", "hax", "--output", output.to_str().unwrap()]);
+        command
+    }
+}
+
+/// The sentence every platform refusal states the requirement with.
+const RELEASE_PLATFORM: &str = "a Kanban release targets linux x86-64 (ELF 64-bit, little-endian)";
+
+/// A refused packaging run records no release: no manifest, no receipt.
+fn assert_no_release_recorded(output: &Path) {
+    assert!(
+        !output.join("manifest.json").exists(),
+        "a refused packaging run wrote {}/manifest.json",
+        output.display()
+    );
+    assert!(
+        !output.with_extension("receipt.json").exists(),
+        "a refused packaging run wrote {}",
+        output.with_extension("receipt.json").display()
+    );
+}
+
+/// A release is linux x86-64 whatever the host that built it runs, and the
+/// build at scripts/hig-release.sh takes no `--target`: on a Mac it produces
+/// Mach-O, and on any other cross-built host something else again. So the
+/// packaging path reads the built image's own header and refuses it unless it
+/// is a 64-bit little-endian x86-64 program - an object file, a core dump and
+/// an ET_NONE image all carry an x86-64 ELF header and none of them is one -
+/// naming the file and what it actually is. Each row here proves the refusal
+/// happens on the FIRST binary of the release set, before a byte of it is
+/// copied into the package, hashed, or named in a manifest.
+#[test]
+fn hig_release_script_refuses_to_package_a_binary_that_is_not_linux_x86_64() {
+    let case = ReleasePackagingCase::new("hig-release-platform-gate");
+    for (label, header, actually) in [
+        // What `cargo build --release` produces on this host today.
+        ("mach-o", mach_o_header(), "Mach-O (magic 0xcffaedfe)"),
+        (
+            "universal",
+            universal_mach_o_header(),
+            "a universal (fat) Mach-O (magic 0xcafebabe)",
+        ),
+        (
+            "elf32",
+            elf_header(1, 1, 0x03, 3),
+            "ELF class 1, data 1, type 0x0003, machine 0x0003",
+        ),
+        (
+            "aarch64",
+            elf_header(2, 1, 0xb7, 3),
+            "ELF class 2, data 1, type 0x0003, machine 0x00b7",
+        ),
+        // Right class, right machine, wrong byte order.
+        (
+            "big-endian",
+            elf_header(2, 2, 0x3e, 3),
+            "ELF class 2, data 2, type 0x0003, machine 0x003e",
+        ),
+        // Right class, right data, right machine, and still not a program:
+        // ET_REL is what `cargo build` leaves in target/release/*.o, ET_CORE
+        // is a crash dump, ET_NONE is neither.
+        (
+            "relocatable-object",
+            elf_header(2, 1, 0x3e, 1),
+            "ELF class 2, data 1, type 0x0001, machine 0x003e",
+        ),
+        (
+            "core-dump",
+            elf_header(2, 1, 0x3e, 4),
+            "ELF class 2, data 1, type 0x0004, machine 0x003e",
+        ),
+        (
+            "type-none",
+            elf_header(2, 1, 0x3e, 0),
+            "ELF class 2, data 1, type 0x0000, machine 0x003e",
+        ),
+    ] {
+        let image = case.fixture.root.join(format!("image-{label}"));
+        write_release_image(&image, &header);
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let packaged = case
+            .package(&output)
+            .env("FAKE_RELEASE_IMAGE", &image)
+            .output()
+            .unwrap();
+        assert!(
+            !packaged.status.success(),
+            "{label}: packaging a {actually} succeeded\nstdout: {}",
+            String::from_utf8_lossy(&packaged.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&packaged.stderr);
+        // The gate runs on the build output, so the file it names is the one
+        // the build produced - the first binary in the release set.
+        let refusal = format!("/kanban: {RELEASE_PLATFORM}, but this file is {actually}");
+        assert!(
+            stderr.contains("hig-release: refusing ") && stderr.contains(&refusal),
+            "{label}: expected a refusal ending {refusal:?} in:\n{stderr}"
+        );
+        assert_no_release_recorded(&output);
+        // The gate judged the BUILD OUTPUT, not the packaged copy: had it run
+        // after `install -m 0755`, the binary would be sitting here. An
+        // unreadable output directory is a failure, never a pass.
+        let left_behind: Vec<_> = match fs::read_dir(&output) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("{label}: reading {}: {error}", output.display()),
+        };
+        assert!(
+            left_behind.is_empty(),
+            "{label}: a refused packaging run copied {left_behind:?} into the output"
+        );
+    }
+}
+
+/// A release binary is the file itself, and a verdict on it must terminate.
+/// So the gate judges the path's TYPE before it opens anything: a FIFO would
+/// hold the header read open forever - the release script has no timeout to
+/// save it - and a symlink is an answer about some other file. Both are
+/// refused, and the FIFO row is bounded by a deadline, because a case that
+/// waits forever for a refusal reports as a hang and not as a failure.
+#[test]
+fn hig_release_script_refuses_a_build_output_that_is_not_a_regular_file() {
+    let case = ReleasePackagingCase::new("hig-release-platform-irregular");
+    // A real linux x86-64 image for the symlink to point at, so what is
+    // refused is the symlink and not the thing at the end of it.
+    let real = case.fixture.root.join("real-kanban");
+    write_release_platform_image(&real, b"#!/bin/sh\nprintf 'kanban 0.0.0-linked\\n'\n");
+
+    let output = case.fixture.root.join("package-fifo");
+    let mut child = case
+        .package(&output)
+        .env("FAKE_RELEASE_FIFO", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("packaging blocked on a FIFO build output instead of refusing it");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let refused = child.wait_with_output().unwrap();
+    assert!(
+        !refused.status.success(),
+        "a FIFO was packaged\nstdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal = format!("/kanban: {RELEASE_PLATFORM}, but this path is not a regular file");
+    assert!(
+        stderr.contains(&refusal),
+        "expected a refusal ending {refusal:?} in:\n{stderr}"
+    );
+    assert_no_release_recorded(&output);
+
+    let output = case.fixture.root.join("package-symlink");
+    let refused = case
+        .package(&output)
+        .env("FAKE_RELEASE_SYMLINK", &real)
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "a symlinked build output was packaged\nstdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal = format!(
+        "/kanban: {RELEASE_PLATFORM}, but this path is a symlink, not the release binary itself"
+    );
+    assert!(
+        stderr.contains(&refusal),
+        "expected a refusal ending {refusal:?} in:\n{stderr}"
+    );
+    assert_no_release_recorded(&output);
+}
+
+/// A file with nothing to read is refused, never waved through: an empty or
+/// truncated build output has no header to judge, and the refusal says how
+/// many bytes a verdict needs and how many the file gave.
+#[test]
+fn hig_release_script_refuses_a_payload_with_no_readable_executable_header() {
+    let case = ReleasePackagingCase::new("hig-release-platform-short");
+    for (label, bytes, produced) in [("truncated", &b"\x7fEL"[..], 3), ("empty", &b""[..], 0)] {
+        let image = case.fixture.root.join(format!("image-{label}"));
+        fs::write(&image, bytes).unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let packaged = case
+            .package(&output)
+            .env("FAKE_RELEASE_IMAGE", &image)
+            .output()
+            .unwrap();
+        assert!(
+            !packaged.status.success(),
+            "{label}: packaging a {produced}-byte image succeeded\nstdout: {}",
+            String::from_utf8_lossy(&packaged.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&packaged.stderr);
+        let refusal = format!(
+            "/kanban: {RELEASE_PLATFORM}, but no executable header could be read from it: \
+             20 bytes are needed and it produced {produced}"
+        );
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected a refusal ending {refusal:?} in:\n{stderr}"
+        );
+        assert_no_release_recorded(&output);
+    }
+}
+
+/// The happy path on a host that cannot execute the platform it packages for.
+/// Every binary the fake build produces really is a linux x86-64 image, so
+/// the gate passes it; the version each one reports comes back through
+/// HIG_RELEASE_TARGET_RUNNER, which is how this host runs a target-platform
+/// binary at all, and the recorded probe is `version` for the two operator
+/// CLIs and `--version` for the dispatcher and every adapter.
+///
+/// What this case does NOT prove, because the script does not check it: that
+/// a runner told the truth. This fixture's runner runs the payload inside the
+/// image, so the recorded version is the packaged bytes' own answer here -
+/// but a set runner is trusted, and one that printed anything at all would be
+/// recorded and re-validated against itself. The provenance wave's receipt
+/// field naming the probe is what will make that checkable.
+#[test]
+fn hig_release_script_runs_target_binaries_through_the_configured_target_runner() {
+    let case = ReleasePackagingCase::new("hig-release-target-runner");
+    let runner_log = case.fixture.root.join("target-runner.log");
+    let output = case.fixture.root.join("package");
+    let packaged = case
+        .package(&output)
+        .env("FAKE_TARGET_RUNNER_LOG", &runner_log)
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "packaging linux x86-64 binaries failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let probe_of = |name: &str| match name {
+        "kanban" | "kb" => "version",
+        _ => "--version",
+    };
+    let reported = |probe: &str| {
+        let answered = Command::new(env!("CARGO_BIN_EXE_kanban"))
+            .arg(probe)
+            .output()
+            .unwrap();
+        assert!(answered.status.success(), "the real binary refused {probe}");
+        String::from_utf8_lossy(&answered.stdout)
+            .trim_end()
+            .to_string()
+    };
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+    let mut expected_probes = Vec::new();
+    for name in declared_bin_names() {
+        let packaged_binary = output.join(&name);
+        let bytes = fs::read(&packaged_binary).unwrap();
+        assert_eq!(
+            &bytes[..20],
+            &linux_x86_64_elf_header(),
+            "{name} was packaged without a linux x86-64 header"
+        );
+        let recorded = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} is missing from the manifest"));
+        assert_eq!(
+            recorded["version"],
+            json!(reported(probe_of(&name))),
+            "{name}: the manifest recorded a version the binary never reported"
+        );
+        expected_probes.push(format!("{name} {}", probe_of(&name)));
+    }
+    let mut probes: Vec<String> = fs::read_to_string(&runner_log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    probes.sort();
+    probes.dedup();
+    expected_probes.sort();
+    assert_eq!(
+        probes, expected_probes,
+        "the versions in the manifest did not all come through the target runner"
+    );
+}
+
+/// The runner is how a version is obtained, never a second answer to what the
+/// version is: a runner that cannot run the image, or that runs it and says
+/// nothing, is a refusal naming the binary. An empty version string is never
+/// recorded in a manifest.
+#[test]
+fn hig_release_script_refuses_a_target_runner_that_reports_no_version() {
+    let case = ReleasePackagingCase::new("hig-release-target-runner-mute");
+    for (label, switch, refusal) in [
+        (
+            "silent",
+            "FAKE_TARGET_RUNNER_SILENT",
+            "the version probe reported nothing",
+        ),
+        (
+            "failing",
+            "FAKE_TARGET_RUNNER_FAILS",
+            "could not report a version for it",
+        ),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let packaged = case.package(&output).env(switch, "1").output().unwrap();
+        assert!(
+            !packaged.status.success(),
+            "{label}: packaging succeeded with no version to record\nstdout: {}",
+            String::from_utf8_lossy(&packaged.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&packaged.stderr);
+        let named = format!("refusing {}: ", output.join("kanban").display());
+        assert!(
+            stderr.contains(&named) && stderr.contains(refusal),
+            "{label}: expected {named:?} and {refusal:?} in:\n{stderr}"
+        );
+        assert_no_release_recorded(&output);
+    }
+}
+
+/// The branch hax and hig actually take: no runner, the release binary asked
+/// for its own version by being run. Every other case in this suite sets
+/// HIG_RELEASE_TARGET_RUNNER, so without this one the production branch has
+/// no coverage at all.
+///
+/// On this host that branch cannot succeed and must not pretend to: bash
+/// special-cases the ELF magic in check_binary_file, so a linux x86-64 image
+/// is refused by exec here rather than run as a script, and the packaging run
+/// refuses with the binary named. That refusal is the assertion. The empty
+/// string is a second row because an operator who exports the variable with
+/// no value must land on the same branch as one who never set it - not on a
+/// runner called "".
+#[test]
+fn hig_release_script_probes_the_version_by_running_the_binary_when_no_runner_is_configured() {
+    let case = ReleasePackagingCase::new("hig-release-native-probe");
+    for (label, runner) in [("unset", None), ("empty", Some(""))] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let mut command = case.package(&output);
+        match runner {
+            None => command.env_remove("HIG_RELEASE_TARGET_RUNNER"),
+            Some(value) => command.env("HIG_RELEASE_TARGET_RUNNER", value),
+        };
+        let packaged = command.output().unwrap();
+        assert!(
+            !packaged.status.success(),
+            "{label}: this host cannot run a linux x86-64 image, so packaging must not report success\nstdout: {}",
+            String::from_utf8_lossy(&packaged.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&packaged.stderr);
+        // The native branch's own refusal: no runner is named in it, which is
+        // what tells the two branches apart.
+        let refusal = format!(
+            "refusing {}: it could not report a version",
+            output.join("kanban").display()
+        );
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the native probe's refusal {refusal:?} in:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("could not report a version for it"),
+            "{label}: the run went through a target runner instead of executing the binary:\n{stderr}"
+        );
+        assert_no_release_recorded(&output);
+    }
+}
+
+/// The runner is ONE executable program that takes no arguments of its own.
+/// An operator who writes an invocation into it - `docker run --rm image`, a
+/// path with flags after it, a file that is merely readable - has configured
+/// something this script cannot call, and is told so by name instead of
+/// leaving a bare exec failure to be read as the binary's fault.
+#[test]
+fn hig_release_script_refuses_a_target_runner_that_is_not_one_executable_program() {
+    let case = ReleasePackagingCase::new("hig-release-runner-contract");
+    let readable = case.fixture.root.join("not-executable-runner");
+    fs::write(&readable, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&readable, fs::Permissions::from_mode(0o644)).unwrap();
+    let with_arguments = format!(
+        "{} --rm",
+        release_target_runner(&case.hostname_bin).display()
+    );
+    for (label, runner) in [
+        ("not-executable", readable.display().to_string()),
+        ("carries-arguments", with_arguments),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let packaged = case
+            .package(&output)
+            .env("HIG_RELEASE_TARGET_RUNNER", &runner)
+            .output()
+            .unwrap();
+        assert!(
+            !packaged.status.success(),
+            "{label}: packaging accepted a runner it cannot call\nstdout: {}",
+            String::from_utf8_lossy(&packaged.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&packaged.stderr);
+        let refusal = format!(
+            "HIG_RELEASE_TARGET_RUNNER must name one executable program, and {runner} is not one"
+        );
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected a refusal ending {refusal:?} in:\n{stderr}"
+        );
+        assert_no_release_recorded(&output);
+    }
+}
+
+/// A hig install is only allowed because the same release is already serving
+/// on hax, which the installer verifies by measuring the release directory
+/// hax activated. That loop measures binaries, so it reads their platform
+/// too: a hax release directory holding something that is not linux x86-64
+/// is not a release to certify hig against, and it is refused before the
+/// package is shipped anywhere.
+#[test]
+fn hig_release_script_refuses_a_hig_install_when_the_activated_hax_release_is_not_linux_x86_64() {
+    let harness = ReleaseGuardHarness::new("hig-release-hax-release-platform");
+    let release_id = release_id_from_package(&harness.package_dir);
+    let activated = harness
+        .hax_install_root
+        .join("releases")
+        .join(&release_id)
+        .join("kanban");
+    assert!(
+        activated.is_file(),
+        "the hax release to corrupt is missing: {}",
+        activated.display()
+    );
+    write_release_image(&activated, &elf_header(2, 1, 0xb7, 3));
+    let install_root = harness.fixture.root.join("hax-release-platform-install");
+    let bin_dir = harness.fixture.root.join("hax-release-platform-bin");
+    let refused = harness.install_from(
+        "hig",
+        &harness.package_dir,
+        &harness.hax_install_root,
+        &install_root,
+        &bin_dir,
+    );
+    assert!(
+        !refused.status.success(),
+        "hig was certified against a hax release that is not the release platform\nstdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal = format!(
+        "refusing {}: {RELEASE_PLATFORM}, but this file is ELF class 2, data 1, type 0x0003, machine 0x00b7",
+        activated.display()
+    );
+    assert!(
+        stderr.contains(&refusal),
+        "expected the activated hax binary to be named in a refusal ending {refusal:?}:\n{stderr}"
+    );
+    assert!(
+        !install_root.exists(),
+        "a refused hig install created {}",
+        install_root.display()
+    );
+}
+
+/// Packaging is not the only way a binary reaches a release store: a package
+/// directory can be handed to `install` by anyone. So the installer reads the
+/// header of every binary it is about to activate, and it reads it before the
+/// size and the hash, because a foreign image whose manifest agrees with it
+/// perfectly is still not a release. Both legs refuse, and neither touches
+/// the install root on the way out.
+#[test]
+fn hig_release_script_refuses_to_install_a_package_binary_that_is_not_linux_x86_64() {
+    let harness = ReleaseGuardHarness::new("hig-release-install-platform");
+    let forged = harness.fixture.root.join("forged");
+    clone_release_package(
+        &harness.package_dir,
+        &forged,
+        "0123456789abcdef0123456789abcdef0000fa01",
+    );
+    let foreign = forged.join("kanban");
+    write_release_image(&foreign, &elf_header(2, 1, 0xb7, 3));
+    // Everything else about the package stays true - the manifest and the
+    // receipt record the foreign image's own size and hash - so the platform
+    // gate is the only thing left that can refuse it.
+    let bytes = fs::metadata(&foreign).unwrap().len();
+    let sha256 = file_sha256(&foreign);
+    let manifest_path = forged.join("manifest.json");
+    let receipt_path = forged.with_extension("receipt.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    for document in [&mut manifest, &mut receipt] {
+        for file in document["files"].as_array_mut().unwrap() {
+            if file["name"] == json!("kanban") {
+                file["sha256"] = json!(sha256);
+                file["bytes"] = json!(bytes);
+            }
+        }
+    }
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    receipt["manifestSha256"] = json!(file_sha256(&manifest_path));
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+    let refusal = format!(
+        "refusing {}: {RELEASE_PLATFORM}, but this file is ELF class 2, data 1, type 0x0003, machine 0x00b7",
+        foreign.display()
+    );
+    for target in ["hax", "hig"] {
+        let install_root = harness
+            .fixture
+            .root
+            .join(format!("install-platform-{target}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("install-platform-bin-{target}"));
+        harness.assert_package_refused_without_mutation(
+            target,
+            &forged,
+            &harness.hax_install_root,
+            &install_root,
+            &bin_dir,
+            &refusal,
+            &[&install_root, &bin_dir, &harness.hax_install_root],
+        );
+    }
+}
+
+/// hax validates a package before it ships it, so the only way a foreign
+/// binary reaches hig's release store is by arriving different from what was
+/// validated: a transfer that garbled it, or a directory staged by hand. The
+/// remote leg therefore judges the bytes it actually holds - the staged copy
+/// is replaced after the transfer and before the remote script runs - and
+/// refuses without creating a release store at all.
+#[test]
+fn hig_release_script_remote_install_refuses_a_staged_binary_that_is_not_linux_x86_64() {
+    let harness = ReleaseGuardHarness::new("hig-release-remote-platform");
+    let foreign = harness.fixture.root.join("foreign-kanban");
+    write_release_image(&foreign, &mach_o_header());
+    let install_root = harness.fixture.root.join("remote-platform-install");
+    let bin_dir = harness.fixture.root.join("remote-platform-bin");
+    let refused = harness
+        .install_command(
+            "hig",
+            &harness.package_dir,
+            &harness.hax_install_root,
+            &install_root,
+            &bin_dir,
+        )
+        .env("FAKE_SSH_SWAP_STAGED", &foreign)
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "the remote leg activated a staged binary that is not the release platform\nstdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal =
+        format!("/package/kanban: {RELEASE_PLATFORM}, but this file is Mach-O (magic 0xcffaedfe)");
+    assert!(
+        stderr.contains(&refusal),
+        "expected the staged copy to be named in a refusal ending {refusal:?}:\n{stderr}"
+    );
+    assert!(
+        !install_root.exists(),
+        "a refused remote install created {}",
+        install_root.display()
+    );
+    assert!(
+        !bin_dir.exists(),
+        "a refused remote install created {}",
+        bin_dir.display()
     );
 }
 
@@ -30812,6 +31677,10 @@ fn hig_release_script_rejects_hig_install_without_hax_install_root() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30831,6 +31700,10 @@ fn hig_release_script_rejects_hig_install_without_hax_install_root() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30886,6 +31759,10 @@ fn hig_release_script_rejects_the_build_provenance_receipt_for_hig_install() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30923,6 +31800,10 @@ fn hig_release_script_rejects_the_build_provenance_receipt_for_hig_install() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -30985,6 +31866,10 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt_before_ssh() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -31004,6 +31889,10 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt_before_ssh() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -31041,6 +31930,10 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt_before_ssh() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -31115,6 +32008,10 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(0))
@@ -31136,6 +32033,10 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(0))
@@ -31184,6 +32085,10 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
             .current_dir(&fixture.main)
             .env("PATH", &path)
             .env("HOSTNAME_BIN", &hostname_bin)
+            .env(
+                "HIG_RELEASE_TARGET_RUNNER",
+                release_target_runner(&hostname_bin),
+            )
             .env("FAKE_HOST", "hax")
             .env("FAKE_REPO_ROOT", &fake_repo_root)
             .env("FAKE_GIT_HEAD", commit(index))
@@ -31234,6 +32139,10 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(99))
@@ -31302,6 +32211,10 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
             .current_dir(&fixture.main)
             .env("PATH", &path)
             .env("HOSTNAME_BIN", &hostname_bin)
+            .env(
+                "HIG_RELEASE_TARGET_RUNNER",
+                release_target_runner(&hostname_bin),
+            )
             .env("FAKE_HOST", "hax")
             .env("FAKE_REPO_ROOT", &fake_repo_root)
             .env("FAKE_GIT_HEAD", commit(index))
@@ -31355,6 +32268,10 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(10))
@@ -31426,6 +32343,10 @@ fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(0))
@@ -31446,6 +32367,10 @@ fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(0))
@@ -31493,6 +32418,10 @@ fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover
             .current_dir(&fixture.main)
             .env("PATH", &path)
             .env("HOSTNAME_BIN", &hostname_bin)
+            .env(
+                "HIG_RELEASE_TARGET_RUNNER",
+                release_target_runner(&hostname_bin),
+            )
             .env("FAKE_HOST", "hax")
             .env("FAKE_REPO_ROOT", &fake_repo_root)
             .env("FAKE_GIT_HEAD", commit(index))
@@ -31530,6 +32459,10 @@ fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover
         .current_dir(&fixture.main)
         .env("PATH", &path)
         .env("HOSTNAME_BIN", &hostname_bin)
+        .env(
+            "HIG_RELEASE_TARGET_RUNNER",
+            release_target_runner(&hostname_bin),
+        )
         .env("FAKE_HOST", "hax")
         .env("FAKE_REPO_ROOT", &fake_repo_root)
         .env("FAKE_GIT_HEAD", commit(1))
@@ -31655,6 +32588,10 @@ impl ReleaseGuardHarness {
             .current_dir(&self.fixture.main)
             .env("PATH", &self.path)
             .env("HOSTNAME_BIN", &self.hostname_bin)
+            .env(
+                "HIG_RELEASE_TARGET_RUNNER",
+                release_target_runner(&self.hostname_bin),
+            )
             .env("FAKE_HOST", "hax")
             .env("FAKE_REPO_ROOT", &self.fake_repo_root)
             .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -31964,6 +32901,13 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         "ensure_managed_activation_receipt",
         "atomic_symlink",
         "reject_carried_release_identity",
+        "require_release_platform",
+        // The version probe and the release-set membership check it calls:
+        // both legs record files[].version, so a remote copy that drifted -
+        // or that quietly lost the runner branch or the empty-version
+        // refusal - would install versions the package never claimed.
+        "file_version",
+        "release_binary_known",
         "serve_restart_and_prove",
         "serve_restore_previous",
         "serve_unit_disposition",
@@ -33809,11 +34753,13 @@ fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases
 
     // The second build ships a different `kanban` reporting a different
     // version: one commit, two builds, which is what the manifest hash is
-    // there to tell apart.
+    // there to tell apart. It is still the platform a release targets - a
+    // rebuild that is not is refused, and that is a different case - so the
+    // reporting payload sits under the header the installer reads.
     let rebuilt = second.join("kanban");
-    write_executable(
+    write_release_platform_image(
         &rebuilt,
-        "#!/bin/sh\nset -eu\nprintf 'kanban 0.3.0-rebuild\\n'\n",
+        b"#!/bin/sh\nset -eu\nprintf 'kanban 0.3.0-rebuild\\n'\n",
     );
     let entry = json!({
         "name": "kanban",
@@ -34377,12 +35323,19 @@ fn hig_release_script_fails_closed_on_an_unexecutable_binary_and_an_unwritable_i
             String::from_utf8_lossy(&refused.stdout)
         );
         let stderr = String::from_utf8_lossy(&refused.stderr);
-        // The wording is deliberately not pinned: today the version probe is
-        // what cannot execute the file, so the message names the version. What
+        // The script refuses on the mode bit itself, in every loop that
+        // measures a release binary, so this holds whoever runs the binary
+        // afterwards: it is not the version probe discovering it, and on a
+        // host that probes through HIG_RELEASE_TARGET_RUNNER it is not the
+        // runner's opinion either. The exact wording stays unpinned; what
         // must hold is that the refusal names the binary and nothing moved.
         assert!(
             stderr.contains("package binary kanban"),
             "{target}: expected the refusal to name the binary:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("version mismatch"),
+            "{target}: the mode bit was left for the version probe to find:\n{stderr}"
         );
         assert_eq!(
             capture_release_links(&install_root, &bin_dir),

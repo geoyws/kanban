@@ -96,14 +96,44 @@ file_version() {
   release_binary_known "$name" || die "unknown release binary $name"
   # `kanban` and `kb` are the operator CLI, whose version is a subcommand; the
   # dispatcher and every adapter answer the `--version` flag instead.
+  local probe="--version"
   case "$name" in
     kanban | kb)
-      "$binary" version
+      probe="version"
       ;;
-    *)
-      "$binary" --version
-      ;;
-  esac | tr -d '\r' | sed 's/[[:space:]]*$//'
+  esac
+  # HIG_RELEASE_TARGET_RUNNER is how THIS host runs a binary built for the
+  # release platform: one executable program taking no arguments of its own,
+  # invoked as "$runner" <binary> <probe>. Unset - and an empty value, which
+  # takes the same branch - means the host executes the release artifact
+  # itself, which is the hax and hig case and the path production runs; the
+  # container path sets it to the program that runs the artifact inside the
+  # same pinned image the binaries were built in, because a host that is not
+  # linux x86-64 cannot ask a release binary anything.
+  #
+  # What it can and cannot reach, as it is today rather than as it should be:
+  # it never carries a gate, because the platform header, the byte count and
+  # every sha256 read the bytes on disk and never pass through it, and a
+  # runner that fails or reports nothing is a refusal, so an empty version is
+  # never recorded. But a runner that is set is TRUSTED: files[].version is
+  # whatever it prints, a false runner yields a false version that
+  # package_validate then re-validates against itself and accepts, and
+  # nothing in the manifest or the receipt records that a runner answered at
+  # all. The provenance wave closes that with a mandatory receipt field
+  # naming the probe that answered (native or runner); this wave does not
+  # touch the receipt schema.
+  local reported
+  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
+      die "refusing $binary: HIG_RELEASE_TARGET_RUNNER must name one executable program, and $HIG_RELEASE_TARGET_RUNNER is not one"
+    reported="$("$HIG_RELEASE_TARGET_RUNNER" "$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: $HIG_RELEASE_TARGET_RUNNER could not report a version for it"
+  else
+    reported="$("$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: it could not report a version"
+  fi
+  [[ -n "$reported" ]] || die "refusing $binary: the version probe reported nothing"
+  printf '%s\n' "$reported"
 }
 
 ensure_regular_dir() {
@@ -178,6 +208,57 @@ reject_carried_release_identity() {
     die "refusing $file: a release artifact must not carry the release identity the installer derives"
 }
 
+# A Kanban release is linux x86-64, whatever the host that built it runs
+# natively: hax and hig both execute the packaged binaries, so a package
+# carrying a Mac's native build output is not a release at all. The witness is
+# the file's own ELF header, read as bytes here rather than asked of file(1),
+# which is not installed on every host this runs on, and never inferred from a
+# name, a mode bit or a build flag. Nothing is skipped for being awkward: a
+# symlink and anything that is not a regular file are refused before the file
+# is opened, and a file too short to carry a header is refused for that.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+require_release_platform() {
+  local file="$1"
+  local platform="a Kanban release targets linux x86-64 (ELF 64-bit, little-endian)"
+  # Refused before anything is opened, and refused rather than followed: a
+  # symlink is not the file it names, and a FIFO planted at a release binary's
+  # path would hold this read open forever instead of answering it.
+  [[ ! -L "$file" ]] ||
+    die "refusing $file: $platform, but this path is a symlink, not the release binary itself"
+  [[ -f "$file" ]] ||
+    die "refusing $file: $platform, but this path is not a regular file"
+  local -a header
+  local read_status=0
+  header=($(LC_ALL=C od -An -v -tu1 -N20 -- "$file" 2>/dev/null)) || read_status=$?
+  (( read_status == 0 && ${#header[@]} == 20 )) ||
+    die "refusing $file: $platform, but no executable header could be read from it: 20 bytes are needed and it produced ${#header[@]}"
+  local magic
+  magic="$(printf '%02x%02x%02x%02x' "${header[0]}" "${header[1]}" "${header[2]}" "${header[3]}")"
+  if [[ "$magic" == 7f454c46 ]]; then
+    # e_type as well as the machine: a relocatable object, a core dump and an
+    # ET_NONE file all carry an x86-64 ELF header and not one of them is a
+    # program a host can run. ET_EXEC and ET_DYN are what a release is - the
+    # linux release profile links PIE, which is ET_DYN.
+    local etype=$(( header[16] + header[17] * 256 ))
+    local machine=$(( header[18] + header[19] * 256 ))
+    local observed
+    observed="$(printf 'ELF class %s, data %s, type 0x%04x, machine 0x%04x' "${header[4]}" "${header[5]}" "$etype" "$machine")"
+    (( header[4] == 2 && header[5] == 1 && machine == 62 && (etype == 2 || etype == 3) )) ||
+      die "refusing $file: $platform, but this file is $observed"
+    return 0
+  fi
+  case "$magic" in
+    feedface | cefaedfe | feedfacf | cffaedfe)
+      die "refusing $file: $platform, but this file is Mach-O (magic 0x$magic)"
+      ;;
+    cafebabe | bebafeca)
+      die "refusing $file: $platform, but this file is a universal (fat) Mach-O (magic 0x$magic)"
+      ;;
+  esac
+  die "refusing $file: $platform, but this file is not an ELF image (magic 0x$magic)"
+}
+
 validate_release_files() {
   local dir="$1"
   local target="$2"
@@ -214,6 +295,11 @@ validate_release_files() {
     local path="$dir/$name"
     [[ -f "$path" ]] || die "package is missing binary $name"
     [[ ! -L "$path" ]] || die "package binary must not be a symlink: $name"
+    require_release_platform "$path"
+    # The script's own verdict on whether this host could run it, so a mode
+    # bit is never left for the version probe - or whatever runs it - to
+    # discover.
+    [[ -x "$path" ]] || die "package binary $name is not executable"
     [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || {
       die "package binary $name has the wrong size"
     }
@@ -338,6 +424,8 @@ validate_hax_activation_receipt() {
   while IFS=$'\t' read -r name sha256 size version; do
     local path="$release_dir/$name"
     [[ -f "$path" ]] || die "hax release directory is missing binary $name"
+    require_release_platform "$path"
+    [[ -x "$path" ]] || die "hax release binary $name is not executable"
     [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "hax release binary $name has the wrong size"
     [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "hax release binary $name hash mismatch"
     [[ "$(file_version "$path")" == "$version" ]] || die "hax release binary $name version mismatch"
@@ -1081,6 +1169,8 @@ package_validate() {
   while IFS=$'\t' read -r name sha256 size version; do
     local path="$package_dir/$name"
     [[ -f "$path" ]] || die "package is missing binary $name"
+    require_release_platform "$path"
+    [[ -x "$path" ]] || die "package binary $name is not executable"
     [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || {
       die "package binary $name has the wrong size"
     }
@@ -1163,6 +1253,10 @@ package_create() {
   for binary in "${BINARIES[@]}"; do
     local source="$build_root/target/release/$binary"
     [[ -x "$source" ]] || die "release build did not produce $binary"
+    # The gate on what a release IS, before a byte of it is copied, hashed or
+    # named in a manifest: the build produced whatever this host builds
+    # natively, and only a linux x86-64 executable may be packaged.
+    require_release_platform "$source"
     install -m 0755 "$source" "$output/$binary"
     local bytes sha256 version
     bytes="$(wc -c <"$output/$binary" | tr -d '[:space:]')"
@@ -1491,14 +1585,44 @@ file_version() {
   release_binary_known "$name" || die "unknown release binary $name"
   # `kanban` and `kb` are the operator CLI, whose version is a subcommand; the
   # dispatcher and every adapter answer the `--version` flag instead.
+  local probe="--version"
   case "$name" in
     kanban | kb)
-      "$binary" version
+      probe="version"
       ;;
-    *)
-      "$binary" --version
-      ;;
-  esac | tr -d '\r' | sed 's/[[:space:]]*$//'
+  esac
+  # HIG_RELEASE_TARGET_RUNNER is how THIS host runs a binary built for the
+  # release platform: one executable program taking no arguments of its own,
+  # invoked as "$runner" <binary> <probe>. Unset - and an empty value, which
+  # takes the same branch - means the host executes the release artifact
+  # itself, which is the hax and hig case and the path production runs; the
+  # container path sets it to the program that runs the artifact inside the
+  # same pinned image the binaries were built in, because a host that is not
+  # linux x86-64 cannot ask a release binary anything.
+  #
+  # What it can and cannot reach, as it is today rather than as it should be:
+  # it never carries a gate, because the platform header, the byte count and
+  # every sha256 read the bytes on disk and never pass through it, and a
+  # runner that fails or reports nothing is a refusal, so an empty version is
+  # never recorded. But a runner that is set is TRUSTED: files[].version is
+  # whatever it prints, a false runner yields a false version that
+  # package_validate then re-validates against itself and accepts, and
+  # nothing in the manifest or the receipt records that a runner answered at
+  # all. The provenance wave closes that with a mandatory receipt field
+  # naming the probe that answered (native or runner); this wave does not
+  # touch the receipt schema.
+  local reported
+  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
+      die "refusing $binary: HIG_RELEASE_TARGET_RUNNER must name one executable program, and $HIG_RELEASE_TARGET_RUNNER is not one"
+    reported="$("$HIG_RELEASE_TARGET_RUNNER" "$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: $HIG_RELEASE_TARGET_RUNNER could not report a version for it"
+  else
+    reported="$("$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
+      die "refusing $binary: it could not report a version"
+  fi
+  [[ -n "$reported" ]] || die "refusing $binary: the version probe reported nothing"
+  printf '%s\n' "$reported"
 }
 
 # The release set as a JSON array, so the receipt name check compares against
@@ -1520,6 +1644,50 @@ reject_carried_release_identity() {
       and (($doc | .releaseId // $expected) == $expected)
   ' "$file" >/dev/null ||
     die "refusing $file: a release artifact must not carry the release identity the installer derives"
+}
+
+# Verbatim copy of the local guard; see the comment above the local
+# require_release_platform for why a release is refused unless it is the
+# platform hig actually executes.
+require_release_platform() {
+  local file="$1"
+  local platform="a Kanban release targets linux x86-64 (ELF 64-bit, little-endian)"
+  # Refused before anything is opened, and refused rather than followed: a
+  # symlink is not the file it names, and a FIFO planted at a release binary's
+  # path would hold this read open forever instead of answering it.
+  [[ ! -L "$file" ]] ||
+    die "refusing $file: $platform, but this path is a symlink, not the release binary itself"
+  [[ -f "$file" ]] ||
+    die "refusing $file: $platform, but this path is not a regular file"
+  local -a header
+  local read_status=0
+  header=($(LC_ALL=C od -An -v -tu1 -N20 -- "$file" 2>/dev/null)) || read_status=$?
+  (( read_status == 0 && ${#header[@]} == 20 )) ||
+    die "refusing $file: $platform, but no executable header could be read from it: 20 bytes are needed and it produced ${#header[@]}"
+  local magic
+  magic="$(printf '%02x%02x%02x%02x' "${header[0]}" "${header[1]}" "${header[2]}" "${header[3]}")"
+  if [[ "$magic" == 7f454c46 ]]; then
+    # e_type as well as the machine: a relocatable object, a core dump and an
+    # ET_NONE file all carry an x86-64 ELF header and not one of them is a
+    # program a host can run. ET_EXEC and ET_DYN are what a release is - the
+    # linux release profile links PIE, which is ET_DYN.
+    local etype=$(( header[16] + header[17] * 256 ))
+    local machine=$(( header[18] + header[19] * 256 ))
+    local observed
+    observed="$(printf 'ELF class %s, data %s, type 0x%04x, machine 0x%04x' "${header[4]}" "${header[5]}" "$etype" "$machine")"
+    (( header[4] == 2 && header[5] == 1 && machine == 62 && (etype == 2 || etype == 3) )) ||
+      die "refusing $file: $platform, but this file is $observed"
+    return 0
+  fi
+  case "$magic" in
+    feedface | cefaedfe | feedfacf | cffaedfe)
+      die "refusing $file: $platform, but this file is Mach-O (magic 0x$magic)"
+      ;;
+    cafebabe | bebafeca)
+      die "refusing $file: $platform, but this file is a universal (fat) Mach-O (magic 0x$magic)"
+      ;;
+  esac
+  die "refusing $file: $platform, but this file is not an ELF image (magic 0x$magic)"
 }
 
 cleanup_remote() {
@@ -2182,6 +2350,8 @@ reject_carried_release_identity "$receipt" "$(jq -r '.sourceCommit + "-" + .mani
 while IFS=$'\t' read -r name sha256 size version; do
   path="$package_dir/$name"
   [[ -f "$path" ]] || die "remote package is missing binary $name"
+  require_release_platform "$path"
+  [[ -x "$path" ]] || die "remote binary $name is not executable"
   [[ "$(wc -c <"$path" | tr -d '[:space:]')" == "$size" ]] || die "remote binary $name has the wrong size"
   [[ "$(sha256sum "$path" | awk '{print $1}')" == "$sha256" ]] || die "remote binary $name hash mismatch"
   [[ "$(file_version "$path")" == "$version" ]] || die "remote binary $name version mismatch"
@@ -2205,6 +2375,12 @@ if [[ ! -d "$release_path" ]]; then
   chmod 0755 "$staging"
   for binary in "${BINARIES[@]}"; do
     install -m 0755 "$package_dir/$binary" "$staging/$binary"
+  done
+  # The staged tree is what the publishing mv makes live, so it is measured
+  # before that mv rather than trusted because the package it was copied from
+  # was: the local leg validates its own staging directory the same way.
+  for binary in "${BINARIES[@]}"; do
+    require_release_platform "$staging/$binary"
   done
   cp "$package_dir/manifest.json" "$staging/manifest.json"
   [[ "$(sha256sum "$staging/manifest.json" | awk '{print $1}')" == "$(jq -r '.manifestSha256' "$receipt")" ]] || {
