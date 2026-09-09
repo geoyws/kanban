@@ -1446,8 +1446,11 @@ install_remote() {
   remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
   tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
   ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
-  local remote_serve remote_status=0
-  remote_serve="$(HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
+  local remote_serve remote_status=0 remote_output
+  remote_output="$(mktemp "${TMPDIR:-/tmp}/kanban-serve-proof.XXXXXX")"
+  track_temp "$remote_output"
+  # Keep the quoted heredoc outside command substitution for Bash 3.2.
+  if HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" > "$remote_output" <<'REMOTE'
 set -Eeuo pipefail
 
 stage_root="$1"
@@ -2286,7 +2289,12 @@ if (( housekeeping )); then
   exit 1
 fi
 REMOTE
-)" || remote_status=$?
+  then
+    remote_status=0
+  else
+    remote_status=$?
+  fi
+  remote_serve="$(cat "$remote_output")"
   if [[ -z "$remote_serve" ]]; then
     # Pre-commit failures have no summary: propagate the failure, not a
     # fabricated receipt. A committed cleanup failure does carry its proof.
