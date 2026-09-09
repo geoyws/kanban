@@ -503,6 +503,30 @@ incident: ADR-034, addendum 2026-09-09. The bare `:NNN` citations above were
 written against the 2026-09-06 revision of `scripts/hig-release.sh` and were
 already offset before this change; they locate a claim by name, not by line.
 
+Addendum 2026-09-09 (second): the asymmetry the addendum above recorded is
+GONE, and the freeze is still untouched. The remote leg wrote its activation
+receipt — and drew an activation sequence number, which this store hands out
+exactly once — BEFORE the proof, and its rollback deleted that receipt only
+when the same run had created the release directory. An activation onto a
+directory already present therefore left a receipt for an activation that
+never happened, with a sequence number spent on it, and `kb rel ls` counted
+it. Both legs now write the activation receipt AFTER
+`serve_restart_and_prove` returns, so a receipt exists only for an activation
+that was proved, and `next_activation_sequence` is reached only on that path.
+No stored field changes: the receipt written is byte-for-byte the one §5
+describes, only later. `hig_release_script_install_writes_no_activation_receipt_when_the_proof_fails`
+drives a refused activation onto a retained release directory through both
+legs and asserts no receipt and an unmoved sequence counter.
+
+The stdout summary — command output for the caller, not a stored artifact, and
+so outside this freeze — gains two fields:
+`serve: {restarted, mainPid, exe, exeSource, listener, http}`. `exeSource`
+says which witness produced `exe`, `/proc/<pid>/exe` or the named test
+override, so a fixture's answer can never be presented as the kernel's;
+`listener` is `{port: N}` or `{socket: PATH}`, read from the unit's own
+`ExecStart`, because `kanban serve` has no default listener to fall back to.
+Reason and incidents: ADR-034, addendum 2026-09-09 (second).
+
 ## References
 
 - `scripts/hig-release.sh` — the whole release path; every citation above

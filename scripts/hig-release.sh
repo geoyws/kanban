@@ -528,6 +528,7 @@ rollback_activation_view() {
 
   trap - ERR
   set +e
+  (( status != 0 )) || status=1
 
   local current_path
   current_path="$(current_link "$install_root")"
@@ -540,16 +541,36 @@ rollback_activation_view() {
     fi
   fi
 
-  if [[ "$release_created" == 1 ]]; then
-    rm -rf -- "$release_path"
-    rm -f -- "$release_meta"
-  fi
-
   if [[ -z "$previous_current" ]]; then
     local binary
     for binary in "${BINARIES[@]}"; do
       rm -f -- "$(bin_link_path "$bin_dir" "$binary")"
     done
+  fi
+
+  # Restoring the links restores the PATHS. If this activation had already
+  # restarted the unit, the PROCESS is still the candidate's, so it has to
+  # follow the links back before the candidate's executable is deleted from
+  # under it - and a recovery that cannot be proved keeps the candidate on
+  # disk and says so next to the failure that started this.
+  # `current` may legitimately hold a relative target - ensure_safe_release_view
+  # accepts one, resolving it against the link's own directory - so the value
+  # is restored verbatim and normalised against the install root before it is
+  # handed to a proof that has to resolve it as a path.
+  local previous_release="$previous_current"
+  [[ -z "$previous_release" || "$previous_release" == /* ]] || previous_release="$install_root/$previous_release"
+  local recovered=1
+  if [[ -n "${SERVE_RESTARTED_UNIT:-}" ]]; then
+    serve_restore_previous "$SERVE_RESTARTED_UNIT" "$previous_release" || recovered=0
+  fi
+
+  if (( recovered )); then
+    if [[ "$release_created" == 1 ]]; then
+      rm -rf -- "$release_path"
+      rm -f -- "$release_meta"
+    fi
+  else
+    printf 'hig-release: the activation failed AND the recovery failed: %s is not proved to be serving, and %s was kept so the host can be recovered from it\n' "${SERVE_RESTARTED_UNIT:-kanban-serve}" "$release_path" >&2
   fi
 
   exit "$status"
@@ -563,20 +584,22 @@ maybe_fail_after_current() {
   return 0
 }
 
-# An install is not green until the process answering the port is the release
-# it just activated. On 2026-09-09 an install on hax swapped `current` and the
-# bin links without restarting kanban-serve: the previous exe kept serving,
-# the new release's board schema migrated the first board it was asked for,
-# and every route answered 500 for two minutes until the unit was restarted by
-# hand. So activation restarts the unit and then MEASURES the result - the
-# unit is active with a MainPID, that pid's executable resolves inside the
-# release directory just installed, and the port its ExecStart names answers
-# 200 - and carries the measurement into the install receipt through
+# An install is not green until the process answering the unit's own listener
+# is the release it just activated. On 2026-09-09 an install on hax swapped
+# `current` and the bin links without restarting kanban-serve: the previous
+# exe kept serving, the new release's board schema migrated the first board it
+# was asked for, and every route answered 500 for two minutes until the unit
+# was restarted by hand. So activation restarts the unit and then MEASURES the
+# result - the unit is active with a MainPID, that pid's executable IS the
+# `kanban` binary retained in the release just installed, the listener its own
+# ExecStart names answers 200, and the pid and exe still agree after it did -
+# and carries the measurement into the install receipt through
 # SERVE_RESTART_JSON. A failed measurement returns non-zero naming what was
-# measured, which the caller's ERR trap turns into the same previous-view
-# rollback a failed activation already performs: a release whose exe is not
-# serving is not installed. A host with no kanban-serve unit (a build box, the
-# e2e harness) is not a failure - it says so once and records why.
+# measured, which the caller's ERR trap turns into a rollback that restores
+# the previous view AND puts the previous release back in service. A host with
+# no kanban-serve unit (a build box, the e2e harness) is not a failure - it
+# says so once and records why. A manager that cannot be asked IS a failure:
+# a skip is a claim about the unit, and an unreachable manager supports none.
 # The identical-guards test in tests/e2e.rs fails when the two copies drift.
 serve_restart_and_prove() {
   local release_path="$1"
@@ -584,84 +607,400 @@ serve_restart_and_prove() {
   local skipped=""
   if ! command -v systemctl >/dev/null 2>&1; then
     skipped="systemctl is not on PATH"
-  elif ! systemctl is-enabled "$unit" >/dev/null 2>&1 && ! systemctl is-active "$unit" >/dev/null 2>&1; then
-    skipped="the $unit unit is not present on this host"
+  else
+    serve_unit_disposition "$unit" || return 1
+    case "$SERVE_UNIT_VERDICT" in
+      restart)
+        ;;
+      absent)
+        skipped="the $unit unit is not present on this host"
+        ;;
+      *)
+        skipped="the $unit unit is present but neither enabled nor active on this host ($SERVE_UNIT_DETAIL)"
+        ;;
+    esac
   fi
   if [[ -n "$skipped" ]]; then
     printf 'hig-release: serve restart skipped: %s\n' "$skipped" >&2
     SERVE_RESTART_JSON="$(jq -n -S --arg skipped "$skipped" '{skipped:$skipped}')"
     return 0
   fi
-  # The port is the unit's own, never a second literal: reading it from
-  # ExecStart means an operator who moves the port cannot be proved green by
-  # a probe still asking about the old one.
-  local exec_start port=14200
-  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
-  if [[ "$exec_start" =~ --port[[:space:]=]+([0-9]+) ]]; then
-    port="${BASH_REMATCH[1]}"
-  fi
-  # One deadline for both proofs, overridable so a test that measures the
-  # timeout itself does not have to wait out the real one.
-  local wait_seconds="${HIG_RELEASE_SERVE_DEADLINE_SECONDS:-15}"
-  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=15
-  systemctl restart "$unit" || {
+  serve_unit_listener "$unit" || return 1
+  local wait_seconds
+  wait_seconds="$(serve_deadline_seconds)" || return 1
+  # The HTTP half of the proof needs curl, and a curl that is not there exits
+  # 127 into a swallowed status: the proof would read as a timeout, the
+  # activation would roll back, and the recovery would fail the same way. So
+  # the dependency is checked while the candidate is still un-restarted.
+  command -v curl >/dev/null 2>&1 || {
+    printf 'hig-release: cannot prove the release is serving: curl is not on PATH and the HTTP proof needs it; refusing before %s is restarted\n' "$unit" >&2
+    return 1
+  }
+  # Set BEFORE the restart: a restart that fails may still have stopped the
+  # process that was serving, so the rollback owes the host a recovery either
+  # way. systemd writes job progress to stdout, which here is the install
+  # receipt's channel, so the unit's output goes to stderr with the diagnostics.
+  SERVE_RESTARTED_UNIT="$unit"
+  systemctl restart "$unit" >&2 || {
     printf 'hig-release: serve restart failed: systemctl restart %s exited non-zero\n' "$unit" >&2
     return 1
   }
+  serve_prove_release "$unit" "$release_path" "$SERVE_LISTENER_KIND" "$SERVE_LISTENER_VALUE" "$wait_seconds" "the release just installed" || return 1
+  SERVE_RESTART_JSON="$(jq -n -S --argjson main_pid "$SERVE_PROVED_PID" --arg exe "$SERVE_PROVED_EXE" --arg exe_source "$SERVE_PROVED_SOURCE" --argjson listener "$(serve_listener_json)" --argjson http "$SERVE_PROVED_HTTP" '{restarted:true, mainPid:$main_pid, exe:$exe, exeSource:$exe_source, listener:$listener, http:$http}')"
+}
+
+# Called from the rollback when the activation that failed had already
+# restarted the unit onto the candidate. The links are back on the previous
+# release by then, so the process follows them: restart, and prove the
+# PREVIOUS release is the one serving, before the candidate's executable is
+# removed. A first install has no previous release to serve, so the unit is
+# STOPPED instead - deleting the executable of a unit left running is how an
+# install leaves a restart loop behind on a host it just failed to change.
+serve_restore_previous() {
+  local unit="$1"
+  local previous_release="$2"
+  if [[ -z "$previous_release" ]]; then
+    systemctl stop "$unit" >&2 || {
+      printf 'hig-release: recovery failed: systemctl stop %s exited non-zero; it may still be running the candidate executable\n' "$unit" >&2
+      return 1
+    }
+    return 0
+  fi
+  systemctl restart "$unit" >&2 || {
+    printf 'hig-release: recovery failed: systemctl restart %s exited non-zero with the previous release restored\n' "$unit" >&2
+    return 1
+  }
+  serve_unit_listener "$unit" || {
+    printf 'hig-release: recovery failed: the %s listener could not be read\n' "$unit" >&2
+    return 1
+  }
+  local wait_seconds
+  wait_seconds="$(serve_deadline_seconds)" || return 1
+  serve_prove_release "$unit" "$previous_release" "$SERVE_LISTENER_KIND" "$SERVE_LISTENER_VALUE" "$wait_seconds" "the previous release" || {
+    printf 'hig-release: recovery failed: %s is not serving the previous release %s\n' "$unit" "$previous_release" >&2
+    return 1
+  }
+}
+
+# The unit's disposition, from ONE manager query. `is-enabled` and `is-active`
+# cannot answer this between them: a manager that cannot be reached fails both
+# exactly as a unit that does not exist does, and reading that pair as "no unit
+# on this host" turns the only proof an install has into a skip notice. But
+# `systemctl show` exits 0 whenever the MANAGER answers, unit or no unit, so a
+# non-zero exit or an answer carrying no LoadState IS the manager failing, and
+# LoadState=not-found IS the unit being absent. A unit that is loaded but
+# neither enabled nor active is idle: it is stopped on purpose, and an
+# installer that started it would be overruling whoever stopped it.
+serve_unit_disposition() {
+  local unit="$1"
+  SERVE_UNIT_VERDICT=""
+  SERVE_UNIT_DETAIL=""
+  local properties
+  properties="$(systemctl show -p LoadState -p UnitFileState -p ActiveState "$unit" 2>&1)" || {
+    printf 'hig-release: the manager could not be asked about %s: systemctl show exited non-zero: %s\n' "$unit" "${properties//$'\n'/ }" >&2
+    return 1
+  }
+  local load_state="" unit_file_state="" active_state="" line
+  while IFS= read -r line; do
+    case "$line" in
+      LoadState=*)
+        load_state="${line#LoadState=}"
+        ;;
+      UnitFileState=*)
+        unit_file_state="${line#UnitFileState=}"
+        ;;
+      ActiveState=*)
+        active_state="${line#ActiveState=}"
+        ;;
+    esac
+  done <<<"$properties"
+  [[ -n "$load_state" ]] || {
+    printf 'hig-release: the manager could not be asked about %s: systemctl show answered no LoadState: %s\n' "$unit" "${properties//$'\n'/ }" >&2
+    return 1
+  }
+  SERVE_UNIT_DETAIL="LoadState=$load_state UnitFileState=${unit_file_state:-<none>} ActiveState=${active_state:-<none>}"
+  if [[ "$load_state" == not-found ]]; then
+    SERVE_UNIT_VERDICT=absent
+    return 0
+  fi
+  # The unit-file states systemd's own `is-enabled` exits 0 for, so this
+  # restarts exactly the units the pair of probes it replaces restarted.
+  case "$active_state:$unit_file_state" in
+    active:* | *:enabled | *:enabled-runtime | *:alias | *:static | *:indirect | *:generated | *:transient)
+      SERVE_UNIT_VERDICT=restart
+      ;;
+    *)
+      SERVE_UNIT_VERDICT=idle
+      ;;
+  esac
+}
+
+# The listener the unit itself names. `kanban serve` takes exactly one -
+# `--port N` or `--socket PATH`, never both and never neither (README, "The
+# web view") - so a unit naming none or two is refused rather than probed at
+# some remembered default: a 200 from a port this release does not listen on
+# is a stranger's answer. systemd renders ExecStart as a property blob whose
+# argv[] is space-separated with any word containing a space quoted, so it is
+# tokenized rather than split, and never eval'd.
+serve_unit_listener() {
+  local unit="$1"
+  SERVE_LISTENER_KIND=""
+  SERVE_LISTENER_VALUE=""
+  local exec_start
+  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>&1)" || {
+    printf 'hig-release: cannot read the listener: systemctl show -p ExecStart %s exited non-zero: %s\n' "$unit" "${exec_start//$'\n'/ }" >&2
+    return 1
+  }
+  [[ "$exec_start" == *'argv[]='* ]] || {
+    printf 'hig-release: cannot read the listener: the %s ExecStart names no command line: %s\n' "$unit" "${exec_start:-<empty>}" >&2
+    return 1
+  }
+  local argv="${exec_start#*'argv[]='}"
+  argv="${argv%%' ; '*}"
+  serve_argv_tokens "$argv" || {
+    printf 'hig-release: cannot read the listener: the %s ExecStart argv does not tokenize - unbalanced quote or trailing escape: %s\n' "$unit" "$argv" >&2
+    return 1
+  }
+  local index kind value token
+  for (( index = 0; index < ${#SERVE_ARGV_TOKENS[@]}; index += 1 )); do
+    token="${SERVE_ARGV_TOKENS[index]}"
+    case "$token" in
+      --port | --socket)
+        kind="${token#--}"
+        value="${SERVE_ARGV_TOKENS[index + 1]:-}"
+        ;;
+      --port=* | --socket=*)
+        kind="${token%%=*}"
+        kind="${kind#--}"
+        value="${token#*=}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    [[ -z "$SERVE_LISTENER_KIND" ]] || {
+      printf 'hig-release: cannot read the listener: the %s ExecStart names more than one listener: %s\n' "$unit" "$argv" >&2
+      return 1
+    }
+    SERVE_LISTENER_KIND="$kind"
+    SERVE_LISTENER_VALUE="$value"
+  done
+  case "$SERVE_LISTENER_KIND" in
+    port)
+      [[ "$SERVE_LISTENER_VALUE" =~ ^[1-9][0-9]*$ ]] && (( SERVE_LISTENER_VALUE <= 65535 )) || {
+        printf 'hig-release: cannot read the listener: the %s ExecStart names --port %s, which is not a port\n' "$unit" "${SERVE_LISTENER_VALUE:-<nothing>}" >&2
+        return 1
+      }
+      ;;
+    socket)
+      [[ "$SERVE_LISTENER_VALUE" == /* ]] || {
+        printf 'hig-release: cannot read the listener: the %s ExecStart names --socket %s, which is not an absolute path\n' "$unit" "${SERVE_LISTENER_VALUE:-<nothing>}" >&2
+        return 1
+      }
+      ;;
+    *)
+      printf 'hig-release: cannot read the listener: the %s ExecStart names no listener, and kanban serve has no default one: %s\n' "$unit" "$argv" >&2
+      return 1
+      ;;
+  esac
+}
+
+# systemd's argv[] rendering, back into arguments: space-separated words, a
+# word containing a space rendered in double quotes, backslash escapes inside
+# it. The words land in SERVE_ARGV_TOKENS rather than on stdout so a path
+# holding anything at all survives, and so a rendering this does NOT
+# understand - an unbalanced quote, a trailing escape - is a non-zero return
+# the caller refuses on, rather than a guess. No `eval` anywhere near an
+# operator's unit file.
+serve_argv_tokens() {
+  local argv="$1"
+  SERVE_ARGV_TOKENS=()
+  local token="" quoted=0 escaped=0 index char
+  for (( index = 0; index < ${#argv}; index += 1 )); do
+    char="${argv:index:1}"
+    if (( escaped )); then
+      token+="$char"
+      escaped=0
+      continue
+    fi
+    case "$char" in
+      '\')
+        escaped=1
+        ;;
+      '"')
+        quoted=$(( 1 - quoted ))
+        ;;
+      ' ')
+        if (( quoted )); then
+          token+=' '
+        else
+          [[ -z "$token" ]] || SERVE_ARGV_TOKENS+=("$token")
+          token=""
+        fi
+        ;;
+      *)
+        token+="$char"
+        ;;
+    esac
+  done
+  (( quoted == 0 && escaped == 0 )) || return 1
+  [[ -z "$token" ]] || SERVE_ARGV_TOKENS+=("$token")
+}
+
+serve_listener_json() {
+  case "$SERVE_LISTENER_KIND" in
+    socket)
+      jq -n -S --arg socket "$SERVE_LISTENER_VALUE" '{socket:$socket}'
+      ;;
+    *)
+      jq -n -S --argjson port "$SERVE_LISTENER_VALUE" '{port:$port}'
+      ;;
+  esac
+}
+
+# The deadline the proof is allowed, overridable so a test that measures the
+# timeout itself does not have to wait out the real one. An override that is
+# not a positive whole number of seconds is refused rather than quietly
+# replaced by the default: a bound nobody set is not a bound anybody chose.
+serve_deadline_seconds() {
+  local seconds="${HIG_RELEASE_SERVE_DEADLINE_SECONDS:-15}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'hig-release: HIG_RELEASE_SERVE_DEADLINE_SECONDS must be a positive whole number of seconds, got %s\n' "$seconds" >&2
+    return 1
+  }
+  printf '%s\n' "$seconds"
+}
+
+# /proc/<pid>/exe is the only witness that survives a symlink swap, and it is
+# what the hosts this installs to have. HIG_RELEASE_EXE_OF_PID is the seam the
+# test suite reads it through on a host without /proc; a proof taken through
+# the seam records `override:` as its source, so a receipt can never present a
+# fixture's answer as the kernel's.
+serve_exe_of_pid() {
+  local pid="$1"
+  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+    "$HIG_RELEASE_EXE_OF_PID" "$pid" 2>/dev/null || true
+  else
+    readlink "/proc/$pid/exe" 2>/dev/null || true
+  fi
+}
+
+serve_exe_source() {
+  local pid="$1"
+  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+    printf 'override:%s\n' "$HIG_RELEASE_EXE_OF_PID"
+  else
+    printf '/proc/%s/exe\n' "$pid"
+  fi
+}
+
+# The one executable a green install accepts: the `kanban` binary retained
+# INSIDE the release just activated. A directory-prefix test is not that test -
+# it passes for `kb`, for `manifest.json`, and for `<path> (deleted)`, the
+# string the kernel hands back once the binary a pid is running has been
+# unlinked, which is exactly what a rolled-back release leaves a service
+# holding. So the exe must resolve to <release>/kanban, and that path must
+# still be a regular executable file.
+serve_exe_is_release_binary() {
+  local exe="$1"
+  local release_physical="$2"
+  [[ -n "$exe" && -n "$release_physical" ]] || return 1
+  [[ "$exe" != *' (deleted)' ]] || return 1
+  local exe_dir
+  exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
+  [[ -n "$exe_dir" ]] || return 1
+  [[ "$exe_dir/${exe##*/}" == "$release_physical/kanban" ]] || return 1
+  [[ -f "$release_physical/kanban" && -x "$release_physical/kanban" ]]
+}
+
+# Every request is bounded by what is LEFT of the deadline, connect and
+# transfer both: curl with no bound waits on a stalled socket for as long as
+# the peer holds it, and a deadline the loop only consults BETWEEN requests is
+# never reached.
+serve_http_status() {
+  local kind="$1"
+  local value="$2"
+  local budget="$3"
+  case "$kind" in
+    socket)
+      curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$budget" --max-time "$budget" --unix-socket "$value" 'http://localhost/' 2>/dev/null || true
+      ;;
+    *)
+      curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$budget" --max-time "$budget" "http://127.0.0.1:$value/" 2>/dev/null || true
+      ;;
+  esac
+}
+
+serve_prove_release() {
+  local unit="$1"
+  local release_path="$2"
+  local kind="$3"
+  local value="$4"
+  local wait_seconds="$5"
+  local subject="$6"
+  SERVE_PROVED_PID=0
+  SERVE_PROVED_EXE=""
+  SERVE_PROVED_SOURCE=""
+  SERVE_PROVED_HTTP=0
+  local release_physical
+  release_physical="$(physical_dir "$release_path" || true)"
   # Readiness and the exe are ONE poll, because a unit that reports active
   # with a MainPID is not yet running its own ExecStart: in that window
   # /proc/<MainPID>/exe resolves to systemd's pre-exec helper,
-  # /usr/lib/systemd/systemd-executor. Reading the exe once, straight after
-  # an active-poll, refused a correct install of 8332e03 on hax at 03:10 MYT
-  # on 2026-09-09 and rolled it back. So an exe that is empty, unreadable or
-  # outside the release is `not yet`, never a verdict - the loop sleeps and
+  # /usr/lib/systemd/systemd-executor. Reading the exe once, straight after an
+  # active-poll, refused a CORRECT install of 8332e03 on hax at 03:10 MYT on
+  # 2026-09-09 and rolled it back. So an exe that is empty, unreadable or not
+  # the release binary is `not yet`, never a verdict - the loop sleeps and
   # looks again, and only the deadline is fatal, naming the last state, pid
-  # and exe it saw. /proc/<pid>/exe is the only witness that survives a
-  # symlink swap, and it exists on the hosts this installs to but not on every
-  # host that runs the tests, so the probe is overridable and the default is
-  # the real one.
-  local release_physical=""
-  release_physical="$(physical_dir "$release_path" || true)"
+  # and exe it saw.
   local deadline=$(( SECONDS + wait_seconds ))
-  local state="" main_pid=0 exe="" exe_dir="" exe_physical=""
+  local state="" main_pid=0 exe=""
   while :; do
     state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
     main_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
     [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || main_pid=0
     exe=""
-    exe_dir=""
-    exe_physical=""
     if [[ "$state" == active && "$main_pid" != 0 ]]; then
-      if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
-        exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
-      else
-        exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
-      fi
-      if [[ -n "$exe" ]]; then
-        exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
-      fi
-      if [[ -n "$exe_dir" ]]; then
-        exe_physical="$exe_dir/${exe##*/}"
-      fi
-      [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]] || break
+      exe="$(serve_exe_of_pid "$main_pid")"
+      ! serve_exe_is_release_binary "$exe" "$release_physical" || break
     fi
     if (( SECONDS >= deadline )); then
-      printf 'hig-release: serve is not running the release just installed within %ss: %s ActiveState=%s MainPID=%s exe=%s resolved=%s release=%s\n' "$wait_seconds" "$unit" "${state:-unknown}" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
+      printf 'hig-release: %s is not running %s within %ss: ActiveState=%s MainPID=%s exe=%s release=%s\n' "$unit" "$subject" "$wait_seconds" "${state:-unknown}" "$main_pid" "${exe:-<unreadable>}" "${release_physical:-$release_path}" >&2
       return 1
     fi
     sleep 0.5
   done
-  local http="" http_deadline=$(( SECONDS + wait_seconds ))
+  local http="" remaining=0
   while :; do
-    http="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
-    [[ "$http" != 200 ]] || break
-    if (( SECONDS >= http_deadline )); then
-      printf 'hig-release: serve did not answer 200 after restart: %s MainPID=%s exe=%s url=http://127.0.0.1:%s/ status=%s\n' "$unit" "$main_pid" "$exe" "$port" "${http:-<none>}" >&2
+    remaining=$(( deadline - SECONDS ))
+    if (( remaining <= 0 )); then
+      printf 'hig-release: %s did not answer 200 for %s within %ss: MainPID=%s exe=%s listener=%s status=%s\n' "$unit" "$subject" "$wait_seconds" "$main_pid" "$exe" "$kind $value" "${http:-<none>}" >&2
       return 1
     fi
+    http="$(serve_http_status "$kind" "$value" "$remaining")"
+    [[ "$http" != 200 ]] || break
     sleep 0.5
   done
-  SERVE_RESTART_JSON="$(jq -n -S --argjson main_pid "$main_pid" --arg exe "$exe" --argjson http "$http" '{restarted:true, mainPid:$main_pid, exe:$exe, http:$http}')"
+  # A 200 proves something answered the listener, not that the process proved
+  # above answered it: a candidate that crashes after its exe was read leaves
+  # the listener to whatever systemd starts next, and an unrelated process
+  # holding the same port or socket answers just as convincingly. So the pid
+  # and its exe are read AGAIN, and a green install is one where the three
+  # measurements still agree.
+  local final_state final_pid final_exe
+  final_state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+  final_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+  [[ "$final_pid" =~ ^[1-9][0-9]*$ ]] || final_pid=0
+  final_exe=""
+  (( final_pid == 0 )) || final_exe="$(serve_exe_of_pid "$final_pid")"
+  if [[ "$final_state" != active ]] || (( final_pid != main_pid )) || [[ "$final_exe" != "$exe" ]] || ! serve_exe_is_release_binary "$final_exe" "$release_physical"; then
+    printf 'hig-release: %s answered 200 but the process serving it is not the one proved: ActiveState=%s MainPID=%s (proved %s) exe=%s (proved %s)\n' "$unit" "${final_state:-unknown}" "$final_pid" "$main_pid" "${final_exe:-<unreadable>}" "$exe" >&2
+    return 1
+  fi
+  SERVE_PROVED_PID="$main_pid"
+  SERVE_PROVED_EXE="$exe"
+  SERVE_PROVED_SOURCE="$(serve_exe_source "$main_pid")"
+  SERVE_PROVED_HTTP="$http"
 }
 
 release_entries() {
@@ -689,14 +1028,21 @@ prune_releases() {
   if (( ${#releases[@]} <= keep )); then
     return 0
   fi
-  local index=0
+  local index=0 failed=0
   for release in "${releases[@]}"; do
     (( index += 1 ))
     if (( index > keep )); then
-      rm -rf -- "$(release_dir "$root" "$release")"
-      rm -f -- "$(release_receipt "$root" "$release")"
+      # Callers handle failure explicitly, disabling errexit in this function.
+      # Keep the receipt indexing any directory we could not remove, and do
+      # not let a later successful removal erase an earlier failure.
+      if rm -rf -- "$root/releases/$release"; then
+        rm -f -- "$root/releases/$release.receipt.json" || failed=1
+      else
+        failed=1
+      fi
     fi
   done
+  return "$failed"
 }
 
 validate_target() {
@@ -932,6 +1278,9 @@ install_release_tree() {
   fi
 
   serve_restart_and_prove "$release_path"
+  # Every check that can still refuse this activation runs BEFORE the receipt
+  # is written; the receipt is the commit.
+  validate_release_files "$release_path" "$target"
 
   if [[ ! -f "$release_meta" ]]; then
     receipt_json="$(jq -c '.' "$receipt")"
@@ -960,8 +1309,13 @@ install_release_tree() {
     mv -f "${release_meta}.tmp" "$release_meta"
   fi
 
-  validate_release_files "$release_path" "$target"
-  prune_releases "$install_root" "$MAX_RELEASES"
+  # Committed: the release is proved to be serving and its receipt is on disk,
+  # so nothing after this line may roll it back. Retention still runs, and a
+  # retention failure is reported as what it is rather than becoming a reason
+  # to delete the release that is answering the port.
+  trap - ERR
+  local housekeeping=0
+  prune_releases "$install_root" "$MAX_RELEASES" || housekeeping=1
 
   jq -n -S \
     --arg installRoot "$install_root" \
@@ -972,7 +1326,10 @@ install_release_tree() {
     --arg target "$target" \
     --argjson serve "$SERVE_RESTART_JSON" \
     '{installRoot:$installRoot, releaseDir:$releaseDir, current:$current, receipt:$receipt, binDir:$binDir, target:$target, serve:$serve}'
-  trap - ERR
+  if (( housekeeping )); then
+    printf 'hig-release: %s is installed, proved to be serving and recorded; pruning older releases under %s failed and needs a look by hand - do NOT roll this activation back on account of it\n' "$release_path" "$install_root" >&2
+    return 1
+  fi
 }
 
 install_local() {
@@ -1089,7 +1446,7 @@ install_remote() {
   remote_stage="$(ssh "$target" 'mktemp -d "${TMPDIR:-/tmp}/kanban-release-install-remote.XXXXXX"')"
   tar -C "$package_dir" -cf - . | ssh "$target" "mkdir -p '$remote_stage/package' && tar -C '$remote_stage/package' -xf -"
   ssh "$target" "cat > '$remote_stage/package.receipt.json'" < "$receipt"
-  local remote_serve
+  local remote_serve remote_status=0
   remote_serve="$(HOSTNAME_BIN="$HOSTNAME_BIN" ssh "$target" bash -s -- "$remote_stage" "$remote_stage/package" "$remote_stage/package.receipt.json" "$install_root" "$target" "$bin_dir" "$MAX_RELEASES" "${BINARIES[@]}" <<'REMOTE'
 set -Eeuo pipefail
 
@@ -1319,6 +1676,7 @@ rollback_activation_view() {
 
   trap - ERR
   set +e
+  (( status != 0 )) || status=1
 
   local current_path="$install_root/current"
   if [[ "$current_switched" == 1 ]]; then
@@ -1328,16 +1686,38 @@ rollback_activation_view() {
       rm -f -- "$current_path"
     fi
   fi
-  if [[ "$release_created" == 1 ]]; then
-    rm -rf -- "$release_path"
-    rm -f -- "$release_meta"
-  fi
   if [[ -z "$previous_current" ]]; then
     local binary
     for binary in "${BINARIES[@]}"; do
       rm -f -- "$bin_dir/$binary"
     done
   fi
+
+  # Restoring the links restores the PATHS. If this activation had already
+  # restarted the unit, the PROCESS is still the candidate's, so it has to
+  # follow the links back before the candidate's executable is deleted from
+  # under it - and a recovery that cannot be proved keeps the candidate on
+  # disk and says so next to the failure that started this.
+  # `current` may legitimately hold a relative target - ensure_safe_release_view
+  # accepts one, resolving it against the link's own directory - so the value
+  # is restored verbatim and normalised against the install root before it is
+  # handed to a proof that has to resolve it as a path.
+  local previous_release="$previous_current"
+  [[ -z "$previous_release" || "$previous_release" == /* ]] || previous_release="$install_root/$previous_release"
+  local recovered=1
+  if [[ -n "${SERVE_RESTARTED_UNIT:-}" ]]; then
+    serve_restore_previous "$SERVE_RESTARTED_UNIT" "$previous_release" || recovered=0
+  fi
+
+  if (( recovered )); then
+    if [[ "$release_created" == 1 ]]; then
+      rm -rf -- "$release_path"
+      rm -f -- "$release_meta"
+    fi
+  else
+    printf 'hig-release: the activation failed AND the recovery failed: %s is not proved to be serving, and %s was kept so the host can be recovered from it\n' "${SERVE_RESTARTED_UNIT:-kanban-serve}" "$release_path" >&2
+  fi
+
   exit "$status"
 }
 
@@ -1349,92 +1729,359 @@ maybe_fail_after_current() {
   return 0
 }
 
-# Verbatim copy of the local guard; see the comment above the local
-# serve_restart_and_prove for the stale-exe incident it measures against.
+# Verbatim copies of the local guards; see the comment above the local
+# serve_restart_and_prove for the incidents they measure against. The
+# identical-guards test in tests/e2e.rs fails when either copy drifts.
 serve_restart_and_prove() {
   local release_path="$1"
   local unit=kanban-serve
   local skipped=""
   if ! command -v systemctl >/dev/null 2>&1; then
     skipped="systemctl is not on PATH"
-  elif ! systemctl is-enabled "$unit" >/dev/null 2>&1 && ! systemctl is-active "$unit" >/dev/null 2>&1; then
-    skipped="the $unit unit is not present on this host"
+  else
+    serve_unit_disposition "$unit" || return 1
+    case "$SERVE_UNIT_VERDICT" in
+      restart)
+        ;;
+      absent)
+        skipped="the $unit unit is not present on this host"
+        ;;
+      *)
+        skipped="the $unit unit is present but neither enabled nor active on this host ($SERVE_UNIT_DETAIL)"
+        ;;
+    esac
   fi
   if [[ -n "$skipped" ]]; then
     printf 'hig-release: serve restart skipped: %s\n' "$skipped" >&2
     SERVE_RESTART_JSON="$(jq -n -S --arg skipped "$skipped" '{skipped:$skipped}')"
     return 0
   fi
-  # The port is the unit's own, never a second literal: reading it from
-  # ExecStart means an operator who moves the port cannot be proved green by
-  # a probe still asking about the old one.
-  local exec_start port=14200
-  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
-  if [[ "$exec_start" =~ --port[[:space:]=]+([0-9]+) ]]; then
-    port="${BASH_REMATCH[1]}"
-  fi
-  # One deadline for both proofs, overridable so a test that measures the
-  # timeout itself does not have to wait out the real one.
-  local wait_seconds="${HIG_RELEASE_SERVE_DEADLINE_SECONDS:-15}"
-  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=15
-  systemctl restart "$unit" || {
+  serve_unit_listener "$unit" || return 1
+  local wait_seconds
+  wait_seconds="$(serve_deadline_seconds)" || return 1
+  # The HTTP half of the proof needs curl, and a curl that is not there exits
+  # 127 into a swallowed status: the proof would read as a timeout, the
+  # activation would roll back, and the recovery would fail the same way. So
+  # the dependency is checked while the candidate is still un-restarted.
+  command -v curl >/dev/null 2>&1 || {
+    printf 'hig-release: cannot prove the release is serving: curl is not on PATH and the HTTP proof needs it; refusing before %s is restarted\n' "$unit" >&2
+    return 1
+  }
+  # Set BEFORE the restart: a restart that fails may still have stopped the
+  # process that was serving, so the rollback owes the host a recovery either
+  # way. systemd writes job progress to stdout, which here is the install
+  # receipt's channel, so the unit's output goes to stderr with the diagnostics.
+  SERVE_RESTARTED_UNIT="$unit"
+  systemctl restart "$unit" >&2 || {
     printf 'hig-release: serve restart failed: systemctl restart %s exited non-zero\n' "$unit" >&2
     return 1
   }
+  serve_prove_release "$unit" "$release_path" "$SERVE_LISTENER_KIND" "$SERVE_LISTENER_VALUE" "$wait_seconds" "the release just installed" || return 1
+  SERVE_RESTART_JSON="$(jq -n -S --argjson main_pid "$SERVE_PROVED_PID" --arg exe "$SERVE_PROVED_EXE" --arg exe_source "$SERVE_PROVED_SOURCE" --argjson listener "$(serve_listener_json)" --argjson http "$SERVE_PROVED_HTTP" '{restarted:true, mainPid:$main_pid, exe:$exe, exeSource:$exe_source, listener:$listener, http:$http}')"
+}
+
+serve_restore_previous() {
+  local unit="$1"
+  local previous_release="$2"
+  if [[ -z "$previous_release" ]]; then
+    systemctl stop "$unit" >&2 || {
+      printf 'hig-release: recovery failed: systemctl stop %s exited non-zero; it may still be running the candidate executable\n' "$unit" >&2
+      return 1
+    }
+    return 0
+  fi
+  systemctl restart "$unit" >&2 || {
+    printf 'hig-release: recovery failed: systemctl restart %s exited non-zero with the previous release restored\n' "$unit" >&2
+    return 1
+  }
+  serve_unit_listener "$unit" || {
+    printf 'hig-release: recovery failed: the %s listener could not be read\n' "$unit" >&2
+    return 1
+  }
+  local wait_seconds
+  wait_seconds="$(serve_deadline_seconds)" || return 1
+  serve_prove_release "$unit" "$previous_release" "$SERVE_LISTENER_KIND" "$SERVE_LISTENER_VALUE" "$wait_seconds" "the previous release" || {
+    printf 'hig-release: recovery failed: %s is not serving the previous release %s\n' "$unit" "$previous_release" >&2
+    return 1
+  }
+}
+
+serve_unit_disposition() {
+  local unit="$1"
+  SERVE_UNIT_VERDICT=""
+  SERVE_UNIT_DETAIL=""
+  local properties
+  properties="$(systemctl show -p LoadState -p UnitFileState -p ActiveState "$unit" 2>&1)" || {
+    printf 'hig-release: the manager could not be asked about %s: systemctl show exited non-zero: %s\n' "$unit" "${properties//$'\n'/ }" >&2
+    return 1
+  }
+  local load_state="" unit_file_state="" active_state="" line
+  while IFS= read -r line; do
+    case "$line" in
+      LoadState=*)
+        load_state="${line#LoadState=}"
+        ;;
+      UnitFileState=*)
+        unit_file_state="${line#UnitFileState=}"
+        ;;
+      ActiveState=*)
+        active_state="${line#ActiveState=}"
+        ;;
+    esac
+  done <<<"$properties"
+  [[ -n "$load_state" ]] || {
+    printf 'hig-release: the manager could not be asked about %s: systemctl show answered no LoadState: %s\n' "$unit" "${properties//$'\n'/ }" >&2
+    return 1
+  }
+  SERVE_UNIT_DETAIL="LoadState=$load_state UnitFileState=${unit_file_state:-<none>} ActiveState=${active_state:-<none>}"
+  if [[ "$load_state" == not-found ]]; then
+    SERVE_UNIT_VERDICT=absent
+    return 0
+  fi
+  # The unit-file states systemd's own `is-enabled` exits 0 for, so this
+  # restarts exactly the units the pair of probes it replaces restarted.
+  case "$active_state:$unit_file_state" in
+    active:* | *:enabled | *:enabled-runtime | *:alias | *:static | *:indirect | *:generated | *:transient)
+      SERVE_UNIT_VERDICT=restart
+      ;;
+    *)
+      SERVE_UNIT_VERDICT=idle
+      ;;
+  esac
+}
+
+serve_unit_listener() {
+  local unit="$1"
+  SERVE_LISTENER_KIND=""
+  SERVE_LISTENER_VALUE=""
+  local exec_start
+  exec_start="$(systemctl show -p ExecStart --value "$unit" 2>&1)" || {
+    printf 'hig-release: cannot read the listener: systemctl show -p ExecStart %s exited non-zero: %s\n' "$unit" "${exec_start//$'\n'/ }" >&2
+    return 1
+  }
+  [[ "$exec_start" == *'argv[]='* ]] || {
+    printf 'hig-release: cannot read the listener: the %s ExecStart names no command line: %s\n' "$unit" "${exec_start:-<empty>}" >&2
+    return 1
+  }
+  local argv="${exec_start#*'argv[]='}"
+  argv="${argv%%' ; '*}"
+  serve_argv_tokens "$argv" || {
+    printf 'hig-release: cannot read the listener: the %s ExecStart argv does not tokenize - unbalanced quote or trailing escape: %s\n' "$unit" "$argv" >&2
+    return 1
+  }
+  local index kind value token
+  for (( index = 0; index < ${#SERVE_ARGV_TOKENS[@]}; index += 1 )); do
+    token="${SERVE_ARGV_TOKENS[index]}"
+    case "$token" in
+      --port | --socket)
+        kind="${token#--}"
+        value="${SERVE_ARGV_TOKENS[index + 1]:-}"
+        ;;
+      --port=* | --socket=*)
+        kind="${token%%=*}"
+        kind="${kind#--}"
+        value="${token#*=}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    [[ -z "$SERVE_LISTENER_KIND" ]] || {
+      printf 'hig-release: cannot read the listener: the %s ExecStart names more than one listener: %s\n' "$unit" "$argv" >&2
+      return 1
+    }
+    SERVE_LISTENER_KIND="$kind"
+    SERVE_LISTENER_VALUE="$value"
+  done
+  case "$SERVE_LISTENER_KIND" in
+    port)
+      [[ "$SERVE_LISTENER_VALUE" =~ ^[1-9][0-9]*$ ]] && (( SERVE_LISTENER_VALUE <= 65535 )) || {
+        printf 'hig-release: cannot read the listener: the %s ExecStart names --port %s, which is not a port\n' "$unit" "${SERVE_LISTENER_VALUE:-<nothing>}" >&2
+        return 1
+      }
+      ;;
+    socket)
+      [[ "$SERVE_LISTENER_VALUE" == /* ]] || {
+        printf 'hig-release: cannot read the listener: the %s ExecStart names --socket %s, which is not an absolute path\n' "$unit" "${SERVE_LISTENER_VALUE:-<nothing>}" >&2
+        return 1
+      }
+      ;;
+    *)
+      printf 'hig-release: cannot read the listener: the %s ExecStart names no listener, and kanban serve has no default one: %s\n' "$unit" "$argv" >&2
+      return 1
+      ;;
+  esac
+}
+
+serve_argv_tokens() {
+  local argv="$1"
+  SERVE_ARGV_TOKENS=()
+  local token="" quoted=0 escaped=0 index char
+  for (( index = 0; index < ${#argv}; index += 1 )); do
+    char="${argv:index:1}"
+    if (( escaped )); then
+      token+="$char"
+      escaped=0
+      continue
+    fi
+    case "$char" in
+      '\')
+        escaped=1
+        ;;
+      '"')
+        quoted=$(( 1 - quoted ))
+        ;;
+      ' ')
+        if (( quoted )); then
+          token+=' '
+        else
+          [[ -z "$token" ]] || SERVE_ARGV_TOKENS+=("$token")
+          token=""
+        fi
+        ;;
+      *)
+        token+="$char"
+        ;;
+    esac
+  done
+  (( quoted == 0 && escaped == 0 )) || return 1
+  [[ -z "$token" ]] || SERVE_ARGV_TOKENS+=("$token")
+}
+
+serve_listener_json() {
+  case "$SERVE_LISTENER_KIND" in
+    socket)
+      jq -n -S --arg socket "$SERVE_LISTENER_VALUE" '{socket:$socket}'
+      ;;
+    *)
+      jq -n -S --argjson port "$SERVE_LISTENER_VALUE" '{port:$port}'
+      ;;
+  esac
+}
+
+serve_deadline_seconds() {
+  local seconds="${HIG_RELEASE_SERVE_DEADLINE_SECONDS:-15}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'hig-release: HIG_RELEASE_SERVE_DEADLINE_SECONDS must be a positive whole number of seconds, got %s\n' "$seconds" >&2
+    return 1
+  }
+  printf '%s\n' "$seconds"
+}
+
+serve_exe_of_pid() {
+  local pid="$1"
+  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+    "$HIG_RELEASE_EXE_OF_PID" "$pid" 2>/dev/null || true
+  else
+    readlink "/proc/$pid/exe" 2>/dev/null || true
+  fi
+}
+
+serve_exe_source() {
+  local pid="$1"
+  if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
+    printf 'override:%s\n' "$HIG_RELEASE_EXE_OF_PID"
+  else
+    printf '/proc/%s/exe\n' "$pid"
+  fi
+}
+
+serve_exe_is_release_binary() {
+  local exe="$1"
+  local release_physical="$2"
+  [[ -n "$exe" && -n "$release_physical" ]] || return 1
+  [[ "$exe" != *' (deleted)' ]] || return 1
+  local exe_dir
+  exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
+  [[ -n "$exe_dir" ]] || return 1
+  [[ "$exe_dir/${exe##*/}" == "$release_physical/kanban" ]] || return 1
+  [[ -f "$release_physical/kanban" && -x "$release_physical/kanban" ]]
+}
+
+serve_http_status() {
+  local kind="$1"
+  local value="$2"
+  local budget="$3"
+  case "$kind" in
+    socket)
+      curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$budget" --max-time "$budget" --unix-socket "$value" 'http://localhost/' 2>/dev/null || true
+      ;;
+    *)
+      curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$budget" --max-time "$budget" "http://127.0.0.1:$value/" 2>/dev/null || true
+      ;;
+  esac
+}
+
+serve_prove_release() {
+  local unit="$1"
+  local release_path="$2"
+  local kind="$3"
+  local value="$4"
+  local wait_seconds="$5"
+  local subject="$6"
+  SERVE_PROVED_PID=0
+  SERVE_PROVED_EXE=""
+  SERVE_PROVED_SOURCE=""
+  SERVE_PROVED_HTTP=0
+  local release_physical
+  release_physical="$(physical_dir "$release_path" || true)"
   # Readiness and the exe are ONE poll, because a unit that reports active
   # with a MainPID is not yet running its own ExecStart: in that window
   # /proc/<MainPID>/exe resolves to systemd's pre-exec helper,
-  # /usr/lib/systemd/systemd-executor. Reading the exe once, straight after
-  # an active-poll, refused a correct install of 8332e03 on hax at 03:10 MYT
-  # on 2026-09-09 and rolled it back. So an exe that is empty, unreadable or
-  # outside the release is `not yet`, never a verdict - the loop sleeps and
+  # /usr/lib/systemd/systemd-executor. Reading the exe once, straight after an
+  # active-poll, refused a CORRECT install of 8332e03 on hax at 03:10 MYT on
+  # 2026-09-09 and rolled it back. So an exe that is empty, unreadable or not
+  # the release binary is `not yet`, never a verdict - the loop sleeps and
   # looks again, and only the deadline is fatal, naming the last state, pid
-  # and exe it saw. /proc/<pid>/exe is the only witness that survives a
-  # symlink swap, and it exists on the hosts this installs to but not on every
-  # host that runs the tests, so the probe is overridable and the default is
-  # the real one.
-  local release_physical=""
-  release_physical="$(physical_dir "$release_path" || true)"
+  # and exe it saw.
   local deadline=$(( SECONDS + wait_seconds ))
-  local state="" main_pid=0 exe="" exe_dir="" exe_physical=""
+  local state="" main_pid=0 exe=""
   while :; do
     state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
     main_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
     [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || main_pid=0
     exe=""
-    exe_dir=""
-    exe_physical=""
     if [[ "$state" == active && "$main_pid" != 0 ]]; then
-      if [[ -n "${HIG_RELEASE_EXE_OF_PID:-}" ]]; then
-        exe="$("$HIG_RELEASE_EXE_OF_PID" "$main_pid" 2>/dev/null || true)"
-      else
-        exe="$(readlink "/proc/$main_pid/exe" 2>/dev/null || true)"
-      fi
-      if [[ -n "$exe" ]]; then
-        exe_dir="$(physical_dir "$(dirname "$exe")" || true)"
-      fi
-      if [[ -n "$exe_dir" ]]; then
-        exe_physical="$exe_dir/${exe##*/}"
-      fi
-      [[ -z "$release_physical" || -z "$exe_physical" || "$exe_physical" != "$release_physical"/* ]] || break
+      exe="$(serve_exe_of_pid "$main_pid")"
+      ! serve_exe_is_release_binary "$exe" "$release_physical" || break
     fi
     if (( SECONDS >= deadline )); then
-      printf 'hig-release: serve is not running the release just installed within %ss: %s ActiveState=%s MainPID=%s exe=%s resolved=%s release=%s\n' "$wait_seconds" "$unit" "${state:-unknown}" "$main_pid" "${exe:-<unreadable>}" "${exe_physical:-<unresolved>}" "${release_physical:-$release_path}" >&2
+      printf 'hig-release: %s is not running %s within %ss: ActiveState=%s MainPID=%s exe=%s release=%s\n' "$unit" "$subject" "$wait_seconds" "${state:-unknown}" "$main_pid" "${exe:-<unreadable>}" "${release_physical:-$release_path}" >&2
       return 1
     fi
     sleep 0.5
   done
-  local http="" http_deadline=$(( SECONDS + wait_seconds ))
+  local http="" remaining=0
   while :; do
-    http="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
-    [[ "$http" != 200 ]] || break
-    if (( SECONDS >= http_deadline )); then
-      printf 'hig-release: serve did not answer 200 after restart: %s MainPID=%s exe=%s url=http://127.0.0.1:%s/ status=%s\n' "$unit" "$main_pid" "$exe" "$port" "${http:-<none>}" >&2
+    remaining=$(( deadline - SECONDS ))
+    if (( remaining <= 0 )); then
+      printf 'hig-release: %s did not answer 200 for %s within %ss: MainPID=%s exe=%s listener=%s status=%s\n' "$unit" "$subject" "$wait_seconds" "$main_pid" "$exe" "$kind $value" "${http:-<none>}" >&2
       return 1
     fi
+    http="$(serve_http_status "$kind" "$value" "$remaining")"
+    [[ "$http" != 200 ]] || break
     sleep 0.5
   done
-  SERVE_RESTART_JSON="$(jq -n -S --argjson main_pid "$main_pid" --arg exe "$exe" --argjson http "$http" '{restarted:true, mainPid:$main_pid, exe:$exe, http:$http}')"
+  # A 200 proves something answered the listener, not that the process proved
+  # above answered it: a candidate that crashes after its exe was read leaves
+  # the listener to whatever systemd starts next, and an unrelated process
+  # holding the same port or socket answers just as convincingly. So the pid
+  # and its exe are read AGAIN, and a green install is one where the three
+  # measurements still agree.
+  local final_state final_pid final_exe
+  final_state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+  final_pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+  [[ "$final_pid" =~ ^[1-9][0-9]*$ ]] || final_pid=0
+  final_exe=""
+  (( final_pid == 0 )) || final_exe="$(serve_exe_of_pid "$final_pid")"
+  if [[ "$final_state" != active ]] || (( final_pid != main_pid )) || [[ "$final_exe" != "$exe" ]] || ! serve_exe_is_release_binary "$final_exe" "$release_physical"; then
+    printf 'hig-release: %s answered 200 but the process serving it is not the one proved: ActiveState=%s MainPID=%s (proved %s) exe=%s (proved %s)\n' "$unit" "${final_state:-unknown}" "$final_pid" "$main_pid" "${final_exe:-<unreadable>}" "$exe" >&2
+    return 1
+  fi
+  SERVE_PROVED_PID="$main_pid"
+  SERVE_PROVED_EXE="$exe"
+  SERVE_PROVED_SOURCE="$(serve_exe_source "$main_pid")"
+  SERVE_PROVED_HTTP="$http"
 }
 
 next_activation_sequence() {
@@ -1487,14 +2134,21 @@ prune_releases() {
   if (( ${#releases[@]} <= keep )); then
     return 0
   fi
-  local index=0
+  local index=0 failed=0
   for release in "${releases[@]}"; do
     (( index += 1 ))
     if (( index > keep )); then
-      rm -rf -- "$root/releases/$release"
-      rm -f -- "$root/releases/$release.receipt.json"
+      # Callers handle failure explicitly, disabling errexit in this function.
+      # Keep the receipt indexing any directory we could not remove, and do
+      # not let a later successful removal erase an earlier failure.
+      if rm -rf -- "$root/releases/$release"; then
+        rm -f -- "$root/releases/$release.receipt.json" || failed=1
+      else
+        failed=1
+      fi
     fi
   done
+  return "$failed"
 }
 
 hostname_bin="${HOSTNAME_BIN:-/bin/hostname}"
@@ -1557,31 +2211,7 @@ if [[ ! -d "$release_path" ]]; then
   release_created=1
 fi
 
-installed_at="$(( $(date +%s) * 1000 ))"
 trap 'rollback_activation_view "$install_root" "$release_path" "$release_receipt" "$previous_current" "$current_switched" "$release_created" "$bin_dir"' ERR
-if [[ ! -f "$release_receipt" ]]; then
-  activation_sequence="$(next_activation_sequence "$install_root")"
-  jq -n -S \
-    --argjson receipt "$(jq -c '.' "$receipt")" \
-    --argjson activation_sequence "$activation_sequence" \
-    --argjson installed_at "$installed_at" \
-    --arg target "$target" \
-    --arg release_id "$release_id" \
-    --arg release_dir "$release_path" \
-    --arg current_link "$install_root/current" \
-    --arg bin_dir "$bin_dir" \
-    --arg installer "$host" \
-    '$receipt + {
-      activationSequence: $activation_sequence,
-      installedAt: $installed_at,
-      target: $target,
-      releaseId: $release_id,
-      releaseDir: $release_dir,
-      currentLink: $current_link,
-      binDir: $bin_dir,
-      installerHost: $installer
-  }' > "$release_receipt"
-fi
 
 ensure_public_binary_links "$install_root" "$bin_dir"
 atomic_symlink "$release_path" "$install_root/current"
@@ -1611,6 +2241,31 @@ fi
 
 serve_restart_and_prove "$release_path"
 
+installed_at="$(( $(date +%s) * 1000 ))"
+if [[ ! -f "$release_receipt" ]]; then
+  activation_sequence="$(next_activation_sequence "$install_root")"
+  jq -n -S \
+    --argjson receipt "$(jq -c '.' "$receipt")" \
+    --argjson activation_sequence "$activation_sequence" \
+    --argjson installed_at "$installed_at" \
+    --arg target "$target" \
+    --arg release_id "$release_id" \
+    --arg release_dir "$release_path" \
+    --arg current_link "$install_root/current" \
+    --arg bin_dir "$bin_dir" \
+    --arg installer "$host" \
+    '$receipt + {
+      activationSequence: $activation_sequence,
+      installedAt: $installed_at,
+      target: $target,
+      releaseId: $release_id,
+      releaseDir: $release_dir,
+      currentLink: $current_link,
+      binDir: $bin_dir,
+      installerHost: $installer
+  }' > "$release_receipt"
+fi
+
 jq -e --arg target "$target" '
   (.targets | type == "array") and
   (.targets | length == 2) and
@@ -1618,25 +2273,26 @@ jq -e --arg target "$target" '
   (.targets | index("hig") != null) and
   (.targets | index($target) != null)
 ' "$release_receipt" >/dev/null || die "remote receipt target mismatch"
-
-releases=()
-while IFS= read -r release; do
-  [[ -n "$release" ]] || continue
-  releases+=("$release")
-done < <(
-  release_entries "$install_root"
-)
-if (( ${#releases[@]} > keep )); then
-  for release in "${releases[@]:keep}"; do
-    rm -rf -- "$install_root/releases/$release"
-    rm -f -- "$install_root/releases/$release.receipt.json"
-  done
-fi
+# Committed: the release is proved to be serving and its receipt is on disk, so
+# nothing after this line may roll it back. Retention still runs, and a
+# retention failure is reported as what it is rather than becoming a reason to
+# delete the release that is answering the listener.
 trap - ERR
+housekeeping=0
+prune_releases "$install_root" "$keep" || housekeeping=1
 printf '%s\n' "$SERVE_RESTART_JSON"
+if (( housekeeping )); then
+  printf 'hig-release: %s is installed, proved to be serving and recorded; pruning older releases under %s failed and needs a look by hand - do NOT roll this activation back on account of it\n' "$release_path" "$install_root" >&2
+  exit 1
+fi
 REMOTE
-)"
-  [[ -n "$remote_serve" ]] || die "remote install did not report the kanban-serve restart proof"
+)" || remote_status=$?
+  if [[ -z "$remote_serve" ]]; then
+    # Pre-commit failures have no summary: propagate the failure, not a
+    # fabricated receipt. A committed cleanup failure does carry its proof.
+    (( remote_status == 0 )) || return "$remote_status"
+    die "remote install did not report the kanban-serve restart proof"
+  fi
 
   jq -n -S \
     --arg installRoot "$install_root" \
@@ -1649,6 +2305,7 @@ REMOTE
     --arg binDir "$bin_dir" \
     --argjson serve "$remote_serve" \
     '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, receipt:$receipt, packageDir:$packageDir, target:$target, binDir:$binDir, serve:$serve}'
+  return "$remote_status"
 }
 
 rollback_release() {
@@ -1735,7 +2392,16 @@ rollback_release() {
     return 1
   fi
 
-  prune_releases "$install_root" "$MAX_RELEASES"
+  # An operator rollback moves the same links an install moves, so it owes the
+  # same proof: the release it just pointed `current` at has to be the one
+  # serving, or the rollback is a claim about symlinks. A failed proof takes
+  # the same ERR trap, which restores the release that WAS current and puts it
+  # back in service.
+  serve_restart_and_prove "$release_path"
+
+  trap - ERR
+  local housekeeping=0
+  prune_releases "$install_root" "$MAX_RELEASES" || housekeeping=1
   jq -n -S \
     --arg installRoot "$install_root" \
     --arg releaseId "$release_id" \
@@ -1743,8 +2409,12 @@ rollback_release() {
     --arg current "$(current_link "$install_root")" \
     --arg binDir "$bin_dir" \
     --arg target "$target" \
-    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, binDir:$binDir, target:$target}'
-  trap - ERR
+    --argjson serve "$SERVE_RESTART_JSON" \
+    '{installRoot:$installRoot, releaseId:$releaseId, releaseDir:$releaseDir, current:$current, binDir:$binDir, target:$target, serve:$serve}'
+  if (( housekeeping )); then
+    printf 'hig-release: %s is rolled back to and proved to be serving; pruning older releases under %s failed and needs a look by hand - do NOT undo this rollback on account of it\n' "$release_path" "$install_root" >&2
+    return 1
+  fi
 }
 
 install_package() {
