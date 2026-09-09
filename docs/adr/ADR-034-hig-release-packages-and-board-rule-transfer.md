@@ -108,6 +108,103 @@ alongside the other guards, and
 and `hig_release_script_install_skips_the_restart_when_the_unit_is_absent`
 drive the four outcomes through both install legs.
 
+Addendum 2026-09-09 (second, before the measurement had ever run on a host):
+reviewing the guard above against the source found five ways it could pass or
+hang where it should refuse, and one way its refusal could leave a host worse
+than it found it. They are fixed together because they are one claim — "the
+release that is installed is the one serving" — and any of them alone makes
+that claim false.
+
+1. The rollback restored PATHS only. `current` and the bin links went back to
+   the previous release while the unit kept running the candidate, and then
+   the candidate's directory was deleted from under it. A rollback now
+   restarts the unit onto the restored links and PROVES the previous release
+   is serving (`serve_restore_previous`) before removing anything; a first
+   install, which has no previous release to serve, STOPS the unit first. A
+   recovery that cannot be proved is never silent and never green: it reports
+   its own failure next to the one that started the rollback and keeps the
+   candidate release on disk to recover from.
+2. `curl` had no per-request bound, so the deadline could not apply to a
+   stalled socket: the loop only looked at the clock between requests, and a
+   peer that accepts and never answers held the install open indefinitely.
+   Each request now gets `--connect-timeout`/`--max-time` equal to what is
+   LEFT of the one deadline.
+3. `is-enabled` and `is-active` both fail for a unit that does not exist AND
+   for a manager that cannot be reached, and failing both was read as "no unit
+   on this host": an unreachable systemd turned the proof into a skip notice
+   and the install reported green. Classification is now one
+   `systemctl show -p LoadState -p UnitFileState -p ActiveState`, which exits
+   0 whenever the MANAGER answers: a non-zero exit or a missing `LoadState` is
+   a failed install, `LoadState=not-found` is the absent-unit skip, and a unit
+   that is loaded but neither enabled nor active is skipped as deliberately
+   stopped rather than started by an installer.
+4. The exe check was a directory prefix, which `kb`, `manifest.json` and the
+   kernel's `<path> (deleted)` all pass — the last being exactly what a
+   rolled-back release leaves a running service holding. It is now an
+   identity: the exe must resolve to `<release>/kanban` and that path must
+   still be a regular executable file.
+5. A 200 proved that something answered, not that the process measured
+   answered. The pid and its exe are re-read after the 200 and must still
+   agree, so a candidate that crashes into whatever systemd starts next, or an
+   unrelated listener on the same port or socket, cannot supply the green.
+
+Two more came out of the same reading. `kanban serve` has no default listener
+— exactly one of `--port N` or `--socket PATH`, both and neither being usage
+errors — so the probe no longer falls back to 14200: it parses the unit's own
+`ExecStart` argv (tokenized, quoted words honoured, never `eval`ed), probes a
+socket through `curl --unix-socket`, and refuses a unit naming none or two
+rather than proving a stranger. And `systemctl` writes job progress to stdout,
+which on the remote leg IS the JSON channel the caller parses, so the unit's
+output goes to stderr with the diagnostics. The receipt gains `exeSource` and
+`listener`: `exeSource` is `/proc/<pid>/exe` on a host that has one and names
+`HIG_RELEASE_EXE_OF_PID` where the test seam answered instead, so a fixture's
+answer can never be read as the kernel's.
+`hig_release_script_install_proves_the_served_exe_through_proc_on_linux` takes
+the seam away entirely on Linux and proves a real process through the real
+`/proc`. The behaviours are pinned by
+`hig_release_script_install_puts_the_previous_release_back_in_service_when_a_candidate_fails`,
+`hig_release_script_install_refuses_when_the_service_manager_cannot_be_asked`,
+`hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline`,
+`hig_release_script_install_refuses_an_exe_that_is_not_the_retained_release_binary`,
+`hig_release_script_install_probes_the_listener_the_unit_names` and
+`hig_release_script_install_refuses_a_restart_that_never_produces_a_serving_release`,
+each driven through both install legs.
+
+Four smaller decisions fall out of the same reading. The `rollback`
+subcommand moves the links an install moves, so it now calls the same
+`serve_restart_and_prove` after the switch, reports the measurement in its
+summary, and falls into the same recovery when the proof fails; a rollback
+that only moved symlinks was a claim about symlinks. `curl` is checked for
+BEFORE the candidate is restarted, because a missing curl exits 127 into a
+swallowed status, which would read as an HTTP timeout and then fail the
+recovery the same way. A relative `current` target - which
+`ensure_safe_release_view` accepts - is restored verbatim and normalised
+against the install root before it is handed to a proof that must resolve it.
+And the receipt is the commit: every check that can still refuse an
+activation runs before it, the `ERR` trap is disarmed immediately after it,
+and retention runs on the far side, so a failed prune reports itself loudly
+(non-zero, naming the release and saying not to roll it back) instead of
+deleting the release that is answering the listener.
+
+What this measurement CANNOT do is bound the blast radius of a schema
+migration, and the recovery must not be read as though it could. Rolling the
+code back does not roll the store back: the candidate may already have opened
+and migrated a board, and the previous release the recovery restarts may then
+be unable to read it. That case ends exactly where every unprovable recovery
+ends - both failures reported, the candidate release retained, nothing
+repointed at anything automatically - and it is NOT a healthy host. The
+release path never rolls back or restores a database; a store that has moved
+forward is an operator decision with `kb backup`/`kb restore`.
+
+The tokenizer is written against systemd's rendering as this repository's
+fixtures reproduce it - space-separated argv words, spaces inside a word
+rendered in double quotes, backslash escapes inside those quotes. That is not
+a proof about every systemd version's quoting, so it fails closed: an
+unbalanced quote or a trailing escape refuses the install naming the argv it
+could not read, rather than guessing or reaching for `eval`. The ExecStart a
+live host actually reports is worth capturing against this the first time it
+runs there.
+
 ## References
 
 - `scripts/hig-release.sh`

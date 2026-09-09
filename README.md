@@ -990,13 +990,39 @@ non-interactive cages that never source a shell profile.
 Installing a release flips `current`, relinks all ten public binaries, then
 restarts `kanban-serve` and proves the process that came back is the release
 it just installed: the unit reports `active` with a `MainPID`, that pid's
-`/proc/<MainPID>/exe` resolves inside the new `releases/<id>`, and the port its
-own `ExecStart` names answers 200. The measurement lands in the install
-receipt as `serve: {restarted, mainPid, exe, http}`. A proof that fails is not
-a warning — the activation is rolled back to the previous `current`, because a
-release whose binary is not the one serving is not installed. A host with no
-such unit prints `serve restart skipped: <reason>` and records
-`serve: {skipped: <reason>}` instead of claiming a restart that never happened.
+`/proc/<MainPID>/exe` IS the `kanban` executable retained in the new
+`releases/<id>` — not merely a path inside it, so `kb` and the kernel's
+`<path> (deleted)` are refused — and the listener its own `ExecStart` names,
+`--port N` or `--socket PATH`, answers 200. Every request is bounded by what
+is left of the deadline, and the pid and its exe are read once more after the
+200, because a 200 proves only that something answered. The measurement lands
+in the install receipt as
+`serve: {restarted, mainPid, exe, exeSource, listener, http}`, where
+`exeSource` is `/proc/<pid>/exe` on a host that has one and names the test
+override where it does not. A proof that fails is not a warning: the previous
+`current` and links are restored, the unit is restarted and the previous
+release PROVED back into service before the candidate's directory is removed
+— a first install with nothing to fall back to stops the unit first — and a
+recovery that cannot be proved reports both failures and keeps the candidate
+on disk to recover from. A host with no such unit prints
+`serve restart skipped: <reason>` and records `serve: {skipped: <reason>}`
+instead of claiming a restart that never happened; a host whose service
+manager cannot be asked is a failed install, because a skip is a claim about
+the unit and an unreachable manager supports none.
+
+`hig-release.sh rollback` owes the same proof and now performs it: it restarts
+the unit and proves the release it rolled back to is the one serving, and its
+summary carries the same `serve` measurement.
+
+What none of this can undo is a schema migration. Rolling the CODE back does
+not roll a store back: a release that has already opened a board migrates it,
+and the older binary the recovery restores may then be unable to read it. In
+that case the recovery is simply unproved — the failure is reported next to
+the original one, the candidate release is kept on disk, and nothing is
+repointed at it automatically. No database is rolled back or restored by the
+release path, ever; a store that has moved forward is an operator decision
+with the backups (`kb backup`, `kb restore`), not something an installer may
+make on its own.
 
 Commands and subcommands have short forms:
 

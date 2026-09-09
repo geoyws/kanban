@@ -13605,24 +13605,36 @@ chmod "$mode" "$dest"
         // the stub decides that, never the host: this suite runs on hax and
         // hig, where a real kanban-serve is serving the authoritative boards,
         // and a test that reached the real systemctl would restart it.
+        //
+        // `show` is the whole classifier surface, so it answers the way
+        // systemd does: `KEY=value` lines, bare values under `--value`, exit
+        // 0 whenever the MANAGER answers -- an absent unit is
+        // `LoadState=not-found`, not a failed call. A manager that cannot be
+        // reached at all (FAKE_SERVE_MANAGER_FAILS) fails every call instead,
+        // which is the case an installer must never read as "no unit here".
         r#"#!/bin/sh
 set -eu
+if [ -n "${FAKE_SERVE_MANAGER_FAILS:-}" ]; then
+  # The ATTEMPT is recorded before the failure, so a test asserting that no
+  # restart was attempted is asserting something that could have been false.
+  case "${1:-}" in
+    restart | stop)
+      if [ -n "${FAKE_SERVE_RESTART_LOG:-}" ]; then
+        printf '%s %s\n' "$1" "${2:-}" >> "$FAKE_SERVE_RESTART_LOG"
+      fi
+      ;;
+  esac
+  printf 'Failed to connect to bus: No such file or directory\n' >&2
+  exit 1
+fi
 present="${FAKE_SERVE_UNIT_PRESENT:-}"
+# Set once the HTTP probe has been answered, so a test can make the unit
+# change under the installer at exactly the moment a 200 has been collected.
+after=""
+if [ -n "${FAKE_SERVE_CURL_TRIGGER:-}" ] && [ -e "${FAKE_SERVE_CURL_TRIGGER}" ]; then
+  after=1
+fi
 case "${1:-}" in
-  is-enabled)
-    [ -n "$present" ] || {
-      printf 'Failed to get unit file state for %s.service: No such file or directory\n' "${2:-}" >&2
-      exit 4
-    }
-    printf 'enabled\n'
-    ;;
-  is-active)
-    [ -n "$present" ] || {
-      printf 'inactive\n'
-      exit 3
-    }
-    printf 'active\n'
-    ;;
   restart)
     [ -n "$present" ] || {
       printf 'Failed to restart %s.service: Unit not found.\n' "${2:-}" >&2
@@ -13631,15 +13643,40 @@ case "${1:-}" in
     if [ -n "${FAKE_SERVE_RESTART_LOG:-}" ]; then
       printf 'restart %s\n' "${2:-}" >> "$FAKE_SERVE_RESTART_LOG"
     fi
+    [ -z "${FAKE_SERVE_RESTART_FAILS:-}" ] || {
+      printf 'Job for %s.service failed.\n' "${2:-}" >&2
+      exit 1
+    }
+    # systemd writes job progress to stdout. An installer that folds stdout
+    # into its own JSON channel is broken by exactly this line.
+    printf 'Job for %s.service finished.\n' "${2:-}"
+    ;;
+  stop)
+    [ -n "$present" ] || {
+      printf 'Failed to stop %s.service: Unit not found.\n' "${2:-}" >&2
+      exit 5
+    }
+    if [ -n "${FAKE_SERVE_RESTART_LOG:-}" ]; then
+      printf 'stop %s\n' "${2:-}" >> "$FAKE_SERVE_RESTART_LOG"
+    fi
+    [ -z "${FAKE_SERVE_STOP_FAILS:-}" ] || {
+      printf 'Job for %s.service failed.\n' "${2:-}" >&2
+      exit 1
+    }
+    printf 'Stopped %s.service.\n' "${2:-}"
     ;;
   show)
-    [ -n "$present" ] || exit 4
     shift
-    property=""
+    bare=0
+    properties=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
+        --value)
+          bare=1
+          shift
+          ;;
         -p)
-          property="$2"
+          properties="$properties $2"
           shift 2
           ;;
         *)
@@ -13647,21 +13684,50 @@ case "${1:-}" in
           ;;
       esac
     done
-    case "$property" in
-      ExecStart)
-        printf '{ path=/root/.local/bin/kanban ; argv[]=/root/.local/bin/kanban serve --port %s --actor-header X-Auth-Request-Email ; ignore_errors=no }\n' "${FAKE_SERVE_PORT:-14200}"
-        ;;
-      ActiveState)
-        printf 'active\n'
-        ;;
-      MainPID)
-        printf '%s\n' "${FAKE_SERVE_MAIN_PID:-0}"
-        ;;
-      *)
-        printf 'unexpected systemctl show -p %s\n' "$property" >&2
-        exit 1
-        ;;
-    esac
+    for property in $properties; do
+      case "$property" in
+        LoadState)
+          if [ -n "$present" ]; then value=loaded; else value=not-found; fi
+          ;;
+        UnitFileState)
+          if [ -n "$present" ]; then value="${FAKE_SERVE_UNIT_FILE_STATE:-enabled}"; else value=""; fi
+          ;;
+        ActiveState)
+          if [ -n "$present" ]; then value="${FAKE_SERVE_ACTIVE_STATE:-active}"; else value=inactive; fi
+          if [ -n "$after" ] && [ -n "${FAKE_SERVE_ACTIVE_STATE_AFTER:-}" ]; then
+            value="$FAKE_SERVE_ACTIVE_STATE_AFTER"
+          fi
+          ;;
+        MainPID)
+          value="${FAKE_SERVE_MAIN_PID:-0}"
+          if [ -n "$after" ] && [ -n "${FAKE_SERVE_MAIN_PID_AFTER:-}" ]; then
+            value="$FAKE_SERVE_MAIN_PID_AFTER"
+          fi
+          ;;
+        ExecStart)
+          if [ -n "${FAKE_SERVE_EXEC_START:-}" ]; then
+            value="$FAKE_SERVE_EXEC_START"
+          else
+            argv="/root/.local/bin/kanban serve"
+            if [ -n "${FAKE_SERVE_SOCKET:-}" ]; then
+              argv="$argv --socket \"$FAKE_SERVE_SOCKET\""
+            else
+              argv="$argv --port ${FAKE_SERVE_PORT:-14200}"
+            fi
+            value="{ path=/root/.local/bin/kanban ; argv[]=$argv --actor-header X-Auth-Request-Email ; ignore_errors=no }"
+          fi
+          ;;
+        *)
+          printf 'unexpected systemctl show -p %s\n' "$property" >&2
+          exit 1
+          ;;
+      esac
+      if [ "$bare" -eq 1 ]; then
+        printf '%s\n' "$value"
+      else
+        printf '%s=%s\n' "$property" "$value"
+      fi
+    done
     ;;
   *)
     printf 'unexpected systemctl %s\n' "$*" >&2
@@ -13672,22 +13738,56 @@ esac
     );
     write_executable(
         &stubs.join("curl"),
-        // Answers the release script's status probe, and records the URL it
-        // was asked for so a test can prove the port came from the unit.
+        // Answers the release script's status probe, and records the listener
+        // it was asked for so a test can prove the probe followed the unit's
+        // own ExecStart. FAKE_SERVE_HTTP_BAD_RELEASE makes the answer depend
+        // on which release `current` points at, which is how a test models one
+        // release that serves and one that does not. FAKE_SERVE_CURL_REAL
+        // hands the request to the real curl, for a case that must measure a
+        // real stalled socket rather than a stub's opinion of one.
         r#"#!/bin/sh
 set -eu
+if [ -n "${FAKE_SERVE_CURL_REAL:-}" ]; then
+  command -p curl "$@"
+  exit "$?"
+fi
 url=""
+socket=""
+previous=""
 for arg in "$@"; do
+  case "$previous" in
+    --unix-socket)
+      socket="$arg"
+      ;;
+  esac
   case "$arg" in
     http://*)
       url="$arg"
       ;;
   esac
+  previous="$arg"
 done
 if [ -n "${FAKE_SERVE_CURL_LOG:-}" ]; then
-  printf '%s\n' "$url" >> "$FAKE_SERVE_CURL_LOG"
+  if [ -n "$socket" ]; then
+    printf '%s %s\n' "$socket" "$url" >> "$FAKE_SERVE_CURL_LOG"
+  else
+    printf '%s\n' "$url" >> "$FAKE_SERVE_CURL_LOG"
+  fi
 fi
-printf '%s' "${FAKE_SERVE_HTTP:-200}"
+status="${FAKE_SERVE_HTTP:-200}"
+if [ -n "${FAKE_SERVE_HTTP_BAD_RELEASE:-}" ] && [ -n "${FAKE_SERVE_CURRENT_LINK:-}" ]; then
+  current="$(readlink "$FAKE_SERVE_CURRENT_LINK" 2>/dev/null || true)"
+  if [ "${current##*/}" = "$FAKE_SERVE_HTTP_BAD_RELEASE" ]; then
+    status="${FAKE_SERVE_HTTP_BAD_STATUS:-503}"
+  fi
+fi
+if [ -n "${FAKE_SERVE_CURL_TRIGGER:-}" ]; then
+  # A 200 has now been collected. Anything the test wants to change about the
+  # unit from here happens between the probe and the revalidation that follows
+  # it, which is the window a crashing service actually uses.
+  : > "$FAKE_SERVE_CURL_TRIGGER"
+fi
+printf '%s' "$status"
 "#,
     );
     write_executable(
@@ -13700,10 +13800,17 @@ printf '%s' "${FAKE_SERVE_HTTP:-200}"
         // FAKE_SERVE_EXE_EARLY instead, which is how a test reproduces the
         // window where the unit is already active with a MainPID whose exe is
         // still systemd's pre-exec helper rather than the service binary.
+        // FAKE_SERVE_EXE_FROM_CURRENT answers whatever `current` points at
+        // when it is asked, which is how a unit whose ExecStart runs the
+        // public bin link behaves across a rollback and the restart after it.
         r#"#!/bin/sh
 set -eu
-[ "${1:-}" = "${FAKE_SERVE_MAIN_PID:?}" ] || {
-  printf 'exe probe asked about pid %s, not the unit MainPID %s\n' "${1:-}" "$FAKE_SERVE_MAIN_PID" >&2
+expected_pid="${FAKE_SERVE_MAIN_PID:?}"
+if [ -n "${FAKE_SERVE_CURL_TRIGGER:-}" ] && [ -e "${FAKE_SERVE_CURL_TRIGGER}" ]; then
+  expected_pid="${FAKE_SERVE_MAIN_PID_AFTER:-$expected_pid}"
+fi
+[ "${1:-}" = "$expected_pid" ] || {
+  printf 'exe probe asked about pid %s, not the unit MainPID %s\n' "${1:-}" "$expected_pid" >&2
   exit 1
 }
 calls=1
@@ -13713,6 +13820,16 @@ if [ -n "${FAKE_SERVE_EXE_CALL_LOG:-}" ]; then
 fi
 if [ "$calls" -le "${FAKE_SERVE_EXE_EARLY_CALLS:-0}" ]; then
   printf '%s\n' "${FAKE_SERVE_EXE_EARLY:?}"
+  exit 0
+fi
+if [ -n "${FAKE_SERVE_EXE_FROM_CURRENT:-}" ]; then
+  current="$(readlink "$FAKE_SERVE_EXE_FROM_CURRENT" 2>/dev/null || true)"
+  [ -n "$current" ] || exit 0
+  printf '%s/kanban\n' "$current"
+  exit 0
+fi
+if [ -n "${FAKE_SERVE_CURL_TRIGGER:-}" ] && [ -e "${FAKE_SERVE_CURL_TRIGGER}" ] && [ -n "${FAKE_SERVE_EXE_AFTER:-}" ]; then
+  printf '%s\n' "$FAKE_SERVE_EXE_AFTER"
   exit 0
 fi
 printf '%s\n' "${FAKE_SERVE_EXE:?}"
@@ -30531,6 +30648,17 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         "atomic_symlink",
         "reject_carried_release_identity",
         "serve_restart_and_prove",
+        "serve_restore_previous",
+        "serve_unit_disposition",
+        "serve_unit_listener",
+        "serve_argv_tokens",
+        "serve_listener_json",
+        "serve_deadline_seconds",
+        "serve_exe_of_pid",
+        "serve_exe_source",
+        "serve_exe_is_release_binary",
+        "serve_http_status",
+        "serve_prove_release",
     ] {
         let header = format!("\n{name}() {{\n");
         let definitions: Vec<(usize, &str)> = script
@@ -30624,6 +30752,8 @@ fn hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe() 
                 "restarted": true,
                 "mainPid": 4242,
                 "exe": served_exe.to_str().unwrap(),
+                "exeSource": format!("override:{}", harness.exe_probe().display()),
+                "listener": { "port": 14311 },
                 "http": 200,
             }),
             "{target}: the install receipt does not carry the restart it proved"
@@ -30653,8 +30783,10 @@ fn hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe() 
 /// restored - the operator keeps the release that is actually serving instead
 /// of a `current` link that lies about it. The refusal names what it
 /// measured, because "install failed" without the pid and the exe is not a
-/// diagnosis. The HTTP probe never runs: a 200 from the old exe would be the
-/// most convincing wrong answer available.
+/// diagnosis. The candidate is never probed over HTTP: a 200 from the old exe
+/// would be the most convincing wrong answer available. The one probe on
+/// record belongs to the recovery, which restarts the unit onto the restored
+/// links and proves release A is serving again before B's directory goes.
 #[test]
 fn hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_release() {
     let harness = ReleaseGuardHarness::new("hig-release-serve-stale-exe");
@@ -30734,12 +30866,13 @@ fn hig_release_script_install_refuses_when_the_served_exe_is_not_the_installed_r
         }
         assert_eq!(
             fs::read_to_string(&restart_log).unwrap(),
-            "restart kanban-serve\n",
-            "{target}: the refusal happened without restarting the unit at all"
+            "restart kanban-serve\nrestart kanban-serve\n",
+            "{target}: the unit was left on the candidate instead of restarted onto the release that is serving"
         );
-        assert!(
-            !curl_log.exists(),
-            "{target}: the HTTP probe ran against an exe that had already failed its proof"
+        assert_eq!(
+            fs::read_to_string(&curl_log).unwrap(),
+            "http://127.0.0.1:14200/\n",
+            "{target}: the candidate was probed over HTTP after its exe had already failed"
         );
         assert_eq!(
             capture_release_links(&install_root, &bin_dir),
@@ -30826,6 +30959,8 @@ fn hig_release_script_install_waits_out_systemd_executor_before_judging_the_serv
                 "restarted": true,
                 "mainPid": 3963673,
                 "exe": served_exe.to_str().unwrap(),
+                "exeSource": format!("override:{}", harness.exe_probe().display()),
+                "listener": { "port": 14200 },
                 "http": 200,
             }),
             "{target}: the install receipt does not carry the exe the poll waited for"
@@ -30839,21 +30974,462 @@ fn hig_release_script_install_waits_out_systemd_executor_before_judging_the_serv
 }
 
 /// Not every host that installs a release runs the unit - a build box, this
-/// test suite. A missing unit is not a failed install, but it is never
-/// silent: the install says which restart it skipped and why, and the receipt
-/// records the same reason, so a release report can never read as proof of a
-/// restart that did not happen.
+/// test suite - and on some it is loaded but deliberately stopped. Neither is
+/// a failed install, and neither is silent: the install says which restart it
+/// skipped and why, and the receipt records the same reason, so a release
+/// report can never read as proof of a restart that did not happen. The
+/// stopped case is the one an installer must not "help" with: starting a unit
+/// an operator disabled and stopped would be overruling them.
 #[test]
-fn hig_release_script_install_skips_the_restart_when_the_unit_is_absent() {
+fn hig_release_script_install_skips_the_restart_when_the_unit_is_not_running() {
     let harness = ReleaseGuardHarness::new("hig-release-serve-absent");
     let absent = "the kanban-serve unit is not present on this host";
+    let idle = "the kanban-serve unit is present but neither enabled nor active on this host \
+                (LoadState=loaded UnitFileState=disabled ActiveState=inactive)";
     for target in ["hax", "hig"] {
-        let install_root = harness.fixture.root.join(format!("absent-{target}"));
-        let bin_dir = harness.fixture.root.join(format!("absent-bin-{target}"));
+        for (label, present, reason) in [("absent", false, absent), ("idle", true, idle)] {
+            let install_root = harness.fixture.root.join(format!("{label}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{label}-bin-{target}"));
+            let restart_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-restart-{target}.log"));
+            let mut command = harness.install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            );
+            command.env("FAKE_SERVE_RESTART_LOG", &restart_log);
+            if present {
+                command
+                    .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                    .env("FAKE_SERVE_UNIT_FILE_STATE", "disabled")
+                    .env("FAKE_SERVE_ACTIVE_STATE", "inactive");
+            }
+            let installed = command.output().unwrap();
+            assert!(
+                installed.status.success(),
+                "{target}/{label}: a host that runs no kanban-serve failed the install: {}\nstderr: {}",
+                String::from_utf8_lossy(&installed.stdout),
+                String::from_utf8_lossy(&installed.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&installed.stderr)
+                    .contains(&format!("hig-release: serve restart skipped: {reason}")),
+                "{target}/{label}: the install skipped the restart without saying so: {}",
+                String::from_utf8_lossy(&installed.stderr)
+            );
+            let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+            assert_eq!(
+                installed_json["serve"],
+                json!({ "skipped": reason }),
+                "{target}/{label}: the install receipt does not record why the restart was skipped"
+            );
+            assert!(
+                !restart_log.exists(),
+                "{target}/{label}: the install restarted a unit it reported as not running"
+            );
+            assert_release_view(
+                &install_root,
+                &bin_dir,
+                &PathBuf::from(installed_json["releaseDir"].as_str().unwrap()),
+            );
+        }
+    }
+}
+
+/// Restoring `current` and the bin links restores the PATHS. The process is
+/// not a path: after a failed proof the unit is still running the candidate,
+/// and the rollback then deleted that candidate's directory out from under
+/// the running service. So the rollback restarts the unit onto the restored
+/// links and PROVES the previous release is the one serving before it removes
+/// anything, and a recovery it cannot prove is reported next to the original
+/// failure with the candidate left on disk to recover from.
+#[test]
+fn hig_release_script_install_puts_the_previous_release_back_in_service_when_a_candidate_fails() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-recovery");
+    let commit_a = "0123456789abcdef0123456789abcdef0000ca01";
+    let commit_b = "0123456789abcdef0123456789abcdef0000cb02";
+    let first = harness.fixture.root.join("recover-a");
+    clone_release_package(&harness.package_dir, &first, commit_a);
+    let second = harness.fixture.root.join("recover-b");
+    clone_release_package(&harness.package_dir, &second, commit_b);
+    let release_id_a = release_id_from_package(&first);
+    let release_id_b = release_id_from_package(&second);
+    for target in ["hax", "hig"] {
+        let hax_for = |package: &Path, commit: &str, label: &str| {
+            if target == "hig" {
+                install_matching_hax_package(&harness.hax_context(), package, commit, label)
+            } else {
+                harness.hax_install_root.clone()
+            }
+        };
+        // Two runs of the same failure, differing only in whether the previous
+        // release can be proved back into service.
+        for (label, recoverable) in [("recovered", true), ("stranded", false)] {
+            let install_root = harness.fixture.root.join(format!("{label}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{label}-bin-{target}"));
+            let restart_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-restart-{target}.log"));
+            let current_link = install_root.join("current");
+            let release_a_dir = install_root.join("releases").join(&release_id_a);
+            let release_b_dir = install_root.join("releases").join(&release_id_b);
+
+            // Release A activates on a host whose unit is running, and the exe
+            // the unit reports follows `current`, the way a unit whose
+            // ExecStart runs the public bin link actually behaves.
+            let hax_a = hax_for(&first, commit_a, &format!("{label}-a-{target}"));
+            let activated = harness
+                .install_command(target, &first, &hax_a, &install_root, &bin_dir)
+                .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                .env("FAKE_SERVE_MAIN_PID", "5151")
+                .env("FAKE_SERVE_EXE_FROM_CURRENT", &current_link)
+                .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+                .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+                .output()
+                .unwrap();
+            assert!(
+                activated.status.success(),
+                "{target}/{label}: release A failed to install: {}\nstderr: {}",
+                String::from_utf8_lossy(&activated.stdout),
+                String::from_utf8_lossy(&activated.stderr)
+            );
+            let previous_links = capture_release_links(&install_root, &bin_dir);
+
+            // Release B comes up on the unit and never answers. When the
+            // recovery is meant to succeed only B is refused a 200; when it is
+            // meant to fail, nothing answers at all.
+            let hax_b = hax_for(&second, commit_b, &format!("{label}-b-{target}"));
+            let mut refusing =
+                harness.install_command(target, &second, &hax_b, &install_root, &bin_dir);
+            refusing
+                .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                .env("FAKE_SERVE_MAIN_PID", "5151")
+                .env("FAKE_SERVE_EXE_FROM_CURRENT", &current_link)
+                .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+                .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
+                .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe());
+            if recoverable {
+                refusing
+                    .env("FAKE_SERVE_CURRENT_LINK", &current_link)
+                    .env("FAKE_SERVE_HTTP_BAD_RELEASE", &release_id_b);
+            } else {
+                refusing.env("FAKE_SERVE_HTTP", "503");
+            }
+            let refused = refusing.output().unwrap();
+            assert!(
+                !refused.status.success(),
+                "{target}/{label}: an install nothing answered for went green\nstdout: {}",
+                String::from_utf8_lossy(&refused.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains("did not answer 200"),
+                "{target}/{label}: the refusal does not name the probe that failed:\n{stderr}"
+            );
+            // Restarted for A, for B, and once more to put A back.
+            assert_eq!(
+                fs::read_to_string(&restart_log).unwrap(),
+                "restart kanban-serve\nrestart kanban-serve\nrestart kanban-serve\n",
+                "{target}/{label}: the rollback did not restart the unit onto the restored links"
+            );
+            assert_eq!(
+                capture_release_links(&install_root, &bin_dir),
+                previous_links,
+                "{target}/{label}: the refused activation left the public view on the candidate"
+            );
+            assert_eq!(
+                fs::read_link(&current_link).unwrap(),
+                release_a_dir,
+                "{target}/{label}: current does not point at the release that is serving"
+            );
+            if recoverable {
+                assert!(
+                    !stderr.contains("recovery failed"),
+                    "{target}/{label}: the recovery it proved was reported as a failure:\n{stderr}"
+                );
+                assert!(
+                    !release_b_dir.exists(),
+                    "{target}/{label}: the refused activation left its release directory behind"
+                );
+            } else {
+                assert!(
+                    stderr.contains("recovery failed"),
+                    "{target}/{label}: a recovery that could not be proved was silent:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains("the activation failed AND the recovery failed"),
+                    "{target}/{label}: the operator was told about one failure, not both:\n{stderr}"
+                );
+                assert!(
+                    release_b_dir.is_dir(),
+                    "{target}/{label}: a host with no proved service lost the artifacts to recover from"
+                );
+            }
+        }
+    }
+}
+
+/// `is-enabled` and `is-active` both fail for a unit that does not exist AND
+/// for a manager that cannot be reached, and the guard read that pair as "no
+/// unit on this host": a systemd that could not answer turned the only proof
+/// an install has into a skip notice, and the install reported green with the
+/// new `current` in place and nothing measured behind it.
+#[test]
+fn hig_release_script_install_refuses_when_the_service_manager_cannot_be_asked() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-manager-down");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("manager-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("manager-bin-{target}"));
         let restart_log = harness
             .fixture
             .root
-            .join(format!("absent-restart-{target}.log"));
+            .join(format!("manager-restart-{target}.log"));
+        let refused = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_MANAGER_FAILS", "1")
+            .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{target}: an install went green against a manager that answered nothing\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("the manager could not be asked about kanban-serve"),
+            "{target}: the refusal does not name what could not be asked:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("serve restart skipped"),
+            "{target}: a manager that cannot answer was reported as an absent unit:\n{stderr}"
+        );
+        assert!(
+            !restart_log.exists(),
+            "{target}: the install restarted a unit it could not classify"
+        );
+        assert!(
+            !install_root.join("current").is_symlink(),
+            "{target}: the refused install left current pointing at an unproved release"
+        );
+        assert!(
+            !bin_dir.join("kanban").is_symlink(),
+            "{target}: the refused install left the public bin links behind"
+        );
+        assert!(
+            !install_root.join("releases").join(&release_id).exists(),
+            "{target}: the refused install left its release directory behind"
+        );
+    }
+}
+
+/// A stalled listener is not a slow one. `curl` with no per-request bound
+/// waits on the socket for as long as the peer holds it, and a deadline the
+/// loop only consults BETWEEN requests is never reached: the install hangs,
+/// holding a `current` that points at a release nothing has proved. So every
+/// request is bounded by what is LEFT of the deadline.
+///
+/// The listener accepts the connection and answers nothing, which is what a
+/// serve process wedged on its data root looks like from outside, and it
+/// timestamps its own accept. The bound is measured from THAT - the moment
+/// the probe reached the socket - to the installer's exit, so it is a
+/// statement about the probe and not about what packaging and validation cost
+/// on a loaded machine. Nothing here waits out the deadline twice: the exe
+/// proof is answered immediately, so the whole window between accept and exit
+/// is the HTTP proof plus the rollback behind it.
+#[test]
+fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-stall");
+    let release_id = release_id_from_package(&harness.package_dir);
+    let stalled = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = stalled.local_addr().unwrap().port();
+    // Accepted from the same loop that waits on the installer, so the moment
+    // the probe reached the socket is observed directly rather than through a
+    // second thread's bookkeeping. Every accepted connection is held open,
+    // unread and unanswered, until the installer has given up on it.
+    stalled.set_nonblocking(true).unwrap();
+    let deadline_seconds = 3_u64;
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("stall-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("stall-bin-{target}"));
+        let served_exe = install_root
+            .join("releases")
+            .join(&release_id)
+            .join("kanban");
+        let mut child = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "6161")
+            .env("FAKE_SERVE_PORT", port.to_string())
+            .env("FAKE_SERVE_EXE", &served_exe)
+            // The real curl, against the real stalled socket: a stub that
+            // returns instantly cannot measure a bound on a request.
+            .env("FAKE_SERVE_CURL_REAL", "1")
+            .env(
+                "HIG_RELEASE_SERVE_DEADLINE_SECONDS",
+                deadline_seconds.to_string(),
+            )
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let give_up = Instant::now() + Duration::from_secs(90);
+        let mut connections = Vec::new();
+        let mut reached_the_socket: Option<Instant> = None;
+        let exited = loop {
+            while let Ok((connection, _)) = stalled.accept() {
+                reached_the_socket.get_or_insert_with(Instant::now);
+                connections.push(connection);
+            }
+            match child.try_wait().unwrap() {
+                Some(_) => break Instant::now(),
+                None if Instant::now() >= give_up => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{target}: the installer blocked on a stalled HTTP probe");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{target}: an install went green against a listener that answered nothing\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("did not answer 200"),
+            "{target}: the refusal does not name the probe that timed out:\n{stderr}"
+        );
+        let reached_the_socket =
+            reached_the_socket.expect("the stalled listener never saw the probe");
+        let stalled_for = exited.duration_since(reached_the_socket);
+        assert!(
+            stalled_for <= Duration::from_secs(deadline_seconds + 2),
+            "{target}: the probe reached the socket and the installer took {stalled_for:?} to give up on a {deadline_seconds}s deadline; the requests are not bounded by what is left of it"
+        );
+    }
+}
+
+/// The exe proof is an identity, not a prefix. A pid running `kb` out of the
+/// release directory is not the server, and the kernel writes `<path>
+/// (deleted)` for a pid whose executable has been unlinked - which is exactly
+/// what a rolled-back release leaves a running service holding. Both sat
+/// inside the release directory and both passed a prefix test. And on a first
+/// install there is nothing to fall back to, so the unit is STOPPED before its
+/// executable is deleted rather than left in a restart loop over a path that
+/// no longer exists.
+#[test]
+fn hig_release_script_install_refuses_an_exe_that_is_not_the_retained_release_binary() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-exe-identity");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        for (label, exe_name) in [("deleted", "kanban (deleted)"), ("other-binary", "kb")] {
+            let install_root = harness.fixture.root.join(format!("{label}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{label}-bin-{target}"));
+            let release_dir = install_root.join("releases").join(&release_id);
+            let restart_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-restart-{target}.log"));
+            let curl_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-curl-{target}.log"));
+            let refused = harness
+                .install_command(
+                    target,
+                    &harness.package_dir,
+                    &harness.hax_install_root,
+                    &install_root,
+                    &bin_dir,
+                )
+                .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                .env("FAKE_SERVE_MAIN_PID", "7171")
+                .env("FAKE_SERVE_EXE", release_dir.join(exe_name))
+                .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+                .env("FAKE_SERVE_CURL_LOG", &curl_log)
+                .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
+                .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+                .output()
+                .unwrap();
+            assert!(
+                !refused.status.success(),
+                "{target}/{label}: an install went green on an exe that is not the release binary\nstdout: {}",
+                String::from_utf8_lossy(&refused.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains("is not running the release just installed"),
+                "{target}/{label}: the refusal does not name what it measured:\n{stderr}"
+            );
+            assert!(
+                !curl_log.exists(),
+                "{target}/{label}: the HTTP probe ran against an exe that had already failed"
+            );
+            assert_eq!(
+                fs::read_to_string(&restart_log).unwrap(),
+                "restart kanban-serve\nstop kanban-serve\n",
+                "{target}/{label}: a first install deleted the executable of a unit it left running"
+            );
+            assert!(
+                !install_root.join("current").is_symlink(),
+                "{target}/{label}: the refused install left current behind"
+            );
+            assert!(
+                !release_dir.exists(),
+                "{target}/{label}: the refused install left its release directory behind"
+            );
+        }
+    }
+}
+
+/// `kanban serve` takes exactly one listener - `--port N` or `--socket PATH`,
+/// never both and never neither (README, "The web view"). The proof reads the
+/// unit's own ExecStart for it: a probe with a listener of its own proves a
+/// port nobody moved, and a unit that names a socket is proved through that
+/// socket. systemd renders an argument containing a space quoted, so the
+/// socket here has one: a parser that splits ExecStart on spaces probes a path
+/// that does not exist and calls the timeout a failed install.
+#[test]
+fn hig_release_script_install_probes_the_listener_the_unit_names() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-listener");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("listener-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("listener-bin-{target}"));
+        let served_exe = install_root
+            .join("releases")
+            .join(&release_id)
+            .join("kanban");
+        let socket = harness
+            .fixture
+            .root
+            .join(format!("kanban serve-{target}.sock"));
+        let curl_log = harness
+            .fixture
+            .root
+            .join(format!("listener-curl-{target}.log"));
         let installed = harness
             .install_command(
                 target,
@@ -30862,37 +31438,763 @@ fn hig_release_script_install_skips_the_restart_when_the_unit_is_absent() {
                 &install_root,
                 &bin_dir,
             )
-            .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "8181")
+            .env("FAKE_SERVE_SOCKET", &socket)
+            .env("FAKE_SERVE_EXE", &served_exe)
+            .env("FAKE_SERVE_CURL_LOG", &curl_log)
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
             .output()
             .unwrap();
         assert!(
             installed.status.success(),
-            "{target}: a host without the unit failed the install: {}\nstderr: {}",
+            "{target}: install failed: {}\nstderr: {}",
             String::from_utf8_lossy(&installed.stdout),
             String::from_utf8_lossy(&installed.stderr)
         );
+        let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        assert_eq!(
+            installed_json["serve"]["listener"],
+            json!({ "socket": socket.to_str().unwrap() }),
+            "{target}: the receipt does not carry the listener the proof used"
+        );
+        assert_eq!(
+            fs::read_to_string(&curl_log).unwrap(),
+            format!("{} http://localhost/\n", socket.display()),
+            "{target}: the HTTP proof did not go through the socket the unit names"
+        );
+
+        for (label, exec_start, refusal) in [
+            (
+                "no-listener",
+                "{ path=/root/.local/bin/kanban ; argv[]=/root/.local/bin/kanban serve --actor-header X-Auth-Request-Email ; ignore_errors=no }",
+                "names no listener",
+            ),
+            (
+                "two-listeners",
+                "{ path=/root/.local/bin/kanban ; argv[]=/root/.local/bin/kanban serve --port 14200 --socket /run/kanban/kanban.sock ; ignore_errors=no }",
+                "names more than one listener",
+            ),
+        ] {
+            let install_root = harness.fixture.root.join(format!("{label}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{label}-bin-{target}"));
+            let restart_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-restart-{target}.log"));
+            let refused = harness
+                .install_command(
+                    target,
+                    &harness.package_dir,
+                    &harness.hax_install_root,
+                    &install_root,
+                    &bin_dir,
+                )
+                .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                .env("FAKE_SERVE_MAIN_PID", "8282")
+                .env("FAKE_SERVE_EXEC_START", exec_start)
+                .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+                .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+                .output()
+                .unwrap();
+            assert!(
+                !refused.status.success(),
+                "{target}/{label}: an install went green against a listener it could not read\nstdout: {}",
+                String::from_utf8_lossy(&refused.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains(refusal),
+                "{target}/{label}: expected {refusal:?} in:\n{stderr}"
+            );
+            assert!(
+                !restart_log.exists(),
+                "{target}/{label}: the unit was restarted before its listener was known"
+            );
+            assert!(
+                !install_root.join("current").is_symlink(),
+                "{target}/{label}: the refused install left current behind"
+            );
+        }
+    }
+}
+
+/// Three ways the restart does not produce a serving release, none of which
+/// may be mistaken for one: the job itself fails, the unit never leaves
+/// `activating`, and the unit reports active with no MainPID at all. Each is
+/// refused naming what it measured, and each leaves the host with no `current`
+/// it cannot back up.
+#[test]
+fn hig_release_script_install_refuses_a_restart_that_never_produces_a_serving_release() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-transitions");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        for (label, key, value, expected) in [
+            (
+                "restart-fails",
+                "FAKE_SERVE_RESTART_FAILS",
+                "1",
+                "serve restart failed",
+            ),
+            (
+                "never-active",
+                "FAKE_SERVE_ACTIVE_STATE",
+                "activating",
+                "ActiveState=activating",
+            ),
+            ("no-main-pid", "FAKE_SERVE_MAIN_PID", "0", "MainPID=0"),
+        ] {
+            let install_root = harness.fixture.root.join(format!("{label}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{label}-bin-{target}"));
+            let release_dir = install_root.join("releases").join(&release_id);
+            let curl_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-curl-{target}.log"));
+            let refused = harness
+                .install_command(
+                    target,
+                    &harness.package_dir,
+                    &harness.hax_install_root,
+                    &install_root,
+                    &bin_dir,
+                )
+                .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                .env("FAKE_SERVE_MAIN_PID", "9191")
+                .env("FAKE_SERVE_EXE", release_dir.join("kanban"))
+                .env("FAKE_SERVE_CURL_LOG", &curl_log)
+                .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
+                .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+                .env(key, value)
+                .output()
+                .unwrap();
+            assert!(
+                !refused.status.success(),
+                "{target}/{label}: an install went green without a serving release\nstdout: {}",
+                String::from_utf8_lossy(&refused.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains(expected),
+                "{target}/{label}: expected {expected:?} in:\n{stderr}"
+            );
+            assert!(
+                !curl_log.exists(),
+                "{target}/{label}: the HTTP probe ran before the unit was proved"
+            );
+            assert!(
+                !install_root.join("current").is_symlink(),
+                "{target}/{label}: the refused install left current behind"
+            );
+            assert!(
+                !release_dir.exists(),
+                "{target}/{label}: the refused install left its release directory behind"
+            );
+        }
+    }
+}
+
+/// The activation receipt is the record that a release ACTIVATED, so it is
+/// written after the proof. The remote installer wrote it before, numbered
+/// with a sequence the store hands out once, and the rollback deleted it only
+/// when this install had created the release directory - so an activation onto
+/// a directory that was already there left a receipt for an activation that
+/// never happened, and `kb`'s own release listing counted it. The local
+/// installer already wrote after the proof; both paths are measured here so
+/// they cannot drift apart again.
+#[test]
+fn hig_release_script_install_writes_no_activation_receipt_when_the_proof_fails() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-receipt-order");
+    let commit_a = "0123456789abcdef0123456789abcdef0000da01";
+    let commit_b = "0123456789abcdef0123456789abcdef0000db02";
+    let first = harness.fixture.root.join("receipt-a");
+    clone_release_package(&harness.package_dir, &first, commit_a);
+    let second = harness.fixture.root.join("receipt-b");
+    clone_release_package(&harness.package_dir, &second, commit_b);
+    let release_id_a = release_id_from_package(&first);
+    let release_id_b = release_id_from_package(&second);
+    for target in ["hax", "hig"] {
+        let hax_for = |package: &Path, commit: &str, label: &str| {
+            if target == "hig" {
+                install_matching_hax_package(&harness.hax_context(), package, commit, label)
+            } else {
+                harness.hax_install_root.clone()
+            }
+        };
+        let install_root = harness.fixture.root.join(format!("receipt-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("receipt-bin-{target}"));
+        let current_link = install_root.join("current");
+        let sequence_path = install_root.join("releases/.activation-sequence");
+        let receipt_b = install_root
+            .join("releases")
+            .join(format!("{release_id_b}.receipt.json"));
+
+        // A and B both activate on a host with no unit, then the operator
+        // rolls back to A: B's directory is retained, and its receipt is the
+        // one thing a later activation of B must write for itself.
+        let hax_a = hax_for(&first, commit_a, &format!("receipt-a-{target}"));
+        let activated_a = harness.install_from(target, &first, &hax_a, &install_root, &bin_dir);
         assert!(
-            String::from_utf8_lossy(&installed.stderr)
-                .contains(&format!("hig-release: serve restart skipped: {absent}")),
-            "{target}: the install skipped the restart without saying so: {}",
+            activated_a.status.success(),
+            "{target}: release A failed to install: {}",
+            String::from_utf8_lossy(&activated_a.stderr)
+        );
+        let hax_b = hax_for(&second, commit_b, &format!("receipt-b-{target}"));
+        let activated_b = harness.install_from(target, &second, &hax_b, &install_root, &bin_dir);
+        assert!(
+            activated_b.status.success(),
+            "{target}: release B failed to install: {}",
+            String::from_utf8_lossy(&activated_b.stderr)
+        );
+        let rolled_back = harness
+            .command()
+            .args([
+                "rollback",
+                target,
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            rolled_back.status.success(),
+            "{target}: rollback to release A failed: {}",
+            String::from_utf8_lossy(&rolled_back.stderr)
+        );
+        fs::remove_file(&receipt_b).unwrap();
+        let sequence_before = fs::read_to_string(&sequence_path).unwrap();
+
+        // B activates again onto the directory it left behind, and never
+        // answers.
+        let refused = harness
+            .install_command(target, &second, &hax_b, &install_root, &bin_dir)
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "9292")
+            .env("FAKE_SERVE_EXE_FROM_CURRENT", &current_link)
+            .env("FAKE_SERVE_CURRENT_LINK", &current_link)
+            .env("FAKE_SERVE_HTTP_BAD_RELEASE", &release_id_b)
+            .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{target}: an install nothing answered for went green\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert!(
+            !receipt_b.exists(),
+            "{target}: a refused activation left a receipt for an activation that never happened"
+        );
+        assert_eq!(
+            fs::read_to_string(&sequence_path).unwrap(),
+            sequence_before,
+            "{target}: a refused activation burned an activation sequence number"
+        );
+        assert!(
+            install_root.join("releases").join(&release_id_b).is_dir(),
+            "{target}: the rollback deleted a release directory this install did not create"
+        );
+        assert_eq!(
+            fs::read_link(&current_link).unwrap(),
+            install_root.join("releases").join(&release_id_a),
+            "{target}: current does not point at the release that is serving"
+        );
+    }
+}
+
+/// Every other serve test reads the exe through the documented test seam,
+/// `HIG_RELEASE_EXE_OF_PID`, which answers a path a fixture chose. The
+/// default witness is the kernel's: `readlink /proc/<pid>/exe`, on the hosts
+/// this installs to. So this one takes the seam away and puts a real process
+/// behind the proof - the very `kanban` executable retained inside the release
+/// - and lets the installer read the real link and the real 200 for it. Linux
+/// only: macOS has no /proc, which is why the seam exists at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn hig_release_script_install_proves_the_served_exe_through_proc_on_linux() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-proc");
+    let release_id = release_id_from_package(&harness.package_dir);
+    harness
+        .fixture
+        .ok_json(&harness.fixture.main, &["init", "--name", "PROC", "--json"]);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("proc-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("proc-bin-{target}"));
+        let served_exe = install_root
+            .join("releases")
+            .join(&release_id)
+            .join("kanban");
+        // A first activation with no unit, so the release binary exists to be
+        // run; the proved activation is the one after it.
+        let staged = harness.install(target, &install_root, &bin_dir);
+        assert!(
+            staged.status.success(),
+            "{target}: staging install failed: {}",
+            String::from_utf8_lossy(&staged.stderr)
+        );
+        let port = {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut server = Command::new(&served_exe)
+            .current_dir(&harness.fixture.main)
+            .env("KANBAN_DATA_DIR", &harness.fixture.data)
+            .env_remove("KANBAN_DB")
+            .args(["serve", "--port", &port.to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = Instant::now() + Duration::from_secs(20);
+        loop {
+            if matches!(
+                std::panic::catch_unwind(|| http_get(port, "/")),
+                Ok((200, _))
+            ) {
+                break;
+            }
+            if Instant::now() >= ready {
+                let _ = server.kill();
+                let _ = server.wait();
+                panic!("{target}: the retained release binary never served on {port}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid = server.id();
+        let installed = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", pid.to_string())
+            .env("FAKE_SERVE_PORT", port.to_string())
+            .env("FAKE_SERVE_CURL_REAL", "1")
+            .output()
+            .unwrap();
+        let _ = server.kill();
+        let _ = server.wait();
+        assert!(
+            installed.status.success(),
+            "{target}: install failed against a real /proc witness: {}\nstderr: {}",
+            String::from_utf8_lossy(&installed.stdout),
             String::from_utf8_lossy(&installed.stderr)
         );
         let installed_json: Value = serde_json::from_slice(&installed.stdout).unwrap();
         assert_eq!(
             installed_json["serve"],
-            json!({ "skipped": absent }),
-            "{target}: the install receipt does not record why the restart was skipped"
-        );
-        assert!(
-            !restart_log.exists(),
-            "{target}: the install restarted a unit it reported as absent"
-        );
-        assert_release_view(
-            &install_root,
-            &bin_dir,
-            &PathBuf::from(installed_json["releaseDir"].as_str().unwrap()),
+            json!({
+                "restarted": true,
+                "mainPid": pid,
+                "exe": served_exe.to_str().unwrap(),
+                "exeSource": format!("/proc/{pid}/exe"),
+                "listener": { "port": port },
+                "http": 200,
+            }),
+            "{target}: the receipt does not carry the proof the kernel gave"
         );
     }
+}
+
+/// A 200 says something answered the listener. It does not say the process
+/// measured a moment earlier answered it: a candidate that dies between the
+/// exe read and the probe leaves the port to whatever systemd starts next,
+/// and a stranger already holding it answers just as well. So the pid and its
+/// exe are read AGAIN after the 200, and the unit changes here in exactly
+/// that window - once by swapping the MainPID, once by leaving the pid alone
+/// and changing what it is running. Both are refused; remove the
+/// revalidation and both go green.
+#[test]
+fn hig_release_script_install_refuses_when_the_process_changes_after_the_200() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-post-200");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        for (label, after_pid, after_exe) in [
+            ("new-pid", Some("7373"), None),
+            ("new-exe", None, Some("/usr/lib/systemd/systemd-executor")),
+        ] {
+            let install_root = harness.fixture.root.join(format!("{label}-{target}"));
+            let bin_dir = harness.fixture.root.join(format!("{label}-bin-{target}"));
+            let release_dir = install_root.join("releases").join(&release_id);
+            let restart_log = harness
+                .fixture
+                .root
+                .join(format!("{label}-restart-{target}.log"));
+            let trigger = harness
+                .fixture
+                .root
+                .join(format!("{label}-answered-{target}"));
+            let mut command = harness.install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            );
+            command
+                .env("FAKE_SERVE_UNIT_PRESENT", "1")
+                .env("FAKE_SERVE_MAIN_PID", "7272")
+                .env("FAKE_SERVE_EXE", release_dir.join("kanban"))
+                .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+                .env("FAKE_SERVE_CURL_TRIGGER", &trigger)
+                .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
+                .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe());
+            if let Some(pid) = after_pid {
+                command.env("FAKE_SERVE_MAIN_PID_AFTER", pid);
+            }
+            if let Some(exe) = after_exe {
+                command.env("FAKE_SERVE_EXE_AFTER", exe);
+            }
+            let refused = command.output().unwrap();
+            assert!(
+                !refused.status.success(),
+                "{target}/{label}: a 200 from a process the install never proved went green\nstdout: {}",
+                String::from_utf8_lossy(&refused.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains("answered 200 but the process serving it is not the one proved"),
+                "{target}/{label}: the refusal does not name the divergence:\n{stderr}"
+            );
+            assert!(
+                trigger.exists(),
+                "{target}/{label}: the HTTP probe never ran, so nothing was revalidated"
+            );
+            assert_eq!(
+                fs::read_to_string(&restart_log).unwrap(),
+                "restart kanban-serve\nstop kanban-serve\n",
+                "{target}/{label}: a first install left the unit running over a deleted release"
+            );
+            assert!(
+                !install_root.join("current").is_symlink(),
+                "{target}/{label}: the refused install left current behind"
+            );
+            assert!(
+                !release_dir.exists(),
+                "{target}/{label}: the refused install left its release directory behind"
+            );
+        }
+    }
+}
+
+/// The first install on a host has no previous release to fall back to, so a
+/// failed proof leaves the unit running an executable that is about to be
+/// deleted: it is STOPPED first. When the stop itself fails, the candidate
+/// binary is exactly what the host still needs - the unit may still be
+/// running it - so it is kept, and the operator is told both what failed and
+/// what was kept.
+#[test]
+fn hig_release_script_install_keeps_the_candidate_when_the_unit_cannot_be_stopped() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-stop-fails");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("stop-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("stop-bin-{target}"));
+        let release_dir = install_root.join("releases").join(&release_id);
+        let restart_log = harness
+            .fixture
+            .root
+            .join(format!("stop-restart-{target}.log"));
+        let refused = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "7474")
+            // Serving something that is not the release binary, so the proof
+            // fails and the rollback has to stop the unit.
+            .env("FAKE_SERVE_EXE", release_dir.join("kb"))
+            .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+            .env("FAKE_SERVE_STOP_FAILS", "1")
+            .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "2")
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{target}: an install whose unit could not be stopped went green\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        for measured in [
+            "is not running the release just installed",
+            "recovery failed: systemctl stop kanban-serve",
+            "the activation failed AND the recovery failed",
+        ] {
+            assert!(
+                stderr.contains(measured),
+                "{target}: the operator was not told {measured:?}:\n{stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&restart_log).unwrap(),
+            "restart kanban-serve\nstop kanban-serve\n",
+            "{target}: the rollback deleted the executable without trying to stop the unit first"
+        );
+        assert!(
+            release_dir.join("kanban").is_file(),
+            "{target}: the executable a possibly-running unit needs was deleted anyway"
+        );
+        assert!(
+            !install_root.join("current").is_symlink(),
+            "{target}: the refused install left current pointing at an unproved release"
+        );
+    }
+}
+
+/// Cleanup failure must retain the old directory's index, survive a later
+/// successful removal, and leave a proved activation and its summary intact.
+#[test]
+fn hig_release_script_prune_failure_keeps_index_and_committed_summary() {
+    let harness = ReleaseGuardHarness::new("hig-release-prune-failure");
+    write_executable(
+        &harness.hostname_bin.parent().unwrap().join("rm"),
+        r#"#!/bin/sh
+set -eu
+for path in "$@"; do
+  if [ "$path" = "$FAKE_PRUNE_FAIL_DIR" ]; then
+    printf 'injected release-directory removal failure: %s\n' "$path" >&2
+    exit 9
+  fi
+done
+command -p rm "$@"
+"#,
+    );
+    let release_id = release_id_from_package(&harness.package_dir);
+    for operation in ["hax", "hig", "rollback"] {
+        let install_root = harness.fixture.root.join(format!("prune-{operation}"));
+        let bin_dir = harness.fixture.root.join(format!("prune-bin-{operation}"));
+        let releases = install_root.join("releases");
+        let candidate = releases.join(&release_id);
+        let candidate_receipt = releases.join(format!("{release_id}.receipt.json"));
+        if operation == "rollback" {
+            let staged = harness
+                .install_command(
+                    "hax",
+                    &harness.package_dir,
+                    &harness.hax_install_root,
+                    &install_root,
+                    &bin_dir,
+                )
+                .env("FAKE_PRUNE_FAIL_DIR", "")
+                .output()
+                .unwrap();
+            assert!(
+                staged.status.success(),
+                "{}",
+                String::from_utf8_lossy(&staged.stderr)
+            );
+            let mut receipt: Value =
+                serde_json::from_slice(&fs::read(&candidate_receipt).unwrap()).unwrap();
+            receipt["activationSequence"] = json!(12);
+            fs::write(&candidate_receipt, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        }
+        fs::create_dir_all(&releases).unwrap();
+        let old_id = |sequence: u64| format!("{sequence:040x}-{sequence:064x}");
+        // Retention only reads these old entries' identity and ordering;
+        // the candidate is activated and validated as a complete package.
+        for sequence in 1..=11 {
+            let id = old_id(sequence);
+            fs::create_dir(releases.join(&id)).unwrap();
+            fs::write(releases.join(&id).join("retained"), b"keep until removed").unwrap();
+            fs::write(
+                releases.join(format!("{id}.receipt.json")),
+                serde_json::to_vec(&json!({
+                    "releaseId": id,
+                    "activationSequence": sequence,
+                    "installedAt": sequence,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        fs::write(
+            releases.join(".activation-sequence"),
+            if operation == "rollback" {
+                "12\n"
+            } else {
+                "11\n"
+            },
+        )
+        .unwrap();
+        let failed_dir = releases.join(old_id(2));
+        let failed_receipt = releases.join(format!("{}.receipt.json", old_id(2)));
+        let before = fs::read(&failed_receipt).unwrap();
+        let mut command = if operation == "rollback" {
+            let mut command = harness.command();
+            // The service-changing rollback has its own case; reactivation
+            // here exercises its shared pruning path.
+            command.args([
+                "rollback",
+                "hax",
+                "--steps",
+                "0",
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--bin-dir",
+                bin_dir.to_str().unwrap(),
+            ]);
+            command
+        } else {
+            harness.install_command(
+                operation,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+        };
+        let output = command
+            .env("FAKE_PRUNE_FAIL_DIR", &failed_dir)
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "7676")
+            .env("FAKE_SERVE_EXE_FROM_CURRENT", install_root.join("current"))
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{operation}: pruning failure went green: {stderr}"
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!("{operation}: committed failure lost its structured summary: {error}\n{stderr}")
+        });
+        assert_eq!(summary["releaseDir"], candidate.to_str().unwrap());
+        assert_eq!(summary["serve"]["restarted"], true);
+        assert_eq!(
+            summary["serve"]["exe"],
+            candidate.join("kanban").to_str().unwrap()
+        );
+        assert_eq!(summary["serve"]["http"], 200);
+        assert_release_view(&install_root, &bin_dir, &candidate);
+        assert!(candidate.join("kanban").is_file());
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(&candidate_receipt).unwrap()).unwrap();
+        assert_eq!(receipt["releaseId"], release_id);
+        assert_eq!(
+            fs::read(&failed_receipt).unwrap(),
+            before,
+            "{operation}: failed directory lost its index"
+        );
+        assert_eq!(
+            fs::read(failed_dir.join("retained")).unwrap(),
+            b"keep until removed"
+        );
+        // A successful removal follows the failed one. It must not erase the
+        // aggregate failure status or keep unrelated old entries needlessly.
+        assert!(!releases.join(old_id(1)).exists());
+        assert!(
+            !releases
+                .join(format!("{}.receipt.json", old_id(1)))
+                .exists()
+        );
+        assert!(
+            stderr.contains("injected release-directory removal failure"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("pruning older releases") && stderr.contains("failed"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("recovery failed"),
+            "{operation}: committed activation was rolled back: {stderr}"
+        );
+    }
+}
+
+/// An operator rollback moves the same links an install moves, so it owes the
+/// same proof. Before this it moved `current` and the bin links and said
+/// nothing about the process: the host kept serving the release the operator
+/// had just rolled BACK from, and the summary read like a success. Now the
+/// unit is restarted and the release rolled back to is proved to be the one
+/// serving, and the summary carries that measurement.
+#[test]
+fn hig_release_script_rollback_puts_the_release_it_rolls_back_to_into_service() {
+    let harness = ReleaseGuardHarness::new("hig-release-rollback-serve");
+    let commit_a = "0123456789abcdef0123456789abcdef0000ea01";
+    let commit_b = "0123456789abcdef0123456789abcdef0000eb02";
+    let first = harness.fixture.root.join("rollback-a");
+    clone_release_package(&harness.package_dir, &first, commit_a);
+    let second = harness.fixture.root.join("rollback-b");
+    clone_release_package(&harness.package_dir, &second, commit_b);
+    let release_id_a = release_id_from_package(&first);
+    let install_root = harness.fixture.root.join("rollback-serve-root");
+    let bin_dir = harness.fixture.root.join("rollback-serve-bin");
+    let current_link = install_root.join("current");
+    let restart_log = harness.fixture.root.join("rollback-serve-restart.log");
+    for package in [&first, &second] {
+        let installed = harness.install_from(
+            "hax",
+            package,
+            &harness.hax_install_root,
+            &install_root,
+            &bin_dir,
+        );
+        assert!(
+            installed.status.success(),
+            "staging install failed: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+    let release_a_dir = install_root.join("releases").join(&release_id_a);
+    let rolled_back = harness
+        .command()
+        .args([
+            "rollback",
+            "hax",
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+        ])
+        .env("FAKE_SERVE_UNIT_PRESENT", "1")
+        .env("FAKE_SERVE_MAIN_PID", "7575")
+        .env("FAKE_SERVE_EXE_FROM_CURRENT", &current_link)
+        .env("FAKE_SERVE_RESTART_LOG", &restart_log)
+        .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+        .output()
+        .unwrap();
+    assert!(
+        rolled_back.status.success(),
+        "rollback failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&rolled_back.stdout),
+        String::from_utf8_lossy(&rolled_back.stderr)
+    );
+    let rolled_back_json: Value = serde_json::from_slice(&rolled_back.stdout).unwrap();
+    assert_eq!(
+        rolled_back_json["serve"],
+        json!({
+            "restarted": true,
+            "mainPid": 7575,
+            "exe": release_a_dir.join("kanban").to_str().unwrap(),
+            "exeSource": format!("override:{}", harness.exe_probe().display()),
+            "listener": { "port": 14200 },
+            "http": 200,
+        }),
+        "the rollback summary does not carry the service it proved"
+    );
+    assert_eq!(
+        fs::read_to_string(&restart_log).unwrap(),
+        "restart kanban-serve\n",
+        "the rollback moved the links without restarting the unit"
+    );
+    assert_eq!(
+        fs::read_link(&current_link).unwrap(),
+        release_a_dir,
+        "the rollback did not leave current on the release it rolled back to"
+    );
 }
 
 /// A release's identity is derived, never carried: the id is
