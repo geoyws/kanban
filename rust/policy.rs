@@ -510,6 +510,23 @@ pub struct PolicyActor {
     pub context: PolicyContext,
 }
 
+/// One pre-principal denial, as the caller knows it.
+///
+/// These attempts are refused before a [`PolicyActor`] can exist, so the
+/// caller carries the denial's identity (`operation`, `stage`, `code`), the
+/// UID pair it was refused on, and the `--as`/`--reason` claim it made, all in
+/// one value for [`Registry::record_denied_attempt`].
+pub struct DeniedAttempt<'a> {
+    pub operation: &'a str,
+    pub stage: &'a str,
+    pub code: &'a str,
+    /// Empty when the UID resolved to no passwd entry at all.
+    pub username: &'a str,
+    pub uid: u32,
+    pub claimed_actor: Option<String>,
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Clause 5: the capability lattice.
 // ---------------------------------------------------------------------------
@@ -1374,83 +1391,80 @@ fn audit_get_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str>
     value.get(key).and_then(|v| v.as_str())
 }
 
+/// The clause-12 `audit` filter set, carried as one value.
+///
+/// The two journals apply the identical set and [`Registry::audit_events`]
+/// reads both, so the filters travel together rather than as a parameter list
+/// repeated three times.
+pub struct AuditFilterSpec<'a> {
+    pub principal: Option<&'a str>,
+    pub actor_principal: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub capability: Option<Capability>,
+    pub scope: Option<&'a ScopeTuple>,
+    pub after_epoch: Option<i64>,
+}
+
 /// Apply the clause-12 `audit` filters to a projected policy event.
-fn audit_policy_matches(
-    value: &serde_json::Value,
-    principal: Option<&str>,
-    actor_principal: Option<&str>,
-    kind: Option<&str>,
-    capability: Option<Capability>,
-    scope: Option<&ScopeTuple>,
-    after_epoch: Option<i64>,
-) -> bool {
-    if let Some(k) = kind {
-        if audit_get_str(value, "kind") != Some(k) {
-            return false;
-        }
+fn audit_policy_matches(value: &serde_json::Value, filter: &AuditFilterSpec<'_>) -> bool {
+    if let Some(k) = filter.kind
+        && audit_get_str(value, "kind") != Some(k)
+    {
+        return false;
     }
-    if let Some(actor) = actor_principal {
-        if audit_get_str(value, "actorPrincipalID") != Some(actor) {
-            return false;
-        }
+    if let Some(actor) = filter.actor_principal
+        && audit_get_str(value, "actorPrincipalID") != Some(actor)
+    {
+        return false;
     }
-    if let Some(p) = principal {
+    if let Some(p) = filter.principal {
         let target = audit_get_str(value, "targetPrincipalID") == Some(p);
         let actor = audit_get_str(value, "actorPrincipalID") == Some(p);
         if !target && !actor {
             return false;
         }
     }
-    if capability.is_some() || scope.is_some() {
+    if filter.capability.is_some() || filter.scope.is_some() {
         // Capability and scope are not carried on a policy event's projection;
         // a tuple filter excludes every policy event (clause 12: the scope
         // filter must form one tuple, and policy events do not name one).
         return false;
     }
-    if let Some(after) = after_epoch {
-        if value
+    if let Some(after) = filter.after_epoch
+        && value
             .get("afterEpoch")
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
             < after
-        {
-            return false;
-        }
+    {
+        return false;
     }
     true
 }
 
 /// Apply the clause-12 `audit` filters to a projected access-audit event.
-fn audit_access_matches(
-    value: &serde_json::Value,
-    principal: Option<&str>,
-    actor_principal: Option<&str>,
-    kind: Option<&str>,
-    capability: Option<Capability>,
-    scope: Option<&ScopeTuple>,
-    after_epoch: Option<i64>,
-) -> bool {
-    if let Some(k) = kind {
-        if audit_get_str(value, "operation") != Some(k) {
-            return false;
-        }
+fn audit_access_matches(value: &serde_json::Value, filter: &AuditFilterSpec<'_>) -> bool {
+    if let Some(k) = filter.kind
+        && audit_get_str(value, "operation") != Some(k)
+    {
+        return false;
     }
-    if let Some(actor) = actor_principal {
-        if audit_get_str(value, "actorPrincipalID") != Some(actor) {
-            return false;
-        }
+    if let Some(actor) = filter.actor_principal
+        && audit_get_str(value, "actorPrincipalID") != Some(actor)
+    {
+        return false;
     }
-    if let Some(p) = principal {
-        if audit_get_str(value, "actorPrincipalID") != Some(p) {
-            return false;
-        }
+    if let Some(p) = filter.principal
+        && audit_get_str(value, "actorPrincipalID") != Some(p)
+    {
+        return false;
     }
-    if let Some(cap) = capability {
-        if audit_get_str(value, "requestedCapability") != Some(cap.as_str()) {
-            return false;
-        }
+    if let Some(cap) = filter.capability
+        && audit_get_str(value, "requestedCapability") != Some(cap.as_str())
+    {
+        return false;
     }
-    if let Some(tuple) = scope {
+    if let Some(tuple) = filter.scope {
         let atoms = tuple.to_atoms();
         let matched = value
             .get("requiredScopes")
@@ -1472,15 +1486,14 @@ fn audit_access_matches(
             return false;
         }
     }
-    if let Some(after) = after_epoch {
-        if value
+    if let Some(after) = filter.after_epoch
+        && value
             .get("policyEpoch")
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
             < after
-        {
-            return false;
-        }
+    {
+        return false;
     }
     true
 }
@@ -1515,16 +1528,16 @@ impl Registry {
     /// hardest-failing and most interesting attempts were the only ones that
     /// left no row at all. A root caller's denied `access grant` is exactly
     /// the attempt an operator would go looking for.
-    pub fn record_denied_attempt(
-        &self,
-        operation: &str,
-        stage: &str,
-        code: &str,
-        username: &str,
-        uid: u32,
-        claimed_actor: Option<String>,
-        reason: Option<String>,
-    ) -> anyhow::Error {
+    pub fn record_denied_attempt(&self, attempt: DeniedAttempt<'_>) -> anyhow::Error {
+        let DeniedAttempt {
+            operation,
+            stage,
+            code,
+            username,
+            uid,
+            claimed_actor,
+            reason,
+        } = attempt;
         let epoch = policy_epoch_on(&self.connection).unwrap_or(0);
         let actor = PolicyActor {
             principal_id: None,
@@ -3704,12 +3717,7 @@ impl Registry {
     /// clause-12 filters applied. `limit` bounds the returned rows.
     pub fn audit_events(
         &self,
-        principal: Option<&str>,
-        actor_principal: Option<&str>,
-        kind: Option<&str>,
-        capability: Option<Capability>,
-        scope: Option<&ScopeTuple>,
-        after_epoch: Option<i64>,
+        filter: &AuditFilterSpec<'_>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
         let mut out = Vec::new();
@@ -3717,18 +3725,10 @@ impl Registry {
             let mut stmt = self.connection.prepare(
                 "SELECT seq,prev_hash,event_hash,payload FROM policy_events ORDER BY seq DESC LIMIT ?1",
             )?;
-            let rows = stmt.query_map(params![limit], |row| policy_event_projection(row))?;
+            let rows = stmt.query_map(params![limit], policy_event_projection)?;
             for row in rows {
                 let value = row?;
-                if audit_policy_matches(
-                    &value,
-                    principal,
-                    actor_principal,
-                    kind,
-                    capability,
-                    scope,
-                    after_epoch,
-                ) {
+                if audit_policy_matches(&value, filter) {
                     out.push(value);
                 }
             }
@@ -3737,18 +3737,10 @@ impl Registry {
             let mut stmt = self.connection.prepare(
                 "SELECT seq,prev_hash,event_hash,payload FROM access_audit ORDER BY seq DESC LIMIT ?1",
             )?;
-            let rows = stmt.query_map(params![limit], |row| access_audit_projection(row))?;
+            let rows = stmt.query_map(params![limit], access_audit_projection)?;
             for row in rows {
                 let value = row?;
-                if audit_access_matches(
-                    &value,
-                    principal,
-                    actor_principal,
-                    kind,
-                    capability,
-                    scope,
-                    after_epoch,
-                ) {
+                if audit_access_matches(&value, filter) {
                     out.push(value);
                 }
             }
@@ -4458,7 +4450,7 @@ mod tests {
         // the retired principal and mints a brand-new identity.
         admin_actor = mint(&registry, &admin_id, "geoyws", 1000);
         let mallory = registry
-            .bind_principal("mallory", 1001, &[alice.clone()], &admin_actor)
+            .bind_principal("mallory", 1001, std::slice::from_ref(&alice), &admin_actor)
             .unwrap();
         assert_ne!(
             mallory.row.id, alice,
@@ -4889,15 +4881,15 @@ mod tests {
         };
         let before = count(&registry);
 
-        let error = registry.record_denied_attempt(
-            "access identity",
-            "principal",
-            "root_is_not_a_policy_principal",
-            "root",
-            0,
-            Some("root".to_owned()),
-            Some("seed".to_owned()),
-        );
+        let error = registry.record_denied_attempt(DeniedAttempt {
+            operation: "access identity",
+            stage: "principal",
+            code: "root_is_not_a_policy_principal",
+            username: "root",
+            uid: 0,
+            claimed_actor: Some("root".to_owned()),
+            reason: Some("seed".to_owned()),
+        });
 
         // The refusal a caller sees is the same generic string as every other
         // denial, so a pre-principal refusal is not an existence oracle.

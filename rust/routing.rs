@@ -433,7 +433,7 @@ mod tests {
         assert!(
             ambiguous.is_err(),
             "a corrupt registry must fail closed, got {:?}",
-            ambiguous.map(|state| state)
+            ambiguous
         );
 
         fs::remove_dir_all(&root).ok();

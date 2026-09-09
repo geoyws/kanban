@@ -39,7 +39,10 @@ mod zcode_notify_adapter;
 use crate::context::{render_context, render_todo};
 use crate::import::{ImportOptions, import_json, import_sqlite};
 use crate::model::*;
-use crate::policy::{CAPABILITIES, Capability, PolicyActor, PolicyContext, ScopeTuple};
+use crate::policy::{
+    AuditFilterSpec, CAPABILITIES, Capability, DeniedAttempt, PolicyActor, PolicyContext,
+    ScopeTuple,
+};
 use crate::registry::{
     BoardPathState, PreparedAdoption, Registry, WORKSPACE_ADOPT_HELPER_COMMAND, data_root, now_ms,
     preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
@@ -1837,14 +1840,13 @@ fn canonical_sub<'a>(command: &str, value: &'a str) -> &'a str {
     }
 
     // `new` resolves to the group's creating verb, where it has one.
-    if value == "new" {
-        if let Some(full) = CREATING_VERBS
+    if value == "new"
+        && let Some(full) = CREATING_VERBS
             .iter()
             .find(|(group, _)| *group == command)
             .map(|(_, full)| *full)
-        {
-            return full;
-        }
+    {
+        return full;
     }
 
     // Mechanical shortforms, resolved against COMMANDS so a group only gains
@@ -3796,21 +3798,21 @@ fn required_provenance(args: &Args, git: Option<&gitctx::GitContext>) -> Result<
     let head_sha = option_string(args, "head").or_else(|| git.map(|g| g.head.clone()));
     let dirty_summary = option_string(args, "dirty").or_else(|| git.map(gitctx::dirty_summary));
 
-    if let Some(head) = &head_sha {
-        if !looks_like_head_sha(head) {
-            bail!(
-                "--head must be a 40-hex SHA (or at least a 7-hex abbreviation), got {head:?}; \
-                 pass `git rev-parse HEAD`, or let kb-board supply it from the caller's checkout"
-            );
-        }
+    if let Some(head) = &head_sha
+        && !looks_like_head_sha(head)
+    {
+        bail!(
+            "--head must be a 40-hex SHA (or at least a 7-hex abbreviation), got {head:?}; \
+             pass `git rev-parse HEAD`, or let kb-board supply it from the caller's checkout"
+        );
     }
-    if let Some(dirty) = &dirty_summary {
-        if !looks_like_dirty_summary(dirty) {
-            bail!(
-                "--dirty must read like git status — \"clean\", \"1 file changed\", or \
-                 \"N files changed\" — got {dirty:?}; kb-board writes exactly this wording"
-            );
-        }
+    if let Some(dirty) = &dirty_summary
+        && !looks_like_dirty_summary(dirty)
+    {
+        bail!(
+            "--dirty must read like git status — \"clean\", \"1 file changed\", or \
+             \"N files changed\" — got {dirty:?}; kb-board writes exactly this wording"
+        );
     }
 
     let mut missing = Vec::new();
@@ -6996,40 +6998,40 @@ fn local_actor(
     // and a bare `bail!` here left the most interesting attempts -- a root
     // caller reaching for a policy mutation above all -- with no audit row.
     if uid == 0 {
-        return Err(registry.record_denied_attempt(
-            "access identity",
-            "principal",
-            "root_is_not_a_policy_principal",
-            "root",
+        return Err(registry.record_denied_attempt(DeniedAttempt {
+            operation: "access identity",
+            stage: "principal",
+            code: "root_is_not_a_policy_principal",
+            username: "root",
             uid,
             claimed_actor,
             reason,
-        ));
+        }));
     }
     let username = match broker::PasswdDatabase::name_for_uid(&broker::SystemPasswd, uid)? {
         Some(name) => name,
         None => {
-            return Err(registry.record_denied_attempt(
-                "access identity",
-                "principal",
-                "uid_has_no_passwd_entry",
-                "",
+            return Err(registry.record_denied_attempt(DeniedAttempt {
+                operation: "access identity",
+                stage: "principal",
+                code: "uid_has_no_passwd_entry",
+                username: "",
                 uid,
                 claimed_actor,
                 reason,
-            ));
+            }));
         }
     };
     if !broker::two_way_passwd_check(&broker::SystemPasswd, &username, uid)? {
-        return Err(registry.record_denied_attempt(
-            "access identity",
-            "principal",
-            "passwd_pair_diverged",
-            &username,
+        return Err(registry.record_denied_attempt(DeniedAttempt {
+            operation: "access identity",
+            stage: "principal",
+            code: "passwd_pair_diverged",
+            username: &username,
             uid,
             claimed_actor,
             reason,
-        ));
+        }));
     }
     let principal = registry.resolve_principal(&username, uid)?;
     let (epoch, state_hash) = registry.live_policy_state()?;
@@ -7203,16 +7205,16 @@ fn run_access(args: &Args, sub: Option<&str>) -> Result<()> {
             if after_epoch.is_some_and(|v| v < 0) {
                 bail!("--after-epoch must be non-negative");
             }
+            let filter = AuditFilterSpec {
+                principal: args.one("principal"),
+                actor_principal: args.one("actor-principal"),
+                kind: args.one("kind"),
+                capability,
+                scope: scope.as_ref(),
+                after_epoch,
+            };
             let rows = args.bounded_page(50, "audit events", |limit| {
-                registry.audit_events(
-                    args.one("principal"),
-                    args.one("actor-principal"),
-                    args.one("kind"),
-                    capability,
-                    scope.as_ref(),
-                    after_epoch,
-                    limit,
-                )
+                registry.audit_events(&filter, limit)
             })?;
             print(&rows, json)
         }

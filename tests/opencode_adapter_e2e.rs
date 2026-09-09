@@ -133,16 +133,22 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        // The child is adopted by its `Endpoint` before the wait begins, so
+        // the timeout assertion below cannot panic out of here leaving an
+        // unreaped process: `Endpoint::drop` kills and waits on every path.
+        // `port` is the one field the fake has not published yet.
+        let mut endpoint = Endpoint {
+            child,
+            port: 0,
+            capture,
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(text) = fs::read_to_string(&port_file)
                 && let Ok(port) = text.trim().parse::<u16>()
             {
-                return Endpoint {
-                    child,
-                    port,
-                    capture,
-                };
+                endpoint.port = port;
+                return endpoint;
             }
             assert!(
                 Instant::now() < deadline,

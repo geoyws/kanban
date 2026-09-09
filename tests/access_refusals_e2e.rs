@@ -240,7 +240,7 @@ fn compiled_binary_direct_db_open_writes_no_policy_decision() {
         ],
     );
 
-    let connection = Connection::open(&fixture.scratch_registry()).unwrap();
+    let connection = Connection::open(fixture.scratch_registry()).unwrap();
     let audit_rows: i64 = connection
         .query_row("SELECT count(*) FROM access_audit", [], |row| row.get(0))
         .unwrap();

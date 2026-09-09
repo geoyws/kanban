@@ -2338,6 +2338,19 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
     } else {
         ("pause", "Pause delivery")
     };
+    let position_meta = format!(
+        "started at seq {}{}{}",
+        subscription.start_event_seq,
+        match position.acked_through_seq {
+            Some(seq) => format!(" · acked through seq {seq}"),
+            None => " · nothing acked yet".to_owned(),
+        },
+        if position.leased == 0 {
+            String::new()
+        } else {
+            format!(" · {} in flight", position.leased)
+        },
+    );
     format!(
         "<tr><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\">{board}</a></div></td>\
          <td>{watches}</td>\
@@ -2373,19 +2386,6 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
         id_path = url_encode(&subscription.id),
         carry = if show_all && paused { "?show=all" } else { "" },
         position_sentence = escape(&position_sentence(view.head_event_seq, acked_position)),
-        position_meta = format!(
-            "started at seq {}{}{}",
-            subscription.start_event_seq,
-            match position.acked_through_seq {
-                Some(seq) => format!(" · acked through seq {seq}"),
-                None => " · nothing acked yet".to_owned(),
-            },
-            if position.leased == 0 {
-                String::new()
-            } else {
-                format!(" · {} in flight", position.leased)
-            },
-        ),
         queued = queued_state(position, &view.dead_letter_codes),
         limits = escape(&format!(
             "{} ms timeout · {} retries · {}/min · {} at a time",

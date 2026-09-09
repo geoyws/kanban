@@ -13284,10 +13284,10 @@ fn declared_bin_names() -> Vec<String> {
         if !in_bin_section {
             continue;
         }
-        if let Some(value) = line.strip_prefix("name") {
-            if let Some(value) = value.trim_start().strip_prefix('=') {
-                names.push(value.trim().trim_matches('"').to_string());
-            }
+        if let Some(value) = line.strip_prefix("name")
+            && let Some(value) = value.trim_start().strip_prefix('=')
+        {
+            names.push(value.trim().trim_matches('"').to_string());
         }
     }
     assert!(
@@ -14762,10 +14762,10 @@ fn a_transact_reports_failed_index_rolled_back_and_skips_every_later_item() {
     );
     // `skipped` is its own field, so an agent tells "refused" from "never
     // tried" without parsing prose.
-    for index in 2..5 {
-        assert_eq!(results[index]["index"], index, "{envelope}");
-        assert_eq!(results[index]["skipped"], true, "{envelope}");
-        assert_eq!(results[index]["error"], Value::Null, "{envelope}");
+    for (index, result) in results.iter().enumerate().take(5).skip(2) {
+        assert_eq!(result["index"], index, "{envelope}");
+        assert_eq!(result["skipped"], true, "{envelope}");
+        assert_eq!(result["error"], Value::Null, "{envelope}");
     }
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "show", "t-1", "--json"])["notes"],
@@ -20217,7 +20217,7 @@ fn every_enum_argument_refusal_names_the_whole_set() {
             arg.label
         );
     }
-    for (key, _) in &schema_values {
+    for key in schema_values.keys() {
         let (operation, argument, positional) = key;
         assert!(
             ENUM_ARGUMENTS.iter().any(|arg| {
@@ -25524,12 +25524,11 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
                  ORDER BY seq",
             )
             .unwrap();
-        let seqs = statement
+        statement
             .query_map([], |row| row.get::<_, i64>(0))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        seqs
+            .unwrap()
     };
     assert_eq!(watched.len(), 3, "three watched events: {watched:?}");
     // Two refusals of one kind and one of another, on the same subscription.
@@ -31742,7 +31741,7 @@ fn hig_release_script_fails_closed_on_an_unexecutable_binary_and_an_unwritable_i
         let unexecutable = harness.fixture.root.join(format!("unexecutable-{target}"));
         clone_release_package(&harness.package_dir, &unexecutable, &commit(0xc1));
         fs::set_permissions(
-            &unexecutable.join("kanban"),
+            unexecutable.join("kanban"),
             fs::Permissions::from_mode(0o644),
         )
         .unwrap();
@@ -31904,10 +31903,10 @@ fn hig_release_script_serializes_racing_activations_on_one_install_root() {
                 settled[index] = child.try_wait().unwrap().is_some();
             }
         }
-        if let Ok(target) = fs::read_link(&current) {
-            if samples.last() != Some(&target) {
-                samples.push(target);
-            }
+        if let Ok(target) = fs::read_link(&current)
+            && samples.last() != Some(&target)
+        {
+            samples.push(target);
         }
         assert!(
             Instant::now() < deadline,

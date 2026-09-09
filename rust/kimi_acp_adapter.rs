@@ -685,7 +685,7 @@ fn accept_frame(frame: &[u8], request: &AdapterRequest) -> Result<AdapterRespons
     }
     // Identity before content: a frame that does not name the request this
     // process sent is refused without its payload ever being inspected.
-    if peer.id != Value::from(DELIVERY_REQUEST_ID) {
+    if peer.id != DELIVERY_REQUEST_ID {
         return Err(failed(
             FailureClass::IdentityMismatch,
             format!(

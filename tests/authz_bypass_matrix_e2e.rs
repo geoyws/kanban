@@ -32,7 +32,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1125,11 +1125,8 @@ impl Stream {
     /// Everything that has arrived since the last drain.
     fn drain(&mut self) -> Vec<String> {
         let mut fresh = Vec::new();
-        loop {
-            match self.lines.try_recv() {
-                Ok(line) => fresh.push(line),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(line) = self.lines.try_recv() {
+            fresh.push(line);
         }
         self.seen.extend(fresh.iter().cloned());
         fresh
