@@ -2,6 +2,11 @@
 
 **Status:** Accepted
 **Date:** 2026-09-10
+**Amended:** 2026-09-10 — §2's "measured" framing, §3's refusal list, §3's
+`HIG_RELEASE_TARGET_RUNNER` rule and §3's claim that a lying runner cannot be
+caught are each corrected in place against the landed implementation and
+dated where they sit; further implementation facts are recorded in the
+amendment at the end of this document.
 **Deciders:** the kanban driver lane on `t-51d5505e` (claim `codex@driver`), under
 George's 2026-09-10 decision on attention `a-4741a3c3`, where he selected the
 choice `mbp-path` — "Add a supported MBP Linux packaging path" — with the note
@@ -26,6 +31,19 @@ receipts frozen by
 read at commit `43eb9de`, the state this ADR decides against. ADR-039's bare
 citations were written against the 2026-09-06 revision and are offset from
 these; they locate a claim by name, not by line.
+
+**Amended 2026-09-10.** Citations added by the amendments below name their
+enclosing function or test **first** and a line second, so a reader can
+relocate a claim after any later shift. They read the wave-2 working tree at
+`/Users/geoyws/work/src/.kanban-worktrees/kanban-t-f03dbe4d-gate-80aa7489`
+at one settled snapshot: `scripts/hig-release.sh` sha256
+`7b3424eb281862ac49d12835904edd3bca4496829c7491a0051c11f74fd02c38` (3080
+lines) and `tests/e2e.rs` sha256
+`63f9740d83e275cc50cc2f8dbc902da609c4c74ac098a16725dd0d48ee3c08f1` (39397
+lines), resolved at 2026-09-10 08:34 MYT after the wave stopped moving. Every
+number below was located by content in that snapshot, not copied forward. A
+bare `:NNN` keeps its original meaning: the same file at `43eb9de`, the state
+this ADR decides against.
 
 Packaging is refused anywhere but `hax` twice over: the CLI target must be
 `hax` (`:1118`) and the shell must be on a host that calls itself `hax`
@@ -157,6 +175,69 @@ separate, and prose about them always says which: **`buildPlatform` is where
 it was built, `artifactPlatform` is what it is.** On George's MBP they read
 `darwin-arm64` and `linux-x86_64`; on `hax` both read `linux-x86_64`.
 
+**Amended 2026-09-10.** Which of these fields is a **record** and which is
+**earned** has to be said plainly, because "measured" reads stronger than
+most of them are. Every field a v2 receipt carries about the build machine is
+what that machine's own `PATH` answered, and each is one program away from a
+caller who redirects it:
+
+- `host` — whatever `host_short` gets from the program `HOSTNAME_BIN` names
+  (`host_short`, `scripts/hig-release.sh:78`–`:80`; the variable at `:22`),
+  now with a write-time refusal when it answers nothing usable
+  (`package_create`, `:1563`–`:1566`);
+- `buildPlatform` — `uname -s` and `uname -m` (`build_platform`,
+  `scripts/hig-release.sh:1332`–`:1339`, the two reads at `:1334`–`:1335`);
+- `buildKind` — derived from that same answer, with no second opinion
+  (`require_release_build_capability`, `scripts/hig-release.sh:1376`–`:1433`,
+  the branch at `:1378`–`:1383`);
+- `builderImage` — the operator's own argument, checked for digest shape only
+  (same function, `:1399`–`:1400`) and probed through a runtime the operator
+  or `PATH` named (`container_runtime_path`,
+  `scripts/hig-release.sh:1346`–`:1356`; the bounded probe at
+  `:1414`–`:1415`);
+- `toolchain` — `rustc --version` and `cargo --version` as they resolve in
+  whichever environment compiled (`release_toolchain_version`,
+  `scripts/hig-release.sh:1445`–`:1474`, in the image at `:1455`–`:1456` and
+  on the host at `:1467`).
+
+None of that is tamper-proof and none of it needs to be: it is a record of
+what the machine reported, and §3's point is that the record authorizes
+nothing. The script says the same in its own comments, over `build_platform`
+(`scripts/hig-release.sh:1312`–`:1319`) and over the gate (`:1346`–`:1355`).
+
+Exactly one field is **earned**: `artifactPlatform`. It exists only because
+§4's gate read the ELF header bytes of every file — `require_release_platform`
+(`scripts/hig-release.sh:252`–`:291`), run on the build output
+(`package_create`, `:1614`), on every packaged copy (`package_validate`,
+`:1247`), on the staged and live trees (`validate_release_files`, `:329`) and
+again on the remote leg (the `REMOTE` heredoc's per-file loop, `:2790`) — and
+that is a claim no `PATH` entry can supply. `versionProbe` is a third kind:
+not a claim about the machine but a record of **which branch** answered
+(`version_probe_kind`, `scripts/hig-release.sh:117`–`:123`). Its `"native"`
+value leans on the same `PATH`-reported `buildPlatform`
+(`receipt_provenance_defs`, `:389`), and even a faked `buildPlatform` cannot
+buy it, because that branch has to execute the artifact — see the amendment
+at the end of this document.
+
+Measured rather than argued. The suite itself produces a receipt reading
+`buildKind` `native`, `buildPlatform` `linux-x86_64` and `builderImage` `null`
+on this darwin-arm64 machine out of nothing but a `uname` stub on `PATH`:
+`hig_release_script_package_builds_natively_when_the_machine_is_already_the_release_platform`
+(`tests/e2e.rs:32001`–`:32041`) sets `FAKE_UNAME_S` and `FAKE_UNAME_M`
+(`:32007`–`:32008`) against the stub written at `tests/e2e.rs:13648`, whose
+defaults are `Darwin` and `arm64` (`:13662`, `:13665`), and asserts those
+three fields at `:32023`–`:32030`. The recorded `toolchain` is likewise
+whatever the `rustc` and `cargo` stubs answered (`tests/e2e.rs:13674`–`:13680`,
+set at `:32010`–`:32011`, asserted at `:32032`). A receipt of that shape
+installs on both legs — the `a-native-linux-build` row of
+`hig_release_script_install_refuses_a_receipt_whose_provenance_could_not_have_been_produced`
+(`tests/e2e.rs:35767`, installed at `:35778` and `:35811`) — and the reviewer
+of the landed wave confirmed end to end on 2026-09-10 that every validator
+accepts one produced this way. `artifactPlatform` stayed `linux-x86_64`
+throughout, because the bytes were read. So a v2 receipt reads as what the
+build machine said plus one field the artifact itself had to satisfy, never as
+a tamper-proof document.
+
 Every site that asserts a receipt is updated in one cut, as ADR-039 requires:
 `validate_receipt` (`:245`–`:259`), `validate_hax_activation_receipt`
 (`:314`–`:335`) and the embedded remote package-receipt validator
@@ -219,11 +300,68 @@ Every refusal is one `hig-release:`-prefixed sentence naming the platform this
 machine is and what was missing, per ADR-008:
 
 - `hig-release: cannot package a linux x86-64 release on darwin-arm64: no container runtime found; none of docker, podman, nerdctl is on PATH and KANBAN_RELEASE_CONTAINER_RUNTIME is unset, so there is no linux x86-64 build environment on this machine`
+- `hig-release: cannot package a linux x86-64 release on darwin-arm64: no container runtime found; KANBAN_RELEASE_CONTAINER_RUNTIME names <value>, which is not an executable program, so there is no linux x86-64 build environment on this machine`
 - `hig-release: cannot package a linux x86-64 release on darwin-arm64: no builder image was named; pass --builder-image <ref>@sha256:<64 hex> or set KANBAN_RELEASE_BUILDER_IMAGE`
 - `hig-release: cannot package a linux x86-64 release on darwin-arm64: builder image rust:1.90-bookworm is not digest-pinned, and a tag can move, so its digest would not name the bytes that built this release`
 - `hig-release: cannot package a linux x86-64 release on darwin-arm64: builder image <ref>@sha256:<digest> does not run linux x86-64; uname -m inside it reported aarch64`
 
 Each has one wording, unit-pinned on its branch.
+
+**Amended 2026-09-10.** The second sentence above is new, and the first is
+narrower than it reads: "no container runtime found" is two different
+absences, and the landed gate says them apart rather than papering over them
+(`require_release_build_capability`, `scripts/hig-release.sh:1388`–`:1395`).
+An operator who set `KANBAN_RELEASE_CONTAINER_RUNTIME` to something
+`command -v` cannot resolve is told what they named and that it is not an
+executable program (same function, `:1391`–`:1392`; the search it replaces is
+`container_runtime_path`, `:1346`–`:1356`); only an operator who named nothing
+is told the variable is unset, and that sentence is the one that also names
+the three runtimes it searched (`:1395`, list at `:34`). Telling the first
+operator their variable was unset would have been false, which is why one
+wording could not cover both. `<value>` above is the value as the operator set
+it, printed verbatim. Both wordings are pinned byte for byte by the
+`no-runtime` and `unusable-runtime` rows of
+`hig_release_script_package_refuses_a_machine_that_cannot_produce_a_linux_x86_64_artifact_naming_what_was_missing`
+(`tests/e2e.rs:32056` and `:32064`, compared at `:32172`, the shared prefix
+constant at `:31762`–`:31763`).
+
+**Amended 2026-09-10, second pass.** The list above is not exhaustive of the
+landed gate, and this ADR does not pretend otherwise. Both container probes
+were bounded after this ADR was accepted — one `uname -m` and one
+`--version`, each run through `run_bounded`
+(`scripts/hig-release.sh:1287`–`:1310`) with the ceiling from
+`container_probe_seconds` (`:1317`–`:1322`), while the build between them
+stays deliberately unbounded — and bounding them added these branches:
+
+- a deadline refusal when the image does not answer the `uname -m` probe
+  (`require_release_build_capability`, `scripts/hig-release.sh:1419`, the
+  bounded call at `:1414`–`:1415`) — pinned by the `wedged-runtime` row,
+  which also measures that the refusal arrives inside the deadline
+  (`tests/e2e.rs:32090`, timing assertion at `:32161`);
+- a refusal carrying the runtime's own complaint when that probe fails for
+  any other reason (same function, `:1426`) — pinned by the
+  `failing-runtime` row (`tests/e2e.rs:32102`);
+- the same deadline refusal around the toolchain probe
+  (`release_toolchain_version`, `:1459`, the bounded call at
+  `:1455`–`:1456`) — pinned by
+  `hig_release_script_package_refuses_a_container_toolchain_probe_that_never_answers`
+  (`tests/e2e.rs:32199`, wording at `:32232`–`:32233`, timing at `:32243`);
+- the toolchain probe's own complaint refusal (same function, `:1463`) and
+  the deadline override's validation refusal (`container_probe_seconds`,
+  `:1319`–`:1320`), neither of which any test names — measured 2026-09-10:
+  `must be a whole number of seconds` occurs in `scripts/hig-release.sh` and
+  nowhere in `tests/e2e.rs`. Both are listed as owed in §Evidence required;
+- and a refusal when `host_short` reports nothing usable (`package_create`,
+  `:1563`–`:1566`), which enforces §2's non-empty, no-whitespace `host`
+  invariant where the receipt is **written** and not only where it is read —
+  pinned inside
+  `hig_release_script_package_records_the_real_build_host_platform_and_toolchain`
+  (`tests/e2e.rs:31892`).
+
+Their **branches** are recorded here; the two unpinned **wordings** are
+deliberately not quoted, so that nothing in this ADR pins a sentence no test
+holds. Whoever adds those two tests pins each wording on its branch, exactly
+as the five above are.
 
 `install_package`'s `require_host hax` (`:2431`) is **not** touched. Installing
 and rolling back are still launched on `hax` for both targets, exactly as
@@ -264,6 +402,34 @@ happens to elicit, precisely so it cannot read as a second source of
   file — never an empty `version` recorded into the manifest. An unanswered
   probe is not a version.
 
+**Amended 2026-09-10.** The container path sets `HIG_RELEASE_TARGET_RUNNER`
+**only when the operator named no runner**: the assignment is guarded by
+`[[ "$RELEASE_BUILD_KIND" == container && -z "${HIG_RELEASE_TARGET_RUNNER:-}" ]]`
+(`package_create`, `scripts/hig-release.sh:1604`–`:1606`), so a runner an
+operator exported is theirs and is kept, and the script never overwrites it
+with the image dispatcher it would otherwise write
+(`release_container_target_runner`, `scripts/hig-release.sh:1500`–`:1520`).
+Provenance is unaffected, because `versionProbe` records the **branch** and
+not who supplied the program: the branch is one reading of whether the
+variable is non-empty (`version_probe_kind`,
+`scripts/hig-release.sh:117`–`:123`), `file_version` probes through that same
+reading (`file_version`, `:157`), and the receipt is written from that same
+function (`package_create`, `:1652`), so both cases record `"runner"` — which
+is exactly what is true of both: the version came through a named runner
+rather than from the artifact executing on the machine `host` names. Which
+bytes the build ran on is named by the digest either way (`package_create`,
+`:1649`, into the field at `:1663`). Both halves are measured. With a runner
+exported, every packaged binary goes through it and the image is never asked
+for a version
+(`hig_release_script_package_records_which_branch_measured_the_version`,
+`tests/e2e.rs:32379`–`:32440`: the runner log at `:32405`, the untouched image
+at `:32413`) while the receipt reads `"runner"` (`:32398`); with none
+exported, no operator runner is called at all, the receipt still reads
+`"runner"`, and every recorded version came back through the pinned image
+(`hig_release_script_package_records_the_pinned_builder_image_digest_on_the_container_path`,
+`tests/e2e.rs:31918`–`:31987`: `:31925`, `:31940`, `:31943`,
+`:31967`–`:31984`).
+
 What the seam does **not** buy, stated plainly because the previous draft of
 this ADR overclaimed it: when a runner is set it is not one source among two,
 it is the **only** source of `files[].version`. A lying runner writes its lie
@@ -279,6 +445,48 @@ digest-pinned (§3) and why the receipt says which branch answered:
 runner" a recorded fact instead of an invisible one. A reader who needs a
 version string that was produced by executing the artifact on the machine
 that reports it must require `versionProbe == "native"`.
+
+**Amended 2026-09-10.** "Nothing downstream can catch it" was too
+pessimistic, and the reviewer of the landed wave measured the catch. Both
+install legs **re-execute** every packaged binary and compare its answer
+against the recorded string, so a lie told at package time and not repeated
+at install time dies there:
+
+- the `hax` leg re-executes in `validate_release_files`
+  (`scripts/hig-release.sh:293`–`:344`, the comparison at `:340` against the
+  manifest's own `files[].version` read at `:343`), reached through
+  `install_release_tree`'s `validate_package` (`:1693`) **before**
+  `ensure_safe_release_view` and `mkdir -p "$install_root/releases"`
+  (`:1699`–`:1700`);
+- the `hig` leg re-executes twice more: `package_validate` on the sending
+  side (`scripts/hig-release.sh:1222`–`:1259`, comparison at `:1255`, called
+  from `install_remote` at `:1909`, ahead of the `hax` activation check at
+  `:1913` and every path the install computes at `:1914`), and the remote
+  script's own per-file loop against the receipt's `files` array (the
+  `REMOTE` heredoc, `:2794`, source at `:2795`);
+- `validate_hax_activation_receipt` re-executes the already-installed release
+  as well (`scripts/hig-release.sh:451`–`:508`, comparison at `:506`).
+
+The first two emit the same sentence — `hig-release: package binary kanban
+version mismatch` (`validate_release_files`, `scripts/hig-release.sh:341`;
+`package_validate`, `:1256`) — and both run before the install root gains a
+`releases/` directory, which is what the reviewer measured on 2026-09-10 from
+a package built through a lying runtime.
+
+What remains uncaught is narrower, and naming it is the point: a runner that
+lies **consistently** — one whose lie is repeated at install time because the
+installing host dispatches through the same program. `file_version` honours
+`HIG_RELEASE_TARGET_RUNNER` wherever it runs
+(`scripts/hig-release.sh:157`–`:161`), so such a host reproduces the same
+false string and the comparison passes. `hax` and `hig` set no runner: the
+production branch executes the artifact itself (`file_version`,
+`:163`–`:164`), so on the hosts that actually install, the comparison is the
+artifact's own answer, and that branch carries its own coverage
+(`hig_release_script_probes_the_version_by_running_the_binary_when_no_runner_is_configured`,
+`tests/e2e.rs:31636`–`:31678`). That is what `versionProbe` is for: a
+`"runner"` receipt says the string is trusted exactly as far as the
+digest-pinned image that answered, and a reader who needs the artifact itself
+to have answered requires `"native"`.
 
 The seam carries the same obligation as every other guard in this script: it
 exists in both the local `file_version` and its remote heredoc twin, and
@@ -518,23 +726,55 @@ the forger controls. With the version refusals reverted, packaging *succeeds*
 and records an empty version string, which is the failure mode §3's runner
 rule forbids. A gate whose removal changes no test is not a gate.
 
-**Still owed by the capability-gate and container waves:**
+**§2 and §3, landed 2026-09-10** with the capability gate, the container path
+and the `formatVersion` 2 receipts:
 
 - `hig_release_script_package_records_the_real_build_host_platform_and_toolchain`
+  (`tests/e2e.rs:31777`) — which also pins the write-time `host` refusal
+  (`:31892`)
 - `hig_release_script_package_records_the_pinned_builder_image_digest_on_the_container_path`
+  (`tests/e2e.rs:31918`)
 - `hig_release_script_package_refuses_a_machine_that_cannot_produce_a_linux_x86_64_artifact_naming_what_was_missing`
+  (`tests/e2e.rs:32047`) — six refusal rows, including the fifth wording §3
+  now pins (`:32064`) and the two bounded-probe wordings §3's second-pass
+  amendment records (`:32090`, `:32102`)
 - `hig_release_script_package_refuses_a_builder_image_that_is_not_digest_pinned`
-- `hig_release_script_install_refuses_a_format_version_1_package_receipt`
+  (`tests/e2e.rs:32253`)
+- `hig_release_script_package_records_which_branch_measured_the_version`
+  (`tests/e2e.rs:32379`) — the `versionProbe` field: `"runner"` with a runner
+  (`:32398`), and the native branch refusing on a host that cannot execute
+  the artifact (`:32419`–`:32439`), which is the coverage boundary named in
+  the amendment below
 - `hig_release_script_provenance_fields_leave_the_manifest_bytes_and_release_id_unchanged`
-- `hig_release_script_package_records_which_branch_measured_the_version` — the
-  `versionProbe` field, `"native"` with no runner and `"runner"` with one
+  (`tests/e2e.rs:32447`)
+- `hig_release_script_install_refuses_a_format_version_1_package_receipt`
+  (`tests/e2e.rs:35863`)
+- the twin test's pinned list now names `file_version`
+  (`tests/e2e.rs:33952`), and with it `release_binary_known` (`:33953`),
+  `version_probe_kind` (`:33957`) and `receipt_provenance_defs` (`:33963`),
+  so neither the runner seam nor the provenance definition can drift between
+  the local functions and the remote heredoc
+
+Landed with the bounded container probes, which this ADR did not foresee:
+
+- `hig_release_script_package_refuses_a_container_toolchain_probe_that_never_answers`
+  (`tests/e2e.rs:32199`) — a wedged probe refuses inside its own deadline
+  rather than hanging packaging (`:32243`)
+
+**Still owed** (as of 2026-09-10):
+
 - `hig_release_script_refuses_a_relocatable_object_carrying_the_right_machine`
   — the `e_type` half of the header check, which an `ET_REL` fixture with a
   correct class, byte order and machine passes without it
-- the twin test's own pinned list must name `file_version`, so the runner
-  seam cannot drift between the local function and the remote heredoc; a
-  guard absent from that list is unpinned, which is how `file_version` stood
-  when this ADR was written
+- one wording test for `build_platform`'s own refusal
+  (`build_platform`, `scripts/hig-release.sh:1336`–`:1337`), which no case
+  names: measured 2026-09-10, `did not report a platform` occurs in
+  `scripts/hig-release.sh` and nowhere in `tests/e2e.rs`
+- one wording test for the container toolchain probe's complaint refusal
+  (`release_toolchain_version`, `scripts/hig-release.sh:1463`) and one for
+  the deadline override's validation refusal (`container_probe_seconds`,
+  `:1319`–`:1320`); every other refusal in the packaging path is pinned on
+  its branch, and these three are the exceptions
 
 plus every existing `hig_release_script_*` case still green, including
 `hig_release_script_local_and_remote_install_guards_are_identical`
@@ -542,9 +782,107 @@ plus every existing `hig_release_script_*` case still green, including
 `hig_release_script_enumerates_exactly_the_executables_the_crate_declares`.
 Each named refusal has one wording, unit-pinned on its branch.
 
+## Amendment — 2026-09-10: three facts the landed implementation settled
+
+§§1, 2, 3 and 5 landed on 2026-09-10 in the wave-2 working tree at
+`/Users/geoyws/work/src/.kanban-worktrees/kanban-t-f03dbe4d-gate-80aa7489`,
+unstaged over commit `2dc2e0f`; every line number in these amendments was
+resolved against the settled snapshot named in §Context, after the wave
+stopped moving. The places where the landed behaviour is not what this ADR
+wrote are corrected in place and dated where they sit — §3's refusal list
+gains the fifth sentence the code actually emits and a second-pass note for
+the bounded-probe and `host` branches, §3's `HIG_RELEASE_TARGET_RUNNER` rule
+is narrowed to "only when the operator named none", §3's claim that a lying
+runner cannot be caught is replaced by where it is caught, and §2 says which
+of its fields are records rather than measurements. Three further facts the
+implementation settled belong in the record.
+
+**`build_platform` refuses rather than recording a platform it did not
+measure.** It reads `uname -s` lowercased and `uname -m` verbatim, and an
+empty answer from either ends the run before the gate has an opinion about
+anything else: `hig-release: this machine did not report a platform: uname -s
+said nothing and uname -m said nothing` (`build_platform`,
+`scripts/hig-release.sh:1332`–`:1339`, refused at `:1336`–`:1337`, prefixed
+by `die` at `:44`). Each clause carries the value that was read, and the word
+`nothing` stands where the read produced nothing. This matters because
+`buildPlatform` is the first field §2 records: a machine that cannot say what
+it is would otherwise have carried an empty string, a lone hyphen or `linux-`
+into a receipt claiming every field was measured. The validators' shape check
+does refuse all three — measured 2026-09-10, `jq -n '$v |
+test("^[a-z0-9_]+-[a-z0-9_.]+$")'` is `false` for `""`, `"-"` and `"linux-"`
+and `true` for `"darwin-arm64"` (`receipt_provenance_defs`,
+`scripts/hig-release.sh:375`) — but it refuses them only after a build has
+run and a package has been written. Refusing at measurement time is what
+keeps §3's promise that nothing is built or written first: the gate calls
+`build_platform` as its own first act (`require_release_build_capability`,
+`scripts/hig-release.sh:1378`, before the platform comparison at `:1379`),
+and the gate itself runs before the output directory exists and before the
+build (`package_create`, `:1557`, ahead of `:1567`–`:1571` and
+`:1584`–`:1589`). Its wording is not pinned by a test; it is listed as owed
+above.
+
+**Receipt provenance is one jq definition, twinned, not three hand-copied
+predicates.** `receipt_provenance_defs`
+(`scripts/hig-release.sh:369`–`:394`) emits a single
+`def receipt_provenance_ok` (`:371`) carrying the six field checks and the
+four cross-field invariants (`:372`–`:389`), and each of the three validation
+sites §2 names prepends that one definition to its own program:
+`validate_receipt` (`scripts/hig-release.sh:406`–`:407`),
+`validate_hax_activation_receipt` (`:474`–`:475`) and the remote
+package-receipt validator inside the `REMOTE` heredoc (`:2770`–`:2771`).
+Three copies of an invariant are three chances to check a different thing on
+the local leg, the `hax` activation check and the remote installer; one
+definition is one thing to read and one thing to change. It is twinned across
+the two legs like every other guard — local at `scripts/hig-release.sh:369`,
+remote at `:2060` — and the twin test pins it by name
+(`hig_release_script_local_and_remote_install_guards_are_identical`,
+`tests/e2e.rs:33934`, the name at `:33963`), asserting exactly two
+definitions, one on each side of the `REMOTE` heredoc, with byte-equal bodies
+(`tests/e2e.rs:33989`, `:33998`). So §2's "updated in one cut" is enforced by
+construction rather than by care: there is one text to cut, and the test fails
+if the two copies of it differ by a byte.
+
+**A receipt reading `versionProbe: "native"` cannot be produced on this
+machine at all, so the tests prove the branch, the refusal and the read.**
+`"native"` requires two things at once: the runner variable unset, which is
+the branch `version_probe_kind` reports
+(`scripts/hig-release.sh:117`–`:123`, the read at `:118`), and
+`buildPlatform == artifactPlatform`, which every validator requires of a
+native probe (`receipt_provenance_defs`, `:389`). On darwin-arm64 the first
+without the second ends exactly where §3 said it would: the native branch of
+`file_version` executes the artifact (`scripts/hig-release.sh:163`–`:164`),
+and a Mac cannot execute a linux x86-64 image, so packaging refuses with
+`refusing <path>: it could not report a version` and records nothing
+(`hig_release_script_package_records_which_branch_measured_the_version`,
+`tests/e2e.rs:32419`–`:32439`;
+`hig_release_script_probes_the_version_by_running_the_binary_when_no_runner_is_configured`,
+`:31636`–`:31678`). The coverage boundary is therefore named rather than
+implied. Three things are proved here:
+
+- **the branch**, recorded as `"runner"` on the container path
+  (`tests/e2e.rs:31940`), on the native path taken with a runner configured
+  (`:32035`) and through an operator's own runner (`:32398`);
+- **the refusal of a false native claim**: a receipt asserting `"native"` on
+  a darwin build platform is refused by the package-receipt validator
+  (`hig_release_script_install_refuses_a_receipt_whose_provenance_could_not_have_been_produced`,
+  `tests/e2e.rs:35730`, refused without mutation at `:35747`) and again by
+  the `hax` activation validator (same test, `:35833`, refused at `:35850`);
+- **that a genuine native receipt is read and installed**: the accepted
+  `a-native-linux-build` row — `buildKind` `native`, `buildPlatform`
+  `linux-x86_64`, `builderImage` null, `versionProbe` `"native"` — installs
+  on the `hax` leg and on the `hig` leg and reaches the activation receipt
+  with all seven provenance fields unchanged (`tests/e2e.rs:35767`, installed
+  at `:35778` and `:35811`, fields compared at `:35803`).
+
+What no test on `@@mbp` can do is **write** one. The first genuine v2
+`"native"` receipt is the first `package` run on `hax`, and that run is the
+measurement this suite cannot stand in for — which is also why the native
+leg's flags, placement and behaviour had to stay byte-for-byte what §1 froze.
+
 ## References
 
-- `scripts/hig-release.sh` — every citation above, at commit `43eb9de`
+- `scripts/hig-release.sh` — every bare `:NNN` citation above, at commit `43eb9de`; narrowed from "every citation" on 2026-09-10, when the amendments added citations written in full against the tree below
+- `/Users/geoyws/work/src/.kanban-worktrees/kanban-t-f03dbe4d-gate-80aa7489/scripts/hig-release.sh` and `.../tests/e2e.rs` — the base of every citation added by the 2026-09-10 amendments: the wave-2 working tree, unstaged over commit `2dc2e0f`, where §§1, 2, 3 and 5 landed, at sha256 `7b3424eb281862ac49d12835904edd3bca4496829c7491a0051c11f74fd02c38` and `63f9740d83e275cc50cc2f8dbc902da609c4c74ac098a16725dd0d48ee3c08f1` (see §Context). The twin test sits at `tests/e2e.rs:33934` in that snapshot, not at the `:31954` of the pre-wave line below
 - [ADR-034: HIG release packages and explicit board-rule transfer](ADR-034-hig-release-packages-and-board-rule-transfer.md) — its build-host clause is superseded here; install, activation, the served-exe proof and rollback are not
 - [ADR-039: The release manifest and receipt schema is frozen at formatVersion 1](ADR-039-release-manifest-and-receipt-schema.md) — §2 and §3 move to `formatVersion` 2 here; §1's manifest, §4's identity rule, §5's sequence, §6's refusals and §7's retention are unchanged
 - [ADR-006: Rust runtime and compiled binary E2E](ADR-006-rust-runtime-and-compiled-binary-e2e.md) — why the evidence is a real process
