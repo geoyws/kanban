@@ -1341,15 +1341,15 @@ fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
 fn task_reference(project: &str, store: &Store, task_id: &str) -> String {
     match store.require_task(task_id) {
         Ok(task) => format!(
-            "<a href=\"/task/{project}/{task_id}\">{title}</a> \
-             <span class=\"type type-{ty}\">{ty}</span>",
+            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\">{title}</a> \
+             <span class=\"type type-{ty}\" data-task-type>{ty}</span>",
             project = escape(&url_encode(project)),
             task_id = escape(&url_encode(&task.id)),
             title = escape(&task.title),
             ty = escape(&task.task_type),
         ),
         Err(_) => format!(
-            "<a href=\"/task/{project}/{task_id}\">{task_id}</a>",
+            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\">{task_id}</a>",
             project = escape(&url_encode(project)),
             task_id = escape(&url_encode(task_id)),
         ),
@@ -1656,7 +1656,7 @@ fn search_page(query: &str) -> Result<String> {
     for result in receipt.results {
         let title = if let Some(task_id) = &result.task_id {
             format!(
-                "<a href=\"/task/{}/{}\">{}</a>",
+                "<a href=\"/task/{0}/{1}\" data-task-link=\"{1}\">{2}</a>",
                 escape(&result.board),
                 escape(task_id),
                 escape(&result.title)
@@ -1698,7 +1698,7 @@ fn search_page(query: &str) -> Result<String> {
 
 fn deployment_link(project: &str, deployment: &DeploymentAttempt) -> String {
     format!(
-        "<a href=\"/deployment/{}/{}\"><code>{}</code></a>",
+        "<a href=\"/deployment/{0}/{1}\" data-deployment-link=\"{2}\"><code>{2}</code></a>",
         escape(&url_encode(project)),
         escape(&url_encode(&deployment.id)),
         escape(&deployment.id),
@@ -1883,9 +1883,16 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
             },
         ),
     ];
-    let mut html = format!("<h1>Deployment <code>{}</code></h1><dl>", escape(&row.id));
+    let mut html = format!(
+        "<h1 data-deployment-detail=\"{0}\">Deployment <code>{0}</code></h1><dl>",
+        escape(&row.id)
+    );
     for (label, value) in fields {
-        html.push_str(&format!("<dt>{}</dt><dd>{}</dd>", escape(label), value));
+        html.push_str(&format!(
+            "<dt>{0}</dt><dd data-deployment-field=\"{0}\">{1}</dd>",
+            escape(label),
+            value
+        ));
     }
     html.push_str("</dl>");
     if !row.artifacts.is_empty() {
@@ -1910,7 +1917,7 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
     }
     html.push_str("<h2>Receipt</h2>");
     html.push_str(&format!(
-        "<pre>{}</pre>",
+        "<pre data-deployment-receipt>{}</pre>",
         escape(row.receipt.as_deref().unwrap_or("No terminal receipt yet."))
     ));
     if let Some(uri) = row.artifact_uri {
@@ -1968,7 +1975,7 @@ fn boards() -> Result<String> {
             .min()
             .unwrap_or(i64::MAX);
         let row = format!(
-            "<tr><td><a href=\"/board/{url}\">{name}</a></td>\
+            "<tr data-board=\"{name}\"><td><a href=\"/board/{url}\" data-board-link>{name}</a></td>\
              <td class=\"n{flag}\">{attention}</td><td class=n>{todo}</td>\
              <td class=n>{doing}</td><td class=n>{stale}</td>\
              <td class=n>{handoffs}</td><td class=n>{total}</td></tr>",
@@ -2006,7 +2013,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
     let mut html = String::from("<h1>Plans</h1>");
     if let Some(id) = opened {
         html.push_str(&format!(
-            "<p class=success>Opened plan <code>{}</code>. Its child work is now eligible for claims.</p>",
+            "<p class=success data-plan-opened>Opened plan <code>{}</code>. Its child work is now eligible for claims.</p>",
             escape(id)
         ));
     }
@@ -2020,9 +2027,12 @@ fn plans(opened: Option<&str>) -> Result<String> {
         for plan in drafts {
             found += 1;
             let plan_attention = task_attention_count(&store, &plan.id)?;
-            html.push_str("<article class=plan>");
             html.push_str(&format!(
-                "<h2><a href=\"/task/{project}/{id}\">{title}</a>{attention}</h2>\
+                "<article class=plan data-plan=\"{}\">",
+                escape(&plan.id)
+            ));
+            html.push_str(&format!(
+                "<h2><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\">{title}</a>{attention}</h2>\
                  <p class=meta><a href=\"/board/{project}\">{project}</a> · \
                  {id} · {priority} · drafted {age}{tags}</p>",
                 project = escape(&project.name),
@@ -2064,7 +2074,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
             }
             html.push_str(&format!(
                 "<form method=post action=\"/plan/{project_path}/{id_path}/open\">\
-                 <button type=submit>Open plan</button></form>\
+                 <button type=submit data-plan-open>Open plan</button></form>\
                  <p class=cmd>Equivalent: <code>kb t mv {id} todo --as {OPERATOR_ACTOR} --project {project}</code></p>",
                 project_path = url_encode(&project.name),
                 id_path = url_encode(&plan.id),
@@ -2357,12 +2367,12 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
         },
     );
     format!(
-        "<tr><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\">{board}</a></div></td>\
+        "<tr data-subscription=\"{id}\"><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\">{board}</a></div></td>\
          <td>{watches}</td>\
          <td><code>{consumer}</code><div class=meta>action <code>{action}</code> · {secret}</div></td>\
-         <td><span class=status>{status}</span>{paused_by}\
+         <td><span class=status data-subscription-state>{status}</span>{paused_by}\
          <form method=post action=\"/subscription/{board_path}/{id_path}/{verb}{carry}\">\
-         <button class=quick type=submit>{verb_label}</button></form></td>\
+         <button class=quick type=submit data-subscription-action=\"{verb}\">{verb_label}</button></form></td>\
          <td>{position_sentence}<div class=meta>{position_meta}</div>{queued}</td>\
          <td><div class=meta>{limits}</div></td></tr>",
         id = escape(&subscription.id),
@@ -2515,7 +2525,10 @@ fn lanes() -> Result<String> {
         std::cmp::Reverse(updates.iter().map(|u| u.created_at).max().unwrap_or(0))
     });
     for ((project, lane), updates) in &ordered {
-        html.push_str("<article class=item>");
+        html.push_str(&format!(
+            "<article class=item data-lane=\"{}\">",
+            escape(lane)
+        ));
         html.push_str(&format!(
             "<h2>{lane} <span class=count><a href=\"/board/{project_url}\">{project}</a></span></h2>",
             lane = escape(lane),
@@ -2524,14 +2537,14 @@ fn lanes() -> Result<String> {
         ));
         for update in updates {
             html.push_str(&format!(
-                "<p class=meta>{author} · {age}{task}{branch}</p><p class=body>{body}</p>",
+                "<p class=meta>{author} · {age}{task}{branch}</p><p class=body data-lane-body>{body}</p>",
                 author = escape(&update.author),
                 age = ago(update.created_at),
                 task = update
                     .task_id
                     .as_ref()
                     .map(|id| format!(
-                        " · <a href=\"/task/{project}/{id}\">{id}</a>",
+                        " · <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\">{id}</a>",
                         project = escape(project),
                         id = escape(id)
                     ))
@@ -2604,7 +2617,7 @@ fn board(name: &str) -> Result<String> {
         for task in rows {
             let attention = task_attention_count(&store, &task.id)?;
             html.push_str(&format!(
-                "<li>{priority} <a href=\"/task/{project}/{id}\">{id}</a> \
+                "<li data-task=\"{id}\">{priority} <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\">{id}</a> \
                  <span class=\"type type-{ty}\">{ty}</span> {title}{lane}{tags}{attention}</li>",
                 project = escape(&project.name),
                 id = escape(&task.id),
@@ -2629,11 +2642,15 @@ fn board(name: &str) -> Result<String> {
 fn task_detail(project_name: &str, id: &str) -> Result<String> {
     let (project, store) = project_named(project_name)?;
     let task = store.require_task(id)?;
-    let mut html = format!("<h1>{}</h1>", escape(&task.title));
+    let mut html = format!(
+        "<h1 data-task-detail=\"{}\" data-task-title>{}</h1>",
+        escape(&task.id),
+        escape(&task.title)
+    );
     html.push_str(&format!(
         "<p class=meta><a href=\"/board/{project}\">{project}</a> · {id} · \
          <span class=\"type type-{ty}\">{ty}</span> \
-         <span class=status>{status}</span> · {priority}{tags}</p>",
+         <span class=status data-task-status>{status}</span> · {priority}{tags}</p>",
         project = escape(&project.name),
         id = escape(&task.id),
         ty = escape(&task.task_type),
@@ -2643,7 +2660,10 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
     ));
     html.push_str(&facts(&project.name, &task));
     if let Some(body) = &task.body {
-        html.push_str(&format!("<h2>Body</h2><pre>{}</pre>", escape(body)));
+        html.push_str(&format!(
+            "<h2>Body</h2><pre data-task-body>{}</pre>",
+            escape(body)
+        ));
     }
 
     // Provenance: where the work actually happened. Captured rather than
@@ -2682,7 +2702,7 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         html.push_str("<h2>Notes</h2>");
         for note in notes {
             html.push_str(&format!(
-                "<article class=note><p class=meta><span class=kind>{kind}</span> \
+                "<article class=note data-task-note><p class=meta><span class=kind>{kind}</span> \
                  {author} · {when}</p><pre>{body}</pre></article>",
                 kind = escape(&note.kind),
                 author = escape(&note.author),
@@ -2723,12 +2743,12 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
     let events = store.events(Some(&task.id), None, DETAIL_ROWS, true)?;
     if !events.is_empty() {
         html.push_str(
-            "<h2>Trail</h2><table><thead><tr><th>When</th><th>What</th>\
+            "<h2>Trail</h2><table data-task-trail><thead><tr><th>When</th><th>What</th>\
                        <th>Who</th><th>Detail</th></tr></thead><tbody>",
         );
         for event in events {
             html.push_str(&format!(
-                "<tr><td class=when>{when}</td><td><code>{kind}</code></td>\
+                "<tr data-event-kind=\"{kind}\"><td class=when>{when}</td><td><code>{kind}</code></td>\
                  <td>{who}</td><td class=payload>{payload}</td></tr>",
                 when = stamp(event.created_at),
                 kind = escape(&event.kind),
@@ -2913,11 +2933,11 @@ fn page(title: &str, body: &str) -> String {
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
-         <nav aria-label=Primary><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
-         <div class=nav-links><a href=\"/\">Needs you</a><a href=\"/lanes\">Lanes</a>\
-         <a href=\"/boards\">Boards</a><a href=\"/plans\">Plans</a><a href=\"/deployments\">Deployments</a>\
-         <a href=\"/subscriptions\">Subscriptions</a></div>\
-         <form action=/search method=get><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
+         <nav aria-label=Primary data-primary-nav><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
+         <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
+         <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
+         <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
+         <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
          </nav><main id=main>{body}</main>\
          <footer>live operator view · <code>kanban serve</code></footer>\
          <script>{JS}</script></body></html>",
@@ -3775,7 +3795,6 @@ mod tests {
             "<span class=live data-live role=status aria-live=polite>live</span>",
         );
         assert!(rendered.contains("width=device-width,initial-scale=1"));
-        assert!(rendered.contains("<nav aria-label=Primary>"));
         assert!(rendered.contains("role=status aria-live=polite"));
         assert!(CSS.contains("min-height:2.75rem"));
         assert!(CSS.contains("env(safe-area-inset-bottom)"));
@@ -4512,7 +4531,6 @@ mod tests {
         assert_html_contains(&html, "Every task_moved event arriving at done.");
         assert_html_contains(&html, "<code>codex.queue</code>");
         assert_html_contains(&html, "action <code>enqueue-turn</code>");
-        assert_html_contains(&html, "<span class=status>active</span>");
         assert_html_contains(&html, "4 board events behind head seq 12.");
         assert_html_contains(
             &html,
@@ -4525,7 +4543,7 @@ mod tests {
     }
 
     #[test]
-    fn many_subscriptions_each_get_their_own_row_and_position() {
+    fn subscription_positions_keep_each_sentence_and_order() {
         let views = [
             subscription_view(
                 "PX",
@@ -4554,7 +4572,6 @@ mod tests {
             ),
         ];
         let html = subscriptions_body(&views, false, None);
-        assert_eq!(html.matches("<tr><td><code>sub-").count(), 3, "{html}");
         assert_html_contains(&html, "Caught up with head seq 20.");
         assert_html_contains(&html, "5 board events behind head seq 20.");
         // Nothing acked leaves a subscription on its start anchor, seq 4 here,
@@ -5074,7 +5091,6 @@ mod tests {
 
         let listed = render("/subscriptions").expect("render subscriptions");
         assert_page_title(&listed, "Subscriptions");
-        assert_html_contains(&listed, "<a href=\"/subscriptions\">Subscriptions</a>");
         assert_html_contains(&listed, &fixture.active);
         assert_html_contains(&listed, &fixture.dead);
         assert!(!listed.contains(&fixture.paused), "{listed}");

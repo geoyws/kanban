@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use headless_chrome::{Browser, LaunchOptionsBuilder};
+use headless_chrome::{Browser, LaunchOptionsBuilder, protocol::cdp::Emulation};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -777,6 +777,36 @@ fn launch_browser(chrome_path: PathBuf) -> Browser {
     Browser::new(options).expect("launch Chrome")
 }
 
+fn launch_mobile_browser(chrome_path: PathBuf) -> Browser {
+    let options = LaunchOptionsBuilder::default()
+        .path(Some(chrome_path))
+        .headless(true)
+        .sandbox(browser_sandbox_enabled(effective_uid()))
+        .window_size(Some((390, 844)))
+        .build()
+        .expect("build mobile Chrome launch options");
+    Browser::new(options).expect("launch mobile Chrome")
+}
+
+fn set_mobile_viewport(tab: &headless_chrome::Tab) {
+    tab.call_method(Emulation::SetDeviceMetricsOverride {
+        width: 390,
+        height: 844,
+        device_scale_factor: 1.0,
+        mobile: true,
+        scale: None,
+        screen_width: Some(390),
+        screen_height: Some(844),
+        position_x: None,
+        position_y: None,
+        dont_set_visible_size: None,
+        screen_orientation: None,
+        viewport: None,
+        display_feature: None,
+        device_posture: None,
+    })
+    .expect("set the 390x844 mobile viewport");
+}
 fn effective_uid() -> u32 {
     unsafe { libc::geteuid() as u32 }
 }
@@ -25157,18 +25187,6 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         "{home}"
     );
     assert!(
-        home.contains("about <a href=\"/task/SERVEWRITE/e-web-open\">Approve this roadmap</a>"),
-        "{home}"
-    );
-    assert!(
-        home.contains("span class=\"type type-epic\">epic</span>"),
-        "{home}"
-    );
-    assert!(
-        home.contains("about <a href=\"/task/SERVEWRITE/s-web-open\">Ship the rollout task</a>"),
-        "{home}"
-    );
-    assert!(
         home.contains("Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on"),
         "{home}"
     );
@@ -25472,6 +25490,126 @@ fn js_value(tab: &headless_chrome::Tab, expression: &str) -> Value {
         .unwrap_or_else(|error| panic!("evaluate {expression}: {error}"))
         .value
         .unwrap_or(Value::Null)
+}
+
+fn trusted_web_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
+    let tab = chrome.new_tab().expect("browser tab");
+    tab.set_extra_http_headers(std::collections::HashMap::from([(
+        "X-Auth-Request-Email",
+        "geoyws",
+    )]))
+    .expect("set the trusted edge actor header");
+    tab.navigate_to(origin).expect("load Kanban");
+    tab.wait_until_navigated().expect("initial navigation");
+    tab.wait_for_element("[data-primary-nav]")
+        .expect("primary navigation");
+    tab
+}
+
+fn assert_no_horizontal_overflow(tab: &headless_chrome::Tab, page_name: &str) {
+    assert_eq!(js_value(tab, "window.innerWidth"), 390, "{page_name}");
+    assert_eq!(js_value(tab, "window.innerHeight"), 844, "{page_name}");
+    assert_eq!(
+        js_value(
+            tab,
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth",
+        ),
+        true,
+        "{page_name} overflows the mobile viewport"
+    );
+}
+
+fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, label: &str) {
+    let control_deadline = Instant::now() + Duration::from_secs(20);
+    let control = loop {
+        let control = tab
+            .wait_for_element(selector)
+            .unwrap_or_else(|error| panic!("{label}: missing {selector}: {error}"));
+        if let Err(scroll_error) = control.scroll_into_view() {
+            let detached = control
+                .call_js_fn("function() { return !this.isConnected; }", vec![], false)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: confirm detachment after scroll error {scroll_error}: {error}")
+                })
+                .value
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label}: detachment check had no value after scroll error {scroll_error}"
+                    )
+                });
+            if detached != json!(true) {
+                panic!("{label}: could not scroll the connected control into view: {scroll_error}");
+            }
+            assert!(
+                Instant::now() < control_deadline,
+                "{label}: the control kept detaching before it could be scrolled into view"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        let state = control
+            .call_js_fn(
+                "function() { if (!this.isConnected) return 'detached'; const r = this.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth) return 'visible'; return JSON.stringify({left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height,innerWidth,innerHeight}); }",
+                vec![],
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{label}: measure the connected control: {error}"))
+            .value
+            .unwrap_or_else(|| panic!("{label}: connected-control measurement had no value"));
+        let state = state
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: connected-control measurement was not a string"));
+        if state == "visible" {
+            break control;
+        }
+        if state != "detached" {
+            panic!("{label}: control was not reachable in the viewport after scrolling: {state}");
+        }
+        assert!(
+            Instant::now() < control_deadline,
+            "{label}: the control kept detaching before its bounds could be measured"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        js_value(
+            tab,
+            "(() => { document.documentElement.dataset.navigationProbe = 'before'; return true; })()",
+        ),
+        true
+    );
+    control
+        .click()
+        .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
+    tab.wait_until_navigated()
+        .unwrap_or_else(|error| panic!("{label}: navigation failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let replaced = tab
+            .evaluate("!document.documentElement.dataset.navigationProbe", false)
+            .ok()
+            .and_then(|result| result.value)
+            == Some(json!(true));
+        if replaced {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: the clicked control never replaced the document"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    tab.wait_for_element(arrived)
+        .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
+}
+
+fn assert_element_text(tab: &headless_chrome::Tab, selector: &str, expected: &str) {
+    let text = tab
+        .wait_for_element(selector)
+        .unwrap_or_else(|error| panic!("missing {selector}: {error}"))
+        .get_inner_text()
+        .unwrap_or_else(|error| panic!("read {selector}: {error}"));
+    assert_eq!(text.trim(), expected, "{selector}");
 }
 
 /// `attention raise` argv for one card: the fixed flags, then the card's own.
@@ -27836,6 +27974,774 @@ fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
     let rows = wait_for_notice_rows(&tab, 1, "a different change");
     assert!(rows[0].contains("t-later"), "{rows:?}");
     drop(server);
+}
+
+#[test]
+fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-mobile-journey");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "MOBILE-JOURNEY", "--json"],
+    );
+    let task_title = "Seleniumquartz mobile release audit";
+    let task_body = "seleniumquartz identifies the exact mobile journey fixture.";
+    let task = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            task_title,
+            "--id",
+            "t-mobile-journey",
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--body",
+            task_body,
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    assert_eq!(task["id"], "t-mobile-journey");
+    assert_eq!(task["title"], task_title);
+    assert_eq!(task["status"], "todo");
+
+    let note_body = "Mobile history receipt 2026-09-10 exact fixture.";
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-mobile-journey",
+            note_body,
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let sitrep_body = "Mobile lane has the seeded task in hand.";
+    let sitrep = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            sitrep_body,
+            "--as",
+            "fixture-agent",
+            "--lane",
+            "mobile-lane",
+            "--task",
+            "t-mobile-journey",
+            "--json",
+        ],
+    );
+    assert_eq!(sitrep["taskID"], "t-mobile-journey");
+
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban-mobile-fixture",
+            "--commit",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--tier",
+            "@_bd",
+            "--environment",
+            "mobile-browser-fixture",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://127.0.0.1:14200",
+            "--task",
+            "t-mobile-journey",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &deployment_id,
+            "--token",
+            deployment["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--receipt",
+            "Mobile fixture served exact commit bbbbbbbbbbbb.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+
+    let recovery = start_recovery_deployment(&fixture, "mobile-artifact-fixture");
+    let recovery_id = recovery["id"].as_str().unwrap().to_owned();
+    let recovery_api = format!("api=docker-image-id:{RECOVERY_API_IMAGE_ID}");
+    let recovery_web = format!("web=oci-manifest-digest:{RECOVERY_WEB_MANIFEST}");
+    let recovery_finish = finish_recovery_deployment(
+        &fixture,
+        &recovery_id,
+        recovery["capabilityToken"].as_str().unwrap(),
+        &[&recovery_api, &recovery_web],
+    );
+    assert!(
+        recovery_finish.status.success(),
+        "artifact deployment finish failed: {}",
+        String::from_utf8_lossy(&recovery_finish.stderr)
+    );
+
+    let server = spawn_server(&fixture);
+    let origin = server.origin();
+    let chrome = launch_mobile_browser(chrome_binary());
+    let tab = chrome.new_tab().expect("mobile tab");
+    set_mobile_viewport(&tab);
+    tab.navigate_to(&origin).expect("load Needs you");
+    tab.wait_until_navigated()
+        .expect("initial mobile navigation");
+    tab.wait_for_element("[data-primary-nav]")
+        .expect("primary navigation");
+    assert_no_horizontal_overflow(&tab, "Needs you");
+
+    let boards_link = tab.wait_for_element("[data-nav=boards]").unwrap();
+    assert_eq!(
+        boards_link.get_attribute_value("href").unwrap().as_deref(),
+        Some("/boards")
+    );
+    click_navigating(
+        &tab,
+        "[data-nav=boards]",
+        "[data-board=\"MOBILE-JOURNEY\"]",
+        "Boards nav",
+    );
+    assert_eq!(js_value(&tab, "location.pathname"), "/boards");
+    assert_no_horizontal_overflow(&tab, "Boards");
+
+    let board_link = tab
+        .wait_for_element("[data-board=\"MOBILE-JOURNEY\"] [data-board-link]")
+        .unwrap();
+    assert_eq!(
+        board_link.get_attribute_value("href").unwrap().as_deref(),
+        Some("/board/MOBILE-JOURNEY")
+    );
+    click_navigating(
+        &tab,
+        "[data-board=\"MOBILE-JOURNEY\"] [data-board-link]",
+        "[data-task=\"t-mobile-journey\"]",
+        "seeded board",
+    );
+    assert_eq!(js_value(&tab, "location.pathname"), "/board/MOBILE-JOURNEY");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-task=\"t-mobile-journey\"]').textContent.includes('Seleniumquartz mobile release audit')",
+        ),
+        true
+    );
+    assert_no_horizontal_overflow(&tab, "seeded board");
+
+    let task_link = tab
+        .wait_for_element("[data-task-link=\"t-mobile-journey\"]")
+        .unwrap();
+    assert_eq!(
+        task_link.get_attribute_value("href").unwrap().as_deref(),
+        Some("/task/MOBILE-JOURNEY/t-mobile-journey")
+    );
+    click_navigating(
+        &tab,
+        "[data-task-link=\"t-mobile-journey\"]",
+        "[data-task-detail=\"t-mobile-journey\"]",
+        "board task",
+    );
+    assert_element_text(&tab, "[data-task-title]", task_title);
+    assert_element_text(&tab, "[data-task-status]", "todo");
+    assert_element_text(&tab, "[data-task-body]", task_body);
+    assert_element_text(&tab, "[data-task-note] pre", note_body);
+    let trail = tab.wait_for_element("[data-task-trail]").unwrap();
+    trail.scroll_into_view().expect("scroll to task trail");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-event-kind=\"note_added\"]').cells[2].textContent === 'fixture-agent'",
+        ),
+        true,
+        "the task trail did not attribute the seeded note event to its CLI actor"
+    );
+    assert_no_horizontal_overflow(&tab, "task detail");
+
+    let search = tab
+        .wait_for_element("[data-nav-search] input[name=q]")
+        .expect("navigation search");
+    search
+        .scroll_into_view()
+        .expect("scroll to navigation search");
+    assert_eq!(
+        search
+            .call_js_fn(
+                "function() { const r = this.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; }",
+                vec![],
+                false,
+            )
+            .unwrap()
+            .value,
+        Some(json!(true)),
+        "the navigation search was not reachable after scrolling"
+    );
+    search
+        .type_into("seleniumquartz")
+        .expect("type navigation search");
+    tab.press_key("Enter").expect("submit navigation search");
+    tab.wait_until_navigated().expect("search navigation");
+    tab.wait_for_element("[data-task-link=\"t-mobile-journey\"]")
+        .expect("seeded search result");
+    assert_eq!(js_value(&tab, "location.pathname"), "/search");
+    assert_no_horizontal_overflow(&tab, "Search");
+    let result = tab
+        .wait_for_element("[data-task-link=\"t-mobile-journey\"]")
+        .unwrap();
+    assert_eq!(
+        result.get_attribute_value("href").unwrap().as_deref(),
+        Some("/task/MOBILE-JOURNEY/t-mobile-journey")
+    );
+    click_navigating(
+        &tab,
+        "[data-task-link=\"t-mobile-journey\"]",
+        "[data-task-detail=\"t-mobile-journey\"]",
+        "search result",
+    );
+    assert_element_text(&tab, "[data-task-title]", task_title);
+    assert_no_horizontal_overflow(&tab, "searched task detail");
+
+    click_navigating(
+        &tab,
+        "[data-nav=lanes]",
+        "[data-lane=\"mobile-lane\"]",
+        "Lanes nav",
+    );
+    assert_eq!(js_value(&tab, "location.pathname"), "/lanes");
+    assert_element_text(
+        &tab,
+        "[data-lane=\"mobile-lane\"] [data-lane-body]",
+        sitrep_body,
+    );
+    assert_no_horizontal_overflow(&tab, "Lanes");
+    click_navigating(
+        &tab,
+        "[data-lane=\"mobile-lane\"] [data-task-link=\"t-mobile-journey\"]",
+        "[data-task-detail=\"t-mobile-journey\"]",
+        "lane task",
+    );
+    assert_element_text(&tab, "[data-task-title]", task_title);
+    assert_no_horizontal_overflow(&tab, "lane task detail");
+
+    click_navigating(
+        &tab,
+        "[data-nav=deployments]",
+        &format!("[data-deployment-link=\"{deployment_id}\"]"),
+        "Deployments nav",
+    );
+    assert_eq!(js_value(&tab, "location.pathname"), "/deployments");
+    assert_no_horizontal_overflow(&tab, "Deployments");
+    let deployment_selector = format!("[data-deployment-link=\"{deployment_id}\"]");
+    let deployment_link = tab.wait_for_element(&deployment_selector).unwrap();
+    assert_eq!(
+        deployment_link
+            .get_attribute_value("href")
+            .unwrap()
+            .as_deref(),
+        Some(format!("/deployment/MOBILE-JOURNEY/{deployment_id}").as_str())
+    );
+    click_navigating(
+        &tab,
+        &deployment_selector,
+        &format!("[data-deployment-detail=\"{deployment_id}\"]"),
+        "deployment attempt",
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deployment-field=\"Repository\"]').textContent"
+        ),
+        "geoyws/kanban-mobile-fixture"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deployment-field=\"Build commit\"]').textContent"
+        ),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deployment-field=\"Environment\"]').textContent"
+        ),
+        "mobile-browser-fixture"
+    );
+    assert_element_text(
+        &tab,
+        "[data-deployment-receipt]",
+        "Mobile fixture served exact commit bbbbbbbbbbbb.",
+    );
+    assert_no_horizontal_overflow(&tab, "deployment detail");
+    click_navigating(
+        &tab,
+        "[data-nav=deployments]",
+        &format!("[data-deployment-link=\"{recovery_id}\"]"),
+        "return to Deployments",
+    );
+    assert_no_horizontal_overflow(&tab, "Deployments with artifact release");
+    let recovery_selector = format!("[data-deployment-link=\"{recovery_id}\"]");
+    let recovery_link = tab.wait_for_element(&recovery_selector).unwrap();
+    assert_eq!(
+        recovery_link
+            .get_attribute_value("href")
+            .unwrap()
+            .as_deref(),
+        Some(format!("/deployment/MOBILE-JOURNEY/{recovery_id}").as_str())
+    );
+    click_navigating(
+        &tab,
+        &recovery_selector,
+        &format!("[data-deployment-detail=\"{recovery_id}\"]"),
+        "artifact-identity deployment attempt",
+    );
+    assert_element_text(
+        &tab,
+        "[data-deployment-field=\"Identity mode\"]",
+        "artifact",
+    );
+    assert_element_text(
+        &tab,
+        "[data-deployment-field=\"Build commit\"]",
+        "build commit unknown - recovered by artifact identity",
+    );
+    assert_element_text(
+        &tab,
+        "[data-deployment-field=\"Deployer checkout\"]",
+        RECOVERY_CHECKOUT,
+    );
+    assert_no_horizontal_overflow(&tab, "artifact deployment detail");
+}
+
+#[test]
+fn opening_a_draft_plan_in_real_chrome_moves_the_real_task_to_todo() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-plan-journey");
+    fixture.ok_json(&fixture.main, &["init", "--name", "WEB-PLAN", "--json"]);
+    let plan_id = "e-browser-open-plan";
+    let plan_title = "Open the browser-backed plan";
+    let plan_body = "This exact plan body is released through the web control.";
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            plan_title,
+            "--id",
+            plan_id,
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--body",
+            plan_body,
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", plan_id, "--json"])["status"],
+        "draft"
+    );
+
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = trusted_web_tab(&chrome, &origin);
+    let plans_nav = tab.wait_for_element("[data-nav=plans]").unwrap();
+    assert_eq!(
+        plans_nav.get_attribute_value("href").unwrap().as_deref(),
+        Some("/plans")
+    );
+    click_navigating(
+        &tab,
+        "[data-nav=plans]",
+        &format!("[data-plan=\"{plan_id}\"]"),
+        "Plans nav",
+    );
+    assert_element_text(
+        &tab,
+        &format!("[data-plan=\"{plan_id}\"] [data-task-link=\"{plan_id}\"]"),
+        plan_title,
+    );
+    assert_element_text(
+        &tab,
+        &format!("[data-plan=\"{plan_id}\"] .plan-body"),
+        plan_body,
+    );
+    let form = tab
+        .wait_for_element(&format!("[data-plan=\"{plan_id}\"] form"))
+        .unwrap();
+    assert_eq!(
+        form.get_attribute_value("action").unwrap().as_deref(),
+        Some("/plan/WEB-PLAN/e-browser-open-plan/open")
+    );
+    click_navigating(
+        &tab,
+        &format!("[data-plan=\"{plan_id}\"] [data-plan-open]"),
+        "[data-plan-opened]",
+        "Open plan",
+    );
+    assert_eq!(
+        js_value(&tab, "location.pathname + location.search"),
+        "/plans?opened=e-browser-open-plan"
+    );
+    assert_element_text(&tab, "[data-plan-opened] code", plan_id);
+    let opened = fixture.ok_json(&fixture.main, &["task", "show", plan_id, "--json"]);
+    assert_eq!(opened["id"], plan_id);
+    assert_eq!(opened["status"], "todo");
+}
+
+#[test]
+fn subscription_pause_and_resume_in_real_chrome_persist_each_state() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-subscription-journey");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WEB-SUBSCRIPTION", "--json"],
+    );
+    let subscription_id = "sub-browser-lifecycle";
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "add",
+            "--id",
+            subscription_id,
+            "--kind",
+            "task_added",
+            "--consumer",
+            "browser.fixture",
+            "--action",
+            "deliver-exact-row",
+            "--timeout-ms",
+            "30000",
+            "--max-retries",
+            "3",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    for (id, consumer) in [
+        ("sub-browser-peer-active", "browser.peer-active"),
+        ("sub-browser-peer-paused", "browser.peer-paused"),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "subscription",
+                "add",
+                "--id",
+                id,
+                "--kind",
+                "task_added",
+                "--consumer",
+                consumer,
+                "--action",
+                "deliver-peer-row",
+                "--timeout-ms",
+                "30000",
+                "--max-retries",
+                "3",
+                "--rate-per-minute",
+                "60",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "geoyws",
+                "--json",
+            ],
+        );
+    }
+    let peer_paused = fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "pause",
+            "sub-browser-peer-paused",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(peer_paused["status"], "paused");
+
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["subscription", "show", subscription_id, "--json"],
+        )["status"],
+        "active"
+    );
+
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = trusted_web_tab(&chrome, &origin);
+    click_navigating(
+        &tab,
+        "[data-nav=subscriptions]",
+        &format!("[data-subscription=\"{subscription_id}\"]"),
+        "Subscriptions nav",
+    );
+    let row = format!("[data-subscription=\"{subscription_id}\"]");
+    assert_element_text(&tab, &format!("{row} [data-subscription-state]"), "active");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{row}').cells[2].querySelector('code').textContent"),
+        ),
+        "browser.fixture"
+    );
+    let pause_form = tab.wait_for_element(&format!("{row} form")).unwrap();
+    assert_eq!(
+        pause_form.get_attribute_value("action").unwrap().as_deref(),
+        Some("/subscription/WEB-SUBSCRIPTION/sub-browser-lifecycle/pause")
+    );
+    click_navigating(
+        &tab,
+        &format!("{row} [data-subscription-action=pause]"),
+        &row,
+        "Pause subscription",
+    );
+    assert_eq!(
+        js_value(&tab, "location.pathname + location.search"),
+        "/subscriptions?show=all&changed=sub-browser-lifecycle"
+    );
+    assert_element_text(&tab, &format!("{row} [data-subscription-state]"), "paused");
+    let assert_subscription_row = |id: &str, state: &str| {
+        let selector = format!("[data-subscription=\"{id}\"]");
+        assert_eq!(
+            js_value(
+                &tab,
+                &format!("document.querySelectorAll('{selector}').length"),
+            ),
+            1,
+            "subscription {id} did not have exactly one table row"
+        );
+        assert_element_text(
+            &tab,
+            &format!("{selector} [data-subscription-state]"),
+            state,
+        );
+    };
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelectorAll('[data-subscription]').length"
+        ),
+        3
+    );
+    assert_subscription_row(subscription_id, "paused");
+    assert_subscription_row("sub-browser-peer-active", "active");
+    assert_subscription_row("sub-browser-peer-paused", "paused");
+    let paused = fixture.ok_json(
+        &fixture.main,
+        &["subscription", "show", subscription_id, "--json"],
+    );
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(paused["pausedBy"], "geoyws");
+
+    let resume_form = tab.wait_for_element(&format!("{row} form")).unwrap();
+    assert_eq!(
+        resume_form
+            .get_attribute_value("action")
+            .unwrap()
+            .as_deref(),
+        Some("/subscription/WEB-SUBSCRIPTION/sub-browser-lifecycle/resume?show=all")
+    );
+    click_navigating(
+        &tab,
+        &format!("{row} [data-subscription-action=resume]"),
+        &row,
+        "Resume subscription",
+    );
+    assert_eq!(
+        js_value(&tab, "location.pathname + location.search"),
+        "/subscriptions?show=all&changed=sub-browser-lifecycle"
+    );
+    assert_element_text(&tab, &format!("{row} [data-subscription-state]"), "active");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelectorAll('[data-subscription]').length"
+        ),
+        3
+    );
+    assert_subscription_row(subscription_id, "active");
+    assert_subscription_row("sub-browser-peer-active", "active");
+    assert_subscription_row("sub-browser-peer-paused", "paused");
+    let resumed = fixture.ok_json(
+        &fixture.main,
+        &["subscription", "show", subscription_id, "--json"],
+    );
+    assert_eq!(resumed["status"], "active");
+    assert_eq!(resumed["pausedBy"], Value::Null);
+}
+
+#[test]
+fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-last-card-journey");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "WEB-LAST-CARD", "--json"],
+    );
+    let task_id = "t-last-browser-card";
+    let task_title = "Inspect the last browser card";
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            task_title,
+            "--id",
+            task_id,
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Approve the final browser card.",
+            "--task",
+            task_id,
+            "--kind",
+            "decision",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let attention_id = attention["id"].as_str().unwrap();
+
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let task_link = tab
+        .wait_for_element(&format!(
+            "[data-item=\"{attention_id}\"] [data-task-link=\"{task_id}\"]"
+        ))
+        .expect("attention card task link");
+    assert_eq!(
+        task_link.get_attribute_value("href").unwrap().as_deref(),
+        Some("/task/WEB-LAST-CARD/t-last-browser-card")
+    );
+    assert_eq!(
+        task_link
+            .get_inner_text()
+            .expect("attention card task title"),
+        task_title
+    );
+    assert_element_text(
+        &tab,
+        &format!("[data-item=\"{attention_id}\"] [data-task-type]"),
+        "task",
+    );
+    click_navigating(
+        &tab,
+        &format!("[data-item=\"{attention_id}\"] [data-task-link=\"{task_id}\"]"),
+        &format!("[data-task-detail=\"{task_id}\"]"),
+        "attention card task drilldown",
+    );
+    assert_element_text(&tab, "[data-task-title]", task_title);
+    click_navigating(
+        &tab,
+        "[data-nav=needs-you]",
+        &format!("[data-item=\"{attention_id}\"]"),
+        "return to Needs you",
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "1"
+    );
+
+    hold_projection(&tab);
+    tab.wait_for_element(&format!(
+        "[data-item=\"{attention_id}\"] button.choice[value=approve]"
+    ))
+    .expect("final approval choice")
+    .click()
+    .expect("settle final attention card");
+    tab.wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
+        .expect("final attention receipt");
+    wait_for_projection_swap(&tab);
+    let receipt = tab
+        .wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
+        .expect("receipt after WebSocket-refreshed empty projection");
+    receipt
+        .scroll_into_view()
+        .expect("receipt remains reachable after WebSocket refresh");
+    assert_receipt(&tab, attention_id, "Approve - proceed");
+    assert_eq!(
+        receipt
+            .call_js_fn(
+                "function() { const r = this.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth; }",
+                vec![],
+                false,
+            )
+            .expect("measure refreshed receipt")
+            .value,
+        Some(json!(true)),
+        "the exact receipt was not visible after scrolling"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('article.item').length"),
+        0
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open, json!([]));
+    let settled = settled_row(&fixture, attention_id);
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["decision"]["choice"], "approve");
+    assert_eq!(settled["decision"]["by"], "geoyws");
 }
 
 #[test]
@@ -38387,10 +39293,6 @@ fn the_deployments_page_says_build_commit_unknown_in_words() {
     assert_eq!(status, 200, "{detail}");
     assert!(
         detail.contains("build commit unknown - recovered by artifact identity"),
-        "{detail}"
-    );
-    assert!(
-        detail.contains("<dt>Identity mode</dt><dd>artifact</dd>"),
         "{detail}"
     );
     // The deployer's checkout is shown as itself, in its own field, and the
