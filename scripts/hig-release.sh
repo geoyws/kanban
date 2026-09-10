@@ -21,6 +21,23 @@ BINARIES=(
 MAX_RELEASES=10
 HOSTNAME_BIN="${HOSTNAME_BIN:-/bin/hostname}"
 BIN_DIR_DEFAULT="${BIN_DIR_DEFAULT:-${HOME:-/root}/.local/bin}"
+# The one platform a Kanban release IS (ADR-044 §1): every packaged binary is
+# this, whatever the machine that built it runs natively. A build is native
+# when the build machine already is it, and containerised when it is not. The
+# same platform is spelled twice more - in require_release_platform's refusal
+# sentence and in receipt_provenance_defs' artifactPlatform check, each with
+# its own remote twin - and all of them move together or not at all.
+RELEASE_ARTIFACT_PLATFORM="linux-x86_64"
+# Tried in this order when the operator names no runtime, first hit wins. Any
+# OCI runtime that accepts `run --rm --platform linux/amd64 <image> <command>`
+# qualifies; KANBAN_RELEASE_CONTAINER_RUNTIME replaces the search in full.
+RELEASE_CONTAINER_RUNTIMES=(docker podman nerdctl)
+# Measured by the capability gate, recorded by the package receipt. Nothing
+# else writes them, and no receipt field asserts one that was not measured.
+RELEASE_BUILD_PLATFORM=""
+RELEASE_BUILD_KIND=""
+RELEASE_BUILDER_IMAGE=""
+RELEASE_BUILD_RUNTIME=""
 TEMP_PATHS=()
 
 die() {
@@ -47,7 +64,7 @@ track_temp() {
 usage() {
   cat >&2 <<'EOF'
 usage:
-  hig-release.sh package hax [--output DIR]
+  hig-release.sh package hax [--output DIR] [--builder-image REF@sha256:HEX]
   hig-release.sh install <hax|hig> --package DIR --install-root DIR [--hax-install-root DIR]
   hig-release.sh rollback <hax|hig> --install-root DIR [--steps N]
 EOF
@@ -90,6 +107,21 @@ release_binary_known() {
   return 1
 }
 
+# Which branch of file_version answers a version probe on this host, so the
+# receipt can RECORD which one did rather than leave a reader to infer it.
+# One reading of HIG_RELEASE_TARGET_RUNNER, shared by the probe that follows
+# it and by the receipt's versionProbe field (ADR-044 §2), because two
+# readings are two facts and two facts can disagree.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+version_probe_kind() {
+  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    printf 'runner\n'
+  else
+    printf 'native\n'
+  fi
+}
+
 file_version() {
   local binary="$1"
   local name="${binary##*/}"
@@ -111,19 +143,18 @@ file_version() {
   # same pinned image the binaries were built in, because a host that is not
   # linux x86-64 cannot ask a release binary anything.
   #
-  # What it can and cannot reach, as it is today rather than as it should be:
+  # What it can and cannot reach, stated as it is rather than as it should be:
   # it never carries a gate, because the platform header, the byte count and
   # every sha256 read the bytes on disk and never pass through it, and a
   # runner that fails or reports nothing is a refusal, so an empty version is
   # never recorded. But a runner that is set is TRUSTED: files[].version is
   # whatever it prints, a false runner yields a false version that
-  # package_validate then re-validates against itself and accepts, and
-  # nothing in the manifest or the receipt records that a runner answered at
-  # all. The provenance wave closes that with a mandatory receipt field
-  # naming the probe that answered (native or runner); this wave does not
-  # touch the receipt schema.
+  # package_validate then re-validates against itself and accepts. What a
+  # receipt can honestly say about that is WHICH BRANCH answered, so the
+  # branch is chosen by version_probe_kind and the package receipt records
+  # that same verdict in versionProbe.
   local reported
-  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+  if [[ "$(version_probe_kind)" == runner ]]; then
     [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
       die "refusing $binary: HIG_RELEASE_TARGET_RUNNER must name one executable program, and $HIG_RELEASE_TARGET_RUNNER is not one"
     reported="$("$HIG_RELEASE_TARGET_RUNNER" "$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
@@ -318,6 +349,50 @@ validate_package() {
   validate_release_files "$package_dir" "$target"
 }
 
+# What a `formatVersion` 2 receipt must SAY ABOUT ITS OWN BUILD, as one jq
+# definition every receipt validator prepends to its own program (ADR-044
+# §2). One copy rather than three, because three copies of an invariant are
+# three chances to check a different thing on the local leg, the hig
+# activation check and the remote installer.
+#
+# `host` is shape-checked and never compared to a name: v1 asserted the
+# literal "hax" back, which authorized nothing and recorded nothing, and v2
+# admits any short hostname because the name is a record. What cannot be
+# faked is checked instead - `artifactPlatform` is the platform every
+# packaged file was verified to be, and the cross-field rules refuse the
+# receipts that could not have been produced: a native build that is not the
+# artifact's own platform, a native build naming an image, a containerised
+# build whose image is not digest-pinned, and a version probe claiming to
+# have run the artifact on a machine that cannot run it.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+receipt_provenance_defs() {
+  cat <<'JQ'
+def receipt_provenance_ok:
+  (.formatVersion == 2)
+  and ((.host | type) == "string") and (.host | test("^\\S+$"))
+  and ((.buildPlatform | type) == "string")
+  and (.buildPlatform | test("^[a-z0-9_]+-[a-z0-9_.]+$"))
+  and (.artifactPlatform == "linux-x86_64")
+  and ((.buildKind == "native") or (.buildKind == "container"))
+  and (has("builderImage"))
+  and (if .buildKind == "native"
+       then (.builderImage == null) and (.buildPlatform == .artifactPlatform)
+       else ((.builderImage | type) == "string")
+            and (.builderImage | test("^[^[:space:]@]+@sha256:[0-9a-f]{64}$"))
+       end)
+  and ((.toolchain | type) == "object")
+  and ((.toolchain | keys) == ["cargo", "rustc"])
+  and ((.toolchain.rustc | type) == "string") and ((.toolchain.rustc | length) > 0)
+  and ((.toolchain.cargo | type) == "string") and ((.toolchain.cargo | length) > 0)
+  and ((.versionProbe == "native") or (.versionProbe == "runner"))
+  and (if .versionProbe == "native"
+       then .buildPlatform == .artifactPlatform
+       else true
+       end);
+JQ
+}
+
 validate_receipt() {
   local receipt="$1"
   local target="$2"
@@ -328,9 +403,8 @@ validate_receipt() {
   manifest_commit="$(jq -r '.sourceCommit' "$(manifest_path "$package_dir")")"
   [[ -f "$receipt" ]] || die "package receipt is missing: $receipt"
   ensure_regular_dir "$(dirname "$receipt")"
-  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --argjson expected_files "$(binaries_json)" '
-    (.formatVersion == 1) and
-    (.host == "hax") and
+  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --argjson expected_files "$(binaries_json)" "$(receipt_provenance_defs)"'
+    receipt_provenance_ok and
     (.targets | type == "array") and
     (.targets | length == 2) and
     (.targets | index("hax") != null) and
@@ -397,9 +471,10 @@ validate_hax_activation_receipt() {
   [[ ! -L "$receipt" ]] || die "hax activation receipt must not be a symlink: $receipt"
   [[ -d "$release_dir" ]] || die "hax release directory is missing: $release_dir"
   [[ ! -L "$release_dir" ]] || die "hax release directory must not be a symlink: $release_dir"
-  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --arg manifest_commit "$manifest_commit" --arg release_id "$release_id" --arg release_dir "$release_dir" --arg current_path "$current_path" '
-    (.formatVersion == 1) and
-    (.host == "hax") and
+  jq -e --arg target "$target" --arg manifest_sha "$manifest_sha" --arg manifest_commit "$manifest_commit" --arg release_id "$release_id" --arg release_dir "$release_dir" --arg current_path "$current_path" "$(receipt_provenance_defs)"'
+    receipt_provenance_ok and
+    # `target` and `installerHost` are facts about the machine that ACTIVATED
+    # this release, which is still hax, and are a different fact from `host`.
     (.target == "hax") and
     (.installerHost == "hax") and
     (.targets | type == "array") and
@@ -1203,11 +1278,255 @@ write_manifest() {
     }' > "$output/manifest.json"
 }
 
+# Runs one command with a deadline, stdout and stderr each to their own file,
+# and answers 124 when the deadline passed - the exit status `timeout(1)`
+# uses, which is not installed on every host this script runs on. What is
+# bounded is the program this shell launched: a container client killed here
+# leaves a `--rm` container to the runtime's own reaper, which is the right
+# trade for a probe that must not be able to hang a release.
+run_bounded() {
+  local seconds="$1"
+  local out="$2"
+  local err="$3"
+  shift 3
+  "$@" > "$out" 2> "$err" &
+  local pid=$!
+  local tenths=$(( seconds * 10 ))
+  while (( tenths > 0 )); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    (( tenths -= 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
+  fi
+  local status=0
+  wait "$pid" || status=$?
+  return "$status"
+}
+
+# The ceiling on any single container call this script makes that is a probe
+# rather than a build: one `uname`, one `--version`, plus whatever pulling the
+# image costs the first time. An operator on a cold cache raises it; nobody
+# removes it, because every one of these calls sits before a release can be
+# refused for free.
+container_probe_seconds() {
+  local seconds="${KANBAN_RELEASE_CONTAINER_PROBE_SECONDS:-120}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] ||
+    die "KANBAN_RELEASE_CONTAINER_PROBE_SECONDS must be a whole number of seconds greater than zero, and it is $seconds"
+  printf '%s\n' "$seconds"
+}
+
+# What THIS machine REPORTS it is, in the receipt's own vocabulary: `uname -s`
+# lowercased, a hyphen, `uname -m` verbatim - linux-x86_64, darwin-arm64. It
+# is a record and not an authorization: `uname` resolves through PATH like
+# every other program here, so a caller who redirects it gets a false
+# buildPlatform on a real receipt, exactly as a redirected HOSTNAME_BIN gets a
+# false `host`. What that buys is nothing, because the claim beside it -
+# artifactPlatform - is earned by require_release_platform reading the actual
+# bytes of every packaged file.
+build_platform() {
+  local kernel machine
+  kernel="$(uname -s | tr '[:upper:]' '[:lower:]')" || kernel=""
+  machine="$(uname -m)" || machine=""
+  [[ -n "$kernel" && -n "$machine" ]] ||
+    die "this machine did not report a platform: uname -s said ${kernel:-nothing} and uname -m said ${machine:-nothing}"
+  printf '%s-%s' "$kernel" "$machine"
+}
+
+# The first OCI runtime this machine offers, or nothing. The requirement is a
+# capability and not a brand - the runtime must accept `run --rm --platform
+# linux/amd64 <image> <command>` - so KANBAN_RELEASE_CONTAINER_RUNTIME naming
+# an executable replaces the search entirely, which is also how the tests
+# drive every container case without a daemon.
+container_runtime_path() {
+  local candidate
+  if [[ -n "${KANBAN_RELEASE_CONTAINER_RUNTIME:-}" ]]; then
+    command -v -- "$KANBAN_RELEASE_CONTAINER_RUNTIME" 2>/dev/null || return 1
+    return 0
+  fi
+  for candidate in "${RELEASE_CONTAINER_RUNTIMES[@]}"; do
+    command -v -- "$candidate" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# The gate that replaced `require_host hax` (ADR-044 §3). It asks what this
+# machine can PRODUCE rather than what it is called, and the difference is not
+# that one input is forgeable and the other is not - `uname`, `rustc` and
+# `cargo` all resolve through PATH, so a caller who redirects them can drive
+# this gate down the native branch and get `buildKind: native` on a machine
+# that is nothing of the sort. The difference is what happens next: whichever
+# branch is chosen, every binary that reaches the package is read byte by byte
+# by require_release_platform, so a redirected gate yields a false record of
+# HOW a release was built and can never yield a release that is not linux
+# x86-64.
+#
+# Native when this machine already is the release platform. Otherwise
+# containerised, and only when a runtime is found, the operator named a
+# digest-pinned image, and that image REALLY runs linux x86-64 - measured by
+# running `uname -m` inside it, never inferred from the runtime's name or
+# from the `--platform` flag it was asked for. Nothing is built or written
+# before this answers, and every refusal names this platform and exactly what
+# was missing.
+require_release_build_capability() {
+  local image="$1"
+  RELEASE_BUILD_PLATFORM="$(build_platform)"
+  if [[ "$RELEASE_BUILD_PLATFORM" == "$RELEASE_ARTIFACT_PLATFORM" ]]; then
+    RELEASE_BUILD_KIND="native"
+    RELEASE_BUILDER_IMAGE=""
+    RELEASE_BUILD_RUNTIME=""
+    return 0
+  fi
+  local refusal="cannot package a linux x86-64 release on $RELEASE_BUILD_PLATFORM"
+  local runtime=""
+  runtime="$(container_runtime_path)" || runtime=""
+  if [[ -z "$runtime" ]]; then
+    # Two different absences, said apart rather than papered over: an
+    # operator who named a runtime is not told the variable is unset.
+    [[ -z "${KANBAN_RELEASE_CONTAINER_RUNTIME:-}" ]] ||
+      die "$refusal: no container runtime found; KANBAN_RELEASE_CONTAINER_RUNTIME names $KANBAN_RELEASE_CONTAINER_RUNTIME, which is not an executable program, so there is no linux x86-64 build environment on this machine"
+    local names
+    names="$(printf '%s, ' "${RELEASE_CONTAINER_RUNTIMES[@]}")"
+    die "$refusal: no container runtime found; none of ${names%, } is on PATH and KANBAN_RELEASE_CONTAINER_RUNTIME is unset, so there is no linux x86-64 build environment on this machine"
+  fi
+  [[ -n "$image" ]] ||
+    die "$refusal: no builder image was named; pass --builder-image <ref>@sha256:<64 hex> or set KANBAN_RELEASE_BUILDER_IMAGE"
+  [[ "$image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] ||
+    die "$refusal: builder image $image is not digest-pinned, and a tag can move, so its digest would not name the bytes that built this release"
+  # Bounded, because a wedged runtime would otherwise hang packaging with no
+  # deadline anywhere in this path, and the operator would see nothing at all.
+  # The build itself is deliberately NOT bounded - a release build takes as
+  # long as it takes - but this probe is one `uname` and a possible image
+  # pull, so KANBAN_RELEASE_CONTAINER_PROBE_SECONDS names the ceiling for a
+  # machine that still has to fetch the image.
+  local probe_seconds
+  probe_seconds="$(container_probe_seconds)"
+  local probe_out probe_err probe_status=0
+  probe_out="$(mktemp "${TMPDIR:-/tmp}/kanban-release-probe.XXXXXX")"
+  probe_err="$(mktemp "${TMPDIR:-/tmp}/kanban-release-probe-err.XXXXXX")"
+  track_temp "$probe_out"
+  track_temp "$probe_err"
+  run_bounded "$probe_seconds" "$probe_out" "$probe_err" \
+    "$runtime" run --rm --platform linux/amd64 "$image" uname -m || probe_status=$?
+  local reported
+  reported="$(tr -d '\r' < "$probe_out" | sed -n '1p' | sed 's/[[:space:]]*$//')"
+  (( probe_status != 124 )) ||
+    die "$refusal: builder image $image did not answer uname -m through $runtime within ${probe_seconds}s, so nothing here shows it runs linux x86-64; raise KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine still has to pull it"
+  if (( probe_status != 0 )); then
+    # The runtime's own complaint, not a shrug: a daemon that is not running
+    # and an image that cannot be pulled are different problems and only it
+    # knows which one happened.
+    local complaint
+    complaint="$(tr -d '\r' < "$probe_err" | sed -n '1p' | sed 's/[[:space:]]*$//')"
+    die "$refusal: $runtime could not run builder image $image: ${complaint:-it exited $probe_status without saying why}"
+  fi
+  [[ "$reported" == x86_64 ]] ||
+    die "$refusal: builder image $image does not run linux x86-64; uname -m inside it reported ${reported:-nothing}"
+  RELEASE_BUILD_KIND="container"
+  RELEASE_BUILDER_IMAGE="$image"
+  RELEASE_BUILD_RUNTIME="$runtime"
+}
+
+# The toolchain that COMPILED the binaries, asked in the environment that
+# compiled them: inside the pinned image on the container path, on this host
+# on the native one. One line, trailing whitespace stripped, exactly as
+# file_version treats a binary's own answer. A tool that cannot answer is a
+# refusal, because an unmeasured toolchain is not a toolchain field.
+#
+# Bounded on the container path for the same reason the capability probe is:
+# it is one `--version` call, and a runtime that has wedged must not be able
+# to stop a release with no deadline and no sentence. The build between them
+# stays unbounded on purpose - a release build takes as long as it takes.
+release_toolchain_version() {
+  local tool="$1"
+  local reported
+  if [[ "$RELEASE_BUILD_KIND" == container ]]; then
+    local seconds probe_out probe_err probe_status=0
+    seconds="$(container_probe_seconds)"
+    probe_out="$(mktemp "${TMPDIR:-/tmp}/kanban-release-toolchain.XXXXXX")"
+    probe_err="$(mktemp "${TMPDIR:-/tmp}/kanban-release-toolchain-err.XXXXXX")"
+    track_temp "$probe_out"
+    track_temp "$probe_err"
+    run_bounded "$seconds" "$probe_out" "$probe_err" \
+      "$RELEASE_BUILD_RUNTIME" run --rm --platform linux/amd64 "$RELEASE_BUILDER_IMAGE" "$tool" --version ||
+      probe_status=$?
+    (( probe_status != 124 )) ||
+      die "refusing to record this release's toolchain: the builder image $RELEASE_BUILDER_IMAGE did not answer $tool --version through $RELEASE_BUILD_RUNTIME within ${seconds}s; raise KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine needs longer"
+    if (( probe_status != 0 )); then
+      local complaint
+      complaint="$(tr -d '\r' < "$probe_err" | sed -n '1p' | sed 's/[[:space:]]*$//')"
+      die "refusing to record this release's toolchain: the builder image $RELEASE_BUILDER_IMAGE could not report a $tool version: ${complaint:-it exited $probe_status without saying why}"
+    fi
+    reported="$(cat "$probe_out")"
+  else
+    reported="$("$tool" --version)" ||
+      die "refusing to record this release's toolchain: this host could not report a $tool version"
+  fi
+  reported="$(printf '%s' "$reported" | sed -n '1p' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+  [[ -n "$reported" ]] ||
+    die "refusing to record this release's toolchain: the $tool version probe reported nothing"
+  printf '%s\n' "$reported"
+}
+
+# `cargo build --release --locked --bins`, run against the worktree inside the
+# pinned image. The worktree is mounted READ-ONLY and CARGO_TARGET_DIR stays
+# outside it, because packaging refuses a run that changed the tree by so much
+# as an untracked file and a root-owned target/ written from inside a
+# container would be exactly that. Both paths keep their host names inside the
+# container so every path the build reports is the path this host holds.
+release_container_build() {
+  local root="$1"
+  local build_root="$2"
+  "$RELEASE_BUILD_RUNTIME" run --rm \
+    --platform linux/amd64 \
+    --volume "$root:$root:ro" \
+    --volume "$build_root:$build_root" \
+    --workdir "$root" \
+    --env "CARGO_TARGET_DIR=$build_root/target" \
+    "$RELEASE_BUILDER_IMAGE" \
+    cargo build --release --locked --bins
+}
+
+# How this host runs a target-platform binary when the build was
+# containerised: the same pinned image the binaries were built in, against the
+# package directory itself. One executable program taking the binary and its
+# probe, which is the HIG_RELEASE_TARGET_RUNNER contract, and it is only
+# installed when the operator named no runner of their own.
+release_container_target_runner() {
+  local package_dir="$1"
+  local runner_dir runner
+  runner_dir="$(mktemp -d "${TMPDIR:-/tmp}/kanban-release-runner.XXXXXX")"
+  track_temp "$runner_dir"
+  runner="$runner_dir/target-runner"
+  cat > "$runner" <<RUNNER
+#!/usr/bin/env bash
+set -Eeuo pipefail
+binary="\$1"
+shift
+exec "$RELEASE_BUILD_RUNTIME" run --rm \\
+  --platform linux/amd64 \\
+  --volume "$package_dir:$package_dir:ro" \\
+  --workdir "$package_dir" \\
+  "$RELEASE_BUILDER_IMAGE" \\
+  "\$binary" "\$@"
+RUNNER
+  chmod 0755 "$runner"
+  printf '%s\n' "$runner"
+}
+
 package_create() {
   local target="$1"
   [[ "$target" == hax ]] || die "package target must be hax"
   shift
   local output=""
+  # No default image, because a default would be an unpinned promise: the
+  # operator names the digest, on the flag or in the environment.
+  local builder_image="${KANBAN_RELEASE_BUILDER_IMAGE:-}"
   while (($#)); do
     case "$1" in
       --output)
@@ -1218,13 +1537,33 @@ package_create() {
         output="${1#*=}"
         shift
         ;;
+      --builder-image)
+        builder_image="${2:?--builder-image requires an image reference}"
+        shift 2
+        ;;
+      --builder-image=*)
+        builder_image="${1#*=}"
+        shift
+        ;;
       *)
         die "unknown package flag $1"
       ;;
     esac
   done
 
-  require_host hax
+  # Not "is this machine called hax" but "can this machine produce a linux
+  # x86-64 release, and how": the answer picks the build below and is what
+  # the receipt records.
+  require_release_build_capability "$builder_image"
+  # The name goes on the receipt, so it is measured here rather than at the
+  # jq that writes it: a HOSTNAME_BIN that reports nothing used to leave a
+  # bash error on stderr, an empty `host` on the receipt and exit 0, and the
+  # operator found out when the package reached hax. It authorizes nothing
+  # either way; it has to be a name.
+  local host
+  host="$(host_short 2>/dev/null)" || host=""
+  [[ -n "$host" && "$host" != *[[:space:]]* ]] ||
+    die "refusing to package: $HOSTNAME_BIN did not report a usable short hostname (it said ${host:-nothing}), and a release receipt records the machine that built it"
   if [[ -z "$output" ]]; then
     output="$(mktemp -d "${TMPDIR:-/tmp}/kanban-release-${target}.XXXXXX")"
   else
@@ -1242,14 +1581,30 @@ package_create() {
   local build_root
   build_root="$(mktemp -d "${TMPDIR:-/tmp}/kanban-release-build-${target}.XXXXXX")"
   track_temp "$build_root"
-  (
-    cd "$root"
-    CARGO_TARGET_DIR="$build_root/target" cargo build --release --locked --bins
-  )
+  if [[ "$RELEASE_BUILD_KIND" == container ]]; then
+    release_container_build "$root" "$build_root"
+  else
+    (
+      cd "$root"
+      CARGO_TARGET_DIR="$build_root/target" cargo build --release --locked --bins
+    )
+  fi
+  local rustc_version cargo_version
+  rustc_version="$(release_toolchain_version rustc)"
+  cargo_version="$(release_toolchain_version cargo)"
   local commit
   commit="$(git -C "$root" rev-parse HEAD)"
   local files='[]'
   mkdir -p "$output"
+  # A containerised build leaves this host unable to ask a release binary
+  # anything - it cannot execute one at all - so the probe goes back into the
+  # same pinned image. An operator who named their own runner keeps it: the
+  # receipt records which BRANCH answered either way, and never pretends the
+  # artifact answered for itself.
+  if [[ "$RELEASE_BUILD_KIND" == container && -z "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    local -x HIG_RELEASE_TARGET_RUNNER
+    HIG_RELEASE_TARGET_RUNNER="$(release_container_target_runner "$output")"
+  fi
   for binary in "${BINARIES[@]}"; do
     local source="$build_root/target/release/$binary"
     [[ -x "$source" ]] || die "release build did not produce $binary"
@@ -1279,21 +1634,46 @@ package_create() {
   local manifest_sha receipt
   manifest_sha="$(package_manifest_sha256 "$output")"
   receipt="$(receipt_path "$output")"
+  # Provenance, every field of it measured before it is written: `host` is
+  # what this machine calls itself and authorizes nothing, `buildPlatform` is
+  # where it was built, `artifactPlatform` is what it IS - earned by
+  # require_release_platform on every build output above and by
+  # package_validate on every packaged copy just now, never copied from a
+  # flag - and `versionProbe` is the same branch of file_version that
+  # produced every files[].version.
   jq -n -S \
-    --arg host "hax" \
+    --arg host "$host" \
+    --arg build_platform "$RELEASE_BUILD_PLATFORM" \
+    --arg artifact_platform "$RELEASE_ARTIFACT_PLATFORM" \
+    --arg build_kind "$RELEASE_BUILD_KIND" \
+    --arg builder_image "$RELEASE_BUILDER_IMAGE" \
+    --arg rustc_version "$rustc_version" \
+    --arg cargo_version "$cargo_version" \
+    --arg version_probe "$(version_probe_kind)" \
     --arg manifest_sha "$manifest_sha" \
     --arg source_commit "$commit" \
     --argjson files "$files" \
     --argjson targets "$(package_targets_json "$target")" \
     '{
-      formatVersion: 1,
+      formatVersion: 2,
       host: $host,
+      buildPlatform: $build_platform,
+      artifactPlatform: $artifact_platform,
+      buildKind: $build_kind,
+      builderImage: (if $builder_image == "" then null else $builder_image end),
+      toolchain: {rustc: $rustc_version, cargo: $cargo_version},
+      versionProbe: $version_probe,
       targets: $targets,
       manifestSha256: $manifest_sha,
       sourceCommit: $source_commit,
       sourceTreeClean: true,
       files: $files
     }' > "$receipt"
+  # Read back what was just written, through the same validator an install
+  # runs: a writer that cannot read its own receipt is how an empty `host`
+  # shipped in the first place, and this run is the last place that can be
+  # refused for free.
+  validate_receipt "$receipt" "$target" "$output"
   jq -n -S \
     --arg packageDir "$output" \
     --arg manifest "$(manifest_path "$output")" \
@@ -1579,6 +1959,21 @@ release_binary_known() {
   return 1
 }
 
+# Which branch of file_version answers a version probe on this host, so the
+# receipt can RECORD which one did rather than leave a reader to infer it.
+# One reading of HIG_RELEASE_TARGET_RUNNER, shared by the probe that follows
+# it and by the receipt's versionProbe field (ADR-044 §2), because two
+# readings are two facts and two facts can disagree.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+version_probe_kind() {
+  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+    printf 'runner\n'
+  else
+    printf 'native\n'
+  fi
+}
+
 file_version() {
   local binary="$1"
   local name="${binary##*/}"
@@ -1600,19 +1995,18 @@ file_version() {
   # same pinned image the binaries were built in, because a host that is not
   # linux x86-64 cannot ask a release binary anything.
   #
-  # What it can and cannot reach, as it is today rather than as it should be:
+  # What it can and cannot reach, stated as it is rather than as it should be:
   # it never carries a gate, because the platform header, the byte count and
   # every sha256 read the bytes on disk and never pass through it, and a
   # runner that fails or reports nothing is a refusal, so an empty version is
   # never recorded. But a runner that is set is TRUSTED: files[].version is
   # whatever it prints, a false runner yields a false version that
-  # package_validate then re-validates against itself and accepts, and
-  # nothing in the manifest or the receipt records that a runner answered at
-  # all. The provenance wave closes that with a mandatory receipt field
-  # naming the probe that answered (native or runner); this wave does not
-  # touch the receipt schema.
+  # package_validate then re-validates against itself and accepts. What a
+  # receipt can honestly say about that is WHICH BRANCH answered, so the
+  # branch is chosen by version_probe_kind and the package receipt records
+  # that same verdict in versionProbe.
   local reported
-  if [[ -n "${HIG_RELEASE_TARGET_RUNNER:-}" ]]; then
+  if [[ "$(version_probe_kind)" == runner ]]; then
     [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
       die "refusing $binary: HIG_RELEASE_TARGET_RUNNER must name one executable program, and $HIG_RELEASE_TARGET_RUNNER is not one"
     reported="$("$HIG_RELEASE_TARGET_RUNNER" "$binary" "$probe" | tr -d '\r' | sed 's/[[:space:]]*$//')" ||
@@ -1644,6 +2038,50 @@ reject_carried_release_identity() {
       and (($doc | .releaseId // $expected) == $expected)
   ' "$file" >/dev/null ||
     die "refusing $file: a release artifact must not carry the release identity the installer derives"
+}
+
+# What a `formatVersion` 2 receipt must SAY ABOUT ITS OWN BUILD, as one jq
+# definition every receipt validator prepends to its own program (ADR-044
+# §2). One copy rather than three, because three copies of an invariant are
+# three chances to check a different thing on the local leg, the hig
+# activation check and the remote installer.
+#
+# `host` is shape-checked and never compared to a name: v1 asserted the
+# literal "hax" back, which authorized nothing and recorded nothing, and v2
+# admits any short hostname because the name is a record. What cannot be
+# faked is checked instead - `artifactPlatform` is the platform every
+# packaged file was verified to be, and the cross-field rules refuse the
+# receipts that could not have been produced: a native build that is not the
+# artifact's own platform, a native build naming an image, a containerised
+# build whose image is not digest-pinned, and a version probe claiming to
+# have run the artifact on a machine that cannot run it.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+receipt_provenance_defs() {
+  cat <<'JQ'
+def receipt_provenance_ok:
+  (.formatVersion == 2)
+  and ((.host | type) == "string") and (.host | test("^\\S+$"))
+  and ((.buildPlatform | type) == "string")
+  and (.buildPlatform | test("^[a-z0-9_]+-[a-z0-9_.]+$"))
+  and (.artifactPlatform == "linux-x86_64")
+  and ((.buildKind == "native") or (.buildKind == "container"))
+  and (has("builderImage"))
+  and (if .buildKind == "native"
+       then (.builderImage == null) and (.buildPlatform == .artifactPlatform)
+       else ((.builderImage | type) == "string")
+            and (.builderImage | test("^[^[:space:]@]+@sha256:[0-9a-f]{64}$"))
+       end)
+  and ((.toolchain | type) == "object")
+  and ((.toolchain | keys) == ["cargo", "rustc"])
+  and ((.toolchain.rustc | type) == "string") and ((.toolchain.rustc | length) > 0)
+  and ((.toolchain.cargo | type) == "string") and ((.toolchain.cargo | length) > 0)
+  and ((.versionProbe == "native") or (.versionProbe == "runner"))
+  and (if .versionProbe == "native"
+       then .buildPlatform == .artifactPlatform
+       else true
+       end);
+JQ
 }
 
 # Verbatim copy of the local guard; see the comment above the local
@@ -2329,15 +2767,14 @@ manifest="$package_dir/manifest.json"
 [[ -f "$manifest" ]] || die "remote package has no manifest.json"
 reject_carried_release_identity "$manifest"
 
-  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" '
-    (.formatVersion == 1) and
+  jq -e --arg target "$target" --argjson expected_files "$(binaries_json)" "$(receipt_provenance_defs)"'
+    receipt_provenance_ok and
     (.targets | type == "array") and
     (.targets | length == 2) and
     (.targets | index("hax") != null) and
     (.targets | index("hig") != null) and
     (.targets | index($target) != null) and
     (.sourceTreeClean == true) and
-    (.host == "hax") and
   ((.sourceCommit | type) == "string") and
   ((.sourceCommit | length) == 40) and
   ((.manifestSha256 | type) == "string") and

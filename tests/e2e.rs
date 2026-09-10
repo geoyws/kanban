@@ -13573,6 +13573,24 @@ fn release_target_runner(hostname_bin: &Path) -> PathBuf {
     hostname_bin.parent().unwrap().join("target-runner")
 }
 
+/// The program the suite hands the release script as
+/// `KANBAN_RELEASE_CONTAINER_RUNTIME`: every machine this suite runs the
+/// packaging path on is measured as one that is not linux x86-64, so the
+/// capability gate takes the container leg, and it takes it against a stub
+/// rather than a daemon. Written beside the other release stubs.
+fn release_container_runtime(hostname_bin: &Path) -> PathBuf {
+    hostname_bin.parent().unwrap().join("container-runtime")
+}
+
+/// The digest-pinned builder image every container case names. It is the
+/// reference the real container build on `@@mbp` ran against on 2026-09-10,
+/// which is why it is a true digest rather than a made-up one - but nothing
+/// here pulls it: the runtime that receives it is the stub above, and what
+/// the gate checks about this string is that it is digest-pinned and that the
+/// runtime handed it reports x86_64.
+const RELEASE_BUILDER_IMAGE: &str =
+    "rust@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f";
+
 fn write_release_tool_stubs(
     fixture: &Fixture,
     fake_repo_root: &Path,
@@ -13627,6 +13645,176 @@ esac
     let platform_header = stubs.join("release-platform-header");
     fs::write(&platform_header, linux_x86_64_elf_header()).unwrap();
     write_executable(
+        &stubs.join("uname"),
+        // The capability gate measures the MACHINE, so the fixture is what
+        // declares which machine the script is running on - exactly as the
+        // hostname stub declares what it calls itself, and the two are now
+        // different powers: the name records, the platform decides.
+        //
+        // The default is a machine that is NOT the release platform, which is
+        // this Mac and is the case the whole container path exists for, so
+        // every packaging case in this suite drives the same branch wherever
+        // the suite itself runs. A case that wants the native path says so.
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  -s)
+    printf '%s\n' "${FAKE_UNAME_S:-Darwin}"
+    ;;
+  -m)
+    printf '%s\n' "${FAKE_UNAME_M:-arm64}"
+    ;;
+  *)
+    command -p uname "$@"
+    ;;
+esac
+"#,
+    );
+    write_executable(
+        &stubs.join("rustc"),
+        // The other half of the recorded toolchain on the native path.
+        r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  --version)
+    printf '%s\n' "${FAKE_RUSTC_VERSION:-rustc 1.90.0 (fake host toolchain)}"
+    ;;
+  *)
+    printf 'unexpected rustc %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_executable(
+        &stubs.join("container-runtime"),
+        // The OCI runtime the capability gate finds and the container build
+        // runs through, so no case in this suite needs a daemon. It holds the
+        // runtime contract the gate depends on and refuses anything outside
+        // it: the verb is `run`, the platform asked for is linux/amd64, and
+        // the image is digest-pinned - a stub that accepted a tag would let a
+        // regression in the gate pass unnoticed.
+        //
+        // Inside the "image" it answers the three things a containerised
+        // release build asks: what machine it is, what toolchain it carries,
+        // and - because a Mac cannot execute a linux x86-64 image at all -
+        // what a packaged binary says when run. FAKE_CONTAINER_UNAME is how a
+        // case makes a pinned image that does not run the release platform,
+        // FAKE_CONTAINER_HANGS a runtime that has wedged, and
+        // FAKE_CONTAINER_FAILS one whose daemon is not there to answer.
+        &[
+            r#"#!/bin/sh
+set -eu
+if [ -n "${FAKE_CONTAINER_LOG:-}" ]; then
+  printf '%s %s\n' "${0##*/}" "$*" >> "$FAKE_CONTAINER_LOG"
+fi
+if [ -n "${FAKE_CONTAINER_HANGS:-}" ]; then
+  # Wedged: it accepted the call and will never answer it. `exec` so the
+  # process a deadline kills is this one and no sleep outlives the case.
+  exec sleep 600
+fi
+if [ -n "${FAKE_CONTAINER_FAILS:-}" ]; then
+  printf 'cannot connect to the container daemon: is it running?\n' >&2
+  exit 3
+fi
+[ "${1:-}" = "run" ] || {
+  printf 'unexpected container runtime verb %s\n' "${1:-}" >&2
+  exit 1
+}
+shift
+platform=""
+workdir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rm)
+      shift
+      ;;
+    --platform)
+      platform="$2"
+      shift 2
+      ;;
+    --volume | -v)
+      shift 2
+      ;;
+    --workdir | -w)
+      workdir="$2"
+      shift 2
+      ;;
+    --env | -e)
+      export "${2:?--env needs KEY=VALUE}"
+      shift 2
+      ;;
+    -*)
+      printf 'unexpected container runtime flag %s\n' "$1" >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+[ "$platform" = "linux/amd64" ] || {
+  printf 'container runtime was asked for platform "%s", not linux/amd64\n' "$platform" >&2
+  exit 1
+}
+image="${1:?container runtime needs an image}"
+shift
+case "$image" in
+  *@sha256:*)
+    ;;
+  *)
+    printf 'container runtime was handed the unpinned image %s\n' "$image" >&2
+    exit 1
+    ;;
+esac
+[ -z "$workdir" ] || cd "$workdir"
+case "${1:-}" in
+  uname)
+    printf '%s\n' "${FAKE_CONTAINER_UNAME:-x86_64}"
+    ;;
+  rustc)
+    [ -z "${FAKE_CONTAINER_HANGS_TOOLCHAIN:-}" ] || exec sleep 600
+    printf '%s\n' "${FAKE_CONTAINER_RUSTC:-rustc 1.90.0 (fake pinned image)}"
+    ;;
+  cargo)
+    if [ "${2:-}" = "--version" ]; then
+      [ -z "${FAKE_CONTAINER_HANGS_TOOLCHAIN:-}" ] || exec sleep 600
+      printf '%s\n' "${FAKE_CONTAINER_CARGO:-cargo 1.90.0 (fake pinned image)}"
+    else
+      "$@"
+    fi
+    ;;
+  *)
+    # A release binary, run inside the image because this host cannot run one:
+    # the header the fake build stamped on comes off and what is underneath
+    # answers, so the version recorded is the packaged bytes' own answer.
+    binary="${1:?container runtime needs a command}"
+    shift
+    [ -x "$binary" ] || {
+      printf '%s: cannot execute\n' "$binary" >&2
+      exit 126
+    }
+    payload_cache=""#,
+            stubs.join("container-payloads").to_str().unwrap(),
+            r#""
+    mkdir -p "$payload_cache"
+    payload="$payload_cache/$(sha256sum "$binary" | awk '{print $1}')"
+    if [ ! -x "$payload" ]; then
+      staged="$payload.$$"
+      tail -c +"#,
+            (linux_x86_64_elf_header().len() + 1).to_string().as_str(),
+            r#" "$binary" > "$staged"
+      chmod 0755 "$staged"
+      mv "$staged" "$payload"
+    fi
+    "$payload" "$@"
+    ;;
+esac
+"#,
+        ]
+        .concat(),
+    );
+    write_executable(
         &stubs.join("cargo"),
         // `cargo build --bins` produces every declared executable, so the stub
         // stands in for all of them: a release script that enumerates fewer
@@ -13644,6 +13832,13 @@ esac
 set -eu
 case "${1:-}" in
   build)
+    ;;
+  --version)
+    # The toolchain the receipt records is asked for its version in the
+    # environment that compiled the binaries, and on the native path that is
+    # this host's own cargo.
+    printf '%s\n' "${FAKE_CARGO_VERSION:-cargo 1.90.0 (fake host toolchain)}"
+    exit 0
     ;;
   *)
     printf 'unexpected cargo %s\n' "$*" >&2
@@ -30228,6 +30423,11 @@ fn hig_release_script_requires_the_initialized_kb_skill_submodule() {
             .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
             .env("FAKE_RELEASE_BINARY_DIR", release_binary_dir)
             .env("FAKE_REMOTE_ROOT", &remote_root)
+            .env(
+                "KANBAN_RELEASE_CONTAINER_RUNTIME",
+                release_container_runtime(&hostname_bin),
+            )
+            .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
             .arg(&script)
             .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
             .output()
@@ -30350,6 +30550,11 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_RELEASE_BINARY_DIR", release_binary_dir)
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -30776,6 +30981,11 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -31059,6 +31269,11 @@ impl ReleasePackagingCase {
             .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
             .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
             .env("FAKE_REMOTE_ROOT", &self.remote_root)
+            .env(
+                "KANBAN_RELEASE_CONTAINER_RUNTIME",
+                release_container_runtime(&self.hostname_bin),
+            )
+            .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
             .arg(&self.script)
             .args(["package", "hax", "--output", output.to_str().unwrap()]);
         command
@@ -31398,9 +31613,17 @@ fn hig_release_script_refuses_a_target_runner_that_reports_no_version() {
 }
 
 /// The branch hax and hig actually take: no runner, the release binary asked
-/// for its own version by being run. Every other case in this suite sets
-/// HIG_RELEASE_TARGET_RUNNER, so without this one the production branch has
-/// no coverage at all.
+/// for its own version by being run. Every other case in this suite lands on
+/// the runner branch, so without this one the production branch has no
+/// coverage at all.
+///
+/// It is now reachable only on a machine that IS the release platform: the
+/// capability gate hands a machine that is not one a runner into the image it
+/// built in, so "no runner configured" and "the artifact is executed here"
+/// stopped being the same statement. The uname stub is what declares this run
+/// a linux x86-64 machine, and the container runtime is configured throughout
+/// and must go untouched - a native build that quietly used a container would
+/// be a different build from the one the receipt would name.
 ///
 /// On this host that branch cannot succeed and must not pretend to: bash
 /// special-cases the ELF magic in check_binary_file, so a linux x86-64 image
@@ -31414,7 +31637,12 @@ fn hig_release_script_probes_the_version_by_running_the_binary_when_no_runner_is
     let case = ReleasePackagingCase::new("hig-release-native-probe");
     for (label, runner) in [("unset", None), ("empty", Some(""))] {
         let output = case.fixture.root.join(format!("package-{label}"));
+        let container_log = case.fixture.root.join(format!("container-{label}.log"));
         let mut command = case.package(&output);
+        command
+            .env("FAKE_UNAME_S", "Linux")
+            .env("FAKE_UNAME_M", "x86_64")
+            .env("FAKE_CONTAINER_LOG", &container_log);
         match runner {
             None => command.env_remove("HIG_RELEASE_TARGET_RUNNER"),
             Some(value) => command.env("HIG_RELEASE_TARGET_RUNNER", value),
@@ -31439,6 +31667,11 @@ fn hig_release_script_probes_the_version_by_running_the_binary_when_no_runner_is
         assert!(
             !stderr.contains("could not report a version for it"),
             "{label}: the run went through a target runner instead of executing the binary:\n{stderr}"
+        );
+        assert!(
+            !container_log.exists(),
+            "{label}: a native build reached for the container runtime: {}",
+            fs::read_to_string(&container_log).unwrap_or_default()
         );
         assert_no_release_recorded(&output);
     }
@@ -31484,6 +31717,786 @@ fn hig_release_script_refuses_a_target_runner_that_is_not_one_executable_program
         );
         assert_no_release_recorded(&output);
     }
+}
+
+/// A PATH that offers the release stubs, the shell, and the handful of
+/// programs the capability gate itself runs - and nothing else this machine
+/// happens to have installed. A case that must prove no container runtime is
+/// reachable cannot inherit the one this workstation really has, and that
+/// includes the PATH `Command::new("bash")` resolves the shell through, so
+/// each program is located on the real PATH once and symlinked into a
+/// directory of its own. The list is the gate's own dependencies: `uname`
+/// through `tr`, the deadline's `mktemp` and `sleep`, `sed` for the answer it
+/// reads back, and `rm` for the temporary files the exit trap clears.
+fn path_with_stubs_and_bash_only(fixture: &Fixture, stubs: &Path, extra: Option<&Path>) -> String {
+    let tools = fixture.root.join("gate-tools");
+    fs::create_dir_all(&tools).unwrap();
+    for tool in ["bash", "tr", "sed", "mktemp", "sleep", "rm", "cat"] {
+        let link = tools.join(tool);
+        if link.exists() {
+            continue;
+        }
+        let located = Command::new("bash")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .unwrap();
+        assert!(
+            located.status.success(),
+            "this machine has no {tool} on PATH"
+        );
+        let resolved = String::from_utf8_lossy(&located.stdout).trim().to_string();
+        std::os::unix::fs::symlink(&resolved, &link).unwrap();
+    }
+    let mut entries: Vec<String> = Vec::new();
+    if let Some(extra) = extra {
+        entries.push(extra.display().to_string());
+    }
+    entries.push(stubs.display().to_string());
+    entries.push(tools.display().to_string());
+    entries.join(":")
+}
+
+/// The prefix every capability-gate refusal carries on the machine this suite
+/// declares itself to be: it names the platform that cannot produce a release
+/// before it names what was missing.
+const CANNOT_PACKAGE_HERE: &str =
+    "hig-release: cannot package a linux x86-64 release on darwin-arm64: ";
+
+/// Provenance is a MEASUREMENT. Packaging on a machine that is not the
+/// release platform records where it was built, what the binaries are, how
+/// they were built, which image built them and which toolchain that image
+/// carries - and the two are different facts throughout: `buildPlatform` is
+/// darwin-arm64 here and `artifactPlatform` is linux-x86_64.
+///
+/// The host name is in the receipt and authorizes nothing, which is the whole
+/// difference from v1: this run calls itself geoywsMBP, not hax, and packages
+/// anyway. And the toolchain is asked in the environment that COMPILED - this
+/// host's own rustc and cargo answer differently and neither string appears
+/// anywhere in the receipt.
+#[test]
+fn hig_release_script_package_records_the_real_build_host_platform_and_toolchain() {
+    let case = ReleasePackagingCase::new("hig-release-provenance");
+    let output = case.fixture.root.join("package");
+    let container_log = case.fixture.root.join("container.log");
+    let packaged = case
+        .package(&output)
+        .env("FAKE_HOST", "geoywsMBP")
+        .env("FAKE_CONTAINER_LOG", &container_log)
+        .env("FAKE_CONTAINER_RUSTC", "rustc 1.90.0 (pinned image)")
+        .env("FAKE_CONTAINER_CARGO", "cargo 1.90.0 (pinned image)")
+        .env(
+            "FAKE_RUSTC_VERSION",
+            "rustc 9.9.9 (this host, which compiled nothing)",
+        )
+        .env(
+            "FAKE_CARGO_VERSION",
+            "cargo 9.9.9 (this host, which compiled nothing)",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "packaging on a machine that is not the release platform failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let receipt_bytes = fs::read(output.with_extension("receipt.json")).unwrap();
+    let receipt: Value = serde_json::from_slice(&receipt_bytes).unwrap();
+    assert_eq!(receipt["formatVersion"], json!(2));
+    assert_eq!(
+        receipt["host"],
+        json!("geoywsMBP"),
+        "the receipt did not record the machine that ran it"
+    );
+    assert_eq!(receipt["buildPlatform"], json!("darwin-arm64"));
+    assert_eq!(receipt["artifactPlatform"], json!("linux-x86_64"));
+    assert_eq!(receipt["buildKind"], json!("container"));
+    assert_eq!(receipt["builderImage"], json!(RELEASE_BUILDER_IMAGE));
+    assert_eq!(
+        receipt["toolchain"],
+        json!({"rustc": "rustc 1.90.0 (pinned image)", "cargo": "cargo 1.90.0 (pinned image)"}),
+        "the toolchain recorded is not the one the build environment reported"
+    );
+    assert_eq!(receipt["versionProbe"], json!("runner"));
+    assert!(
+        !String::from_utf8_lossy(&receipt_bytes).contains("9.9.9"),
+        "the receipt recorded this host's toolchain instead of the one that compiled the binaries"
+    );
+
+    // The build itself, as the runtime saw it: one cargo build, in the pinned
+    // image, asked for linux/amd64, with the worktree read-only and the target
+    // directory outside it.
+    let log = fs::read_to_string(&container_log).unwrap();
+    let build: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("cargo build --release --locked --bins"))
+        .collect();
+    assert_eq!(
+        build.len(),
+        1,
+        "expected exactly one container build in:\n{log}"
+    );
+    let build = build[0];
+    assert!(
+        build.contains("--platform linux/amd64"),
+        "the container build did not ask for linux/amd64: {build}"
+    );
+    assert!(
+        build.contains(RELEASE_BUILDER_IMAGE),
+        "the container build did not run in the pinned image: {build}"
+    );
+    let repo = case.fake_repo_root.display().to_string();
+    assert!(
+        build.contains(&format!("--volume {repo}:{repo}:ro")),
+        "the container build did not mount the worktree read-only: {build}"
+    );
+    let target_dir = build
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("CARGO_TARGET_DIR="))
+        .unwrap_or_else(|| panic!("the container build set no CARGO_TARGET_DIR: {build}"));
+    assert!(
+        !target_dir.starts_with(&repo),
+        "the container build wrote its target directory into the worktree: {target_dir}"
+    );
+    assert!(
+        log.lines().any(|line| line.ends_with("uname -m")),
+        "the gate never measured what the pinned image runs:\n{log}"
+    );
+
+    // A machine that cannot say what it is called does not get to write a
+    // receipt that says nothing. Before this refusal existed, a misdirected
+    // HOSTNAME_BIN left a bash error on stderr, wrote "host": "" and exited
+    // 0 with a success summary - a package only hax would ever reject, and
+    // only after it had been carried there.
+    for (label, reported, said) in [
+        ("silent", "", "nothing"),
+        ("spaced", "two words", "two words"),
+    ] {
+        let refused_output = case.fixture.root.join(format!("package-{label}-host"));
+        let refused_log = case
+            .fixture
+            .root
+            .join(format!("container-{label}-host.log"));
+        let refused = case
+            .package(&refused_output)
+            .env("FAKE_HOST", reported)
+            .env("FAKE_CONTAINER_LOG", &refused_log)
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{label}: a release was packaged by a machine that could not name itself\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let refusal = format!(
+            "hig-release: refusing to package: {} did not report a usable short hostname (it said \
+             {said}), and a release receipt records the machine that built it",
+            case.hostname_bin.display()
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the refusal {refusal:?} in:\n{stderr}"
+        );
+        assert_no_release_recorded(&refused_output);
+        assert!(
+            !fs::read_to_string(&refused_log)
+                .unwrap_or_default()
+                .contains("cargo build"),
+            "{label}: the refusal came after the build instead of before it"
+        );
+    }
+}
+
+/// The image is named by digest on the receipt because the digest is what
+/// names the bytes that built the release - and because it is also what the
+/// version probe goes back into. With no runner of the operator's own, the
+/// script installs one that dispatches into the SAME pinned image against the
+/// package directory, so every files[].version is the packaged bytes' own
+/// answer obtained the only way this machine can obtain it.
+#[test]
+fn hig_release_script_package_records_the_pinned_builder_image_digest_on_the_container_path() {
+    let case = ReleasePackagingCase::new("hig-release-image-digest");
+    let output = case.fixture.root.join("package");
+    let container_log = case.fixture.root.join("container.log");
+    let runner_log = case.fixture.root.join("operator-runner.log");
+    let packaged = case
+        .package(&output)
+        .env_remove("HIG_RELEASE_TARGET_RUNNER")
+        .env("FAKE_CONTAINER_LOG", &container_log)
+        .env("FAKE_TARGET_RUNNER_LOG", &runner_log)
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "packaging through the pinned image failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(output.with_extension("receipt.json")).unwrap()).unwrap();
+    assert_eq!(receipt["buildKind"], json!("container"));
+    assert_eq!(receipt["builderImage"], json!(RELEASE_BUILDER_IMAGE));
+    assert_eq!(receipt["versionProbe"], json!("runner"));
+    assert!(
+        !runner_log.exists(),
+        "a runner the operator never configured answered the version probe"
+    );
+    let log = fs::read_to_string(&container_log).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+    // What the packaged bytes answer when they are run: the fixture's build
+    // stamps the release header onto this very binary, so the version the
+    // image reports back has to be this binary's own.
+    let reported = |probe: &str| {
+        let answered = Command::new(env!("CARGO_BIN_EXE_kanban"))
+            .arg(probe)
+            .output()
+            .unwrap();
+        assert!(answered.status.success(), "the real binary refused {probe}");
+        String::from_utf8_lossy(&answered.stdout)
+            .trim_end()
+            .to_string()
+    };
+    for name in declared_bin_names() {
+        let probe = if name == "kanban" || name == "kb" {
+            "version"
+        } else {
+            "--version"
+        };
+        let dispatch = format!(
+            "{RELEASE_BUILDER_IMAGE} {} {probe}",
+            output.join(&name).display()
+        );
+        assert!(
+            log.lines().any(|line| line.ends_with(&dispatch)),
+            "{name} was never probed inside the pinned image:\n{log}"
+        );
+        let recorded = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} is missing from the manifest"));
+        assert_eq!(
+            recorded["version"],
+            json!(reported(probe)),
+            "{name}: the manifest recorded a version the image never reported"
+        );
+    }
+}
+
+/// A machine that already IS the release platform builds as it always has:
+/// the gate picks `native`, the container runtime it was handed is never
+/// called even though one is configured and an image is named, and the
+/// receipt says so - `builderImage` is JSON null, which says "no image was
+/// used" rather than "unknown", and the key is present so a reader never has
+/// to tell an absent field from an unknown value.
+///
+/// `versionProbe` is still `runner` here, because this host cannot execute a
+/// linux x86-64 image and the fixture hands the script a runner that can.
+/// That is the pairing the schema allows and the receipt states: a native
+/// build whose version came through a named runner.
+#[test]
+fn hig_release_script_package_builds_natively_when_the_machine_is_already_the_release_platform() {
+    let case = ReleasePackagingCase::new("hig-release-native-gate");
+    let output = case.fixture.root.join("package");
+    let container_log = case.fixture.root.join("container.log");
+    let packaged = case
+        .package(&output)
+        .env("FAKE_UNAME_S", "Linux")
+        .env("FAKE_UNAME_M", "x86_64")
+        .env("FAKE_CONTAINER_LOG", &container_log)
+        .env("FAKE_RUSTC_VERSION", "rustc 1.90.0 (this host)")
+        .env("FAKE_CARGO_VERSION", "cargo 1.90.0 (this host)")
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "a native release build failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&packaged.stdout),
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(output.with_extension("receipt.json")).unwrap()).unwrap();
+    assert_eq!(receipt["formatVersion"], json!(2));
+    assert_eq!(receipt["buildKind"], json!("native"));
+    assert_eq!(receipt["buildPlatform"], json!("linux-x86_64"));
+    assert_eq!(receipt["artifactPlatform"], json!("linux-x86_64"));
+    assert!(
+        receipt.as_object().unwrap().contains_key("builderImage"),
+        "a native receipt dropped the builderImage key instead of writing null"
+    );
+    assert_eq!(receipt["builderImage"], json!(null));
+    assert_eq!(
+        receipt["toolchain"],
+        json!({"rustc": "rustc 1.90.0 (this host)", "cargo": "cargo 1.90.0 (this host)"})
+    );
+    assert_eq!(receipt["versionProbe"], json!("runner"));
+    assert!(
+        !container_log.exists(),
+        "a native build ran through a container runtime: {}",
+        fs::read_to_string(&container_log).unwrap_or_default()
+    );
+}
+
+/// A machine that cannot produce a linux x86-64 artifact is told so in one
+/// sentence naming the platform it is and the one thing that was missing -
+/// before anything is built, written or even measured about the repository.
+#[test]
+fn hig_release_script_package_refuses_a_machine_that_cannot_produce_a_linux_x86_64_artifact_naming_what_was_missing()
+ {
+    let case = ReleasePackagingCase::new("hig-release-capability-gate");
+    let stubs = case.hostname_bin.parent().unwrap().to_path_buf();
+    let unusable = case.fixture.root.join("not-a-container-runtime");
+    fs::write(&unusable, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&unusable, fs::Permissions::from_mode(0o644)).unwrap();
+    for (label, refusal) in [
+        (
+            "no-runtime",
+            format!(
+                "{CANNOT_PACKAGE_HERE}no container runtime found; none of docker, podman, nerdctl \
+                 is on PATH and KANBAN_RELEASE_CONTAINER_RUNTIME is unset, so there is no linux \
+                 x86-64 build environment on this machine"
+            ),
+        ),
+        (
+            "unusable-runtime",
+            format!(
+                "{CANNOT_PACKAGE_HERE}no container runtime found; \
+                 KANBAN_RELEASE_CONTAINER_RUNTIME names {}, which is not an executable program, \
+                 so there is no linux x86-64 build environment on this machine",
+                unusable.display()
+            ),
+        ),
+        (
+            "no-image",
+            format!(
+                "{CANNOT_PACKAGE_HERE}no builder image was named; pass --builder-image \
+                 <ref>@sha256:<64 hex> or set KANBAN_RELEASE_BUILDER_IMAGE"
+            ),
+        ),
+        (
+            "foreign-image",
+            format!(
+                "{CANNOT_PACKAGE_HERE}builder image {RELEASE_BUILDER_IMAGE} does not run linux \
+                 x86-64; uname -m inside it reported aarch64"
+            ),
+        ),
+        (
+            // A runtime that answers nothing, ever: there is no deadline
+            // anywhere else in packaging, so without one here the release
+            // path hangs and says nothing at all.
+            "wedged-runtime",
+            format!(
+                "{CANNOT_PACKAGE_HERE}builder image {RELEASE_BUILDER_IMAGE} did not answer \
+                 uname -m through {} within 1s, so nothing here shows it runs linux x86-64; \
+                 raise KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine still has to \
+                 pull it",
+                release_container_runtime(&case.hostname_bin).display()
+            ),
+        ),
+        (
+            // The runtime's own complaint, which is the only thing that says
+            // whether the daemon is down or the image cannot be pulled.
+            "failing-runtime",
+            format!(
+                "{CANNOT_PACKAGE_HERE}{} could not run builder image {RELEASE_BUILDER_IMAGE}: \
+                 cannot connect to the container daemon: is it running?",
+                release_container_runtime(&case.hostname_bin).display()
+            ),
+        ),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let container_log = case.fixture.root.join(format!("container-{label}.log"));
+        let mut command = case.package(&output);
+        command.env("FAKE_CONTAINER_LOG", &container_log);
+        match label {
+            // A PATH with no runtime on it at all: the gate refuses before
+            // anything else on that PATH would have been needed.
+            "no-runtime" => command
+                .env(
+                    "PATH",
+                    path_with_stubs_and_bash_only(&case.fixture, &stubs, None),
+                )
+                .env_remove("KANBAN_RELEASE_CONTAINER_RUNTIME"),
+            "unusable-runtime" => command.env("KANBAN_RELEASE_CONTAINER_RUNTIME", &unusable),
+            "no-image" => command.env_remove("KANBAN_RELEASE_BUILDER_IMAGE"),
+            "foreign-image" => command.env("FAKE_CONTAINER_UNAME", "aarch64"),
+            "wedged-runtime" => command
+                .env("FAKE_CONTAINER_HANGS", "1")
+                .env("KANBAN_RELEASE_CONTAINER_PROBE_SECONDS", "1"),
+            "failing-runtime" => command.env("FAKE_CONTAINER_FAILS", "1"),
+            other => unreachable!("unhandled capability row {other}"),
+        };
+        // Spawned against a deadline rather than waited on: a gate that
+        // failed to bound the wedged runtime would hang this case, and a
+        // hang reports as neither a pass nor a failure.
+        let started = Instant::now();
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = started + Duration::from_secs(60);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(_) => break,
+                None if Instant::now() >= deadline => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{label}: packaging never came back instead of refusing");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        let elapsed = started.elapsed();
+        let refused = child.wait_with_output().unwrap();
+        if label == "wedged-runtime" {
+            // The deadline the gate was given is 1s; the wall time is the
+            // measurement that says it was honoured rather than merely
+            // survived by this case's own timeout.
+            assert!(
+                elapsed < Duration::from_secs(30),
+                "the 1s probe deadline took {elapsed:?} to refuse a runtime that never answers"
+            );
+        }
+        assert!(
+            !refused.status.success(),
+            "{label}: a machine that cannot build a release packaged one\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the refusal {refusal:?} in:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{label}: a refused gate created {}",
+            output.display()
+        );
+        assert_no_release_recorded(&output);
+        if !matches!(
+            label,
+            "foreign-image" | "wedged-runtime" | "failing-runtime"
+        ) {
+            assert!(
+                !container_log.exists(),
+                "{label}: the gate called a runtime it had already refused"
+            );
+        }
+    }
+}
+
+/// The capability probe is not the only container call a release makes
+/// before it can still be refused for free: the toolchain the receipt
+/// records is asked for inside the same image, and a runtime that wedges
+/// there would hang packaging just as completely. It is bounded by the same
+/// deadline and refuses with the same kind of sentence - naming the image,
+/// the runtime, the seconds and the variable that raises them.
+#[test]
+fn hig_release_script_package_refuses_a_container_toolchain_probe_that_never_answers() {
+    let case = ReleasePackagingCase::new("hig-release-toolchain-deadline");
+    let output = case.fixture.root.join("package");
+    let started = Instant::now();
+    let mut child = case
+        .package(&output)
+        .env("FAKE_CONTAINER_HANGS_TOOLCHAIN", "1")
+        .env("KANBAN_RELEASE_CONTAINER_PROBE_SECONDS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = started + Duration::from_secs(60);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("a wedged toolchain probe hung packaging instead of refusing it");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let elapsed = started.elapsed();
+    let refused = child.wait_with_output().unwrap();
+    assert!(
+        !refused.status.success(),
+        "a toolchain that never answered was recorded anyway\nstdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal = format!(
+        "hig-release: refusing to record this release's toolchain: the builder image \
+         {RELEASE_BUILDER_IMAGE} did not answer rustc --version through {} within 1s; raise \
+         KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine needs longer",
+        release_container_runtime(&case.hostname_bin).display()
+    );
+    assert!(
+        stderr.contains(&refusal),
+        "expected the refusal {refusal:?} in:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the 1s toolchain deadline took {elapsed:?} to refuse"
+    );
+    assert_no_release_recorded(&output);
+}
+
+/// A tag can move, so a tag cannot name the bytes that built a release. The
+/// gate takes a digest-pinned reference and nothing that merely resembles
+/// one, and the flag beats the environment so an operator who pins on the
+/// command line is not silently overridden by a stale export.
+#[test]
+fn hig_release_script_package_refuses_a_builder_image_that_is_not_digest_pinned() {
+    let case = ReleasePackagingCase::new("hig-release-image-pinning");
+    for (label, image, on_the_flag) in [
+        ("tag", "rust:1.90-bookworm".to_string(), false),
+        ("bare-name", "rust".to_string(), false),
+        (
+            "short-digest",
+            format!("rust@sha256:{}", "a".repeat(63)),
+            false,
+        ),
+        (
+            "upper-case-digest",
+            format!("rust@sha256:{}", "A".repeat(64)),
+            false,
+        ),
+        (
+            "other-algorithm",
+            format!("rust@sha512:{}", "a".repeat(64)),
+            false,
+        ),
+        // The flag is what the operator typed; a pinned export must not save
+        // an unpinned flag.
+        ("tag-on-the-flag", "rust:1.90-bookworm".to_string(), true),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let mut command = case.package(&output);
+        if on_the_flag {
+            command.args(["--builder-image", &image]);
+        } else {
+            command.env("KANBAN_RELEASE_BUILDER_IMAGE", &image);
+        }
+        let refused = command.output().unwrap();
+        assert!(
+            !refused.status.success(),
+            "{label}: an unpinned builder image was accepted\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let refusal = format!(
+            "{CANNOT_PACKAGE_HERE}builder image {image} is not digest-pinned, and a tag can \
+             move, so its digest would not name the bytes that built this release"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the refusal {refusal:?} in:\n{stderr}"
+        );
+        assert_no_release_recorded(&output);
+    }
+}
+
+/// Which runtime drives the image is a capability, not a brand: the gate
+/// takes the first of docker, podman and nerdctl that is on PATH, in that
+/// order, and KANBAN_RELEASE_CONTAINER_RUNTIME replaces the search entirely.
+/// Every row here refuses at the image measurement, because the question is
+/// only which program was asked - and a refusal answers it without building
+/// anything.
+#[test]
+fn hig_release_script_package_discovers_a_container_runtime_by_name_in_order() {
+    let case = ReleasePackagingCase::new("hig-release-runtime-discovery");
+    let stubs = case.hostname_bin.parent().unwrap().to_path_buf();
+    let runtime = release_container_runtime(&case.hostname_bin);
+    for (label, offered, overridden, expected) in [
+        (
+            "all-three",
+            &["docker", "podman", "nerdctl"][..],
+            None,
+            "docker",
+        ),
+        ("no-docker", &["podman", "nerdctl"][..], None, "podman"),
+        ("nerdctl-only", &["nerdctl"][..], None, "nerdctl"),
+        (
+            "operator-override",
+            &["docker", "podman", "nerdctl"][..],
+            Some("nerdctl"),
+            "nerdctl",
+        ),
+    ] {
+        let offered_dir = case.fixture.root.join(format!("runtimes-{label}"));
+        fs::create_dir_all(&offered_dir).unwrap();
+        for name in offered {
+            fs::copy(&runtime, offered_dir.join(name)).unwrap();
+        }
+        let log = case.fixture.root.join(format!("discovery-{label}.log"));
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let mut command = case.package(&output);
+        command
+            .env(
+                "PATH",
+                path_with_stubs_and_bash_only(&case.fixture, &stubs, Some(&offered_dir)),
+            )
+            .env("FAKE_CONTAINER_LOG", &log)
+            .env("FAKE_CONTAINER_UNAME", "aarch64");
+        match overridden {
+            None => command.env_remove("KANBAN_RELEASE_CONTAINER_RUNTIME"),
+            Some(name) => command.env("KANBAN_RELEASE_CONTAINER_RUNTIME", offered_dir.join(name)),
+        };
+        let refused = command.output().unwrap();
+        assert!(
+            !refused.status.success(),
+            "{label}: an image reporting aarch64 was accepted\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let logged = fs::read_to_string(&log)
+            .unwrap_or_else(|error| panic!("{label}: no runtime was called at all: {error}"));
+        let called = logged
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("{label}: the runtime log is empty"))
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(called, expected, "{label}: the wrong runtime was chosen");
+    }
+}
+
+/// `versionProbe` names the branch that actually answered, and it is written
+/// from that same branch rather than from a flag or from `buildKind`.
+///
+/// What this suite cannot show is a receipt reading `native`: that requires a
+/// machine that both IS the release platform and can execute the artifact,
+/// and no Mac can execute a linux x86-64 image at all - the native row below
+/// therefore ends in the refusal that branch produces here, with no receipt
+/// written. A receipt that CLAIMS `native` on a build platform that is not
+/// the artifact's own is refused by every validator, which is asserted in
+/// hig_release_script_install_refuses_a_receipt_whose_provenance_could_not_have_been_produced.
+#[test]
+fn hig_release_script_package_records_which_branch_measured_the_version() {
+    let case = ReleasePackagingCase::new("hig-release-version-probe");
+
+    let output = case.fixture.root.join("package-operator-runner");
+    let runner_log = case.fixture.root.join("operator-runner.log");
+    let container_log = case.fixture.root.join("container.log");
+    let packaged = case
+        .package(&output)
+        .env("FAKE_TARGET_RUNNER_LOG", &runner_log)
+        .env("FAKE_CONTAINER_LOG", &container_log)
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "packaging through the operator's runner failed: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(output.with_extension("receipt.json")).unwrap()).unwrap();
+    assert_eq!(receipt["versionProbe"], json!("runner"));
+    let probed = fs::read_to_string(&runner_log).unwrap();
+    for name in declared_bin_names() {
+        assert!(
+            probed
+                .lines()
+                .any(|line| line.starts_with(&format!("{name} "))),
+            "{name} did not go through the operator's runner, which the receipt says answered:\n{probed}"
+        );
+    }
+    let containerised = fs::read_to_string(&container_log).unwrap();
+    assert!(
+        !containerised
+            .lines()
+            .any(|line| line.contains(&output.join("kanban").display().to_string())),
+        "the operator's runner was configured and the image answered anyway:\n{containerised}"
+    );
+
+    // The native branch, on a machine that is the release platform and has no
+    // runner: it executes the artifact, which this host cannot do, so it
+    // refuses instead of recording anything.
+    let native = case.fixture.root.join("package-native-probe");
+    let refused = case
+        .package(&native)
+        .env("FAKE_UNAME_S", "Linux")
+        .env("FAKE_UNAME_M", "x86_64")
+        .env_remove("HIG_RELEASE_TARGET_RUNNER")
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "the native probe reported a version on a host that cannot run the artifact"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(&format!(
+            "refusing {}: it could not report a version",
+            native.join("kanban").display()
+        )),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_no_release_recorded(&native);
+}
+
+/// The six provenance fields went into the receipt and NOT into the manifest,
+/// which keeps its five fields and its formatVersion 1. That is what leaves
+/// every `releaseId` on both hosts where it is: the identity is derived from
+/// the manifest bytes, and the manifest bytes did not move.
+#[test]
+fn hig_release_script_provenance_fields_leave_the_manifest_bytes_and_release_id_unchanged() {
+    let case = ReleasePackagingCase::new("hig-release-manifest-untouched");
+    let output = case.fixture.root.join("package");
+    let packaged = case.package(&output).output().unwrap();
+    assert!(
+        packaged.status.success(),
+        "packaging failed: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let manifest_path = output.join("manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["formatVersion"], json!(1));
+    assert_eq!(
+        manifest.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec![
+            "files",
+            "formatVersion",
+            "sourceCommit",
+            "sourceTreeClean",
+            "targets"
+        ],
+        "the manifest gained or lost a field"
+    );
+    for field in [
+        "host",
+        "buildPlatform",
+        "artifactPlatform",
+        "buildKind",
+        "builderImage",
+        "toolchain",
+        "versionProbe",
+    ] {
+        assert!(
+            manifest.get(field).is_none(),
+            "the manifest carries the provenance field {field}, which would rename every release"
+        );
+        assert!(
+            manifest["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file.get(field).is_none()),
+            "a manifest file row carries the provenance field {field}"
+        );
+    }
+    assert_eq!(
+        release_id_from_package(&output),
+        format!(
+            "0123456789abcdef0123456789abcdef01234567-{}",
+            file_sha256(&manifest_path)
+        ),
+        "the release identity is no longer the source commit and the manifest's own hash"
+    );
 }
 
 /// A hig install is only allowed because the same release is already serving
@@ -31686,6 +32699,11 @@ fn hig_release_script_rejects_hig_install_without_hax_install_root() {
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -31768,6 +32786,11 @@ fn hig_release_script_rejects_the_build_provenance_receipt_for_hig_install() {
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -31875,6 +32898,11 @@ fn hig_release_script_rejects_a_mismatched_hax_install_receipt_before_ssh() {
         .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -32018,6 +33046,11 @@ fn hig_release_script_prunes_to_ten_and_rolls_back_to_the_previous_release() {
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
         .env("FAKE_RELEASE_DATE_SECONDS", release_second)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -32352,6 +33385,11 @@ fn hig_release_script_restores_the_previous_view_when_rollback_fails_mid_cutover
         .env("FAKE_GIT_HEAD", commit(0))
         .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
         .env("FAKE_REMOTE_ROOT", &remote_root)
+        .env(
+            "KANBAN_RELEASE_CONTAINER_RUNTIME",
+            release_container_runtime(&hostname_bin),
+        )
+        .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
         .arg(&script)
         .args(["package", "hax", "--output", output_dir.to_str().unwrap()])
         .output()
@@ -32597,6 +33635,11 @@ impl ReleaseGuardHarness {
             .env("FAKE_GIT_HEAD", "0123456789abcdef0123456789abcdef01234567")
             .env("FAKE_RELEASE_BINARY", env!("CARGO_BIN_EXE_kanban"))
             .env("FAKE_REMOTE_ROOT", &self.remote_root)
+            .env(
+                "KANBAN_RELEASE_CONTAINER_RUNTIME",
+                release_container_runtime(&self.hostname_bin),
+            )
+            .env("KANBAN_RELEASE_BUILDER_IMAGE", RELEASE_BUILDER_IMAGE)
             .arg(&self.script);
         command
     }
@@ -32908,6 +33951,16 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         // refusal - would install versions the package never claimed.
         "file_version",
         "release_binary_known",
+        // The branch the version probe took, which the package receipt
+        // records as versionProbe: a remote copy reading a different variable
+        // would take a different branch from the one the receipt names.
+        "version_probe_kind",
+        // The provenance a formatVersion 2 receipt must carry, as one jq
+        // definition: the local receipt check, the hax activation check and
+        // the remote installer all prepend it, so a remote copy that dropped
+        // a cross-field invariant would install a receipt the local leg
+        // refuses.
+        "receipt_provenance_defs",
         "serve_restart_and_prove",
         "serve_restore_previous",
         "serve_unit_disposition",
@@ -34581,6 +35634,357 @@ fn hig_release_script_refuses_a_package_that_carries_the_release_identity_it_der
     let meta: Value =
         serde_json::from_slice(&fs::read(installed["receipt"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(meta["releaseId"], json!(truthful_id));
+}
+
+/// One row of a provenance case: the label it reports under, and the single
+/// edit it makes to a receipt a real packaging run wrote.
+type ReceiptEdit = (&'static str, fn(&mut Value));
+
+/// Provenance is only worth reading if a receipt cannot claim a build that
+/// never happened, so every validator refuses the shapes no build could have
+/// produced - a native build on a machine that is not the artifact's own
+/// platform, a native build naming an image, a containerised build with no
+/// digest-pinned image, a version probe claiming to have executed the
+/// artifact on a machine that cannot execute it - and refuses a receipt
+/// missing any of the six fields outright.
+///
+/// What it does NOT refuse is a hostname it does not recognise: `host` is a
+/// record and never an authorization, which is the whole difference from the
+/// v1 receipt that asserted the literal "hax" back. The accepted rows install
+/// on both legs to prove the readable shapes really read, including the
+/// `versionProbe: "native"` receipt that only a linux x86-64 build host can
+/// write and that this machine can therefore only verify by reading one.
+#[test]
+fn hig_release_script_install_refuses_a_receipt_whose_provenance_could_not_have_been_produced() {
+    let harness = ReleaseGuardHarness::new("hig-release-provenance-invariants");
+    let forge = |tag: u32, label: &str, patch: &dyn Fn(&mut Value)| -> PathBuf {
+        let package = harness.fixture.root.join(format!("package-{label}"));
+        clone_release_package(
+            &harness.package_dir,
+            &package,
+            &format!("0123456789abcdef0123456789abcdef{tag:08x}"),
+        );
+        let receipt_path = package.with_extension("receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        patch(&mut receipt);
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        package
+    };
+
+    let refusals: [ReceiptEdit; 18] = [
+        ("missing-build-platform", |r| {
+            r.as_object_mut().unwrap().remove("buildPlatform").unwrap();
+        }),
+        ("missing-artifact-platform", |r| {
+            r.as_object_mut()
+                .unwrap()
+                .remove("artifactPlatform")
+                .unwrap();
+        }),
+        ("missing-build-kind", |r| {
+            r.as_object_mut().unwrap().remove("buildKind").unwrap();
+        }),
+        // The key is always present, so removing it is not the same edit as
+        // setting it to null and must not be read as one.
+        ("missing-builder-image", |r| {
+            r.as_object_mut().unwrap().remove("builderImage").unwrap();
+        }),
+        ("missing-toolchain", |r| {
+            r.as_object_mut().unwrap().remove("toolchain").unwrap();
+        }),
+        ("missing-version-probe", |r| {
+            r.as_object_mut().unwrap().remove("versionProbe").unwrap();
+        }),
+        // A native build on a machine that is not linux x86-64 is not
+        // representable: this receipt was written on darwin-arm64.
+        ("native-on-a-foreign-platform", |r| {
+            r["buildKind"] = json!("native");
+            r["builderImage"] = json!(null);
+        }),
+        ("native-naming-an-image", |r| {
+            r["buildKind"] = json!("native");
+            r["buildPlatform"] = json!("linux-x86_64");
+        }),
+        ("container-without-an-image", |r| {
+            r["builderImage"] = json!(null);
+        }),
+        ("container-with-a-tag", |r| {
+            r["builderImage"] = json!("rust:1.90-bookworm");
+        }),
+        ("container-with-a-short-digest", |r| {
+            r["builderImage"] = json!(format!("rust@sha256:{}", "a".repeat(63)));
+        }),
+        // The artifact platform is earned by measuring every packaged file,
+        // so it is the one value a receipt may not simply state.
+        ("foreign-artifact-platform", |r| {
+            r["artifactPlatform"] = json!("darwin-arm64");
+        }),
+        ("unknown-build-kind", |r| {
+            r["buildKind"] = json!("cross");
+        }),
+        ("unknown-version-probe", |r| {
+            r["versionProbe"] = json!("guess");
+        }),
+        // A host that cannot execute the artifact cannot have produced a
+        // native version string for it.
+        ("native-probe-on-a-foreign-platform", |r| {
+            r["versionProbe"] = json!("native");
+        }),
+        ("toolchain-with-an-extra-key", |r| {
+            r["toolchain"]["linker"] = json!("lld");
+        }),
+        ("toolchain-with-an-empty-rustc", |r| {
+            r["toolchain"]["rustc"] = json!("");
+        }),
+        ("host-that-is-not-a-hostname", |r| {
+            r["host"] = json!("two words");
+        }),
+    ];
+    for (index, (label, patch)) in refusals.iter().enumerate() {
+        let package = forge(index as u32 + 1, label, patch);
+        let install_root = harness.fixture.root.join(format!("install-{label}"));
+        let bin_dir = harness.fixture.root.join(format!("bin-{label}"));
+        harness.assert_package_refused_without_mutation(
+            "hax",
+            &package,
+            &harness.hax_install_root,
+            &install_root,
+            &bin_dir,
+            "package receipt is incomplete or mismatched",
+            &[&install_root, &bin_dir],
+        );
+    }
+
+    let accepted: [ReceiptEdit; 2] = [
+        // A name this estate has never heard of, on a real release: the
+        // record is kept and nothing is authorized by it.
+        ("another-host", |r| {
+            r["host"] = json!("geoywsMBP");
+        }),
+        // The shape a hax build writes, which this machine can read but
+        // cannot produce: it is linux x86-64, so it builds natively, uses no
+        // image, and asks the artifact itself for its version.
+        ("a-native-linux-build", |r| {
+            r["buildKind"] = json!("native");
+            r["buildPlatform"] = json!("linux-x86_64");
+            r["builderImage"] = json!(null);
+            r["versionProbe"] = json!("native");
+        }),
+    ];
+    for (index, (label, patch)) in accepted.iter().enumerate() {
+        let package = forge(100 + index as u32, label, patch);
+        let hax_root = harness.fixture.root.join(format!("hax-{label}"));
+        let hax_bin = harness.fixture.root.join(format!("hax-bin-{label}"));
+        let installed = harness.install_from("hax", &package, &hax_root, &hax_root, &hax_bin);
+        assert!(
+            installed.status.success(),
+            "{label}: a readable v2 receipt was refused\nstderr: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(package.with_extension("receipt.json")).unwrap())
+                .unwrap();
+        let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+        let activation: Value =
+            serde_json::from_slice(&fs::read(installed["receipt"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(activation["formatVersion"], json!(2));
+        for field in [
+            "host",
+            "buildPlatform",
+            "artifactPlatform",
+            "buildKind",
+            "builderImage",
+            "toolchain",
+            "versionProbe",
+        ] {
+            assert_eq!(
+                activation[field], receipt[field],
+                "{label}: the activation receipt changed {field}"
+            );
+        }
+        // The activation's own facts stay the installing machine's, which is
+        // still hax however the package receipt names its build host.
+        assert_eq!(activation["installerHost"], json!("hax"));
+        let hig_root = harness.fixture.root.join(format!("hig-{label}"));
+        let hig_bin = harness.fixture.root.join(format!("hig-bin-{label}"));
+        let shipped = harness.install_from("hig", &package, &hax_root, &hig_root, &hig_bin);
+        assert!(
+            shipped.status.success(),
+            "{label}: the remote leg refused a readable v2 receipt\nstderr: {}",
+            String::from_utf8_lossy(&shipped.stderr)
+        );
+    }
+
+    // The hax activation receipt is validated by its own copy of the same
+    // rules, and a hig install is what reaches it.
+    let activated = harness.hax_install_root.join("releases").join(format!(
+        "{}.receipt.json",
+        release_id_from_package(&harness.package_dir)
+    ));
+    let genuine = fs::read(&activated).unwrap();
+    let activation_refusals: [ReceiptEdit; 3] = [
+        ("no-build-kind", |r: &mut Value| {
+            r.as_object_mut().unwrap().remove("buildKind").unwrap();
+        }),
+        ("a-tagged-image", |r: &mut Value| {
+            r["builderImage"] = json!("rust:1.90-bookworm");
+        }),
+        ("a-native-probe-it-could-not-have-run", |r: &mut Value| {
+            r["versionProbe"] = json!("native");
+        }),
+    ];
+    for (label, patch) in activation_refusals {
+        let mut receipt: Value = serde_json::from_slice(&genuine).unwrap();
+        patch(&mut receipt);
+        fs::write(&activated, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        let install_root = harness.fixture.root.join(format!("hig-activation-{label}"));
+        let bin_dir = harness
+            .fixture
+            .root
+            .join(format!("hig-activation-bin-{label}"));
+        harness.assert_refused_without_mutation(
+            "hig",
+            &install_root,
+            &bin_dir,
+            "hax activation receipt is incomplete or mismatched",
+            &[&install_root, &bin_dir],
+        );
+    }
+    fs::write(&activated, &genuine).unwrap();
+}
+
+/// A package built before 2026-09-10 carries a `formatVersion` 1 receipt, and
+/// a v2 script refuses it on both legs rather than reading its unconditional
+/// `"hax"` as provenance. Packages do not outlive the operation that builds
+/// them, so the remedy is to rebuild - and refusing is what stops a receipt
+/// whose `host` was a literal from being read as a measurement.
+#[test]
+fn hig_release_script_install_refuses_a_format_version_1_package_receipt() {
+    let harness = ReleaseGuardHarness::new("hig-release-v1-package-receipt");
+    let package = harness.fixture.root.join("package-v1");
+    clone_release_package(
+        &harness.package_dir,
+        &package,
+        "0123456789abcdef0123456789abcdef0000f101",
+    );
+    let receipt_path = package.with_extension("receipt.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    // Exactly what v1 wrote: the literal host, and not one provenance field.
+    receipt["formatVersion"] = json!(1);
+    receipt["host"] = json!("hax");
+    for field in [
+        "buildPlatform",
+        "artifactPlatform",
+        "buildKind",
+        "builderImage",
+        "toolchain",
+        "versionProbe",
+    ] {
+        receipt.as_object_mut().unwrap().remove(field).unwrap();
+    }
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("install-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("bin-{target}"));
+        harness.assert_package_refused_without_mutation(
+            target,
+            &package,
+            &harness.hax_install_root,
+            &install_root,
+            &bin_dir,
+            "package receipt is incomplete or mismatched",
+            &[&install_root, &bin_dir],
+        );
+    }
+}
+
+/// A release ACTIVATED under v1 stays in service: the readers that manage the
+/// store never look at `formatVersion`, so a v1 activation receipt is still
+/// ordered, retained and rolled back to. And nothing backfills it - a receipt
+/// is write-once per release, and inventing `buildKind: "native"` for a
+/// release nobody measured would be the invented provenance this whole change
+/// removes.
+#[test]
+fn hig_release_script_rolls_back_to_a_release_activated_under_format_version_1() {
+    let harness = ReleaseGuardHarness::new("hig-release-v1-activation-receipt");
+    let install_root = harness.fixture.root.join("install");
+    let bin_dir = harness.fixture.root.join("bin");
+    let first = harness.install("hax", &install_root, &bin_dir);
+    assert!(
+        first.status.success(),
+        "the first install failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_id = release_id_from_package(&harness.package_dir);
+
+    let second_package = harness.fixture.root.join("package-second");
+    clone_release_package(
+        &harness.package_dir,
+        &second_package,
+        "0123456789abcdef0123456789abcdef0000f202",
+    );
+    let second = harness.install_from(
+        "hax",
+        &second_package,
+        &harness.hax_install_root,
+        &install_root,
+        &bin_dir,
+    );
+    assert!(
+        second.status.success(),
+        "the second install failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let activated = install_root
+        .join("releases")
+        .join(format!("{first_id}.receipt.json"));
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&activated).unwrap()).unwrap();
+    receipt["formatVersion"] = json!(1);
+    receipt["host"] = json!("hax");
+    for field in [
+        "buildPlatform",
+        "artifactPlatform",
+        "buildKind",
+        "builderImage",
+        "toolchain",
+        "versionProbe",
+    ] {
+        receipt.as_object_mut().unwrap().remove(field).unwrap();
+    }
+    let downgraded = serde_json::to_vec_pretty(&receipt).unwrap();
+    fs::write(&activated, &downgraded).unwrap();
+
+    let rolled = harness
+        .command()
+        .args([
+            "rollback",
+            "hax",
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--bin-dir",
+            bin_dir.to_str().unwrap(),
+            "--steps",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rolled.status.success(),
+        "a release activated under v1 could not be rolled back to: {}",
+        String::from_utf8_lossy(&rolled.stderr)
+    );
+    assert_eq!(
+        fs::read_link(install_root.join("current")).unwrap(),
+        install_root.join("releases").join(&first_id),
+        "the rollback did not put the v1-activated release back in service"
+    );
+    assert_eq!(
+        fs::read(&activated).unwrap(),
+        downgraded,
+        "the rollback backfilled provenance into a receipt that never carried any"
+    );
 }
 
 /// `releases/<id>.receipt.json` is a managed destination, not a hint. The
