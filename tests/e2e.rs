@@ -13768,18 +13768,39 @@ case "$image" in
     ;;
 esac
 [ -z "$workdir" ] || cd "$workdir"
+# How a tool inside the image answers `--version`: the pinned answer, or -
+# for a case whose image cannot report a toolchain at all - nothing, or a
+# failure carrying the image's own complaint. FAKE_CONTAINER_TOOLCHAIN_MUTE
+# and FAKE_CONTAINER_TOOLCHAIN_FAILS each name the tool they apply to, or
+# `all` for both, and FAKE_CONTAINER_TOOLCHAIN_COMPLAINT is what a failure
+# says on stderr - unset for one that fails without saying anything.
+toolchain_answer() {
+  case "${FAKE_CONTAINER_TOOLCHAIN_MUTE:-}" in
+    "$1" | all)
+      exit 0
+      ;;
+  esac
+  case "${FAKE_CONTAINER_TOOLCHAIN_FAILS:-}" in
+    "$1" | all)
+      [ -z "${FAKE_CONTAINER_TOOLCHAIN_COMPLAINT:-}" ] ||
+        printf '%s\n' "$FAKE_CONTAINER_TOOLCHAIN_COMPLAINT" >&2
+      exit 3
+      ;;
+  esac
+  printf '%s\n' "$2"
+}
 case "${1:-}" in
   uname)
     printf '%s\n' "${FAKE_CONTAINER_UNAME:-x86_64}"
     ;;
   rustc)
     [ -z "${FAKE_CONTAINER_HANGS_TOOLCHAIN:-}" ] || exec sleep 600
-    printf '%s\n' "${FAKE_CONTAINER_RUSTC:-rustc 1.90.0 (fake pinned image)}"
+    toolchain_answer rustc "${FAKE_CONTAINER_RUSTC:-rustc 1.90.0 (fake pinned image)}"
     ;;
   cargo)
     if [ "${2:-}" = "--version" ]; then
       [ -z "${FAKE_CONTAINER_HANGS_TOOLCHAIN:-}" ] || exec sleep 600
-      printf '%s\n' "${FAKE_CONTAINER_CARGO:-cargo 1.90.0 (fake pinned image)}"
+      toolchain_answer cargo "${FAKE_CONTAINER_CARGO:-cargo 1.90.0 (fake pinned image)}"
     else
       "$@"
     fi
@@ -31391,6 +31412,88 @@ fn hig_release_script_refuses_to_package_a_binary_that_is_not_linux_x86_64() {
     }
 }
 
+/// ADR-044 §4 asks for an EXECUTABLE object type, and `e_type` is the half of
+/// the header no machine check can see: `cargo build --release` leaves
+/// relocatable objects in target/release beside the binaries, and one of them
+/// carries the right ELF class, the right byte order and the right machine
+/// while being nothing a host can run. The refusal names the type it
+/// observed, and the boundary is drawn where the linker draws it - both
+/// executable types package, so the gate refuses an object rather than
+/// refusing whatever is not exactly what today's profile happens to link.
+#[test]
+fn hig_release_script_refuses_a_relocatable_object_carrying_the_right_machine() {
+    let case = ReleasePackagingCase::new("hig-release-elf-object-type");
+    let object = case.fixture.root.join("kanban.o");
+    write_release_image(&object, &elf_header(2, 1, 0x3e, 1));
+    let output = case.fixture.root.join("package-et-rel");
+    let refused = case
+        .package(&output)
+        .env("FAKE_RELEASE_IMAGE", &object)
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "an ET_REL object was packaged as a release\nstdout: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal = format!(
+        "/kanban: {RELEASE_PLATFORM}, but this file is ELF class 2, data 1, type 0x0001, \
+         machine 0x003e"
+    );
+    assert!(
+        stderr.contains("hig-release: refusing ") && stderr.contains(&refusal),
+        "expected a refusal ending {refusal:?} in:\n{stderr}"
+    );
+    assert_no_release_recorded(&output);
+    let left_behind: Vec<_> = fs::read_dir(&output)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", output.display()))
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "a refused object type left {left_behind:?} in the package directory"
+    );
+
+    // The same boundary from the other side, so the refusal above is the
+    // e_type check and not an accident of this fixture: ET_DYN is what the
+    // linux release profile links, ET_EXEC is what a non-PIE build of the
+    // same source is, and each one packages and answers for its own version.
+    for (label, etype) in [("et-exec", 2_u16), ("et-dyn", 3_u16)] {
+        let image = case.fixture.root.join(format!("image-{label}"));
+        let mut bytes = elf_header(2, 1, 0x3e, etype).to_vec();
+        bytes
+            .extend_from_slice(format!("#!/bin/sh\nprintf 'kanban 0.0.0-{label}\\n'\n").as_bytes());
+        fs::write(&image, &bytes).unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let packaged = case
+            .package(&output)
+            .env("FAKE_RELEASE_IMAGE", &image)
+            .output()
+            .unwrap();
+        assert!(
+            packaged.status.success(),
+            "{label}: an executable object type was refused\nstderr: {}",
+            String::from_utf8_lossy(&packaged.stderr)
+        );
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+        let versions: Vec<String> = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["version"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            versions,
+            vec![format!("kanban 0.0.0-{label}"); declared_bin_names().len()],
+            "{label}: the packaged binaries did not answer for themselves"
+        );
+    }
+}
+
 /// A release binary is the file itself, and a verdict on it must terminate.
 /// So the gate judges the path's TYPE before it opens anything: a FIFO would
 /// hold the header read open forever - the release script has no timeout to
@@ -32189,6 +32292,119 @@ fn hig_release_script_package_refuses_a_machine_that_cannot_produce_a_linux_x86_
     }
 }
 
+/// `build_platform` is the FIRST measurement packaging makes, and the only
+/// thing it can measure is what this machine answers: a `uname` that says
+/// nothing leaves `buildPlatform` with nothing to record, so the run ends
+/// there rather than writing a platform nobody measured or comparing an empty
+/// string against the artifact's own. The last row is the one the
+/// `|| kernel=""` fallbacks exist for - a `uname` that FAILS rather than
+/// answering emptily, which under `set -e` would otherwise end the run with
+/// no sentence at all.
+///
+/// Driven through the seam `build_platform` itself names: `uname` resolves
+/// through PATH exactly as `rustc` and `cargo` do, so a stub ahead of the
+/// suite's own on PATH is what a machine that cannot answer looks like.
+#[test]
+fn hig_release_script_package_refuses_a_machine_that_reports_no_platform() {
+    let case = ReleasePackagingCase::new("hig-release-build-platform");
+    let mute = case.fixture.root.join("mute-uname");
+    fs::create_dir_all(&mute).unwrap();
+    write_executable(
+        &mute.join("uname"),
+        // FAKE_UNAME_MUTE names the flag this machine answers nothing for -
+        // `s`, `m` or `both` - and FAKE_UNAME_MUTE_FAILS makes that silence
+        // an outright failure instead of an empty answer.
+        r#"#!/bin/sh
+set -eu
+flag="${1:-}"
+case "$flag" in
+  -s)
+    answer="${FAKE_UNAME_S:-Darwin}"
+    ;;
+  -m)
+    answer="${FAKE_UNAME_M:-arm64}"
+    ;;
+  *)
+    printf 'unexpected uname %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+case "${FAKE_UNAME_MUTE:?}:$flag" in
+  both:* | s:-s | m:-m)
+    answer=""
+    ;;
+esac
+[ -z "$answer" ] || {
+  printf '%s\n' "$answer"
+  exit 0
+}
+[ -z "${FAKE_UNAME_MUTE_FAILS:-}" ] || {
+  printf 'uname: cannot determine %s\n' "$flag" >&2
+  exit 1
+}
+exit 0
+"#,
+    );
+    let path = format!("{}:{}", mute.display(), case.path);
+    for (label, muted, fails, said) in [
+        (
+            "no-kernel",
+            "s",
+            false,
+            "uname -s said nothing and uname -m said arm64",
+        ),
+        (
+            "no-machine",
+            "m",
+            false,
+            "uname -s said darwin and uname -m said nothing",
+        ),
+        (
+            "uname-fails",
+            "both",
+            true,
+            "uname -s said nothing and uname -m said nothing",
+        ),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let container_log = case.fixture.root.join(format!("container-{label}.log"));
+        let mut command = case.package(&output);
+        command
+            .env("PATH", &path)
+            .env("FAKE_UNAME_MUTE", muted)
+            .env("FAKE_CONTAINER_LOG", &container_log);
+        if fails {
+            command.env("FAKE_UNAME_MUTE_FAILS", "1");
+        }
+        let refused = command.output().unwrap();
+        assert!(
+            !refused.status.success(),
+            "{label}: a machine that reported no platform packaged a release\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert_eq!(refused.status.code(), Some(1), "{label}");
+        let refusal = format!("hig-release: this machine did not report a platform: {said}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the refusal {refusal:?} in:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{label}: an unmeasured platform created {}",
+            output.display()
+        );
+        assert_no_release_recorded(&output);
+        // Nothing was built, because the platform is measured before the gate
+        // has an opinion about a runtime, an image or a toolchain.
+        assert!(
+            !container_log.exists(),
+            "{label}: the run reached a container runtime: {}",
+            fs::read_to_string(&container_log).unwrap_or_default()
+        );
+    }
+}
+
 /// The capability probe is not the only container call a release makes
 /// before it can still be refused for free: the toolchain the receipt
 /// records is asked for inside the same image, and a runtime that wedges
@@ -32243,6 +32459,163 @@ fn hig_release_script_package_refuses_a_container_toolchain_probe_that_never_ans
         "the 1s toolchain deadline took {elapsed:?} to refuse"
     );
     assert_no_release_recorded(&output);
+}
+
+/// An unmeasured toolchain is not a toolchain field, so a builder image that
+/// runs but cannot say what compiled the binaries ends the release. The
+/// refusal carries the image's OWN complaint, because only it knows whether
+/// the toolchain is absent or broken, and falls back to the exit status when
+/// it says nothing at all - and the tool named is whichever one failed, so
+/// `cargo` is measured as well as `rustc`.
+///
+/// Where this refusal sits is the point of the last assertion: the toolchain
+/// is asked AFTER the container build, so a completed build is thrown away
+/// rather than recorded beside a toolchain nobody measured. Nothing is
+/// written either way - no package directory, no manifest, no receipt.
+#[test]
+fn hig_release_script_package_refuses_a_toolchain_the_builder_image_cannot_report() {
+    let case = ReleasePackagingCase::new("hig-release-toolchain-mute");
+    let toolchain = "hig-release: refusing to record this release's toolchain:";
+    for (label, mute, fails, complaint, refusal) in [
+        (
+            "rustc-complains",
+            None,
+            Some("rustc"),
+            Some("exec: rustc: not found"),
+            format!(
+                "{toolchain} the builder image {RELEASE_BUILDER_IMAGE} could not report a rustc \
+                 version: exec: rustc: not found"
+            ),
+        ),
+        (
+            // A tool that fails without a word: the status is the only thing
+            // left to say, and saying it beats an empty clause.
+            "rustc-fails-mutely",
+            None,
+            Some("rustc"),
+            None,
+            format!(
+                "{toolchain} the builder image {RELEASE_BUILDER_IMAGE} could not report a rustc \
+                 version: it exited 3 without saying why"
+            ),
+        ),
+        (
+            // The second half of the recorded toolchain, asked after rustc
+            // answered: the refusal names cargo, not the tool that worked.
+            "cargo-complains",
+            None,
+            Some("cargo"),
+            Some("error: no override and no default toolchain set"),
+            format!(
+                "{toolchain} the builder image {RELEASE_BUILDER_IMAGE} could not report a cargo \
+                 version: error: no override and no default toolchain set"
+            ),
+        ),
+        (
+            // Exit 0 and an empty answer, which is the failure mode a status
+            // check alone would wave through into the receipt.
+            "rustc-answers-nothing",
+            Some("rustc"),
+            None,
+            None,
+            format!("{toolchain} the rustc version probe reported nothing"),
+        ),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let container_log = case.fixture.root.join(format!("container-{label}.log"));
+        let mut command = case.package(&output);
+        command.env("FAKE_CONTAINER_LOG", &container_log);
+        if let Some(tool) = mute {
+            command.env("FAKE_CONTAINER_TOOLCHAIN_MUTE", tool);
+        }
+        if let Some(tool) = fails {
+            command.env("FAKE_CONTAINER_TOOLCHAIN_FAILS", tool);
+        }
+        if let Some(text) = complaint {
+            command.env("FAKE_CONTAINER_TOOLCHAIN_COMPLAINT", text);
+        }
+        let refused = command.output().unwrap();
+        assert!(
+            !refused.status.success(),
+            "{label}: an unmeasured toolchain was recorded\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert_eq!(refused.status.code(), Some(1), "{label}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the refusal {refusal:?} in:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{label}: a refused toolchain measurement created {}",
+            output.display()
+        );
+        assert_no_release_recorded(&output);
+        let logged = fs::read_to_string(&container_log)
+            .unwrap_or_else(|error| panic!("{label}: no runtime was called at all: {error}"));
+        assert!(
+            logged.contains("cargo build --release --locked --bins"),
+            "{label}: the toolchain was refused before the build it describes:\n{logged}"
+        );
+    }
+}
+
+/// The probe deadline is a bound an operator CHOSE, so a value that is not
+/// one is refused rather than quietly replaced by the default: a ceiling of
+/// `0`, of `1.5`, or of `60s` would otherwise become 120 seconds nobody
+/// asked for, or - worse for `0` - a probe with no time to answer at all.
+/// The refusal quotes the value back, because an operator who exported it in
+/// another shell cannot see it from here.
+///
+/// Every row refuses before the runtime is called even once, which is what
+/// makes a mistyped deadline free: the container log does not exist, so
+/// nothing was probed, pulled or built.
+#[test]
+fn hig_release_script_package_refuses_a_probe_deadline_that_is_not_a_positive_whole_number() {
+    let case = ReleasePackagingCase::new("hig-release-probe-deadline");
+    for (label, seconds) in [
+        ("zero", "0"),
+        ("negative", "-30"),
+        ("fractional", "1.5"),
+        ("with-units", "60s"),
+        ("words", "two minutes"),
+    ] {
+        let output = case.fixture.root.join(format!("package-{label}"));
+        let container_log = case.fixture.root.join(format!("container-{label}.log"));
+        let refused = case
+            .package(&output)
+            .env("KANBAN_RELEASE_CONTAINER_PROBE_SECONDS", seconds)
+            .env("FAKE_CONTAINER_LOG", &container_log)
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{label}: a probe deadline of {seconds:?} was accepted\nstdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert_eq!(refused.status.code(), Some(1), "{label}");
+        let refusal = format!(
+            "hig-release: KANBAN_RELEASE_CONTAINER_PROBE_SECONDS must be a whole number of \
+             seconds greater than zero, and it is {seconds}"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal),
+            "{label}: expected the refusal {refusal:?} in:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{label}: a refused deadline created {}",
+            output.display()
+        );
+        assert_no_release_recorded(&output);
+        assert!(
+            !container_log.exists(),
+            "{label}: a runtime was called under a deadline the script had refused: {}",
+            fs::read_to_string(&container_log).unwrap_or_default()
+        );
+    }
 }
 
 /// A tag can move, so a tag cannot name the bytes that built a release. The
