@@ -282,6 +282,18 @@ fn is_gate_owned_status(status: &str) -> bool {
         .any(|workflow| story_status_for(workflow) == status)
 }
 
+/// The statuses that assert work is under way on a row, or finished.
+///
+/// A completion gate governs exactly these. The rest are bookkeeping about
+/// where a row sits — `draft` and `backlog` say it is not scheduled, `todo`
+/// that it is queued, `blocked` that it is stuck, `cancelled` that it will not
+/// be done — and gating those would take away the routes a holder needs when
+/// a prerequisite reopens underneath it. `review` is work: it asserts the
+/// deliverable exists and is being judged.
+fn is_work_bearing_status(status: &str) -> bool {
+    matches!(status, "in_progress" | "review" | "done")
+}
+
 /// The article a type name takes, so a refusal reads as English.
 ///
 /// Only `epic` begins with a vowel, but a message an agent is meant to act on
@@ -1530,6 +1542,157 @@ fn dependencies(connection: &Connection, task_id: &str) -> Result<Vec<Task>> {
         .map_err(Into::into)
 }
 
+/// Every incomplete prerequisite a row inherits: those declared on the row
+/// itself, and those declared on any of its ancestors.
+///
+/// The recursion walks parent edges only. A prerequisite's own dependencies
+/// are deliberately not followed — whether a prerequisite is finished is that
+/// row's own business, and walking through it would report blockers nothing is
+/// actually waiting on. The `path` guard is what stops a malformed board (a
+/// parent cycle written before the nesting rules landed) from spinning here,
+/// rather than a recursion limit nobody set.
+///
+/// Nearest owner first, then prerequisite id, so a refusal and a rendered
+/// board name the same gate first. Existence is the caller's to establish,
+/// exactly as [`dependencies`] leaves it.
+fn blocking_gates(
+    connection: &Connection,
+    task_id: &str,
+    lapsed: &LapsedLeases,
+) -> Result<Vec<GateBlocker>> {
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE owners(id,depth,path) AS (\
+             SELECT id,0,json_array(id) FROM tasks WHERE id=?1 \
+             UNION ALL \
+             SELECT parent.id,owners.depth+1,json_insert(owners.path,'$[#]',parent.id) \
+             FROM owners \
+             JOIN tasks child ON child.id=owners.id \
+             JOIN tasks parent ON parent.id=child.parent_id \
+             WHERE NOT EXISTS (SELECT 1 FROM json_each(owners.path) seen WHERE seen.value=parent.id)\
+         ) \
+         SELECT owners.id,prerequisite.id,prerequisite.title,prerequisite.status \
+         FROM owners \
+         JOIN task_dependencies dependency ON dependency.task_id=owners.id \
+         JOIN tasks prerequisite ON prerequisite.id=dependency.depends_on \
+         WHERE prerequisite.status<>'done' \
+         ORDER BY owners.depth,prerequisite.id",
+    )?;
+    let mut blockers = statement
+        .query_map([task_id], |row| {
+            Ok(GateBlocker {
+                source_task_id: row.get(0)?,
+                prerequisite_id: row.get(1)?,
+                prerequisite_title: row.get(2)?,
+                prerequisite_status: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The projection [`apply_lapsed_leases`] puts on a task row, applied to
+    // the prerequisite statuses a blocker carries. Without it a prerequisite
+    // whose holder vanished reads `in_progress` here and `todo` in the same
+    // command's `dependencies` array — two answers about one row, from one
+    // read. Either way the prerequisite is unmet, so this changes what a
+    // reader is told and never whether the gate holds.
+    for blocker in &mut blockers {
+        if blocker.prerequisite_status == "in_progress" && lapsed.contains(&blocker.prerequisite_id)
+        {
+            blocker.prerequisite_status = "todo".to_owned();
+        }
+    }
+    Ok(blockers)
+}
+
+/// Every lease that has run out, read once for a whole command.
+///
+/// The projection it feeds is per prerequisite, but the read is board-wide,
+/// and `task list --with-relations` asks for the gate of every row on the
+/// board (`rust/lib.rs`, `list_json`). Reading it inside each
+/// [`blocking_gates`] call put an unindexed scan of `task_claims` on that
+/// listing path once per row — measured at 0.666s against 0.590s on a
+/// 3036-row board the moment one prerequisite was `in_progress`. A caller
+/// that reads many gates reads this once and hands it down.
+///
+/// Empty on a board old enough to lack the claims table, which a read-only
+/// open cannot migrate into place.
+#[derive(Default)]
+struct LapsedLeases(BTreeSet<String>);
+
+impl LapsedLeases {
+    fn contains(&self, task_id: &str) -> bool {
+        self.0.contains(task_id)
+    }
+}
+
+fn lapsed_leases(connection: &Connection) -> Result<LapsedLeases> {
+    if !has_claims_table(connection)? {
+        return Ok(LapsedLeases::default());
+    }
+    let mut statement =
+        connection.prepare("SELECT task_id FROM task_claims WHERE expires_at<=?")?;
+    let lapsed = statement
+        .query_map([now_ms()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<String>>>()?;
+    Ok(LapsedLeases(lapsed))
+}
+
+/// Whether the caller being refused is the one holding this row's lease.
+///
+/// Only a holder can `checkpoint --state blocked` or `release`, so only a
+/// holder is told about them: naming that route to `claim`, `task add
+/// --status in_progress` or `story advance` sends a caller after a lease it
+/// does not have.
+#[derive(Clone, Copy)]
+enum GateCaller {
+    /// `heartbeat`, `checkpoint`, and a `task move` by the current holder.
+    Holder,
+    /// `claim`, handoff acceptance, `task add`, `story advance`, and a move
+    /// by anyone who is not holding the row.
+    Unleased,
+}
+
+/// Refuse work whose prerequisites are not finished.
+///
+/// The refusal names every unmet prerequisite, its status, and which row
+/// declared it: an inherited gate that said only "blocked" would leave an
+/// agent grepping the tree for the epic it came from. A prerequisite counts as
+/// met at `done` and at nothing else — `cancelled` is a decision not to do the
+/// work, which is not the same as the work being finished — so the way out is
+/// named too. The row is named by what it is, as the story-projection refusal
+/// in [`Store::move_task`] does, because "task s-2" is wrong about a story.
+fn require_no_blocking_gates(connection: &Connection, id: &str, caller: GateCaller) -> Result<()> {
+    let blockers = blocking_gates(connection, id, &lapsed_leases(connection)?)?;
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    let details = blockers
+        .iter()
+        .map(|blocker| {
+            let source = if blocker.source_task_id == id {
+                format!("declared on {id} itself")
+            } else {
+                format!("declared on ancestor {}", blocker.source_task_id)
+            };
+            format!(
+                "{} is {} ({source})",
+                blocker.prerequisite_id, blocker.prerequisite_status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let kind = require_task(connection, id)?.task_type;
+    let escape = match caller {
+        GateCaller::Holder => {
+            " A holder that must stop here can `checkpoint --state blocked` or `release`."
+        }
+        GateCaller::Unleased => "",
+    };
+    bail!(
+        "{kind} {id} is gated on work that is not done: {details}. A prerequisite \
+         satisfies a gate only at status done: finish it, or drop the edge with \
+         `task update <owner> --depends-on ...` or `--clear-dependencies`.{escape}"
+    )
+}
+
 pub(crate) fn event(
     connection: &Connection,
     task_id: Option<&str>,
@@ -2002,6 +2165,123 @@ fn depends_transitively(connection: &Connection, start: &str, target: &str) -> R
     )? != 0)
 }
 
+/// The first gate this row can never satisfy, as `(owner, prerequisite)`.
+///
+/// A completion gate is inherited down the parent chain, so a prerequisite can
+/// be unsatisfiable with no dependency-only cycle present at all: an epic
+/// gated on a task inside its own subtree can never be unblocked, because that
+/// descendant inherits the epic's gate and so waits on itself. Re-parenting
+/// can build the same deadlock without touching a dependency edge, which is
+/// why both changes validate through here and [`depends_transitively`] is kept
+/// only for the direct-edge refusal it already worded.
+///
+/// `owners` is the chain whose gates this row inherits and `edges` their
+/// prerequisites; `subtree` is what inherits this row's own gates. `required`
+/// is then what finishing each prerequisite actually costs, carried per seed:
+/// a row that must be completed drags in its children, because a container is
+/// not done while work under it is open, and every row reached contributes the
+/// prerequisites of itself and its ancestors. `worked=0` marks a row reached
+/// only as a gate owner — its prerequisites still apply, but its other
+/// children are nobody's business, so it does not descend.
+///
+/// `fertile` is what keeps that descent from being the whole board. A
+/// prerequisite's children are only ever worth walking into for two reasons:
+/// one of them is in this row's subtree, or one of them declares a dependency
+/// that leads somewhere that is. So descent is confined to rows that are in
+/// `subtree`, or on the `spine` — the ancestors of this row and of every row
+/// that declares a dependency at all. A child outside both roots a subtree
+/// with no dependency edge in it and no member of `subtree` under it, because
+/// an ancestor of a row in `subtree` is itself in `subtree` or an ancestor of
+/// this row; all it could still contribute is its own ancestors, which the
+/// path that reached it already contributed. Nothing refused before is
+/// accepted now, and nothing accepted before is refused. Measured on a
+/// 3036-row board: `task update <leaf> --depends-on <epic with 3000
+/// descendants>` went from 0.738s to 0.040s.
+///
+/// Status is deliberately not consulted: a prerequisite that happens to be
+/// done today would deadlock the tree the moment it reopened, and a shape that
+/// only works while nothing changes is not a shape to store. `UNION`
+/// deduplicates, which bounds every walk here on a graph of any shape, a
+/// malformed parent cycle included.
+fn gate_deadlock(connection: &Connection, id: &str) -> Result<Option<(String, String)>> {
+    connection
+        .query_row(
+            "WITH RECURSIVE subtree(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT child.id FROM subtree JOIN tasks child ON child.parent_id=subtree.id\
+             ), \
+             spine(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT task_id FROM task_dependencies \
+                 UNION \
+                 SELECT parent.id FROM spine \
+                 JOIN tasks node ON node.id=spine.id \
+                 JOIN tasks parent ON parent.id=node.parent_id\
+             ), \
+             fertile(id) AS (SELECT id FROM subtree UNION SELECT id FROM spine), \
+             owners(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT parent.id FROM owners \
+                 JOIN tasks owner ON owner.id=owners.id \
+                 JOIN tasks parent ON parent.id=owner.parent_id\
+             ), \
+             edges(owner,prerequisite) AS (\
+                 SELECT dependency.task_id,dependency.depends_on FROM owners \
+                 JOIN task_dependencies dependency ON dependency.task_id=owners.id\
+             ), \
+             required(seed,id,worked) AS (\
+                 SELECT prerequisite,prerequisite,1 FROM edges \
+                 UNION \
+                 SELECT required.seed,child.id,1 FROM required \
+                 JOIN tasks child ON child.parent_id=required.id \
+                 JOIN fertile ON fertile.id=child.id \
+                 WHERE required.worked=1 \
+                 UNION \
+                 SELECT required.seed,parent.id,0 FROM required \
+                 JOIN tasks owner ON owner.id=required.id \
+                 JOIN tasks parent ON parent.id=owner.parent_id \
+                 UNION \
+                 SELECT required.seed,dependency.depends_on,1 FROM required \
+                 JOIN task_dependencies dependency ON dependency.task_id=required.id\
+             ) \
+             SELECT edges.owner,edges.prerequisite FROM edges \
+             JOIN required ON required.seed=edges.prerequisite \
+             JOIN subtree ON subtree.id=required.id \
+             WHERE required.worked=1 \
+             ORDER BY edges.owner,edges.prerequisite \
+             LIMIT 1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Refuse a tree whose completion gate could never be satisfied.
+///
+/// Called after the parent and dependency rows are written and inside the same
+/// transaction, so the check sees the shape the caller asked for and the
+/// refusal leaves none of it behind.
+fn require_no_gate_deadlock(connection: &Connection, id: &str) -> Result<()> {
+    let Some((owner, prerequisite)) = gate_deadlock(connection, id)? else {
+        return Ok(());
+    };
+    if owner == id {
+        bail!(
+            "task {id} cannot depend on {prerequisite}: finishing {prerequisite} needs work \
+             inside {id}'s own tree, which inherits this gate and would wait on itself"
+        );
+    }
+    bail!(
+        "task {id} cannot sit under {owner}: {owner} depends on {prerequisite}, and finishing \
+         {prerequisite} needs work inside {id}'s tree, which inherits that gate and would wait \
+         on itself"
+    )
+}
+
 #[derive(Default)]
 pub struct UpdateTask {
     pub parent_id: Option<Option<String>>,
@@ -2071,18 +2351,27 @@ fn eligible_claim_candidates(
     options: &ClaimOptions,
 ) -> Result<Vec<Task>> {
     let mut statement = connection.prepare(
-        "SELECT t.* FROM tasks t
+        // `gated` is the completion gate as a set, computed once: every row
+        // carrying an unfinished prerequisite, plus everything beneath it,
+        // because a gate declared on a plan is inherited by the work under it.
+        // A correlated per-row walk would answer the same question one
+        // candidate at a time; `UNION` also makes a malformed parent cycle
+        // terminate instead of recursing.
+        "WITH RECURSIVE gated(id) AS (
+             SELECT dependency.task_id FROM task_dependencies dependency
+             JOIN tasks prerequisite ON prerequisite.id=dependency.depends_on
+             WHERE prerequisite.status<>'done'
+             UNION
+             SELECT child.id FROM gated JOIN tasks child ON child.parent_id=gated.id
+         )
+         SELECT t.* FROM tasks t
          LEFT JOIN task_claims c ON c.task_id=t.id AND c.expires_at>?
          LEFT JOIN task_claims x ON x.task_id=t.id AND x.expires_at<=?
          WHERE (t.status='todo' OR (t.status='in_progress' AND x.task_id IS NOT NULL))
            AND t.archived=0
            AND t.type=?
            AND c.task_id IS NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM task_dependencies d
-             JOIN tasks dep ON dep.id=d.depends_on
-             WHERE d.task_id=t.id AND dep.status<>'done'
-           )
+           AND t.id NOT IN (SELECT id FROM gated)
          ORDER BY t.priority,t.created_at,t.id",
     )?;
     let now = now_ms();
@@ -3869,6 +4158,14 @@ impl Store {
                 params![id, dependency],
             )?;
         }
+        require_no_gate_deadlock(&transaction, &id)?;
+        // A row may be created straight into work — an import, a task moved in
+        // one step — and the gate applies to that exactly as it applies to the
+        // move. Checked after the dependency rows exist, so a row declaring its
+        // own unfinished prerequisite is refused rather than created mid-work.
+        if is_work_bearing_status(&input.status) {
+            require_no_blocking_gates(&transaction, &id, GateCaller::Unleased)?;
+        }
         // Every other event kind names who did it; creating a task was the one
         // action the trail could not attribute, because there was no `--as` to
         // record. Measured 2026-08-21 across the live boards, 132 of these
@@ -4055,6 +4352,39 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every unfinished prerequisite standing between this row and work on it,
+    /// whether declared here or inherited from a plan above it.
+    ///
+    /// The one query every surface reads the gate through — the refusals, the
+    /// context packet, `task show`, `task list --with-relations` — so a board
+    /// view and a refused claim cannot disagree about what is blocking. An
+    /// empty list means no dependency gate, which is not the same as claimable:
+    /// a draft ancestor, a live lease, routing and authorization are separate
+    /// rules with their own answers.
+    pub fn blocking_gates(&self, id: &str) -> Result<Vec<GateBlocker>> {
+        // Relations carry no tags of their own: board scope only, exactly as
+        // [`Store::dependencies`] reads them.
+        self.authz.check_read(&[])?;
+        require_task(&self.connection, id)?;
+        blocking_gates(&self.connection, id, &lapsed_leases(&self.connection)?)
+    }
+
+    /// The same answer for a listing, which asks it of every row.
+    ///
+    /// The lapsed-lease projection every blocker is read through is
+    /// board-wide (see `LapsedLeases`), so a listing reads it once here
+    /// rather than once per row.
+    pub fn blocking_gates_for(&self, ids: &[String]) -> Result<Vec<Vec<GateBlocker>>> {
+        self.authz.check_read(&[])?;
+        let lapsed = lapsed_leases(&self.connection)?;
+        ids.iter()
+            .map(|id| {
+                require_task(&self.connection, id)?;
+                blocking_gates(&self.connection, id, &lapsed)
+            })
+            .collect()
+    }
+
     pub fn ancestors(&self, id: &str) -> Result<Vec<Task>> {
         let mut current = self.require_task(id)?;
         let mut out = Vec::new();
@@ -4100,6 +4430,23 @@ impl Store {
             bail!(
                 "story {id} status is projected from its gate, now at {workflow}: advance it with `story advance` (--force overwrites the projection and records it)"
             );
+        }
+        // A completion gate governs work, not bookkeeping: a move that claims
+        // work is under way or finished waits on the prerequisites, while
+        // draft, backlog, todo, blocked and cancelled stay available —
+        // including to a holder parking a row whose prerequisite reopened.
+        // `--force` seizes a live lease; it does not finish a prerequisite,
+        // so it is deliberately not consulted here.
+        if is_work_bearing_status(status) {
+            // A move is the one gate site that may or may not be the holder's:
+            // the same refusal reaches a holder pushing their own row to done
+            // and a bystander moving a free one, and only the first has a
+            // lease to stop.
+            let caller = match active_claim(&transaction, id, now_ms())? {
+                Some(held) if held.agent_id == actor => GateCaller::Holder,
+                _ => GateCaller::Unleased,
+            };
+            require_no_blocking_gates(&transaction, id, caller)?;
         }
         let seized = require_free_lease(&transaction, id, &actor, force, "move")?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
@@ -4286,6 +4633,7 @@ impl Store {
             "UPDATE tasks SET parent_id=?,title=?,body=?,assignee=?,lane=?,deliverable=?,stale_minutes=?,driver_only=?,priority=?,updated_at=? WHERE id=?",
             params![parent,nonempty(&title,"title")?,body,assignee,lane,deliverable,stale,driver as i64,priority,now_ms(),id],
         )?;
+        let dependencies_replaced = input.dependencies.is_some();
         if let Some(deps) = input.dependencies {
             let mut unique = Vec::new();
             for dependency in deps {
@@ -4309,6 +4657,13 @@ impl Store {
                     params![id, dependency],
                 )?;
             }
+        }
+        // Either change can build a gate nothing can satisfy: a new
+        // prerequisite, or a new parent whose gates this row now inherits.
+        // Validated once, after both are written, so it sees the shape the
+        // caller asked for rather than a half of it.
+        if dependencies_replaced || parent != previous_parent {
+            require_no_gate_deadlock(&transaction, id)?;
         }
         if let Some(tags) = &input.tags {
             set_tags(&transaction, id, tags)?;
@@ -4369,18 +4724,7 @@ impl Store {
         if !["todo", "in_progress"].contains(&task.status.as_str()) {
             bail!("task {} is {}, not claimable", task.id, task.status);
         }
-        let unmet = dependencies(&transaction, &task.id)?
-            .into_iter()
-            .filter(|d| d.status != "done")
-            .map(|d| d.id)
-            .collect::<Vec<_>>();
-        if !unmet.is_empty() {
-            bail!(
-                "task {} has unmet dependencies: {}",
-                task.id,
-                unmet.join(", ")
-            );
-        }
+        require_no_blocking_gates(&transaction, &task.id, GateCaller::Unleased)?;
         if let Some(held) = active_claim(&transaction, &task.id, now)? {
             // Name the holder and the way out. `claim` has no --force, and
             // --allow-reassign only filters `claim --candidates`, so a caller
@@ -4480,6 +4824,12 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
+        // A live lease is never revoked by a gate, but renewing one asserts
+        // the work is still going: a prerequisite introduced or reopened
+        // underneath the holder stops the renewal here, and the holder's way
+        // out is `checkpoint --state blocked` or `release`, both of which stay
+        // open.
+        require_no_blocking_gates(&transaction, id, GateCaller::Holder)?;
         match git {
             Some(git) => transaction.execute(
                 "UPDATE task_claims SET heartbeat_at=?,expires_at=?,worktree=?,worktree_kind=?,branch=?,head_sha=?,root_head=? WHERE task_id=? AND lease_token=?",
@@ -4615,6 +4965,12 @@ impl Store {
         let prior_status = require_task(&transaction, &input.task_id)?.status;
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
+        }
+        // `continue` and `done` both claim work happened; `blocked` is the
+        // holder saying it did not, which is exactly the route out of a
+        // prerequisite that appeared or reopened mid-lease, so it stays open.
+        if input.state != "blocked" {
+            require_no_blocking_gates(&transaction, &input.task_id, GateCaller::Holder)?;
         }
         transaction.execute(
             "INSERT INTO checkpoints(task_id,author,session_id,model,state,summary,intent,next_action,blockers,validations,repo_path,branch,head_sha,dirty_summary,created_at,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -5053,6 +5409,37 @@ impl Store {
             .query_row(
                 &format!("SELECT COUNT(*) FROM attention{where_clause}"),
                 params_from_iter(refs),
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// How many workable rows are waiting on a prerequisite: the dashboard's
+    /// number, and a count rather than a filter.
+    ///
+    /// The status totals beside it stay raw status counts — a `todo` row that
+    /// is gated is still `todo`, and quietly renaming or subtracting it would
+    /// make the board's own arithmetic stop adding up. This is the separate
+    /// number that says how much of the queue nobody can start.
+    ///
+    /// Tasks only, because a task is the only row a lease is ever granted on,
+    /// and `done`/`cancelled` are excluded because a settled row is not
+    /// waiting for anything. Archived cold history is out for the same reason
+    /// every other dashboard number leaves it out.
+    pub fn count_gated_tasks(&self) -> Result<i64> {
+        self.authz.check_read(&[])?;
+        self.connection
+            .query_row(
+                "WITH RECURSIVE gated(id) AS (\
+                     SELECT dependency.task_id FROM task_dependencies dependency \
+                     JOIN tasks prerequisite ON prerequisite.id=dependency.depends_on \
+                     WHERE prerequisite.status<>'done' \
+                     UNION \
+                     SELECT child.id FROM gated JOIN tasks child ON child.parent_id=gated.id\
+                 ) \
+                 SELECT COUNT(*) FROM tasks t JOIN gated ON gated.id=t.id \
+                 WHERE t.archived=0 AND t.type=? AND t.status NOT IN ('done','cancelled')",
+                [CLAIMABLE_TYPE],
                 |row| row.get(0),
             )
             .map_err(Into::into)
@@ -5659,18 +6046,7 @@ impl Store {
         if task.driver_only && caller_scope != Some("driver") {
             bail!("task {} is driver-only", task.id);
         }
-        let unmet = dependencies(&transaction, &task.id)?
-            .into_iter()
-            .filter(|d| d.status != "done")
-            .map(|d| d.id)
-            .collect::<Vec<_>>();
-        if !unmet.is_empty() {
-            bail!(
-                "task {} has unmet dependencies: {}",
-                task.id,
-                unmet.join(", ")
-            );
-        }
+        require_no_blocking_gates(&transaction, &task.id, GateCaller::Unleased)?;
         if let Some(held) = active_claim(&transaction, &task.id, now)? {
             // Name the holder and the way out. `claim` has no --force, and
             // --allow-reassign only filters `claim --candidates`, so a caller
@@ -5880,6 +6256,12 @@ impl Store {
             return Ok(
                 json!({"from":current,"to":target,"parentEpicFlipped":false,"dispatchedTaskID":Value::Null,"noop":true}),
             );
+        }
+        // `planning -> ready` is the story being made ready to act on, which
+        // is bookkeeping; every step past it asserts the work itself is
+        // moving, so the story's own and inherited prerequisites apply.
+        if target != "ready" {
+            require_no_blocking_gates(&transaction, id, GateCaller::Unleased)?;
         }
 
         let mut statement = transaction.prepare(
@@ -6107,6 +6489,7 @@ impl Store {
             task,
             ancestors: self.ancestors(id)?,
             dependencies: self.dependencies(id)?,
+            blocking_gates: self.blocking_gates(id)?,
             claim: self.get_claim(id)?.as_ref().map(ClaimSummary::from),
             orphaned_from: orphaned_from(&self.connection, id)?,
             open_attention,
@@ -6917,6 +7300,55 @@ mod tests {
         }
     }
 
+    /// A typed, parented row for the completion-gate fixtures, created
+    /// through `add_task` so the nesting and gate rules see it as a caller
+    /// would build it.
+    fn gate_row(id: &str, task_type: &str, parent: Option<&str>) -> AddTask {
+        AddTask {
+            id: Some(id.to_owned()),
+            task_type: task_type.to_owned(),
+            parent_id: parent.map(str::to_owned),
+            title: format!("{id} fixture"),
+            body: None,
+            assignee: None,
+            lane: None,
+            deliverable: None,
+            stale_minutes: None,
+            driver_only: false,
+            status: "todo".to_owned(),
+            priority: 3,
+            dependencies: Vec::new(),
+            metadata: serde_json::json!({}),
+            actor: Some("seed".to_owned()),
+            tags: Vec::new(),
+        }
+    }
+
+    /// A dependency-set replacement, leaving every other field alone.
+    fn dependency_update(prerequisites: &[&str]) -> UpdateTask {
+        UpdateTask {
+            dependencies: Some(prerequisites.iter().map(|id| (*id).to_owned()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// The blockers as `(owner, prerequisite, status)`, which is what every
+    /// caller of the gate actually reads.
+    fn gate_triples(store: &Store, id: &str) -> Vec<(String, String, String)> {
+        store
+            .blocking_gates(id)
+            .expect("read blocking gates")
+            .into_iter()
+            .map(|blocker| {
+                (
+                    blocker.source_task_id,
+                    blocker.prerequisite_id,
+                    blocker.prerequisite_status,
+                )
+            })
+            .collect()
+    }
+
     fn handoff_input() -> HandoffInput {
         HandoffInput {
             task_id: None,
@@ -7565,6 +7997,248 @@ mod tests {
             event_plan_text.contains("created_at>") || event_plan_text.contains("created_at<"),
             "{event_plan_text}"
         );
+    }
+
+    #[test]
+    fn a_completion_gate_is_inherited_from_every_ancestor_and_only_done_clears_it() {
+        let mut store = test_store("gate-inheritance");
+        for (id, task_type, parent) in [
+            ("e-root", "epic", None),
+            ("e-phase", "epic", Some("e-root")),
+            ("t-leaf", "task", Some("e-phase")),
+            ("t-root-prereq", "task", None),
+            ("t-phase-prereq", "task", None),
+            ("t-own-prereq", "task", None),
+            ("t-archived-prereq", "task", None),
+            ("t-far", "task", None),
+            ("t-independent", "task", None),
+        ] {
+            store.add_task(gate_row(id, task_type, parent)).unwrap();
+        }
+        store
+            .update_task("e-root", dependency_update(&["t-root-prereq"]), "seed")
+            .unwrap();
+        store
+            .update_task("e-phase", dependency_update(&["t-phase-prereq"]), "seed")
+            .unwrap();
+        store
+            .update_task(
+                "t-leaf",
+                dependency_update(&["t-own-prereq", "t-archived-prereq"]),
+                "seed",
+            )
+            .unwrap();
+        // A prerequisite with a prerequisite of its own: whether `t-far` is
+        // finished is `t-own-prereq`'s business, and reporting it as a blocker
+        // on the leaf would name a row the leaf is not waiting for.
+        store
+            .update_task("t-own-prereq", dependency_update(&["t-far"]), "seed")
+            .unwrap();
+
+        assert_eq!(
+            gate_triples(&store, "t-leaf"),
+            [
+                ("t-leaf", "t-archived-prereq", "todo"),
+                ("t-leaf", "t-own-prereq", "todo"),
+                ("e-phase", "t-phase-prereq", "todo"),
+                ("e-root", "t-root-prereq", "todo"),
+            ]
+            .map(|(owner, prerequisite, status)| (
+                owner.to_owned(),
+                prerequisite.to_owned(),
+                status.to_owned()
+            ))
+        );
+        assert!(gate_triples(&store, "t-independent").is_empty());
+        // The gate is the only thing standing in the way, and an unrelated row
+        // is still claimable while the gated tree is not.
+        store
+            .claim(Some("t-independent"), claim_options("driver-2"))
+            .unwrap();
+        // The queue's set-shaped gate and the per-row one are two expressions
+        // of the same rule, so they have to agree: anything offered has no
+        // blockers, and the gated tree is never offered.
+        let candidates = store
+            .claim_candidates(&claim_options("driver-9"), None, 50)
+            .unwrap();
+        assert!(!candidates.is_empty());
+        for candidate in &candidates {
+            assert!(
+                gate_triples(&store, &candidate.id).is_empty(),
+                "{} was offered while gated",
+                candidate.id
+            );
+        }
+        assert!(!candidates.iter().any(|row| row.id == "t-leaf"));
+
+        // A done prerequisite clears; a cancelled one does not, because a
+        // decision not to do the work is not the work being finished; and a
+        // done row archived into cold history still counts as finished.
+        store
+            .move_task("t-phase-prereq", "done", "seed", json!({}), false)
+            .unwrap();
+        store
+            .move_task("t-root-prereq", "cancelled", "seed", json!({}), false)
+            .unwrap();
+        store
+            .move_task("t-archived-prereq", "done", "seed", json!({}), false)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET archived=1,archived_at=1 WHERE id='t-archived-prereq'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            gate_triples(&store, "t-leaf"),
+            [
+                (
+                    "t-leaf".to_owned(),
+                    "t-own-prereq".to_owned(),
+                    "todo".to_owned()
+                ),
+                (
+                    "e-root".to_owned(),
+                    "t-root-prereq".to_owned(),
+                    "cancelled".to_owned()
+                ),
+            ]
+        );
+        let refusal = store
+            .claim(Some("t-leaf"), claim_options("driver-3"))
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "t-leaf",
+            "t-own-prereq",
+            "t-root-prereq",
+            "cancelled",
+            "ancestor e-root",
+        ] {
+            assert!(refusal.contains(needle), "{needle} missing from {refusal}");
+        }
+
+        // A reopened prerequisite gates future work again.
+        store
+            .move_task("t-phase-prereq", "todo", "seed", json!({}), false)
+            .unwrap();
+        assert!(gate_triples(&store, "t-leaf").contains(&(
+            "e-phase".to_owned(),
+            "t-phase-prereq".to_owned(),
+            "todo".to_owned()
+        )));
+    }
+
+    #[test]
+    fn a_gate_nothing_could_satisfy_is_refused_on_dependency_and_on_parent_changes() {
+        let mut store = test_store("gate-deadlock");
+        for (id, task_type, parent) in [
+            ("e-parent", "epic", None),
+            ("t-inside", "task", Some("e-parent")),
+            ("e-gated", "epic", None),
+            ("t-external", "task", None),
+            ("e-one", "epic", None),
+            ("t-a", "task", Some("e-one")),
+            ("e-two", "epic", None),
+            ("t-b", "task", Some("e-two")),
+        ] {
+            store.add_task(gate_row(id, task_type, parent)).unwrap();
+        }
+
+        // An epic gated on a task inside its own subtree: the descendant
+        // inherits the gate, so finishing the prerequisite requires work the
+        // gate forbids. No dependency-only cycle exists here at all.
+        let own = store
+            .update_task("e-parent", dependency_update(&["t-inside"]), "seed")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            own.contains("e-parent") && own.contains("t-inside"),
+            "{own}"
+        );
+        assert!(store.dependencies("e-parent").unwrap().is_empty());
+
+        // The same deadlock built from the parent side, with the dependency
+        // edge already legal when it was declared.
+        store
+            .update_task("e-gated", dependency_update(&["t-external"]), "seed")
+            .unwrap();
+        let reparented = store
+            .update_task(
+                "t-external",
+                UpdateTask {
+                    parent_id: Some(Some("e-gated".to_owned())),
+                    ..Default::default()
+                },
+                "seed",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reparented.contains("e-gated") && reparented.contains("t-external"),
+            "{reparented}"
+        );
+        assert_eq!(store.require_task("t-external").unwrap().parent_id, None);
+
+        // A dependency across two trees is ordinary sequencing, not a
+        // deadlock, and stays accepted.
+        store
+            .update_task("t-a", dependency_update(&["t-b"]), "seed")
+            .unwrap();
+        assert_eq!(
+            store
+                .dependencies("t-a")
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            ["t-b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_gated_task_count_is_unfinished_unarchived_leaf_rows_only() {
+        let mut store = test_store("gate-count");
+        for (id, task_type, parent) in [
+            ("e-plan", "epic", None),
+            ("t-waiting", "task", Some("e-plan")),
+            ("t-settled", "task", Some("e-plan")),
+            ("t-direct", "task", None),
+            ("t-plan-prereq", "task", None),
+        ] {
+            store.add_task(gate_row(id, task_type, parent)).unwrap();
+        }
+        // Finished before the gate exists, because finishing under a live gate
+        // is precisely what the gate refuses.
+        store
+            .move_task("t-settled", "done", "seed", json!({}), false)
+            .unwrap();
+        store
+            .update_task("e-plan", dependency_update(&["t-plan-prereq"]), "seed")
+            .unwrap();
+        store
+            .update_task("t-direct", dependency_update(&["t-plan-prereq"]), "seed")
+            .unwrap();
+
+        // `t-waiting` inherits the plan's gate and `t-direct` declared its
+        // own. The gated epic itself is not counted — no lease is ever granted
+        // on a container — and neither is the settled row or the prerequisite.
+        assert_eq!(store.count_gated_tasks().unwrap(), 2);
+
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET archived=1,archived_at=1 WHERE id='t-waiting'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.count_gated_tasks().unwrap(), 1);
+
+        store
+            .move_task("t-direct", "cancelled", "seed", json!({}), false)
+            .unwrap();
+        assert_eq!(store.count_gated_tasks().unwrap(), 0);
     }
 
     #[test]

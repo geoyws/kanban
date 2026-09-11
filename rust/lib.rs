@@ -135,7 +135,9 @@ Usage:
              (every listed row carries claimed; --with-claims and task show
              carry claim, whose holder is claim.agentID. assignee is intent,
              never the lease: an assigned task can be free, a held one
-             assigned to someone else)
+             assigned to someone else. --with-relations and task show carry
+             dependencies and blockingGates — the unfinished prerequisites
+             this row inherits from itself and from every ancestor)
   kanban task move ID draft|backlog|todo|in_progress|blocked|review|done|cancelled --as ACTOR [--metadata-patch-json JSON_OBJECT] [--force]
   kanban task remove ID --as ACTOR [--force]
   kanban task update ID --as ACTOR [--title TEXT] [--body TEXT | --body-file PATH]
@@ -3872,20 +3874,35 @@ fn list_json(
     include_archived: bool,
 ) -> Result<Value> {
     let listed = store.list_tasks_with_claims(status, tag, lane, include_archived)?;
+    // Every row's gate in one read, because the lapsed-lease projection it
+    // applies is board-wide: asking row by row put that read on the listing
+    // once per row.
+    let mut gates = if relations {
+        store.blocking_gates_for(
+            &listed
+                .iter()
+                .map(|(task, _)| task.id.clone())
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        Vec::new()
+    }
+    .into_iter();
     let mut out = Vec::with_capacity(listed.len());
     for (task, claim) in listed {
-        let dependencies = if relations {
-            Some(
+        let related = if relations {
+            Some((
                 store
                     .dependencies(&task.id)?
                     .into_iter()
                     .map(|dependency| dependency.id)
                     .collect(),
-            )
+                gates.next().context("one gate list per listed row")?,
+            ))
         } else {
             None
         };
-        out.push(task_list_row(&task, claim, claims, dependencies)?);
+        out.push(task_list_row(&task, claim, claims, related)?);
     }
     Ok(Value::Array(out))
 }
@@ -3904,15 +3921,19 @@ fn task_list_row(
     task: &Task,
     claim: Option<ClaimSummary>,
     with_claims: bool,
-    dependencies: Option<Vec<String>>,
+    relations: Option<(Vec<String>, Vec<GateBlocker>)>,
 ) -> Result<Value> {
     let mut value = object_of(task)?;
     value.insert("claimed".into(), Value::Bool(claim.is_some()));
     if with_claims {
         value.insert(TASK_CLAIM_FIELD.into(), serde_json::to_value(claim)?);
     }
-    if let Some(dependencies) = dependencies {
+    if let Some((dependencies, blocking_gates)) = relations {
         value.insert(TASK_RELATION_FIELD.into(), json!(dependencies));
+        value.insert(
+            TASK_GATE_FIELD.into(),
+            serde_json::to_value(blocking_gates)?,
+        );
     }
     Ok(Value::Object(value))
 }
@@ -3951,15 +3972,23 @@ const TASK_FIELDS: [&str; 21] = [
 /// summary, or null.
 const TASK_CLAIM_FIELD: &str = "claim";
 
-/// The one key `task list --with-relations` adds to every row.
+/// The keys `task list --with-relations` adds to every row.
+///
+/// Both come from the one flag because neither answers the question alone:
+/// `dependencies` is what this row itself declared, and `blockingGates` is
+/// what is actually unfinished anywhere in its ancestry. A row carrying the
+/// first without the second reads as unblocked while the epic above it holds
+/// the gate — which is the state a leaf is usually in.
 const TASK_RELATION_FIELD: &str = "dependencies";
+const TASK_GATE_FIELD: &str = "blockingGates";
 
 /// Keys a `task list` row carries only under a flag, with the flag that adds
 /// each, so `--fields claim` without `--with-claims` is refused naming the
 /// flag rather than a key list that omits it (ADR-008).
-const TASK_GATED_FIELDS: [(&str, &str); 2] = [
+const TASK_GATED_FIELDS: [(&str, &str); 3] = [
     (TASK_CLAIM_FIELD, "with-claims"),
     (TASK_RELATION_FIELD, "with-relations"),
+    (TASK_GATE_FIELD, "with-relations"),
 ];
 
 /// The keys of one `attention list` row, exactly as a caller sees them.
@@ -5660,6 +5689,10 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             value.insert("openAttention".into(), json!(open_attention));
             value.insert("totalTasks".into(), json!(tasks.len()));
             value.insert("staleTasks".into(), json!(store.stale_tasks()?.len()));
+            // Not folded into the status counts beside it: a gated row keeps
+            // whatever status it holds, and renaming `todo` to something
+            // narrower would leave the board's own totals not adding up.
+            value.insert("gatedTasks".into(), json!(store.count_gated_tasks()?));
             let queued = tasks
                 .iter()
                 .filter(|task| task.status == "todo")
@@ -6392,6 +6425,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         }
         if relations {
             fields.push(TASK_RELATION_FIELD);
+            fields.push(TASK_GATE_FIELD);
         }
         // Checked before the query, so a misspelt key is refused without
         // reading the board.
@@ -6418,6 +6452,10 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         value.insert(
             "dependencies".into(),
             serde_json::to_value(store.dependencies(id)?)?,
+        );
+        value.insert(
+            "blockingGates".into(),
+            serde_json::to_value(store.blocking_gates(id)?)?,
         );
         value.insert("claim".into(), serde_json::to_value(claim)?);
         // One --limit bounds all three histories: a task's record is read as
@@ -9069,7 +9107,7 @@ mod tests {
         let mut expected = TASK_FIELDS.to_vec();
         expected.sort_unstable();
         assert_eq!(keys(&task_row()), expected);
-        // Under both flags the row gains exactly the two gated keys.
+        // Under both flags the row gains exactly the gated keys.
         let claim = crate::model::ClaimSummary {
             task_id: "t-1".into(),
             agent_id: "driver-2".into(),
@@ -9081,7 +9119,7 @@ mod tests {
         let mut expected = TASK_FIELDS.to_vec();
         expected.extend(TASK_GATED_FIELDS.iter().map(|(key, _)| *key));
         expected.sort_unstable();
-        let full = task_list_row(&task(), Some(claim), true, Some(vec![])).unwrap();
+        let full = task_list_row(&task(), Some(claim), true, Some((vec![], vec![]))).unwrap();
         assert_eq!(keys(&full), expected);
         assert_eq!(full["claimed"], true);
         assert_eq!(full["claim"]["agentID"], "driver-2");

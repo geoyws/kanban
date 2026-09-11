@@ -3604,7 +3604,7 @@ mod tests {
                 driver_only: false,
                 status: "in_progress".to_owned(),
                 priority: 1,
-                dependencies: vec![story.id.clone()],
+                dependencies: vec![],
                 metadata: serde_json::json!({"focus": "render"}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["ops".to_owned(), "release".to_owned()],
@@ -3624,12 +3624,38 @@ mod tests {
                 driver_only: false,
                 status: "done".to_owned(),
                 priority: 3,
-                dependencies: vec![task.id.clone()],
+                dependencies: vec![],
                 metadata: serde_json::json!({"done": true}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["release".to_owned()],
             })
             .expect("add done task");
+        // The two edges are attached after the rows exist rather than declared
+        // at creation. The fixture's whole point is a row rendered mid-work and
+        // a row rendered finished, and a completion gate refuses to CREATE
+        // either state while a prerequisite is unfinished; editing dependencies
+        // is not a work transition, so the board ends up in exactly the shape
+        // the page is here to render.
+        store
+            .update_task(
+                &task.id,
+                crate::store::UpdateTask {
+                    dependencies: Some(vec![story.id.clone()]),
+                    ..Default::default()
+                },
+                "geoyws",
+            )
+            .expect("attach in-progress task dependency");
+        store
+            .update_task(
+                &done.id,
+                crate::store::UpdateTask {
+                    dependencies: Some(vec![task.id.clone()]),
+                    ..Default::default()
+                },
+                "geoyws",
+            )
+            .expect("attach done task dependency");
         store
             .add_note(
                 &epic.id,

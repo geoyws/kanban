@@ -1,5 +1,5 @@
 use crate::model::{
-    Attention, Checkpoint, ContextPacket, Handoff, RuleSummary, Sitrep, Task, TaskNote,
+    Attention, Checkpoint, ContextPacket, GateBlocker, Handoff, RuleSummary, Sitrep, Task, TaskNote,
 };
 use crate::store::Store;
 use anyhow::{Result, bail};
@@ -9,6 +9,42 @@ fn task_line(task: &Task) -> String {
         "- {} [{}] P{} {}",
         task.id, task.status, task.priority, task.title
     )
+}
+
+/// One unfinished prerequisite, and whose gate it is.
+///
+/// The owner is named because a leaf inherits the gates of every plan above
+/// it: told only that some other row is unfinished, a resuming agent reads
+/// its own dependencies, finds none, and concludes the tool is confused.
+fn gate_line(blocker: &GateBlocker) -> String {
+    format!(
+        "- {} [{}] {} (gate declared on {})",
+        blocker.prerequisite_id,
+        blocker.prerequisite_status,
+        blocker.prerequisite_title,
+        blocker.source_task_id
+    )
+}
+
+/// The gate on one line, for the compact packet.
+///
+/// The compact path drops ancestry and dependencies, but not this: an agent
+/// resuming into work it cannot start needs to know that before it reads
+/// anything else, and the ids are short.
+fn render_gates_compact(blockers: &[GateBlocker]) -> String {
+    if blockers.is_empty() {
+        return "(none)".to_owned();
+    }
+    blockers
+        .iter()
+        .map(|blocker| {
+            format!(
+                "{} [{}] via {}",
+                blocker.prerequisite_id, blocker.prerequisite_status, blocker.source_task_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_checkpoint(checkpoint: &Checkpoint) -> String {
@@ -270,6 +306,18 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                 .collect::<Vec<_>>()
                 .join("\n")
         },
+        String::new(),
+        "## Blocking gates".to_owned(),
+        if packet.blocking_gates.is_empty() {
+            "(none)".to_owned()
+        } else {
+            packet
+                .blocking_gates
+                .iter()
+                .map(gate_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
     ]
     .join("\n");
     let newest_checkpoint = packet.checkpoints.last();
@@ -298,6 +346,10 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .claim
                     .as_ref()
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
+            ),
+            format!(
+                "Blocking gates: {}",
+                render_gates_compact(&packet.blocking_gates)
             ),
             format!(
                 "Open attention: {}",
@@ -542,6 +594,7 @@ mod tests {
             task: sample_task(),
             ancestors: vec![],
             dependencies: vec![],
+            blocking_gates: vec![],
             claim: None,
             orphaned_from: None,
             open_attention: vec![

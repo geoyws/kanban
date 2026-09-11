@@ -75,11 +75,12 @@ kanban claim --candidates --project my-project --as atmux@_superbot \
 
 The result is priority ordered and contains task fields, including tags, lane,
 assignee and `driverOnly`, but never a lease token. It excludes containers,
-dependency-blocked work, work under draft plans, active leases, incompatible
-assignees and driver-only work unless `--caller-scope driver` is supplied.
-Inspection is read-only: it does not migrate or touch registry recency, expire
-leases, update task state, append events, or cache a result. A returned row is
-still only a candidate; take it with atomic `claim ID` or `claim --next`.
+work behind an unmet completion gate, work under draft plans, active leases,
+incompatible assignees and driver-only work unless `--caller-scope driver` is
+supplied. Inspection is read-only: it does not migrate or touch registry
+recency, expire leases, update task state, append events, or cache a result. A
+returned row is still only a candidate; take it with atomic `claim ID` or
+`claim --next`.
 
 To ask who holds a task, read the lease, not the assignee. Every `task list`
 row carries `claimed`, and `task list --with-claims` (or `task show`) adds
@@ -89,6 +90,57 @@ is a separate field recording intent, not possession: an assigned task can be
 free, and a held task can be assigned to someone else. `--fields actor` is
 refused naming the keys that exist, so the wrong question fails where it is
 typed rather than answering null.
+
+## Completion gates
+
+A dependency is a gate on doing the work, not only on being offered it. Declare
+one with the dependency flags that already exist — `task add --depends-on ID`,
+`task update --depends-on ID ...` (a repeatable set replacement) and
+`task update --clear-dependencies` — and a row inherits every prerequisite
+declared on itself **or on any ancestor**, the same way a draft ancestor holds
+back its whole tree (ADR-013). A prerequisite satisfies the gate at `done` and
+nowhere else: `cancelled` is a decision not to do the work, and an archived
+`done` row is still finished.
+
+While a prerequisite is unfinished, these refuse, naming the row, each
+unfinished prerequisite with its status, and the ancestor that declared it:
+`claim ID`, `claim --next`, `handoff accept`, `task add`/`task move` into
+`in_progress`, `review` or `done`, `story advance` past `ready`,
+`checkpoint --state continue|done`, and `heartbeat`. `--force` seizes a lease;
+it does not finish a prerequisite, so it is not a way through.
+
+What stays open is everything that records where the work stands rather than
+claiming it moved: `task move` to `draft`, `backlog`, `todo`, `blocked` or
+`cancelled`, `note`, `sitrep`, `attention`, `handoff create`,
+`checkpoint --state blocked` and `release`. A live lease is never revoked by a
+gate — a prerequisite introduced or reopened mid-lease stops the next renewal
+and leaves the holder the blocked checkpoint and the release. Nothing here
+auto-changes a status, claims work, marks an epic done, or reopens finished
+work.
+
+The blockers are data, not only a refusal. `task show`, `kanban context` and
+`task list --with-relations` carry `blockingGates`: an array of
+`{sourceTaskID, prerequisiteID, prerequisiteTitle, prerequisiteStatus}`,
+ordered nearest owner first then by prerequisite id, where `sourceTaskID` is the
+row that declared the edge — itself or an ancestor. `dependencies` is unchanged
+and still lists only what the row declared, so `--fields blockingGates` needs
+`--with-relations` exactly as `--fields dependencies` does. An empty array means
+no dependency gate; it is not a promise that the row is claimable, because
+draft ancestors, live leases, routing and authorization are separate rules.
+
+A dependency that no amount of work could satisfy is refused when it is
+declared, on the dependency change and on a parent change alike: an epic gated
+on a task inside its own subtree can never be unblocked, because the descendant
+inherits the epic's gate and would wait on itself. The existing self-dependency
+and dependency-cycle refusals are unchanged.
+
+```bash
+kb t up "$LEAF" --depends-on "$PREREQ" --as "$AGENT" --json
+kb t cat "$LEAF" --json | jq .blockingGates
+kb claim "$LEAF" --as "$AGENT"      # refused, naming PREREQ and its owner
+kb t mv "$PREREQ" done --as "$AGENT"
+kb claim "$LEAF" --as "$AGENT"      # granted
+```
 
 ## Roadmap todo lists
 
@@ -1058,6 +1110,13 @@ claim heartbeat when there is one and from `updated_at` otherwise, and
 `kb dashboard` carries the count per project plus `highestPriority` and
 `highestPriorityLevel`, and orders projects by that priority then the oldest
 row at the level. Projects with no queued work sink to the end.
+
+`kb dashboard` also carries `gatedTasks` per project: the unarchived,
+unfinished task rows waiting on a completion gate, whether declared on the row
+or inherited from a plan above it. It sits beside `taskCounts` rather than
+inside it, because `taskCounts` is the raw status tally and a gated `todo` row
+is still `todo` — subtracting or renaming it would leave the board's own
+arithmetic not adding up.
 
 ```bash
 kb stale --json           # [{ id, staleMinutes, idleMinutes, overdueMinutes, lastSignal }]

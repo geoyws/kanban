@@ -116,6 +116,61 @@ status as Markdown checkboxes. See
 [ADR-022](ADR-022-roadmap-todo-lists-are-child-epics.md) for the completion and
 projection contract.
 
+### A dependency holds back the work beneath it too
+
+**Amended 2026-09-11.** The draft rule above and the dependency graph answered
+two halves of one question and only one of them inherited. A dependency was
+consulted by `claim` alone, on the row that declared it: a task under an epic
+gated on another epic's work was hidden from nothing and refused by nothing,
+and a plan's ordering — the very thing ADR-022 says child-epic dependencies
+express — had no effect on the work beneath those children.
+
+A prerequisite is now a gate on **doing** the work, inherited down the parent
+chain exactly as a draft ancestor is. It is the same graph: no gate table, no
+new status, no flag, no second vocabulary. `Store::blocking_gates` is the one
+query, returning `GateBlocker { sourceTaskID, prerequisiteID,
+prerequisiteTitle, prerequisiteStatus }` — the owner travels with the
+prerequisite, because a leaf told only that some other row is unfinished reads
+its own dependencies, finds none, and concludes the tool is confused.
+
+Only `done` satisfies a gate. `cancelled` is a decision not to do the work,
+which is not the work being finished, and an archived `done` row is still
+finished. A prerequisite's own prerequisites are not walked: whether they are
+met is that row's business, and reporting them would name rows nothing is
+waiting for.
+
+What the gate refuses is work: `claim` by id and `--next`, `handoff accept`,
+`task add`/`task move` into `in_progress`, `review` or `done`, `story advance`
+past `ready`, `checkpoint --state continue|done`, and `heartbeat`. What stays
+open is every way of recording where the work stands: the administrative
+statuses, notes, sitreps, attention, `handoff create`,
+`checkpoint --state blocked` and `release`. `--force` seizes a lease and does
+not finish a prerequisite, so it is not a route through — and a live lease is
+never revoked, because revoking one would destroy the provenance a successor
+reads. A prerequisite introduced or reopened mid-lease stops the next renewal
+and leaves the holder the blocked checkpoint.
+
+Gates decide nothing on their own: no status is auto-changed, no work is
+auto-claimed, no epic is marked done, and nothing completed is reopened. The
+blockers are published rather than only enforced — `task show`, `context` and
+`task list --with-relations` carry `blockingGates`, and `dashboard` carries
+`gatedTasks` beside the raw status counts — because a queue that silently
+hides rows teaches an operator that the board is lying to them.
+
+Inheritance also creates a shape that dependency-cycle detection cannot see:
+an epic gated on a task **inside its own subtree** has no dependency cycle at
+all, and can still never be unblocked, because the descendant inherits the
+epic's gate and waits on itself. Re-parenting builds the same deadlock without
+touching a dependency edge. Both changes therefore validate the resulting
+shape over parent and dependency edges together, cycle-safely, and refuse
+naming both ends. That walk descends only into rows that could reach the
+changed row's subtree — the subtree itself, and the ancestors of it and of
+every row that declares a dependency — because a branch with no dependency
+edge under it and no member of that subtree can only lead back to ancestors
+the walk already has. Status is deliberately not consulted there: a shape
+that only works while a prerequisite happens to be done is not a shape worth
+storing.
+
 ## Consequences
 
 Widening the status `CHECK` meant rebuilding the `tasks` table, and a rebuild is

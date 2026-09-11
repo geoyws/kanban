@@ -479,6 +479,22 @@ pub struct Task {
     /// as opposed to `lane`, which is what kind of work it is.
     pub tags: Vec<String>,
 }
+/// One incomplete prerequisite inherited by a task from itself or an ancestor.
+///
+/// This is a projection of task_dependencies, never stored separately. The
+/// source identity is retained because an inherited epic gate must tell a leaf
+/// which plan owns the edge rather than presenting the prerequisite as local.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateBlocker {
+    #[serde(rename = "sourceTaskID")]
+    pub source_task_id: String,
+    #[serde(rename = "prerequisiteID")]
+    pub prerequisite_id: String,
+    #[serde(rename = "prerequisiteTitle")]
+    pub prerequisite_title: String,
+    #[serde(rename = "prerequisiteStatus")]
+    pub prerequisite_status: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -735,6 +751,8 @@ pub struct ContextPacket {
     pub task: Task,
     pub ancestors: Vec<Task>,
     pub dependencies: Vec<Task>,
+    /// Incomplete direct prerequisites on this row and every ancestor.
+    pub blocking_gates: Vec<GateBlocker>,
     pub claim: Option<ClaimSummary>,
     /// The previous holder whose lease expired, for a successor reading the
     /// packet cold. See [`ClaimReceipt::orphaned_from`]; absent when nothing

@@ -767,25 +767,62 @@ fn browser_sandbox_disables_only_for_root_uid() {
     assert!(!browser_sandbox_enabled(0));
 }
 
+/// Chrome, proved to be answering before it is handed to a journey.
+///
+/// `Browser::new` returns once the DevTools socket is up, and on a loaded
+/// machine Chrome has been seen dying immediately afterwards: the journey's
+/// very first call then fails with `Unable to make method calls because
+/// underlying connection is closed`, before a page has been loaded, let
+/// alone asserted on. A version call proves the connection, and a browser
+/// that will not start is replaced rather than half-used.
+fn launched_browser<F>(build: F, label: &str) -> Browser
+where
+    F: Fn() -> headless_chrome::LaunchOptions<'static>,
+{
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let failure = match Browser::new(build()) {
+            Ok(browser) => match browser.get_version() {
+                Ok(_) => return browser,
+                Err(error) => format!("the freshly launched browser did not answer: {error}"),
+            },
+            Err(error) => format!("launch failed: {error}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{label}: no usable Chrome within ninety seconds: {failure}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn launch_browser(chrome_path: PathBuf) -> Browser {
-    let options = LaunchOptionsBuilder::default()
-        .path(Some(chrome_path))
-        .headless(true)
-        .sandbox(browser_sandbox_enabled(effective_uid()))
-        .build()
-        .expect("build Chrome launch options");
-    Browser::new(options).expect("launch Chrome")
+    launched_browser(
+        move || {
+            LaunchOptionsBuilder::default()
+                .path(Some(chrome_path.clone()))
+                .headless(true)
+                .sandbox(browser_sandbox_enabled(effective_uid()))
+                .build()
+                .expect("build Chrome launch options")
+        },
+        "Chrome",
+    )
 }
 
 fn launch_mobile_browser(chrome_path: PathBuf) -> Browser {
-    let options = LaunchOptionsBuilder::default()
-        .path(Some(chrome_path))
-        .headless(true)
-        .sandbox(browser_sandbox_enabled(effective_uid()))
-        .window_size(Some((390, 844)))
-        .build()
-        .expect("build mobile Chrome launch options");
-    Browser::new(options).expect("launch mobile Chrome")
+    launched_browser(
+        move || {
+            LaunchOptionsBuilder::default()
+                .path(Some(chrome_path.clone()))
+                .headless(true)
+                .sandbox(browser_sandbox_enabled(effective_uid()))
+                .window_size(Some((390, 844)))
+                .build()
+                .expect("build mobile Chrome launch options")
+        },
+        "mobile Chrome",
+    )
 }
 
 fn set_mobile_viewport(tab: &headless_chrome::Tab) {
@@ -25413,6 +25450,30 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_ne!(changed["revision"], ready["revision"]);
 }
 
+/// A new Chrome tab, retried while the browser is still warming up.
+///
+/// `Browser::new_tab` waits ten seconds for `Target.createTarget` to answer
+/// and otherwise fails with `The event waited for never came`. On a loaded
+/// machine that deadline is reached before Chrome has finished starting:
+/// five of twelve consecutive runs of one journey failed this way at load
+/// average 76, none of them past tab creation. Retrying weakens nothing --
+/// no page has been loaded, let alone asserted on, and a browser that never
+/// opens a tab still fails the test, ninety seconds later instead of ten.
+fn opened_tab(chrome: &Browser, label: &str) -> Arc<headless_chrome::Tab> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let last = match chrome.new_tab() {
+            Ok(tab) => return tab,
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{label}: Chrome never opened a tab within ninety seconds: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// A Chrome tab on "Needs you", carrying the trusted edge actor header the
 /// resolve gate accepts.
 ///
@@ -25421,7 +25482,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
 /// behind SSO says who is reading. Configured here so the recorded
 /// `decision.by` is the header's value rather than the process default.
 fn decision_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
-    let tab = chrome.new_tab().expect("browser tab");
+    let tab = opened_tab(chrome, "decision tab");
     tab.set_extra_http_headers(std::collections::HashMap::from([(
         "X-Auth-Request-Email",
         "geoyws",
@@ -25493,7 +25554,7 @@ fn js_value(tab: &headless_chrome::Tab, expression: &str) -> Value {
 }
 
 fn trusted_web_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
-    let tab = chrome.new_tab().expect("browser tab");
+    let tab = opened_tab(chrome, "trusted tab");
     tab.set_extra_http_headers(std::collections::HashMap::from([(
         "X-Auth-Request-Email",
         "geoyws",
@@ -25519,57 +25580,107 @@ fn assert_no_horizontal_overflow(tab: &headless_chrome::Tab, page_name: &str) {
     );
 }
 
+/// A click that navigates, dispatched at a point this helper measured itself
+/// instead of through the element handle.
+///
+/// The handle was the flake. `Element::click` re-resolves the node, scrolls
+/// it and asks Chrome for its content quads, and the page under test replaces
+/// its projection whenever the live socket says the board changed -- so a swap
+/// landing between finding the control and clicking it detaches the node under
+/// all three steps. Observed on the resume click as both `Scrolling element
+/// into view failed: Node is detached from document` and, when the quad lookup
+/// fell through to its own twenty-second poll of a detached node's zeroed
+/// rect, `The event waited for never came`.
+///
+/// Measuring the control, scrolling it and hit-testing the point in one
+/// in-page expression closes that window: nothing can interleave inside it,
+/// and a swap that happens anyway is retried from scratch because no input has
+/// been dispatched yet. What is dispatched is still a real trusted mouse press
+/// and release, at a point that hit-tests to the control itself, and every
+/// assertion below -- the document really was replaced, the arrival selector
+/// really is there -- is unchanged.
 fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, label: &str) {
-    let control_deadline = Instant::now() + Duration::from_secs(20);
-    let control = loop {
-        let control = tab
-            .wait_for_element(selector)
-            .unwrap_or_else(|error| panic!("{label}: missing {selector}: {error}"));
-        if let Err(scroll_error) = control.scroll_into_view() {
-            let detached = control
-                .call_js_fn("function() { return !this.isConnected; }", vec![], false)
-                .unwrap_or_else(|error| {
-                    panic!("{label}: confirm detachment after scroll error {scroll_error}: {error}")
-                })
-                .value
-                .unwrap_or_else(|| {
+    const MEASURE: &str = "(() => {
+        const element = document.querySelector(__SELECTOR__);
+        if (!element) return JSON.stringify({state: 'missing'});
+        if (!element.isConnected) return JSON.stringify({state: 'detached'});
+        // Per-line boxes, not the bounding rect: the bounding rect of a link
+        // that wrapped onto two lines spans the gap between them, and its
+        // centre hit-tests to the cell behind the link rather than the link.
+        const boxes = () => [...element.getClientRects()].filter((box) => box.width > 0 && box.height > 0);
+        const widest = (list) => list.reduce((best, box) => (best && best.width * best.height >= box.width * box.height ? best : box), null);
+        let box = widest(boxes());
+        if (!box) return JSON.stringify({state: 'unrendered'});
+        if (box.top < 0 || box.bottom > innerHeight || box.left < 0 || box.right > innerWidth) {
+            element.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+            box = widest(boxes());
+            if (!box) return JSON.stringify({state: 'unrendered'});
+        }
+        const left = Math.max(0, box.left);
+        const right = Math.min(innerWidth, box.right);
+        const top = Math.max(0, box.top);
+        const bottom = Math.min(innerHeight, box.bottom);
+        if (!(right > left && bottom > top)) {
+            return JSON.stringify({state: 'offscreen', left: box.left, top: box.top, right: box.right, bottom: box.bottom, innerWidth, innerHeight});
+        }
+        // A point a user could actually hit: the browser's own hit test has
+        // to land on this control, not on whatever is painted over it.
+        let missed = null;
+        for (const [fx, fy] of [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75], [0.1, 0.5], [0.9, 0.5]]) {
+            const x = left + (right - left) * fx;
+            const y = top + (bottom - top) * fy;
+            const hit = document.elementFromPoint(x, y);
+            if (hit && (hit === element || element.contains(hit))) {
+                return JSON.stringify({state: 'ready', x, y});
+            }
+            missed = hit ? hit.outerHTML.slice(0, 160) : null;
+        }
+        return JSON.stringify({state: 'obscured', hit: missed, left, top, right, bottom});
+    })()";
+    let measure = MEASURE.replace(
+        "__SELECTOR__",
+        &serde_json::to_string(selector).expect("selector as a JS string literal"),
+    );
+    let measure_point = || {
+        let control_deadline = Instant::now() + Duration::from_secs(20);
+        let mut last = "no measurement completed".to_owned();
+        loop {
+            // A tolerated Err is the page swapping execution contexts
+            // underneath the read, the same transient the states below
+            // describe.
+            let measured = tab
+                .evaluate(&measure, false)
+                .ok()
+                .and_then(|result| result.value)
+                .and_then(|value| value.as_str().map(ToOwned::to_owned));
+            if let Some(measured) = measured {
+                let state: Value = serde_json::from_str(&measured).unwrap_or_else(|error| {
                     panic!(
-                        "{label}: detachment check had no value after scroll error {scroll_error}"
+                        "{label}: measuring {selector} returned {measured}, which is not JSON: \
+                         {error}"
                     )
                 });
-            if detached != json!(true) {
-                panic!("{label}: could not scroll the connected control into view: {scroll_error}");
+                if state["state"] == "ready" {
+                    break headless_chrome::browser::tab::point::Point {
+                        x: state["x"].as_f64().expect("measured x"),
+                        y: state["y"].as_f64().expect("measured y"),
+                    };
+                }
+                last = measured;
             }
             assert!(
                 Instant::now() < control_deadline,
-                "{label}: the control kept detaching before it could be scrolled into view"
+                "{label}: {selector} never settled into a clickable position; last measurement: \
+                 {last}"
             );
             std::thread::sleep(Duration::from_millis(25));
-            continue;
         }
-        let state = control
-            .call_js_fn(
-                "function() { if (!this.isConnected) return 'detached'; const r = this.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth) return 'visible'; return JSON.stringify({left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height,innerWidth,innerHeight}); }",
-                vec![],
-                false,
-            )
-            .unwrap_or_else(|error| panic!("{label}: measure the connected control: {error}"))
-            .value
-            .unwrap_or_else(|| panic!("{label}: connected-control measurement had no value"));
-        let state = state
-            .as_str()
-            .unwrap_or_else(|| panic!("{label}: connected-control measurement was not a string"));
-        if state == "visible" {
-            break control;
-        }
-        if state != "detached" {
-            panic!("{label}: control was not reachable in the viewport after scrolling: {state}");
-        }
-        assert!(
-            Instant::now() < control_deadline,
-            "{label}: the control kept detaching before its bounds could be measured"
-        );
-        std::thread::sleep(Duration::from_millis(25));
+    };
+    let replaced = || {
+        tab.evaluate("!document.documentElement.dataset.navigationProbe", false)
+            .ok()
+            .and_then(|result| result.value)
+            == Some(json!(true))
     };
     assert_eq!(
         js_value(
@@ -25578,26 +25689,37 @@ fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, l
         ),
         true
     );
-    control
-        .click()
-        .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
-    tab.wait_until_navigated()
-        .unwrap_or_else(|error| panic!("{label}: navigation failed: {error}"));
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Measure, dispatch, and prove the document was replaced -- and if it was
+    // not, measure and dispatch again rather than declare the page broken.
+    //
+    // A projection swap can move the control between the measurement and the
+    // press, and a press that lands where the control no longer is does
+    // nothing at all. Re-dispatching is only safe because the probe is still
+    // on the document: had the earlier press been accepted, the reply from
+    // the local server -- which has never taken anything like eight seconds
+    // to answer -- would already have replaced it. The test still fails, with
+    // the same message, if no press ever navigates.
+    let deadline = Instant::now() + Duration::from_secs(40);
     loop {
-        let replaced = tab
-            .evaluate("!document.documentElement.dataset.navigationProbe", false)
-            .ok()
-            .and_then(|result| result.value)
-            == Some(json!(true));
-        if replaced {
+        tab.click_point(measure_point())
+            .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
+        // Only a settling wait: the probe below, not this event, is what
+        // proves a new document arrived.
+        let _ = tab.wait_until_navigated();
+        let grace = Instant::now() + Duration::from_secs(8);
+        while !replaced() {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the clicked control never replaced the document"
+            );
+            if Instant::now() > grace {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if replaced() {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{label}: the clicked control never replaced the document"
-        );
-        std::thread::sleep(Duration::from_millis(25));
     }
     tab.wait_for_element(arrived)
         .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
@@ -27495,7 +27617,7 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
     let server = spawn_server(&fixture);
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("initial tab");
+    let tab = opened_tab(&chrome, "initial tab");
     tab.navigate_to(&format!("{origin}/subscriptions"))
         .expect("load Subscriptions");
     tab.wait_until_navigated().expect("initial navigation");
@@ -27609,7 +27731,7 @@ fn a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload() {
     let origin = server.origin();
 
     let chrome = launch_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("initial tab");
+    let tab = opened_tab(&chrome, "initial tab");
     tab.navigate_to(&origin).expect("load Needs you");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
@@ -27694,7 +27816,7 @@ fn a_reconnected_notice_socket_in_real_chrome_does_not_replay_history() {
     let origin = server.origin();
 
     let chrome = launch_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("initial tab");
+    let tab = opened_tab(&chrome, "initial tab");
     tab.navigate_to(&origin).expect("load Needs you");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
@@ -27795,7 +27917,7 @@ fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
     let origin = server.origin();
 
     let chrome = launch_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("initial tab");
+    let tab = opened_tab(&chrome, "initial tab");
     tab.navigate_to(&origin).expect("load Needs you");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
@@ -27891,7 +28013,7 @@ fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
     let origin = server.origin();
 
     let chrome = launch_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("initial tab");
+    let tab = opened_tab(&chrome, "initial tab");
     tab.navigate_to(&origin).expect("load Needs you");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
@@ -28106,7 +28228,7 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     let server = spawn_server(&fixture);
     let origin = server.origin();
     let chrome = launch_mobile_browser(chrome_binary());
-    let tab = chrome.new_tab().expect("mobile tab");
+    let tab = opened_tab(&chrome, "mobile tab");
     set_mobile_viewport(&tab);
     tab.navigate_to(&origin).expect("load Needs you");
     tab.wait_until_navigated()
@@ -40669,4 +40791,1476 @@ fn a_listing_says_whether_each_task_is_held_and_by_whom() {
     let usage = String::from_utf8_lossy(&help.stdout);
     assert!(usage.contains("--with-claims"), "{usage}");
     assert!(usage.contains("claim.agentID"), "{usage}");
+}
+
+/// Where this board's SQLite file lives, for the raw counts below.
+fn completion_gate_board_path(fixture: &Fixture) -> PathBuf {
+    fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+/// Every event on the board, archived history included. A refused completion
+/// gate must leave this number exactly where it was: a partial write that
+/// appends a receipt for work it then refuses is what these tests are here to
+/// catch.
+fn completion_gate_event_count(board: &Path) -> i64 {
+    Connection::open(board)
+        .unwrap()
+        .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// A completion-gate refusal, checked for the four facts an agent needs in
+/// order to have a next move: the row it wanted to work, the prerequisite that
+/// is not done, that prerequisite's status, and the row the edge was declared
+/// on -- an ancestor when the gate was inherited, the row itself when it was
+/// not. Wording is not pinned; the identifiers are.
+fn completion_gate_refusal(
+    output: &Output,
+    affected: &str,
+    prerequisite: &str,
+    prerequisite_status: &str,
+    source: &str,
+) -> String {
+    let error = refusal_object(output);
+    for value in [affected, prerequisite, prerequisite_status, source] {
+        assert!(
+            error.contains(value),
+            "a completion-gate refusal that does not name {value} loses which gate blocked the \
+             row: {error}"
+        );
+    }
+    error
+}
+
+/// Sorted dependency ids, so an assertion about which direct dependencies a
+/// row carries does not also pin the order they happen to be read back in.
+/// Accepts both shapes the surfaces emit: bare ids from `task list
+/// --with-relations`, full rows from `task show`.
+fn dependency_ids(dependencies: &Value) -> Vec<String> {
+    let mut ids = dependencies
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|dependency| match dependency {
+            Value::String(id) => id.clone(),
+            row => row["id"].as_str().unwrap().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+/// A prerequisite declared on an epic gates every row beneath it, and the
+/// blocker a reader is handed says which epic that was. Two levels of plan,
+/// each with its own prerequisite, plus two declared on the leaf: the leaf
+/// reports all four, attributed, while an unrelated task stays workable.
+#[test]
+fn completion_gates_report_direct_and_inherited_blockers_on_every_relation_surface() {
+    let fixture = Fixture::new("completion-gate-surfaces");
+    fixture.ok_json(&fixture.main, &["init", "--name", "GATES", "--json"]);
+
+    // Assigned away so the prerequisites are not themselves candidates, and
+    // created b before a so prerequisite-id order is distinguishable from
+    // creation order.
+    for (id, title) in [
+        ("t-root-prereq", "Root prerequisite"),
+        ("t-phase-prereq", "Phase prerequisite"),
+        ("t-direct-b", "Direct prerequisite B"),
+        ("t-direct-a", "Direct prerequisite A"),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                title,
+                "--id",
+                id,
+                "--assignee",
+                "maintainer",
+                "--priority",
+                "9",
+                "--json",
+            ],
+        );
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Root plan",
+            "--id",
+            "e-root",
+            "--type",
+            "epic",
+            "--depends-on",
+            "t-root-prereq",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Phase",
+            "--id",
+            "e-phase",
+            "--type",
+            "epic",
+            "--parent",
+            "e-root",
+            "--depends-on",
+            "t-phase-prereq",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Leaf with direct and inherited gates",
+            "--id",
+            "t-leaf",
+            "--parent",
+            "e-phase",
+            "--priority",
+            "0",
+            "--depends-on",
+            "t-direct-b",
+            "--depends-on",
+            "t-direct-a",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Leaf with inherited gates only",
+            "--id",
+            "t-inherited-only",
+            "--parent",
+            "e-phase",
+            "--priority",
+            "0",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Independent work",
+            "--id",
+            "t-free",
+            "--priority",
+            "1",
+            "--json",
+        ],
+    );
+
+    // Nearest owner first, prerequisite id within an owner: the leaf's own
+    // two, then the phase's, then the root plan's.
+    let expected = json!([
+        {
+            "sourceTaskID": "t-leaf",
+            "prerequisiteID": "t-direct-a",
+            "prerequisiteTitle": "Direct prerequisite A",
+            "prerequisiteStatus": "todo"
+        },
+        {
+            "sourceTaskID": "t-leaf",
+            "prerequisiteID": "t-direct-b",
+            "prerequisiteTitle": "Direct prerequisite B",
+            "prerequisiteStatus": "todo"
+        },
+        {
+            "sourceTaskID": "e-phase",
+            "prerequisiteID": "t-phase-prereq",
+            "prerequisiteTitle": "Phase prerequisite",
+            "prerequisiteStatus": "todo"
+        },
+        {
+            "sourceTaskID": "e-root",
+            "prerequisiteID": "t-root-prereq",
+            "prerequisiteTitle": "Root prerequisite",
+            "prerequisiteStatus": "todo"
+        }
+    ]);
+
+    // One computed answer, identical on all three surfaces, and the direct
+    // dependency output beside it unchanged: an inherited gate is reported,
+    // never folded into the row's own declared edges.
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-leaf", "--json"]);
+    assert_eq!(shown["blockingGates"], expected);
+    assert_eq!(
+        dependency_ids(&shown["dependencies"]),
+        ["t-direct-a", "t-direct-b"]
+    );
+    let context = fixture.ok_json(&fixture.main, &["context", "t-leaf", "--json"]);
+    assert_eq!(context["task"]["id"], "t-leaf");
+    assert_eq!(context["blockingGates"], expected);
+
+    // The packet a human or a resuming agent actually reads, not only its
+    // machine form: both the full render and the compact one an agent gets
+    // when the budget is tight must name every unmet prerequisite and the
+    // ancestor whose gate it is, or a reader sees an unstartable row with no
+    // stated reason. Identifiers are pinned; prose is not.
+    let rendered = fixture.run(&fixture.main, &["context", "t-leaf"]);
+    assert!(rendered.status.success());
+    let rendered = String::from_utf8(rendered.stdout).unwrap();
+    for named in [
+        "t-direct-a",
+        "t-direct-b",
+        "t-phase-prereq",
+        "e-phase",
+        "t-root-prereq",
+        "e-root",
+    ] {
+        assert!(
+            rendered.contains(named),
+            "the rendered context packet never names {named}: {rendered}"
+        );
+    }
+
+    // The compact packet only appears when the full one overruns the budget,
+    // so give the board a real sitrep to carry the packet past it: the point
+    // under test is what compaction keeps, and it must keep the gates.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "Lane status while the leaf waits on its prerequisites, written long \
+             enough that the full cold-start packet no longer fits the smallest \
+             budget a resuming agent can ask for, which is the only way to reach \
+             the compact rendering from the command line at all, and deliberately \
+             saying nothing about which rows are gated so the compact gate line \
+             cannot pass on this text alone.",
+            "--as",
+            "operator",
+            "--lane",
+            "driver",
+            "--task",
+            "t-leaf",
+            "--json",
+        ],
+    );
+    let compact = fixture.run(&fixture.main, &["context", "t-leaf", "--max-chars", "1000"]);
+    assert!(compact.status.success());
+    let compact = String::from_utf8(compact.stdout).unwrap();
+    assert!(
+        compact.contains("# Kanban cold-start context (compact)"),
+        "the budget did not produce the compact packet, so its gate line went \
+         unchecked: {compact}"
+    );
+    for named in [
+        "t-direct-a",
+        "t-direct-b",
+        "t-phase-prereq",
+        "e-phase",
+        "t-root-prereq",
+        "e-root",
+    ] {
+        assert!(
+            compact.contains(named),
+            "the compact packet an agent resumes on drops {named}: {compact}"
+        );
+    }
+
+    // And the other half of the same contract: a row with nothing unmet says
+    // so, so "no gates" is distinguishable from "gates not rendered".
+    let free_rendered = fixture.run(&fixture.main, &["context", "t-free"]);
+    assert!(free_rendered.status.success());
+    let free_rendered = String::from_utf8(free_rendered.stdout).unwrap();
+    for unrelated in ["t-direct-a", "t-phase-prereq", "t-root-prereq"] {
+        assert!(
+            !free_rendered.contains(unrelated),
+            "an ungated row was rendered as blocked by {unrelated}: {free_rendered}"
+        );
+    }
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--with-relations", "--json"],
+    );
+    let listed_leaf = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "t-leaf")
+        .unwrap();
+    assert_eq!(listed_leaf["blockingGates"], expected);
+    assert_eq!(
+        dependency_ids(&listed_leaf["dependencies"]),
+        ["t-direct-a", "t-direct-b"]
+    );
+
+    // A row with nothing unmet says so with an empty array, which is the only
+    // way a reader can tell "not gated" from "not computed".
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-free", "--json"])["blockingGates"],
+        json!([])
+    );
+
+    // The key rides on the relations flag exactly as dependencies does, so a
+    // caller naming it without the flag is told which flag adds it.
+    let missing_flag = fixture.run(
+        &fixture.main,
+        &["task", "list", "--fields", "id,blockingGates", "--json"],
+    );
+    assert!(
+        !missing_flag.status.success(),
+        "--fields blockingGates was accepted without --with-relations"
+    );
+    let missing_flag_error = String::from_utf8_lossy(&missing_flag.stderr);
+    assert!(
+        missing_flag_error.contains("blockingGates"),
+        "{missing_flag_error}"
+    );
+    assert!(
+        missing_flag_error.contains("--with-relations"),
+        "{missing_flag_error}"
+    );
+    let projected = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "list",
+            "--with-relations",
+            "--fields",
+            "id,dependencies,blockingGates",
+            "--json",
+        ],
+    );
+    let projected_leaf = projected
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "t-leaf")
+        .unwrap();
+    assert_eq!(projected_leaf["blockingGates"], expected);
+    assert_eq!(
+        dependency_ids(&projected_leaf["dependencies"]),
+        ["t-direct-a", "t-direct-b"]
+    );
+
+    // Inspection and the scheduler agree, and both withhold the leaf whose
+    // only gates are inherited -- it carries no dependency edge of its own.
+    let candidates = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "--candidates",
+            "--as",
+            "driver",
+            "--limit",
+            "20",
+            "--json",
+        ],
+    );
+    let candidate_ids = candidates
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_ids, ["t-free"]);
+    let named = fixture.run(
+        &fixture.main,
+        &["claim", "t-inherited-only", "--as", "driver", "--json"],
+    );
+    let error = completion_gate_refusal(
+        &named,
+        "t-inherited-only",
+        "t-phase-prereq",
+        "todo",
+        "e-phase",
+    );
+    assert!(
+        error.contains("t-root-prereq") && error.contains("e-root"),
+        "the outer plan's gate was dropped from the refusal: {error}"
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "--next", "--as", "driver", "--json"]
+        )["taskID"],
+        "t-free",
+        "the scheduler handed out gated work"
+    );
+
+    // The operator surface says how much of the board is waiting on a
+    // prerequisite, as its own number: the two gated leaves, while the status
+    // counts beside it stay raw -- a gated row still holds the status it
+    // holds, so silently moving it out of `todo` would leave the board's own
+    // totals not adding up.
+    let all_rows = fixture.ok_json(&fixture.main, &["task", "list", "--json"]);
+    let todo_rows = all_rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["status"] == "todo")
+        .count();
+    let dashboard = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    let board_row = dashboard
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["taskCounts"].is_object())
+        .unwrap_or_else(|| panic!("the dashboard reported no board: {dashboard}"));
+    assert_eq!(
+        board_row["gatedTasks"], 2,
+        "the dashboard lost the count of rows held by a completion gate \
+         (t-leaf, t-inherited-only): {board_row}"
+    );
+    assert_eq!(
+        board_row["taskCounts"]["todo"], todo_rows,
+        "the status counts were filtered by the gate instead of staying raw: {board_row}"
+    );
+    assert_eq!(
+        board_row["totalTasks"],
+        all_rows.as_array().unwrap().len(),
+        "{board_row}"
+    );
+}
+
+/// What counts as satisfied: done, and nothing else. A cancelled prerequisite
+/// will never complete, an archived done one still happened, and reopening a
+/// completed prerequisite re-gates future work without rewriting the history
+/// already recorded against it.
+#[test]
+fn completion_gates_track_prerequisite_lifecycle_and_cleared_dependencies() {
+    let fixture = Fixture::new("completion-gate-lifecycle");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LIFECYCLE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Foundation",
+            "--id",
+            "t-prerequisite",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Dependent work",
+            "--id",
+            "t-gated",
+            "--depends-on",
+            "t-prerequisite",
+            "--json",
+        ],
+    );
+    let gate_status = |expected: &str| {
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["task", "show", "t-gated", "--json"])["blockingGates"]
+                [0]["prerequisiteStatus"],
+            expected
+        );
+    };
+    gate_status("todo");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-prerequisite",
+            "cancelled",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    gate_status("cancelled");
+    completion_gate_refusal(
+        &fixture.run(
+            &fixture.main,
+            &["claim", "t-gated", "--as", "worker", "--json"],
+        ),
+        "t-gated",
+        "t-prerequisite",
+        "cancelled",
+        "t-gated",
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-prerequisite",
+            "done",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-gated", "--json"])["blockingGates"],
+        json!([])
+    );
+    let first = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-gated", "--as", "worker", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "release",
+            "t-gated",
+            "--lease",
+            first["leaseToken"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    // Reopened: new work is gated again, and the claim already recorded stays
+    // in the ledger -- a gate refuses the future, it does not edit the past.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-prerequisite",
+            "todo",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    gate_status("todo");
+    completion_gate_refusal(
+        &fixture.run(
+            &fixture.main,
+            &["claim", "t-gated", "--as", "worker", "--json"],
+        ),
+        "t-gated",
+        "t-prerequisite",
+        "todo",
+        "t-gated",
+    );
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &[
+                    "events",
+                    "--task",
+                    "t-gated",
+                    "--kind",
+                    "task_claimed",
+                    "--json",
+                ]
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the completed claim history was disturbed by a later gate"
+    );
+
+    // Archived done still satisfies: cold storage is where completed work
+    // goes, not a way of un-completing it.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-prerequisite",
+            "done",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let board = completion_gate_board_path(&fixture);
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=1,updated_at=1 WHERE id='t-prerequisite'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "archive",
+                "--older-than-days",
+                "1",
+                "--as",
+                "operator",
+                "--json",
+            ],
+        )["tasks"],
+        1
+    );
+    let after_archive = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-gated", "--as", "worker", "--json"],
+    );
+    assert_eq!(after_archive["taskID"], "t-gated");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "release",
+            "t-gated",
+            "--lease",
+            after_archive["leaseToken"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    // Authoring is the dependency surface that already exists, so withdrawing
+    // a gate is --clear-dependencies and nothing new.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "New prerequisite",
+            "--id",
+            "t-new-prerequisite",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Clearable work",
+            "--id",
+            "t-clearable",
+            "--depends-on",
+            "t-new-prerequisite",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-clearable", "--json"])["blockingGates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-clearable",
+            "--as",
+            "operator",
+            "--clear-dependencies",
+            "--json",
+        ],
+    );
+    let cleared = fixture.ok_json(&fixture.main, &["task", "show", "t-clearable", "--json"]);
+    assert_eq!(
+        dependency_ids(&cleared["dependencies"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(cleared["blockingGates"], json!([]));
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["claim", "t-clearable", "--as", "worker", "--json"]
+        )["taskID"],
+        "t-clearable"
+    );
+}
+
+/// Accepting a handoff mints a lease, so it meets the same gate claim does --
+/// otherwise the route past a completion gate is to hand the task to yourself.
+/// The pending handoff survives the refusal: the correspondence is still
+/// waiting for whoever finishes the prerequisite.
+#[test]
+fn completion_gates_apply_to_lease_taking_handoff_acceptance() {
+    let fixture = Fixture::new("completion-gate-handoff");
+    fixture.ok_json(&fixture.main, &["init", "--name", "HANDOFF", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Handoff prerequisite",
+            "--id",
+            "t-handoff-prerequisite",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Handoff plan",
+            "--id",
+            "e-handoff",
+            "--type",
+            "epic",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Handed-off work",
+            "--id",
+            "t-handoff",
+            "--parent",
+            "e-handoff",
+            "--json",
+        ],
+    );
+    let outgoing = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-handoff", "--as", "outgoing", "--json"],
+    );
+    // The gate arrives on the plan while the work is already held, which is
+    // how a board really acquires one: somebody discovers the ordering later.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "e-handoff",
+            "--as",
+            "operator",
+            "--depends-on",
+            "t-handoff-prerequisite",
+            "--json",
+        ],
+    );
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-handoff",
+            "--lease",
+            outgoing["leaseToken"].as_str().unwrap(),
+            "--as",
+            "outgoing",
+            "--to",
+            "incoming",
+            "--summary",
+            "Paused once the plan grew a prerequisite",
+            "--intent",
+            "Continue only after it completes",
+            "--next-action",
+            "Finish t-handoff-prerequisite",
+            "--json",
+        ],
+    );
+    let board = completion_gate_board_path(&fixture);
+    let before = completion_gate_event_count(&board);
+    completion_gate_refusal(
+        &fixture.run(
+            &fixture.main,
+            &[
+                "handoff",
+                "accept",
+                handoff["id"].as_str().unwrap(),
+                "--as",
+                "incoming",
+                "--json",
+            ],
+        ),
+        "t-handoff",
+        "t-handoff-prerequisite",
+        "todo",
+        "e-handoff",
+    );
+    assert_eq!(
+        completion_gate_event_count(&board),
+        before,
+        "a refused acceptance still wrote to the ledger"
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["handoff", "list", "--status", "pending", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == handoff["id"]),
+        "the refused handoff was consumed"
+    );
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-handoff", "--json"]);
+    assert!(
+        task["claim"].is_null(),
+        "a refused acceptance minted a lease"
+    );
+    assert_eq!(task["status"], "todo");
+    assert_eq!(
+        task["blockingGates"][0]["sourceTaskID"], "e-handoff",
+        "{task}"
+    );
+
+    // And the correspondence really is only waiting: once the prerequisite
+    // completes, the same handoff id accepts, mints the incoming agent's
+    // lease and puts the row into work. Without this, a gate that refused
+    // every acceptance for gated ancestry -- forever, prerequisite or not --
+    // would read exactly like the refusal above.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-handoff-prerequisite",
+            "done",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            handoff["id"].as_str().unwrap(),
+            "--as",
+            "incoming",
+            "--json",
+        ],
+    );
+    assert_eq!(accepted["handoff"]["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["claim"]["agentID"], "incoming", "{accepted}");
+    assert!(
+        accepted["claim"]["leaseToken"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "acceptance minted no lease for the incoming agent: {accepted}"
+    );
+    let resumed = fixture.ok_json(&fixture.main, &["task", "show", "t-handoff", "--json"]);
+    assert_eq!(resumed["status"], "in_progress", "{resumed}");
+    assert_eq!(resumed["blockingGates"], json!([]), "{resumed}");
+}
+
+/// The gate is about doing the work, not only about being handed it: the
+/// work-bearing statuses are refused on the verb that creates a row and the
+/// verb that moves one, --force included, while the administrative statuses
+/// stay available so a board can still record what is true.
+#[test]
+fn completion_gates_refuse_work_bearing_task_add_and_move_states() {
+    let fixture = Fixture::new("completion-gate-task-states");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TASK-STATES", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "State prerequisite",
+            "--id",
+            "t-state-prerequisite",
+            "--json",
+        ],
+    );
+    let board = completion_gate_board_path(&fixture);
+
+    for status in ["in_progress", "review", "done"] {
+        let id = format!("t-add-{status}");
+        let before = completion_gate_event_count(&board);
+        completion_gate_refusal(
+            &fixture.run(
+                &fixture.main,
+                &[
+                    "task",
+                    "add",
+                    "Premature work",
+                    "--id",
+                    &id,
+                    "--status",
+                    status,
+                    "--depends-on",
+                    "t-state-prerequisite",
+                    "--json",
+                ],
+            ),
+            &id,
+            "t-state-prerequisite",
+            "todo",
+            &id,
+        );
+        assert_eq!(completion_gate_event_count(&board), before);
+        assert!(
+            !fixture
+                .run(&fixture.main, &["task", "show", &id, "--json"])
+                .status
+                .success(),
+            "{id} was created by a refused add"
+        );
+    }
+
+    for (id, target, force) in [
+        ("t-move-progress", "in_progress", false),
+        ("t-move-review", "review", false),
+        ("t-move-done", "done", false),
+        ("t-move-forced", "done", true),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                "Movable work",
+                "--id",
+                id,
+                "--depends-on",
+                "t-state-prerequisite",
+                "--json",
+            ],
+        );
+        let before = completion_gate_event_count(&board);
+        let mut args = vec!["task", "move", id, target, "--as", "operator"];
+        if force {
+            args.push("--force");
+        }
+        args.push("--json");
+        completion_gate_refusal(
+            &fixture.run(&fixture.main, &args),
+            id,
+            "t-state-prerequisite",
+            "todo",
+            id,
+        );
+        assert_eq!(completion_gate_event_count(&board), before);
+        let unchanged = fixture.ok_json(&fixture.main, &["task", "show", id, "--json"]);
+        assert_eq!(unchanged["status"], "todo", "{id} moved anyway");
+        assert!(
+            unchanged["completedAt"].is_null(),
+            "{id} was stamped complete"
+        );
+    }
+
+    for status in ["blocked", "cancelled"] {
+        let id = format!("t-admin-{status}");
+        assert_eq!(
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "task",
+                    "add",
+                    "Administrative state",
+                    "--id",
+                    &id,
+                    "--status",
+                    status,
+                    "--depends-on",
+                    "t-state-prerequisite",
+                    "--json",
+                ],
+            )["status"],
+            status
+        );
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Administrative move",
+            "--id",
+            "t-admin-move",
+            "--depends-on",
+            "t-state-prerequisite",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "move",
+                "t-admin-move",
+                "blocked",
+                "--as",
+                "operator",
+                "--json",
+            ],
+        )["status"],
+        "blocked"
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-admin-move",
+            "Waiting on the prerequisite",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+}
+
+/// A story's gate walks through planning before any work exists, so the
+/// completion gate starts where the work does: planning to ready is allowed on
+/// a gated story, and every step past it is refused with the projection and
+/// the metadata left where the last legal step put them.
+#[test]
+fn completion_gates_stop_a_story_at_the_boundary_between_planning_and_work() {
+    let fixture = Fixture::new("completion-gate-story");
+    fixture.ok_json(&fixture.main, &["init", "--name", "STORY-GATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Story prerequisite",
+            "--id",
+            "t-story-prerequisite",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Gated story",
+            "--id",
+            "s-gated",
+            "--type",
+            "story",
+            "--depends-on",
+            "t-story-prerequisite",
+            "--json",
+        ],
+    );
+
+    let planned = fixture.ok_json(
+        &fixture.main,
+        &["story", "advance", "s-gated", "--as", "driver", "--json"],
+    );
+    assert_eq!(planned["from"], "planning");
+    assert_eq!(planned["to"], "ready");
+
+    let board = completion_gate_board_path(&fixture);
+    let before_work = completion_gate_event_count(&board);
+    completion_gate_refusal(
+        &fixture.run(
+            &fixture.main,
+            &["story", "advance", "s-gated", "--as", "driver", "--json"],
+        ),
+        "s-gated",
+        "t-story-prerequisite",
+        "todo",
+        "s-gated",
+    );
+    assert_eq!(completion_gate_event_count(&board), before_work);
+    let ready = fixture.ok_json(&fixture.main, &["task", "show", "s-gated", "--json"]);
+    assert_eq!(ready["metadata"]["workflowStatus"], "ready");
+    assert_eq!(ready["status"], "todo");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-story-prerequisite",
+            "done",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["story", "advance", "s-gated", "--as", "driver", "--json"]
+        )["to"],
+        "in-progress"
+    );
+
+    // Reopened mid-flight: the next step is refused and the story keeps the
+    // state it legitimately reached rather than being rolled back.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-story-prerequisite",
+            "todo",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let before_testing = completion_gate_event_count(&board);
+    completion_gate_refusal(
+        &fixture.run(
+            &fixture.main,
+            &["story", "advance", "s-gated", "--as", "driver", "--json"],
+        ),
+        "s-gated",
+        "t-story-prerequisite",
+        "todo",
+        "s-gated",
+    );
+    assert_eq!(completion_gate_event_count(&board), before_testing);
+    let working = fixture.ok_json(&fixture.main, &["task", "show", "s-gated", "--json"]);
+    assert_eq!(working["metadata"]["workflowStatus"], "in-progress");
+    assert_eq!(working["status"], "in_progress");
+}
+
+/// A gate that appears after the lease was taken does not seize the lease --
+/// nothing is torn out from under a working agent. It refuses the next
+/// heartbeat and the next progress or completion checkpoint, and leaves the
+/// two honest exits open: checkpoint blocked, or release.
+#[test]
+fn completion_gates_refuse_further_progress_without_revoking_a_live_lease() {
+    let fixture = Fixture::new("completion-gate-lease-progress");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LEASE-GATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Lease prerequisite",
+            "--id",
+            "t-lease-prerequisite",
+            "--status",
+            "done",
+            "--json",
+        ],
+    );
+    let claim_gated = |id: &str| -> String {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                "Leased work",
+                "--id",
+                id,
+                "--depends-on",
+                "t-lease-prerequisite",
+                "--json",
+            ],
+        );
+        fixture.ok_json(&fixture.main, &["claim", id, "--as", "worker", "--json"])["leaseToken"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let heartbeat_token = claim_gated("t-heartbeat");
+    let continue_token = claim_gated("t-continue");
+    let done_token = claim_gated("t-done");
+    let blocked_token = claim_gated("t-blocked");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-lease-prerequisite",
+            "todo",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    for id in ["t-heartbeat", "t-continue", "t-done", "t-blocked"] {
+        let held = fixture.ok_json(&fixture.main, &["task", "show", id, "--json"]);
+        assert_eq!(
+            held["claim"]["agentID"], "worker",
+            "the reopened prerequisite revoked the live lease on {id}"
+        );
+        assert_eq!(held["status"], "in_progress");
+    }
+
+    let board = completion_gate_board_path(&fixture);
+    let lease_before =
+        fixture.ok_json(&fixture.main, &["task", "show", "t-heartbeat", "--json"])["claim"].clone();
+    let before_heartbeat = completion_gate_event_count(&board);
+    completion_gate_refusal(
+        &fixture.run(
+            &fixture.main,
+            &[
+                "heartbeat",
+                "t-heartbeat",
+                "--lease",
+                &heartbeat_token,
+                "--json",
+            ],
+        ),
+        "t-heartbeat",
+        "t-lease-prerequisite",
+        "todo",
+        "t-heartbeat",
+    );
+    assert_eq!(completion_gate_event_count(&board), before_heartbeat);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-heartbeat", "--json"])["claim"],
+        lease_before,
+        "a refused renewal still moved the lease"
+    );
+
+    for (id, token, state) in [
+        ("t-continue", &continue_token, "continue"),
+        ("t-done", &done_token, "done"),
+    ] {
+        let before = completion_gate_event_count(&board);
+        completion_gate_refusal(
+            &fixture.run(
+                &fixture.main,
+                &[
+                    "checkpoint",
+                    id,
+                    "--lease",
+                    token,
+                    "--as",
+                    "worker",
+                    "--summary",
+                    "A prerequisite appeared mid-flight",
+                    "--intent",
+                    "Do not cross the gate",
+                    "--next-action",
+                    "Finish t-lease-prerequisite",
+                    "--state",
+                    state,
+                    "--json",
+                ],
+            ),
+            id,
+            "t-lease-prerequisite",
+            "todo",
+            id,
+        );
+        assert_eq!(completion_gate_event_count(&board), before);
+        let task = fixture.ok_json(&fixture.main, &["task", "show", id, "--json"]);
+        assert_eq!(task["status"], "in_progress", "{id} was moved by a refusal");
+        assert!(task["completedAt"].is_null(), "{id} was stamped complete");
+        assert_eq!(task["claim"]["agentID"], "worker", "{id} lost its lease");
+        assert!(
+            fixture.ok_json(&fixture.main, &["context", id, "--json"])["checkpoints"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{id} persisted a checkpoint the gate refused"
+        );
+    }
+
+    // The way out stays open, and it is the one that records why.
+    let blocked = fixture.ok_json(
+        &fixture.main,
+        &[
+            "checkpoint",
+            "t-blocked",
+            "--lease",
+            &blocked_token,
+            "--as",
+            "worker",
+            "--summary",
+            "Blocked on a new prerequisite",
+            "--intent",
+            "Preserve the work for whoever resumes",
+            "--next-action",
+            "Finish t-lease-prerequisite",
+            "--state",
+            "blocked",
+            "--json",
+        ],
+    );
+    assert_eq!(blocked["state"], "blocked");
+    let blocked_task = fixture.ok_json(&fixture.main, &["task", "show", "t-blocked", "--json"]);
+    assert_eq!(blocked_task["status"], "blocked");
+    assert!(blocked_task["claim"].is_null());
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "release",
+            "t-heartbeat",
+            "--lease",
+            &heartbeat_token,
+            "--json",
+        ],
+    );
+    let released = fixture.ok_json(&fixture.main, &["task", "show", "t-heartbeat", "--json"]);
+    assert_eq!(released["status"], "todo");
+    assert!(released["claim"].is_null());
+}
+
+/// Inheritance makes the graph two-edged, so a gate can close a loop the
+/// dependency-only guard cannot see: an epic waiting on a task inside its own
+/// subtree gates that task on itself forever. Both ways of writing that loop
+/// are refused, and a refusal leaves no half-written edge behind.
+#[test]
+fn completion_gate_graph_rejects_self_and_mixed_parent_dependency_cycles() {
+    let fixture = Fixture::new("completion-gate-cycles");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CYCLES", "--json"]);
+    let board = completion_gate_board_path(&fixture);
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Self", "--id", "t-self", "--json"],
+    );
+    let before_self = completion_gate_event_count(&board);
+    let self_cycle = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-self",
+            "--as",
+            "operator",
+            "--depends-on",
+            "t-self",
+            "--json",
+        ],
+    );
+    // The pre-existing self guard: refused, and its wording is its own -- what
+    // this test owns is that it survives and writes nothing.
+    refusal_object(&self_cycle);
+    assert_eq!(completion_gate_event_count(&board), before_self);
+    assert_eq!(
+        dependency_ids(
+            &fixture.ok_json(&fixture.main, &["task", "show", "t-self", "--json"])["dependencies"]
+        ),
+        Vec::<String>::new()
+    );
+
+    // What an epic declares is inherited by everything under it, so depending
+    // on one of its own descendants is that epic depending on itself.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Parent plan",
+            "--id",
+            "e-parent",
+            "--type",
+            "epic",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Inside work",
+            "--id",
+            "t-inside",
+            "--parent",
+            "e-parent",
+            "--json",
+        ],
+    );
+    let before_subtree = completion_gate_event_count(&board);
+    let subtree_cycle = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "e-parent",
+            "--as",
+            "operator",
+            "--depends-on",
+            "t-inside",
+            "--json",
+        ],
+    );
+    let subtree_error = refusal_object(&subtree_cycle);
+    assert!(
+        subtree_error.contains("e-parent") && subtree_error.contains("t-inside"),
+        "a mixed parent/dependency cycle must name both ends: {subtree_error}"
+    );
+    assert_eq!(completion_gate_event_count(&board), before_subtree);
+    assert_eq!(
+        dependency_ids(
+            &fixture.ok_json(&fixture.main, &["task", "show", "e-parent", "--json"])["dependencies"]
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-inside", "--json"])["parentID"],
+        "e-parent",
+        "the refused dependency change moved the tree"
+    );
+
+    // Written the other way round: re-parenting an existing prerequisite under
+    // the plan that waits on it closes the same loop.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "External prerequisite",
+            "--id",
+            "t-external",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Gated plan",
+            "--id",
+            "e-gated",
+            "--type",
+            "epic",
+            "--depends-on",
+            "t-external",
+            "--json",
+        ],
+    );
+    let before_parent = completion_gate_event_count(&board);
+    let parent_cycle = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-external",
+            "--as",
+            "operator",
+            "--parent",
+            "e-gated",
+            "--json",
+        ],
+    );
+    let parent_error = refusal_object(&parent_cycle);
+    assert!(
+        parent_error.contains("e-gated") && parent_error.contains("t-external"),
+        "{parent_error}"
+    );
+    assert_eq!(completion_gate_event_count(&board), before_parent);
+    assert!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-external", "--json"])["parentID"]
+            .is_null(),
+        "the refused re-parent still landed"
+    );
+    assert_eq!(
+        dependency_ids(
+            &fixture.ok_json(&fixture.main, &["task", "show", "e-gated", "--json"])["dependencies"]
+        ),
+        ["t-external"]
+    );
 }

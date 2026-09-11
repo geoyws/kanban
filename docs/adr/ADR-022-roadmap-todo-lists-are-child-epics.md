@@ -36,11 +36,20 @@ Use `draft` while shaping the roadmap and its children, then move the roadmap to
 `todo` when the tree is ready to act on. A draft ancestor holds back its entire
 tree as established by ADR-013.
 
-A direct child epic is the roadmap item's checkbox. Until Kanban implements a
-generic derived epic-completion gate, an agent may mark that child epic `done`
-only after every non-cancelled descendant is settled and the relevant evidence
-is durable in checkpoints or events. This is an explicit agent-verified
-transition, not an automatic property of the current CLI.
+A direct child epic is the roadmap item's checkbox. An agent may mark that child
+epic `done` only after every non-cancelled descendant is settled and the
+relevant evidence is durable in checkpoints or events. This is an explicit
+agent-verified transition, not an automatic property of the CLI.
+
+**Amended 2026-09-11.** The ordering these child-epic dependencies express is
+now enforced, which is a different gate from the one this paragraph is about.
+A prerequisite that is not `done` blocks work on its dependent **and on
+everything beneath it**, so a roadmap item whose predecessor is unfinished can
+no longer be claimed, moved into work, checkpointed forward or advanced
+(ADR-013, amended the same day). What is still not derived is completion in the
+other direction: nothing marks an epic `done` because its descendants settled,
+and nothing reopens it because one did not. The checkbox stays agent-verified;
+the ordering does not.
 
 A single standalone action remains a task. Agents must not create ornamental
 roadmap and child epics around one item merely to satisfy this convention.
@@ -55,10 +64,14 @@ The direct-child rule preserves a stable level for roadmap reporting even when
 each item later grows its own sub-epics. It also gives future CLI and web views a
 deterministic projection: count or render the roadmap epic's direct child epics.
 
-Completion is presently procedural. The CLI does not yet prove that every
-descendant is settled when an epic is moved to `done`; documentation and global
-agent instructions must say that plainly. A future derived transition may
-automate the check without changing the data model or this decision.
+Completion in the upward direction is still procedural. The CLI does not prove
+that every descendant is settled when an epic is moved to `done`;
+documentation and global agent instructions must say that plainly. Ordering in
+the downward direction is no longer procedural: as of 2026-09-11 an unfinished
+prerequisite refuses work on the dependent row and on its whole subtree, and
+the blockers are published as `blockingGates` on `task show`, `context` and
+`task list --with-relations`. A future derived transition may automate the
+upward check without changing the data model or this decision.
 
 ## References
 
