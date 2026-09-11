@@ -1321,6 +1321,21 @@ container_probe_seconds() {
   printf '%s\n' "$seconds"
 }
 
+
+# The toolchain probe's own ceiling. It defaults to the container ceiling so
+# an operator's existing KANBAN_RELEASE_CONTAINER_PROBE_SECONDS keeps
+# governing everything, and exists as its own knob because the two probes
+# fail differently: the capability probe may legitimately wait out a cold
+# image pull, while the toolchain probe runs after the build on an image the
+# capability gate has already exercised. A test (or an operator) that wants a
+# wedged toolchain probe refused quickly no longer has to shrink the budget
+# the capability probe needs to succeed on a loaded machine.
+toolchain_probe_seconds() {
+  local seconds="${KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS:-$(container_probe_seconds)}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] ||
+    die "KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS must be a whole number of seconds greater than zero, and it is $seconds"
+  printf '%s\n' "$seconds"
+}
 # What THIS machine REPORTS it is, in the receipt's own vocabulary: `uname -s`
 # lowercased, a hyphen, `uname -m` verbatim - linux-x86_64, darwin-arm64. It
 # is a record and not an authorization: `uname` resolves through PATH like
@@ -1447,7 +1462,7 @@ release_toolchain_version() {
   local reported
   if [[ "$RELEASE_BUILD_KIND" == container ]]; then
     local seconds probe_out probe_err probe_status=0
-    seconds="$(container_probe_seconds)"
+    seconds="$(toolchain_probe_seconds)"
     probe_out="$(mktemp "${TMPDIR:-/tmp}/kanban-release-toolchain.XXXXXX")"
     probe_err="$(mktemp "${TMPDIR:-/tmp}/kanban-release-toolchain-err.XXXXXX")"
     track_temp "$probe_out"
@@ -1456,7 +1471,7 @@ release_toolchain_version() {
       "$RELEASE_BUILD_RUNTIME" run --rm --platform linux/amd64 "$RELEASE_BUILDER_IMAGE" "$tool" --version ||
       probe_status=$?
     (( probe_status != 124 )) ||
-      die "refusing to record this release's toolchain: the builder image $RELEASE_BUILDER_IMAGE did not answer $tool --version through $RELEASE_BUILD_RUNTIME within ${seconds}s; raise KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine needs longer"
+      die "refusing to record this release's toolchain: the builder image $RELEASE_BUILDER_IMAGE did not answer $tool --version through $RELEASE_BUILD_RUNTIME within ${seconds}s; raise KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS if this machine needs longer"
     if (( probe_status != 0 )); then
       local complaint
       complaint="$(tr -d '\r' < "$probe_err" | sed -n '1p' | sed 's/[[:space:]]*$//')"

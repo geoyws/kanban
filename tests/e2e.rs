@@ -34088,7 +34088,12 @@ fn hig_release_script_package_refuses_a_container_toolchain_probe_that_never_ans
     let mut child = case
         .package(&output)
         .env("FAKE_CONTAINER_HANGS_TOOLCHAIN", "1")
-        .env("KANBAN_RELEASE_CONTAINER_PROBE_SECONDS", "1")
+        // Only the TOOLCHAIN probe gets the 1s ceiling: the capability and
+        // version probes share the container knob and must keep its 120s
+        // default, because on a loaded machine those probes still have to
+        // succeed - shrinking their budget was the flake this case used to
+        // carry (wrong refusal, right knob, 2026-09-11).
+        .env("KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -34116,7 +34121,7 @@ fn hig_release_script_package_refuses_a_container_toolchain_probe_that_never_ans
     let refusal = format!(
         "hig-release: refusing to record this release's toolchain: the builder image \
          {RELEASE_BUILDER_IMAGE} did not answer rustc --version through {} within 1s; raise \
-         KANBAN_RELEASE_CONTAINER_PROBE_SECONDS if this machine needs longer",
+         KANBAN_RELEASE_TOOLCHAIN_PROBE_SECONDS if this machine needs longer",
         release_container_runtime(&case.hostname_bin).display()
     );
     assert!(
