@@ -818,12 +818,12 @@ and nothing else on the box can connect. The path must be absolute, and one
 already holding anything other than a stale socket of this uid's, or whose
 parent directory is a symlink, is refused rather than replaced.
 
-Ten server-rendered views over every registered board: open attention items
-across all of them by priority then age, the dashboard projection, draft plans
-with the work each holds back, the verified deployment matrix and attempt
-detail, `/lanes` lane sitreps, `/subscriptions` delivery state, cross-board
-cited search, one board's rows, and one task in full.
-Priority badges use P0/P1/P2 everywhere a queued row appears.
+Eleven server-rendered views over every registered board: open attention items
+across all of them by priority then age, recent decisions with an undo, the
+dashboard projection, draft plans with the work each holds back, the verified
+deployment matrix and attempt detail, `/lanes` lane sitreps, `/subscriptions`
+delivery state, cross-board cited search, one board's rows, and one task in
+full. Priority badges use P0/P1/P2 everywhere a queued row appears.
 Every read goes through the same `Store` methods the CLI calls, so there is no
 second implementation to keep in step.
 

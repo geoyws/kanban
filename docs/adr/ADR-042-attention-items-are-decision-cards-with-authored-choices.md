@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-08
-**Deciders:** claude@driver under geoyws's 2026-09-08 words (epic `e-fddce629`).
+**Amended:** 2026-09-11 (§5's undo copy: the receipt now offers a web Undo; see ADR-016's 2026-09-11 amendment)
 He named the shape of the problem three times in one hour — "kanban needs to
 have multiple choice questions about what to do, not just approve or reject,
 with one additional choice being the free text choice that also allows for
@@ -485,6 +485,12 @@ and is audited: `reopen` (`rust/store.rs:5228`), gated to geoyws or the resolver
 (`rust/store.rs:5243`), preserving the resolution it undoes
 (`rust/store.rs:5263`). The card names reopen as the undo in one line of copy so
 the absence of a confirmation is a stated property rather than an oversight.
+
+**Amended 2026-09-11.** The card still names reopen as the undo, but it no
+longer quotes a CLI command: the receipt carries an Undo button, `u` reopens
+the newest decision on the page, and `/decided` lists recent decisions with
+an undo per row. Same gates, same store operation; the web shape is
+ADR-016's 2026-09-11 amendment.
 
 **Keyboard: `1`–`4` pick the nth listed choice, `c` focuses the custom
 textarea.** Because the recommendation is always listed first, `1` is always the

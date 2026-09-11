@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-24
-**Amended:** 2026-08-26
+**Amended:** 2026-09-11 (decisions room: recent decisions, web undo, previews, markdown)
 **Deciders:** George
 
 ## Context
@@ -209,6 +209,75 @@ can tell without knowing the names.
 This was a bare `!= "mcp"` inside the tool builder. It was correct while there
 was one such command and wrong the moment there were two, which is what a
 literal in place of a set always eventually is.
+
+## Amendment, 2026-09-11: the decisions room
+
+George commissioned this batch in one sitting, in his words: "when a decision
+has been made we need to put the item in a recent decisions tab or something
+so that the eye can easily engage the next item"; "hotkeys to make it easy to
+select and confirm and undo to bring back the last item that was decided on";
+"all reference links... must allow for mouseover to show what they are and
+also allow for nested mouseovers and if clicked should open a tab to that
+item"; "use formatting and markdown and etc to make it easier to read as well
+for all our texts"; and on the skin, that the phosphor-neon terminal look is
+not mandatory and the page may wear the OMP harness's palette instead.
+
+**The undo is a third write shape, on purpose.** `POST
+/attention/<board>/<id>/reopen` reopens exactly one decided item through the
+same audited `Store::reopen_attention` the CLI's `attention reopen` uses,
+gated exactly like the reply route: same-origin, the trusted-edge actor
+(default `geoyws`), the store's operator-or-resolver gate, and a fixed reopen
+note (`undone from the web view`) because an undo that demanded words would
+be a dialog wearing a button. It joins `move_task` and the subscription verbs
+in the module's write-guard allowlist. The reply route's refusals are
+inherited: cross-origin is a 403, an already-open row is a 409 carrying the
+store's own words, an unknown board a 404.
+
+**Recent decisions is a read view, `/decided`.** The newest resolved items
+across every board (each board scanned newest-first to a 200-row bound,
+merged, truncated to 20), each rendered with its question, its decision in
+the ledger's own words, its note, who decided and when, and one Undo. The
+keyboard rule is the same everywhere: `u` reopens the decided row under
+focus, and on Needs you it falls back to the newest receipt on the page —
+the one the last keypress just made. After an undo the projection refreshes
+and focus lands on the brought-back card, so `1`–`4` keep working.
+
+**Hover previews are a read route, `/preview/<kind>/<board>/<id>`.** The
+page script derives the URL by prefixing `/preview` to a reference anchor's
+own path, so task, board, deployment and attention references all preview
+without a second mapping. The fragment it returns is not a page: a whole
+document inside a document would bring a second socket and a second copy of
+the keyboard map into being behind the operator's back. Anchors are marked
+`data-ref` and open `target=_blank rel=noopener`; the fragments themselves
+render `data-ref` anchors (a task preview names its parent), which — with
+every listener delegated to the document — is what makes previews nest.
+
+**Markdown renders board texts, and raw HTML never survives it.** Bodies,
+notes, plan bodies and sitrep bodies go through `pulldown-cmark`
+(`default-features = false, features = ["html"]` — the crate's first entry in
+the dependency list since the server was chosen), with `Html`/`InlineHtml`
+events dropped and link destinations restricted to `http(s)`, `mailto` and
+same-page anchors. A soft break renders as a hard break: bodies were
+`pre-wrap` plain text before, and a receipt's SHA line or a `RESOLVE-WHEN`
+clause is line-shaped on purpose. Scalar interpolation still goes through
+`escape`; the parser is the one bounded place a body meets one.
+
+**The skin is the OMP harness's, not a terminal's.** The phosphor green, the
+CRT overlays and the webfont are gone; the palette follows the
+`dark-catppuccin-omp` theme installed in George's omp (crust `#11111b`,
+base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, green `#a6e3a1`, red
+`#f38ba8`, peach `#fab387`), the system sans stack reads the prose and mono
+is reserved for ids, keys and receipts. One register with the chat the
+decisions are made from, so the page and the harness do not read as two
+products.
+
+**Acceptance is compiled-process and real-Chrome, per this repo's rule.**
+`tests/e2e.rs` pins: the undo key round trip (receipt gone, card back with
+focus, row open, `decision` cleared, `attention_reopened` carrying the
+previous decision), `/decided` newest-first with an undo from the page, the
+reopen route's cross-origin/open-row/unknown-board refusals, hover previews
+opening and nesting with Escape closing them, and markdown rendering with raw
+HTML inert — plus the unit tests for the renderer itself.
 
 ## Consequences
 

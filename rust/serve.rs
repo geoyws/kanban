@@ -18,7 +18,8 @@
 //! the documented arrangement, not a workaround.
 //!
 //! The write surface is deliberately narrow: an authenticated operator may
-//! reply to and resolve an attention item, or open a draft epic. The socket
+//! reply to and resolve an attention item, reopen one that was just decided
+//! (the undo), or open a draft epic. The socket
 //! carries the coarse revision, after which the browser fetches the canonical
 //! server-rendered projection, and it carries NOTICES: a notice is an
 //! already-authorized summary this process read through the store's filtered
@@ -70,6 +71,25 @@ const SOCKET_MODE: u32 = 0o660;
 /// trail and is one command away. A page that renders ten thousand events is
 /// slower to load and no more useful.
 const DETAIL_ROWS: i64 = 50;
+/// How many decided rows the Recent decisions page shows.
+///
+/// The page exists so a decided item leaves Needs you without disappearing:
+/// the eye moves to the next open card while the last decisions stay within
+/// reach of one Undo. `kb ev` and the search view are the archive, not this.
+const DECIDED_ROWS: usize = 20;
+/// How many of each board's newest decisions one scan reads.
+///
+/// The page shows the newest `DECIDED_ROWS` across every board, and each
+/// board is read decided-first (`recent_resolved_attention`) up to this bound
+/// before the merge. A board holding more recent decisions than this bound
+/// would need it raised; `kb ev` and search are the archive this page is not.
+const DECIDED_SCAN: i64 = 200;
+const WEB_UNDO_NOTE: &str = "undone from the web view";
+/// How many characters of a body a hover preview renders.
+///
+/// The preview answers "what is this?", and a body that needs reading whole
+/// is one click away in its own tab.
+const PREVIEW_BODY_CHARS: usize = 800;
 
 /// A browser reply is a decision note, not a document upload.
 const MAX_REPLY_BYTES: usize = 4_096;
@@ -380,7 +400,11 @@ fn render(url: &str) -> Result<String> {
         .collect::<Vec<_>>();
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
-        [] => needs_you(query_value(query, "replied").as_deref()),
+        [] => needs_you(
+            query_value(query, "replied").as_deref(),
+            query_value(query, "undone").as_deref(),
+        ),
+        ["decided"] => decided_page(query_value(query, "undone").as_deref()),
         ["boards"] => boards(),
         ["plans"] => plans(query_value(query, "opened").as_deref()),
         ["deployments"] => deployments(),
@@ -390,6 +414,16 @@ fn render(url: &str) -> Result<String> {
         ),
         ["lanes"] => lanes(),
         ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
+        // `/preview` + the item path: `/preview/task/PREVIEW/t-1`. The kind
+        // leads, exactly as it does in the path being previewed, so the page
+        // script derives the URL with one prefix and nothing else.
+        [
+            "preview",
+            kind @ ("task" | "attention" | "deployment"),
+            project,
+            id,
+        ] => preview_page(project, kind, id),
+        ["preview", "board", project] => preview_page(project, "board", project),
         ["board", project] => board(project),
         ["task", project, id] => task_detail(project, id),
         ["deployment", project, id] => deployment_detail(project, id),
@@ -412,6 +446,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
     if !matches!(
         parts.as_slice(),
         ["attention", _, _, "reply"]
+            | ["attention", _, _, "reopen"]
             | ["plan", _, _, "open"]
             | ["subscription", _, _, "pause" | "resume"]
     ) {
@@ -520,6 +555,43 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
         return Ok(WebResponse::Redirect(format!(
             "/subscriptions?{}changed={}",
             if show_all { "show=all&" } else { "" },
+            url_encode(id)
+        )));
+    }
+    if let ["attention", project, id, "reopen"] = parts.as_slice() {
+        let Ok((_, mut store)) = project_named(project) else {
+            return Ok(WebResponse::Html(
+                404,
+                page("Board not found", "<h1>Board not found</h1>"),
+            ));
+        };
+        // The undo is one keypress or one click, so its reopen note is fixed
+        // prose rather than a form field: an undo that demanded words would
+        // be a dialog wearing a button. The row's previous decision and
+        // resolution stay in the hash-chained ledger (ADR-042 §3); this note
+        // says where the reopen came from.
+        if let Err(error) = store.reopen_attention(id, &actor, WEB_UNDO_NOTE) {
+            return Ok(WebResponse::Html(
+                409,
+                page(
+                    "Not reopened",
+                    &format!(
+                        "<h1>Not reopened</h1><p class=error>{}</p>",
+                        escape(&error.to_string())
+                    ),
+                ),
+            ));
+        }
+        // Land where the operator was: the decided rows carry `back`, the
+        // receipts post from Needs you and land back on it. The value is
+        // compared, not trusted, so a form cannot redirect elsewhere.
+        let back = if query_value(query, "back").as_deref() == Some("/decided") {
+            "/decided"
+        } else {
+            "/"
+        };
+        return Ok(WebResponse::Redirect(format!(
+            "{back}?undone={}",
             url_encode(id)
         )));
     }
@@ -1339,9 +1411,14 @@ fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
 }
 
 fn task_reference(project: &str, store: &Store, task_id: &str) -> String {
+    // Every reference link previews on hover and opens in its own tab
+    // (data-ref), so an id met mid-sentence answers "what is this?" without
+    // leaving the page. Previews inside previews carry the same attribute,
+    // which is what makes the nesting work.
     match store.require_task(task_id) {
         Ok(task) => format!(
-            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\">{title}</a> \
+            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\" \
+             data-ref target=_blank rel=noopener>{title}</a> \
              <span class=\"type type-{ty}\" data-task-type>{ty}</span>",
             project = escape(&url_encode(project)),
             task_id = escape(&url_encode(&task.id)),
@@ -1349,7 +1426,8 @@ fn task_reference(project: &str, store: &Store, task_id: &str) -> String {
             ty = escape(&task.task_type),
         ),
         Err(_) => format!(
-            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\">{task_id}</a>",
+            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\" \
+             data-ref target=_blank rel=noopener>{task_id}</a>",
             project = escape(&url_encode(project)),
             task_id = escape(&url_encode(task_id)),
         ),
@@ -1383,10 +1461,14 @@ fn attention_section(project: &str, title: &str, items: &[Attention]) -> String 
             age = age(item.created_at),
             tags = tag_list(&item.tags),
         ));
-        html.push_str(&format!("<p class=body>{}</p>", escape(&item.body)));
+        html.push_str(&format!(
+            "<div class=\"body md\">{}</div>",
+            markdown(&item.body)
+        ));
         if let Some(task_id) = &item.task_id {
             html.push_str(&format!(
-                "<p class=meta>about <a href=\"/task/{project}/{task_id}\">{task_id}</a></p>",
+                "<p class=meta>about <a href=\"/task/{project}/{task_id}\" \
+                 data-ref target=_blank rel=noopener>{task_id}</a></p>",
                 project = escape(&url_encode(project)),
                 task_id = escape(&url_encode(task_id)),
             ));
@@ -1402,7 +1484,7 @@ fn attention_section(project: &str, title: &str, items: &[Attention]) -> String 
 /// The landing page, and the reason the server exists: everything open across
 /// every board, priority first and then oldest, so interrupts lead while age
 /// remains the tie-breaker that prevents starvation within a level.
-fn needs_you(replied: Option<&str>) -> Result<String> {
+fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     let mut stores = std::collections::BTreeMap::new();
     for (project, store) in projects()? {
@@ -1427,6 +1509,13 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     if let Some(id) = replied {
         html.push_str(&format!(
             "<p class=success>Decision recorded for <code>{}</code>.</p>",
+            escape(id)
+        ));
+    }
+    if let Some(id) = undone {
+        html.push_str(&format!(
+            "<p class=success>Brought back <code>{}</code> - it is open again \
+             and back at its place in this list.</p>",
             escape(id)
         ));
     }
@@ -1455,9 +1544,148 @@ fn needs_you(replied: Option<&str>) -> Result<String> {
     }
     html.push_str(
         "<p class=keys>Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on, \
-         or <kbd>c</kbd> to write a reply. <kbd>Esc</kbd> clears a verdict you picked.</p>",
+         <kbd>c</kbd> to write a reply, <kbd>u</kbd> to bring back the last decision. \
+         <kbd>Esc</kbd> clears a verdict you picked. Decided items move to \
+         <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a>.</p>",
     );
     Ok(page("Needs you", &html))
+}
+
+/// Recent decisions: what was decided, newest first, each one undoable.
+///
+/// Deciding is one keypress, so the list it leaves behind has to be readable
+/// at the same speed: the question, the verdict in the ledger's own words, the
+/// note when one rode along, and one Undo. The rows carry the same
+/// `data-item`/`data-project` contract the receipts do, so `u` and the undo
+/// button land on the same code path both places.
+///
+/// The previous decision is NOT re-shown from the row: a reopen clears it
+/// (ADR-042 §3), so what is rendered here is whatever the row settled with,
+/// read once while it was still resolved.
+fn decided_page(undone: Option<&str>) -> Result<String> {
+    let mut items: Vec<(String, Attention)> = Vec::new();
+    let mut stores = std::collections::BTreeMap::new();
+    for (project, store) in projects()? {
+        let name = project.name.clone();
+        for item in store.recent_resolved_attention(DECIDED_SCAN)? {
+            items.push((name.clone(), item));
+        }
+        stores.insert(name, store);
+    }
+    // Newest decided first, then board and id so the order never flickers.
+    items.sort_by(|(project_a, item_a), (project_b, item_b)| {
+        let decided_a = item_a.resolved_at.unwrap_or(i64::MIN);
+        let decided_b = item_b.resolved_at.unwrap_or(i64::MIN);
+        decided_b
+            .cmp(&decided_a)
+            .then_with(|| item_a.id.cmp(&item_b.id))
+            .then_with(|| project_a.cmp(project_b))
+    });
+    items.truncate(DECIDED_ROWS);
+
+    let mut html = String::from(
+        "<div class=heading><h1>Recent decisions</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
+    );
+    if let Some(id) = undone {
+        html.push_str(&format!(
+            "<p class=success>Brought back <code>{}</code> - it is open again \
+             on <a href=\"/\">Needs you</a>.</p>",
+            escape(id)
+        ));
+    }
+    if items.is_empty() {
+        html.push_str("<p class=empty>Nothing decided yet.</p>");
+        return Ok(page("Recent decisions", &html));
+    }
+    html.push_str(&format!(
+        "<p class=count>Newest {} shown. Undoing one puts it back on Needs you.</p>",
+        items.len(),
+    ));
+    for (project, item) in &items {
+        let store = stores
+            .get(project)
+            .expect("project store map built from same iterator");
+        html.push_str(&decided_row(project, store, item));
+    }
+    html.push_str(
+        "<p class=keys>Focus a row and press <kbd>u</kbd> to undo it, or use its button.</p>",
+    );
+    Ok(page("Recent decisions", &html))
+}
+
+/// One decided row: the question, the decision in the words the ledger keeps,
+/// and the undo. `tabindex=0` is what makes `u` able to aim at a row.
+fn decided_row(project: &str, store: &Store, item: &Attention) -> String {
+    let id = escape(&item.id);
+    let id_url = escape(&url_encode(&item.id));
+    let project_url = escape(&url_encode(project));
+    let decision = decision_words(item);
+    let mut html = format!(
+        "<article class=decided tabindex=0 data-item=\"{id}\" data-project=\"{project}\" \
+         aria-labelledby=\"d-{id}\"><h2 id=\"d-{id}\">{question}</h2>",
+        project = escape(project),
+        question = escape(&card_question(item)),
+    );
+    html.push_str(&format!(
+        "<p class=decision><span class=\"outcome outcome-{outcome}\">{outcome}</span> \
+         {words}</p>",
+        outcome = escape(
+            item.decision
+                .as_ref()
+                .map(|d| d.outcome.as_str())
+                .unwrap_or("other")
+        ),
+        words = escape(&decision),
+    ));
+    if let Some(decision) = &item.decision
+        && let Some(note) = &decision.note
+    {
+        html.push_str(&format!("<p class=note>{}</p>", escape(note)));
+    }
+    html.push_str(&format!(
+        "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
+         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a> \
+         · decided by {who} {when}{about}</p>",
+        kind = escape(&item.kind),
+        priority = priority_badge(item.priority, item.priority_level.as_deref()),
+        project = escape(project),
+        who = escape(item.resolved_by.as_deref().unwrap_or("someone")),
+        when = item.resolved_at.map(ago).unwrap_or_default(),
+        about = item
+            .task_id
+            .as_ref()
+            .map(|task| format!(" · about {}", task_reference(project, store, task)))
+            .unwrap_or_default(),
+    ));
+    html.push_str(&format!(
+        "<form class=undo method=post action=\"/attention/{project_url}/{id_url}/reopen\">\
+         <input type=hidden name=back value=\"/decided\">\
+         <button type=submit class=undo-button data-undo>Undo - open it again</button></form>",
+    ));
+    html.push_str("</article>");
+    html
+}
+
+/// What the decision was, in the words the ledger keeps for it: the chosen
+/// label, or the custom answer with its verdict. Falls back to the composed
+/// resolution for a row settled before decisions were recorded, so a pre-2026
+/// decision still reads as itself rather than as nothing.
+fn decision_words(item: &Attention) -> String {
+    if let Some(decision) = &item.decision {
+        if decision.choice == CUSTOM_CHOICE {
+            return format!("Your own answer, recorded as {}.", decision.outcome);
+        }
+        if let Some(choice) = item
+            .choices
+            .iter()
+            .find(|choice| choice.key == decision.choice)
+        {
+            return format!("{}. {}", choice.label, choice.consequence);
+        }
+    }
+    item.resolution
+        .clone()
+        .unwrap_or_else(|| "Resolved.".to_owned())
 }
 
 /// One item as the card geoyws decides from (ADR-042 §5).
@@ -1479,8 +1707,9 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     let id_url = escape(&url_encode(&item.id));
     let project_url = escape(&url_encode(project));
     let mut html = format!(
-        "<article class=item tabindex=0 data-item=\"{id}\" aria-labelledby=\"q-{id}\">\
-         <h2 id=\"q-{id}\">{question}</h2>",
+        "<article class=item tabindex=0 data-item=\"{id}\" data-project=\"{project}\" \
+         aria-labelledby=\"q-{id}\"><h2 id=\"q-{id}\">{question}</h2>",
+        project = escape(project),
         question = escape(&card_question(item)),
     );
     if let Some(context) = &item.context {
@@ -1538,12 +1767,12 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     ));
     html.push_str(&format!(
         "<details class=full><summary>show the full item</summary>\
-         <p class=body>{}</p></details>",
-        escape(&item.body)
+         <div class=\"body md\">{}</div></details>",
+        markdown(&item.body)
     ));
     html.push_str(&format!(
         "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
-         <a href=\"/board/{project_url}\">{project}</a> \
+         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a> \
          · raised by {who} · waiting {age}{about}{tags}</p></article>",
         kind = escape(&item.kind),
         priority = priority_badge(item.priority, item.priority_level.as_deref()),
@@ -1584,6 +1813,145 @@ fn ordered_choices(item: &Attention) -> Vec<&AttentionChoice> {
     ordered.extend(item.choices.iter().filter(|choice| choice.recommended));
     ordered.extend(item.choices.iter().filter(|choice| !choice.recommended));
     ordered
+}
+
+/// One reference answered on hover: what the item is, in one glance.
+///
+/// The page script fetches this fragment for every `a[data-ref]` anchor, and
+/// the anchors the fragment itself renders carry `data-ref` too — which is
+/// what makes previews nest. It is a fragment, not a page: a whole document
+/// inside a document would bring a second socket and a second copy of the
+/// keyboard map into being behind the operator's back.
+fn preview_page(project: &str, kind: &str, id: &str) -> Result<String> {
+    let (record, store) = project_named(project)?;
+    let name = record.name.as_str();
+    let body = match kind {
+        "task" => task_preview(name, &store, id)?,
+        "attention" => attention_preview(name, &store, id)?,
+        "deployment" => deployment_preview(name, &store, id)?,
+        "board" if id == name => board_preview(name, &store)?,
+        _ => return Ok(String::from("<p class=meta>Nothing to preview here.</p>")),
+    };
+    Ok(format!(
+        "<div class=preview-card data-preview-card>{body}</div>"
+    ))
+}
+
+fn task_preview(project: &str, store: &Store, id: &str) -> Result<String> {
+    let task = store.require_task(id)?;
+    let mut html = format!(
+        "<h3>{title}</h3><p class=meta><span class=status>{status}</span> \
+         <span class=\"type type-{ty}\">{ty}</span> · {priority} · updated {when}{lane}{parent}</p>",
+        title = escape(&task.title),
+        status = escape(&task.status),
+        ty = escape(&task.task_type),
+        priority = priority_badge(task.priority, task.priority_level.as_deref()),
+        when = ago(task.updated_at),
+        lane = task
+            .lane
+            .as_ref()
+            .map(|lane| format!(" · lane {}", escape(lane)))
+            .unwrap_or_default(),
+        parent = task
+            .parent_id
+            .as_ref()
+            .map(|parent| format!(" · part of {}", task_reference(project, store, parent)))
+            .unwrap_or_default(),
+    );
+    if let Some(body) = &task.body {
+        html.push_str(&format!(
+            "<div class=\"body md\">{}</div>",
+            markdown(&excerpt(body, PREVIEW_BODY_CHARS))
+        ));
+    }
+    let open = task_attention_count(store, &task.id)?;
+    if open > 0 {
+        html.push_str(&format!(
+            "<p class=meta>{open} open attention - it is on Needs you.</p>"
+        ));
+    }
+    Ok(html)
+}
+
+fn attention_preview(project: &str, store: &Store, id: &str) -> Result<String> {
+    // No single-row getter exists and none is added for a hover: the listing
+    // is bounded, indexed by id and already the read path every page uses.
+    let item = store
+        .attention(None, None, None, None, None, 500, false)?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| anyhow::anyhow!("attention {id} not found"))?;
+    let mut html = format!("<h3>{}</h3>", escape(&card_question(&item)));
+    if let Some(context) = &item.context {
+        html.push_str(&format!("<p class=meta>{}</p>", escape(context)));
+    }
+    let state = if item.status == "resolved" {
+        format!("decided: {}", escape(&decision_words(&item)))
+    } else {
+        let choices = ordered_choices(&item)
+            .iter()
+            .map(|choice| {
+                format!(
+                    "{}{}",
+                    if choice.recommended { "*" } else { "" },
+                    escape(&choice.label)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        format!("open - {choices}")
+    };
+    html.push_str(&format!(
+        "<p class=meta><span class=\"kind kind-{kind}\">{kind}</span> {state}</p>",
+        kind = escape(&item.kind),
+    ));
+    if let Some(task) = &item.task_id {
+        html.push_str(&format!(
+            "<p class=meta>about {}</p>",
+            task_reference(project, store, task)
+        ));
+    }
+    Ok(html)
+}
+
+fn deployment_preview(project: &str, store: &Store, id: &str) -> Result<String> {
+    let row = store.require_deployment(id)?;
+    Ok(format!(
+        "<h3><code>{id}</code></h3><p class=meta>{repo} · <span class=tag>{tier}</span> \
+         {environment} on {host} · {status} · {when} · board {board}</p>",
+        id = escape(&row.id),
+        repo = escape(&row.repo),
+        tier = escape(&row.tier),
+        environment = escape(&row.environment),
+        host = escape(&row.host),
+        status = escape(&row.status),
+        when = escape(&ago(row.updated_at)),
+        board = escape(project),
+    ))
+}
+
+fn board_preview(project: &str, store: &Store) -> Result<String> {
+    let tasks = store.list_tasks(None, None, None, false)?;
+    let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
+    let open_attention = store.count_open_attention()?;
+    Ok(format!(
+        "<h3>{project}</h3><p class=meta>{attention} open attention · {todo} to do · \
+         {doing} in progress · {total} tasks</p>",
+        project = escape(project),
+        attention = open_attention,
+        todo = count("todo"),
+        doing = count("in_progress"),
+        total = tasks.len(),
+    ))
+}
+
+/// The first `bound` characters of a body, cut on a character boundary so the
+/// markdown renderer never sees half a grapheme, with an ellipsis when it cut.
+fn excerpt(text: &str, bound: usize) -> String {
+    if text.chars().count() <= bound {
+        return text.to_owned();
+    }
+    format!("{}…", text.chars().take(bound).collect::<String>())
 }
 
 /// Cross-board retrieval for people who should not need to know which board
@@ -1656,7 +2024,8 @@ fn search_page(query: &str) -> Result<String> {
     for result in receipt.results {
         let title = if let Some(task_id) = &result.task_id {
             format!(
-                "<a href=\"/task/{0}/{1}\" data-task-link=\"{1}\">{2}</a>",
+                "<a href=\"/task/{0}/{1}\" data-task-link=\"{1}\" \
+                 data-ref target=_blank rel=noopener>{2}</a>",
                 escape(&result.board),
                 escape(task_id),
                 escape(&result.title)
@@ -1698,7 +2067,8 @@ fn search_page(query: &str) -> Result<String> {
 
 fn deployment_link(project: &str, deployment: &DeploymentAttempt) -> String {
     format!(
-        "<a href=\"/deployment/{0}/{1}\" data-deployment-link=\"{2}\"><code>{2}</code></a>",
+        "<a href=\"/deployment/{0}/{1}\" data-deployment-link=\"{2}\" \
+         data-ref target=_blank rel=noopener><code>{2}</code></a>",
         escape(&url_encode(project)),
         escape(&url_encode(&deployment.id)),
         escape(&deployment.id),
@@ -1816,7 +2186,7 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
         .as_ref()
         .map(|task| {
             format!(
-                "<a href=\"/task/{}/{}\">{}</a>",
+                "<a href=\"/task/{}/{}\" data-ref target=_blank rel=noopener>{}</a>",
                 escape(&url_encode(project)),
                 escape(&url_encode(task)),
                 escape(task)
@@ -1975,7 +2345,7 @@ fn boards() -> Result<String> {
             .min()
             .unwrap_or(i64::MAX);
         let row = format!(
-            "<tr data-board=\"{name}\"><td><a href=\"/board/{url}\" data-board-link>{name}</a></td>\
+            "<tr data-board=\"{name}\"><td><a href=\"/board/{url}\" data-board-link data-ref target=_blank rel=noopener>{name}</a></td>\
              <td class=\"n{flag}\">{attention}</td><td class=n>{todo}</td>\
              <td class=n>{doing}</td><td class=n>{stale}</td>\
              <td class=n>{handoffs}</td><td class=n>{total}</td></tr>",
@@ -2032,8 +2402,9 @@ fn plans(opened: Option<&str>) -> Result<String> {
                 escape(&plan.id)
             ));
             html.push_str(&format!(
-                "<h2><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\">{title}</a>{attention}</h2>\
-                 <p class=meta><a href=\"/board/{project}\">{project}</a> · \
+                "<h2><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
+                 data-ref target=_blank rel=noopener>{title}</a>{attention}</h2>\
+                 <p class=meta><a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a> · \
                  {id} · {priority} · drafted {age}{tags}</p>",
                 project = escape(&project.name),
                 id = escape(&plan.id),
@@ -2057,7 +2428,8 @@ fn plans(opened: Option<&str>) -> Result<String> {
                 for child in children {
                     let child_attention = task_attention_count(&store, &child.id)?;
                     html.push_str(&format!(
-                        "<li>{priority} <a href=\"/task/{project}/{id}\">{id}</a> \
+                        "<li>{priority} <a href=\"/task/{project}/{id}\" \
+                         data-ref target=_blank rel=noopener>{id}</a> \
                          <span class=status>{status}</span> {title}{attention}</li>",
                         project = escape(&project.name),
                         id = escape(&child.id),
@@ -2070,7 +2442,10 @@ fn plans(opened: Option<&str>) -> Result<String> {
                 html.push_str("</ul>");
             }
             if let Some(body) = &plan.body {
-                html.push_str(&format!("<pre class=plan-body>{}</pre>", escape(body)));
+                html.push_str(&format!(
+                    "<div class=\"body md plan-body\" data-plan-body>{}</div>",
+                    markdown(body)
+                ));
             }
             html.push_str(&format!(
                 "<form method=post action=\"/plan/{project_path}/{id_path}/open\">\
@@ -2367,7 +2742,7 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
         },
     );
     format!(
-        "<tr data-subscription=\"{id}\"><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\">{board}</a></div></td>\
+        "<tr data-subscription=\"{id}\"><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\" data-ref target=_blank rel=noopener>{board}</a></div></td>\
          <td>{watches}</td>\
          <td><code>{consumer}</code><div class=meta>action <code>{action}</code> · {secret}</div></td>\
          <td><span class=status data-subscription-state>{status}</span>{paused_by}\
@@ -2530,21 +2905,24 @@ fn lanes() -> Result<String> {
             escape(lane)
         ));
         html.push_str(&format!(
-            "<h2>{lane} <span class=count><a href=\"/board/{project_url}\">{project}</a></span></h2>",
+            "<h2>{lane} <span class=count><a href=\"/board/{project_url}\" \
+             data-ref target=_blank rel=noopener>{project}</a></span></h2>",
             lane = escape(lane),
             project_url = escape(project),
             project = escape(project),
         ));
         for update in updates {
             html.push_str(&format!(
-                "<p class=meta>{author} · {age}{task}{branch}</p><p class=body data-lane-body>{body}</p>",
+                "<p class=meta>{author} · {age}{task}{branch}</p>\
+                 <div class=\"body md\" data-lane-body>{body}</div>",
                 author = escape(&update.author),
                 age = ago(update.created_at),
                 task = update
                     .task_id
                     .as_ref()
                     .map(|id| format!(
-                        " · <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\">{id}</a>",
+                        " · <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
+                         data-ref target=_blank rel=noopener>{id}</a>",
                         project = escape(project),
                         id = escape(id)
                     ))
@@ -2554,7 +2932,7 @@ fn lanes() -> Result<String> {
                     .as_ref()
                     .map(|branch| format!(" · <span class=lane>{}</span>", escape(branch)))
                     .unwrap_or_default(),
-                body = escape(&update.body),
+                body = markdown(&update.body),
             ));
         }
         html.push_str("</article>");
@@ -2617,7 +2995,8 @@ fn board(name: &str) -> Result<String> {
         for task in rows {
             let attention = task_attention_count(&store, &task.id)?;
             html.push_str(&format!(
-                "<li data-task=\"{id}\">{priority} <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\">{id}</a> \
+                "<li data-task=\"{id}\">{priority} <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
+                 data-ref target=_blank rel=noopener>{id}</a> \
                  <span class=\"type type-{ty}\">{ty}</span> {title}{lane}{tags}{attention}</li>",
                 project = escape(&project.name),
                 id = escape(&task.id),
@@ -2648,7 +3027,7 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         escape(&task.title)
     );
     html.push_str(&format!(
-        "<p class=meta><a href=\"/board/{project}\">{project}</a> · {id} · \
+        "<p class=meta><a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a> · {id} · \
          <span class=\"type type-{ty}\">{ty}</span> \
          <span class=status data-task-status>{status}</span> · {priority}{tags}</p>",
         project = escape(&project.name),
@@ -2661,8 +3040,8 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
     html.push_str(&facts(&project.name, &task));
     if let Some(body) = &task.body {
         html.push_str(&format!(
-            "<h2>Body</h2><pre data-task-body>{}</pre>",
-            escape(body)
+            "<h2>Body</h2><div class=\"body md\" data-task-body>{}</div>",
+            markdown(body)
         ));
     }
 
@@ -2703,11 +3082,11 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         for note in notes {
             html.push_str(&format!(
                 "<article class=note data-task-note><p class=meta><span class=kind>{kind}</span> \
-                 {author} · {when}</p><pre>{body}</pre></article>",
+                 {author} · {when}</p><div class=\"body md\">{body}</div></article>",
                 kind = escape(&note.kind),
                 author = escape(&note.author),
                 when = stamp(note.created_at),
-                body = escape(&note.body),
+                body = markdown(&note.body),
             ));
         }
     }
@@ -2780,7 +3159,7 @@ fn facts(project: &str, task: &Task) -> String {
         html.push_str(&row(
             "parent",
             &format!(
-                "<a href=\"/task/{project}/{parent}\">{parent}</a>",
+                "<a href=\"/task/{project}/{parent}\" data-ref target=_blank rel=noopener>{parent}</a>",
                 project = escape(project),
                 parent = escape(parent),
             ),
@@ -2840,6 +3219,69 @@ fn compact(payload: &serde_json::Value) -> String {
             .join("  "),
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+/// Long board texts as markdown, so structure reads at a glance (George,
+/// 2026-09-11: "use formatting and markdown and etc to make it easier to read
+/// as well for all our texts").
+///
+/// **Raw HTML never survives this.** Board text is agent-authored and this
+/// page carries write power, so a body is a document to typeset, never a
+/// document to trust: `Html` and `InlineHtml` events are dropped, and a link
+/// whose destination is not `http(s)`, `mailto` or same-page keeps its text
+/// and points at nothing. Everything else the renderer emits is its own
+/// escaped output, so `escape` stays the rule for every scalar the page
+/// interpolates and this is the one bounded place with a parser in front.
+///
+/// A soft break becomes a hard break. Bodies were `pre-wrap` plain text
+/// before this, and a receipt's SHA line or a `RESOLVE-WHEN` clause is
+/// line-shaped on purpose: markdown's default "newline means space" would
+/// reflow those into prose the moment the renderer touched them.
+fn markdown(text: &str) -> String {
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    let rewritten = pulldown_cmark::Parser::new_ext(text, options).map(|event| match event {
+        pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {
+            pulldown_cmark::Event::Text("".into())
+        }
+        pulldown_cmark::Event::SoftBreak => pulldown_cmark::Event::HardBreak,
+        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if !safe_href(&dest_url) => pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
+            link_type,
+            dest_url: "#".into(),
+            title,
+            id,
+        }),
+        other => other,
+    });
+    let mut out = String::new();
+    pulldown_cmark::html::push_html(&mut out, rewritten);
+    out
+}
+
+/// Whether a markdown link destination may survive into the page. Same-page
+/// anchors, web links and mail addresses pass; anything with another scheme —
+/// `javascript:` first among them — does not.
+fn safe_href(destination: &str) -> bool {
+    let trimmed = destination.trim();
+    if trimmed.starts_with('#') {
+        return true;
+    }
+    match trimmed.split_once(':') {
+        None => true,
+        Some((scheme, _)) => [
+            scheme.eq_ignore_ascii_case("http"),
+            scheme.eq_ignore_ascii_case("https"),
+            scheme.eq_ignore_ascii_case("mailto"),
+        ]
+        .into_iter()
+        .any(|allowed| allowed),
     }
 }
 
@@ -2934,7 +3376,7 @@ fn page(title: &str, body: &str) -> String {
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
          <nav aria-label=Primary data-primary-nav><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
-         <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
+         <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
          <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
          <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
          <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
@@ -3075,13 +3517,19 @@ function showReceipt(card, label, noted) {
   const receipt = document.createElement('p');
   receipt.className = 'receipt';
   receipt.dataset.receipt = card.dataset.item;
+  receipt.dataset.item = card.dataset.item;
+  receipt.dataset.project = card.dataset.project || '';
   receipt.setAttribute('role', 'status');
   const decided = document.createElement('span');
   decided.className = 'decided';
   decided.textContent = noted ? `Decided: ${label}. Your reply is recorded.` : `Decided: ${label}.`;
-  const command = document.createElement('code');
-  command.textContent = `kanban attention reopen ${card.dataset.item}`;
-  receipt.append(decided, document.createTextNode(' Reopen it with '), command);
+  const undo = document.createElement('button');
+  undo.type = 'button';
+  undo.className = 'undo-button';
+  undo.dataset.undo = '';
+  undo.textContent = 'Undo';
+  receipt.append(decided, document.createTextNode(' '), undo);
+  lastDecided = receipt;
   const following = card.nextElementSibling;
   const held = card.contains(document.activeElement);
   card.replaceWith(receipt);
@@ -3090,6 +3538,57 @@ function showReceipt(card, label, noted) {
   // Keep the keyboard where the work is: the next card, so 1-4 keeps deciding.
   if (held && following && following.matches('article.item')) following.focus();
 }
+// The most recent decision on the page, so `u` has a target after the focus
+// has already moved on to the next card. Only ever a live DOM node.
+let lastDecided = null;
+// Reopen one decided item through the same trusted-edge route a reply uses.
+// The reopen note is fixed prose on the server; an undo that demanded words
+// would be a dialog wearing a button.
+async function undoDecision(row) {
+  const id = row.dataset.item;
+  const project = row.dataset.project;
+  if (!id || !project || row.dataset.undoing) return;
+  row.dataset.undoing = '1';
+  try {
+    const response = await fetch(
+      `/attention/${encodeURIComponent(project)}/${encodeURIComponent(id)}/reopen`,
+      {method: 'POST', credentials: 'same-origin', redirect: 'manual'}
+    );
+    if (response.type === 'opaqueredirect' || response.ok) {
+      row.remove();
+      // The item is open again: pull the fresh projection so it reappears as
+      // a card (on Needs you) or leaves this list (on Recent decisions), then
+      // put the keyboard back on the returned card so 1-4 keeps working.
+      await refreshProjection();
+      const back = document.querySelector(`article.item[data-item="${cssEscape(id)}"]`);
+      if (back) back.focus();
+      applyNotice({type: 'notice', key: `undone-${id}-${Date.now()}`, what: `Brought back ${id}. It is open again.`});
+    } else {
+      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const refused = page.querySelector('.error');
+      showRowRefusal(row, refused ? refused.textContent : `The board refused to bring back ${id} (${response.status}).`);
+    }
+  } catch (error) {
+    showRowRefusal(row, `The undo did not reach the board. Try again.`);
+  } finally {
+    delete row.dataset.undoing;
+  }
+}
+// A refusal on a decided row has no form to live in, so it lives on the row.
+function showRowRefusal(row, text) {
+  let refusal = row.querySelector('[data-refusal=board]');
+  if (!refusal) {
+    refusal = document.createElement('p');
+    refusal.className = 'error';
+    refusal.setAttribute('data-refusal', 'board');
+    refusal.setAttribute('role', 'alert');
+    row.append(refusal);
+  }
+  refusal.textContent = text;
+}
+// `CSS.escape` is the standard name; the fallback keeps the selector honest
+// on a browser that predates it, and ids are slugs anyway.
+const cssEscape = value => (window.CSS && CSS.escape) ? CSS.escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
 // One refusal line per KIND, and no kind ever takes another's line.
 // `incomplete` is the composer's own sentence, true only while a half is
 // missing, and cleared the moment it stops being true or the answer is
@@ -3262,6 +3761,117 @@ document.addEventListener('click', event => {
   const dismiss = event.target.closest('.notice > .dismiss');
   if (dismiss) dismiss.parentElement.remove();
 });
+// The undo button on a receipt (Needs you) and the submit on a decided row's
+// form (Recent decisions) are the same action through the same route; the
+// form keeps its real POST so a browser without script still undoes.
+document.addEventListener('click', event => {
+  const undo = event.target.closest('[data-undo]');
+  if (!undo) return;
+  const row = undo.closest('[data-receipt], article.decided');
+  if (row) { event.preventDefault(); undoDecision(row); }
+});
+document.addEventListener('submit', event => {
+  const form = event.target.closest('form.undo');
+  if (!form) return;
+  const row = form.closest('article.decided');
+  if (row) { event.preventDefault(); undoDecision(row); }
+});
+// --- hover previews ---------------------------------------------------------
+// Every `a[data-ref]` shows what it points at on hover, and the fragment it
+// fetches can itself carry `data-ref` anchors, so previews nest: hovering a
+// reference inside a preview opens the next one beside it. All listening is
+// delegated to the document, which is what makes that true for content that
+// did not exist when the page loaded. Focus opens the same preview, so the
+// keyboard path is not a second-class citizen.
+const PREVIEW_DELAY = 120;
+const previewCache = new Map();
+const openPreviews = [];
+let previewTimer = null;
+let previewCloseTimer = null;
+const previewUrl = anchor => {
+  try {
+    const url = new URL(anchor.href, location.href);
+    if (url.origin !== location.origin) return null;
+    return `/preview${url.pathname}`;
+  } catch (_) { return null; }
+};
+// Pop every popup that is not an ancestor of `keep`: hovering a new anchor
+// in the page closes everything, hovering one inside a popup closes only the
+// popups deeper than that one.
+const closePreviews = keep => {
+  while (openPreviews.length && !(openPreviews[openPreviews.length - 1].contains(keep) || openPreviews[openPreviews.length - 1] === keep)) {
+    openPreviews.pop().remove();
+  }
+};
+const closeAllPreviews = () => { while (openPreviews.length) openPreviews.pop().remove(); };
+function positionPreview(popup, anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const margin = 8;
+  popup.style.visibility = 'hidden';
+  document.body.append(popup);
+  const box = popup.getBoundingClientRect();
+  let left = Math.min(rect.right + margin, window.innerWidth - box.width - margin);
+  left = Math.max(margin, left);
+  const below = rect.bottom + margin + box.height < window.innerHeight;
+  popup.style.top = below ? `${rect.bottom + margin}px` : `${Math.max(margin, rect.top - box.height - margin)}px`;
+  popup.style.left = `${left}px`;
+  popup.style.visibility = 'visible';
+}
+async function showPreview(anchor) {
+  const url = previewUrl(anchor);
+  if (!url) return;
+  closePreviews(anchor);
+  if (openPreviews.some(popup => popup.dataset.previewFor === url && popup.contains(anchor))) return;
+  const popup = document.createElement('div');
+  popup.className = 'preview-pop';
+  popup.dataset.previewFor = url;
+  popup.setAttribute('role', 'tooltip');
+  const loading = document.createElement('p');
+  loading.className = 'meta';
+  loading.textContent = 'Loading…';
+  popup.append(loading);
+  openPreviews.push(popup);
+  positionPreview(popup, anchor);
+  try {
+    let html = previewCache.get(url);
+    if (html === undefined) {
+      const response = await fetch(url, {credentials: 'same-origin'});
+      if (!response.ok) throw new Error(`preview ${response.status}`);
+      html = await response.text();
+      previewCache.set(url, html);
+    }
+    if (!popup.isConnected) return;
+    popup.innerHTML = html;
+    positionPreview(popup, anchor);
+  } catch (error) {
+    if (popup.isConnected) {
+      popup.innerHTML = '';
+      const failed = document.createElement('p');
+      failed.className = 'meta';
+      failed.textContent = 'The preview did not load. Click the link to open the item.';
+      popup.append(failed);
+    }
+  }
+}
+const schedulePreview = anchor => {
+  clearTimeout(previewCloseTimer);
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => showPreview(anchor), PREVIEW_DELAY);
+};
+const scheduleCloseAll = () => {
+  clearTimeout(previewTimer);
+  clearTimeout(previewCloseTimer);
+  previewCloseTimer = setTimeout(closeAllPreviews, PREVIEW_DELAY * 2);
+};
+document.addEventListener('mouseover', event => {
+  const anchor = event.target.closest ? event.target.closest('a[data-ref]') : null;
+  if (anchor) { schedulePreview(anchor); return; }
+  if (!event.target.closest || !event.target.closest('.preview-pop')) scheduleCloseAll();
+});
+document.addEventListener('focusin', event => {
+  const anchor = event.target.closest ? event.target.closest('a[data-ref]') : null;
+  if (anchor) schedulePreview(anchor);
+});
 // 1-4 answer the card that has focus, in the order it lists them, so 1 is
 // always the recommendation -- the muscle memory that makes a long list
 // tractable. `c` reaches that card's reply field instead.
@@ -3281,6 +3891,11 @@ document.addEventListener('click', event => {
 // submit instead, which records the free-text answer or refuses it in the
 // board's words.
 //
+// `u` brings back the last decided item (George, 2026-09-11): the receipt
+// under focus on Needs you, the decided row under focus on Recent decisions,
+// and otherwise the newest receipt on the page -- which is the one the last
+// keypress just made. It is inert while composing, like every other key.
+//
 // `Escape` is the release, and it works while composing because that is
 // where it is needed: a picked verdict holds the live projection and HTML
 // has no other way to un-check a radio group. An `Escape` that is ending an
@@ -3290,6 +3905,7 @@ document.addEventListener('keydown', event => {
   const target = event.target;
   const composing = Boolean(target && target.matches && target.matches('textarea, input'));
   if (event.key === 'Escape') {
+    if (openPreviews.length) { event.preventDefault(); closeAllPreviews(); return; }
     const escaped = cardOf(target) || cardOf(document.activeElement);
     const form = escaped && escaped.querySelector('form.decide');
     if (form) { event.preventDefault(); clearVerdict(form); }
@@ -3300,6 +3916,12 @@ document.addEventListener('keydown', event => {
       const record = target.form.querySelector('button.record');
       if (record) { event.preventDefault(); record.click(); }
     }
+    return;
+  }
+  if (event.key === 'u') {
+    const row = (target.closest && target.closest('[data-receipt], article.decided'))
+      || (lastDecided && lastDecided.isConnected ? lastDecided : null);
+    if (row) { event.preventDefault(); undoDecision(row); }
     return;
   }
   const card = cardOf(document.activeElement);
@@ -3319,152 +3941,189 @@ document.addEventListener('keydown', event => {
 bindCards();
 connectLive();
 "#;
-
-/// The terminal skin: phosphor green on black, one accent.
+/// The OMP skin: the calm dark palette of the harness George reads this from,
+/// not the phosphor terminal it replaced (George, 2026-09-11: "you don't need
+/// to have to use the neon color thing strictly, it can feel more like OMP's
+/// theme here").
 ///
-/// Amber is work that is waiting or retrying, red is the only failure states
-/// (dead letters, P0, errors, decline), and everything else is phosphor or its
-/// dim shade. Every pill variant is spelled out even where it only restates the
-/// dim default, so that adding a colour is an edit to a line that already
-/// exists rather than a new rule someone has to invent.
+/// Tokens follow the `dark-catppuccin-omp` theme installed in his omp — the
+/// same Mocha palette the harness renders in — so the page and the chat it is
+/// decided from share one visual register: deep blue-dark grounds, soft
+/// lavender-white text, blue for what is readable and actionable, green for
+/// settled, red for refusal and P0, peach for waiting. One family for prose
+/// and one for identifiers: the system serif-less stack for reading, mono for
+/// ids, keys and receipts. No webfont, no CRT overlays, no glow: the decision
+/// card is the loudest thing on the page and everything else is quiet on
+/// purpose. Every pill variant is spelled out even where it only restates the
+/// default, so that adding a colour is an edit to a line that already exists
+/// rather than a new rule someone has to invent.
 const CSS: &str = "\
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');\
 *{box-sizing:border-box}\
-:root{color-scheme:dark;--canvas:#0a0a0a;--phosphor:#33ff33;--dim:#1e9e1e;--amber:#ffb000;\
---red:#ff3333;--panel:rgba(51,255,51,.06)}\
-body{margin:0;min-height:100vh;color:var(--phosphor);background:var(--canvas);\
-font:14px/1.6 'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;\
-scrollbar-color:var(--dim) var(--canvas)}\
-body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:99;\
-background:radial-gradient(ellipse at center,rgba(51,255,51,.03) 0,transparent 70%)}\
-body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:100;\
-background:repeating-linear-gradient(0deg,rgba(0,0,0,.06) 0,rgba(0,0,0,.06) 1px,transparent 1px,transparent 3px)}\
-nav{z-index:10;display:flex;align-items:center;gap:.8rem;padding:.65rem max(1rem,env(safe-area-inset-right)) .65rem max(1rem,env(safe-area-inset-left));\
-background:var(--canvas);border-bottom:1px solid var(--dim);position:sticky;top:0}\
-.brand,.brand:hover{padding:0;background:transparent;color:var(--phosphor);font-weight:700;\
-text-shadow:0 0 10px rgba(51,255,51,.5)}\
-.brand::before{content:'>';margin-right:.4em}\
+:root{color-scheme:dark;\
+--crust:#11111b;--mantle:#181825;--base:#1e1e2e;--surface0:#313244;--surface1:#45475a;\
+--text:#cdd6f4;--subtext:#a6adc8;--muted:#7f849c;\
+--accent:#89b4fa;--green:#a6e3a1;--red:#f38ba8;--peach:#fab387;--mauve:#cba6f7;\
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
+body{margin:0;min-height:100vh;color:var(--text);background:var(--crust);\
+font:15px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;\
+scrollbar-color:var(--surface1) var(--crust)}\
+nav{z-index:10;display:flex;align-items:center;gap:.8rem;padding:.6rem max(1rem,env(safe-area-inset-right)) .6rem max(1rem,env(safe-area-inset-left));\
+background:var(--mantle);border-bottom:1px solid var(--surface0);position:sticky;top:0}\
+.brand,.brand:hover{padding:0;background:transparent;color:var(--accent);font-weight:700;font-family:var(--mono)}\
+.brand::before{content:'>';margin-right:.4em;color:var(--mauve)}\
 .nav-links{display:flex;align-items:center;gap:.15rem}\
-nav a{display:flex;align-items:center;min-height:2.5rem;padding:0 .65rem;color:var(--phosphor);\
-text-decoration:none;border-radius:4px;white-space:nowrap}\
-nav a:hover{color:var(--canvas);background:var(--phosphor);text-decoration:none}\
+nav a{display:flex;align-items:center;min-height:2.5rem;padding:0 .65rem;color:var(--subtext);\
+text-decoration:none;border-radius:6px;white-space:nowrap;font-size:.9rem}\
+nav a:hover{color:var(--crust);background:var(--accent);text-decoration:none}\
 nav form{margin-left:auto;min-width:8rem}nav form input{width:100%}\
-input,button,textarea{min-height:2.75rem;font:inherit;color:var(--phosphor);background:var(--canvas);\
-border:1px solid var(--phosphor);border-radius:4px;padding:.55rem .7rem}\
-input::placeholder,textarea::placeholder{color:var(--dim)}\
-input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}\
+input,button,textarea{min-height:2.6rem;font:inherit;color:var(--text);background:var(--base);\
+border:1px solid var(--surface1);border-radius:6px;padding:.5rem .7rem}\
+input::placeholder,textarea::placeholder{color:var(--muted)}\
+input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 button{cursor:pointer;background:transparent}\
-button:hover{opacity:.85}button:active{transform:translateY(1px)}\
+button:hover{border-color:var(--accent)}button:active{transform:translateY(1px)}\
 .search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
-main{max-width:64rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
-footer{max-width:64rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--dim);font-size:.85rem}\
-h1{font-size:1.25rem;font-weight:700;line-height:1.3;margin:.2rem 0 1rem;text-shadow:0 0 10px rgba(51,255,51,.5)}\
-h1::before{content:'> '}\
-h2{font-size:.9rem;font-weight:700;margin:1.6rem 0 .5rem;color:var(--dim)}\
-a{color:var(--phosphor);text-decoration:none}a:hover{text-decoration:underline}\
-code,kbd{color:var(--phosphor);background:rgba(51,255,51,.1);padding:.1em .35em;border-radius:2px}\
-pre{background:var(--panel);border:1px solid var(--dim);border-radius:4px;padding:.8rem;\
-overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem}\
-table{width:100%;border-collapse:collapse;font-size:.85rem}\
-th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--dim);\
+main{max-width:66rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
+footer{max-width:66rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--muted);font-size:.85rem}\
+h1{font-size:1.35rem;font-weight:650;line-height:1.3;margin:.2rem 0 1rem;color:var(--text)}\
+h1::before{content:'> ';color:var(--mauve);font-family:var(--mono)}\
+h2{font-size:1rem;font-weight:650;margin:1.6rem 0 .5rem;color:var(--subtext)}\
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
+code,kbd{color:var(--text);background:var(--surface0);padding:.12em .4em;border-radius:4px;font-family:var(--mono);font-size:.92em}\
+pre{background:var(--base);border:1px solid var(--surface0);border-radius:6px;padding:.8rem;\
+overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem;font-family:var(--mono)}\
+table{width:100%;border-collapse:collapse;font-size:.88rem}\
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--surface0);\
 vertical-align:top}\
-th{color:var(--dim);font-weight:400}\
+th{color:var(--muted);font-weight:500}\
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}\
-td.waiting{color:var(--amber);font-weight:700}\
-.queued{margin-top:.25rem;font-size:.85rem;color:var(--dim)}\
-.queued .retrying{color:var(--amber);font-weight:600}\
+td.waiting{color:var(--peach);font-weight:650}\
+.queued{margin-top:.25rem;font-size:.85rem;color:var(--muted)}\
+.queued .retrying{color:var(--peach);font-weight:600}\
 .queued .dead{color:var(--red);font-weight:700}\
-td.when{white-space:nowrap;color:var(--dim)}\
-td.payload{color:var(--dim);font-size:.85rem;word-break:break-word}\
-.item,.note,.plan,.search-result{border:1px solid var(--dim);border-radius:4px;\
-padding:clamp(.9rem,3vw,1.25rem);margin:1rem 0;background:rgba(51,255,51,.08)}\
-.item:has(.priority-p0){border-color:var(--red)}.item:has(.priority-p1){border-color:var(--amber)}\
+td.when{white-space:nowrap;color:var(--muted)}\
+td.payload{color:var(--muted);font-size:.85rem;word-break:break-word}\
+.item,.note,.plan,.search-result{border:1px solid var(--surface0);border-radius:10px;\
+padding:clamp(.9rem,3vw,1.25rem);margin:1rem 0;background:var(--base)}\
+.item:has(.priority-p0){border-color:var(--red)}.item:has(.priority-p1){border-color:var(--peach)}\
 .heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
-.live{color:var(--phosphor);font-size:.75rem}\
-.live::after{content:'_';animation:blink 1s step-end infinite}\
-@keyframes blink{50%{opacity:0}}\
-.success{background:var(--panel);border:1px solid var(--phosphor);border-radius:4px;padding:.6rem .75rem}\
+.live{color:var(--green);font-size:.75rem}\
+.live::after{content:'●';margin-left:.35em;animation:pulse 2.4s ease-in-out infinite}\
+@keyframes pulse{50%{opacity:.35}}\
+.success{background:rgba(166,227,161,.08);border:1px solid var(--green);border-radius:8px;padding:.6rem .75rem}\
 .notices{display:grid;gap:.35rem;margin:0 0 1.1rem}\
 .notice{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:0;padding:.4rem .55rem;\
-font-size:.85rem;background:var(--canvas);border:1px solid var(--dim);\
-border-left:2px solid var(--phosphor);border-radius:4px;animation:notice-in .18s ease-out}\
-.notice-board{color:var(--dim)}\
+font-size:.85rem;background:var(--mantle);border:1px solid var(--surface0);\
+border-left:2px solid var(--accent);border-radius:6px;animation:notice-in .18s ease-out}\
+.notice-board{color:var(--muted)}\
 .notice-what{font-weight:400}\
-.notice.summary .notice-what{font-weight:700}\
+.notice.summary .notice-what{font-weight:650}\
 .notice .dismiss{margin-left:auto;min-height:auto;padding:.1rem .5rem;font-size:.75rem;\
-color:var(--dim);border-color:var(--dim)}\
+color:var(--muted);border-color:var(--surface1)}\
 @keyframes notice-in{from{opacity:0;transform:translateY(-.25rem)}to{opacity:1;transform:none}}\
 .decide textarea{display:block;width:100%;min-height:2.9rem;resize:vertical}\
 .actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.6rem}\
 .actions button{min-width:6.5rem}\
-.item h2{max-width:72ch;margin:0 0 .6rem;padding-left:1.15em;text-indent:-1.15em;\
-color:var(--phosphor);font-size:1.0625rem;line-height:1.45;text-shadow:0 0 10px rgba(51,255,51,.35)}\
-.item h2::before{content:'> '}\
-.item:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}\
-.context{max-width:72ch;margin:0 0 1.1rem}\
+.item h2{max-width:72ch;margin:0 0 .6rem;color:var(--text);font-size:1.125rem;line-height:1.45;font-weight:650}\
+.item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
+.context{max-width:72ch;margin:0 0 1.1rem;color:var(--subtext)}\
 .decide{margin:0}\
 fieldset{min-width:0;margin:0;padding:0;border:0}\
-legend{padding:0;color:var(--dim);font-size:.8rem}\
-.recommended{padding:.2rem .85rem .9rem;border:1px solid var(--phosphor);border-radius:4px}\
-.recommended legend{padding:0 .45em;color:var(--phosphor)}\
-.choice{display:block;width:100%;margin:0;text-align:left;line-height:1.45;white-space:normal}\
+legend{padding:0;color:var(--muted);font-size:.78rem;letter-spacing:.02em}\
+.recommended{padding:.25rem .85rem .9rem;border:1px solid var(--accent);border-radius:8px}\
+.recommended legend{padding:0 .45em;color:var(--accent)}\
+.choice{display:block;width:100%;margin:0;text-align:left;line-height:1.45;white-space:normal;font-weight:500}\
 .choice .key{display:inline-block;min-width:1.6em;margin-right:.5em;padding:0 .2em;\
-border:1px solid currentColor;border-radius:2px;font-size:.75rem;text-align:center}\
-.choice.outcome-approve{color:var(--phosphor);border-color:var(--phosphor)}\
-.choice.outcome-defer{color:var(--amber);border-color:var(--amber)}\
+border:1px solid currentColor;border-radius:4px;font-size:.75rem;text-align:center;font-family:var(--mono)}\
+.choice.outcome-approve{color:var(--green);border-color:var(--green)}\
+.choice.outcome-defer{color:var(--peach);border-color:var(--peach)}\
 .choice.outcome-reject{color:var(--red);border-color:var(--red)}\
-.choice.outcome-other{color:var(--dim);border-color:var(--dim)}\
-.recommended .choice{color:var(--canvas);background:var(--phosphor);border-color:var(--phosphor);font-weight:700}\
-.consequence{max-width:72ch;margin:.5rem 0 0;color:var(--dim)}\
-.recommended .consequence{color:var(--phosphor)}\
+.choice.outcome-other{color:var(--subtext);border-color:var(--surface1)}\
+.recommended .choice{color:var(--crust);background:var(--accent);border-color:var(--accent);font-weight:650}\
+.recommended .choice .key{opacity:.75}\
+.recommended .choice:hover{border-color:var(--crust)}\
+.consequence{max-width:72ch;margin:.5rem 0 0;color:var(--muted);font-size:.92rem}\
+.recommended .consequence{color:var(--subtext)}\
 .alternatives{display:grid;gap:1.15rem;margin:1.15rem 0 0}\
 .alternative .consequence{margin-top:.4rem}\
 .reply{margin-top:1.15rem}\
-.reply>label{display:block;margin:0 0 .35rem;color:var(--phosphor);font-size:.8rem}\
+.reply>label{display:block;margin:0 0 .35rem;color:var(--subtext);font-size:.8rem}\
 .reply .hint{margin-top:.4rem}\
-.custom{margin-top:1.7rem;padding-top:1rem;border-top:1px solid var(--dim)}\
+.custom{margin-top:1.5rem;padding-top:1rem;border-top:1px dashed var(--surface1)}\
 .picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
-.picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.5rem;\
-padding:.25rem .6rem;color:var(--dim);border:1px solid var(--dim);border-radius:4px;cursor:pointer}\
-.picks label:has(input:checked){color:var(--phosphor);border-color:var(--phosphor)}\
-.picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;border:0;accent-color:var(--phosphor)}\
-.record{color:var(--phosphor);border-color:var(--phosphor)}\
-.clear{color:var(--dim);border-color:var(--dim)}\
-.hint{margin:0;color:var(--dim);font-size:.8rem}\
-.receipt{margin:1rem 0;padding:.55rem .75rem;color:var(--dim);background:var(--canvas);\
-border:1px solid var(--dim);border-left:2px solid var(--phosphor);border-radius:4px}\
-.receipt .decided{color:var(--phosphor)}\
+.picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.4rem;\
+padding:.25rem .6rem;color:var(--subtext);border:1px solid var(--surface1);border-radius:6px;cursor:pointer}\
+.picks label:has(input:checked){color:var(--accent);border-color:var(--accent)}\
+.picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;border:0;accent-color:var(--accent)}\
+.record{color:var(--accent);border-color:var(--accent)}\
+.clear{color:var(--muted);border-color:var(--surface1)}\
+.hint{margin:0;color:var(--muted);font-size:.8rem}\
+.receipt{margin:1rem 0;padding:.55rem .75rem;color:var(--subtext);background:var(--mantle);\
+border:1px solid var(--surface0);border-left:2px solid var(--green);border-radius:8px}\
+.receipt .decided{color:var(--green)}\
+.receipt .undo-button{min-height:auto;margin-left:.4rem;padding:.15rem .7rem;font-size:.8rem;\
+color:var(--peach);border-color:var(--peach)}\
+.decided{border:1px solid var(--surface0);border-left:2px solid var(--surface1);border-radius:10px;\
+padding:clamp(.8rem,3vw,1.1rem);margin:.8rem 0;background:var(--base)}\
+.decided h2{margin:0 0 .5rem;color:var(--subtext);font-size:1rem;font-weight:600}\
+.decided:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
+.decided .decision{margin:.2rem 0;color:var(--text)}\
+.decided .note{margin:.3rem 0;color:var(--subtext);font-style:italic}\
+.decided .undo-button{margin-top:.5rem;color:var(--peach);border-color:var(--peach)}\
+.undo-button:hover{color:var(--crust);background:var(--peach);border-color:var(--peach)}\
+.outcome{display:inline-block;margin-right:.5em;padding:.05em .5em;border-radius:4px;font-size:.75rem;\
+border:1px solid var(--surface1);color:var(--subtext);font-family:var(--mono)}\
+.outcome-approve{color:var(--green);border-color:var(--green)}\
+.outcome-reject{color:var(--red);border-color:var(--red)}\
+.outcome-defer{color:var(--peach);border-color:var(--peach)}\
 .full{margin:1.2rem 0 0}\
-.full summary{color:var(--dim);cursor:pointer;list-style:none}\
+.full summary{color:var(--muted);cursor:pointer;list-style:none}\
 .full summary::-webkit-details-marker{display:none}\
 .full summary::before{content:'+ '}\
 .full[open] summary::before{content:'- '}\
-.full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--dim)}\
-.keys{margin:1.6rem 0 0;color:var(--dim);font-size:.85rem}\
-.search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:var(--dim)}\
-.meta{color:var(--dim);font-size:.85rem;margin:.2rem 0}\
-.body{margin:.5rem 0;white-space:pre-wrap}\
+.full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--subtext)}\
+.keys{margin:1.6rem 0 0;color:var(--muted);font-size:.85rem}\
+.search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:var(--muted)}\
+.meta{color:var(--muted);font-size:.85rem;margin:.2rem 0}\
+.body{margin:.5rem 0}\
+.body.md>*:first-child{margin-top:0}.body.md>*:last-child{margin-bottom:0}\
+.body.md p{margin:.5rem 0;max-width:78ch}\
+.body.md h1,.body.md h2,.body.md h3,.body.md h4{margin:.9rem 0 .35rem;color:var(--text);font-weight:650}\
+.body.md h1{font-size:1.1rem}.body.md h2{font-size:1.05rem}.body.md h3{font-size:1rem}.body.md h4{font-size:.95rem}\
+.body.md ul,.body.md ol{margin:.5rem 0;padding-left:1.4rem;max-width:78ch}\
+.body.md li{margin:.2rem 0}\
+.body.md ul{list-style:disc}.body.md ol{list-style:decimal}\
+.body.md blockquote{margin:.6rem 0;padding:.2rem .9rem;border-left:3px solid var(--surface1);color:var(--muted)}\
+.body.md pre{margin:.6rem 0}\
+.body.md table{margin:.6rem 0}\
+.body.md hr{border:0;border-top:1px solid var(--surface0);margin:1rem 0}\
 .cmd{margin:.5rem 0 0;font-size:.85rem}\
-.empty{color:var(--dim)}\
-.count{color:var(--dim);font-weight:400;font-size:.85rem}\
-.attention-count{display:inline-block;margin-left:.4rem;padding:.05em .45em;border-radius:2px;\
-background:transparent;border:1px solid var(--phosphor);color:var(--phosphor);font-size:.75rem;font-weight:700}\
+.empty{color:var(--muted)}\
+.count{color:var(--muted);font-weight:400;font-size:.85rem}\
+.attention-count{display:inline-block;margin-left:.4rem;padding:.05em .45em;border-radius:4px;\
+background:transparent;border:1px solid var(--accent);color:var(--accent);font-size:.75rem;font-weight:600}\
 .kind,.type,.status,.lane,.tag,.priority{display:inline-block;padding:.05em .5em;\
-border-radius:2px;font-size:.75rem;color:var(--dim);background:transparent;border:1px solid var(--dim)}\
+border-radius:4px;font-size:.75rem;color:var(--subtext);background:transparent;border:1px solid var(--surface1)}\
 .kind-blocking,.priority-p0{color:var(--red);border-color:var(--red)}\
-.kind-risk,.priority-p1{color:var(--amber);border-color:var(--amber)}\
-.kind-review,.kind-approval{color:var(--phosphor);border-color:var(--phosphor)}\
-.kind-decision,.priority-p2,.priority-legacy,.type-epic,.type-story,.type-task{color:var(--dim);border-color:var(--dim)}\
+.kind-risk,.priority-p1{color:var(--peach);border-color:var(--peach)}\
+.kind-review,.kind-approval{color:var(--green);border-color:var(--green)}\
+.kind-decision,.priority-p2,.priority-legacy,.type-epic,.type-story,.type-task{color:var(--subtext);border-color:var(--surface1)}\
 ul.rows,ul.children{list-style:none;padding:0;margin:.3rem 0}\
-ul.rows li,ul.children li{padding:.3rem 0;border-bottom:1px solid var(--dim)}\
+ul.rows li,ul.children li{padding:.3rem 0;border-bottom:1px solid var(--surface0)}\
 dl{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:.4rem 0}\
-dt{color:var(--dim);font-size:.85rem}\
+dt{color:var(--muted);font-size:.85rem}\
 dd{margin:0;font-size:.9rem;word-break:break-word}\
 .plan-body{max-height:28rem;overflow-y:auto}\
 .error{color:var(--red)}\
+.preview-pop{position:fixed;z-index:300;max-width:26rem;max-height:22rem;overflow-y:auto;\
+background:var(--mantle);border:1px solid var(--surface1);border-radius:10px;\
+box-shadow:0 12px 32px rgba(0,0,0,.45);padding:.8rem .9rem;color:var(--text);animation:notice-in .12s ease-out}\
+.preview-card h3{margin:.1rem 0 .4rem;font-size:.95rem;font-weight:650;color:var(--text)}\
+.preview-card h3 a{color:inherit}\
+.preview-card .body{margin:.4rem 0 0;color:var(--subtext);font-size:.88rem}\
 @media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.actions button{flex:1}.picks{display:grid;grid-template-columns:1fr 1fr}.heading{align-items:flex-start}table{min-width:38rem}}\
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
-.notice{animation:none}.live::after{animation:none}}\
+.notice{animation:none}.live::after{animation:none}.preview-pop{animation:none}}\
 ";
 
 #[cfg(test)]
@@ -3822,7 +4481,7 @@ mod tests {
         );
         assert!(rendered.contains("width=device-width,initial-scale=1"));
         assert!(rendered.contains("role=status aria-live=polite"));
-        assert!(CSS.contains("min-height:2.75rem"));
+        assert!(CSS.contains("min-height:2.6rem"));
         assert!(CSS.contains("env(safe-area-inset-bottom)"));
         assert!(CSS.contains(".attention-count"));
         assert!(CSS.contains("@media(max-width:700px)"));
@@ -3882,10 +4541,7 @@ mod tests {
         let home = render("/").expect("render needs-you");
         assert_page_title(&home, "Needs you");
         assert_html_contains(&home, "Needs you");
-        assert_html_contains(
-            &home,
-            "Please review &lt;strong&gt;before release&lt;/strong&gt;",
-        );
+        assert_html_contains(&home, "Please review before release");
         assert_html_contains(
             &home,
             "<legend>Or answer in your own words, recorded as</legend>",
@@ -3982,14 +4638,8 @@ mod tests {
         assert_page_title(&lanes, "Lanes");
         assert_html_contains(&lanes, "driver-2");
         assert_html_contains(&lanes, "driver-3");
-        assert_html_contains(
-            &lanes,
-            "Working &lt;i&gt;quietly&lt;/i&gt; on the render page.",
-        );
-        assert_html_contains(
-            &lanes,
-            "A second lane with &lt;b&gt;markup&lt;/b&gt; to sort.",
-        );
+        assert_html_contains(&lanes, "Working quietly on the render page.");
+        assert_html_contains(&lanes, "A second lane with markup to sort.");
 
         let search_empty = render("/search").expect("render empty search");
         assert_page_title(&search_empty, "Search");
@@ -4021,21 +4671,15 @@ mod tests {
             render(&format!("/task/SERVE-RENDER/{}", fixture.epic_id)).expect("render task detail");
         assert_page_title(&task_detail, "Plan &lt;b&gt;render&lt;/b&gt;");
         assert_html_contains(&task_detail, "Open attention");
-        assert_html_contains(
-            &task_detail,
-            "Keep the &lt;script&gt; tag escaped &amp; readable.",
-        );
+        assert_html_contains(&task_detail, "tag escaped &amp; readable");
         assert_html_contains(&task_detail, "Trail");
         assert_html_contains(&task_detail, "decision");
-        assert_html_contains(
-            &task_detail,
-            "Please review &lt;strong&gt;before release&lt;/strong&gt;",
-        );
+        assert_html_contains(&task_detail, "Please review before release");
 
         let story_detail = render(&format!("/task/SERVE-RENDER/{}", fixture.story_id))
             .expect("render story detail");
         assert_page_title(&story_detail, "Ship &lt;script&gt;render&lt;/script&gt;");
-        assert_html_contains(&story_detail, "Story body with &lt;em&gt;markup&lt;/em&gt;");
+        assert_html_contains(&story_detail, "Story body with markup");
         assert_html_contains(&story_detail, "type-story");
 
         let task_page =
@@ -4104,15 +4748,18 @@ mod tests {
         // check that quietly stops applying.
         const SOURCE: &str = include_str!("serve.rs");
         // The Needs-you reply form resolves exactly one attention item through
-        // the same audited Store operation as `kb att resolve`, and the
-        // Subscriptions page pauses or resumes exactly one subscription
+        // the same audited Store operation as `kb att resolve`, the undo
+        // reopens exactly one through the same audited operation as
+        // `kb att reopen` (George, 2026-09-11: undo belongs on the page), and
+        // the Subscriptions page pauses or resumes exactly one subscription
         // through the same audited operation as `kb subscription pause` --
-        // both idempotent, both actor-stamped. No other web route is allowed a
-        // mutator.
-        const ALLOWED: [&str; 5] = [
+        // all idempotent-shaped, all actor-stamped. No other web route is
+        // allowed a mutator.
+        const ALLOWED: [&str; 6] = [
             "move_task",
             "resolve_attention",
             "resolve_attention_from_trusted_edge",
+            "reopen_attention",
             "pause_subscription",
             "resume_subscription",
         ];
@@ -4122,7 +4769,7 @@ mod tests {
             .unwrap_or(SOURCE);
         // Every `&mut self` method on Store, which is the complete set of ways
         // this module could change a board.
-        const MUTATORS: [&str; 27] = [
+        const MUTATORS: [&str; 29] = [
             "add_task",
             "move_task",
             "remove_task",
@@ -4136,7 +4783,9 @@ mod tests {
             "add_tag",
             "remove_tag",
             "raise_attention",
+            "update_attention",
             "resolve_attention",
+            "reopen_attention",
             "create_handoff",
             "accept_handoff",
             "retire_handoff",
@@ -4191,6 +4840,42 @@ mod tests {
         let html = page("<b>x</b>", "body");
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"), "{html}");
         assert!(!html.contains("<title><b>"), "{html}");
+    }
+
+    /// Markdown is the one place a body meets a parser instead of a scalar
+    /// escape, so the two properties that make it safe to render agent text
+    /// are pinned here: structure renders, and raw HTML never survives.
+    #[test]
+    fn markdown_renders_structure_strips_raw_html_and_keeps_line_shape() {
+        let html = markdown(
+            "## Ship it\n\n- **one** receipt\n- two\n\n<script>alert(1)</script>\nplain <b>bold</b>",
+        );
+        assert!(html.contains("<h2>Ship it</h2>"), "{html}");
+        assert!(html.contains("<strong>one</strong>"), "{html}");
+        assert!(html.contains("<li>"), "{html}");
+        // The tags are gone; the words between them stay as inert text.
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains("plain bold"), "{html}");
+        // A single newline keeps its line, the way the pre-wrap body had it.
+        assert!(markdown("first\nsecond").contains("<br"), "{html}");
+    }
+
+    #[test]
+    fn markdown_neutralizes_unsafe_link_schemes_and_keeps_web_ones() {
+        let html = markdown(
+            "[bad](javascript:alert(1)) and [good](https://example.com) and [rel](/task/P/T)",
+        );
+        assert!(html.contains("href=\"#\""), "{html}");
+        assert!(html.contains("https://example.com"), "{html}");
+        assert!(html.contains("href=\"/task/P/T\""), "{html}");
+        assert!(!html.contains("javascript"), "{html}");
+        assert!(safe_href("#anchor"));
+        assert!(safe_href("/task/P/T"));
+        assert!(safe_href("mailto:a@b.example"));
+        assert!(safe_href("HTTPS://upper.example"));
+        assert!(!safe_href("javascript:alert(1)"));
+        assert!(!safe_href("data:text/html,x"));
     }
 
     #[test]
@@ -4553,7 +5238,10 @@ mod tests {
             None,
         );
         assert_html_contains(&html, "<code>sub-one</code>");
-        assert_html_contains(&html, "<a href=\"/board/PX\">PX</a>");
+        assert_html_contains(
+            &html,
+            "<a href=\"/board/PX\" data-ref target=_blank rel=noopener>PX</a>",
+        );
         assert_html_contains(&html, "Every task_moved event arriving at done.");
         assert_html_contains(&html, "<code>codex.queue</code>");
         assert_html_contains(&html, "action <code>enqueue-turn</code>");
@@ -4682,7 +5370,7 @@ mod tests {
         // queued, amber for a retry that resolves itself, and red for a dead
         // letter, because in this UI red is failure and nothing else.
         assert!(
-            CSS.contains(".queued .retrying{color:var(--amber);font-weight:600}"),
+            CSS.contains(".queued .retrying{color:var(--peach);font-weight:600}"),
             "{CSS}"
         );
         assert!(
@@ -4690,8 +5378,8 @@ mod tests {
             "{CSS}"
         );
         assert!(
-            CSS.contains("td.waiting{color:var(--amber);font-weight:700}"),
-            "waiting is the same amber as a retry: attention, not yet failure: {CSS}"
+            CSS.contains("td.waiting{color:var(--peach);font-weight:650}"),
+            "waiting is the same peach as a retry: attention, not yet failure: {CSS}"
         );
     }
 

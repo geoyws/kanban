@@ -24132,11 +24132,14 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "a quiet lane sorted above an active one: {lanes}"
     );
     assert!(lanes.contains("retry path is the culprit"), "{lanes}");
+    // Raw HTML in a body never reaches the page as markup: the words stay
+    // and the tags do not (markdown strips them server-side).
     assert!(
-        lanes.contains("&lt;i&gt;underway&lt;/i&gt;"),
-        "a sitrep body was not escaped: {lanes}"
+        lanes.contains("underway"),
+        "a sitrep body lost its words: {lanes}"
     );
     assert!(!lanes.contains("<i>underway</i>"), "{lanes}");
+    assert!(!lanes.contains("&lt;i&gt;"), "{lanes}");
 
     let (status, plans) = http_get(port, "/plans");
     assert_eq!(status, 200);
@@ -25190,7 +25193,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "<input type=radio name=outcome value=other>",
             "name=decision value=custom>Record this answer",
             "<details class=full><summary>show the full item</summary>",
-            "<p class=body>PARKED - until an account is assigned",
+            "<div class=\"body md\"><p>PARKED - until an account is assigned",
             "<p class=meta>",
             "raised by codex@driver",
         ],
@@ -25496,8 +25499,8 @@ fn decision_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
 }
 
 /// What the card became after a decision that carried no words: one line
-/// naming the choice in the same words the ledger uses, and the command that
-/// undoes it.
+/// naming the choice in the same words the ledger uses, and the Undo that
+/// brings it back — a button on the page, not a command to go and type.
 fn assert_receipt(tab: &headless_chrome::Tab, id: &str, label: &str) {
     assert_receipt_reads(tab, id, &format!("Decided: {label}."));
 }
@@ -25519,7 +25522,21 @@ fn assert_receipt_reads(tab: &headless_chrome::Tab, id: &str, decided: &str) {
         .unwrap_or_else(|error| panic!("receipt for {id}: {error}"));
     assert_eq!(
         receipt.get_inner_text().expect("receipt text").trim(),
-        format!("{decided} Reopen it with kanban attention reopen {id}")
+        format!("{decided} Undo")
+    );
+    // The undo is a button on the page that knows which board to reopen on;
+    // the round trip it powers is pinned by the undo case further down.
+    assert_eq!(
+        js_value(
+            tab,
+            &format!(
+                "(() => {{ const r = document.querySelector('p.receipt[data-receipt=\"{id}\"]'); \
+                 const b = r && r.querySelector('button[data-undo]'); \
+                 return Boolean(b) && r.dataset.project.length > 0; }})()"
+            )
+        ),
+        Value::Bool(true),
+        "the receipt's undo must exist and know its board"
     );
 }
 
@@ -25723,6 +25740,64 @@ fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, l
     }
     tab.wait_for_element(arrived)
         .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
+}
+
+/// A reference link opens its item in a tab of its own (George, 2026-09-11:
+/// "if clicked should open a tab to that item"), so a journey that clicks
+/// one follows it into the new tab rather than waiting for this document to
+/// be replaced. Returns the tab the item opened in.
+fn click_opening_tab(
+    chrome: &Browser,
+    tab: &headless_chrome::Tab,
+    selector: &str,
+    arrived: &str,
+    label: &str,
+    headers: &[(&'static str, &'static str)],
+) -> Arc<headless_chrome::Tab> {
+    let selector_literal =
+        serde_json::to_string(selector).expect("selector as a JS string literal");
+    let before: Vec<String> = chrome
+        .get_tabs()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|open| format!("{:?}", open.get_target_id()))
+        .collect();
+    tab.evaluate(
+        &format!("document.querySelector({selector_literal}).click()"),
+        false,
+    )
+    .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let opened = chrome
+            .get_tabs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|open| !before.contains(&format!("{:?}", open.get_target_id())))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(new_tab) = opened.first() {
+            // Extra headers and device metrics are per-tab: a tab opened by
+            // target=_blank starts with neither, and a trusted-edge write
+            // from it would fail closed without the actor header.
+            if !headers.is_empty() {
+                new_tab
+                    .set_extra_http_headers(headers.iter().cloned().collect())
+                    .unwrap_or_else(|error| panic!("{label}: set headers: {error}"));
+            }
+            new_tab
+                .wait_for_element(arrived)
+                .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
+            return new_tab.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: the clicked reference opened no tab of its own"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn assert_element_text(tab: &headless_chrome::Tab, selector: &str, expected: &str) {
@@ -26147,6 +26222,552 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
         "Decision: Custom answer, recorded as other.\nNote: Buy the seat on 2026-09-09 and log in \
          from the laptop.",
         "{row}"
+    );
+}
+
+/// `u` brings back the last decided item: the receipt disappears, the card
+/// returns with the keyboard on it, and the row is open again with its
+/// decision cleared and the previous one kept in the ledger (George,
+/// 2026-09-11: "undo to bring back the last item that was decided on").
+#[test]
+fn the_undo_key_bring_back_the_last_decision_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-undo-key");
+    fixture.ok_json(&fixture.main, &["init", "--name", "UNDOKEY", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let spare = raise_carded(
+        &fixture,
+        "Waiting behind the P0: nothing to decide here yet.",
+        "codex@driver-2",
+        &["--kind", "review", "--priority", "6"],
+    );
+    let spare_id = spare["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    // Decide with the keyboard, the way the undo is meant to follow.
+    tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+        .expect("the card")
+        .focus()
+        .expect("focus the card");
+    tab.press_key("1").expect("press 1");
+    let choice = card_choices()[0].clone();
+    let label = choice["label"].as_str().unwrap();
+    assert_receipt(&tab, id, label);
+    let resolved = settled_row(&fixture, id);
+    assert_eq!(resolved["status"], "resolved", "{resolved}");
+
+    // `u` undoes it. Focus sits on the next card after a decision, so this
+    // exercises the "newest receipt on the page" arm of the key.
+    tab.press_key("u").expect("press u");
+    tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+        .expect("the brought-back card");
+    assert_eq!(
+        js_value(&tab, "document.activeElement.dataset.item"),
+        id,
+        "the keyboard must land back on the brought-back card"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("Boolean(document.querySelector('p.receipt[data-receipt=\"{id}\"]'))")
+        ),
+        Value::Bool(false),
+        "the receipt outlived its own undo"
+    );
+    // The row is open again, carries no decision, and says who reopened it.
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    let row = reopened
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap_or_else(|| panic!("{id} did not come back open: {reopened}"));
+    assert_eq!(row["decision"], Value::Null, "{row}");
+    assert_eq!(row["reopenNote"], "undone from the web view", "{row}");
+    assert_eq!(row["reopenedBy"], "geoyws", "{row}");
+    // The ledger keeps what the undo took off the row.
+    let trail = fixture.ok_json(&fixture.main, &["events", "--limit", "10", "--json"]);
+    let reopened_event = trail
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "attention_reopened")
+        .unwrap_or_else(|| panic!("no attention_reopened event: {trail}"));
+    assert_eq!(reopened_event["payload"]["attentionID"], id);
+    assert_eq!(
+        reopened_event["payload"]["decision"]["choice"],
+        "assign-and-login"
+    );
+    // The spare row is untouched by all of this.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("Boolean(document.querySelector('article.item[data-item=\"{spare_id}\"]'))")
+        ),
+        Value::Bool(true),
+        "the untouched card vanished"
+    );
+}
+
+/// Recent decisions holds what was decided, newest first, and undoes from
+/// there (George, 2026-09-11: "put the item in a recent decisions tab or
+/// something so the eye can easily engage the next item").
+#[test]
+fn recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-decided-page");
+    fixture.ok_json(&fixture.main, &["init", "--name", "DECIDED", "--json"]);
+    let first = raise_carded(
+        &fixture,
+        "Decided first: the body, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let second = raise_carded(
+        &fixture,
+        "Decided second: the body, unchanged.",
+        "codex@driver-2",
+        &card_args(&["--kind", "risk", "--priority", "2"], &CARD),
+    );
+    let first_id = first["id"].as_str().unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    // Decide both from the page, in order, so the resolutions carry real
+    // timestamps from the store rather than seeds.
+    for (id, key) in [(first_id, "1"), (second_id, "1")] {
+        tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+            .expect("the card")
+            .focus()
+            .expect("focus the card");
+        tab.press_key(key).expect("decide");
+        tab.wait_for_element(&format!("p.receipt[data-receipt=\"{id}\"]"))
+            .expect("the receipt");
+    }
+
+    tab.navigate_to(&format!("{origin}decided"))
+        .expect("load Recent decisions");
+    // `evaluate` without return-by-value hands back objects by reference, so
+    // the row order travels as JSON text.
+    let rows = || {
+        js_value(
+            &tab,
+            "JSON.stringify([...document.querySelectorAll('article.decided')].map(row => row.dataset.item))",
+        )
+    };
+    assert_eq!(
+        rows(),
+        serde_json::json!(format!("[\"{second_id}\",\"{first_id}\"]")),
+        "newest decided first"
+    );
+    // Each row says what was decided in the words the ledger keeps, and
+    // carries an undo aimed at its own board.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('article.decided[data-item=\"{second_id}\"] \
+                 .outcome').textContent"
+            )
+        ),
+        "approve"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('article.decided[data-item=\"{second_id}\"] \
+                 button[data-undo]') && \
+                 document.querySelector('article.decided[data-item=\"{second_id}\"]')\
+                 .querySelector('form.undo').action"
+            )
+        ),
+        format!("{origin}attention/DECIDED/{second_id}/reopen"),
+        "the row's undo must post to its own board"
+    );
+
+    // Undo the newest from its button. The submit is intercepted, so the
+    // page stays where it is and the row leaves the projection.
+    tab.wait_for_element(&format!(
+        "article.decided[data-item=\"{second_id}\"] button[data-undo]"
+    ))
+    .expect("the undo button")
+    .click()
+    .expect("undo the newest decision");
+    tab.wait_for_element(&format!("article.decided[data-item=\"{first_id}\"]"))
+        .expect("the older decision stays");
+    for _ in 0..100 {
+        if js_value(
+            &tab,
+            &format!(
+                "Boolean(document.querySelector('article.decided[data-item=\"{second_id}\"]'))"
+            ),
+        ) == Value::Bool(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "Boolean(document.querySelector('article.decided[data-item=\"{second_id}\"]'))"
+            )
+        ),
+        Value::Bool(false),
+        "the undone row stayed on Recent decisions"
+    );
+    // The undone item is open again on its board, the other is still decided.
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert!(
+        open.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == second_id),
+        "the undone item is not open again: {open}"
+    );
+    let settled = settled_row(&fixture, first_id);
+    assert_eq!(settled["status"], "resolved", "{settled}");
+}
+
+/// The reopen route is a write, so it inherits the reply route's refusals:
+/// another origin is refused without touching the row, and an already-open
+/// row is refused by name rather than re-stamped.
+#[test]
+fn the_reopen_route_refuses_cross_origin_and_open_rows() {
+    let fixture = Fixture::new("serve-reopen-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REOPEN", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "A body to decide and then reopen.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "assign-and-login",
+            "--json",
+        ],
+    );
+    assert_eq!(resolved["status"], "resolved");
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let path = format!("/attention/REOPEN/{id}/reopen");
+    let (status, _) = http_post(port, &path, "https://hostile.example", b"");
+    assert_eq!(status, 403, "a cross-origin undo was accepted");
+    let still_resolved = settled_row(&fixture, id);
+    assert_eq!(still_resolved["status"], "resolved", "{still_resolved}");
+
+    // Same-origin against a row that is open: the store's own refusal,
+    // surfaced as a page.
+    let opened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            id,
+            "--as",
+            "geoyws",
+            "--note",
+            "cli reopen for the refusal case",
+            "--json",
+        ],
+    );
+    assert_eq!(opened["status"], "open", "{opened}");
+    let (status, page) = http_post(port, &path, &format!("http://127.0.0.1:{port}"), b"");
+    assert_eq!(
+        status, 409,
+        "an already-open row was reopened again: {page}"
+    );
+    assert!(
+        page.contains("already open; there is no resolution to reopen"),
+        "{page}"
+    );
+    let (status, _) = http_post(
+        port,
+        "/attention/NO-SUCH-BOARD/x/reopen",
+        &format!("http://127.0.0.1:{port}"),
+        b"",
+    );
+    assert_eq!(status, 404, "an unknown board was accepted");
+}
+
+/// Every reference link previews on hover, a preview nested inside another
+/// preview previews too, and a click opens the item in its own tab (George,
+/// 2026-09-11: "all reference links... mouseover... nested mouseovers... if
+/// clicked should open a tab to that item").
+#[test]
+fn reference_links_preview_on_hover_nest_and_open_a_new_tab_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-hover-previews");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PREVIEW", "--json"]);
+    let epic = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ship the decision room",
+            "--as",
+            "codex@driver",
+            "--type",
+            "epic",
+            "--status",
+            "todo",
+            "--json",
+        ],
+    );
+    let task = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Pin the hover preview",
+            "--as",
+            "codex@driver",
+            "--parent",
+            epic["id"].as_str().unwrap(),
+            "--status",
+            "todo",
+            "--json",
+        ],
+    );
+    let task_id = task["id"].as_str().unwrap();
+    let epic_id = epic["id"].as_str().unwrap();
+    let item = raise_carded(
+        &fixture,
+        "The body about the task, unchanged.",
+        "codex@driver",
+        &card_args(
+            &["--kind", "blocking", "--priority", "0", "--task", task_id],
+            &CARD,
+        ),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    // The card's task reference carries the preview contract.
+    let about =
+        format!("article.item[data-item=\"{id}\"] a[data-ref][data-task-link=\"{task_id}\"]");
+    tab.wait_for_element(&about)
+        .expect("the task reference on the card")
+        .focus()
+        .expect("focus the reference");
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{about}').target")),
+        "_blank",
+        "a reference must open its own tab"
+    );
+
+    // Hover (as focus) opens the first preview: the task, by title, with its
+    // own parent reference inside — which is the nesting target.
+    let popups = "document.querySelectorAll('.preview-pop').length";
+    for _ in 0..100 {
+        if js_value(
+            &tab,
+            &format!(
+                "(() => {{ const n = {popups}; return n >= 1 && \
+             document.querySelector('.preview-pop .preview-card h3') \
+             && document.querySelector('.preview-pop .preview-card h3').textContent \
+                 .includes('Pin the hover preview'); }})()"
+            ),
+        ) == Value::Bool(true)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        js_value(&tab, popups),
+        serde_json::json!(1),
+        "the task preview did not open"
+    );
+    let nested = ".preview-pop .preview-card a[data-ref][data-task-link]".to_owned();
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{nested}') && \
+                      document.querySelector('{nested}').dataset.taskLink"
+            )
+        ),
+        epic_id,
+        "the preview must carry its own reference link"
+    );
+
+    // Hover the parent reference INSIDE the preview: a second popup opens
+    // beside it, and the first stays.
+    js_value(
+        &tab,
+        &format!(
+            "document.querySelector('{nested}').dispatchEvent(\
+             new MouseEvent('mouseover', {{bubbles: true}})) "
+        ),
+    );
+    for _ in 0..100 {
+        if js_value(
+            &tab,
+            &format!(
+                "(() => {{ const n = {popups}; return n >= 2 && \
+             [...document.querySelectorAll('.preview-pop .preview-card h3')]\
+                 .some(h => h.textContent.includes('Ship the decision room')); }})()"
+            ),
+        ) == Value::Bool(true)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        js_value(&tab, popups),
+        serde_json::json!(2),
+        "a preview inside a preview did not open"
+    );
+
+    // Escape closes what hover opened. The click contract is the anchor's
+    // own: every reference opens its item in a new tab with no opener
+    // reference (`target=_blank rel=noopener`), which is what was asserted
+    // above; Chrome's anchor navigation is the platform's behaviour, not
+    // this page's.
+    tab.press_key("Escape").expect("close the previews");
+    for _ in 0..50 {
+        if js_value(&tab, popups) == serde_json::json!(0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        js_value(&tab, popups),
+        serde_json::json!(0),
+        "Escape left popups open"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{about}').getAttribute('rel')")
+        ),
+        "noopener",
+        "a new tab must not carry a reference back to the operator's page"
+    );
+}
+
+/// Board texts render as markdown, and raw HTML inside them never reaches
+/// the page as anything but inert text (George, 2026-09-11: "use formatting
+/// and markdown and etc to make it easier to read as well for all our
+/// texts").
+#[test]
+fn markdown_renders_in_real_chrome_and_raw_html_stays_inert() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-markdown");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MARKDOWN", "--json"]);
+    let body = "## Receipts\n\n- **bold** claim\n- plain one\n\n<script>alert(1)</script>\nfirst\nsecond\n[link](https://example.com/x)";
+    let item = raise_carded(
+        &fixture,
+        body,
+        "codex@driver",
+        &card_args(&["--kind", "decision", "--priority", "3"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    tab.wait_for_element(&format!(
+        "article.item[data-item=\"{id}\"] details.full > summary"
+    ))
+    .expect("the folded body")
+    .click()
+    .expect("unfold the body");
+    let details = format!("article.item[data-item=\"{id}\"] details.full .body.md");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{details} h2') && \
+                      document.querySelector('{details} h2').textContent"
+            )
+        ),
+        "Receipts",
+        "a markdown heading did not render"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{details} strong') && \
+                      document.querySelector('{details} strong').textContent"
+            )
+        ),
+        "bold",
+        "markdown emphasis did not render"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelectorAll('{details} li').length")
+        ),
+        serde_json::json!(2),
+        "markdown lists did not render"
+    );
+    // Single newlines keep their lines: the pre-wrap body's shape survives.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{details}').innerText.includes('first\\nsecond')")
+        ),
+        Value::Bool(true),
+        "a line break in the body was reflowed away"
+    );
+    // Raw HTML is inert: no script node, and the web link kept its scheme.
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('script').length"),
+        serde_json::json!(1),
+        "a script tag from a board body reached the page (the page's own script is the only one)"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{details} a[href=\"https://example.com/x\"]') !== null"
+            )
+        ),
+        Value::Bool(true),
+        "a safe web link was stripped"
     );
 }
 
@@ -28258,12 +28879,15 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         board_link.get_attribute_value("href").unwrap().as_deref(),
         Some("/board/MOBILE-JOURNEY")
     );
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         "[data-board=\"MOBILE-JOURNEY\"] [data-board-link]",
         "[data-task=\"t-mobile-journey\"]",
         "seeded board",
+        &[],
     );
+    set_mobile_viewport(&tab);
     assert_eq!(js_value(&tab, "location.pathname"), "/board/MOBILE-JOURNEY");
     assert_eq!(
         js_value(
@@ -28281,16 +28905,19 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         task_link.get_attribute_value("href").unwrap().as_deref(),
         Some("/task/MOBILE-JOURNEY/t-mobile-journey")
     );
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         "[data-task-link=\"t-mobile-journey\"]",
         "[data-task-detail=\"t-mobile-journey\"]",
         "board task",
+        &[],
     );
+    set_mobile_viewport(&tab);
     assert_element_text(&tab, "[data-task-title]", task_title);
     assert_element_text(&tab, "[data-task-status]", "todo");
     assert_element_text(&tab, "[data-task-body]", task_body);
-    assert_element_text(&tab, "[data-task-note] pre", note_body);
+    assert_element_text(&tab, "[data-task-note] .body.md", note_body);
     let trail = tab.wait_for_element("[data-task-trail]").unwrap();
     trail.scroll_into_view().expect("scroll to task trail");
     assert_eq!(
@@ -28337,12 +28964,15 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         result.get_attribute_value("href").unwrap().as_deref(),
         Some("/task/MOBILE-JOURNEY/t-mobile-journey")
     );
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         "[data-task-link=\"t-mobile-journey\"]",
         "[data-task-detail=\"t-mobile-journey\"]",
         "search result",
+        &[],
     );
+    set_mobile_viewport(&tab);
     assert_element_text(&tab, "[data-task-title]", task_title);
     assert_no_horizontal_overflow(&tab, "searched task detail");
 
@@ -28359,12 +28989,15 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         sitrep_body,
     );
     assert_no_horizontal_overflow(&tab, "Lanes");
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         "[data-lane=\"mobile-lane\"] [data-task-link=\"t-mobile-journey\"]",
         "[data-task-detail=\"t-mobile-journey\"]",
         "lane task",
+        &[],
     );
+    set_mobile_viewport(&tab);
     assert_element_text(&tab, "[data-task-title]", task_title);
     assert_no_horizontal_overflow(&tab, "lane task detail");
 
@@ -28385,12 +29018,15 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
             .as_deref(),
         Some(format!("/deployment/MOBILE-JOURNEY/{deployment_id}").as_str())
     );
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         &deployment_selector,
         &format!("[data-deployment-detail=\"{deployment_id}\"]"),
         "deployment attempt",
+        &[],
     );
+    set_mobile_viewport(&tab);
     assert_eq!(
         js_value(
             &tab,
@@ -28434,12 +29070,15 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
             .as_deref(),
         Some(format!("/deployment/MOBILE-JOURNEY/{recovery_id}").as_str())
     );
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         &recovery_selector,
         &format!("[data-deployment-detail=\"{recovery_id}\"]"),
         "artifact-identity deployment attempt",
+        &[],
     );
+    set_mobile_viewport(&tab);
     assert_element_text(
         &tab,
         "[data-deployment-field=\"Identity mode\"]",
@@ -28801,11 +29440,13 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
         &format!("[data-item=\"{attention_id}\"] [data-task-type]"),
         "task",
     );
-    click_navigating(
+    let tab = click_opening_tab(
+        &chrome,
         &tab,
         &format!("[data-item=\"{attention_id}\"] [data-task-link=\"{task_id}\"]"),
         &format!("[data-task-detail=\"{task_id}\"]"),
         "attention card task drilldown",
+        &[("X-Auth-Request-Email", "geoyws")],
     );
     assert_element_text(&tab, "[data-task-title]", task_title);
     click_navigating(

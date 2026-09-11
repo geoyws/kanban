@@ -5414,6 +5414,28 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The newest resolved attention rows, decided-first — the web's Recent
+    /// decisions view.
+    ///
+    /// `attention(Some("resolved"), …)` orders by priority then raised time,
+    /// which is the right order for a queue and the wrong end for "what was
+    /// decided lately": a board with more resolved rows than the caller's
+    /// bound would hand back its oldest decisions. This is the one read that
+    /// orders by `resolved_at DESC`.
+    pub fn recent_resolved_attention(&self, limit: i64) -> Result<Vec<Attention>> {
+        self.authz.check_read(&[])?;
+        let mut statement = self.connection.prepare(
+            "SELECT * FROM attention WHERE status='resolved' AND archived=0 \
+             ORDER BY resolved_at DESC,id ASC LIMIT ?",
+        )?;
+        let mut rows = statement
+            .query_map([limit], attention_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_attention_tags(&self.connection, &mut rows)?;
+        Ok(rows)
+    }
+
     /// How many workable rows are waiting on a prerequisite: the dashboard's
     /// number, and a count rather than a filter.
     ///
