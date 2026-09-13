@@ -266,7 +266,18 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
         format!("Priority: {}", task.priority),
         format!("Title: {}", task.title),
         format!("Body: {}", task.body.as_deref().unwrap_or("(none)")),
-        String::new(),
+        // The optional block owns both separators. Its empty form is exactly
+        // the one pre-sprint blank line between task and claim.
+        packet.sprint.as_ref().map_or_else(String::new, |sprint| {
+            format!(
+                "\n## Sprint\n{} \"{}\" v{} · {}\nGoal: {}\n",
+                sprint.sprint_id,
+                sprint.title,
+                sprint.target_version,
+                sprint.status,
+                sprint.goal.as_deref().unwrap_or("(unplanned)")
+            )
+        }),
         "## Claim".to_owned(),
         packet.claim.as_ref().map_or_else(
             || "unclaimed".to_owned(),
@@ -346,6 +357,13 @@ pub fn render_context(packet: &ContextPacket, max_chars: usize) -> Result<String
                     .claim
                     .as_ref()
                     .map_or("unclaimed", |claim| claim.agent_id.as_str())
+            ),
+            format!(
+                "Sprint: {}",
+                packet
+                    .sprint
+                    .as_ref()
+                    .map_or("(none)", |sprint| { &sprint.sprint_id })
             ),
             format!(
                 "Blocking gates: {}",
@@ -616,6 +634,7 @@ mod tests {
             handoffs: vec![],
             rules: vec![],
             sitreps: vec![],
+            sprint: None,
             generated_at: 4,
             truncated: false,
         }
@@ -625,6 +644,11 @@ mod tests {
     fn open_attention_is_rendered_in_full_and_compact_contexts() {
         let packet = sample_packet();
         let full = render_context(&packet, 5_000).unwrap();
+        assert!(
+            full.contains(&format!("Body: {}\n\n## Claim", "x".repeat(1_200))),
+            "sprintless spacing drifted: {full}"
+        );
+        assert!(!full.contains("## Sprint"), "{full}");
         assert!(full.contains("## Open attention"), "{full}");
         assert!(full.contains("2 open items"), "{full}");
         assert!(

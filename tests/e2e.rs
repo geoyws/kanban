@@ -1709,7 +1709,13 @@ fn serve_readiness_banner_matches_exact_output() {
 }
 
 /// Return a current fixture to the exact pre-search schema shape before a
-/// historical migration test removes or renames tables referenced by V13.
+/// Restore the actual pre-sprint v26 shape before lowering a historical fixture.
+fn remove_v27_sprint_schema(connection: &Connection) {
+    connection.execute_batch(
+        "ALTER TABLE deployments DROP COLUMN served_version; ALTER TABLE deployments DROP COLUMN target_version; ALTER TABLE deployments DROP COLUMN sprint_id; DROP TABLE task_sprints; DROP TABLE sprints;"
+    ).unwrap();
+}
+
 fn remove_v13_search_schema(connection: &Connection) {
     let trigger_names = {
         let mut statement = connection
@@ -2086,7 +2092,7 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|project| project["schemaVersion"] == 26)
+            .all(|project| project["schemaVersion"] == 27)
     );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
@@ -2282,9 +2288,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 26);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 26);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 26);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 27);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 27);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 27);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -3106,6 +3112,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         .unwrap()
         .to_owned();
     let connection = Connection::open(&board).unwrap();
+    remove_v27_sprint_schema(&connection);
     remove_v21_subscription_schema(&connection);
     remove_v18_board_audit_schema(&connection);
     remove_v13_search_schema(&connection);
@@ -3137,7 +3144,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        26
+        27
     );
     assert_eq!(
         reopened
@@ -6032,10 +6039,9 @@ fn compiled_binary_still_migrates_a_board_that_is_behind() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert!(current > 1, "expected a migrated board, got v{current}");
-    Connection::open(&board)
-        .unwrap()
-        .execute_batch(&format!("PRAGMA user_version={}", current - 1))
-        .unwrap();
+    Connection::open(&board).unwrap().execute_batch(
+        "ALTER TABLE deployments DROP COLUMN served_version; ALTER TABLE deployments DROP COLUMN target_version; ALTER TABLE deployments DROP COLUMN sprint_id; DROP TABLE task_sprints; DROP TABLE sprints; PRAGMA user_version=26;"
+    ).unwrap();
 
     let listed = fixture.ok_json(
         &fixture.main,
@@ -6937,10 +6943,9 @@ fn a_board_behind_the_schema_that_cannot_be_migrated_says_both_halves() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    Connection::open(&estate.board)
-        .unwrap()
-        .execute_batch(&format!("PRAGMA user_version={}", current - 1))
-        .unwrap();
+    Connection::open(&estate.board).unwrap().execute_batch(
+        "ALTER TABLE deployments DROP COLUMN served_version; ALTER TABLE deployments DROP COLUMN target_version; ALTER TABLE deployments DROP COLUMN sprint_id; DROP TABLE task_sprints; DROP TABLE sprints; PRAGMA user_version=26;"
+    ).unwrap();
     estate.seal();
 
     let refused = fixture.run(
@@ -7193,7 +7198,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 26"),
+        version.contains("board schema 27"),
         "version output: {version}"
     );
     assert!(
@@ -11136,6 +11141,24 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
         ],
     );
     let rule_id = rule["id"].as_str().unwrap().to_owned();
+    let sprint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "Readonly surface probe",
+            "--target-version",
+            "0.3.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "agent",
+            "--json",
+        ],
+    );
+    let sprint_id = sprint["id"].as_str().unwrap().to_owned();
     let deployment = fixture.ok_json(
         &fixture.main,
         &[
@@ -11204,6 +11227,8 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "rule show" => vec!["rule", "show", &rule_id],
             "sitrep list" => vec!["sitrep", "list"],
             "subscription list" => vec!["subscription", "list"],
+            "sprint list" => vec!["sprint", "list"],
+            "sprint show" => vec!["sprint", "show", &sprint_id],
             "subscription show" => {
                 vec!["subscription", "show", "sub-schema-readonly"]
             }
@@ -15410,7 +15435,7 @@ fn a_transact_resolves_a_back_reference_to_an_earlier_items_result() {
         &fixture.main,
         &[checkpoint_item(
             "t-1",
-            json!(token.replace('a', "b")),
+            json!(format!("wrong-{token}")),
             "agent-a",
         )],
     );
@@ -17589,6 +17614,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         .unwrap()
         .to_owned();
     let connection = Connection::open(&board).unwrap();
+    remove_v27_sprint_schema(&connection);
     remove_v21_subscription_schema(&connection);
     remove_v18_board_audit_schema(&connection);
     connection.execute_batch("PRAGMA user_version=16;").unwrap();
@@ -17602,7 +17628,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        26
+        27
     );
 }
 
@@ -18675,6 +18701,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let board = board_path_for_project(&fixture, &fixture.main, "MIGRATE");
     {
         let connection = Connection::open(&board).unwrap();
+        remove_v27_sprint_schema(&connection);
         remove_v25_attention_card_schema(&connection);
         connection.execute_batch("PRAGMA user_version=24;").unwrap();
         let columns: Vec<String> = connection
@@ -18696,7 +18723,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        26
+        27
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -18764,6 +18791,7 @@ fn the_audit_chain_stays_healthy_across_the_card_migration() {
     let board = board_path_for_project(&fixture, &fixture.main, "CHAIN");
     {
         let connection = Connection::open(&board).unwrap();
+        remove_v27_sprint_schema(&connection);
         remove_v25_attention_card_schema(&connection);
         connection.execute_batch("PRAGMA user_version=24;").unwrap();
     }
@@ -19530,6 +19558,32 @@ fn seed_task_and_board_path(fixture: &Fixture) -> String {
 }
 
 const CAPPED_LISTINGS: &[CappedListing] = &[
+    CappedListing {
+        label: "sprints",
+        argv: &["sprint", "list"],
+        default: 100,
+        rows: None,
+        prepare: seed_nothing,
+        seed: |fixture, _, index| {
+            fixture.ok_json(
+                &fixture.main,
+                &[
+                    "sprint",
+                    "new",
+                    &format!("cap probe {index}"),
+                    "--target-version",
+                    "0.3.0",
+                    "--start",
+                    "0",
+                    "--end",
+                    "4102444800000",
+                    "--as",
+                    "agent",
+                    "--json",
+                ],
+            );
+        },
+    },
     CappedListing {
         label: "events",
         argv: &["events"],
@@ -20389,6 +20443,14 @@ const ENUM_ARGUMENTS: &[EnumArgument] = &[
         ],
     },
     EnumArgument {
+        label: "sprint-list-status",
+        operation: "sprint list",
+        argument: "status",
+        positional: false,
+        prepare: seed_nothing,
+        argv: &["sprint", "list", "--status", "@bogus@", "--json"],
+    },
+    EnumArgument {
         label: "attention-list-kind",
         operation: "attention list",
         argument: "kind",
@@ -21201,6 +21263,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
     // it through the compiled binary below must run V10, not merely exercise
     // fresh-board behaviour.
     let connection = Connection::open(&board).unwrap();
+    remove_v27_sprint_schema(&connection);
     remove_v21_subscription_schema(&connection);
     remove_v18_board_audit_schema(&connection);
     remove_v13_search_schema(&connection);
@@ -21303,7 +21366,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        26
+        27
     );
     assert_eq!(
         connection
@@ -23461,7 +23524,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 27_i64)
+        .pragma_update(None, "user_version", 28_i64)
         .unwrap();
     drop(newer_connection);
 
@@ -42908,5 +42971,338 @@ fn completion_gate_graph_rejects_self_and_mixed_parent_dependency_cycles() {
             &fixture.ok_json(&fixture.main, &["task", "show", "e-gated", "--json"])["dependencies"]
         ),
         ["t-external"]
+    );
+}
+
+#[test]
+fn sprint_cli_enforces_scope_version_proof_carry_and_atomic_writes() {
+    let fixture = Fixture::new("sprint-core-contract");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SPRINT", "--json"]);
+    let banner = fixture.run(&fixture.main, &["--version"]);
+    assert!(
+        banner.status.success(),
+        "global --version was consumed by sprint arguments"
+    );
+
+    let create = |id: &str, version: &str| {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "sprint",
+                "new",
+                id,
+                "--id",
+                id,
+                "--target-version",
+                version,
+                "--start",
+                "0",
+                "--end",
+                "4102444800000",
+                "--as",
+                "operator",
+                "--json",
+            ],
+        )
+    };
+    create("sp-current", "1.2.3");
+    create("sp-next", "1.2.4");
+    let bad_id = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "bad",
+            "--id",
+            "not-a-sprint",
+            "--target-version",
+            "1.0.0",
+            "--start",
+            "0",
+            "--end",
+            "1",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&bad_id).contains("must start with sp-"));
+    let unplanned = fixture.run(
+        &fixture.main,
+        &["sprint", "start", "sp-next", "--as", "operator", "--json"],
+    );
+    assert!(refusal_object(&unplanned).contains("no recorded goal and criteria"));
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-next",
+            "--body",
+            "Reserved emergency sprint\nShip nothing unless needed",
+            "--empty-scope",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Loose", "--id", "t-loose", "--json"],
+    );
+    let plain = fixture.run(&fixture.main, &["context", "t-loose"]);
+    assert!(plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stdout).contains("## Sprint"));
+
+    let add_refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Must roll back",
+            "--id",
+            "t-rolledback",
+            "--sprint",
+            "sp-missing",
+            "--json",
+        ],
+    );
+    refusal_object(&add_refused);
+    refusal_object(&fixture.run(&fixture.main, &["task", "show", "t-rolledback", "--json"]));
+
+    let update_refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-loose",
+            "--as",
+            "operator",
+            "--title",
+            "Changed",
+            "--sprint",
+            "sp-missing",
+            "--json",
+        ],
+    );
+    refusal_object(&update_refused);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-loose", "--json"])["title"],
+        "Loose"
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "In sprint", "--id", "t-in", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-current",
+            "--body",
+            "Ship 1.2.3\nAcceptance",
+            "--candidate",
+            "t-in",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-current",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let dash = fixture.ok_json(&fixture.main, &["dashboard", "--json"]);
+    let sprint = &dash[0]["currentSprint"];
+    assert_eq!(sprint["targetVersion"], "1.2.3");
+    assert_eq!(sprint["open"], 1);
+    assert_eq!(sprint["done"], 0);
+    assert_eq!(sprint["goal"], "Ship 1.2.3");
+    assert!(sprint["daysRemaining"].as_i64().unwrap() > 0);
+
+    let direct = fixture.run(
+        &fixture.main,
+        &["claim", "t-loose", "--as", "worker", "--json"],
+    );
+    assert!(refusal_object(&direct).contains("--any-sprint"));
+
+    let outgoing = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-loose",
+            "--as",
+            "worker",
+            "--any-sprint",
+            "--json",
+        ],
+    );
+    let lease = outgoing["leaseToken"].as_str().unwrap();
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-loose",
+            "--lease",
+            lease,
+            "--as",
+            "worker",
+            "--summary",
+            "cross-sprint handoff",
+            "--intent",
+            "continue loose work",
+            "--next-action",
+            "accept explicitly",
+            "--reason",
+            "manual",
+            "--json",
+        ],
+    );
+    let handoff_id = handoff["id"].as_str().unwrap();
+    let handoff_refused = fixture.run(
+        &fixture.main,
+        &["handoff", "accept", handoff_id, "--as", "next", "--json"],
+    );
+    assert!(refusal_object(&handoff_refused).contains("--any-sprint"));
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            handoff_id,
+            "--as",
+            "next",
+            "--any-sprint",
+            "--json",
+        ],
+    );
+    assert_eq!(accepted["claim"]["taskID"], "t-loose");
+
+    let started = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban",
+            "--commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tier",
+            "@_p",
+            "--environment",
+            "production",
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--sprint",
+            "sp-current",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(started["sprintID"], "sp-current");
+    assert_eq!(started["targetVersion"], "1.2.3");
+    let deployment = started["id"].as_str().unwrap();
+    let token = started["capabilityToken"].as_str().unwrap();
+    let wrong = fixture.run(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            deployment,
+            "--token",
+            token,
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--receipt",
+            "observed running tier",
+            "--served-commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--served-version",
+            "9.9.9",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&wrong).contains("target version 1.2.3"));
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            deployment,
+            "--token",
+            token,
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--receipt",
+            "observed running tier",
+            "--served-commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--served-version",
+            "1.2.3",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    let no_carry = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-current",
+            "--deployment",
+            deployment,
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&no_carry).contains("--carry-to"));
+    let closed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-current",
+            "--deployment",
+            deployment,
+            "--carry-to",
+            "sp-next",
+            "--carry-note",
+            "unfinished work is explicitly deferred",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(closed["status"], "closed");
+    let next = fixture.ok_json(&fixture.main, &["sprint", "show", "sp-next", "--json"]);
+    assert!(
+        next["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == "t-in")
     );
 }

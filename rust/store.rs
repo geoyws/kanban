@@ -962,12 +962,33 @@ fn deployment_row(row: &Row<'_>) -> rusqlite::Result<DeploymentAttempt> {
         receipt: row.get("receipt")?,
         artifact_uri: row.get("artifact_uri")?,
         served_commit: row.get("served_commit")?,
+        sprint_id: row.get("sprint_id")?,
+        target_version: row.get("target_version")?,
+        served_version: row.get("served_version")?,
         artifacts: artifact_verifications(expected, observed),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
         archived: row.get::<_, i64>("archived")? != 0,
         archived_at: row.get("archived_at")?,
+    })
+}
+
+fn sprint_row(row: &Row<'_>) -> rusqlite::Result<Sprint> {
+    Ok(Sprint {
+        id: row.get("id")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        status: row.get("status")?,
+        target_version: row.get("target_version")?,
+        scheduled_start: row.get("scheduled_start")?,
+        scheduled_end: row.get("scheduled_end")?,
+        starts_at: row.get("starts_at")?,
+        ends_at: row.get("ends_at")?,
+        closed_by_deployment: row.get("closed_by_deployment")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        archived: row.get::<_, i64>("archived")? != 0,
     })
 }
 
@@ -2296,6 +2317,16 @@ pub struct UpdateTask {
     pub dependencies: Option<Vec<String>>,
     /// `None` leaves tags alone; `Some(list)` replaces them wholesale.
     pub tags: Option<Vec<String>>,
+    /// None leaves scope; Some(Some(id)) attaches; Some(None) audits detach.
+    pub sprint: Option<Option<String>>,
+}
+pub struct AcceptHandoffOptions {
+    pub agent: String,
+    pub session: Option<String>,
+    pub lease_ms: i64,
+    pub caller_scope: Option<String>,
+    pub sprint_override: Option<String>,
+    pub git: Option<crate::gitctx::GitContext>,
 }
 
 pub struct ClaimOptions {
@@ -2310,6 +2341,12 @@ pub struct ClaimOptions {
     /// Where the claimer is standing, resolved by the caller so the store stays
     /// free of subprocesses and remains testable without a repository.
     pub git: Option<crate::gitctx::GitContext>,
+    /// The sprint-boundary override (ADR-045 §3): `Some("sp-…")` works
+    /// another sprint's rows deliberately, `Some("any")` is the escape
+    /// hatch that says "I know" in the ledger. `None` scopes the pool to
+    /// the board's current sprint when one exists, and changes nothing on a
+    /// board without one.
+    pub sprint_override: Option<String>,
 }
 
 pub struct Store {
@@ -2320,6 +2357,131 @@ pub struct Store {
     /// no-ops; the managed broker path injects a minted context via
     /// [`Store::open_with_authz`].
     authz: AuthzContext,
+}
+
+/// One named sprint row, from whatever connection holds it.
+fn require_sprint_on(connection: &Connection, id: &str) -> Result<Sprint> {
+    connection
+        .query_row("SELECT * FROM sprints WHERE id=?", [id], sprint_row)
+        .optional()?
+        .with_context(|| format!("sprint {id} does not exist on this board"))
+}
+
+/// The board's current sprint, or none: the boundary a claim is scoped to
+/// (ADR-045 §3) and the one line `kb dash` carries.
+fn current_sprint_on(connection: &Connection) -> Result<Option<Sprint>> {
+    Ok(connection
+        .query_row(
+            "SELECT * FROM sprints WHERE status='current' AND archived=0",
+            [],
+            sprint_row,
+        )
+        .optional()?)
+}
+
+/// A sprint rows may be attached to: not history. Closed and abandoned are
+/// over — attaching work to either would scope nothing, because no claim is
+/// ever bounded by a sprint that ended.
+fn require_attachable_sprint_on(connection: &Connection, id: &str) -> Result<Sprint> {
+    let sprint = require_sprint_on(connection, id)?;
+    if sprint.status == "closed" {
+        bail!(
+            "sprint {id} is closed history; attach the rows to a planned or current sprint \
+             instead"
+        );
+    }
+    if sprint.status == "abandoned" {
+        bail!("sprint {id} is abandoned; attach the rows to a planned or current sprint instead");
+    }
+    Ok(sprint)
+}
+fn carry_sprint_rows(
+    connection: &Connection,
+    from: &str,
+    to: &str,
+    actor: &str,
+    now: i64,
+    rows: &[String],
+) -> Result<()> {
+    for id in rows {
+        connection.execute(
+            concat!("UP", "DATE task_sprints SET sprint_id=?,attached_at=?,attached_by=? WHERE sprint_id=? AND task_id=?"),
+            params![to, now, actor, from, id],
+        )?;
+    }
+    Ok(())
+}
+#[derive(Debug)]
+struct SprintMove {
+    task_id: String,
+    old_sprint_id: Option<String>,
+}
+
+fn attach_scope_on(
+    connection: &Connection,
+    root: &str,
+    sprint: &str,
+    actor: &str,
+    now: i64,
+) -> Result<Vec<SprintMove>> {
+    require_active_task(connection, root)?;
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent_id=tree.id) SELECT tree.id,old.sprint_id FROM tree LEFT JOIN task_sprints old ON old.task_id=tree.id ORDER BY tree.id"
+    )?;
+    let existing = statement
+        .query_map([root], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let moves = existing
+        .into_iter()
+        .filter(|(id, old)| {
+            (id == root && old.as_deref() != Some(sprint)) || (id != root && old.is_none())
+        })
+        .map(|(task_id, old_sprint_id)| SprintMove {
+            task_id,
+            old_sprint_id,
+        })
+        .collect::<Vec<_>>();
+    for moved in &moves {
+        connection.execute(
+            "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET sprint_id=excluded.sprint_id,attached_at=excluded.attached_at,attached_by=excluded.attached_by",
+            params![moved.task_id, sprint, now, actor],
+        )?;
+    }
+    Ok(moves)
+}
+
+/// Resolve a claim's sprint boundary (ADR-045 §3): the filter the candidate
+/// pool is bounded by, and the value the `task_claim` payload records when
+/// the caller crossed a boundary on purpose.
+///
+/// One resolver for the read-only inspection and the atomic writer, so
+/// `claim --candidates` can never show a row `claim --next` refuses.
+fn resolve_claim_sprint(
+    connection: &Connection,
+    sprint_override: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    match sprint_override {
+        // The escape hatch: no filter, and the ledger says "any" out loud.
+        Some("any") => Ok((None, Some("any".to_owned()))),
+        // A named boundary: refused when unknown or abandoned, because a
+        // carry-over needs a live boundary to carry over to. Closed is
+        // allowed — landing a fix against the sprint that just shipped is
+        // exactly what the override exists for.
+        Some(id) => {
+            let sprint = require_sprint_on(connection, id)?;
+            if sprint.status == "abandoned" {
+                bail!("sprint {id} is abandoned");
+            }
+            Ok((Some(id.to_owned()), Some(id.to_owned())))
+        }
+        // No override: the board's current sprint, when it has one. On a
+        // board without one the filter is a no-op and nothing downstream
+        // changes — the byte-identical behaviour ADR-045 §3 promises.
+        None => Ok((current_sprint_on(connection)?.map(|sprint| sprint.id), None)),
+    }
 }
 
 /// The scheduler's single definition of an eligible next task.
@@ -2349,8 +2511,17 @@ fn eligible_claim_candidates(
     connection: &Connection,
     agent: &str,
     options: &ClaimOptions,
+    sprint_filter: Option<&str>,
 ) -> Result<Vec<Task>> {
-    let mut statement = connection.prepare(
+    // The sprint clause is appended only when a boundary exists, so a board
+    // with no current sprint runs the exact SQL it always has — the
+    // byte-identical behaviour ADR-045 §3 makes the success criterion.
+    let sprint_clause = if sprint_filter.is_some() {
+        " AND t.id IN (SELECT task_id FROM task_sprints WHERE sprint_id=?)"
+    } else {
+        ""
+    };
+    let sql = format!(
         // `gated` is the completion gate as a set, computed once: every row
         // carrying an unfinished prerequisite, plus everything beneath it,
         // because a gate declared on a plan is inherited by the work under it.
@@ -2371,12 +2542,22 @@ fn eligible_claim_candidates(
            AND t.archived=0
            AND t.type=?
            AND c.task_id IS NULL
-           AND t.id NOT IN (SELECT id FROM gated)
-         ORDER BY t.priority,t.created_at,t.id",
-    )?;
+           AND t.id NOT IN (SELECT id FROM gated){sprint_clause}
+         ORDER BY t.priority,t.created_at,t.id"
+    );
+    // One clock for both lease joins: `c` and `x` must divide the claim rows
+    // at the same instant, or a lease expiring between the two reads would
+    // count as neither live nor lapsed.
     let now = now_ms();
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(now), Box::new(now), Box::new(CLAIMABLE_TYPE)];
+    if let Some(sprint) = sprint_filter {
+        values.push(Box::new(sprint.to_owned()));
+    }
+    let refs = values.iter().map(|value| value.as_ref());
+    let mut statement = connection.prepare(&sql)?;
     let mut candidates = statement
-        .query_map(params![now, now, CLAIMABLE_TYPE], task_row)?
+        .query_map(params_from_iter(refs), task_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     // Before the routing below reads `assignee`: a lapsed lease left the
@@ -4116,7 +4297,12 @@ impl Store {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub fn add_task(&mut self, input: AddTask) -> Result<Task> {
+        self.add_task_in_sprint(input, None)
+    }
+
+    pub fn add_task_in_sprint(&mut self, input: AddTask, sprint_id: Option<&str>) -> Result<Task> {
         validate(&input.task_type, &TASK_TYPES, "task type")?;
         validate(&input.status, &TASK_STATUSES, "task status")?;
         validate_priority(Some(input.priority))?;
@@ -4181,6 +4367,22 @@ impl Store {
             None,
             Some(&input.status),
         )?;
+        if let Some(sprint) = sprint_id {
+            require_attachable_sprint_on(&transaction, sprint)?;
+            let actor = input.actor.as_deref().unwrap_or("system@cli");
+            let moves = attach_scope_on(&transaction, &id, sprint, actor, now)?;
+            let moved = moves
+                .iter()
+                .map(|moved| moved.task_id.clone())
+                .collect::<Vec<_>>();
+            event(
+                &transaction,
+                Some(&id),
+                "task_sprint_changed",
+                Some(actor),
+                json!({"taskID":id,"oldSprintID":null,"newSprintID":sprint,"moved":moved}),
+            )?;
+        }
         transaction.commit()?;
         self.require_task(&id)
     }
@@ -4697,6 +4899,42 @@ impl Store {
             Some(&actor),
             payload,
         )?;
+        if let Some(sprint) = input.sprint {
+            let old: Option<String> = transaction
+                .query_row(
+                    "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let moved = if let Some(sprint) = sprint.as_deref() {
+                require_attachable_sprint_on(&transaction, sprint)?;
+                let moved = attach_scope_on(&transaction, id, sprint, &actor, now_ms())?;
+                for change in &moved {
+                    let tags = task_tags(&transaction, &change.task_id)?;
+                    self.authz.check_write(&tags, &tags)?;
+                }
+                moved
+            } else {
+                let Some(old_sprint_id) = old else {
+                    bail!("task {id} is not attached to a sprint; there is nothing to clear");
+                };
+                transaction.execute("DELETE FROM task_sprints WHERE task_id=?", [id])?;
+                vec![SprintMove {
+                    task_id: id.to_owned(),
+                    old_sprint_id: Some(old_sprint_id),
+                }]
+            };
+            for change in &moved {
+                event(
+                    &transaction,
+                    Some(&change.task_id),
+                    "task_sprint_changed",
+                    Some(&actor),
+                    json!({"oldSprintID":change.old_sprint_id, "newSprintID":sprint}),
+                )?;
+            }
+        }
         transaction.commit()?;
         self.require_task(id)
     }
@@ -4711,13 +4949,47 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
         expire_claims(&transaction, now)?;
+        // Resolved under the write lock, so the filter the pool is bounded
+        // by and the override the ledger records are one decision — the
+        // boundary exists or it does not, for the pool and the payload alike
+        // (ADR-045 §3).
+        let (sprint_filter, sprint_recorded) =
+            resolve_claim_sprint(&transaction, options.sprint_override.as_deref())?;
         let task = if let Some(id) = id {
-            require_active_task(&transaction, id)?
+            let tags = task_tags(&transaction, id)?;
+            self.authz.check_write(&tags, &tags)?;
+            let task = require_active_task(&transaction, id)?;
+            if let Some(required_sprint) = sprint_filter.as_deref() {
+                let attached: Option<String> = transaction
+                    .query_row(
+                        "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if attached.as_deref() != Some(required_sprint) {
+                    bail!(
+                        "task {id} is not in sprint {required_sprint}; use --sprint with its sprint or --any-sprint to cross the current boundary explicitly"
+                    );
+                }
+            }
+            task
         } else {
-            eligible_claim_candidates(&transaction, &agent, &options)?
-                .into_iter()
-                .next()
-                .context("no claimable task")?
+            let candidates = eligible_claim_candidates(
+                &transaction,
+                &agent,
+                &options,
+                sprint_filter.as_deref(),
+            )?;
+            let mut selected = None;
+            for candidate in candidates {
+                let tags = task_tags(&transaction, &candidate.id)?;
+                if self.authz.check_write(&tags, &tags).is_ok() {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+            selected.context("no claimable task")?
         };
         require_claimable_type(&task.id, &task.task_type)?;
         require_no_draft_ancestor(&transaction, &task.id)?;
@@ -4766,7 +5038,16 @@ impl Store {
             Some(&task.id),
             "task_claimed",
             Some(&agent),
-            json!({"expiresAt": now+options.lease_ms}),
+            // `sprintOverride` rides along only when the caller crossed a
+            // boundary on purpose; a default-scoped claim keeps the payload
+            // byte-identical to a board without sprints (ADR-045 §3).
+            {
+                let mut payload = json!({"expiresAt": now+options.lease_ms});
+                if let Some(recorded) = &sprint_recorded {
+                    payload["sprintOverride"] = json!(recorded);
+                }
+                payload
+            },
             Some(&task.status),
             Some("in_progress"),
         )?;
@@ -4795,8 +5076,12 @@ impl Store {
             .map(|value| validate_registered_tags(&self.connection, &[value.to_owned()], "claim"))
             .transpose()?
             .and_then(|mut values| values.pop());
-        let mut candidates = eligible_claim_candidates(&self.connection, agent, options)?;
+        let (sprint_filter, _) =
+            resolve_claim_sprint(&self.connection, options.sprint_override.as_deref())?;
+        let mut candidates =
+            eligible_claim_candidates(&self.connection, agent, options, sprint_filter.as_deref())?;
         attach_tags(&self.connection, candidates.iter_mut())?;
+        candidates.retain(|candidate| self.authz.permits_read(&candidate.tags));
         if let Some(tag) = tag {
             candidates.retain(|candidate| candidate.tags.contains(&tag));
         }
@@ -5982,13 +6267,17 @@ impl Store {
     pub fn accept_handoff(
         &mut self,
         id: &str,
-        agent: &str,
-        session: Option<String>,
-        lease_ms: i64,
-        caller_scope: Option<&str>,
-        git: Option<crate::gitctx::GitContext>,
+        options: AcceptHandoffOptions,
     ) -> Result<(Handoff, Option<Claim>)> {
-        let agent = nonempty(agent, "agent id")?.to_owned();
+        let AcceptHandoffOptions {
+            agent,
+            session,
+            lease_ms,
+            caller_scope,
+            sprint_override,
+            git,
+        } = options;
+        let agent = nonempty(&agent, "agent id")?.to_owned();
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
         }
@@ -5997,6 +6286,15 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
         expire_claims(&transaction, now)?;
+        let subject: Option<Option<String>> = transaction
+            .query_row("SELECT task_id FROM handoffs WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(Some(task_id)) = subject {
+            let tags = task_tags(&transaction, &task_id)?;
+            self.authz.check_write(&tags, &tags)?;
+        }
         let handoff = transaction
             .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
             .optional()?
@@ -6065,7 +6363,24 @@ impl Store {
         if task.status != "todo" {
             bail!("task {} is {}, not claimable", task.id, task.status);
         }
-        if task.driver_only && caller_scope != Some("driver") {
+        let (sprint_filter, sprint_recorded) =
+            resolve_claim_sprint(&transaction, sprint_override.as_deref())?;
+        if let Some(required_sprint) = sprint_filter.as_deref() {
+            let attached: Option<String> = transaction
+                .query_row(
+                    "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if attached.as_deref() != Some(required_sprint) {
+                bail!(
+                    "task {} is not in sprint {required_sprint}; use --sprint with its sprint or --any-sprint to cross the current boundary explicitly",
+                    task.id
+                );
+            }
+        }
+        if task.driver_only && caller_scope.as_deref() != Some("driver") {
             bail!("task {} is driver-only", task.id);
         }
         require_no_blocking_gates(&transaction, &task.id, GateCaller::Unleased)?;
@@ -6102,7 +6417,13 @@ impl Store {
             Some(&task.id),
             "handoff_accepted",
             Some(&agent),
-            json!({"handoffID":id,"expiresAt":now+lease_ms}),
+            {
+                let mut payload = json!({"handoffID":id,"expiresAt":now+lease_ms});
+                if let Some(value) = sprint_recorded {
+                    payload["sprintOverride"] = json!(value);
+                }
+                payload
+            },
             Some(&task.status),
             Some("in_progress"),
         )?;
@@ -6520,9 +6841,41 @@ impl Store {
             handoffs,
             rules: Vec::new(),
             sitreps,
+            // Which release this work is heading toward (ADR-045 §5), read
+            // straight off the row's own attachment: the packet is what a
+            // resuming agent reads, and the boundary is part of the work.
+            sprint: self.context_sprint(id)?,
             generated_at: now_ms(),
             truncated,
         })
+    }
+
+    /// The sprint summary a context packet carries: id, status, version,
+    /// title and the goal headline (ADR-045 §5). `None` when the task is
+    /// unattached.
+    fn context_sprint(&self, task_id: &str) -> Result<Option<ContextSprint>> {
+        let attached: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(id) = attached else {
+            return Ok(None);
+        };
+        // Missing here means a dangling FK, which the schema says cannot
+        // happen — surfaced rather than read as "no sprint".
+        let sprint = require_sprint_on(&self.connection, &id)?;
+        Ok(Some(ContextSprint {
+            sprint_id: sprint.id,
+            status: sprint.status,
+            target_version: sprint.target_version,
+            title: sprint.title,
+            goal: crate::model::sprint_goal(sprint.body.as_deref()).map(str::to_owned),
+        }))
     }
 
     /// SQLite's own integrity verdict. Board scope: the strings are page and
@@ -6668,6 +7021,15 @@ impl Store {
         if let Some(task_id) = input.task_id.as_deref() {
             require_task(&transaction, task_id)?;
         }
+        let deployment_target_version = if let Some(sprint_id) = input.sprint_id.as_deref() {
+            let sprint = require_sprint_on(&transaction, sprint_id)?;
+            if sprint.status == "abandoned" {
+                bail!("sprint {sprint_id} is abandoned");
+            }
+            Some(sprint.target_version)
+        } else {
+            None
+        };
         if let Some(retry_of) = input.retry_of.as_deref() {
             let status: Option<String> = transaction
                 .query_row(
@@ -6720,7 +7082,9 @@ impl Store {
                     && deployment.mechanism == input.mechanism
                     && deployment.retry_of == input.retry_of
                     && deployment.actor == actor
-                    && deployment.lane == input.lane;
+                    && deployment.lane == input.lane
+                    && deployment.sprint_id == input.sprint_id
+                    && deployment.target_version == deployment_target_version;
                 if !same {
                     bail!(
                         "operation id {operation_id} already names a different deployment attempt"
@@ -6739,15 +7103,15 @@ impl Store {
         let capability_token = Uuid::new_v4().to_string();
         let now = now_ms();
         transaction.execute(
-            "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,actor,lane,capability_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'started',?,?,?,?,?)",
-            params![id,input.task_id,repo,identity_mode,build_commit,deployer_checkout,expected_json,input.branch,input.tier,environment,host,url,input.mechanism,input.operation_id,input.retry_of,actor,input.lane,capability_token,now,now],
+            "INSERT INTO deployments(id,task_id,repo,identity_mode,commit_sha,deployer_checkout,expected_artifacts,branch,tier,environment,host,url,mechanism,operation_id,retry_of,status,actor,lane,capability_token,created_at,updated_at,sprint_id,target_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'started',?,?,?,?,?,?,?)",
+            params![id,input.task_id,repo,identity_mode,build_commit,deployer_checkout,expected_json,input.branch,input.tier,environment,host,url,input.mechanism,input.operation_id,input.retry_of,actor,input.lane,capability_token,now,now,input.sprint_id,deployment_target_version],
         )?;
         event(
             &transaction,
             input.task_id.as_deref(),
             "deployment_started",
             Some(&actor),
-            json!({"deploymentID":id,"repo":repo,"identityMode":identity_mode,"buildCommit":build_commit,"deployerCheckout":deployer_checkout,"expectedArtifacts":expected,"tier":input.tier,"environment":environment,"host":host,"url":url,"retryOf":input.retry_of}),
+            json!({"deploymentID":id,"repo":repo,"identityMode":identity_mode,"buildCommit":build_commit,"deployerCheckout":deployer_checkout,"expectedArtifacts":expected,"tier":input.tier,"environment":environment,"host":host,"url":url,"retryOf":input.retry_of,"sprintID":input.sprint_id,"targetVersion":deployment_target_version}),
         )?;
         let deployment = transaction.query_row(
             "SELECT * FROM deployments WHERE id=?",
@@ -6902,6 +7266,11 @@ impl Store {
             .as_deref()
             .map(|value| full_commit(value, "served commit"))
             .transpose()?;
+        let served_version = input
+            .served_version
+            .as_deref()
+            .map(target_version)
+            .transpose()?;
         if input.result == "succeeded" && phase != "verification" {
             bail!("a succeeded deployment requires --phase verification");
         }
@@ -6909,15 +7278,23 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let subject_tags = deployment_subject_tags_on(&transaction, &input.id)?;
         self.authz.check_write(&subject_tags, &subject_tags)?;
-        let current: (String, String, String, String, Option<String>) = transaction
+        let current: (String, String, String, String, Option<String>, Option<String>, Option<String>) = transaction
             .query_row(
-                "SELECT status,capability_token,identity_mode,commit_sha,expected_artifacts FROM deployments WHERE id=?",
+                "SELECT status,capability_token,identity_mode,commit_sha,expected_artifacts,sprint_id,target_version FROM deployments WHERE id=?",
                 [&input.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .optional()?
             .with_context(|| format!("deployment {} not found", input.id))?;
-        let (status, token, identity_mode, build_commit, expected_json) = current;
+        let (
+            status,
+            token,
+            identity_mode,
+            build_commit,
+            expected_json,
+            sprint_id,
+            deployment_target_version,
+        ) = current;
         if status != "started" {
             bail!("deployment {} is already {}", input.id, status);
         }
@@ -6961,10 +7338,33 @@ impl Store {
         {
             bail!("served commit must exactly match the requested deployment commit");
         }
+        if input.result == "succeeded" {
+            match (
+                sprint_id.as_deref(),
+                deployment_target_version.as_deref(),
+                served_version.as_deref(),
+            ) {
+                (Some(_), Some(expected), Some(served)) if expected == served => {}
+                (Some(sprint_id), Some(expected), Some(served)) => bail!(
+                    "deployment {} is bound to sprint {sprint_id} target version {expected}, but served version {served} was observed",
+                    input.id
+                ),
+                (Some(sprint_id), Some(expected), None) => bail!(
+                    "deployment {} is bound to sprint {sprint_id} target version {expected}; successful verification requires --served-version {expected}",
+                    input.id
+                ),
+                (None, _, Some(_)) => {
+                    bail!("--served-version requires a deployment started with --sprint")
+                }
+                _ => {}
+            }
+        } else if served_version.is_some() {
+            bail!("--served-version is proof for a succeeded verification deployment only");
+        }
         let now = now_ms();
         transaction.execute(
-            "UPDATE deployments SET status=?,phase=?,receipt=?,artifact_uri=?,served_commit=?,observed_artifacts=?,updated_at=?,completed_at=? WHERE id=?",
-            params![input.result,input.phase,input.receipt,input.artifact_uri,served_commit,observed_json,now,now,input.id],
+            "UPDATE deployments SET status=?,phase=?,receipt=?,artifact_uri=?,served_commit=?,served_version=?,observed_artifacts=?,updated_at=?,completed_at=? WHERE id=?",
+            params![input.result,input.phase,input.receipt,input.artifact_uri,served_commit,served_version,observed_json,now,now,input.id],
         )?;
         let task_id: Option<String> = transaction.query_row(
             "SELECT task_id FROM deployments WHERE id=?",
@@ -7043,8 +7443,631 @@ impl Store {
         Ok(deployment)
     }
 
+    /// Open a sprint. The row starts `planned`; `start` makes it the
+    /// boundary, `close` ends it on proof, `abandon` ends it on a note
+    /// (ADR-045 §2).
+    pub fn create_sprint(&mut self, input: NewSprint) -> Result<Sprint> {
+        let title = nonempty(&input.title, "sprint title")?.to_owned();
+        let target_version = target_version(&input.target_version)?;
+        let actor = nonempty(&input.actor, "actor")?.to_owned();
+        if input.scheduled_start < 0 || input.scheduled_end < input.scheduled_start {
+            bail!("sprint schedule requires non-negative --start and --end at or after --start");
+        }
+        if let Some(body) = input.body.as_deref() {
+            nonempty(body, "sprint body")?;
+        }
+        let transaction = self.begin_write()?;
+        // A sprint carries no tags of its own: board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
+        let now = now_ms();
+        let id = match input.id {
+            Some(value) => {
+                let value = subscription_identifier(&value, "sprint id", 64)?;
+                if value.strip_prefix("sp-").is_none_or(str::is_empty) {
+                    bail!("sprint id must start with sp- and include a suffix");
+                }
+                value
+            }
+            None => format!("sp-{}", &Uuid::new_v4().simple().to_string()[..8]),
+        };
+        transaction.execute(
+            "INSERT INTO sprints(id,title,body,status,target_version,scheduled_start,scheduled_end,starts_at,ends_at,closed_by_deployment,created_at,updated_at) \
+             VALUES(?,?,?,'planned',?,?,?,0,NULL,NULL,?,?)",
+            params![id, title, input.body, target_version, input.scheduled_start, input.scheduled_end, now, now],
+        )?;
+        event(
+            &transaction,
+            None,
+            "sprint_created",
+            Some(&actor),
+            json!({"sprintID": id, "title": title, "targetVersion": target_version, "scheduledStart": input.scheduled_start, "scheduledEnd": input.scheduled_end}),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM sprints WHERE id=?", [&id], sprint_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Author the sprint's goal and success criteria. Status stays
+    /// `planned` — planning writes the card, not the boundary (ADR-045 §2).
+    pub fn plan_sprint(
+        &mut self,
+        id: &str,
+        body: &str,
+        candidates: &[String],
+        parent_epic: Option<&str>,
+        empty_scope: bool,
+        actor: &str,
+    ) -> Result<Sprint> {
+        let body = nonempty(body, "sprint body")?.to_owned();
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self.begin_write()?;
+        self.authz.check_write(&[], &[])?;
+        let existing = require_sprint_on(&transaction, id)?;
+        if existing.status == "closed" {
+            bail!("sprint {id} is closed history; its card cannot be rewritten");
+        }
+        if existing.status == "abandoned" {
+            bail!(
+                "sprint {id} is abandoned; open a new sprint instead of rewriting this one — \
+                 the goal it never met is part of the record"
+            );
+        }
+        if existing.status == "current" {
+            bail!(
+                "sprint {id} is current and cannot be replanned; close or abandon it before planning another sprint"
+            );
+        }
+        let mut scope = candidates.to_vec();
+        if let Some(parent) = parent_epic {
+            let parent_tags = task_tags(&transaction, parent)?;
+            self.authz.check_write(&parent_tags, &parent_tags)?;
+            let task = require_active_task(&transaction, parent)?;
+            if task.task_type != "epic" {
+                bail!(
+                    "sprint plan --parent-epic requires an epic, but {parent} is a {}",
+                    task.task_type
+                );
+            }
+            scope.push(parent.to_owned());
+        }
+        scope.sort();
+        scope.dedup();
+        let existing_scope: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_sprints WHERE sprint_id=?)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if empty_scope && (!scope.is_empty() || existing_scope != 0) {
+            bail!(
+                "--empty-scope cannot be combined with candidate, parent epic, or existing sprint scope"
+            );
+        }
+        if !empty_scope && scope.is_empty() && existing_scope == 0 {
+            bail!(
+                "sprint plan requires --candidate, --parent-epic, existing explicit scope, or --empty-scope"
+            );
+        }
+        let now = now_ms();
+        let mut attached = Vec::new();
+        for root in &scope {
+            let root_tags = task_tags(&transaction, root)?;
+            self.authz.check_write(&root_tags, &root_tags)?;
+            attached.extend(attach_scope_on(&transaction, root, id, &actor, now)?);
+        }
+        for change in &attached {
+            let tags = task_tags(&transaction, &change.task_id)?;
+            self.authz.check_write(&tags, &tags)?;
+            event(
+                &transaction,
+                Some(&change.task_id),
+                "task_sprint_changed",
+                Some(&actor),
+                json!({"oldSprintID":change.old_sprint_id,"newSprintID":id,"planned":true}),
+            )?;
+        }
+        transaction.execute(
+            "UPDATE sprints SET body=?,updated_at=? WHERE id=?",
+            params![body, now, id],
+        )?;
+        event(
+            &transaction,
+            None,
+            "sprint_planned",
+            Some(&actor),
+            json!({"sprintID": id, "previousBody": existing.body, "emptyScope": empty_scope}),
+        )?;
+        let result = transaction.query_row("SELECT * FROM sprints WHERE id=?", [id], sprint_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// planned -> current: this sprint becomes the boundary every claim is
+    /// scoped to. Refused while another sprint is current, because the
+    /// boundary must be unambiguous — and the `one_current_sprint` index
+    /// holds the same rule even against a bug here (ADR-045 §1).
+    pub fn start_sprint(&mut self, id: &str, actor: &str) -> Result<Sprint> {
+        let transaction = self.begin_write()?;
+        self.authz.check_write(&[], &[])?;
+        let existing = require_sprint_on(&transaction, id)?;
+        if existing.status == "closed" {
+            bail!("sprint {id} is closed history; its card cannot be rewritten");
+        }
+        if existing.status == "abandoned" {
+            bail!("sprint {id} is abandoned; open a new sprint instead of starting this one");
+        }
+        if existing.status == "current" {
+            bail!("sprint {id} is already current");
+        }
+        if crate::model::sprint_goal(existing.body.as_deref()).is_none() {
+            bail!("sprint {id} has no recorded goal and criteria; run sprint plan first");
+        }
+        let has_plan: i64 = transaction.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='sprint_planned' AND json_extract(payload,'$.sprintID')=?)", [id], |row| row.get(0))?;
+        if has_plan == 0 {
+            bail!("sprint {id} has not been planned; run sprint plan first");
+        }
+        let has_scope: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_sprints WHERE sprint_id=?)",
+            [id],
+            |row| row.get(0),
+        )?;
+        let deliberately_empty: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE kind='sprint_planned' AND json_extract(payload,'$.sprintID')=? AND json_extract(payload,'$.emptyScope')=1)", [id], |row| row.get(0)
+        )?;
+        if has_scope == 0 && deliberately_empty == 0 {
+            bail!(
+                "sprint {id} has no deliberate scope; plan candidates, a parent epic, or --empty-scope before starting"
+            );
+        }
+        // Under the write lock this check is authoritative; the index below
+        // is the invariant, so the rule cannot fail open either way.
+        if let Some(current) = current_sprint_on(&transaction)? {
+            bail!(
+                "sprint {} is current; close or abandon it before starting {id}",
+                current.id
+            );
+        }
+        let now = now_ms();
+        match transaction.execute(
+            "UPDATE sprints SET status='current',starts_at=?,updated_at=? WHERE id=?",
+            params![now, now, id],
+        ) {
+            Ok(_) => {}
+            // The partial unique index firing here means the check above
+            // raced something it cannot race under BEGIN IMMEDIATE; answer
+            // with the same refusal anyway, naming the holder it names.
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation
+                    && error.to_string().contains("one_current_sprint") =>
+            {
+                let current = current_sprint_on(&transaction)?
+                    .expect("the index fired, so a current sprint exists");
+                bail!(
+                    "sprint {} is current; close or abandon it before starting {id}",
+                    current.id
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        event(
+            &transaction,
+            None,
+            "sprint_started",
+            Some(actor),
+            json!({"sprintID": id, "startsAt": now, "previousStatus": existing.status}),
+        )?;
+        let result = transaction.query_row("SELECT * FROM sprints WHERE id=?", [id], sprint_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Close the current sprint on typed, version-matched served proof. Any
+    /// unfinished attached rows must be moved atomically to one named sprint
+    /// with an audit note; close never rolls work over implicitly.
+    pub fn close_sprint(
+        &mut self,
+        id: &str,
+        deployment_id: Option<&str>,
+        carry_to: Option<&str>,
+        carry_note: Option<&str>,
+        actor: &str,
+    ) -> Result<Sprint> {
+        let deployment_id = deployment_id.context(
+            "sprint close requires --deployment d-…: the version is served or the sprint is not done",
+        )?;
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self.begin_write()?;
+        self.authz.check_write(&[], &[])?;
+        let existing = require_sprint_on(&transaction, id)?;
+        match existing.status.as_str() {
+            "closed" => bail!("sprint {id} is closed history; its card cannot be rewritten"),
+            "abandoned" => bail!("sprint {id} is abandoned; it cannot be closed"),
+            "planned" => bail!("sprint {id} is planned, not current; start it before closing it"),
+            _ => {}
+        }
+        let proof_tags = deployment_subject_tags_on(&transaction, deployment_id)?;
+        self.authz.check_write(&proof_tags, &proof_tags)?;
+        let proof = transaction
+            .query_row(
+                "SELECT * FROM deployments WHERE id=?",
+                [deployment_id],
+                deployment_row,
+            )
+            .optional()?
+            .with_context(|| format!("deployment {deployment_id} not found"))?;
+        if proof.status != "succeeded" || proof.phase.as_deref() != Some("verification") {
+            bail!(
+                "sprint {id} cannot close on {deployment_id}: that attempt is {} ({}); \
+                 a sprint closes only on a succeeded verification-phase deployment",
+                proof.status,
+                proof.phase.as_deref().unwrap_or("no phase"),
+            );
+        }
+        if proof.sprint_id.as_deref() != Some(id)
+            || proof.target_version.as_deref() != Some(existing.target_version.as_str())
+            || proof.served_version.as_deref() != Some(existing.target_version.as_str())
+        {
+            bail!(
+                "sprint {id} cannot close on {deployment_id}: proof must be bound to this sprint and served version {}",
+                existing.target_version
+            );
+        }
+        let mut statement = transaction.prepare(
+            "SELECT t.id,t.status FROM tasks t JOIN task_sprints ts ON ts.task_id=t.id WHERE ts.sprint_id=? AND t.archived=0 ORDER BY t.id",
+        )?;
+        let sprint_rows = statement
+            .query_map([id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (row_id, _) in &sprint_rows {
+            let tags = task_tags(&transaction, row_id)?;
+            self.authz.check_write(&tags, &tags)?;
+        }
+        let open_rows = sprint_rows
+            .into_iter()
+            .filter_map(|(id, status)| {
+                (!matches!(status.as_str(), "done" | "cancelled")).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        let carry = if open_rows.is_empty() {
+            if carry_to.is_some() || carry_note.is_some() {
+                bail!("sprint {id} has no unfinished rows to carry over");
+            }
+            None
+        } else {
+            let destination = carry_to.context(format!("sprint {id} has {} unfinished row(s); close requires --carry-to sp-… and --carry-note TEXT", open_rows.len()))?;
+            let note = nonempty(carry_note.unwrap_or(""), "carry-over note")?;
+            if destination == id {
+                bail!("carry-over destination must be a different sprint");
+            }
+            require_attachable_sprint_on(&transaction, destination)?;
+            Some((destination, note))
+        };
+        let now = now_ms();
+        if let Some((destination, note)) = carry {
+            carry_sprint_rows(&transaction, id, destination, &actor, now, &open_rows)?;
+            for row_id in &open_rows {
+                event(
+                    &transaction,
+                    Some(row_id),
+                    "task_sprint_changed",
+                    Some(&actor),
+                    json!({"oldSprintID":id,"newSprintID":destination,"carryNote":note}),
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE sprints SET status='closed',ends_at=?,closed_by_deployment=?,updated_at=? \
+             WHERE id=?",
+            params![now, deployment_id, now, id],
+        )?;
+        event(
+            &transaction,
+            None,
+            "sprint_closed",
+            Some(&actor),
+            json!({
+                "sprintID": id,
+                "deploymentID": deployment_id,
+                "targetVersion": existing.target_version,
+                "previousStatus": existing.status,
+            }),
+        )?;
+        let result = transaction.query_row("SELECT * FROM sprints WHERE id=?", [id], sprint_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Any non-closed status -> abandoned, with a note. "Later" with no
+    /// stated reason is how a boundary silently stops existing — the same
+    /// rule a defer consequence answers (ADR-045 §2, ADR-042 §7).
+    pub fn abandon_sprint(&mut self, id: &str, note: &str, actor: &str) -> Result<Sprint> {
+        let note = nonempty(note, "abandon note")?.to_owned();
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self.begin_write()?;
+        self.authz.check_write(&[], &[])?;
+        let existing = require_sprint_on(&transaction, id)?;
+        if existing.status == "closed" {
+            bail!("sprint {id} is closed history; its card cannot be rewritten");
+        }
+        if existing.status == "abandoned" {
+            bail!("sprint {id} is already abandoned");
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE sprints SET status='abandoned',ends_at=?,updated_at=? WHERE id=?",
+            params![now, now, id],
+        )?;
+        event(
+            &transaction,
+            None,
+            "sprint_abandoned",
+            Some(&actor),
+            json!({"sprintID": id, "note": note, "previousStatus": existing.status}),
+        )?;
+        let result = transaction.query_row("SELECT * FROM sprints WHERE id=?", [id], sprint_row)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Sprint rows, newest first. With no `--status` the closed and
+    /// abandoned ones stay hidden — history, not a queue — unless `all`
+    /// asks for them (ADR-045 §2).
+    pub fn sprints(&self, status: Option<&str>, all: bool, limit: i64) -> Result<Vec<Sprint>> {
+        if let Some(value) = status {
+            validate(value, &SPRINT_STATUSES, "sprint status")?;
+        }
+        self.authz.check_read(&[])?;
+        let mut sql = String::from("SELECT * FROM sprints WHERE 1=1");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !all {
+            sql.push_str(" AND archived=0");
+        }
+        match status {
+            Some(value) => {
+                sql.push_str(" AND status=?");
+                values.push(Box::new(value.to_owned()));
+            }
+            // The default view answers "what is live or coming": a closed
+            // sprint is a receipt, not a plan.
+            None if !all => sql.push_str(" AND status IN ('planned','current')"),
+            None => {}
+        }
+        sql.push_str(" ORDER BY created_at DESC,id DESC LIMIT ?");
+        values.push(Box::new(limit));
+        let refs = values.iter().map(|value| value.as_ref());
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(refs), sprint_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One named sprint row. Board scope: the row carries no tags of its own.
+    pub fn require_sprint(&self, id: &str) -> Result<Sprint> {
+        self.authz.check_read(&[])?;
+        require_sprint_on(&self.connection, id)
+    }
+
+    /// The board's current sprint — the boundary a claim is scoped to and
+    /// `kb dash` reports. `None` on a board that has not opened one, where
+    /// every claim behaviour is byte-identical to a board without sprints
+    /// (ADR-045 §3).
+    pub fn current_sprint(&self) -> Result<Option<Sprint>> {
+        self.authz.check_read(&[])?;
+        current_sprint_on(&self.connection)
+    }
+
+    /// The task rows attached to a sprint — `sprint cat`'s "its rows", in
+    /// the listing's own order.
+    pub fn sprint_tasks(&self, sprint_id: &str) -> Result<Vec<Task>> {
+        self.authz.check_read(&[])?;
+        require_sprint_on(&self.connection, sprint_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT t.* FROM tasks t JOIN task_sprints s ON s.task_id=t.id \
+             WHERE s.sprint_id=? AND t.archived=0 \
+             ORDER BY t.priority,t.created_at,t.id",
+        )?;
+        let mut rows = statement
+            .query_map([sprint_id], task_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_tags(&self.connection, rows.iter_mut())?;
+        rows.retain(|task| self.authz.permits_read(&task.tags));
+        apply_lapsed_leases(&self.connection, rows.iter_mut())?;
+        Ok(rows)
+    }
+
+    /// Count only rows visible to this caller; hidden tagged scope contributes
+    /// neither content nor aggregate existence.
+    pub fn sprint_task_counts(&self, sprint_id: &str) -> Result<(i64, i64)> {
+        self.authz.check_read(&[])?;
+        require_sprint_on(&self.connection, sprint_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT t.id,t.status FROM tasks t JOIN task_sprints s ON s.task_id=t.id WHERE s.sprint_id=? AND t.archived=0"
+        )?;
+        let rows = statement
+            .query_map([sprint_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut open = 0;
+        let mut done = 0;
+        for (id, status) in rows {
+            if !self.authz.permits_read(&task_tags(&self.connection, &id)?) {
+                continue;
+            }
+            if status == "done" {
+                done += 1;
+            } else if status != "cancelled" {
+                open += 1;
+            }
+        }
+        Ok((open, done))
+    }
+
+    /// Attach a task to a sprint. Attaching a container carries its subtree:
+    /// every descendant not already inside another sprint joins, and the one
+    /// event names the full set, so the audit trail is the scope (ADR-045
+    /// §2). The named row itself always moves — a carry-over after close is
+    /// exactly this.
+    #[cfg(test)]
+    pub fn attach_sprint(
+        &mut self,
+        task_id: &str,
+        sprint_id: &str,
+        actor: &str,
+    ) -> Result<TaskSprintReceipt> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self.begin_write()?;
+        let root_tags = task_tags(&transaction, task_id)?;
+        self.authz.check_write(&root_tags, &root_tags)?;
+        require_active_task(&transaction, task_id)?;
+        require_attachable_sprint_on(&transaction, sprint_id)?;
+        // The subtree, breadth-first so the receipt reads parent-first; the
+        // seen-set terminates a malformed parent cycle the way the gate's
+        // recursive CTE does.
+        let mut subtree = vec![task_id.to_owned()];
+        let mut seen = std::collections::BTreeSet::from([task_id.to_owned()]);
+        let mut cursor = 0;
+        while cursor < subtree.len() {
+            let parent = subtree[cursor].clone();
+            cursor += 1;
+            let mut statement =
+                transaction.prepare("SELECT id FROM tasks WHERE parent_id=? ORDER BY id")?;
+            let children: Vec<String> = statement
+                .query_map([&parent], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(statement);
+            for child in children {
+                if seen.insert(child.clone()) {
+                    subtree.push(child);
+                }
+            }
+        }
+        // The named row moves; a descendant joins only when unattached — a
+        // row that moved itself to another sprint stays where it put itself.
+        let old_sprint_id: Option<String> = transaction
+            .query_row(
+                "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let mut moved = Vec::new();
+        if old_sprint_id.as_deref() != Some(sprint_id) {
+            moved.push(task_id.to_owned());
+        }
+        for id in &subtree[1..] {
+            let attached: Option<String> = transaction
+                .query_row(
+                    "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if attached.is_none() {
+                moved.push(id.clone());
+            }
+        }
+        if moved.is_empty() {
+            bail!(
+                "task {task_id} and its subtree are already attached to sprint {sprint_id}; \
+                 there is nothing to attach"
+            );
+        }
+        // Attachment moves rows between scopes, so each moved row is checked
+        // against its own tags — old set equals new set, because attaching
+        // does not retag (the reopen_attention precedent).
+        for id in &moved {
+            let tags = task_tags(&transaction, id)?;
+            self.authz.check_write(&tags, &tags)?;
+        }
+        let now = now_ms();
+        for id in &moved {
+            // An upsert rather than a bare insert: the named row may be
+            // carrying over from another sprint, which is a replace, while a
+            // joining descendant is a plain insert — the PK on task_id makes
+            // one statement hold both (ADR-045 §2 carry-over).
+            transaction.execute(
+                "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                 VALUES(?,?,?,?) \
+                 ON CONFLICT(task_id) DO UPDATE SET \
+                 sprint_id=excluded.sprint_id,attached_at=excluded.attached_at,\
+                 attached_by=excluded.attached_by",
+                params![id, sprint_id, now, actor],
+            )?;
+        }
+        for moved_id in &moved {
+            event(
+                &transaction,
+                Some(moved_id),
+                "task_sprint_changed",
+                Some(&actor),
+                json!({"oldSprintID": if moved_id == task_id { old_sprint_id.as_ref() } else { None }, "newSprintID": sprint_id}),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(TaskSprintReceipt {
+            task_id: task_id.to_owned(),
+            old_sprint_id,
+            new_sprint_id: Some(sprint_id.to_owned()),
+            moved,
+        })
+    }
+
+    /// Clear one row's sprint attachment. Explicit, audited, never
+    /// recursive, never a side effect — a subtree detaches row by row, by
+    /// the operator's hand (ADR-045 §2).
+    #[cfg(test)]
+    pub fn detach_sprint(&mut self, task_id: &str, actor: &str) -> Result<TaskSprintReceipt> {
+        let actor = nonempty(actor, "actor")?.to_owned();
+        let transaction = self.begin_write()?;
+        let root_tags = task_tags(&transaction, task_id)?;
+        self.authz.check_write(&root_tags, &root_tags)?;
+        require_active_task(&transaction, task_id)?;
+        let old_sprint_id: Option<String> = transaction
+            .query_row(
+                "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(old_sprint_id) = old_sprint_id else {
+            bail!("task {task_id} is not attached to a sprint; there is nothing to clear");
+        };
+        // Detaching does not retag: old set equals new set, under the lock.
+        let tags = task_tags(&transaction, task_id)?;
+        self.authz.check_write(&tags, &tags)?;
+        transaction.execute("DELETE FROM task_sprints WHERE task_id=?", [task_id])?;
+        event(
+            &transaction,
+            Some(task_id),
+            "task_sprint_changed",
+            Some(&actor),
+            json!({
+                "taskID": task_id,
+                "oldSprintID": old_sprint_id,
+                "newSprintID": null,
+                "moved": [task_id],
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(TaskSprintReceipt {
+            task_id: task_id.to_owned(),
+            old_sprint_id: Some(old_sprint_id),
+            new_sprint_id: None,
+            moved: vec![task_id.to_owned()],
+        })
+    }
+
     /// Move settled history out of operational views and secondary indexes.
-    ///
     /// Rows stay in the same SQLite file and remain readable through `--all`.
     /// This is intentionally an explicit sweep: opening or reading a board must
     /// never mutate it merely because wall-clock time passed.
@@ -7297,6 +8320,7 @@ mod tests {
             caller_scope: None,
             cross_lane: false,
             allow_reassign: false,
+            sprint_override: None,
             git: None,
         }
     }
@@ -7600,7 +8624,17 @@ mod tests {
         );
         assert_denied(store.create_handoff(handoff_input()), "handoff create");
         assert_denied(
-            store.accept_handoff("h-x", "agent", None, 60_000, None, None),
+            store.accept_handoff(
+                "h-x",
+                AcceptHandoffOptions {
+                    agent: "agent".into(),
+                    session: None,
+                    lease_ms: 60_000,
+                    caller_scope: None,
+                    sprint_override: None,
+                    git: None,
+                },
+            ),
             "handoff accept",
         );
         assert_denied(
@@ -10948,6 +11982,7 @@ mod tests {
                         caller_scope: None,
                         cross_lane: false,
                         allow_reassign: false,
+                        sprint_override: None,
                         git: None,
                     },
                 )
@@ -11022,6 +12057,7 @@ mod tests {
                     caller_scope: None,
                     cross_lane: false,
                     allow_reassign: false,
+                    sprint_override: None,
                     git: None,
                 },
             )
@@ -11627,6 +12663,7 @@ mod tests {
                     retry_of: None,
                     actor: "geoyws".to_owned(),
                     lane: None,
+                    sprint_id: None,
                 })
                 .expect("start the attempt")
         };
@@ -11663,6 +12700,7 @@ mod tests {
             served_commit: None,
             observed: Vec::new(),
             actor: "geoyws".to_owned(),
+            served_version: None,
         }
     }
 
@@ -11758,5 +12796,791 @@ mod tests {
         let live = store.current_deployments().unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].build_commit_label, UNKNOWN_BUILD_COMMIT_WORDS);
+    }
+
+    /// A board with sprints enabled, ready for sprint work.
+    fn sprint_store(name: &str) -> Store {
+        let mut store = test_store(name);
+        store.initialize(name, "test@driver").unwrap();
+        store
+    }
+
+    fn new_sprint(id: &str, version: &str) -> NewSprint {
+        NewSprint {
+            id: Some(id.to_owned()),
+            title: format!("{id} fixture"),
+            body: Some("Fixture goal\nFixture acceptance criteria".to_owned()),
+            target_version: version.to_owned(),
+            scheduled_start: 0,
+            scheduled_end: i64::MAX,
+            actor: "geoyws".to_owned(),
+        }
+    }
+    fn plan_empty(store: &mut Store, id: &str) {
+        store
+            .plan_sprint(
+                id,
+                "Fixture goal\nFixture acceptance criteria",
+                &[],
+                None,
+                true,
+                "geoyws",
+            )
+            .unwrap();
+    }
+
+    fn task_sprint_id(store: &Store, id: &str) -> Option<String> {
+        store
+            .connection
+            .query_row(
+                "SELECT sprint_id FROM task_sprints WHERE task_id=?",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten()
+    }
+
+    fn last_event_payload(store: &Store, kind: &str) -> Value {
+        store
+            .connection
+            .query_row(
+                "SELECT payload FROM events WHERE kind=? ORDER BY seq DESC LIMIT 1",
+                [kind],
+                |row| {
+                    let text: String = row.get(0)?;
+                    Ok(serde_json::from_str(&text)
+                        .expect("the events table stores valid JSON payloads"))
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn starting_a_second_current_sprint_is_refused_naming_the_holder() {
+        let mut store = sprint_store("sprint-one-current");
+        store
+            .create_sprint(new_sprint("sp-first", "0.1.0"))
+            .unwrap();
+        plan_empty(&mut store, "sp-first");
+        store.start_sprint("sp-first", "geoyws").unwrap();
+        let before_events: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let before_body = store.require_sprint("sp-first").unwrap().body;
+        let refusal = error_string(store.plan_sprint(
+            "sp-first",
+            "replacement goal\ncriteria",
+            &[],
+            None,
+            true,
+            "geoyws",
+        ));
+        assert!(
+            refusal.contains("current and cannot be replanned"),
+            "{refusal}"
+        );
+        assert_eq!(store.require_sprint("sp-first").unwrap().body, before_body);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            before_events
+        );
+        store
+            .create_sprint(new_sprint("sp-second", "0.2.0"))
+            .unwrap();
+        plan_empty(&mut store, "sp-second");
+        assert_eq!(
+            error_string(store.start_sprint("sp-second", "geoyws")),
+            "sprint sp-first is current; close or abandon it before starting sp-second"
+        );
+        // The refused start left the row planned, and closing out the first
+        // opens the way.
+        assert_eq!(store.require_sprint("sp-second").unwrap().status, "planned");
+        store
+            .abandon_sprint("sp-first", "the boundary moved", "geoyws")
+            .unwrap();
+        store.start_sprint("sp-second", "geoyws").unwrap();
+        assert_eq!(store.require_sprint("sp-second").unwrap().status, "current");
+        assert!(store.require_sprint("sp-second").unwrap().starts_at > 0);
+    }
+
+    #[test]
+    fn a_sprint_closes_only_on_a_succeeded_verification_deployment() {
+        let mut store = sprint_store("sprint-close-gate");
+        store
+            .create_sprint(new_sprint("sp-close", "0.4.0"))
+            .unwrap();
+        plan_empty(&mut store, "sp-close");
+        store.start_sprint("sp-close", "geoyws").unwrap();
+
+        // ADR-045 §2 refusal 3: no proof offered at all.
+        assert_eq!(
+            error_string(store.close_sprint("sp-close", None, None, None, "geoyws")),
+            "sprint close requires --deployment d-…: the version is served or the sprint is not done"
+        );
+
+        // A started attempt is not proof: refusal 2, verbatim.
+        let started = store
+            .start_deployment(StartDeployment {
+                task_id: None,
+                repo: "geoyws/legacy-stack".to_owned(),
+                identity: DeployIdentity::Git("a".repeat(40)),
+                deployer_checkout: None,
+                branch: None,
+                tier: "@_p".to_owned(),
+                environment: "production".to_owned(),
+                host: "hax".to_owned(),
+                url: "https://legacy.geoy.ws".to_owned(),
+                mechanism: None,
+                operation_id: None,
+                retry_of: None,
+                actor: "geoyws".to_owned(),
+                lane: None,
+                sprint_id: Some("sp-close".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            error_string(store.close_sprint(
+                "sp-close",
+                Some(&started.deployment.id),
+                None,
+                None,
+                "geoyws"
+            )),
+            format!(
+                "sprint sp-close cannot close on {}: that attempt is started (no phase); \
+                 a sprint closes only on a succeeded verification-phase deployment",
+                started.deployment.id
+            )
+        );
+
+        // A succeeded verification attempt closes it and stamps the proof.
+        let mut finish = finish_input(&started);
+        finish.served_commit = Some("a".repeat(40));
+        finish.served_version = Some("0.4.0".to_owned());
+        store.finish_deployment(finish).unwrap();
+        let closed = store
+            .close_sprint(
+                "sp-close",
+                Some(&started.deployment.id),
+                None,
+                None,
+                "geoyws",
+            )
+            .unwrap();
+        assert_eq!(closed.status, "closed");
+        assert_eq!(
+            closed.closed_by_deployment.as_deref(),
+            Some(started.deployment.id.as_str())
+        );
+        assert!(closed.ends_at.is_some());
+        assert_eq!(
+            last_event_payload(&store, "sprint_closed")["deploymentID"],
+            json!(started.deployment.id)
+        );
+        assert_eq!(
+            last_event_payload(&store, "sprint_closed")["targetVersion"],
+            json!("0.4.0")
+        );
+
+        // ADR-045 §2 refusal 6: closed is history.
+        assert_eq!(
+            error_string(store.plan_sprint("sp-close", "rewrite", &[], None, false, "geoyws")),
+            "sprint sp-close is closed history; its card cannot be rewritten"
+        );
+        assert_eq!(
+            error_string(store.close_sprint(
+                "sp-close",
+                Some(&started.deployment.id),
+                None,
+                None,
+                "geoyws"
+            )),
+            "sprint sp-close is closed history; its card cannot be rewritten"
+        );
+    }
+
+    #[test]
+    fn a_planned_sprint_cannot_close_and_abandon_needs_a_note() {
+        let mut store = sprint_store("sprint-lifecycle-refusals");
+        store.create_sprint(new_sprint("sp-plan", "0.1.0")).unwrap();
+        assert_eq!(
+            error_string(store.close_sprint("sp-plan", Some("d-none"), None, None, "geoyws")),
+            "sprint sp-plan is planned, not current; start it before closing it"
+        );
+        assert_eq!(
+            error_string(store.abandon_sprint("sp-plan", "  ", "geoyws")),
+            "abandon note is required"
+        );
+        let abandoned = store
+            .abandon_sprint("sp-plan", "the release is pulled", "geoyws")
+            .unwrap();
+        assert_eq!(abandoned.status, "abandoned");
+        assert!(abandoned.ends_at.is_some());
+        assert_eq!(
+            last_event_payload(&store, "sprint_abandoned")["note"],
+            json!("the release is pulled")
+        );
+        assert_eq!(
+            error_string(store.start_sprint("sp-plan", "geoyws")),
+            "sprint sp-plan is abandoned; open a new sprint instead of starting this one"
+        );
+    }
+
+    #[test]
+    fn a_version_must_be_semver_shaped_before_a_sprint_exists() {
+        assert_eq!(target_version("0.4.0").unwrap(), "0.4.0");
+        assert_eq!(target_version(" 1.2.3 ").unwrap(), "1.2.3");
+        assert_eq!(target_version("0.4.0-rc.1").unwrap(), "0.4.0-rc.1");
+        assert_eq!(
+            target_version("10.20.30-build.1").unwrap(),
+            "10.20.30-build.1"
+        );
+        for bad in ["", "v0.4", "0.4", "0.4.0.1", "0.4.x", "latest", "0..3"] {
+            assert!(
+                target_version(bad).is_err(),
+                "{bad} was accepted as a version"
+            );
+        }
+        let mut store = sprint_store("sprint-version-shape");
+        let error = error_string(store.create_sprint(NewSprint {
+            id: None,
+            title: "Bad version".into(),
+            body: None,
+            target_version: "v1".into(),
+            scheduled_start: 0,
+            scheduled_end: 1,
+            actor: "geoyws".into(),
+        }));
+        assert!(error.contains("X.Y.Z"), "{error}");
+        assert!(error.contains("\"v1\""), "{error}");
+    }
+
+    #[test]
+    fn claims_are_scoped_to_the_current_sprint_and_overrides_are_recorded() {
+        let mut store = sprint_store("sprint-claim-scope");
+        insert_task(&store, "t-in");
+        insert_task(&store, "t-out");
+        insert_task(&store, "t-free");
+        store.create_sprint(new_sprint("sp-live", "0.4.0")).unwrap();
+        store.create_sprint(new_sprint("sp-next", "0.5.0")).unwrap();
+        store.attach_sprint("t-in", "sp-live", "geoyws").unwrap();
+        store.attach_sprint("t-out", "sp-next", "geoyws").unwrap();
+        store
+            .plan_sprint(
+                "sp-live",
+                "Fixture goal\nFixture acceptance criteria",
+                &[],
+                None,
+                false,
+                "geoyws",
+            )
+            .unwrap();
+        store.start_sprint("sp-live", "geoyws").unwrap();
+
+        let ids = |options: &ClaimOptions| {
+            store
+                .claim_candidates(options, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+        };
+        // The default pool is the current sprint's rows — unattached is
+        // outside the boundary, not inside it (ADR-045 §3).
+        assert_eq!(ids(&claim_options("agent")), vec!["t-in"]);
+        // The escape hatch sees everything again.
+        let mut any = claim_options("agent");
+        any.sprint_override = Some("any".into());
+        let mut any_ids = ids(&any);
+        any_ids.sort();
+        assert_eq!(any_ids, vec!["t-free", "t-in", "t-out"]);
+        // A named boundary sees only its own rows.
+        let mut named = claim_options("agent");
+        named.sprint_override = Some("sp-next".into());
+        assert_eq!(ids(&named), vec!["t-out"]);
+        // ADR-045 §2 refusal 4: unknown and abandoned names.
+        named.sprint_override = Some("sp-nope".into());
+        assert_eq!(
+            error_string(store.claim_candidates(&named, None, 10)),
+            "sprint sp-nope does not exist on this board"
+        );
+        store
+            .abandon_sprint("sp-next", "superseded", "geoyws")
+            .unwrap();
+        named.sprint_override = Some("sp-next".into());
+        assert_eq!(
+            error_string(store.claim_candidates(&named, None, 10)),
+            "sprint sp-next is abandoned"
+        );
+
+        // A default-scoped claim records no override and lands inside the
+        // boundary; a crossing one records the "I know".
+        let receipt = store.claim(None, claim_options("agent")).unwrap();
+        assert_eq!(receipt.claim.task_id, "t-in");
+        let payload = last_event_payload(&store, "task_claimed");
+        assert!(
+            payload.get("sprintOverride").is_none(),
+            "a default-scoped claim must not grow a payload key: {payload}"
+        );
+        let mut crossing = claim_options("agent");
+        crossing.sprint_override = Some("any".into());
+        let receipt = store.claim(Some("t-free"), crossing).unwrap();
+        assert_eq!(receipt.claim.task_id, "t-free");
+        assert_eq!(
+            last_event_payload(&store, "task_claimed")["sprintOverride"],
+            json!("any")
+        );
+    }
+
+    #[test]
+    fn a_board_without_a_current_sprint_claims_exactly_as_before() {
+        let mut store = sprint_store("sprint-no-current");
+        insert_task(&store, "t-a");
+        insert_task(&store, "t-b");
+        // A planned sprint exists — planned is not the boundary, so the pool
+        // is untouched until one is current.
+        store.create_sprint(new_sprint("sp-idle", "0.1.0")).unwrap();
+        let ids: Vec<String> = store
+            .claim_candidates(&claim_options("agent"), None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(ids, vec!["t-a", "t-b"]);
+        let receipt = store.claim(None, claim_options("agent")).unwrap();
+        assert_eq!(receipt.claim.task_id, "t-a");
+        assert!(
+            last_event_payload(&store, "task_claimed")
+                .get("sprintOverride")
+                .is_none(),
+            "a board with no current sprint must not grow a payload key"
+        );
+    }
+
+    #[test]
+    fn attaching_an_epic_carries_its_subtree_skipping_other_sprints_rows() {
+        let mut store = sprint_store("sprint-subtree");
+        store.add_task(gate_row("e-root", "epic", None)).unwrap();
+        store
+            .add_task(gate_row("s-kid", "story", Some("e-root")))
+            .unwrap();
+        store
+            .add_task(gate_row("t-kid", "task", Some("s-kid")))
+            .unwrap();
+        store
+            .add_task(gate_row("t-late", "task", Some("e-root")))
+            .unwrap();
+        store.create_sprint(new_sprint("sp-one", "0.1.0")).unwrap();
+        store.create_sprint(new_sprint("sp-two", "0.2.0")).unwrap();
+        // A descendant that already moved itself stays where it put itself.
+        store.attach_sprint("t-late", "sp-two", "geoyws").unwrap();
+
+        let receipt = store.attach_sprint("e-root", "sp-one", "geoyws").unwrap();
+        assert_eq!(receipt.moved, vec!["e-root", "s-kid", "t-kid"]);
+        assert_eq!(receipt.old_sprint_id, None);
+        assert_eq!(receipt.new_sprint_id.as_deref(), Some("sp-one"));
+        assert_eq!(task_sprint_id(&store, "s-kid").as_deref(), Some("sp-one"));
+        assert_eq!(task_sprint_id(&store, "t-kid").as_deref(), Some("sp-one"));
+        assert_eq!(task_sprint_id(&store, "t-late").as_deref(), Some("sp-two"));
+        let audited: i64 = store.connection.query_row(
+            "SELECT COUNT(DISTINCT task_id) FROM events WHERE kind='task_sprint_changed' AND task_id IN ('e-root','s-kid','t-kid')",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(audited, 3);
+
+        // Attaching to history is refused; attaching what is already
+        // attached is a no-op refusal.
+        store
+            .plan_sprint(
+                "sp-one",
+                "Fixture goal\nFixture acceptance criteria",
+                &[],
+                None,
+                false,
+                "geoyws",
+            )
+            .unwrap();
+        store.start_sprint("sp-one", "geoyws").unwrap();
+        store.create_sprint(new_sprint("sp-old", "0.0.9")).unwrap();
+        store
+            .abandon_sprint("sp-old", "never happened", "geoyws")
+            .unwrap();
+        assert_eq!(
+            error_string(store.attach_sprint("t-kid", "sp-old", "geoyws")),
+            "sprint sp-old is abandoned; attach the rows to a planned or current sprint instead"
+        );
+        assert_eq!(
+            error_string(store.attach_sprint("t-late", "sp-two", "geoyws")),
+            "task t-late and its subtree are already attached to sprint sp-two; \
+             there is nothing to attach"
+        );
+
+        // Detach is one row, never recursive.
+        let detach = store.detach_sprint("s-kid", "geoyws").unwrap();
+        assert_eq!(detach.moved, vec!["s-kid"]);
+        assert_eq!(detach.old_sprint_id.as_deref(), Some("sp-one"));
+        assert_eq!(detach.new_sprint_id, None);
+        assert_eq!(task_sprint_id(&store, "s-kid"), None);
+        assert_eq!(task_sprint_id(&store, "t-kid").as_deref(), Some("sp-one"));
+        assert_eq!(
+            error_string(store.detach_sprint("s-kid", "geoyws")),
+            "task s-kid is not attached to a sprint; there is nothing to clear"
+        );
+    }
+
+    #[test]
+    fn a_context_packet_carries_the_tasks_sprint_and_the_dash_counts_it() {
+        let mut store = sprint_store("sprint-projections");
+        insert_task(&store, "t-ctx");
+        insert_task(&store, "t-ctx-done");
+        store
+            .connection
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=1 WHERE id='t-ctx-done'",
+                [],
+            )
+            .unwrap();
+        store.create_sprint(new_sprint("sp-ctx", "0.4.0")).unwrap();
+        store
+            .plan_sprint(
+                "sp-ctx",
+                "\n   \n  Ship the decisions room  \n- criteria one",
+                &[],
+                None,
+                true,
+                "geoyws",
+            )
+            .unwrap();
+        store.attach_sprint("t-ctx", "sp-ctx", "geoyws").unwrap();
+        store
+            .attach_sprint("t-ctx-done", "sp-ctx", "geoyws")
+            .unwrap();
+        store.start_sprint("sp-ctx", "geoyws").unwrap();
+
+        // The packet's sprint is the boundary the resuming agent works toward.
+        let packet = store.context_packet("t-ctx").unwrap();
+        let sprint = packet.sprint.expect("the task is attached");
+        assert_eq!(sprint.sprint_id, "sp-ctx");
+        assert_eq!(sprint.target_version, "0.4.0");
+        assert_eq!(sprint.goal.as_deref(), Some("Ship the decisions room"));
+        // An unattached task reads no sprint at all.
+        insert_task(&store, "t-loose");
+        assert!(store.context_packet("t-loose").unwrap().sprint.is_none());
+
+        // Dashboard counts unfinished and actually done rows independently.
+        let (open, done) = store.sprint_task_counts("sp-ctx").unwrap();
+        assert_eq!((open, done), (1, 1));
+    }
+
+    #[test]
+    fn sprint_plan_records_only_real_scope_moves_with_previous_assignment() {
+        let mut store = sprint_store("sprint-actual-moves");
+        store.add_task(gate_row("e-move", "epic", None)).unwrap();
+        store
+            .add_task(gate_row("t-stays", "task", Some("e-move")))
+            .unwrap();
+        store.create_sprint(new_sprint("sp-from", "1.0.0")).unwrap();
+        store.create_sprint(new_sprint("sp-to", "1.1.0")).unwrap();
+        store.attach_sprint("e-move", "sp-from", "actor").unwrap();
+        store
+            .plan_sprint(
+                "sp-to",
+                "Move root\nKeep assigned descendant",
+                &["e-move".into()],
+                None,
+                false,
+                "actor",
+            )
+            .unwrap();
+        assert_eq!(task_sprint_id(&store, "e-move").as_deref(), Some("sp-to"));
+        assert_eq!(
+            task_sprint_id(&store, "t-stays").as_deref(),
+            Some("sp-from")
+        );
+        let payload: String = store.connection.query_row("SELECT payload FROM events WHERE kind='task_sprint_changed' AND task_id='e-move' ORDER BY seq DESC LIMIT 1", [], |row| row.get(0)).unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["oldSprintID"], "sp-from");
+        assert_eq!(payload["newSprintID"], "sp-to");
+        let before: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='task_sprint_changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .plan_sprint(
+                "sp-to",
+                "Reworded goal\nSame scope",
+                &[],
+                None,
+                false,
+                "actor",
+            )
+            .unwrap();
+        let after: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='task_sprint_changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "replanning unchanged scope emitted phantom moves"
+        );
+    }
+
+    #[test]
+    fn managed_sprint_projections_hide_restricted_rows_counts_and_event_ids() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+        let board = "eeeeeeee-5555-4555-8555-555555555555";
+        let dir = std::env::temp_dir().join(format!("kanban-sprint-visibility-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{board}.db"));
+        let (secret_handoff, proof_id) = {
+            let mut seed = Store::open(&path).unwrap();
+            seed.initialize("visibility", "seed").unwrap();
+            seed.add_tag("visible", None, Some("seed")).unwrap();
+            seed.add_tag("secret", None, Some("seed")).unwrap();
+            seed.add_task(task_input(
+                "t-visible",
+                "visible content",
+                vec!["visible".into()],
+                vec![],
+            ))
+            .unwrap();
+            seed.add_task(task_input(
+                "t-secret",
+                "secret content",
+                vec!["secret".into()],
+                vec![],
+            ))
+            .unwrap();
+            seed.add_task(task_input(
+                "t-secret-lease",
+                "secret lease",
+                vec!["secret".into()],
+                vec![],
+            ))
+            .unwrap();
+            seed.create_sprint(new_sprint("sp-visible", "1.0.0"))
+                .unwrap();
+            seed.create_sprint(new_sprint("sp-plan", "1.1.0")).unwrap();
+            seed.attach_sprint("t-visible", "sp-visible", "seed")
+                .unwrap();
+            seed.attach_sprint("t-secret", "sp-visible", "seed")
+                .unwrap();
+            seed.attach_sprint("t-secret-lease", "sp-visible", "seed")
+                .unwrap();
+            let claimed = seed
+                .claim(Some("t-secret-lease"), claim_options("seed"))
+                .unwrap();
+            let mut input = handoff_input();
+            input.task_id = Some("t-secret-lease".into());
+            input.lease_token = Some(claimed.claim.lease_token);
+            input.from_agent = "seed".into();
+            let handoff_id = seed.create_handoff(input).unwrap().id;
+            seed.move_task("t-secret", "done", "seed", json!({}), false)
+                .unwrap();
+            seed.plan_sprint(
+                "sp-visible",
+                "Visible release\nAcceptance",
+                &[],
+                None,
+                false,
+                "seed",
+            )
+            .unwrap();
+            seed.start_sprint("sp-visible", "seed").unwrap();
+            let started = seed
+                .start_deployment(StartDeployment {
+                    task_id: None,
+                    repo: "geoyws/kanban".into(),
+                    identity: DeployIdentity::Git("a".repeat(40)),
+                    deployer_checkout: None,
+                    branch: None,
+                    tier: "@_p".into(),
+                    environment: "production".into(),
+                    host: "hax".into(),
+                    url: "https://kb.invalid".into(),
+                    mechanism: None,
+                    operation_id: None,
+                    retry_of: None,
+                    actor: "seed".into(),
+                    lane: None,
+                    sprint_id: Some("sp-visible".into()),
+                })
+                .unwrap();
+            let mut finish = finish_input(&started);
+            finish.served_commit = Some("a".repeat(40));
+            finish.served_version = Some("1.0.0".into());
+            seed.finish_deployment(finish).unwrap();
+            (handoff_id, started.deployment.id)
+        };
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.into(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.into(),
+                    tag: "visible".into(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::Board {
+                    board_id: board.into(),
+                },
+                Capability::Write,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.into(),
+                    tag: "visible".into(),
+                },
+                Capability::Write,
+            ),
+        ]);
+        let mut managed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.into()),
+        )
+        .unwrap();
+        assert_denied(
+            managed.close_sprint("sp-visible", Some(&proof_id), None, None, "actor"),
+            "close hidden sprint scope",
+        );
+        let listing_options = claim_options("managed");
+        let candidates = managed
+            .claim_candidates(&listing_options, None, 10)
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-visible"]
+        );
+        assert_denied(
+            managed.claim(Some("t-secret-lease"), claim_options("managed")),
+            "direct hidden claim",
+        );
+        assert_denied(
+            managed.accept_handoff(
+                &secret_handoff,
+                AcceptHandoffOptions {
+                    agent: "managed".into(),
+                    session: None,
+                    lease_ms: 60_000,
+                    caller_scope: None,
+                    sprint_override: None,
+                    git: None,
+                },
+            ),
+            "hidden handoff accept",
+        );
+        let tasks = managed.sprint_tasks("sp-visible").unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-visible"]
+        );
+        assert!(tasks.iter().all(|task| !task.title.contains("secret")));
+        assert_eq!(managed.sprint_task_counts("sp-visible").unwrap(), (1, 0));
+        let events = managed
+            .events_since_filtered(
+                None,
+                &["task_sprint_changed".into()],
+                &[],
+                &[],
+                &[],
+                &[],
+                0,
+                100,
+                true,
+            )
+            .unwrap();
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.task_id.as_deref(),
+                Some("t-secret" | "t-secret-lease")
+            ) && !event.payload.to_string().contains("t-secret")
+        }));
+        assert_eq!(
+            managed
+                .claim(None, claim_options("managed"))
+                .unwrap()
+                .claim
+                .task_id,
+            "t-visible"
+        );
+        let direct = Store::open(&path).unwrap();
+        assert_eq!(
+            direct
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM task_claims WHERE task_id='t-secret-lease'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            direct
+                .connection
+                .query_row(
+                    "SELECT status FROM handoffs WHERE id=?",
+                    [&secret_handoff],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "pending"
+        );
+        for error in [
+            managed
+                .plan_sprint(
+                    "sp-plan",
+                    "replacement\ncriteria",
+                    &["t-secret".into()],
+                    None,
+                    false,
+                    "actor",
+                )
+                .unwrap_err(),
+            managed
+                .plan_sprint(
+                    "sp-plan",
+                    "replacement\ncriteria",
+                    &[],
+                    Some("t-secret"),
+                    false,
+                    "actor",
+                )
+                .unwrap_err(),
+            managed
+                .attach_sprint("t-secret", "sp-missing", "actor")
+                .unwrap_err(),
+            managed.detach_sprint("t-secret", "actor").unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "denied or not found");
+        }
     }
 }

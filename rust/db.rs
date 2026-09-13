@@ -1733,6 +1733,49 @@ CREATE TRIGGER search_deployments_au AFTER UPDATE ON deployments BEGIN
 END;
 "#;
 
+/// Sprints: a typed row that scopes claims and cannot close without a
+/// served version (ADR-045 §1).
+///
+/// Entirely additive — two tables, three deployment proof columns, one partial unique index,
+/// no ALTER on `tasks` — so a board that never opens a sprint behaves
+/// byte-identically, rollback is "abandon the sprint", not a migration back
+/// (ADR-045 §3). Each production migration runs exactly once. Planned dates
+/// are separate from actual lifecycle stamps.
+///
+/// `task_sprints` carries no CHECK beyond the FKs because the attachment
+/// rules are cross-row — an epic attaches its subtree; a descendant may sit
+/// in another sprint — and belong in the store where a refusal can name the
+/// fix (ADR-042 §2 precedent: half-enforced schema invariants read as though
+/// the schema were authoritative).
+const BOARD_V27: &str = r#"
+CREATE TABLE sprints (
+ id TEXT PRIMARY KEY NOT NULL,
+ title TEXT NOT NULL,
+ body TEXT,
+ status TEXT NOT NULL DEFAULT 'planned'
+  CHECK(status IN ('planned','current','closed','abandoned')),
+ target_version TEXT NOT NULL,
+ scheduled_start INTEGER NOT NULL,
+ scheduled_end INTEGER NOT NULL CHECK(scheduled_end >= scheduled_start),
+ starts_at INTEGER NOT NULL,
+ ends_at INTEGER,
+ closed_by_deployment TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1))
+) STRICT;
+CREATE UNIQUE INDEX one_current_sprint ON sprints(status) WHERE status='current';
+CREATE TABLE task_sprints (
+ task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ sprint_id TEXT NOT NULL REFERENCES sprints(id),
+ attached_at INTEGER NOT NULL,
+ attached_by TEXT NOT NULL
+) STRICT;
+ALTER TABLE deployments ADD COLUMN sprint_id TEXT REFERENCES sprints(id);
+ALTER TABLE deployments ADD COLUMN target_version TEXT;
+ALTER TABLE deployments ADD COLUMN served_version TEXT;
+"#;
+
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -2034,7 +2077,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 26;
+pub const BOARD_SCHEMA_VERSION: usize = 27;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2494,7 +2537,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
-    BOARD_V26,
+    BOARD_V26, BOARD_V27,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4319,5 +4362,112 @@ mod tests {
                 "the rebuild dropped {index}"
             );
         }
+    }
+
+    #[test]
+    fn board_schema_v27_migrates_a_real_v26_board_and_preserves_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..26]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 26);
+        // A live v26 task, written through the pre-sprint shape.
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,body,status,priority,created_at,updated_at,completed_at,metadata) \
+                 VALUES('t-v26','task','survivor','body','todo',3,1,1,NULL,'{}')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+
+        // The row survived, byte for byte; the tasks table gained nothing.
+        let (title, body): (String, String) = connection
+            .query_row("SELECT title,body FROM tasks WHERE id='t-v26'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title, "survivor");
+        assert_eq!(body, "body");
+
+        // The partial unique index holds the one-current rule: a second
+        // current sprint is refused, a planned one coexists.
+        let insert = |status: &str| {
+            connection.execute(
+                "INSERT INTO sprints(id,title,status,target_version,scheduled_start,scheduled_end,starts_at,created_at,updated_at) VALUES(?,?,?,'0.1.0',0,1,1,1,1)",
+                params![format!("sp-{status}"), format!("{status} sprint"), status],
+            )
+        };
+        insert("planned").unwrap();
+        insert("current").unwrap();
+        assert!(
+            insert("current").is_err(),
+            "a second current sprint was admitted"
+        );
+        assert!(
+            index_names(&connection, "sprints")
+                .iter()
+                .any(|name| name == "one_current_sprint"),
+            "the v27 migration dropped the one-current index"
+        );
+        // Attachment is a junction row, and the FK refuses a sprint that
+        // does not exist; the PK refuses a second sprint for one task.
+        connection
+            .execute(
+                "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                 VALUES('t-v26','sp-current',1,'geoyws')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                     VALUES('t-v26','sp-planned',1,'geoyws')",
+                    [],
+                )
+                .is_err(),
+            "one task was attached to two sprints at once"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO task_sprints(task_id,sprint_id,attached_at,attached_by) \
+                     VALUES('t-v26','sp-nope',1,'geoyws')",
+                    [],
+                )
+                .is_err(),
+            "a task was attached to a sprint that does not exist"
+        );
+    }
+
+    #[test]
+    fn v27_refuses_unexpected_objects_and_rolls_back_without_partial_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..26]).unwrap();
+        connection.execute_batch("CREATE TABLE task_sprints(id TEXT PRIMARY KEY); INSERT INTO tasks(id,type,title,status,priority,created_at,updated_at,metadata) VALUES('t-keep','task','keep','todo',3,1,1,'{}');").unwrap();
+        let error = migrate(&mut connection, BOARD_MIGRATIONS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("task_sprints already exists"), "{error}");
+        assert_eq!(schema_version(&connection).unwrap(), 26);
+        assert_eq!(
+            connection
+                .query_row("SELECT title FROM tasks WHERE id='t-keep'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "keep"
+        );
+        assert!(
+            !sqlite_table_exists(&connection, "sprints").unwrap(),
+            "earlier V27 DDL was not rolled back"
+        );
+        assert!(
+            sqlite_table_exists(&connection, "task_sprints").unwrap(),
+            "the incompatible preexisting object was destroyed"
+        );
+        let sprint_column: i64 = connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('deployments') WHERE name='sprint_id')", [], |row| row.get(0)).unwrap();
+        assert_eq!(sprint_column, 0);
     }
 }

@@ -48,7 +48,7 @@ use crate::registry::{
     preflight_live_root_for_adoption, prepare_live_root_for_adoption, require_sane_clock,
     retired_board_message, run_workspace_adopt_helper, spawn_workspace_adopt_helper,
 };
-use crate::store::{ClaimOptions, Store, UpdateTask};
+use crate::store::{AcceptHandoffOptions, ClaimOptions, Store, UpdateTask};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -99,7 +99,7 @@ Usage:
   kanban deploy start --repo REPO --commit FULL_SHA --tier @_bdt|@_bd|@_bst|@_bs|@_s|@_uat|@_p --environment NAME
              --host HOST --url URL --as ACTOR [--task ID] [--branch NAME]
              [--lane LANE] [--mechanism NAME] [--operation-id ID] [--retry-of ID]
-             [--deployer-checkout FULL_SHA]
+             [--deployer-checkout FULL_SHA] [--sprint sp-…]
   kanban deploy start --repo REPO --artifact ROLE=KIND:VALUE ... --build-commit unknown
              --tier TIER --environment NAME --host HOST --url URL --as ACTOR
              [--deployer-checkout FULL_SHA] [--task ID] [--branch NAME]
@@ -112,7 +112,7 @@ Usage:
              refused on the Git line above.)
   kanban deploy finish ID --token TOKEN --result succeeded|failed|cancelled|abandoned --as ACTOR
              --phase build|publish|start|verification --receipt TEXT
-             [--served-commit FULL_SHA] [--artifact-uri URI]
+             [--served-commit FULL_SHA] [--served-version X.Y.Z] [--artifact-uri URI]
   kanban deploy finish ID --token TOKEN --result succeeded --phase verification
              --receipt TEXT --observed ROLE=KIND:VALUE ... --as ACTOR
              (an artifact-identity attempt: one --observed per expected role,
@@ -127,7 +127,7 @@ Usage:
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled]
              [--priority P0|P1|P2|0-9] [--depends-on ID ...] [--tag NAME ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
-             [--stale-minutes N] [--driver-only]
+             [--stale-minutes N] [--driver-only] [--sprint sp-…]
   kanban task list [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled] [--tag NAME] [--lane LANE] [--all]
              [--with-claims] [--with-relations]
              [--fields id,title,status,... | --no-body] [--json]
@@ -145,13 +145,17 @@ Usage:
              [--tag NAME ... | --clear-tags] [--depends-on ID ... | --clear-dependencies]
              [--assignee AGENT | --unassign] [--lane LANE | --clear-lane]
              [--deliverable TEXT | --clear-deliverable] [--stale-minutes N]
-             [--driver-only | --no-driver-only] [--json]
+             [--driver-only | --no-driver-only] [--sprint sp-… | --clear-sprint] [--json]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
   kanban story advance ID --as ACTOR [--to planning|ready|in-progress|testing|review|merging|done] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role ROLE] [--caller-scope driver]
-             [--no-cross-lane] [--allow-reassign] [--json]
+             [--no-cross-lane] [--allow-reassign]
+             [--sprint sp-… | --any-sprint] [--json]
+             (when a current sprint exists, claims are scoped to it; the
+             override is recorded on the task_claim event; unattached rows
+             are NOT offered — outside the boundary, not inside it)
   kanban claim --candidates --as AGENT [--tag NAME] [--lane LANE] [--role ROLE]
              [--caller-scope driver] [--no-cross-lane] [--allow-reassign]
              [--limit N] [--json]
@@ -172,7 +176,7 @@ Usage:
              git checkout when omitted; an explicit flag overrides the capture)
   kanban handoff list [--task ID] [--status pending|accepted|cancelled|retired] [--to AGENT] [--limit N] [--all] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
-             [--caller-scope driver] [--json]
+             [--caller-scope driver] [--sprint sp-… | --any-sprint] [--json]
   kanban handoff retire ID --as AGENT --note TEXT [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
@@ -210,6 +214,15 @@ Usage:
   kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
              --note TEXT [--json]
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
+  kanban sprint new TITLE --target-version X.Y.Z --start EPOCH_MS --end EPOCH_MS --as ACTOR [--id sp-…] [--body TEXT | --body-file PATH] [--json]
+  kanban sprint plan ID --body TEXT|--body-file PATH --as ACTOR [--candidate ID ... | --parent-epic ID | --empty-scope] [--json]
+  kanban sprint start ID --as ACTOR [--json]       (refused while another sprint is current)
+  kanban sprint close ID --deployment d-… --as ACTOR [--carry-to sp-… --carry-note TEXT] [--json]
+             (proof must be a succeeded verification deployment bound to this sprint/version)
+  kanban sprint abandon ID --note TEXT --as ACTOR [--json]
+  kanban sprint list [--status planned|current|closed|abandoned] [--all] [--limit N]
+             [--fields id,title,… | --no-body] [--json]   (default hides closed/abandoned)
+  kanban sprint show ID [--json]                     (the row, its rows, its deployment)
   kanban sitrep post TEXT --as AGENT --lane LANE [--task ID]
              [--repo PATH] [--branch NAME] [--head SHA] [--dirty TEXT] [--json]
              (--repo, --branch, --head and --dirty are captured from the cwd's
@@ -284,6 +297,7 @@ Aliases (the binary installs as both `kanban` and `kb`):
   sitrep:        ls=list  new=post
   deploy:        ls=list  cat=show
   subscription:  ls=list  new=add  cat=show
+  sprint:        ls=list  cat=show
              repeat --board NAME; --except-board NAME means ALL except that board
 Aliases resolve by exact match; abbreviations such as --proj are not accepted.
 
@@ -296,10 +310,10 @@ again for a fresh token. Unknown flags are errors.
 --limit N is honoured exactly, up to 1000000 -- effectively unbounded for any
 board this tool holds, and a ceiling only so a mistyped value is refused rather
 than answered. It applies to every surface that takes the flag: events, search,
-watch, attention list, sitrep list, deploy list, handoff list, claim
---candidates and task show. Without it a listing is capped -- events 50, watch
-50, sitrep list 20, search 10, attention list, deploy list, handoff list and
-claim --candidates 100, task show 100 notes, 20 checkpoints and 100 handoffs --
+watch, attention list, sitrep list, deploy list, handoff list, sprint
+list, claim --candidates and task show. Without it a listing is capped -- events 50, watch
+50, sitrep list 20, search 10, attention list, deploy list, handoff list,
+sprint list and claim --candidates 100, task show 100 notes, 20 checkpoints and 100 handoffs --
 and one that would exceed its cap refuses and names --limit rather than passing
 the first page off as the whole. events goes one step further: an explicit
 --limit that cut the page is named on stderr, because a page of history that
@@ -308,7 +322,7 @@ unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 31] = [
+pub(crate) const BOOLEAN: [&str; 34] = [
     "help",
     "json",
     "version",
@@ -340,6 +354,9 @@ pub(crate) const BOOLEAN: [&str; 31] = [
     "follow",
     "no-body",
     "clear-card",
+    "any-sprint",
+    "clear-sprint",
+    "empty-scope",
 ];
 
 /// Removed boolean flags that remain recognizable only to return an actionable
@@ -385,9 +402,10 @@ pub(crate) const CARD_REPEATABLE: [&str; 2] = ["choice", "consequence"];
 /// The artifact-identity flags, list-valued on the one subcommand each
 /// belongs to: a `deploy start` expects one identity per component role and a
 /// `deploy finish` observes one per role (ADR-043 §2). Neither flag exists on
-/// the other subcommand, so each is claimed once.
+/// List-valued identity and sprint planning flags.
 pub(crate) const ARTIFACT_EXPECTED_REPEATABLE: [&str; 1] = ["artifact"];
 pub(crate) const ARTIFACT_OBSERVED_REPEATABLE: [&str; 1] = ["observed"];
+pub(crate) const SPRINT_PLAN_REPEATABLE: [&str; 1] = ["candidate"];
 
 /// One operation's list-valued flags, keyed on the command AND the
 /// subcommand.
@@ -403,7 +421,7 @@ struct ListValued {
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 7] = [
+const LIST_VALUED: [ListValued; 8] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -438,6 +456,11 @@ const LIST_VALUED: [ListValued; 7] = [
         command: "deploy",
         sub: Some("finish"),
         flags: &ARTIFACT_OBSERVED_REPEATABLE,
+    },
+    ListValued {
+        command: "sprint",
+        sub: Some("plan"),
+        flags: &SPRINT_PLAN_REPEATABLE,
     },
 ];
 
@@ -897,6 +920,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "retry-of",
             "as",
             "lane",
+            "sprint",
         ],
         &[],
         false,
@@ -912,6 +936,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "observed",
             "receipt",
             "artifact-uri",
+            "served-version",
             "as",
         ],
         &["id"],
@@ -986,6 +1011,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "deliverable",
             "stale-minutes",
             "driver-only",
+            "sprint",
         ],
         &["title"],
         false,
@@ -1046,6 +1072,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "priority",
             "depends-on",
             "clear-dependencies",
+            "sprint",
+            "clear-sprint",
         ],
         &["id"],
         false,
@@ -1075,6 +1103,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "candidates",
             "tag",
             "limit",
+            "sprint",
+            "any-sprint",
         ],
         &["?id"],
         false,
@@ -1144,7 +1174,14 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "handoff",
         Some("accept"),
-        &["as", "session", "lease-minutes", "caller-scope"],
+        &[
+            "as",
+            "session",
+            "lease-minutes",
+            "caller-scope",
+            "sprint",
+            "any-sprint",
+        ],
         &["id"],
         false,
     ),
@@ -1262,6 +1299,52 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         false,
     ),
     ("attention", Some("reopen"), &["as", "note"], &["id"], false),
+    (
+        "sprint",
+        Some("new"),
+        &[
+            "as",
+            "target-version",
+            "start",
+            "end",
+            "id",
+            "body",
+            "body-file",
+        ],
+        &["title"],
+        false,
+    ),
+    (
+        "sprint",
+        Some("plan"),
+        &[
+            "as",
+            "body",
+            "body-file",
+            "candidate",
+            "parent-epic",
+            "empty-scope",
+        ],
+        &["id"],
+        false,
+    ),
+    ("sprint", Some("start"), &["as"], &["id"], false),
+    (
+        "sprint",
+        Some("close"),
+        &["as", "deployment", "carry-to", "carry-note"],
+        &["id"],
+        false,
+    ),
+    ("sprint", Some("abandon"), &["as", "note"], &["id"], false),
+    (
+        "sprint",
+        Some("list"),
+        &["status", "all", "limit", "fields", "no-body"],
+        &[],
+        true,
+    ),
+    ("sprint", Some("show"), &[], &["id"], true),
     (
         "sitrep",
         Some("post"),
@@ -1574,6 +1657,13 @@ pub(crate) const ENUM_ARGUMENTS: &[EnumArgument] = &[
         values: &ATTENTION_OUTCOMES,
     },
     EnumArgument {
+        command: "sprint",
+        sub: Some("list"),
+        slot: ArgSlot::Flag,
+        name: "status",
+        values: &SPRINT_STATUSES,
+    },
+    EnumArgument {
         command: "deploy",
         sub: Some("start"),
         slot: ArgSlot::Flag,
@@ -1734,7 +1824,7 @@ fn arity(sub: Option<&str>, positionals: &[&str]) -> usize {
 }
 
 /// Commands whose second positional is a subcommand rather than an id.
-const SUBCOMMAND_GROUPS: [&str; 13] = [
+const SUBCOMMAND_GROUPS: [&str; 14] = [
     "task",
     "story",
     "handoff",
@@ -1748,10 +1838,10 @@ const SUBCOMMAND_GROUPS: [&str; 13] = [
     "deploy",
     "subscription",
     "access",
+    "sprint",
 ];
 
 /// Short names for commands, resolved by exact match only.
-///
 /// Never prefix inference: every alias is written down, so adding a command
 /// later cannot silently retarget one that already exists (ADR-008). An alias
 /// that is not listed stays an unknown command.
@@ -2368,6 +2458,22 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+/// The `--sprint`/`--any-sprint` pair on `claim`, as the store's
+/// `sprint_override` (ADR-045 §3). Two answers to one question are refused
+/// here, once, for `claim --next` and `claim --candidates` alike.
+fn claim_sprint_override(args: &Args) -> Result<Option<String>> {
+    if args.has("sprint") && args.has("any-sprint") {
+        bail!(
+            "--sprint and --any-sprint both answer which sprint boundary this claim crosses; \
+             pass one — --sprint names the boundary, --any-sprint says any"
+        );
+    }
+    if args.has("any-sprint") {
+        return Ok(Some("any".to_owned()));
+    }
+    Ok(option_string(args, "sprint"))
+}
+
 /// Minutes to milliseconds, refusing values that would overflow or expire
 /// instantly. `--lease-minutes 999999999999999` used to panic on the multiply.
 fn lease_ms(args: &Args) -> Result<i64> {
@@ -2706,8 +2812,10 @@ const BOARD_CREATORS: [(&str, Option<&str>); 1] = [("task", Some("add"))];
 /// and each of those call sites takes [`Store::open_for_read_as_caller`]
 /// directly for the same reason. `search-rebuild` is absent from both: it
 /// writes the index.
-const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 13] = [
+const READ_ONLY_BOARD_COMMANDS: [(&str, Option<&str>); 15] = [
     ("attention", Some("list")),
+    ("sprint", Some("list")),
+    ("sprint", Some("show")),
     ("deploy", Some("current")),
     ("deploy", Some("list")),
     ("deploy", Some("show")),
@@ -4014,6 +4122,24 @@ const ATTENTION_FIELDS: [&str; 21] = [
     "reopenNote",
     "archived",
     "tags",
+];
+
+/// The keys of one `sprint list` row, exactly as a caller sees them
+/// (ADR-045 §2). Joins the same drift guard as [`ATTENTION_FIELDS`].
+const SPRINT_FIELDS: [&str; 13] = [
+    "id",
+    "title",
+    "body",
+    "status",
+    "targetVersion",
+    "scheduledStart",
+    "scheduledEnd",
+    "startsAt",
+    "endsAt",
+    "closedByDeployment",
+    "createdAt",
+    "updatedAt",
+    "archived",
 ];
 
 /// The keys `--fields` or `--no-body` keep of every row in a listing, or
@@ -5693,6 +5819,33 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             // whatever status it holds, and renaming `todo` to something
             // narrower would leave the board's own totals not adding up.
             value.insert("gatedTasks".into(), json!(store.count_gated_tasks()?));
+            if let Some(sprint) = store.current_sprint()? {
+                let (open_tasks, done_tasks) = store.sprint_task_counts(&sprint.id)?;
+                let day = 24 * 60 * 60 * 1000_i64;
+                let remaining = sprint.scheduled_end.saturating_sub(now_ms());
+                let days_remaining = if remaining <= 0 {
+                    0
+                } else {
+                    (remaining + day - 1) / day
+                };
+                let goal = crate::model::sprint_goal(sprint.body.as_deref());
+                value.insert(
+                    "currentSprint".into(),
+                    json!({
+                        "id": sprint.id,
+                        "title": sprint.title,
+                        "status": sprint.status,
+                        "targetVersion": sprint.target_version,
+                        "scheduledStart": sprint.scheduled_start,
+                        "scheduledEnd": sprint.scheduled_end,
+                        "daysRemaining": days_remaining,
+                        "open": open_tasks,
+                        "done": done_tasks,
+                        "goal": goal,
+                        "body": sprint.body,
+                    }),
+                );
+            }
             let queued = tasks
                 .iter()
                 .filter(|task| task.status == "todo")
@@ -6199,6 +6352,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             caller_scope: option_string(&args, "caller-scope"),
             cross_lane: !args.has("no-cross-lane"),
             allow_reassign: args.has("allow-reassign"),
+            sprint_override: claim_sprint_override(&args)?,
         };
         return print(
             &args.bounded_page(100, "claim candidates", |limit| {
@@ -6332,6 +6486,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 retry_of: option_string(&args, "retry-of"),
                 actor: args.require("as")?.to_owned(),
                 lane: option_string(&args, "lane"),
+                sprint_id: option_string(&args, "sprint"),
             })?,
             args.has("json"),
         );
@@ -6348,6 +6503,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 served_commit: option_string(&args, "served-commit"),
                 observed: ArtifactIdentity::parse(&args.many("observed"), "--observed")?,
                 actor: args.require("as")?.to_owned(),
+                served_version: option_string(&args, "served-version"),
             })?,
             args.has("json"),
         );
@@ -6396,24 +6552,27 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "task" && sub == Some("add") {
         let title = rest.first().context("task title is required")?.clone();
-        let task = store.add_task(crate::model::AddTask {
-            tags: args.many("tag"),
-            id: option_string(&args, "id"),
-            task_type: args.one("type").unwrap_or("task").into(),
-            parent_id: option_string(&args, "parent"),
-            title,
-            actor: Some(args.one("as").unwrap_or("system@cli").to_owned()),
-            body: args.body()?,
-            assignee: option_string(&args, "assignee"),
-            lane: option_string(&args, "lane"),
-            deliverable: option_string(&args, "deliverable"),
-            stale_minutes: args.optional_integer("stale-minutes")?,
-            driver_only: args.has("driver-only"),
-            status: args.one("status").unwrap_or("todo").into(),
-            priority: args.priority(6)?,
-            dependencies: args.many("depends-on"),
-            metadata: json!({}),
-        })?;
+        let task = store.add_task_in_sprint(
+            crate::model::AddTask {
+                tags: args.many("tag"),
+                id: option_string(&args, "id"),
+                task_type: args.one("type").unwrap_or("task").into(),
+                parent_id: option_string(&args, "parent"),
+                title,
+                actor: Some(args.one("as").unwrap_or("system@cli").to_owned()),
+                body: args.body()?,
+                assignee: option_string(&args, "assignee"),
+                lane: option_string(&args, "lane"),
+                deliverable: option_string(&args, "deliverable"),
+                stale_minutes: args.optional_integer("stale-minutes")?,
+                driver_only: args.has("driver-only"),
+                status: args.one("status").unwrap_or("todo").into(),
+                priority: args.priority(6)?,
+                dependencies: args.many("depends-on"),
+                metadata: json!({}),
+            },
+            args.one("sprint"),
+        )?;
         return print(&task, args.has("json"));
     }
     if command == "task" && sub == Some("list") {
@@ -6511,6 +6670,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             ("parent", "clear-parent"),
             ("depends-on", "clear-dependencies"),
             ("tag", "clear-tags"),
+            ("sprint", "clear-sprint"),
         ] {
             if args.has(a) && args.has(b) {
                 bail!("--{a} and --{b} are mutually exclusive");
@@ -6570,6 +6730,13 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             } else {
                 None
             },
+            sprint: if let Some(value) = args.one("sprint") {
+                Some(Some(value.to_owned()))
+            } else if args.has("clear-sprint") {
+                Some(None)
+            } else {
+                None
+            },
         };
         return print(
             &store.update_task(id, input, args.require("as")?)?,
@@ -6624,6 +6791,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 caller_scope: option_string(&args, "caller-scope"),
                 cross_lane: !args.has("no-cross-lane"),
                 allow_reassign: args.has("allow-reassign"),
+                sprint_override: claim_sprint_override(&args)?,
             },
         )?;
         value.rules = effective_rule_summaries(&args, &store, Some(&value.claim.task_id))?;
@@ -6735,11 +6903,14 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         let git = here();
         let (handoff, claim) = store.accept_handoff(
             id,
-            args.require("as")?,
-            option_string(&args, "session"),
-            lease_ms(&args)?,
-            args.one("caller-scope"),
-            git,
+            AcceptHandoffOptions {
+                agent: args.require("as")?.to_owned(),
+                session: option_string(&args, "session"),
+                lease_ms: lease_ms(&args)?,
+                caller_scope: option_string(&args, "caller-scope"),
+                sprint_override: claim_sprint_override(&args)?,
+                git,
+            },
         )?;
         let rules = effective_rule_summaries(
             &args,
@@ -6927,6 +7098,102 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         let id = rest.first().context("attention id is required")?;
         return print(
             &store.reopen_attention(id, args.require("as")?, args.require("note")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("new") {
+        let title = rest.first().context("sprint title is required")?.clone();
+        return print(
+            &store.create_sprint(NewSprint {
+                id: option_string(&args, "id"),
+                title,
+                body: args.body()?,
+                target_version: args.require("target-version")?.to_owned(),
+                scheduled_start: args
+                    .require("start")?
+                    .parse()
+                    .context("--start must be an epoch-millisecond integer")?,
+                scheduled_end: args
+                    .require("end")?
+                    .parse()
+                    .context("--end must be an epoch-millisecond integer")?,
+                actor: args.require("as")?.to_owned(),
+            })?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("plan") {
+        let id = rest.first().context("sprint id is required")?;
+        // Planning IS writing the goal, so a plan without a body is the
+        // no-op the refusal names rather than an empty card.
+        let body = args.body()?.context(
+            "sprint plan requires --body or --body-file: the goal and success criteria are \
+             the plan — without them the sprint is a title and a version",
+        )?;
+        return print(
+            &store.plan_sprint(
+                id,
+                &body,
+                &args.many("candidate"),
+                args.one("parent-epic"),
+                args.has("empty-scope"),
+                args.require("as")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("start") {
+        let id = rest.first().context("sprint id is required")?;
+        return print(
+            &store.start_sprint(id, args.require("as")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("close") {
+        let id = rest.first().context("sprint id is required")?;
+        return print(
+            &store.close_sprint(
+                id,
+                args.one("deployment"),
+                args.one("carry-to"),
+                args.one("carry-note"),
+                args.require("as")?,
+            )?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("abandon") {
+        let id = rest.first().context("sprint id is required")?;
+        return print(
+            &store.abandon_sprint(id, args.require("note")?, args.require("as")?)?,
+            args.has("json"),
+        );
+    }
+    if command == "sprint" && sub == Some("list") {
+        let keep = projection(&args, &SPRINT_FIELDS, &[])?;
+        let mut rows = serde_json::to_value(args.bounded_page(100, "sprints", |limit| {
+            store.sprints(args.one("status"), args.has("all"), limit)
+        })?)?;
+        if let Some(keep) = &keep {
+            project(&mut rows, keep);
+        }
+        return print(&rows, args.has("json"));
+    }
+    if command == "sprint" && sub == Some("show") {
+        let id = rest.first().context("sprint id is required")?;
+        let sprint = store.require_sprint(id)?;
+        // The close gate's proof, resolved for the reader: the row, its
+        // rows, and the deployment that ended it (ADR-045 §2).
+        let deployment = match &sprint.closed_by_deployment {
+            Some(deployment_id) => serde_json::to_value(store.require_deployment(deployment_id)?)?,
+            None => Value::Null,
+        };
+        return print(
+            &json!({
+                "sprint": sprint,
+                "tasks": store.sprint_tasks(id)?,
+                "deployment": deployment,
+            }),
             args.has("json"),
         );
     }
@@ -9090,6 +9357,25 @@ mod tests {
         .unwrap()
     }
 
+    fn sprint_row() -> Value {
+        serde_json::to_value(crate::model::Sprint {
+            id: "sp-1".into(),
+            title: "Ship the decisions room".into(),
+            body: Some("Ship it.\n- criteria one".into()),
+            status: "current".into(),
+            target_version: "0.4.0".into(),
+            scheduled_start: 0,
+            scheduled_end: 1,
+            starts_at: 1,
+            ends_at: None,
+            closed_by_deployment: None,
+            created_at: 1,
+            updated_at: 1,
+            archived: false,
+        })
+        .unwrap()
+    }
+
     fn keys(row: &Value) -> Vec<&str> {
         row.as_object()
             .unwrap()
@@ -9126,6 +9412,9 @@ mod tests {
         let mut expected = ATTENTION_FIELDS.to_vec();
         expected.sort_unstable();
         assert_eq!(keys(&attention_row()), expected);
+        let mut expected = SPRINT_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys(&sprint_row()), expected);
     }
 
     #[test]

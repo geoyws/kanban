@@ -772,6 +772,12 @@ pub struct ContextPacket {
     /// only `sitrep list` could see would be an update the reader it was
     /// written for never gets.
     pub sitreps: Vec<Sitrep>,
+    /// The sprint this task is attached to, when it is inside one: the
+    /// version boundary the resuming agent is working toward (ADR-045 §5).
+    /// Absent when the task is unattached, so a board that never opened a
+    /// sprint reads exactly as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<ContextSprint>,
     pub generated_at: i64,
     pub truncated: bool,
 }
@@ -842,6 +848,14 @@ pub const ATTENTION_STATUSES: [&str; 2] = ["open", "resolved"];
 /// reason: a closed set the schema publishes rather than a convention. The
 /// label is what geoyws reads; this is what a lane branches on.
 pub const ATTENTION_OUTCOMES: [&str; 4] = ["approve", "reject", "defer", "other"];
+
+/// The statuses a sprint row may hold (ADR-045 §1).
+///
+/// A closed set beside [`ATTENTION_STATUSES`] for the same reason: the
+/// schema publishes the vocabulary instead of a convention growing one.
+/// `closed` and `abandoned` are history — reopened never, rewritten never —
+/// which is why the rewrite verbs refuse them by name.
+pub const SPRINT_STATUSES: [&str; 4] = ["planned", "current", "closed", "abandoned"];
 
 /// The reserved key of the free-text answer every item offers. Never stored
 /// in `choices`, and refused as an authored key (ADR-042 §4 refusal 9).
@@ -1376,6 +1390,42 @@ pub(crate) fn full_commit(value: &str, label: &str) -> Result<String> {
     Ok(value)
 }
 
+/// A `--version` value: `X.Y.Z` with an optional `-suffix` (ADR-045 §2).
+///
+/// The sprint's whole point is a version boundary, and a version nobody can
+/// match against a served artifact is decoration — so the shape is enforced
+/// here, once, for every surface that names one.
+pub fn target_version(value: &str) -> Result<String> {
+    let value = value.trim();
+    let (core, suffix) = match value.split_once('-') {
+        Some((core, suffix)) => (core, Some(suffix)),
+        None => (value, None),
+    };
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let core_valid = {
+        let mut parts = core.split('.');
+        (0..3).all(|_| numeric(parts.next().unwrap_or(""))) && parts.next().is_none()
+    };
+    let suffix_valid = suffix.is_none_or(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    });
+    if !core_valid || !suffix_valid {
+        bail!(
+            "version {value:?} must read X.Y.Z with an optional -suffix, such as 0.4.0 or \
+             0.4.0-rc.1 — the version is matched against a served artifact, so a shape nobody \
+             can match is decoration"
+        );
+    }
+    Ok(value.to_owned())
+}
+/// The canonical goal headline carried by context and dashboard projections.
+pub(crate) fn sprint_goal(body: Option<&str>) -> Option<&str> {
+    body?.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
 /// The ordinary identity: a build commit, verified at finish against the
 /// commit the tier actually served. Every deploy that has Git provenance uses
 /// this and nothing about it changes.
@@ -1753,6 +1803,12 @@ pub struct DeploymentAttempt {
     pub receipt: Option<String>,
     pub artifact_uri: Option<String>,
     pub served_commit: Option<String>,
+    #[serde(rename = "sprintID", skip_serializing_if = "Option::is_none")]
+    pub sprint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_version: Option<String>,
     /// The expected identities and what the finish observed for each, in the
     /// attempt's own expected order. Empty in Git mode.
     pub artifacts: Vec<ArtifactVerification>,
@@ -1789,6 +1845,8 @@ pub struct StartDeployment {
     pub retry_of: Option<String>,
     pub actor: String,
     pub lane: Option<String>,
+    /// Optional typed release boundary, resolved to its target version atomically at start.
+    pub sprint_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1803,7 +1861,87 @@ pub struct FinishDeployment {
     /// What the finish measured, per role. Empty in Git mode, and one
     /// identity per expected role for a succeeded artifact-mode attempt.
     pub observed: Vec<ArtifactIdentity>,
+    /// The version actually observed as served. Required for successful, sprint-bound verification.
+    pub served_version: Option<String>,
     pub actor: String,
+}
+
+/// One sprint row: a typed boundary that scopes claims and cannot close
+/// without a served version (ADR-045 §1).
+///
+/// Not the tasks table, deliberately — a sprint is not work and must not be
+/// claimable, gated or handed off; typed rows get tables (the
+/// `attention`/`deployment`/`subscription` precedent) and `sp-` is a
+/// first-class id like `a-` and `d-`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sprint {
+    pub id: String,
+    pub title: String,
+    /// The goal and success criteria, authored by `sprint plan`.
+    pub body: Option<String>,
+    /// One of [`SPRINT_STATUSES`].
+    pub status: String,
+    /// The version this sprint ships; the close gate's deployment row is the
+    /// proof that version was served.
+    pub target_version: String,
+    /// Planned interval, independent of actual start/close stamps. Epoch milliseconds.
+    pub scheduled_start: i64,
+    pub scheduled_end: i64,
+    /// Stamped by `sprint start`. `0` until then — epoch zero is not a
+    /// moment anyone can have started at, so it can never read as a stamp.
+    pub starts_at: i64,
+    /// Stamped by `sprint close` and `sprint abandon`.
+    pub ends_at: Option<i64>,
+    /// The `d-` attempt that proved the version served, set by close.
+    pub closed_by_deployment: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived: bool,
+}
+
+/// The `sprint new` input. The row starts `planned`; `start` makes it the
+/// boundary, `close` ends it on proof, `abandon` ends it on a note.
+#[derive(Debug, Clone)]
+pub struct NewSprint {
+    pub id: Option<String>,
+    pub title: String,
+    pub body: Option<String>,
+    pub target_version: String,
+    pub scheduled_start: i64,
+    pub scheduled_end: i64,
+    pub actor: String,
+}
+
+/// What one task-sprint change did: the row it moved, its old boundary, and
+/// every row whose attachment changed — the same set the event payload
+/// names, so the CLI answer and the ledger cannot disagree (ADR-045 §2).
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSprintReceipt {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    pub old_sprint_id: Option<String>,
+    pub new_sprint_id: Option<String>,
+    /// Every row the change moved, parent-first: the named row plus each
+    /// subtree descendant that joined it.
+    pub moved: Vec<String>,
+}
+
+/// The sprint a context packet's task is attached to (ADR-045 §5): which
+/// release the resuming agent is working toward.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSprint {
+    #[serde(rename = "sprintID")]
+    pub sprint_id: String,
+    pub status: String,
+    pub target_version: String,
+    pub title: String,
+    /// The sprint body's first line — the goal as a headline, without the
+    /// whole success-criteria document.
+    pub goal: Option<String>,
 }
 
 /// One bounded retrieval request over Kanban's derived search corpus.

@@ -4370,6 +4370,7 @@ mod tests {
                 retry_of: None,
                 actor: "geoyws".to_owned(),
                 lane: Some("deploy".to_owned()),
+                sprint_id: None,
             })
             .expect("start current deployment");
         let current = store
@@ -4383,6 +4384,7 @@ mod tests {
                 served_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
                 observed: Vec::new(),
                 actor: "geoyws".to_owned(),
+                served_version: None,
             })
             .expect("finish current deployment");
         let failed_start = store
@@ -4403,6 +4405,7 @@ mod tests {
                 retry_of: None,
                 actor: "geoyws".to_owned(),
                 lane: Some("deploy".to_owned()),
+                sprint_id: None,
             })
             .expect("start failed deployment");
         let failed = store
@@ -4416,6 +4419,7 @@ mod tests {
                 served_commit: None,
                 observed: Vec::new(),
                 actor: "geoyws".to_owned(),
+                served_version: None,
             })
             .expect("finish failed deployment");
         assert_eq!(attention.task_id.as_deref(), Some(epic.id.as_str()));
