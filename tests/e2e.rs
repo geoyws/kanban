@@ -36601,6 +36601,18 @@ fn hig_release_script_install_refuses_when_the_service_manager_cannot_be_asked()
     }
 }
 
+fn elapsed_from_file_marker(marker: &Path, end: SystemTime) -> Result<Duration, String> {
+    let start = fs::metadata(marker)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| format!("cannot read {} timestamp: {error}", marker.display()))?;
+    end.duration_since(start).map_err(|error| {
+        format!(
+            "clock moved backwards between {} and process exit: {error}",
+            marker.display()
+        )
+    })
+}
+
 fn spawn_bounded_stalled_accept_worker(
     listener: std::net::TcpListener,
     start_rx: mpsc::Receiver<()>,
@@ -36654,6 +36666,8 @@ fn spawn_bounded_stalled_accept_worker(
 
 #[test]
 fn stalled_accept_worker_keeps_a_real_connection_queued_before_stop() {
+    let fixture = Fixture::new("stalled-accept-late-observer");
+    let marker = fixture.root.join("curl-started");
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let (start_tx, start_rx) = mpsc::channel();
@@ -36661,20 +36675,22 @@ fn stalled_accept_worker_keeps_a_real_connection_queued_before_stop() {
     let (stop_tx, stop_rx) = mpsc::channel();
     let worker = spawn_bounded_stalled_accept_worker(listener, start_rx, ready_tx, stop_rx);
     ready_rx.recv().unwrap();
+    fs::write(&marker, []).unwrap();
     let connection = std::net::TcpStream::connect(address).unwrap();
-    let simulated_child_exit = Instant::now();
-    // Model the observer being descheduled until after both the real probe was
-    // queued and the child had exited. A pending stop must not relabel that
-    // queued connection as a synthetic teardown wake-up.
+    let simulated_child_exit = SystemTime::now();
+    // Model observation delayed until after the real probe was queued and the
+    // child exited. Connection proof survives pending stop; elapsed time comes
+    // from curl's pre-launch marker rather than the late userspace dequeue.
     let _ = stop_tx.send(());
     start_tx.send(()).unwrap();
-    let observed = worker
+    worker
         .join()
         .unwrap()
         .expect("queued real connection was discarded when stop was pending");
+    let measured = elapsed_from_file_marker(&marker, simulated_child_exit).unwrap();
     assert!(
-        observed >= simulated_child_exit,
-        "the worker was not actually delayed until after simulated child exit"
+        measured <= Duration::from_secs(1),
+        "marker-to-exit measurement included delayed observation: {measured:?}"
     );
     drop(connection);
 }
@@ -36686,13 +36702,13 @@ fn stalled_accept_worker_keeps_a_real_connection_queued_before_stop() {
 /// request is bounded by what is LEFT of the deadline.
 ///
 /// The listener accepts the connection and answers nothing, which is what a
-/// serve process wedged on its data root looks like from outside, and it
-/// timestamps its own accept. The bound is measured from THAT - the moment
-/// the probe reached the socket - to the installer's exit, so it is a
-/// statement about the probe and not about what packaging and validation cost
-/// on a loaded machine. Nothing here waits out the deadline twice: the exe
-/// proof is answered immediately, so the whole window between accept and exit
-/// is the HTTP proof plus the rollback behind it.
+/// serve process wedged on its data root looks like from outside. The bound
+/// starts at a fixture marker written immediately before execing real curl and
+/// ends when the parent observes installer exit. SystemTime is deliberate: it
+/// is the clock shared with the marker's filesystem mtime, and a backwards
+/// wall-clock jump is refused rather than saturated. Starting before curl
+/// launch and ending after exit is conservative and independent of when a
+/// loaded observer thread dequeues the proved TCP connection.
 #[test]
 fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
     let harness = ReleaseGuardHarness::new("hig-release-serve-stall");
@@ -36722,6 +36738,10 @@ fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
             .fixture
             .root
             .join(format!("stall-stage-{target}.log"));
+        let curl_started = harness
+            .fixture
+            .root
+            .join(format!("stall-curl-started-{target}"));
         let mut child = harness
             .install_command(
                 target,
@@ -36738,6 +36758,7 @@ fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
             // returns instantly cannot measure a bound on a request.
             .env("FAKE_SERVE_CURL_REAL", "1")
             .env("FAKE_SERVE_STAGE_LOG", &stage_log)
+            .env("FAKE_SERVE_CURL_STARTED", &curl_started)
             .env(
                 "HIG_RELEASE_SERVE_DEADLINE_SECONDS",
                 deadline_seconds.to_string(),
@@ -36748,12 +36769,12 @@ fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
             .spawn()
             .unwrap();
         let give_up = Instant::now() + Duration::from_secs(90);
-        let (exited, watchdog_fired) = loop {
+        let (exited_at, watchdog_fired) = loop {
             match child.try_wait().unwrap() {
-                Some(_) => break (Instant::now(), false),
+                Some(_) => break (SystemTime::now(), false),
                 None if Instant::now() >= give_up => {
                     let _ = child.kill();
-                    break (Instant::now(), true);
+                    break (SystemTime::now(), true);
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -36787,17 +36808,15 @@ fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
             Some("exe-start\ncurl-real-start\n"),
             "{target}: identity proof was not followed by a real HTTP probe; stderr:\n{stderr}"
         );
-        let reached_the_socket = reached_the_socket.unwrap_or_else(|| {
+        reached_the_socket.unwrap_or_else(|| {
             panic!("{target}: the prearmed listener never saw the real probe; stderr:\n{stderr}")
         });
-        let stalled_for = exited.checked_duration_since(reached_the_socket).unwrap_or_else(|| {
-            panic!(
-                "{target}: listener observation happened after installer exit; timing is not trustworthy; stderr:\n{stderr}"
-            )
+        let stalled_for = elapsed_from_file_marker(&curl_started, exited_at).unwrap_or_else(|error| {
+            panic!("{target}: cannot measure the real HTTP probe deadline: {error}; stderr:\n{stderr}")
         });
         assert!(
             stalled_for <= Duration::from_secs(deadline_seconds + 2),
-            "{target}: the probe reached the socket and the installer took {stalled_for:?} to give up on a {deadline_seconds}s deadline; the requests are not bounded by what is left of it"
+            "{target}: from real curl launch until installer exit took {stalled_for:?} on a {deadline_seconds}s deadline; the request is not bounded by what is left of it"
         );
     }
 }
