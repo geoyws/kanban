@@ -14209,6 +14209,8 @@ esac
         r#"#!/bin/sh
 set -eu
 if [ -n "${FAKE_SERVE_CURL_REAL:-}" ]; then
+  [ -z "${FAKE_SERVE_CURL_STARTED:-}" ] || : > "$FAKE_SERVE_CURL_STARTED"
+  [ -z "${FAKE_SERVE_STAGE_LOG:-}" ] || printf 'curl-real-start\n' >> "$FAKE_SERVE_STAGE_LOG"
   command -p curl "$@"
   exit "$?"
 fi
@@ -14267,6 +14269,9 @@ printf '%s' "$status"
         r#"#!/bin/sh
 set -eu
 expected_pid="${FAKE_SERVE_MAIN_PID:?}"
+[ -z "${FAKE_SERVE_EXE_STARTED:-}" ] || : > "$FAKE_SERVE_EXE_STARTED"
+[ -z "${FAKE_SERVE_STAGE_LOG:-}" ] || printf 'exe-start\n' >> "$FAKE_SERVE_STAGE_LOG"
+[ -z "${FAKE_SERVE_EXE_DELAY_SECONDS:-}" ] || sleep "$FAKE_SERVE_EXE_DELAY_SECONDS"
 if [ -n "${FAKE_SERVE_CURL_TRIGGER:-}" ] && [ -e "${FAKE_SERVE_CURL_TRIGGER}" ]; then
   expected_pid="${FAKE_SERVE_MAIN_PID_AFTER:-$expected_pid}"
 fi
@@ -36596,6 +36601,84 @@ fn hig_release_script_install_refuses_when_the_service_manager_cannot_be_asked()
     }
 }
 
+fn spawn_bounded_stalled_accept_worker(
+    listener: std::net::TcpListener,
+    start_rx: mpsc::Receiver<()>,
+    ready_tx: mpsc::SyncSender<()>,
+    stop_rx: mpsc::Receiver<()>,
+) -> std::thread::JoinHandle<Option<Instant>> {
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        ready_tx.send(()).unwrap();
+        if start_rx.recv().is_err() {
+            return None;
+        }
+        let mut connections = Vec::new();
+        let mut reached = None;
+        loop {
+            loop {
+                match listener.accept() {
+                    Ok((connection, _)) => {
+                        reached.get_or_insert_with(Instant::now);
+                        connections.push(connection);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("stalled listener accept failed: {error}"),
+                }
+            }
+            match stop_rx.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    // A real connection can become ready between the regular
+                    // drain and observing stop. Drain once more before exit;
+                    // unlike a synthetic wake-up, every socket here was
+                    // queued by the installer while the listener was alive.
+                    loop {
+                        match listener.accept() {
+                            Ok((connection, _)) => {
+                                reached.get_or_insert_with(Instant::now);
+                                connections.push(connection);
+                            }
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("stalled listener final accept failed: {error}"),
+                        }
+                    }
+                    return reached;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn stalled_accept_worker_keeps_a_real_connection_queued_before_stop() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (start_tx, start_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let worker = spawn_bounded_stalled_accept_worker(listener, start_rx, ready_tx, stop_rx);
+    ready_rx.recv().unwrap();
+    let connection = std::net::TcpStream::connect(address).unwrap();
+    let simulated_child_exit = Instant::now();
+    // Model the observer being descheduled until after both the real probe was
+    // queued and the child had exited. A pending stop must not relabel that
+    // queued connection as a synthetic teardown wake-up.
+    let _ = stop_tx.send(());
+    start_tx.send(()).unwrap();
+    let observed = worker
+        .join()
+        .unwrap()
+        .expect("queued real connection was discarded when stop was pending");
+    assert!(
+        observed >= simulated_child_exit,
+        "the worker was not actually delayed until after simulated child exit"
+    );
+    drop(connection);
+}
+
 /// A stalled listener is not a slow one. `curl` with no per-request bound
 /// waits on the socket for as long as the peer holds it, and a deadline the
 /// loop only consults BETWEEN requests is never reached: the install hangs,
@@ -36614,21 +36697,31 @@ fn hig_release_script_install_refuses_when_the_service_manager_cannot_be_asked()
 fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
     let harness = ReleaseGuardHarness::new("hig-release-serve-stall");
     let release_id = release_id_from_package(&harness.package_dir);
-    let stalled = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = stalled.local_addr().unwrap().port();
-    // Accepted from the same loop that waits on the installer, so the moment
-    // the probe reached the socket is observed directly rather than through a
-    // second thread's bookkeeping. Every accepted connection is held open,
-    // unread and unanswered, until the installer has given up on it.
-    stalled.set_nonblocking(true).unwrap();
     let deadline_seconds = 3_u64;
     for target in ["hax", "hig"] {
+        let stalled = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener_address = stalled.local_addr().unwrap();
+        let port = listener_address.port();
+        // Arm observation before spawning. The former parent-side polling
+        // could observe process exit just before a kernel-queued connection,
+        // making a real probe look like no probe under scheduler pressure.
+        let (start_tx, start_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let accept_worker =
+            spawn_bounded_stalled_accept_worker(stalled, start_rx, ready_tx, stop_rx);
+        ready_rx.recv().unwrap();
+        start_tx.send(()).unwrap();
         let install_root = harness.fixture.root.join(format!("stall-{target}"));
         let bin_dir = harness.fixture.root.join(format!("stall-bin-{target}"));
         let served_exe = install_root
             .join("releases")
             .join(&release_id)
             .join("kanban");
+        let stage_log = harness
+            .fixture
+            .root
+            .join(format!("stall-stage-{target}.log"));
         let mut child = harness
             .install_command(
                 target,
@@ -36644,6 +36737,7 @@ fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
             // The real curl, against the real stalled socket: a stub that
             // returns instantly cannot measure a bound on a request.
             .env("FAKE_SERVE_CURL_REAL", "1")
+            .env("FAKE_SERVE_STAGE_LOG", &stage_log)
             .env(
                 "HIG_RELEASE_SERVE_DEADLINE_SECONDS",
                 deadline_seconds.to_string(),
@@ -36654,40 +36748,117 @@ fn hig_release_script_install_bounds_a_stalled_http_probe_by_its_deadline() {
             .spawn()
             .unwrap();
         let give_up = Instant::now() + Duration::from_secs(90);
-        let mut connections = Vec::new();
-        let mut reached_the_socket: Option<Instant> = None;
-        let exited = loop {
-            while let Ok((connection, _)) = stalled.accept() {
-                reached_the_socket.get_or_insert_with(Instant::now);
-                connections.push(connection);
-            }
+        let (exited, watchdog_fired) = loop {
             match child.try_wait().unwrap() {
-                Some(_) => break Instant::now(),
+                Some(_) => break (Instant::now(), false),
                 None if Instant::now() >= give_up => {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("{target}: the installer blocked on a stalled HTTP probe");
+                    let _ = child.kill();
+                    break (Instant::now(), true);
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
         };
+        // Release every accepted socket before collecting piped output. A
+        // killed shell can leave curl holding those descriptors until its
+        // stalled connection is closed.
+        let _ = stop_tx.send(());
+        let worker_result = accept_worker.join();
         let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if watchdog_fired {
+            panic!(
+                "{target}: the installer exceeded the 90s fixture watchdog\nstdout: {}\nstderr: {stderr}\naccept worker joined: {}",
+                String::from_utf8_lossy(&output.stdout),
+                worker_result.is_ok()
+            );
+        }
+        let reached_the_socket = worker_result.expect("stalled accept worker panicked");
         assert!(
             !output.status.success(),
-            "{target}: an install went green against a listener that answered nothing\nstdout: {}",
+            "{target}: an install went green against a listener that answered nothing\nstdout: {}\nstderr: {stderr}",
             String::from_utf8_lossy(&output.stdout)
         );
-        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("did not answer 200"),
             "{target}: the refusal does not name the probe that timed out:\n{stderr}"
         );
-        let reached_the_socket =
-            reached_the_socket.expect("the stalled listener never saw the probe");
-        let stalled_for = exited.duration_since(reached_the_socket);
+        assert_eq!(
+            fs::read_to_string(&stage_log).ok().as_deref(),
+            Some("exe-start\ncurl-real-start\n"),
+            "{target}: identity proof was not followed by a real HTTP probe; stderr:\n{stderr}"
+        );
+        let reached_the_socket = reached_the_socket.unwrap_or_else(|| {
+            panic!("{target}: the prearmed listener never saw the real probe; stderr:\n{stderr}")
+        });
+        let stalled_for = exited.checked_duration_since(reached_the_socket).unwrap_or_else(|| {
+            panic!(
+                "{target}: listener observation happened after installer exit; timing is not trustworthy; stderr:\n{stderr}"
+            )
+        });
         assert!(
             stalled_for <= Duration::from_secs(deadline_seconds + 2),
             "{target}: the probe reached the socket and the installer took {stalled_for:?} to give up on a {deadline_seconds}s deadline; the requests are not bounded by what is left of it"
+        );
+    }
+}
+
+/// The readiness/exe and HTTP polls intentionally share one deadline. This
+/// proves the distinct no-HTTP branch where startup consumes that deadline;
+/// it must not be mistaken for evidence that an HTTP request stalled.
+#[test]
+fn hig_release_script_install_reports_when_startup_exhausts_the_http_budget() {
+    let harness = ReleaseGuardHarness::new("hig-release-serve-startup-exhaustion");
+    let release_id = release_id_from_package(&harness.package_dir);
+    for target in ["hax", "hig"] {
+        let install_root = harness.fixture.root.join(format!("startup-{target}"));
+        let bin_dir = harness.fixture.root.join(format!("startup-bin-{target}"));
+        let served_exe = install_root
+            .join("releases")
+            .join(&release_id)
+            .join("kanban");
+        let stage_log = harness
+            .fixture
+            .root
+            .join(format!("startup-stage-{target}.log"));
+        let curl_started = harness.fixture.root.join(format!("startup-curl-{target}"));
+        let output = harness
+            .install_command(
+                target,
+                &harness.package_dir,
+                &harness.hax_install_root,
+                &install_root,
+                &bin_dir,
+            )
+            .env("FAKE_SERVE_UNIT_PRESENT", "1")
+            .env("FAKE_SERVE_MAIN_PID", "6262")
+            .env("FAKE_SERVE_PORT", "9")
+            .env("FAKE_SERVE_EXE", &served_exe)
+            .env("FAKE_SERVE_EXE_DELAY_SECONDS", "2")
+            .env("FAKE_SERVE_CURL_REAL", "1")
+            .env("FAKE_SERVE_CURL_STARTED", &curl_started)
+            .env("FAKE_SERVE_STAGE_LOG", &stage_log)
+            .env("HIG_RELEASE_SERVE_DEADLINE_SECONDS", "1")
+            .env("HIG_RELEASE_EXE_OF_PID", harness.exe_probe())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{target}: startup that exhausted the deadline went green\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("did not answer 200") && stderr.contains("status=<none>"),
+            "{target}: startup exhaustion lost the no-HTTP status:\n{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(&stage_log).ok().as_deref(),
+            Some("exe-start\n"),
+            "{target}: startup exhaustion crossed into real curl; stderr:\n{stderr}"
+        );
+        assert!(
+            !curl_started.exists(),
+            "{target}: curl ran after startup consumed the shared deadline; stderr:\n{stderr}"
         );
     }
 }
