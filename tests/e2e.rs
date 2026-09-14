@@ -28822,6 +28822,137 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     assert_eq!(task["title"], task_title);
     assert_eq!(task["status"], "todo");
 
+    let closed_sprint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "Shipped mobile history",
+            "--id",
+            "sp-mobile-closed",
+            "--target-version",
+            "2.3.3",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    assert_eq!(closed_sprint["status"], "planned");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-mobile-closed",
+            "--body",
+            "Ship the prior mobile release\n\n- Prove the served version",
+            "--candidate",
+            "t-mobile-journey",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-mobile-closed",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "Current mobile release",
+            "--id",
+            "sp-mobile-current",
+            "--target-version",
+            "2.4.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-mobile-current",
+            "--body",
+            "Deliver the **mobile sprint page** safely.",
+            "--empty-scope",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let opaque_task_id = "t-mobile/opaque?#";
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Opaque ID sprint task",
+            "--id",
+            opaque_task_id,
+            "--status",
+            "todo",
+            "--sprint",
+            "sp-mobile-current",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "Next mobile release",
+            "--id",
+            "sp-mobile-next",
+            "--target-version",
+            "2.5.0",
+            "--start",
+            "4102444800000",
+            "--end",
+            "4102531200000",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-mobile-next",
+            "--body",
+            "Plan the next release.",
+            "--empty-scope",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
     let note_body = "Mobile history receipt 2026-09-10 exact fixture.";
     fixture.ok_json(
         &fixture.main,
@@ -28871,6 +29002,8 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
             "http://127.0.0.1:14200",
             "--task",
             "t-mobile-journey",
+            "--sprint",
+            "sp-mobile-closed",
             "--as",
             "fixture-agent",
             "--json",
@@ -28891,6 +29024,8 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
             "verification",
             "--served-commit",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--served-version",
+            "2.3.3",
             "--receipt",
             "Mobile fixture served exact commit bbbbbbbbbbbb.",
             "--as",
@@ -28898,6 +29033,38 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
             "--json",
         ],
     );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-mobile-closed",
+            "--deployment",
+            &deployment_id,
+            "--carry-to",
+            "sp-mobile-current",
+            "--carry-note",
+            "Carry the visible task into the current sprint",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-mobile-current",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let empty_board = fixture.root.join("empty-board");
+    fs::create_dir_all(&empty_board).unwrap();
+    let _ = make_repo(&empty_board);
+    fixture.ok_json(&empty_board, &["init", "--name", "EMPTY-SPRINTS", "--json"]);
 
     let recovery = start_recovery_deployment(&fixture, "mobile-artifact-fixture");
     let recovery_id = recovery["id"].as_str().unwrap().to_owned();
@@ -28926,6 +29093,173 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     tab.wait_for_element("[data-primary-nav]")
         .expect("primary navigation");
     assert_no_horizontal_overflow(&tab, "Needs you");
+
+    let sprints_link = tab.wait_for_element("[data-nav=sprints]").unwrap();
+    assert_eq!(
+        sprints_link.get_attribute_value("href").unwrap().as_deref(),
+        Some("/sprints")
+    );
+    click_navigating(
+        &tab,
+        "[data-nav=sprints]",
+        "[data-sprints-overview]",
+        "Sprints nav",
+    );
+    assert_eq!(js_value(&tab, "location.pathname"), "/sprints");
+    assert_element_text(
+        &tab,
+        "[data-sprint-board=\"EMPTY-SPRINTS\"] [data-no-current-sprint]",
+        "No current sprint. Planned and historical sprints remain below.",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-board=\"EMPTY-SPRINTS\"] [data-no-sprints]",
+        "This board has no sprints.",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-summary=\"sp-mobile-current\"] [data-sprint-version]",
+        "2.4.0",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-summary=\"sp-mobile-closed\"] [data-sprint-state]",
+        "closed",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-summary=\"sp-mobile-next\"] [data-sprint-state]",
+        "planned",
+    );
+    assert_no_horizontal_overflow(&tab, "Sprints overview");
+    click_navigating(
+        &tab,
+        "[data-sprint-board=\"MOBILE-JOURNEY\"] > h2 [data-board-sprints-link]",
+        "[data-board-sprints=\"MOBILE-JOURNEY\"]",
+        "board sprint overview",
+    );
+    assert_eq!(
+        js_value(&tab, "location.pathname"),
+        "/sprints/MOBILE-JOURNEY"
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-current] [data-sprint-title]",
+        "Current mobile release",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-current] [data-sprint-scheduled-start]",
+        "1970-01-01 00:00:00Z",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-current] [data-sprint-scheduled-end]",
+        "2100-01-01 00:00:00Z",
+    );
+    assert_element_text(&tab, "[data-sprint-current] [data-sprint-open]", "2");
+    assert_element_text(&tab, "[data-sprint-current] [data-sprint-done]", "0");
+    assert_eq!(
+        js_value(
+            &tab,
+            "Number(document.querySelector('[data-sprint-current] [data-sprint-days-remaining]').textContent) > 0"
+        ),
+        true
+    );
+    click_navigating(
+        &tab,
+        "[data-sprint-link=\"sp-mobile-closed\"]",
+        "[data-sprint-detail=\"sp-mobile-closed\"]",
+        "closed sprint detail",
+    );
+    assert_element_text(&tab, "[data-sprint-served-version]", "2.3.3");
+    assert_element_text(
+        &tab,
+        "[data-sprint-served-commit]",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-sprint-actual-start]').textContent.endsWith('Z') && document.querySelector('[data-sprint-actual-end]').textContent.endsWith('Z')",
+        ),
+        true,
+        "the closed sprint did not distinguish actual start/end from its schedule",
+    );
+
+    assert_no_horizontal_overflow(&tab, "closed sprint detail");
+    click_navigating(
+        &tab,
+        "[data-board-sprints-back]",
+        "[data-board-sprints=\"MOBILE-JOURNEY\"]",
+        "return to board sprints",
+    );
+    click_navigating(
+        &tab,
+        "[data-sprint-current] [data-sprint-link=\"sp-mobile-current\"]",
+        "[data-sprint-detail=\"sp-mobile-current\"]",
+        "current sprint detail",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-goal]",
+        "Deliver the mobile sprint page safely.",
+    );
+    assert_element_text(&tab, "[data-sprint-state]", "current");
+    assert_element_text(&tab, "[data-sprint-open]", "2");
+    assert_element_text(&tab, "[data-sprint-done]", "0");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-sprint-actual-start]').textContent.endsWith('Z')",
+        ),
+        true,
+        "a started sprint did not render its actual start instant",
+    );
+    assert_element_text(&tab, "[data-sprint-actual-end]", "not ended");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('main button, main form') === null"
+        ),
+        true,
+        "the sprint detail exposed mutation controls",
+    );
+
+    let opaque_link = tab
+        .wait_for_element("[data-sprint-tasks] [data-task-link=\"t-mobile/opaque?#\"]")
+        .unwrap();
+    assert_eq!(
+        opaque_link.get_attribute_value("href").unwrap().as_deref(),
+        Some("/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23"),
+    );
+    let opaque_tab = click_opening_tab(
+        &chrome,
+        &tab,
+        "[data-sprint-tasks] [data-task-link=\"t-mobile/opaque?#\"]",
+        "[data-task-detail=\"t-mobile/opaque?#\"]",
+        "opaque sprint task",
+        &[],
+    );
+    set_mobile_viewport(&opaque_tab);
+    assert_element_text(&opaque_tab, "[data-task-title]", "Opaque ID sprint task");
+    assert_eq!(
+        js_value(&opaque_tab, "location.pathname"),
+        "/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23",
+    );
+    assert_no_horizontal_overflow(&opaque_tab, "opaque sprint task detail");
+
+    let tab = click_opening_tab(
+        &chrome,
+        &tab,
+        "[data-sprint-tasks] [data-task-link=\"t-mobile-journey\"]",
+        "[data-task-detail=\"t-mobile-journey\"]",
+        "sprint task",
+        &[],
+    );
+    set_mobile_viewport(&tab);
+    assert_element_text(&tab, "[data-task-title]", task_title);
+    assert_no_horizontal_overflow(&tab, "sprint task detail");
 
     let boards_link = tab.wait_for_element("[data-nav=boards]").unwrap();
     assert_eq!(

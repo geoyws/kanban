@@ -36,7 +36,7 @@
 use crate::model::{
     ATTENTION_OUTCOMES, Attention, AttentionAnswer, AttentionChoice, CUSTOM_CHOICE, DeadLetterCode,
     DeploymentAttempt, IDENTITY_MODE_ARTIFACT, OPERATOR_ACTOR, ProjectRecord, SearchOptions,
-    Sitrep, Subscription, SubscriptionPosition, Task,
+    Sitrep, Sprint, Subscription, SubscriptionPosition, Task,
 };
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
@@ -406,6 +406,9 @@ fn render(url: &str) -> Result<String> {
         ),
         ["decided"] => decided_page(query_value(query, "undone").as_deref()),
         ["boards"] => boards(),
+        ["sprints"] => sprints(),
+        ["sprints", project] => board_sprints(project),
+        ["sprint", project, id] => sprint_detail(project, id),
         ["plans"] => plans(query_value(query, "opened").as_deref()),
         ["deployments"] => deployments(),
         ["subscriptions"] => subscriptions(
@@ -2299,6 +2302,212 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
     Ok(page(&format!("Deployment {id}"), &html))
 }
 
+const DAY_MS: i64 = 86_400_000;
+
+fn sprint_days_remaining(scheduled_end: i64) -> i64 {
+    let remaining = scheduled_end.saturating_sub(now_ms());
+    if remaining <= 0 {
+        0
+    } else {
+        remaining.saturating_add(DAY_MS - 1) / DAY_MS
+    }
+}
+
+fn sprint_summary(store: &Store, project: &str, sprint: &Sprint, current: bool) -> Result<String> {
+    let (open, done) = store.sprint_task_counts(&sprint.id)?;
+    let route = format!("/sprint/{}/{}", url_encode(project), url_encode(&sprint.id));
+    let archived = if sprint.archived {
+        " <span class=meta data-sprint-archived>archived</span>"
+    } else {
+        ""
+    };
+    let goal =
+        sprint.body.as_deref().map(markdown).unwrap_or_else(|| {
+            "<p class=empty>No goal or success criteria recorded.</p>".to_owned()
+        });
+    Ok(format!(
+        r#"<article class="card{current_class}" data-sprint-summary="{id}"{current_attr}>
+        <h2 class=sprint-version><a href="{route}" data-sprint-link="{id}"><code data-sprint-version>{version}</code></a></h2>
+        <p><strong data-sprint-title>{title}</strong></p>
+        <div class="body md" data-sprint-goal>{goal}</div>
+        <p class=meta><span class="status status-{status}" data-sprint-state>{status}</span>{archived}</p>
+        <dl><dt>Scheduled start</dt><dd data-sprint-scheduled-start>{scheduled_start}</dd>
+        <dt>Scheduled end</dt><dd data-sprint-scheduled-end>{scheduled_end}</dd>
+        <dt>Days remaining</dt><dd data-sprint-days-remaining>{days}</dd>
+        <dt>Open tasks</dt><dd data-sprint-open>{open}</dd>
+        <dt>Done tasks</dt><dd data-sprint-done>{done}</dd></dl></article>"#,
+        current_class = if current { " current" } else { "" },
+        current_attr = if current { " data-sprint-current" } else { "" },
+        id = escape(&sprint.id),
+        route = escape(&route),
+        version = escape(&sprint.target_version),
+        title = escape(&sprint.title),
+        goal = goal,
+        status = escape(&sprint.status),
+        archived = archived,
+        scheduled_start = escape(&stamp(sprint.scheduled_start)),
+        scheduled_end = escape(&stamp(sprint.scheduled_end)),
+        days = sprint_days_remaining(sprint.scheduled_end),
+    ))
+}
+
+fn board_sprints_content(project: &ProjectRecord, store: &Store) -> Result<String> {
+    let current = store.current_sprint()?;
+    let history = store.sprints(None, true, i64::MAX)?;
+    let mut html = String::new();
+    html.push_str("<h2>Current sprint</h2>");
+    match &current {
+        Some(sprint) => html.push_str(&sprint_summary(store, &project.name, sprint, true)?),
+        None => html.push_str(
+            "<p class=empty data-no-current-sprint>No current sprint. Planned and historical sprints remain below.</p>",
+        ),
+    }
+    let secondary = history
+        .iter()
+        .filter(|sprint| sprint.status != "current")
+        .collect::<Vec<_>>();
+    if secondary.is_empty() {
+        if current.is_none() {
+            html.push_str("<p class=empty data-no-sprints>This board has no sprints.</p>");
+        } else {
+            html.push_str(
+                "<p class=empty data-no-sprint-history>No planned or historical sprints.</p>",
+            );
+        }
+    } else {
+        html.push_str(&format!(
+            "<section class=sprint-history data-sprint-history><h2>Planned and history <span class=count>{}</span></h2>",
+            secondary.len()
+        ));
+        for sprint in secondary {
+            html.push_str(&sprint_summary(store, &project.name, sprint, false)?);
+        }
+        html.push_str("</section>");
+    }
+    Ok(html)
+}
+
+/// Every registered board's current release boundary and complete sprint history.
+fn sprints() -> Result<String> {
+    let mut html = String::from("<h1 data-sprints-overview>Sprints</h1>");
+    let boards = projects()?;
+    if boards.is_empty() {
+        html.push_str("<p class=empty>No boards are registered.</p>");
+    }
+    for (project, store) in boards {
+        html.push_str(&format!(
+            r#"<section data-sprint-board="{name}"><h2><a href="/sprints/{route}" data-board-sprints-link>{name}</a></h2>"#,
+            name = escape(&project.name),
+            route = escape(&url_encode(&project.name)),
+        ));
+        html.push_str(&board_sprints_content(&project, &store)?);
+        html.push_str("</section>");
+    }
+    Ok(page("Sprints", &html))
+}
+
+/// One board's current release boundary and complete planned/closed/abandoned history.
+fn board_sprints(name: &str) -> Result<String> {
+    let (project, store) = project_named(name)?;
+    let mut html = format!(
+        r#"<h1 data-board-sprints="{name}">{name} sprints</h1><p><a href="/board/{route}">Back to board</a></p>"#,
+        name = escape(&project.name),
+        route = escape(&url_encode(&project.name)),
+    );
+    html.push_str(&board_sprints_content(&project, &store)?);
+    Ok(page(&format!("{} sprints", project.name), &html))
+}
+
+/// One sprint's release goal, dates, visible scope and authoritative deployment proof.
+fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
+    let (project, store) = project_named(project_name)?;
+    let sprint = store.require_sprint(id)?;
+    let tasks = store.sprint_tasks(id)?;
+    let (open, done) = store.sprint_task_counts(id)?;
+    let archived = if sprint.archived { "yes" } else { "no" };
+    let actual_start = if sprint.starts_at == 0 {
+        "not started".to_owned()
+    } else {
+        stamp(sprint.starts_at)
+    };
+    let actual_end = sprint
+        .ends_at
+        .map(stamp)
+        .unwrap_or_else(|| "not ended".to_owned());
+    let mut html = format!(
+        r#"<h1 data-sprint-detail="{id}"><code data-sprint-version>{version}</code> · <span data-sprint-title>{title}</span></h1>
+        <p><a href="/sprints/{board}" data-board-sprints-back>Back to {project} sprints</a></p>
+        <div class="card current"><div class="body md" data-sprint-goal>{goal}</div>
+        <dl><dt>State</dt><dd><span class="status status-{status}" data-sprint-state>{status}</span></dd>
+        <dt>Scheduled start</dt><dd data-sprint-scheduled-start>{scheduled_start}</dd>
+        <dt>Scheduled end</dt><dd data-sprint-scheduled-end>{scheduled_end}</dd>
+        <dt>Actual start</dt><dd data-sprint-actual-start>{actual_start}</dd>
+        <dt>Actual end</dt><dd data-sprint-actual-end>{actual_end}</dd>
+        <dt>Days remaining</dt><dd data-sprint-days-remaining>{days}</dd>
+        <dt>Open tasks</dt><dd data-sprint-open>{open}</dd>
+        <dt>Done tasks</dt><dd data-sprint-done>{done}</dd>
+        <dt>Archived</dt><dd data-sprint-archived>{archived}</dd></dl></div>"#,
+        id = escape(&sprint.id),
+        version = escape(&sprint.target_version),
+        title = escape(&sprint.title),
+        board = escape(&url_encode(&project.name)),
+        project = escape(&project.name),
+        goal = sprint.body.as_deref().map(markdown).unwrap_or_else(|| {
+            "<p class=empty>No goal or success criteria recorded.</p>".to_owned()
+        }),
+        status = escape(&sprint.status),
+        scheduled_start = escape(&stamp(sprint.scheduled_start)),
+        scheduled_end = escape(&stamp(sprint.scheduled_end)),
+        actual_start = escape(&actual_start),
+        actual_end = escape(&actual_end),
+        days = sprint_days_remaining(sprint.scheduled_end),
+    );
+    if let Some(deployment_id) = &sprint.closed_by_deployment {
+        let deployment = store.require_deployment(deployment_id)?;
+        html.push_str(&format!(
+            r#"<section class=card data-sprint-deployment-proof><h2>Served deployment proof</h2>
+            <p>{link}</p><dl><dt>Served version</dt><dd data-sprint-served-version>{version}</dd>
+            <dt>Served commit</dt><dd data-sprint-served-commit>{commit}</dd></dl></section>"#,
+            link = deployment_link(&project.name, &deployment),
+            version = deployment
+                .served_version
+                .as_deref()
+                .map(escape)
+                .unwrap_or_else(|| "not recorded".to_owned()),
+            commit = deployment
+                .served_commit
+                .as_deref()
+                .map(|value| format!("<code>{}</code>", escape(value)))
+                .unwrap_or_else(|| "not recorded".to_owned()),
+        ));
+    } else if sprint.status == "closed" {
+        html.push_str(
+            "<p class=empty data-no-sprint-proof>No served deployment proof is attached.</p>",
+        );
+    }
+    html.push_str(&format!(
+        "<h2>Attached tasks <span class=count>{}</span></h2>",
+        tasks.len()
+    ));
+    if tasks.is_empty() {
+        html.push_str("<p class=empty data-no-sprint-tasks>No visible tasks are attached.</p>");
+    } else {
+        html.push_str("<ul class=rows data-sprint-tasks>");
+        for task in tasks {
+            html.push_str(&format!(
+                r#"<li data-task="{id}"><a href="/task/{project}/{task_route}" data-task-link="{id}" data-ref target=_blank rel=noopener>{id}</a> <span class="status status-{status}" data-task-state>{status}</span> <span data-task-title>{title}</span></li>"#,
+                project = escape(&url_encode(&project.name)),
+                task_route = escape(&url_encode(&task.id)),
+                id = escape(&task.id),
+                status = escape(&task.status),
+                title = escape(&task.title),
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    Ok(page(&format!("Sprint {}", sprint.id), &html))
+}
+
 /// Every board at a glance — the `dashboard` projection, rendered.
 fn boards() -> Result<String> {
     let mut html = String::from(
@@ -2945,7 +3154,11 @@ fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None, None, false)?;
     let rules = Registry::open()?.applicable_rules(Some(&project.name), None, false)?;
-    let mut html = format!("<h1>{}</h1>", escape(&project.name));
+    let mut html = format!(
+        "<h1>{0}</h1><p><a href=\"/sprints/{1}\" data-board-sprints-link>Sprints for {0}</a></p>",
+        escape(&project.name),
+        escape(&url_encode(&project.name)),
+    );
     let roots = if project.workspace_roots.is_empty() {
         "Rootless".to_owned()
     } else {
@@ -3377,7 +3590,7 @@ fn page(title: &str, body: &str) -> String {
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
          <nav aria-label=Primary data-primary-nav><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
          <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
-         <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
+         <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/sprints\" data-nav=sprints>Sprints</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
          <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
          <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
          </nav><main id=main>{body}</main>\
@@ -4003,9 +4216,11 @@ td.waiting{color:var(--peach);font-weight:650}\
 .queued .dead{color:var(--red);font-weight:700}\
 td.when{white-space:nowrap;color:var(--muted)}\
 td.payload{color:var(--muted);font-size:.85rem;word-break:break-word}\
-.item,.note,.plan,.search-result{border:1px solid var(--surface0);border-radius:10px;\
+.item,.note,.plan,.search-result,.card{border:1px solid var(--surface0);border-radius:10px;\
 padding:clamp(.9rem,3vw,1.25rem);margin:1rem 0;background:var(--base)}\
 .item:has(.priority-p0){border-color:var(--red)}.item:has(.priority-p1){border-color:var(--peach)}\
+.card>h2:first-child{margin-top:0}.card.current{border-color:var(--green)}\
+.sprint-version{font-size:1.15rem}.sprint-history{margin-top:1.5rem}\
 .heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
 .live{color:var(--green);font-size:.75rem}\
 .live::after{content:'●';margin-left:.35em;animation:pulse 2.4s ease-in-out infinite}\
@@ -4131,7 +4346,8 @@ mod tests {
     use super::*;
     use crate::authz::AuthzContext;
     use crate::model::{
-        AddSubscription, AddTask, DecisionCard, DeployIdentity, FinishDeployment, StartDeployment,
+        AddSubscription, AddTask, DecisionCard, DeployIdentity, FinishDeployment, NewSprint,
+        StartDeployment,
     };
     use crate::policy::{Capability, ScopeTuple, authority};
     use crate::routing::Enforcement;
@@ -4151,6 +4367,9 @@ mod tests {
         task_id: String,
         current_deployment_id: String,
         failed_deployment_id: String,
+        current_sprint_started_at: i64,
+        closed_sprint_started_at: i64,
+        closed_sprint_ended_at: i64,
     }
 
     struct TempDataDir(PathBuf);
@@ -4422,6 +4641,216 @@ mod tests {
                 served_version: None,
             })
             .expect("finish failed deployment");
+        let closed = store
+            .create_sprint(NewSprint {
+                id: Some("sp-render-closed".to_owned()),
+                title: "Closed <release>".to_owned(),
+                body: None,
+                target_version: "3.1.0".to_owned(),
+                scheduled_start: 1_700_000_000_000,
+                scheduled_end: 4_102_444_800_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create closed sprint");
+        store
+            .plan_sprint(
+                &closed.id,
+                "Ship **3.1.0**\n\n<script>unsafe()</script>",
+                std::slice::from_ref(&done.id),
+                None,
+                false,
+                "geoyws",
+            )
+            .expect("plan closed sprint");
+        store
+            .start_sprint(&closed.id, "geoyws")
+            .expect("start closed sprint");
+        let proof_start = store
+            .start_deployment(StartDeployment {
+                task_id: Some(done.id.clone()),
+                repo: "geoyws/kanban".to_owned(),
+                identity: DeployIdentity::Git(
+                    "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                ),
+                deployer_checkout: None,
+                branch: Some("release/3.1.0".to_owned()),
+                tier: "@_p".to_owned(),
+                environment: "production".to_owned(),
+                host: "serve-host".to_owned(),
+                url: "https://serve.invalid/3.1.0".to_owned(),
+                mechanism: Some("unit fixture".to_owned()),
+                operation_id: Some("serve-sprint-proof".to_owned()),
+                retry_of: None,
+                actor: "geoyws".to_owned(),
+                lane: Some("deploy".to_owned()),
+                sprint_id: Some(closed.id.clone()),
+            })
+            .expect("start sprint proof");
+        let proof = store
+            .finish_deployment(FinishDeployment {
+                id: proof_start.deployment.id.clone(),
+                capability_token: proof_start.capability_token,
+                result: "succeeded".to_owned(),
+                phase: Some("verification".to_owned()),
+                receipt: Some("served 3.1.0".to_owned()),
+                artifact_uri: None,
+                served_commit: Some("cccccccccccccccccccccccccccccccccccccccc".to_owned()),
+                observed: Vec::new(),
+                actor: "geoyws".to_owned(),
+                served_version: Some("3.1.0".to_owned()),
+            })
+            .expect("finish sprint proof");
+        let closed_finished = store
+            .close_sprint(&closed.id, Some(&proof.id), None, None, "geoyws")
+            .expect("close sprint on proof");
+
+        let opaque = store
+            .add_task(AddTask {
+                id: Some("t-render/opaque?#".to_owned()),
+                task_type: "task".to_owned(),
+                parent_id: None,
+                title: "Opaque <task>".to_owned(),
+                body: None,
+                assignee: None,
+                lane: None,
+                deliverable: None,
+                stale_minutes: None,
+                driver_only: false,
+                status: "todo".to_owned(),
+                priority: 2,
+                dependencies: vec![],
+                metadata: serde_json::json!({}),
+                actor: Some("geoyws".to_owned()),
+                tags: vec!["release".to_owned()],
+            })
+            .expect("add opaque sprint task");
+        let current_sprint = store
+            .create_sprint(NewSprint {
+                id: Some("sp-render-current".to_owned()),
+                title: "Current release".to_owned(),
+                body: None,
+                target_version: "3.2.0".to_owned(),
+                scheduled_start: 1_700_000_000_000,
+                scheduled_end: 4_102_444_800_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create current sprint");
+        store
+            .plan_sprint(
+                &current_sprint.id,
+                "Current **goal** and criteria.",
+                std::slice::from_ref(&opaque.id),
+                None,
+                false,
+                "geoyws",
+            )
+            .expect("plan current sprint");
+        let current_started = store
+            .start_sprint(&current_sprint.id, "geoyws")
+            .expect("start current sprint");
+
+        let planned = store
+            .create_sprint(NewSprint {
+                id: Some("sp-render-planned".to_owned()),
+                title: "Planned release".to_owned(),
+                body: None,
+                target_version: "3.3.0".to_owned(),
+                scheduled_start: 4_102_444_800_000,
+                scheduled_end: 4_102_531_200_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create planned sprint");
+        store
+            .plan_sprint(&planned.id, "Planned goal.", &[], None, true, "geoyws")
+            .expect("plan future sprint");
+        let abandoned = store
+            .create_sprint(NewSprint {
+                id: Some("sp-render-abandoned".to_owned()),
+                title: "Abandoned release".to_owned(),
+                body: Some("Goal that was not met.".to_owned()),
+                target_version: "3.0.0".to_owned(),
+                scheduled_start: 1_600_000_000_000,
+                scheduled_end: 1_700_000_000_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create abandoned sprint");
+        store
+            .abandon_sprint(&abandoned.id, "superseded", "geoyws")
+            .expect("abandon sprint");
+        let archived = store
+            .create_sprint(NewSprint {
+                id: Some("sp-render-archived".to_owned()),
+                title: "Archived release".to_owned(),
+                body: None,
+                target_version: "2.9.0".to_owned(),
+                scheduled_start: 1_500_000_000_000,
+                scheduled_end: 1_600_000_000_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create archived sprint");
+        store
+            .connection
+            .execute("UPDATE sprints SET archived=1 WHERE id=?", [&archived.id])
+            .expect("archive historical sprint fixture");
+        let missing_proof = store
+            .create_sprint(NewSprint {
+                id: Some("sp-render-missing-proof".to_owned()),
+                title: "Closed without proof fixture".to_owned(),
+                body: Some("Legacy closed row.".to_owned()),
+                target_version: "2.8.0".to_owned(),
+                scheduled_start: 1_400_000_000_000,
+                scheduled_end: 1_500_000_000_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create legacy sprint fixture");
+        store
+            .connection
+            .execute(
+                "UPDATE sprints SET status='closed',ends_at=updated_at WHERE id=?",
+                [&missing_proof.id],
+            )
+            .expect("seed a legacy closed row without proof");
+
+        let empty = registry
+            .register(None, "SERVE-SPRINT-EMPTY", false, "geoyws")
+            .expect("register empty sprint board");
+        let mut empty_store = Store::open(Path::new(&empty.board_path)).expect("open empty board");
+        empty_store
+            .initialize("SERVE-SPRINT-EMPTY", "geoyws")
+            .expect("initialize empty board");
+        let current_only = registry
+            .register(None, "SERVE-SPRINT-CURRENT-ONLY", false, "geoyws")
+            .expect("register current-only sprint board");
+        let mut current_only_store =
+            Store::open(Path::new(&current_only.board_path)).expect("open current-only board");
+        current_only_store
+            .initialize("SERVE-SPRINT-CURRENT-ONLY", "geoyws")
+            .expect("initialize current-only board");
+        let sole_current = current_only_store
+            .create_sprint(NewSprint {
+                id: Some("sp-only-current".to_owned()),
+                title: "Only current sprint".to_owned(),
+                body: None,
+                target_version: "1.0.0".to_owned(),
+                scheduled_start: 0,
+                scheduled_end: 4_102_444_800_000,
+                actor: "geoyws".to_owned(),
+            })
+            .expect("create sole current sprint");
+        current_only_store
+            .plan_sprint(
+                &sole_current.id,
+                "The only sprint on this board.",
+                &[],
+                None,
+                true,
+                "geoyws",
+            )
+            .expect("plan sole current sprint");
+        current_only_store
+            .start_sprint(&sole_current.id, "geoyws")
+            .expect("start sole current sprint");
+
         assert_eq!(attention.task_id.as_deref(), Some(epic.id.as_str()));
         assert_eq!(current.status, "succeeded");
         assert_eq!(failed.status, "failed");
@@ -4431,11 +4860,30 @@ mod tests {
             task_id: task.id,
             current_deployment_id: current.id,
             failed_deployment_id: failed.id,
+            current_sprint_started_at: current_started.starts_at,
+            closed_sprint_started_at: closed_finished.starts_at,
+            closed_sprint_ended_at: closed_finished.ends_at.expect("closed sprint end"),
         }
     }
 
     fn assert_html_contains(html: &str, needle: &str) {
         assert!(html.contains(needle), "missing {needle:?} in {html}");
+    }
+
+    fn sprint_card<'a>(html: &'a str, id: &str) -> &'a str {
+        let marker = format!("data-sprint-summary=\"{id}\"");
+        let marker_at = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing sprint card {id:?} in {html}"));
+        let start = html[..marker_at]
+            .rfind("<article")
+            .expect("sprint marker belongs to an article");
+        let end = marker_at
+            + html[marker_at..]
+                .find("</article>")
+                .expect("sprint article closes")
+            + "</article>".len();
+        &html[start..end]
     }
 
     fn assert_page_title(html: &str, title: &str) {
@@ -4540,6 +4988,10 @@ mod tests {
         let data_dir = env::var_os("KANBAN_DATA_DIR")
             .map(PathBuf::from)
             .expect("child data dir");
+        let no_boards = render("/sprints").expect("render overview with no boards");
+        assert_html_contains(&no_boards, "No boards are registered.");
+        assert!(!no_boards.contains("data-sprint-board="));
+
         let fixture = seed_render_fixture(&data_dir);
 
         let home = render("/").expect("render needs-you");
@@ -4703,6 +5155,124 @@ mod tests {
         );
         assert_html_contains(&failed_detail, "failed");
         assert_html_contains(&failed_detail, "build &lt;failed&gt;");
+
+        let sprint_overview = render("/sprints").expect("render sprint overview");
+        assert_page_title(&sprint_overview, "Sprints");
+        assert_html_contains(&sprint_overview, "data-sprint-board=\"SERVE-RENDER\"");
+        let current_card = sprint_card(&sprint_overview, "sp-render-current");
+        assert_html_contains(current_card, "data-sprint-current");
+        assert_html_contains(current_card, "data-sprint-version>3.2.0");
+        assert_html_contains(current_card, "data-sprint-state>current");
+        assert_html_contains(current_card, "data-sprint-open>1");
+        assert_html_contains(current_card, "data-sprint-done>0");
+        for (id, state) in [
+            ("sp-render-planned", "planned"),
+            ("sp-render-closed", "closed"),
+            ("sp-render-abandoned", "abandoned"),
+            ("sp-render-archived", "planned"),
+        ] {
+            let card = sprint_card(&sprint_overview, id);
+            assert_html_contains(card, &format!("data-sprint-state>{state}"));
+            if id == "sp-render-archived" {
+                assert_html_contains(card, "data-sprint-archived>archived");
+            } else {
+                assert!(
+                    !card.contains("data-sprint-archived"),
+                    "{id} was mislabeled archived"
+                );
+            }
+        }
+
+        assert_html_contains(&sprint_overview, "data-sprint-board=\"SERVE-SPRINT-EMPTY\"");
+        assert_html_contains(&sprint_overview, "data-no-current-sprint");
+        assert_html_contains(&sprint_overview, "data-no-sprints");
+
+        let sprint_board = render("/sprints/SERVE-RENDER").expect("render board sprints");
+        assert_page_title(&sprint_board, "SERVE-RENDER sprints");
+        assert_html_contains(&sprint_board, "data-board-sprints=\"SERVE-RENDER\"");
+        assert_html_contains(&sprint_board, "data-sprint-history");
+        assert_html_contains(&sprint_board, "2023-11-14 22:13:20Z");
+        assert_html_contains(&sprint_board, "2100-01-01 00:00:00Z");
+
+        let current_sprint =
+            render("/sprint/SERVE-RENDER/sp-render-current").expect("render current sprint detail");
+        assert_page_title(&current_sprint, "Sprint sp-render-current");
+        assert_html_contains(
+            &current_sprint,
+            "Current <strong>goal</strong> and criteria.",
+        );
+        let current_actual_start = stamp(fixture.current_sprint_started_at);
+        assert_html_contains(
+            &current_sprint,
+            &format!("data-sprint-actual-start>{current_actual_start}"),
+        );
+        assert_ne!(current_actual_start, stamp(1_700_000_000_000));
+        assert_ne!(current_actual_start, stamp(4_102_444_800_000));
+        assert_html_contains(&current_sprint, "data-sprint-actual-end>not ended");
+
+        assert_html_contains(&current_sprint, "data-task-state>todo");
+        assert_html_contains(&current_sprint, "Opaque &lt;task&gt;");
+        assert_html_contains(
+            &current_sprint,
+            "href=\"/task/SERVE-RENDER/t-render%2Fopaque%3F%23\"",
+        );
+        assert!(!current_sprint.contains("<main id=main><form"));
+        assert!(!current_sprint.contains("<button"));
+
+        let closed_sprint =
+            render("/sprint/SERVE-RENDER/sp-render-closed").expect("render closed sprint detail");
+        assert_html_contains(&closed_sprint, "data-sprint-deployment-proof");
+        assert_html_contains(&closed_sprint, "data-sprint-served-version>3.1.0");
+        assert_html_contains(
+            &closed_sprint,
+            "data-sprint-served-commit><code>cccccccccccccccccccccccccccccccccccccccc</code>",
+        );
+        let closed_actual_start = stamp(fixture.closed_sprint_started_at);
+        let closed_actual_end = stamp(fixture.closed_sprint_ended_at);
+        assert_html_contains(
+            &closed_sprint,
+            &format!("data-sprint-actual-start>{closed_actual_start}"),
+        );
+        assert_html_contains(
+            &closed_sprint,
+            &format!("data-sprint-actual-end>{closed_actual_end}"),
+        );
+        assert_ne!(closed_actual_start, stamp(1_700_000_000_000));
+        assert_ne!(closed_actual_end, stamp(4_102_444_800_000));
+
+        assert!(!closed_sprint.contains("unsafe()"));
+
+        let archived_sprint = render("/sprint/SERVE-RENDER/sp-render-archived")
+            .expect("render archived sprint without goal");
+        assert_html_contains(
+            &archived_sprint,
+            "data-sprint-goal><p class=empty>No goal or success criteria recorded.</p>",
+        );
+
+        let missing_proof = render("/sprint/SERVE-RENDER/sp-render-missing-proof")
+            .expect("render legacy sprint without proof");
+        assert_html_contains(&missing_proof, "data-no-sprint-proof");
+        assert!(!missing_proof.contains("data-sprint-deployment-proof"));
+        let planned_sprint =
+            render("/sprint/SERVE-RENDER/sp-render-planned").expect("render planned sprint detail");
+        assert_html_contains(&planned_sprint, "data-sprint-actual-start>not started");
+        assert_html_contains(&planned_sprint, "data-sprint-actual-end>not ended");
+        let abandoned_sprint = render("/sprint/SERVE-RENDER/sp-render-abandoned")
+            .expect("render abandoned sprint detail");
+        assert_html_contains(&abandoned_sprint, "data-sprint-state>abandoned");
+        assert_html_contains(&abandoned_sprint, "data-sprint-days-remaining>0");
+        let empty_sprints =
+            render("/sprints/SERVE-SPRINT-EMPTY").expect("render empty board sprint page");
+        assert_html_contains(&empty_sprints, "data-no-current-sprint");
+        assert_html_contains(&empty_sprints, "data-no-sprints");
+        let current_only = render("/sprints/SERVE-SPRINT-CURRENT-ONLY")
+            .expect("render board with only a current sprint");
+        assert_html_contains(&current_only, "data-sprint-current");
+        assert_html_contains(&current_only, "data-no-sprint-history");
+        assert!(!current_only.contains("data-no-sprints"));
+
+        assert!(render("/sprints/NO-SUCH-SPRINT-BOARD").is_err());
+        assert!(render("/sprint/SERVE-RENDER/sp-no-such").is_err());
 
         let not_found = render("/no/such/page").expect("render 404 page");
         assert_page_title(&not_found, "Not found");
@@ -6064,6 +6634,148 @@ mod tests {
                 Capability::Write,
             ),
         ]
+    }
+
+    #[test]
+    fn sprint_projection_counts_and_proof_obey_tag_visibility() {
+        let dir = TempDataDir::new("sprint-authz");
+        let path = dir.path().join("sprint-authz.db");
+        let board_id = "aaaaaaaa-8888-4888-8888-888888888888";
+        let mut direct = Store::open(&path).expect("open sprint auth fixture");
+        direct
+            .initialize("SPRINT-AUTHZ", "seed")
+            .expect("initialize sprint auth fixture");
+        for tag in ["visible", "hidden"] {
+            direct
+                .add_tag(tag, None, Some("seed"))
+                .expect("register sprint task tag");
+        }
+        let mut add = |id: &str, status: &str, tag: &str| {
+            direct
+                .add_task(AddTask {
+                    id: Some(id.to_owned()),
+                    task_type: "task".to_owned(),
+                    parent_id: None,
+                    title: format!("{tag} {status}"),
+                    body: None,
+                    assignee: None,
+                    lane: None,
+                    deliverable: None,
+                    stale_minutes: None,
+                    driver_only: false,
+                    status: status.to_owned(),
+                    priority: 2,
+                    dependencies: vec![],
+                    metadata: serde_json::json!({}),
+                    actor: Some("seed".to_owned()),
+                    tags: vec![tag.to_owned()],
+                })
+                .expect("add tagged sprint task")
+                .id
+        };
+        let visible_open = add("t-visible-open", "todo", "visible");
+        let visible_done = add("t-visible-done", "done", "visible");
+        let hidden_open = add("t-hidden-open", "todo", "hidden");
+        let hidden_done = add("t-hidden-done", "done", "hidden");
+
+        let sprint = direct
+            .create_sprint(NewSprint {
+                id: Some("sp-authz".to_owned()),
+                title: "Scoped sprint".to_owned(),
+                body: None,
+                target_version: "4.0.0".to_owned(),
+                scheduled_start: 0,
+                scheduled_end: 4_102_444_800_000,
+                actor: "seed".to_owned(),
+            })
+            .expect("create scoped sprint");
+        direct
+            .plan_sprint(
+                &sprint.id,
+                "Only visible scope contributes.",
+                &[
+                    visible_open.clone(),
+                    visible_done.clone(),
+                    hidden_open.clone(),
+                    hidden_done.clone(),
+                ],
+                None,
+                false,
+                "seed",
+            )
+            .expect("plan scoped sprint");
+        direct
+            .start_sprint(&sprint.id, "seed")
+            .expect("start scoped sprint");
+        let hidden_proof = direct
+            .start_deployment(StartDeployment {
+                task_id: Some(hidden_open.clone()),
+                repo: "geoyws/kanban".to_owned(),
+                identity: DeployIdentity::Git(
+                    "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                ),
+                deployer_checkout: None,
+                branch: None,
+                tier: "@_p".to_owned(),
+                environment: "production".to_owned(),
+                host: "hidden-host".to_owned(),
+                url: "https://hidden.invalid".to_owned(),
+                mechanism: None,
+                operation_id: None,
+                retry_of: None,
+                actor: "seed".to_owned(),
+                lane: None,
+                sprint_id: Some(sprint.id.clone()),
+            })
+            .expect("seed hidden proof subject")
+            .deployment;
+        drop(direct);
+
+        let managed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(
+                Enforcement::Managed,
+                authority(vec![
+                    (
+                        ScopeTuple::Board {
+                            board_id: board_id.to_owned(),
+                        },
+                        Capability::Write,
+                    ),
+                    (
+                        ScopeTuple::BoardTag {
+                            board_id: board_id.to_owned(),
+                            tag: "visible".to_owned(),
+                        },
+                        Capability::Write,
+                    ),
+                ]),
+                board_id.to_owned(),
+            ),
+        )
+        .expect("open scoped sprint projection");
+        let row = managed
+            .require_sprint(&sprint.id)
+            .expect("read board sprint");
+        let summary = sprint_summary(&managed, "SPRINT-AUTHZ", &row, true)
+            .expect("render visibility-safe summary");
+        assert_html_contains(&summary, "data-sprint-open>1");
+        assert_html_contains(&summary, "data-sprint-done>1");
+        let visible = managed
+            .sprint_tasks(&sprint.id)
+            .expect("read visible sprint tasks");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            [visible_open.as_str(), visible_done.as_str()],
+        );
+        let denial = managed
+            .require_deployment(&hidden_proof.id)
+            .expect_err("hidden proof subject must not become a link")
+            .to_string();
+        assert_eq!(denial, AUTHZ_DENIAL);
     }
 
     fn same_origin_post_with_header(path: &str, name: &str, value: &str) -> Request {
