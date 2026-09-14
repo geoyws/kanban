@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** George
-**Updated:** 2026-08-31
+**Updated:** 2026-09-14
 
 ## Product statement
 
@@ -69,6 +69,24 @@ The operator can request an aggregate view containing each registered project,
 its worktree roots, active task counts, blocked work, pending handoffs, and
 recent progress. Reads occur across project databases without merging their
 write domains.
+
+### Ship a sprint to a served version
+
+The operator opens the board's one current sprint against a target version,
+attaches the work that version ships, and lanes claim inside that boundary.
+When the work is finished, a deployment attempt is started against that sprint,
+the served commit and version are observed independently, and that observation
+is recorded on the attempt. Closing the sprint reads that succeeded
+verification attempt and refuses anything weaker; work still open moves to a
+named carry-over sprint with a written note.
+
+### Decide in one click
+
+The operator opens the decision room, reads a card's question and context, and
+either takes the recommended choice or writes a reply and picks an outcome. The
+card is replaced in place by a one-line receipt naming the decision, with Undo
+one click or one keystroke away, the open count drops, and the lane that raised
+the item reads a machine-readable verdict instead of a paragraph.
 
 ## Functional requirements
 
@@ -162,6 +180,98 @@ write domains.
   support; that requires a distinct live smoke.
   Live authentication is currently blocked by revoked OAuth attention
   `a-347ff24c`; the adapter must not work around authentication.
+- Beyond the Codex and Claude bridges, offer checked-in harness adapters for
+  the OpenCode server (`opencode.server`/`enqueue-turn` over a configured
+  loopback HTTP endpoint), Kimi over ACP stdio (`kimi.acp`/`enqueue-turn`),
+  the Cursor worker (`cursor.worker`/`start-turn`, serialized through one
+  state-directory slot), and notify-only ZCode (`zcode.notify`/
+  `post-notification`, which has no response channel). Each must read one
+  delivery document from stdin and refuse a wrong protocol version, attempt,
+  event identity, or secret-shaped payload key before its peer is contacted;
+  each must pin its own consumer/action pair so a subscription cannot re-point
+  it at another binary; each must refuse unknown, repeated, and positional
+  arguments by name, probe the peer or executable identity it was configured
+  with, and accept only an acknowledgement naming that exact delivery.
+- Notification must reach a harness through that harness's own documented
+  ingress — a queue, an HTTP request, an RPC frame, a worker turn, or a
+  notification sink. Writing into a terminal, a human's session, or any
+  `send-keys`-style keystroke injection is never a delivery mechanism, and the
+  live receipts are held to the same rule.
+
+### Sprint release boundaries
+
+- Represent a sprint as its own typed row with an `sp-` identifier, a required
+  semver-shaped target version, planned start and end dates, and the closed
+  status set planned/current/closed/abandoned. A sprint is not work: it must
+  never be claimable, gated, or handed off.
+- Offer plan, start, close, and abandon over that row plus read-only list and
+  show, and allow at most one current sprint per board. Planning must record a
+  deliberate scope — explicit candidates, a parent epic, already attached
+  scope, or an explicit empty-scope decision — and starting must additionally
+  require a non-empty goal body. Attaching an epic attaches its subtree;
+  detaching stays explicit and non-recursive. A closed sprint's card cannot be
+  rewritten.
+- Scope claim candidates, `claim --next`, and handoff acceptance to the current
+  sprint whenever one exists, offering neither another sprint's rows nor
+  unattached rows. A board with no current sprint must behave exactly as
+  before. Crossing the boundary must require an explicit named-sprint or
+  any-sprint override, and that override must be recorded on the claim event.
+- Close a sprint only on a succeeded verification-phase deployment bound to
+  that sprint whose target version and independently observed served version
+  match it. A receipt is never parsed and is not version proof. If any attached
+  row is still outside done or cancelled, close must additionally require a
+  named carry-to sprint and a non-empty carry note, and the carry and close
+  must commit atomically.
+- Project the current sprint in the dashboard, the attached sprint in task
+  context only when the task is attached, and read-only `/sprints`,
+  `/sprints/BOARD`, and `/sprint/BOARD/ID` web views.
+- Scope a rule to a sprint as `SPRINT:sp-ID` with exactly one board selector
+  and optional intersecting subsystem tags; setting and clearing that scope are
+  mutually exclusive. Claim, handoff acceptance, and task context must evaluate
+  it against the task's authoritative attachment, so unattached work and work
+  in another sprint do not receive it.
+- Index sprint title, body, and target version as a first-class search source,
+  refresh that document on every lifecycle change, and cite results as
+  `kanban://BOARD/sprint/ID`.
+- Deliberately out of scope: estimation, velocity, burndown, draft sprints,
+  automatic rollover, and automatic sprint archival.
+
+### The decision room
+
+- Render every open attention item on the served "Needs you" page as a decision
+  card, in the order it is decided: the question as the heading, the context,
+  the authored choices with the recommendation first and each choice's
+  consequence beneath its button, the card's one reply field, the free-text
+  answer with its four-value outcome picker, the body folded beneath, then the
+  meta line.
+- Settle an item in one click as the operator. Reply text, when written, rides
+  with whichever choice is clicked and is recorded as that decision's note; the
+  free-text answer must carry both a note and an explicit outcome or be
+  refused. A choice key the row no longer carries must be refused by name
+  rather than mapped onto whatever now sits in that position, so a card left
+  open in a tab stays safe to click.
+- Answer a focused card from the keyboard: the digits select its choices in the
+  order it lists them, so the first is always the recommendation, one key
+  reaches the reply field, and one key undoes the decision just made. A typed
+  reply must not disarm the digits — it rides with whichever choice is clicked
+  — but they must stay inert when no card has focus, while the free-text
+  textarea has focus, and on a card whose free-text verdict is already picked,
+  so an authored key can never drop a chosen verdict.
+- Settle without navigating. The card is replaced in place by a one-line
+  `Decided:` receipt naming the choice, saying whether a reply was recorded,
+  and carrying an Undo control; the open count drops and the receipt survives
+  the live refresh. Recent decisions must be browsable with the same undo, and
+  undoing must reopen the item through the audited reopen operation with a
+  fixed note rather than asking for words.
+- Serve a row whose raiser authored no card as the default approve/reject pair
+  with its first body line as the question and nothing marked recommended.
+- Render long board text as markdown, and answer every reference link with a
+  read-only hover preview of the task, attention item, deployment, or board it
+  points at; previews nest and are bounded excerpts, never whole documents.
+- Keep the rest of the served surface read-only. Resolving an attention item,
+  undoing that decision by reopening it from the web, opening a draft plan,
+  and pausing or resuming a subscription are the only writes the browser may
+  perform.
 
 ### P0 — first usable slice
 
@@ -268,6 +378,12 @@ A handoff is valid only when:
    capability-gated dispatcher, the Codex queue compiled-process
    adapter-contract coverage, and the separately named HAX live smoke receipt
    for installed Codex support.
+8. **Decision room:** decision cards with authored choices, one-click
+   settlement with reply and undo, keyboard answering, hover previews, and
+   markdown across the served views.
+9. **Sprint release boundaries:** typed sprint rows, sprint-scoped claims and
+   handoff acceptance, the served-version close gate, sprint web projections,
+   sprint-scoped rules, and first-class sprint search.
 
 ## Current delivery status
 
@@ -283,5 +399,18 @@ The production runtime is Rust per ADR-006. A release is ready only when the
 compiled executable passes the current process-boundary E2E matrix and the
 focused atmux CLI adapter contract suite against current data. TypeScript and
 Bun are not production or development dependencies of Kanban.
+
+What is shipped is not what is served. The decision room, the pub/sub
+dispatcher, and the harness adapters are shipped and served: the host serves
+commit `3eceab7` at board schema 26. Being served is not the same as being
+proven against a real peer — every adapter smoke receipt outside the Codex
+bridges drives a dependency-free fake, and the Claude print bridge's live
+receipt was dropped with its authentication attention `a-347ff24c`. The sprint
+surface — typed rows, the close gate, the sprint web projections,
+sprint-scoped rules, and sprint search — is published source at `d0fdc9f` and
+is not yet released; it waits on the operator's release approval recorded as
+attention `a-b923d928`. Releasing it advances the board schema to 28, which is
+a migration and not a code-only rollback boundary, so the release runs that
+migration per board.
 
 See [the historical 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).
