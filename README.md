@@ -91,6 +91,60 @@ free, and a held task can be assigned to someone else. `--fields actor` is
 refused naming the keys that exist, so the wrong question fails where it is
 typed rather than answering null.
 
+## Sprint release boundaries
+
+A sprint is a typed release boundary, not a task container or an estimate. Its
+scheduled millisecond dates are planning data; `sprint start`, `close`, and
+`abandon` record the actual lifecycle. Only one sprint can be current on a
+board. Planning requires a non-empty goal body and either explicit candidates,
+a parent epic, already attached scope, or an explicit `--empty-scope` decision.
+
+A minimal ledger lifecycle (with `TASK_ID`, `FULL_SHA`, and `OPERATION_ID` set
+for the board's own repository and staging tier) is:
+
+```bash
+printf '%s\n' 'Ship 1.4.0' 'Success: the served version is 1.4.0.' > /tmp/sprint-goal.txt
+kb sprint new "Release 1.4.0" --target-version 1.4.0 \
+  --start 1789344000000 --end 1789948800000 --as operator --json
+# Save the returned sprint id as SPRINT_ID.
+kb sprint plan "$SPRINT_ID" --body-file /tmp/sprint-goal.txt \
+  --candidate "$TASK_ID" --as operator --json
+kb sprint start "$SPRINT_ID" --as operator --json
+kb sprint list --status current --json
+kb sprint list --json
+kb sprint show "$SPRINT_ID" --json
+
+kb deploy start --repo example/service --commit "$FULL_SHA" \
+  --tier @_s --environment example-staging --host example-host \
+  --url https://staging.example.test --task "$TASK_ID" \
+  --operation-id "$OPERATION_ID" --sprint "$SPRINT_ID" --as operator --json
+# Save the returned deployment id. Keep its capability token private.
+# Independently deploy and inspect the endpoint, then record that observation:
+kb deploy finish "$DEPLOYMENT_ID" --token "$CAPABILITY_TOKEN" \
+  --result succeeded --phase verification --served-commit "$FULL_SHA" \
+  --served-version 1.4.0 --receipt "observed served commit and version" \
+  --as operator --json
+kb sprint close "$SPRINT_ID" --deployment "$DEPLOYMENT_ID" --as operator --json
+```
+
+`deploy start` records an attempt; it neither deploys nor inspects an endpoint.
+With `--sprint`, it also copies the sprint target version into that attempt.
+After an independent observation of the exact served commit and version,
+`deploy finish --result succeeded --phase verification` records that evidence
+with the matching `--served-version`. `sprint close` then accepts only that
+same sprint's succeeded verification-phase attempt. A receipt alone is not
+version proof, and the deployment capability token must remain private.
+If work is unfinished, close also requires `--carry-to` and a non-empty
+`--carry-note`. Use `task add --sprint` or `task update --sprint` to attach work,
+`task update --clear-sprint` to detach it, and deliberate `claim --sprint` or
+`claim --any-sprint` overrides to cross the current boundary; those changes
+are audited. `dashboard` projects the current sprint for each board; `context`
+projects the task's own sprint only when that task is attached. The read-only
+web projections are `/sprints`, `/sprints/BOARD`, and `/sprint/BOARD/ID`.
+
+Sprint-scoped rules and first-class sprint search/citations are not implemented.
+There is no draft sprint status, estimation, or automatic rollover.
+
 ## Completion gates
 
 A dependency is a gate on doing the work, not only on being offered it. Declare
