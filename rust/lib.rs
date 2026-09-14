@@ -4734,13 +4734,23 @@ fn restore(args: &Args) -> Result<()> {
         );
     }
 
+    // Settle every rescue source's read authority before the rescue directory
+    // exists, so a denial can never become a verbatim copy below.
+    let rescue_sources = rescue_sources
+        .into_iter()
+        .map(|(name, path)| {
+            let prepared = Store::prepare_rescue_read(&path)?;
+            Ok((name, path, prepared))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let rescue = root
         .join("backups")
         .join(format!("pre-restore-{}", now_ms()));
     let rescue_registry = rescue.join("registry.db");
     registry.backup(&rescue_registry)?;
     let mut rescue_boards = Vec::new();
-    for (name, path) in rescue_sources {
+    for (name, path, prepared) in rescue_sources {
         let file_name = path
             .file_name()
             .with_context(|| format!("board path has no file name: {}", path.display()))?;
@@ -4766,10 +4776,13 @@ fn restore(args: &Args) -> Result<()> {
         // a board whose corruption sits in free pages copied cleanly and then
         // failed here, aborting the restore just the same. Anything that cannot
         // be copied *and* described as a board becomes a verbatim copy instead.
-        match Store::open_readonly_as_caller(&path)
-            .and_then(|store| store.backup(&destination))
-            .and_then(|()| snapshot_file(&rescue, &destination, "board", name.clone()))
-        {
+        let copied = match prepared {
+            store::PreparedRescueRead::Online(store) => store
+                .backup(&destination)
+                .and_then(|()| snapshot_file(&rescue, &destination, "board", name.clone())),
+            store::PreparedRescueRead::PhysicalFailure(error) => Err(error),
+        };
+        match copied {
             Ok(_) => rescue_boards.push((name, destination)),
             Err(error) => {
                 // Leave nothing half-described behind: an unmanifested `.db`

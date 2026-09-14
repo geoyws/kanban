@@ -252,6 +252,34 @@ impl ManagedEstate {
             .execute("UPDATE enforcement_state SET state=? WHERE id=1", [state])
             .unwrap();
     }
+
+    fn live_bytes(&self) -> Vec<Vec<u8>> {
+        [
+            self.xdg.join("kanban").join("registry.db"),
+            PathBuf::from(&self.board_a),
+            PathBuf::from(&self.board_b),
+        ]
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect()
+    }
+
+    fn pre_restore_snapshots(&self) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(self.xdg.join("kanban").join("backups")) else {
+            return Vec::new();
+        };
+        let mut paths = entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with("pre-restore-")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
 }
 
 impl Drop for ManagedEstate {
@@ -338,6 +366,122 @@ fn cross_board_authority_reaches_no_derived_surface_of_another_board() {
     );
     estate.ok_json(&work_a, &["events", "--json"]);
     estate.ok_json(&work_a, &["deploy", "list", "--json"]);
+}
+
+/// Restore's undo snapshot includes registered boards the incoming snapshot
+/// will not overwrite. That rescue-only copy is a whole-board read: missing
+/// board authority or authority that omits one row's tag must refuse before
+/// any pre-restore artifact exists, never fall through to a raw file copy.
+#[test]
+fn restore_requires_whole_board_read_for_every_rescue_only_board() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "kanban-authz-matrix-restore-rescue-{}-{unique}",
+        std::process::id()
+    ));
+    let xdg = root.join("xdg");
+    let work_a = root.join("work-a");
+    let work_b = root.join("work-b");
+    for directory in [&xdg, &work_a, &work_b] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let mut estate = ManagedEstate {
+        root,
+        xdg,
+        work_a,
+        work_b,
+        board_a: String::new(),
+        board_b: String::new(),
+        id_a: String::new(),
+        id_b: String::new(),
+    };
+    let work_a = estate.work_a.clone();
+    let work_b = estate.work_b.clone();
+    let alpha = estate.ok_json(&work_a, &["init", "--name", "Alpha", "--json"]);
+    estate.board_a = alpha["boardPath"].as_str().unwrap().to_owned();
+    estate.id_a = board_id(&estate.board_a);
+    let snapshot = estate.root.join("alpha-snapshot");
+    let snapshot_arg = snapshot.to_string_lossy().into_owned();
+    estate.ok_json(&work_a, &["backup", "--output", &snapshot_arg, "--json"]);
+
+    let beta = estate.ok_json(&work_b, &["init", "--name", "Beta", "--json"]);
+    estate.board_b = beta["boardPath"].as_str().unwrap().to_owned();
+    estate.id_b = board_id(&estate.board_b);
+    estate.ok_json(
+        &work_b,
+        &["tag", "add", "private", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_b,
+        &[
+            "task",
+            "add",
+            "beta secret",
+            "--tag",
+            "private",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "post-snapshot alpha",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+
+    estate.bind_self("p-restore", &owner_of(&estate.id_a));
+    estate.enforce("managed");
+    let restore_args = ["restore", "--from", &snapshot_arg, "--force", "--json"];
+
+    let before = estate.live_bytes();
+    estate.denied(&work_a, &restore_args);
+    assert_eq!(
+        estate.live_bytes(),
+        before,
+        "denied restore changed live files"
+    );
+    assert!(
+        estate.pre_restore_snapshots().is_empty(),
+        "denied restore created a pre-restore snapshot"
+    );
+
+    estate.grant("p-restore", &[board_scope("read", &estate.id_b)]);
+    let before = estate.live_bytes();
+    estate.denied(&work_a, &restore_args);
+    assert_eq!(
+        estate.live_bytes(),
+        before,
+        "partially authorized restore changed live files"
+    );
+    assert!(
+        estate.pre_restore_snapshots().is_empty(),
+        "partially authorized restore created a pre-restore snapshot"
+    );
+
+    estate.grant(
+        "p-restore",
+        &[(
+            "read",
+            vec![format!("board:{}", estate.id_b), "*".to_owned()],
+        )],
+    );
+    let restored = estate.ok_json(&work_a, &restore_args);
+    let rescue = PathBuf::from(restored["rescueSnapshot"].as_str().unwrap());
+    let beta_name = Path::new(&estate.board_b).file_name().unwrap();
+    assert!(
+        rescue.join("boards").join(beta_name).is_file(),
+        "authorized restore did not rescue registered non-overwrite Beta"
+    );
 }
 
 // ---------------------------------------------------------------------------

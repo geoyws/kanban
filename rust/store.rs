@@ -2349,6 +2349,12 @@ pub struct ClaimOptions {
     pub sprint_override: Option<String>,
 }
 
+/// The outcome of settling a restore rescue source before copying it.
+pub(crate) enum PreparedRescueRead {
+    Online(Store),
+    PhysicalFailure(anyhow::Error),
+}
+
 pub struct Store {
     pub connection: Connection,
     /// The one authorization context every board-row surface checks through
@@ -2938,6 +2944,19 @@ impl Store {
     /// The bulk-write gate on this store's own connection.
     pub(crate) fn require_whole_board_write(&self) -> Result<()> {
         whole_board_write_on(&self.authz, &self.connection)
+    }
+
+    /// A rescue source whose read authority was settled before any rescue
+    /// artifact exists. Only a physical open failure stays recoverable.
+    pub(crate) fn prepare_rescue_read(path: &Path) -> Result<PreparedRescueRead> {
+        let authz = crate::routing::board_authz(path)?;
+        authz.check_read(&[])?;
+        let connection = match open_board_readonly(path) {
+            Ok(connection) => connection,
+            Err(error) => return Ok(PreparedRescueRead::PhysicalFailure(error)),
+        };
+        whole_board_read_on(&authz, &connection)?;
+        Ok(PreparedRescueRead::Online(Self { connection, authz }))
     }
 
     pub(crate) fn require_restore_write(path: &Path) -> Result<()> {
