@@ -43854,3 +43854,871 @@ fn sprint_cli_enforces_scope_version_proof_carry_and_atomic_writes() {
             .any(|task| task["id"] == "t-in")
     );
 }
+
+fn sprint_fixture_new(fixture: &Fixture, id: &str, version: &str) {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            id,
+            "--id",
+            id,
+            "--target-version",
+            version,
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+}
+
+/// Record a deployment receipt made entirely inside the fixture. This is
+/// deliberately labelled as simulated local test data: no live claim or
+/// external tier is involved in these process-level acceptance journeys.
+fn sprint_fixture_deployment(
+    fixture: &Fixture,
+    sprint_id: &str,
+    version: &str,
+    result: &str,
+    phase: &str,
+) -> String {
+    let started = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "fixture/local",
+            "--commit",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "local-test",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "https://fixture.invalid",
+            "--sprint",
+            sprint_id,
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let id = started["id"].as_str().unwrap().to_owned();
+    let token = started["capabilityToken"].as_str().unwrap();
+    let mut args = vec![
+        "deploy",
+        "finish",
+        &id,
+        "--token",
+        token,
+        "--result",
+        result,
+        "--phase",
+        phase,
+        "--receipt",
+        "simulated local test data; no live claim or external deployment",
+    ];
+    if result == "succeeded" && phase == "verification" {
+        args.extend([
+            "--served-commit",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--served-version",
+            version,
+        ]);
+    }
+    args.extend(["--as", "operator", "--json"]);
+    fixture.ok_json(&fixture.main, &args);
+    id
+}
+
+#[test]
+fn sprint_v26_board_migrates_then_completes_a_proof_gated_lifecycle() {
+    let fixture = Fixture::new("sprint-v26-migration");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SPRINT-V26", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Legacy v26 work",
+            "--id",
+            "t-v26-legacy",
+            "--json",
+        ],
+    );
+    let board = board_path_for_project(&fixture, &fixture.main, "SPRINT-V26");
+    {
+        let connection = Connection::open(&board).unwrap();
+        remove_v27_sprint_schema(&connection);
+        connection.execute_batch("PRAGMA user_version=26;").unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT title FROM tasks WHERE id='t-v26-legacy'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Legacy v26 work"
+        );
+    }
+
+    sprint_fixture_new(&fixture, "sp-migrated", "26.1.0");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-migrated",
+            "--body",
+            "Ship the migrated board
+Legacy row remains durable",
+            "--candidate",
+            "t-v26-legacy",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-migrated",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "move",
+            "t-v26-legacy",
+            "done",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let proof = sprint_fixture_deployment(
+        &fixture,
+        "sp-migrated",
+        "26.1.0",
+        "succeeded",
+        "verification",
+    );
+    let closed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-migrated",
+            "--deployment",
+            &proof,
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(closed["status"], "closed");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-v26-legacy", "--json"])["title"],
+        "Legacy v26 work"
+    );
+    let audit = fixture.ok_json(&fixture.main, &["audit", "verify", "--json"]);
+    assert_eq!(audit["healthy"], true);
+    assert_eq!(audit["boards"][0]["audit"]["healthy"], true);
+}
+
+#[test]
+fn sprint_parent_epic_scope_preserves_explicit_descendants_and_audits_detach() {
+    let fixture = Fixture::new("sprint-parent-scope");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SPRINT-SCOPE", "--json"]);
+    sprint_fixture_new(&fixture, "sp-release", "2.0.0");
+    sprint_fixture_new(&fixture, "sp-other", "2.1.0");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Release epic",
+            "--id",
+            "e-release",
+            "--type",
+            "epic",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Release story",
+            "--id",
+            "s-release",
+            "--type",
+            "story",
+            "--parent",
+            "e-release",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Inherited task",
+            "--id",
+            "t-inherited",
+            "--parent",
+            "s-release",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Already planned elsewhere",
+            "--id",
+            "t-other",
+            "--parent",
+            "s-release",
+            "--sprint",
+            "sp-other",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-release",
+            "--body",
+            "Ship release 2.0
+Epic subtree is the scope",
+            "--parent-epic",
+            "e-release",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    let release = fixture.ok_json(&fixture.main, &["sprint", "show", "sp-release", "--json"]);
+    let release_ids = release["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(release_ids, ["e-release", "s-release", "t-inherited"]);
+    let other = fixture.ok_json(&fixture.main, &["sprint", "show", "sp-other", "--json"]);
+    assert_eq!(other["tasks"][0]["id"], "t-other");
+
+    for task_id in ["e-release", "s-release", "t-inherited"] {
+        let events = fixture.ok_json(
+            &fixture.main,
+            &[
+                "events",
+                "--task",
+                task_id,
+                "--kind",
+                "task_sprint_changed",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            events[0]["payload"]["oldSprintID"],
+            Value::Null,
+            "{task_id}: {events}"
+        );
+        assert_eq!(
+            events[0]["payload"]["newSprintID"], "sp-release",
+            "{task_id}: {events}"
+        );
+    }
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-inherited",
+            "--as",
+            "operator",
+            "--clear-sprint",
+            "--json",
+        ],
+    );
+    let detached = fixture.ok_json(
+        &fixture.main,
+        &[
+            "events",
+            "--task",
+            "t-inherited",
+            "--kind",
+            "task_sprint_changed",
+            "--json",
+        ],
+    );
+    assert_eq!(detached[0]["payload"]["oldSprintID"], "sp-release");
+    assert_eq!(detached[0]["payload"]["newSprintID"], Value::Null);
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["sprint", "show", "sp-other", "--json"])["tasks"][0]["id"],
+        "t-other"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
+        true
+    );
+}
+
+#[test]
+fn sprint_claim_boundary_filters_scheduler_and_records_only_explicit_overrides() {
+    let fixture = Fixture::new("sprint-claim-boundary");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SPRINT-CLAIMS", "--json"],
+    );
+    sprint_fixture_new(&fixture, "sp-current-boundary", "3.0.0");
+    sprint_fixture_new(&fixture, "sp-other-boundary", "3.1.0");
+    for (id, sprint) in [
+        ("t-current-boundary", Some("sp-current-boundary")),
+        ("t-other-boundary", Some("sp-other-boundary")),
+        ("t-unattached-boundary", None),
+    ] {
+        let mut args = vec!["task", "add", id, "--id", id];
+        if let Some(sprint) = sprint {
+            args.extend(["--sprint", sprint]);
+        }
+        args.push("--json");
+        fixture.ok_json(&fixture.main, &args);
+    }
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-current-boundary",
+            "--body",
+            "Ship current scope
+Only attached work is claimable",
+            "--candidate",
+            "t-current-boundary",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-current-boundary",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    let candidates = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "--candidates",
+            "--as",
+            "candidate-reader",
+            "--json",
+        ],
+    );
+    assert_eq!(candidates.as_array().unwrap().len(), 1, "{candidates}");
+    assert_eq!(candidates[0]["id"], "t-current-boundary");
+    let next = fixture.ok_json(
+        &fixture.main,
+        &["claim", "--next", "--as", "next-worker", "--json"],
+    );
+    assert_eq!(next["taskID"], "t-current-boundary");
+    let implicit_event = fixture.ok_json(
+        &fixture.main,
+        &[
+            "events",
+            "--task",
+            "t-current-boundary",
+            "--kind",
+            "task_claimed",
+            "--json",
+        ],
+    );
+    assert!(
+        implicit_event[0]["payload"].get("sprintOverride").is_none(),
+        "an implicit current-sprint selection was falsely recorded as an override: {implicit_event}"
+    );
+
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "claim",
+            "t-other-boundary",
+            "--as",
+            "direct-worker",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&refused).contains("not in sprint sp-current-boundary"));
+    let named = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-other-boundary",
+            "--as",
+            "named-worker",
+            "--sprint",
+            "sp-other-boundary",
+            "--json",
+        ],
+    );
+    assert_eq!(named["taskID"], "t-other-boundary");
+    let any = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-unattached-boundary",
+            "--as",
+            "any-worker",
+            "--any-sprint",
+            "--json",
+        ],
+    );
+    assert_eq!(any["taskID"], "t-unattached-boundary");
+    let named_event = fixture.ok_json(
+        &fixture.main,
+        &[
+            "events",
+            "--task",
+            "t-other-boundary",
+            "--kind",
+            "task_claimed",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        named_event[0]["payload"]["sprintOverride"],
+        "sp-other-boundary"
+    );
+    let any_event = fixture.ok_json(
+        &fixture.main,
+        &[
+            "events",
+            "--task",
+            "t-unattached-boundary",
+            "--kind",
+            "task_claimed",
+            "--json",
+        ],
+    );
+    assert_eq!(any_event[0]["payload"]["sprintOverride"], "any");
+
+    let legacy = Fixture::new("claim-without-current-sprint");
+    legacy.ok_json(
+        &legacy.main,
+        &["init", "--name", "NO-CURRENT-SPRINT", "--json"],
+    );
+    legacy.ok_json(
+        &legacy.main,
+        &[
+            "task",
+            "add",
+            "Legacy claim",
+            "--id",
+            "t-legacy-claim",
+            "--json",
+        ],
+    );
+    let legacy_candidates = legacy.ok_json(
+        &legacy.main,
+        &["claim", "--candidates", "--as", "legacy-worker", "--json"],
+    );
+    assert_eq!(legacy_candidates[0]["id"], "t-legacy-claim");
+    legacy.ok_json(
+        &legacy.main,
+        &["claim", "--next", "--as", "legacy-worker", "--json"],
+    );
+    let legacy_event = legacy.ok_json(
+        &legacy.main,
+        &[
+            "events",
+            "--task",
+            "t-legacy-claim",
+            "--kind",
+            "task_claimed",
+            "--json",
+        ],
+    );
+    assert!(
+        legacy_event[0]["payload"].get("sprintOverride").is_none(),
+        "{legacy_event}"
+    );
+}
+
+#[test]
+fn sprint_current_boundary_requires_deliberate_scope_and_enriches_only_attached_context() {
+    let fixture = Fixture::new("sprint-context-boundary");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SPRINT-CONTEXT", "--json"],
+    );
+    sprint_fixture_new(&fixture, "sp-context-current", "4.0.0");
+    sprint_fixture_new(&fixture, "sp-context-next", "4.1.0");
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Attached", "--id", "t-context-in", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Unattached",
+            "--id",
+            "t-context-out",
+            "--json",
+        ],
+    );
+
+    let missing_scope = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-context-next",
+            "--body",
+            "Next goal
+Scope must be deliberate",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&missing_scope).contains(
+        "requires --candidate, --parent-epic, existing explicit scope, or --empty-scope"
+    ));
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-context-current",
+            "--body",
+            "Exact context goal
+Attached context names the release",
+            "--candidate",
+            "t-context-in",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-context-current",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-context-next",
+            "--body",
+            "Next goal
+Deliberately empty",
+            "--empty-scope",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let second_start = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-context-next",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let second_error = refusal_object(&second_start);
+    assert!(
+        second_error.contains("sp-context-current") && second_error.contains("sp-context-next"),
+        "{second_error}"
+    );
+
+    let context = fixture.ok_json(&fixture.main, &["context", "t-context-in", "--json"]);
+    assert_eq!(context["sprint"]["sprintID"], "sp-context-current");
+    assert_eq!(context["sprint"]["targetVersion"], "4.0.0");
+    assert_eq!(context["sprint"]["goal"], "Exact context goal");
+    let text = fixture.run(&fixture.main, &["context", "t-context-in"]);
+    assert!(text.status.success());
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(r#"sp-context-current "sp-context-current" v4.0.0 · current"#),
+        "{text}"
+    );
+    assert!(text.contains("Goal: Exact context goal"), "{text}");
+
+    let unattached = fixture.ok_json(&fixture.main, &["context", "t-context-out", "--json"]);
+    assert!(unattached.get("sprint").is_none(), "{unattached}");
+    let unattached_text = fixture.run(&fixture.main, &["context", "t-context-out"]);
+    assert!(unattached_text.status.success());
+    assert!(!String::from_utf8_lossy(&unattached_text.stdout).contains("## Sprint"));
+}
+
+#[test]
+fn sprint_close_rejects_every_unqualified_proof_and_durably_records_carry() {
+    let fixture = Fixture::new("sprint-close-gates");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SPRINT-CLOSE", "--json"]);
+    sprint_fixture_new(&fixture, "sp-close-current", "5.0.0");
+    sprint_fixture_new(&fixture, "sp-close-carry", "5.1.0");
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Unfinished", "--id", "t-carry", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-close-current",
+            "--body",
+            "Ship exact 5.0.0
+Only verified serving closes",
+            "--candidate",
+            "t-carry",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-close-current",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    let absent = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-close-current",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&absent).contains("requires --deployment"));
+
+    let failed = sprint_fixture_deployment(
+        &fixture,
+        "sp-close-current",
+        "5.0.0",
+        "failed",
+        "verification",
+    );
+    let failed_close = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-close-current",
+            "--deployment",
+            &failed,
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&failed_close).contains("failed (verification)"));
+
+    let build = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "fixture/local",
+            "--commit",
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "local-test",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "https://fixture.invalid",
+            "--sprint",
+            "sp-close-current",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let build_id = build["id"].as_str().unwrap();
+    let build_token = build["capabilityToken"].as_str().unwrap();
+    let non_verification = fixture.run(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            build_id,
+            "--token",
+            build_token,
+            "--result",
+            "succeeded",
+            "--phase",
+            "build",
+            "--receipt",
+            "simulated local test data; no live claim or external deployment",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&non_verification),
+        "a succeeded deployment requires --phase verification"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["deploy", "show", build_id, "--json"])["status"],
+        "started",
+        "the refused non-verification result finalized the deployment"
+    );
+    let other = sprint_fixture_deployment(
+        &fixture,
+        "sp-close-carry",
+        "5.1.0",
+        "succeeded",
+        "verification",
+    );
+    let other_close = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-close-current",
+            "--deployment",
+            &other,
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&other_close).contains("bound to this sprint and served version 5.0.0"));
+
+    let proof = sprint_fixture_deployment(
+        &fixture,
+        "sp-close-current",
+        "5.0.0",
+        "succeeded",
+        "verification",
+    );
+    let unnamed_note = fixture.run(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-close-current",
+            "--deployment",
+            &proof,
+            "--carry-to",
+            "sp-close-carry",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(refusal_object(&unnamed_note).contains("carry-over note"));
+    let note = "Carry t-carry after simulated local verification";
+    let closed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "close",
+            "sp-close-current",
+            "--deployment",
+            &proof,
+            "--carry-to",
+            "sp-close-carry",
+            "--carry-note",
+            note,
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(closed["status"], "closed");
+    assert_eq!(closed["closedByDeployment"], proof);
+    let destination = fixture.ok_json(
+        &fixture.main,
+        &["sprint", "show", "sp-close-carry", "--json"],
+    );
+    assert_eq!(destination["tasks"][0]["id"], "t-carry");
+    assert_eq!(destination["tasks"][0]["status"], "todo");
+    let carry_event = fixture.ok_json(
+        &fixture.main,
+        &[
+            "events",
+            "--task",
+            "t-carry",
+            "--kind",
+            "task_sprint_changed",
+            "--json",
+        ],
+    );
+    assert_eq!(carry_event[0]["payload"]["oldSprintID"], "sp-close-current");
+    assert_eq!(carry_event[0]["payload"]["newSprintID"], "sp-close-carry");
+    assert_eq!(carry_event[0]["payload"]["carryNote"], note);
+    let close_event = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "sprint_closed", "--json"],
+    );
+    assert_eq!(close_event[0]["payload"]["sprintID"], "sp-close-current");
+    assert_eq!(close_event[0]["payload"]["deploymentID"], proof);
+    assert_eq!(close_event[0]["payload"]["targetVersion"], "5.0.0");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
+        true
+    );
+}
