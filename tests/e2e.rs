@@ -1709,9 +1709,95 @@ fn serve_readiness_banner_matches_exact_output() {
     ));
 }
 
-/// Return a current fixture to the exact pre-search schema shape before a
+/// Restore the exact v27 search corpus before removing v27's sprint tables.
+/// Historical fixtures must exercise the real ladder input, not a current
+/// schema with only user_version lowered.
+fn remove_v28_sprint_search_schema(connection: &Connection) {
+    let view_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='view' AND name='search_source_rows'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let sprint_arm = "\nUNION ALL\nSELECT\n 'sprint', sp.id, NULL,\n sp.title,\n COALESCE(sp.body,'') || char(10) || sp.target_version,\n sp.status, NULL, '',\n sp.created_at, sp.updated_at, sp.archived\nFROM sprints sp";
+    let base_migration_sql = format!(
+        "{};",
+        view_sql
+            .strip_suffix(sprint_arm)
+            .expect("current search_source_rows must end with the v28 sprint arm")
+    );
+    connection.execute_batch(
+        r#"
+        DROP TRIGGER search_sprints_ai;
+        DROP TRIGGER search_sprints_au;
+        DROP TRIGGER search_sprints_ad;
+        DROP TRIGGER search_documents_ai;
+        DROP TRIGGER search_documents_ad;
+        DROP TRIGGER search_documents_au;
+        DROP TABLE search_fts;
+        DROP VIEW search_source_rows;
+        PRAGMA legacy_alter_table=ON;
+        ALTER TABLE search_documents RENAME TO search_documents_v28;
+        CREATE TABLE search_documents (
+         seq INTEGER PRIMARY KEY,
+         source_kind TEXT NOT NULL CHECK(source_kind IN ('task','note','checkpoint','handoff','attention','sitrep','rule','event')),
+         source_id TEXT NOT NULL,
+         task_id TEXT,
+         title TEXT NOT NULL,
+         body TEXT NOT NULL,
+         status TEXT,
+         lane TEXT,
+         tags TEXT NOT NULL DEFAULT '',
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL,
+         archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+         source_hash TEXT,
+         embedding_model TEXT,
+         embedding BLOB,
+         UNIQUE(source_kind,source_id)
+        ) STRICT;
+        INSERT INTO search_documents(
+         seq,source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,
+         archived,source_hash,embedding_model,embedding
+        )
+        SELECT
+         seq,source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,
+         archived,source_hash,embedding_model,embedding
+        FROM search_documents_v28 WHERE source_kind<>'sprint';
+        DROP TABLE search_documents_v28;
+        PRAGMA legacy_alter_table=OFF;
+        CREATE INDEX idx_search_documents_source ON search_documents(source_kind,source_id);
+        CREATE INDEX idx_search_documents_task ON search_documents(task_id);
+        CREATE INDEX idx_search_documents_active ON search_documents(updated_at DESC) WHERE archived=0;
+        CREATE VIRTUAL TABLE search_fts USING fts5(
+         title, body, tags,
+         content='search_documents', content_rowid='seq',
+         tokenize='porter unicode61 remove_diacritics 2', prefix='2 3'
+        );
+        CREATE TRIGGER search_documents_ai AFTER INSERT ON search_documents BEGIN
+         INSERT INTO search_fts(rowid,title,body,tags) VALUES(new.seq,new.title,new.body,new.tags);
+        END;
+        CREATE TRIGGER search_documents_ad AFTER DELETE ON search_documents BEGIN
+         INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+         VALUES('delete',old.seq,old.title,old.body,old.tags);
+        END;
+        CREATE TRIGGER search_documents_au AFTER UPDATE OF title,body,tags ON search_documents BEGIN
+         INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+         VALUES('delete',old.seq,old.title,old.body,old.tags);
+         INSERT INTO search_fts(rowid,title,body,tags) VALUES(new.seq,new.title,new.body,new.tags);
+        END;
+        "#,
+    ).unwrap();
+    connection.execute_batch(&base_migration_sql).unwrap();
+    connection
+        .execute("INSERT INTO search_fts(search_fts) VALUES('rebuild')", [])
+        .unwrap();
+}
+
 /// Restore the actual pre-sprint v26 shape before lowering a historical fixture.
 fn remove_v27_sprint_schema(connection: &Connection) {
+    remove_v28_sprint_search_schema(connection);
     connection.execute_batch(
         "ALTER TABLE deployments DROP COLUMN served_version; ALTER TABLE deployments DROP COLUMN target_version; ALTER TABLE deployments DROP COLUMN sprint_id; DROP TABLE task_sprints; DROP TABLE sprints;"
     ).unwrap();
@@ -2088,13 +2174,6 @@ fn compiled_binary_manages_audited_board_local_subscriptions_fail_closed() {
 
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
     assert!(doctor["healthy"].as_bool().unwrap());
-    assert!(
-        doctor["projects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|project| project["schemaVersion"] == 27)
-    );
 
     let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
     for (name, read_only) in [
@@ -2289,9 +2368,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 27);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 27);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 27);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 28);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 28);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 28);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -2458,6 +2537,341 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
     );
 }
 
+#[test]
+fn sprint_search_is_board_scoped_fresh_rebuildable_and_exactly_cited() {
+    let fixture = Fixture::new("sprint-search");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SEARCH-SPRINT-A", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "Photon release boundary",
+            "--id",
+            "sp-deadbeef",
+            "--body",
+            "Deliver the cobalt navigation contract.",
+            "--target-version",
+            "9.4.7",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+
+    for query in ["Photon release boundary", "cobalt navigation", "9.4.7"] {
+        let found = fixture.ok_json(
+            &fixture.main,
+            &["search", query, "--source", "sprint", "--json"],
+        );
+        assert_eq!(found["results"][0]["sourceKind"], "sprint", "{found}");
+        assert_eq!(found["results"][0]["sourceId"], "sp-deadbeef", "{found}");
+        assert_eq!(
+            found["results"][0]["citation"], "kanban://SEARCH-SPRINT-A/sprint/sp-deadbeef",
+            "{found}"
+        );
+        assert_eq!(found["results"][0]["tags"], json!([]), "{found}");
+    }
+
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "sp-deadbeef", "--as", "operator", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Generated ID tag collision",
+            "--id",
+            "t-collision",
+            "--tag",
+            "sp-deadbeef",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let exact = fixture.ok_json(&fixture.main, &["search", "sp-deadbeef", "--json"]);
+    assert!(
+        exact["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["sourceId"] != "t-collision"),
+        "{exact}"
+    );
+    assert_eq!(exact["results"][0]["sourceKind"], "sprint", "{exact}");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-deadbeef",
+            "--body",
+            "Deliver the cobalt navigation contract.\nAcceptance: exact sprint search stays fresh.",
+            "--empty-scope",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "start",
+            "sp-deadbeef",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let fresh = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "Photon release boundary",
+            "--source",
+            "sprint",
+            "--status",
+            "current",
+            "--json",
+        ],
+    );
+    assert_eq!(fresh["results"].as_array().unwrap().len(), 1, "{fresh}");
+    let stale = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "Photon release boundary",
+            "--source",
+            "sprint",
+            "--status",
+            "planned",
+            "--json",
+        ],
+    );
+    assert!(stale["results"].as_array().unwrap().is_empty(), "{stale}");
+
+    let beta = fixture.root.join("beta-search-sprint");
+    fs::create_dir_all(&beta).unwrap();
+    fixture.ok_json(&beta, &["init", "--name", "SEARCH-SPRINT-B", "--json"]);
+    fixture.ok_json(
+        &beta,
+        &[
+            "sprint",
+            "new",
+            "Photon release boundary",
+            "--id",
+            "sp-feedface",
+            "--target-version",
+            "10.0.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let local = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "Photon release boundary",
+            "--source",
+            "sprint",
+            "--json",
+        ],
+    );
+    assert!(
+        local["results"].as_array().unwrap().iter().all(|row| {
+            row["citation"]
+                .as_str()
+                .unwrap()
+                .starts_with("kanban://SEARCH-SPRINT-A/")
+        }),
+        "{local}"
+    );
+    let global = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "Photon release boundary",
+            "--source",
+            "sprint",
+            "--all-boards",
+            "--json",
+        ],
+    );
+    let citations = global["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["citation"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        citations.contains(&"kanban://SEARCH-SPRINT-A/sprint/sp-deadbeef"),
+        "{global}"
+    );
+    assert!(
+        citations.contains(&"kanban://SEARCH-SPRINT-B/sprint/sp-feedface"),
+        "{global}"
+    );
+
+    let rebuilt = fixture.ok_json(
+        &fixture.main,
+        &["search-rebuild", "--as", "operator", "--json"],
+    );
+    assert_eq!(rebuilt["documents"], rebuilt["embedded"], "{rebuilt}");
+    let after_rebuild = fixture.ok_json(
+        &fixture.main,
+        &[
+            "search",
+            "cobalt navigation",
+            "--source",
+            "sprint",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        after_rebuild["results"].as_array().unwrap().len(),
+        1,
+        "{after_rebuild}"
+    );
+    assert_eq!(after_rebuild["results"][0]["sourceId"], "sp-deadbeef");
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    let health = &doctor["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["name"] == "SEARCH-SPRINT-A")
+        .unwrap()["searchIndex"];
+    assert_eq!(health["healthy"], true, "{doctor}");
+    assert_eq!(health["sourceRows"], health["documents"], "{doctor}");
+    assert_eq!(health["documents"], health["ftsRows"], "{doctor}");
+    assert_eq!(health["missingEmbeddings"], 0, "{doctor}");
+}
+#[test]
+fn v27_board_migrates_sprint_search_with_citation_cache_identity_and_index_health() {
+    let fixture = Fixture::new("sprint-search-v27");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "SEARCH-SPRINT-V27", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Preserve indexed cache",
+            "--id",
+            "t-v27-cache",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "Migration release",
+            "--id",
+            "sp-7654abcd",
+            "--body",
+            "Existing heliotrope sprint knowledge.",
+            "--target-version",
+            "8.1.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let board = board_path_for_project(&fixture, &fixture.main, "SEARCH-SPRINT-V27");
+    let connection = Connection::open(&board).unwrap();
+    let cached: (i64, String, String, Vec<u8>) = connection
+        .query_row(
+            "SELECT seq,source_hash,embedding_model,embedding FROM search_documents \
+         WHERE source_kind='task' AND source_id='t-v27-cache'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    remove_v28_sprint_search_schema(&connection);
+    connection.execute_batch("PRAGMA user_version=27;").unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM search_documents WHERE source_kind='sprint'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sprints WHERE id='sp-7654abcd'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let found = fixture.ok_json(
+        &fixture.main,
+        &["search", "heliotrope", "--source", "sprint", "--json"],
+    );
+    assert_eq!(found["results"].as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found["results"][0]["sourceId"], "sp-7654abcd");
+    assert_eq!(
+        found["results"][0]["citation"],
+        "kanban://SEARCH-SPRINT-V27/sprint/sp-7654abcd"
+    );
+
+    let connection = Connection::open(&board).unwrap();
+    let preserved: (i64, String, String, Vec<u8>) = connection
+        .query_row(
+            "SELECT seq,source_hash,embedding_model,embedding FROM search_documents \
+         WHERE source_kind='task' AND source_id='t-v27-cache'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(preserved, cached);
+    connection
+        .execute(
+            "INSERT INTO search_fts(search_fts) VALUES('integrity-check')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
+    let health = &doctor["projects"][0]["searchIndex"];
+    assert_eq!(health["healthy"], true, "{doctor}");
+    assert_eq!(health["sourceRows"], health["documents"], "{doctor}");
+    assert_eq!(health["documents"], health["ftsRows"], "{doctor}");
+    assert_eq!(health["missingEmbeddings"], 0, "{doctor}");
+}
 #[test]
 fn compiled_binary_searches_hybrid_knowledge_across_cli_and_boards() {
     let fixture = Fixture::new("rag-search");
@@ -3145,7 +3559,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        27
+        28
     );
     assert_eq!(
         reopened
@@ -6040,9 +6454,10 @@ fn compiled_binary_still_migrates_a_board_that_is_behind() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert!(current > 1, "expected a migrated board, got v{current}");
-    Connection::open(&board).unwrap().execute_batch(
-        "ALTER TABLE deployments DROP COLUMN served_version; ALTER TABLE deployments DROP COLUMN target_version; ALTER TABLE deployments DROP COLUMN sprint_id; DROP TABLE task_sprints; DROP TABLE sprints; PRAGMA user_version=26;"
-    ).unwrap();
+    let connection = Connection::open(&board).unwrap();
+    remove_v27_sprint_schema(&connection);
+    connection.execute_batch("PRAGMA user_version=26;").unwrap();
+    drop(connection);
 
     let listed = fixture.ok_json(
         &fixture.main,
@@ -17634,7 +18049,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        27
+        28
     );
 }
 
@@ -18729,7 +19144,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        27
+        28
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -21372,7 +21787,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        27
+        28
     );
     assert_eq!(
         connection

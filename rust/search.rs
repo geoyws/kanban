@@ -352,7 +352,7 @@ fn canonical_generated_id_query(query: &str) -> bool {
     };
     matches!(
         prefix,
-        "t" | "e" | "s" | "d" | "sr" | "a" | "h" | "sub" | "r"
+        "t" | "e" | "s" | "sp" | "d" | "sr" | "a" | "h" | "sub" | "r"
     ) && suffix.len() == 8
         && suffix
             .bytes()
@@ -402,12 +402,11 @@ fn snippet(document: &Document, query_words: &[String]) -> String {
 /// may no longer see. So the copy is used for RANKING (which is all it is
 /// good for) and never for the decision.
 ///
-/// Every source kind except `rule` hangs off a task, and every one of those
-/// derives its indexed tags from that task's `task_tags` (see
-/// `search_source_rows`). An `attention` document is the exception worth
-/// naming: the view gives it the TASK's tags, but the attention row carries
-/// its own in `attention_tags`, so both are required here. A `rule` lives in
-/// the registry and carries no board tag, so board scope is its whole check.
+/// Task-linked source kinds derive authorization tags from their task tags
+/// (see search_source_rows). An attention document also carries its own
+/// attention tags, so both are required here. Rules live in the registry and
+/// sprints are board-only rows; neither carries board tags, so its containing
+/// scope is the whole authorization check.
 ///
 /// A document whose task no longer exists is a stale index entry with no
 /// source row left to authorize against, so it yields the tag that can never
@@ -936,7 +935,7 @@ mod tests {
 
     #[test]
     fn canonical_generated_id_queries_are_recognized_by_the_documented_shape() {
-        for prefix in ["t", "e", "s", "d", "sr", "a", "h", "sub", "r"] {
+        for prefix in ["t", "e", "s", "sp", "d", "sr", "a", "h", "sub", "r"] {
             assert!(
                 canonical_generated_id_query(&format!("{prefix}-1234abcd")),
                 "{prefix}"

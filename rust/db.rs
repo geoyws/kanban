@@ -1776,6 +1776,202 @@ ALTER TABLE deployments ADD COLUMN target_version TEXT;
 ALTER TABLE deployments ADD COLUMN served_version TEXT;
 "#;
 
+/// Sprints are board-owned search sources, with the same indexed lifecycle as
+/// every other authoritative board row. SQLite cannot widen a CHECK in place,
+/// so the document table is rebuilt with all fifteen columns copied explicitly:
+/// row identities and any cached embeddings survive unchanged. The external-
+/// content FTS table is rebuilt from those preserved rows after its triggers and
+/// indexes are restored; existing sprints are then backfilled through the
+/// extended authoritative source view.
+const BOARD_V28: &str = r#"
+DROP TRIGGER search_documents_ai;
+DROP TRIGGER search_documents_ad;
+DROP TRIGGER search_documents_au;
+DROP TABLE search_fts;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE search_documents RENAME TO search_documents_v27;
+CREATE TABLE search_documents (
+ seq INTEGER PRIMARY KEY,
+ source_kind TEXT NOT NULL CHECK(source_kind IN ('task','note','checkpoint','handoff','attention','sitrep','rule','event','sprint')),
+ source_id TEXT NOT NULL,
+ task_id TEXT,
+ title TEXT NOT NULL,
+ body TEXT NOT NULL,
+ status TEXT,
+ lane TEXT,
+ tags TEXT NOT NULL DEFAULT '',
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ source_hash TEXT,
+ embedding_model TEXT,
+ embedding BLOB,
+ UNIQUE(source_kind,source_id)
+) STRICT;
+INSERT INTO search_documents(
+ seq,source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,
+ archived,source_hash,embedding_model,embedding
+)
+SELECT
+ seq,source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,
+ archived,source_hash,embedding_model,embedding
+FROM search_documents_v27;
+DROP TABLE search_documents_v27;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_search_documents_source ON search_documents(source_kind,source_id);
+CREATE INDEX idx_search_documents_task ON search_documents(task_id);
+CREATE INDEX idx_search_documents_active ON search_documents(updated_at DESC) WHERE archived=0;
+CREATE VIRTUAL TABLE search_fts USING fts5(
+ title,
+ body,
+ tags,
+ content='search_documents',
+ content_rowid='seq',
+ tokenize='porter unicode61 remove_diacritics 2',
+ prefix='2 3'
+);
+CREATE TRIGGER search_documents_ai AFTER INSERT ON search_documents BEGIN
+ INSERT INTO search_fts(rowid,title,body,tags)
+ VALUES(new.seq,new.title,new.body,new.tags);
+END;
+CREATE TRIGGER search_documents_ad AFTER DELETE ON search_documents BEGIN
+ INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+ VALUES('delete',old.seq,old.title,old.body,old.tags);
+END;
+CREATE TRIGGER search_documents_au AFTER UPDATE OF title,body,tags ON search_documents BEGIN
+ INSERT INTO search_fts(search_fts,rowid,title,body,tags)
+ VALUES('delete',old.seq,old.title,old.body,old.tags);
+ INSERT INTO search_fts(rowid,title,body,tags)
+ VALUES(new.seq,new.title,new.body,new.tags);
+END;
+DROP VIEW search_source_rows;
+CREATE VIEW search_source_rows AS
+SELECT
+ 'task' AS source_kind,
+ t.id AS source_id,
+ t.id AS task_id,
+ t.title AS title,
+ COALESCE(t.body,'') || char(10) || COALESCE(t.deliverable,'') || char(10) || t.metadata AS body,
+ t.status AS status,
+ t.lane AS lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=t.id AND archived=0 ORDER BY tag)), '') AS tags,
+ t.created_at AS created_at,
+ t.updated_at AS updated_at,
+ t.archived AS archived
+FROM tasks t
+UNION ALL
+SELECT
+ 'note', CAST(n.seq AS TEXT), n.task_id,
+ n.kind || ' note on ' || n.task_id,
+ n.author || char(10) || n.body,
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=n.task_id AND archived=0 ORDER BY tag)), ''),
+ n.created_at, n.created_at, n.archived
+FROM task_notes n JOIN tasks t ON t.id=n.task_id
+UNION ALL
+SELECT
+ 'checkpoint', CAST(c.seq AS TEXT), c.task_id,
+ 'checkpoint: ' || c.summary,
+ c.author || char(10) || c.summary || char(10) || c.intent || char(10) || c.next_action ||
+   char(10) || c.blockers || char(10) || c.validations || char(10) ||
+   COALESCE(c.repo_path,'') || char(10) || COALESCE(c.branch,''),
+ t.status, t.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=c.task_id AND archived=0 ORDER BY tag)), ''),
+ c.created_at, c.created_at, c.archived
+FROM checkpoints c JOIN tasks t ON t.id=c.task_id
+UNION ALL
+SELECT
+ 'handoff', h.id, h.task_id,
+ 'handoff: ' || h.summary,
+ h.from_agent || char(10) || COALESCE(h.to_agent,'') || char(10) || h.summary ||
+   char(10) || h.intent || char(10) || h.next_action || char(10) || h.blockers ||
+   char(10) || h.validations || char(10) || COALESCE(h.repo_path,'') ||
+   char(10) || COALESCE(h.branch,''),
+ h.status,
+ (SELECT lane FROM tasks WHERE id=h.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=h.task_id AND archived=0 ORDER BY tag)), ''),
+ h.created_at, COALESCE(h.accepted_at,h.created_at), h.archived
+FROM handoffs h
+UNION ALL
+SELECT
+ 'attention', a.id, a.task_id,
+ 'attention: ' || a.kind,
+ a.raised_by || char(10) || a.body || char(10) || COALESCE(a.resolution,'') ||
+   char(10) || COALESCE(a.question,'') || char(10) || COALESCE(a.context,'') ||
+   char(10) || COALESCE((SELECT group_concat(
+     json_extract(choice.value,'$.label') || char(10) ||
+     json_extract(choice.value,'$.consequence'), char(10))
+     FROM json_each(a.choices) choice), ''),
+ a.status,
+ (SELECT lane FROM tasks WHERE id=a.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=a.task_id AND archived=0 ORDER BY tag)), ''),
+ a.created_at, COALESCE(a.resolved_at,a.created_at), a.archived
+FROM attention a
+UNION ALL
+SELECT
+ 'sitrep', s.id, s.task_id,
+ 'sitrep: ' || s.lane,
+ s.author || char(10) || s.body || char(10) || COALESCE(s.worktree,'') ||
+   char(10) || COALESCE(s.branch,''),
+ NULL, s.lane,
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=s.task_id AND archived=0 ORDER BY tag)), ''),
+ s.created_at, s.created_at, s.archived
+FROM sitreps s
+UNION ALL
+SELECT
+ 'rule', r.id, NULL,
+ substr(r.body,1,instr(r.body || char(10),char(10))-1),
+ r.body,
+ CASE WHEN r.archived=0 THEN 'active' ELSE 'retired' END,
+ NULL, '', r.created_at, r.updated_at, r.archived
+FROM rules r
+UNION ALL
+SELECT
+ 'event', CAST(e.seq AS TEXT), e.task_id,
+ 'event: ' || e.kind,
+ COALESCE(e.actor,'') || char(10) || e.payload,
+ (SELECT status FROM tasks WHERE id=e.task_id),
+ (SELECT lane FROM tasks WHERE id=e.task_id),
+ COALESCE((SELECT group_concat(tag,' ') FROM
+   (SELECT tag FROM task_tags WHERE task_id=e.task_id AND archived=0 ORDER BY tag)), ''),
+ e.created_at, e.created_at, e.archived
+FROM events e
+WHERE e.kind IN (
+ 'task_added','task_updated','task_moved','note_added','checkpoint_added',
+ 'handoff_created','handoff_accepted','attention_raised','attention_resolved',
+ 'sitrep_posted','rule_added','rule_updated','rule_retired','archive_swept'
+)
+UNION ALL
+SELECT
+ 'sprint', sp.id, NULL,
+ sp.title,
+ COALESCE(sp.body,'') || char(10) || sp.target_version,
+ sp.status, NULL, '',
+ sp.created_at, sp.updated_at, sp.archived
+FROM sprints sp;
+
+CREATE TRIGGER search_sprints_ai AFTER INSERT ON sprints BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sprint' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sprints_au AFTER UPDATE ON sprints BEGIN
+ DELETE FROM search_documents WHERE source_kind='sprint' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='sprint' AND source_id=new.id;
+END;
+CREATE TRIGGER search_sprints_ad AFTER DELETE ON sprints BEGIN
+ DELETE FROM search_documents WHERE source_kind='sprint' AND source_id=old.id;
+END;
+INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+SELECT * FROM search_source_rows WHERE source_kind='sprint';
+INSERT INTO search_fts(search_fts) VALUES('rebuild');
+"#;
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -2077,7 +2273,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 27;
+pub const BOARD_SCHEMA_VERSION: usize = 28;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2537,7 +2733,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
-    BOARD_V26, BOARD_V27,
+    BOARD_V26, BOARD_V27, BOARD_V28,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4439,6 +4635,176 @@ mod tests {
                 .is_err(),
             "a task was attached to a sprint that does not exist"
         );
+    }
+    #[test]
+    fn board_schema_v28_backfills_sprints_without_rekeying_or_erasing_cached_documents() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &BOARD_MIGRATIONS[..27]).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 27);
+        connection.execute(
+            "INSERT INTO tasks(id,type,title,body,status,priority,created_at,updated_at,metadata) \
+             VALUES('t-cache','task','preserved cache','other indexed kind','todo',3,10,11,'{}')",
+            [],
+        ).unwrap();
+        connection.execute(
+            "UPDATE search_documents SET source_hash='kept-hash',embedding_model='kept-model',embedding=x'01020304' \
+             WHERE source_kind='task' AND source_id='t-cache'",
+            [],
+        ).unwrap();
+        let old_seq: i64 = connection
+            .query_row(
+                "SELECT seq FROM search_documents WHERE source_kind='task' AND source_id='t-cache'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO sprints(id,title,body,status,target_version,scheduled_start,scheduled_end,starts_at,created_at,updated_at) \
+             VALUES('sp-1234abcd','Existing release','Backfill this release body','planned','7.8.9',0,100,1,20,21)",
+            [],
+        ).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM search_documents WHERE source_kind='sprint'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 28);
+        let preserved: (i64, String, String, Vec<u8>) = connection
+            .query_row(
+                "SELECT seq,source_hash,embedding_model,embedding FROM search_documents \
+             WHERE source_kind='task' AND source_id='t-cache'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                old_seq,
+                "kept-hash".into(),
+                "kept-model".into(),
+                vec![1, 2, 3, 4]
+            )
+        );
+
+        let sprint: (
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT task_id,title,body,status,lane,tags,created_at,updated_at,archived \
+                 FROM search_documents WHERE source_kind='sprint' AND source_id='sp-1234abcd'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            sprint,
+            (
+                None,
+                "Existing release".into(),
+                "Backfill this release body\n7.8.9".into(),
+                "planned".into(),
+                None,
+                String::new(),
+                20,
+                21,
+                0,
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH 'Existing release'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute(
+                "INSERT INTO search_fts(search_fts) VALUES('integrity-check')",
+                [],
+            )
+            .unwrap();
+        for name in [
+            "idx_search_documents_source",
+            "idx_search_documents_task",
+            "idx_search_documents_active",
+        ] {
+            assert!(
+                index_names(&connection, "search_documents")
+                    .iter()
+                    .any(|actual| actual == name),
+                "missing {name}"
+            );
+        }
+
+        connection.execute(
+            "UPDATE sprints SET title='Fresh release',body='Fresh lifecycle body',status='current',updated_at=22 \
+             WHERE id='sp-1234abcd'",
+            [],
+        ).unwrap();
+        let fresh: (i64, String, String, String, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT COUNT(*),title,body,status,embedding FROM search_documents \
+             WHERE source_kind='sprint' AND source_id='sp-1234abcd'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fresh,
+            (
+                1,
+                "Fresh release".into(),
+                "Fresh lifecycle body\n7.8.9".into(),
+                "current".into(),
+                None
+            )
+        );
+        connection
+            .execute("DELETE FROM sprints WHERE id='sp-1234abcd'", [])
+            .unwrap();
+        assert_eq!(connection.query_row(
+            "SELECT COUNT(*) FROM search_documents WHERE source_kind='sprint' AND source_id='sp-1234abcd'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
     }
 
     #[test]
