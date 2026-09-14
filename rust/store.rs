@@ -2730,6 +2730,44 @@ impl SnapshotSource for Store {
     }
 }
 
+/// A coherent read snapshot that is a no-op inside an open scope.
+///
+/// Readers that must see several rows from one point in time open this. When
+/// the connection already holds a transaction — a `transact` batch, or a
+/// write path reading back its own work — that scope IS the snapshot, and a
+/// nested `BEGIN` would be refused by SQLite. Outside one, a deferred
+/// transaction pins the snapshot; dropping it releases the read.
+pub(crate) struct ReadSnapshot<'a> {
+    connection: Option<&'a Connection>,
+}
+
+impl<'a> ReadSnapshot<'a> {
+    fn open(connection: &'a Connection) -> Result<Self> {
+        if !connection.is_autocommit() {
+            return Ok(Self { connection: None });
+        }
+        connection.execute_batch("BEGIN")?;
+        Ok(Self {
+            connection: Some(connection),
+        })
+    }
+
+    fn close(mut self) -> Result<()> {
+        if let Some(connection) = self.connection.take() {
+            connection.execute_batch("COMMIT")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 impl Store {
     /// Open a write scope: the one way a write path in this file takes the
     /// mutation lock.
@@ -6849,7 +6887,7 @@ impl Store {
         const HANDOFFS: usize = 20;
         const SITREPS: usize = 20;
         // The packet and its applicable rules must use the same task selectors.
-        let snapshot = self.connection.unchecked_transaction()?;
+        let snapshot = ReadSnapshot::open(&self.connection)?;
         let task = self.require_task(id)?;
         #[cfg(test)]
         tests::run_context_packet_after_task_hook();
@@ -6890,7 +6928,7 @@ impl Store {
             generated_at: now_ms(),
             truncated,
         };
-        snapshot.commit()?;
+        snapshot.close()?;
         Ok(packet)
     }
 
@@ -6926,10 +6964,11 @@ impl Store {
     /// Claim and handoff call this after their mutation commits.
     pub fn task_rule_selectors(&self, task_id: &str) -> Result<(HashSet<String>, Option<String>)> {
         self.authz.check_read(&[])?;
-        let snapshot = self.connection.unchecked_transaction()?;
-        let tags = task_tags(&snapshot, task_id)?;
+        let snapshot = ReadSnapshot::open(&self.connection)?;
+        let tags = task_tags(&self.connection, task_id)?;
         self.authz.check_read(&tags)?;
-        let sprint: Option<String> = snapshot
+        let sprint: Option<String> = self
+            .connection
             .query_row(
                 "SELECT ts.sprint_id FROM tasks t \
                  LEFT JOIN task_sprints ts ON ts.task_id=t.id WHERE t.id=?",
@@ -6938,7 +6977,7 @@ impl Store {
             )
             .optional()?
             .with_context(|| format!("task {task_id} not found"))?;
-        snapshot.commit()?;
+        snapshot.close()?;
         Ok((tags.into_iter().collect(), sprint))
     }
 

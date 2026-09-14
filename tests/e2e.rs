@@ -7355,13 +7355,10 @@ fn a_board_behind_the_schema_that_cannot_be_migrated_says_both_halves() {
         );
         return;
     }
-    let current: i64 = Connection::open(&estate.board)
-        .unwrap()
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    Connection::open(&estate.board).unwrap().execute_batch(
-        "ALTER TABLE deployments DROP COLUMN served_version; ALTER TABLE deployments DROP COLUMN target_version; ALTER TABLE deployments DROP COLUMN sprint_id; DROP TABLE task_sprints; DROP TABLE sprints; PRAGMA user_version=26;"
-    ).unwrap();
+    let connection = Connection::open(&estate.board).unwrap();
+    remove_v27_sprint_schema(&connection);
+    connection.execute_batch("PRAGMA user_version=26;").unwrap();
+    drop(connection);
     estate.seal();
 
     let refused = fixture.run(
@@ -7376,7 +7373,7 @@ fn a_board_behind_the_schema_that_cannot_be_migrated_says_both_halves() {
     );
     let message = refusal_object(&refused);
     assert!(
-        message.contains(&format!("schema {}", current - 1)),
+        message.contains("schema 26"),
         "the refusal does not name the schema the board is at: {message}"
     );
     assert!(
@@ -7614,7 +7611,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains("kanban"));
     assert!(
-        version.contains("board schema 27"),
+        version.contains("board schema 28"),
         "version output: {version}"
     );
     assert!(
@@ -15708,6 +15705,40 @@ fn transact_runs_its_items_in_order_and_each_result_matches_the_same_command_alo
         .map(|note| note["body"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(bodies, ["one", "two", "three"]);
+}
+
+/// The coherent selector snapshot behind `context` and `claim` must nest
+/// inside a batch: a nested BEGIN would fail every item after the first read.
+#[test]
+fn a_transact_can_read_context_and_claim_inside_one_batch() {
+    let fixture = Fixture::new("transact-context");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TXCTX", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "subject", "--id", "t-1", "--json"],
+    );
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({ "name": "context", "arguments": { "id": "t-1" } }),
+            json!({ "name": "claim", "arguments": { "id": "t-1", "as": "agent-a" } }),
+            json!({ "name": "context", "arguments": { "id": "t-1" } }),
+        ],
+    );
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert_eq!(
+        envelope["results"][0]["result"]["task"]["id"], "t-1",
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["results"][1]["result"]["agentID"], "agent-a",
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["results"][2]["result"]["claim"]["agentID"], "agent-a",
+        "{envelope}"
+    );
 }
 
 #[test]
@@ -23992,7 +24023,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 28_i64)
+        .pragma_update(None, "user_version", 29_i64)
         .unwrap();
     drop(newer_connection);
 
