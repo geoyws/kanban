@@ -2753,8 +2753,11 @@ impl<'a> ReadSnapshot<'a> {
     }
 
     fn close(mut self) -> Result<()> {
-        if let Some(connection) = self.connection.take() {
+        // Commit first; a failed COMMIT leaves the transaction open, and Drop
+        // must still be able to roll it back.
+        if let Some(connection) = self.connection {
             connection.execute_batch("COMMIT")?;
+            self.connection = None;
         }
         Ok(())
     }
