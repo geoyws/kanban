@@ -142,8 +142,32 @@ are audited. `dashboard` projects the current sprint for each board; `context`
 projects the task's own sprint only when that task is attached. The read-only
 web projections are `/sprints`, `/sprints/BOARD`, and `/sprint/BOARD/ID`.
 
-Sprint-scoped rules and first-class sprint search/citations are not implemented.
-There is no draft sprint status, estimation, or automatic rollover.
+Sprint-scoped rules and first-class sprint search/citations are implemented. A
+sprint rule is encoded as `SPRINT:sp-ID` with exactly one `ONLY:BOARD`; optional
+repeatable `--tag` selectors intersect that scope. The sprint must exist on that
+board (closed history is valid). Add or replace the scope explicitly:
+
+```bash
+kb rule add "Ship only with served proof" --board BOARD --sprint sp-ID --as operator --json
+# Save the returned rule id as RULE_ID.
+kb rule update "$RULE_ID" --sprint sp-OTHER --as operator --json
+kb rule update "$RULE_ID" --clear-sprint --as operator --json
+kb search "release goal" --source sprint --json
+```
+
+`rule add` accepts `--as`, `--body`, `--body-file`, repeatable `--board`,
+repeatable `--except-board`, `--sprint`, and repeatable `--tag`; `rule update`
+also accepts `--clear-sprint` and `--clear-tags`. `--sprint` and
+`--clear-sprint` are mutually exclusive. Applicability reads the task's
+authoritative attached sprint for claim, handoff acceptance, and context;
+unattached work and work in another sprint do not receive the rule. Sprint
+rows have no tags and are board-only. Raw `rule list` (`--all`/`--full` only)
+and board-targeted search remain inventories and still list sprint-scoped
+rules; only board HTML without a task omits them, since it has no sprint to
+match. Sprint search indexes title, body, and target version, cites
+results as `kanban://BOARD/sprint/ID`, and is refreshed by lifecycle updates.
+There is no draft sprint status, estimation, automatic rollover, or automatic
+sprint archival.
 
 ## Completion gates
 

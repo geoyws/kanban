@@ -1,11 +1,11 @@
 # ADR-045: A sprint is a typed row that scopes claims and cannot close without a served version
 
-**Status:** Partially implemented — core and web complete; sprint rules and first-class search pending
+**Status:** Implemented — core, web, sprint-scoped rules, and first-class search complete
 **Date:** 2026-09-11
 **Authority:** sprint epic `e-ee95dbd5` is the authoritative requirement source
 and overrides weaker wording here. The typed lifecycle, claim boundary,
-deployment proof gate, CLI/read projections, and server-rendered sprint pages
-are implemented. Sprint-scoped rules and first-class sprint search are pending.
+deployment proof gate, CLI/read projections, server-rendered sprint pages,
+sprint-scoped rules, and first-class sprint search are implemented.
 **Supersedes:** nothing.
 
 ## Context
@@ -19,9 +19,9 @@ the sprint, this ships as vX.Y, and it is not done until that version is served"
 The historical baseline offered typed rows in their own tables with typed id
 prefixes (`a-` attention, `d-` deployments, `sub-` subscriptions), append-only
 migrations through board schema 26, ADR-008 store refusals, and ADR-029 hash-
-chained events. V27 is now the current board schema: it adds sprint rows while
-extending the existing claim candidate pool and lane/no-cross-lane vocabulary
-rather than duplicating them.
+chained events. V27 introduced sprint rows while extending the existing claim
+candidate pool and lane/no-cross-lane vocabulary rather than duplicating them.
+V28 is now the current board schema and adds sprint rows to first-class search.
 
 ## Decision
 
@@ -63,12 +63,13 @@ ALTER TABLE deployments ADD COLUMN served_version TEXT;
 start time by `sprint start`; `ends_at` records the actual close or abandon time.
 The partial unique index enforces exactly one current sprint per board.
 
-V26 is the historical migration baseline and V27 is current. The V27 migration
-is appended to `BOARD_MIGRATIONS`; the ladder test keeps the declared schema and
-migrations equal. No `tasks` table rebuild or `ALTER` is needed: `task_sprints`
-holds the one-sprint-per-task rule while recording who attached each row and
-when. The deployment `ALTER`s bind attempts to a sprint target and record the
-served-version observation.
+V26 is the historical pre-sprint migration baseline. V27 adds the sprint model;
+V28 is current and adds sprint search schema plus a backfill of existing sprint
+rows. Both migrations are appended to `BOARD_MIGRATIONS`; the ladder test keeps
+the declared schema and migrations equal. No `tasks` table rebuild or `ALTER`
+is needed: `task_sprints` holds the one-sprint-per-task rule while recording who
+attached each row and when. The deployment `ALTER`s bind attempts to a sprint
+target and record the served-version observation.
 
 Production migrations fail closed. V27 uses ordinary additive `CREATE` and
 `ALTER TABLE ADD COLUMN` statements without `IF NOT EXISTS`; an unexpected
@@ -181,9 +182,23 @@ attachment moves, carry event, and close event commit atomically.
 - The server-rendered, read-only sprint projections are `/sprints` across
   boards, `/sprints/BOARD` for one board, and `/sprint/BOARD/ID` for detail.
 
-The typed lifecycle, CLI projections, and web pages are implemented. Search
-citations (`kanban://BOARD/sprint/ID`), first-class sprint retrieval, and
-sprint-scoped rules remain pending and must not be inferred from the web routes.
+The typed lifecycle, CLI projections, web pages, first-class retrieval, and
+sprint-scoped rules are implemented. V28 indexes sprint title, body, and target
+version as source `sprint`; lifecycle updates refresh the document and results
+carry citations of the form `kanban://BOARD/sprint/ID`. The migration backfills
+existing sprints. Sprint rows are board-only, carry no tags, and are not
+automatically archived.
+
+A sprint-scoped rule stores selector `SPRINT:sp-ID` together with exactly one
+`ONLY:BOARD`, plus any optional subsystem tag intersection. The sprint must
+exist on that board; closed historical sprints remain valid selectors.
+`rule add --board BOARD --sprint sp-ID` sets the scope, `rule update --sprint`
+replaces it, and `rule update --clear-sprint` removes it; setting and clearing
+are mutually exclusive. Claim, handoff acceptance, and task context evaluate
+the rule against the task's authoritative attachment. Tasks without a sprint
+or attached to another sprint do not receive it. Raw rule inventory and
+board-targeted search inventory are unchanged, and a board HTML projection
+without a task does not show sprint-only rules.
 
 ### 6. Events: six kinds, one chain
 
