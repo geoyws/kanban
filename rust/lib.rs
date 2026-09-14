@@ -75,7 +75,8 @@ Usage:
   kanban dashboard [--all] [--json]
   kanban doctor [--all] [--json]
   kanban audit verify [--against MANIFEST] [--json]
-  kanban search QUERY [--source KIND] [--status STATUS] [--tag NAME] [--lane LANE]
+  kanban search QUERY [--source task|note|checkpoint|handoff|attention|sitrep|rule|event|sprint]
+             [--status STATUS] [--tag NAME] [--lane LANE]
              [--after MS] [--before MS] [--all] [--all-boards]
              [--limit N] [--max-chars N] [--json]
   kanban search-rebuild --as ACTOR [--all-boards] [--json]
@@ -3675,7 +3676,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
         bail!("--after must not be later than --before");
     }
     if let Some(source) = args.one("source") {
-        const SOURCES: [&str; 8] = [
+        const SOURCES: [&str; 9] = [
             "task",
             "note",
             "checkpoint",
@@ -3684,6 +3685,7 @@ fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
             "sitrep",
             "rule",
             "event",
+            "sprint",
         ];
         if !SOURCES.contains(&source) {
             bail!("invalid --source {source}; expected {}", SOURCES.join(", "));
