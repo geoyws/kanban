@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -36732,6 +36733,7 @@ fn stalled_accept_worker_keeps_a_real_connection_queued_before_stop() {
     let fixture = Fixture::new("stalled-accept-late-observer");
     let marker = fixture.root.join("curl-started");
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let queued_probe = listener.try_clone().unwrap();
     let address = listener.local_addr().unwrap();
     let (start_tx, start_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(0);
@@ -36740,6 +36742,28 @@ fn stalled_accept_worker_keeps_a_real_connection_queued_before_stop() {
     ready_rx.recv().unwrap();
     fs::write(&marker, []).unwrap();
     let connection = std::net::TcpStream::connect(address).unwrap();
+    // Client connect completion is not proof that the listener is ready to accept.
+    let mut queued_events = libc::pollfd {
+        fd: queued_probe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let poll_result = unsafe { libc::poll(&mut queued_events, 1, 2_000) };
+    assert!(
+        poll_result >= 0,
+        "listener readiness poll failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        poll_result, 1,
+        "no connection queued on the listener within two seconds"
+    );
+    assert_ne!(
+        queued_events.revents & libc::POLLIN,
+        0,
+        "listener woke without a queued connection: {:#x}",
+        queued_events.revents
+    );
     let simulated_child_exit = SystemTime::now();
     // Model observation delayed until after the real probe was queued and the
     // child exited. Connection proof survives pending stop; elapsed time comes
