@@ -184,12 +184,14 @@ Usage:
   kanban tag list [--json]
   kanban tag remove NAME [--force] [--as ACTOR] [--json]
   kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR
-             [--board NAME ... | --except-board NAME ...] [--tag NAME ...] [--json]
+             [--board NAME ... | --except-board NAME ...] [--sprint sp-ID]
+             [--tag NAME ...] [--json]
+             (--sprint requires exactly one named --board and matches only tasks attached to that sprint)
   kanban rule list [--all] [--full] [--json]
   kanban rule show ID [--json]
   kanban rule update ID [--body TEXT | --body-file PATH]
-             [--board NAME ... | --except-board NAME ...] [--tag NAME ... | --clear-tags]
-             --as ACTOR [--json]
+             [--board NAME ... | --except-board NAME ...] [--sprint sp-ID | --clear-sprint]
+             [--tag NAME ... | --clear-tags] --as ACTOR [--json]
   kanban rule retire ID --as ACTOR [--json]
   kanban rule export --board NAME ... --as ACTOR [--output PATH] [--json]
   kanban rule import PATH --as ACTOR [--json]
@@ -1214,7 +1216,15 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "rule",
         Some("add"),
-        &["as", "body", "body-file", "board", "except-board", "tag"],
+        &[
+            "as",
+            "body",
+            "body-file",
+            "board",
+            "except-board",
+            "sprint",
+            "tag",
+        ],
         &["?body"],
         false,
     ),
@@ -1229,6 +1239,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "body-file",
             "board",
             "except-board",
+            "sprint",
+            "clear-sprint",
             "tag",
             "clear-tags",
         ],
@@ -3849,17 +3861,30 @@ fn effective_rule_summaries(
     args: &Args,
     store: &Store,
     task_id: Option<&str>,
+    known_task_tags: Option<&[String]>,
+    known_sprint: Option<&str>,
 ) -> Result<Vec<RuleSummary>> {
     let board_name = selected_board_name(args)?;
-    let task_tags = task_id
-        .map(|id| store.require_task(id).map(|task| task.tags))
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let loaded = if known_task_tags.is_none() {
+        task_id
+            .map(|id| store.task_rule_selectors(id))
+            .transpose()?
+    } else {
+        None
+    };
+    let known_tags = known_task_tags.map(|tags| tags.iter().cloned().collect());
+    let task_tags = known_tags
+        .as_ref()
+        .or_else(|| loaded.as_ref().map(|(tags, _)| tags));
+    let task_sprint = if known_task_tags.is_some() {
+        known_sprint
+    } else {
+        loaded.as_ref().and_then(|(_, sprint)| sprint.as_deref())
+    };
     Registry::open_for_read()?.applicable_rule_summaries(
         board_name.as_deref(),
-        task_id.map(|_| &task_tags),
+        task_tags,
+        task_sprint,
         false,
     )
 }
@@ -4812,15 +4837,10 @@ fn restore(args: &Args) -> Result<()> {
     // rescue copy above went through `Store::backup`, which applies the
     // matching bulk-READ gate.
     for (_, destination) in &overwrites {
-        // Only a destination that still OPENS as a board has rows this could
-        // be withholding. A corrupt or foreign file is exactly what `restore`
-        // exists to replace, and it has already been copied out of the way
-        // above; refusing it here would turn the guard into the reason a
-        // recovery cannot happen.
-        if destination.exists()
-            && let Ok(store) = Store::open_readonly_as_caller(destination)
-        {
-            store.require_whole_board_write()?;
+        // Base write authority is independent of whether bytes can be opened.
+        // Readable boards additionally require the whole-board write gate.
+        if destination.exists() {
+            Store::require_restore_write(destination)?;
         }
     }
 
@@ -6271,6 +6291,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             let tags = registry.canonical_rule_tags(
                 &args.many("board"),
                 &args.many("except-board"),
+                args.one("sprint"),
                 &args.many("tag"),
             )?;
             return print(
@@ -6279,8 +6300,10 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             );
         }
         if sub == Some("update") {
-            if args.has("tag") && args.has("clear-tags") {
-                bail!("--tag and --clear-tags are mutually exclusive");
+            for (left, right) in [("tag", "clear-tags"), ("sprint", "clear-sprint")] {
+                if args.has(left) && args.has(right) {
+                    bail!("--{left} and --{right} are mutually exclusive");
+                }
             }
             let id = rest.first().context("rule id is required")?;
             let body = args.body()?;
@@ -6297,11 +6320,19 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             } else {
                 None
             };
+            let sprint = if let Some(value) = args.one("sprint") {
+                Some(Some(value))
+            } else if args.has("clear-sprint") {
+                Some(None)
+            } else {
+                None
+            };
             return print(
                 &registry.update_rule(
                     id,
                     body.as_deref(),
                     selector_tags.as_deref(),
+                    sprint,
                     subsystem_tags.as_deref(),
                     args.require("as")?,
                 )?,
@@ -6794,7 +6825,8 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 sprint_override: claim_sprint_override(&args)?,
             },
         )?;
-        value.rules = effective_rule_summaries(&args, &store, Some(&value.claim.task_id))?;
+        value.rules =
+            effective_rule_summaries(&args, &store, Some(&value.claim.task_id), None, None)?;
         return print(&value, args.has("json"));
     }
     if command == "heartbeat" {
@@ -6919,6 +6951,8 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 .as_ref()
                 .map(|claim| claim.task_id.as_str())
                 .or(handoff.task_id.as_deref()),
+            None,
+            None,
         )?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),
@@ -7253,7 +7287,12 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     if command == "context" {
         let id = sub.context("task id is required")?;
         let mut packet = store.context_packet(id)?;
-        packet.rules = effective_rule_summaries(&args, &store, Some(id))?;
+        let task_tags = &packet.task.tags;
+        let sprint = packet
+            .sprint
+            .as_ref()
+            .map(|sprint| sprint.sprint_id.as_str());
+        packet.rules = effective_rule_summaries(&args, &store, Some(id), Some(task_tags), sprint)?;
         if args.has("json") {
             // --max-chars bounds the rendered text and has never had any
             // effect here, so accepting it silently handed back an unbounded

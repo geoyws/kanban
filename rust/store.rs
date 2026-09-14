@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Type};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -2877,10 +2877,15 @@ impl Store {
     /// the next writable open. Nothing else is lost by not writing, and
     /// nothing is refused for being unable to.
     pub(crate) fn open_readonly_as_caller(path: &Path) -> Result<Self> {
-        Ok(Self {
-            connection: open_board_readonly(path)?,
-            authz: crate::routing::board_authz(path)?,
-        })
+        let authz = crate::routing::board_authz(path)?;
+        Self::open_readonly_with_authz(path, authz)
+    }
+
+    fn open_readonly_with_authz(path: &Path, authz: AuthzContext) -> Result<Self> {
+        // Refuse before SQLite can reveal missing or corrupt board bytes.
+        authz.check_read(&[])?;
+        let connection = open_board_readonly(path)?;
+        Ok(Self { connection, authz })
     }
 
     /// Open a board for a command that only READS it.
@@ -2933,6 +2938,20 @@ impl Store {
     /// The bulk-write gate on this store's own connection.
     pub(crate) fn require_whole_board_write(&self) -> Result<()> {
         whole_board_write_on(&self.authz, &self.connection)
+    }
+
+    pub(crate) fn require_restore_write(path: &Path) -> Result<()> {
+        let authz = crate::routing::board_authz(path)?;
+        Self::require_restore_write_with_authz(path, authz)
+    }
+
+    fn require_restore_write_with_authz(path: &Path, authz: AuthzContext) -> Result<()> {
+        authz.check_write(&[], &[])?;
+        // Only physical open failures are recoverable; permission errors propagate.
+        if let Ok(connection) = open_board_readonly(path) {
+            whole_board_write_on(&authz, &connection)?;
+        }
+        Ok(())
     }
 
     /// Keep only the events this caller may see, by each event's REAL tags.
@@ -6810,7 +6829,11 @@ impl Store {
         const CHECKPOINTS: usize = 20;
         const HANDOFFS: usize = 20;
         const SITREPS: usize = 20;
+        // The packet and its applicable rules must use the same task selectors.
+        let snapshot = self.connection.unchecked_transaction()?;
         let task = self.require_task(id)?;
+        #[cfg(test)]
+        tests::run_context_packet_after_task_hook();
         let open_attention = self.open_attentions(id)?;
         // Over-fetch by one so "there is older history" is measured, not
         // assumed. `truncated` was hardcoded false, so a resuming agent was
@@ -6828,7 +6851,7 @@ impl Store {
         truncated |= keep_newest(&mut checkpoints, CHECKPOINTS);
         truncated |= keep_newest(&mut handoffs, HANDOFFS);
         truncated |= keep_newest(&mut sitreps, SITREPS);
-        Ok(ContextPacket {
+        let packet = ContextPacket {
             task,
             ancestors: self.ancestors(id)?,
             dependencies: self.dependencies(id)?,
@@ -6847,7 +6870,9 @@ impl Store {
             sprint: self.context_sprint(id)?,
             generated_at: now_ms(),
             truncated,
-        })
+        };
+        snapshot.commit()?;
+        Ok(packet)
     }
 
     /// The sprint summary a context packet carries: id, status, version,
@@ -6876,6 +6901,32 @@ impl Store {
             title: sprint.title,
             goal: crate::model::sprint_goal(sprint.body.as_deref()).map(str::to_owned),
         }))
+    }
+
+    /// Read the task's authorized rule selectors in one board snapshot.
+    /// Claim and handoff call this after their mutation commits.
+    pub fn task_rule_selectors(&self, task_id: &str) -> Result<(HashSet<String>, Option<String>)> {
+        self.authz.check_read(&[])?;
+        let snapshot = self.connection.unchecked_transaction()?;
+        let tags = task_tags(&snapshot, task_id)?;
+        self.authz.check_read(&tags)?;
+        let sprint: Option<String> = snapshot
+            .query_row(
+                "SELECT ts.sprint_id FROM tasks t \
+                 LEFT JOIN task_sprints ts ON ts.task_id=t.id WHERE t.id=?",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("task {task_id} not found"))?;
+        snapshot.commit()?;
+        Ok((tags.into_iter().collect(), sprint))
+    }
+
+    /// Prove a sprint exists through the caller-authorized read-only board.
+    pub fn require_rule_sprint(&self, id: &str) -> Result<()> {
+        self.authz.check_read(&[])?;
+        require_sprint_on(&self.connection, id).map(|_| ())
     }
 
     /// SQLite's own integrity verdict. Board scope: the strings are page and
@@ -7461,13 +7512,7 @@ impl Store {
         self.authz.check_write(&[], &[])?;
         let now = now_ms();
         let id = match input.id {
-            Some(value) => {
-                let value = subscription_identifier(&value, "sprint id", 64)?;
-                if value.strip_prefix("sp-").is_none_or(str::is_empty) {
-                    bail!("sprint id must start with sp- and include a suffix");
-                }
-                value
-            }
+            Some(value) => sprint_id(&value)?,
             None => format!("sp-{}", &Uuid::new_v4().simple().to_string()[..8]),
         };
         transaction.execute(
@@ -8205,6 +8250,300 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    std::thread_local! {
+        static CONTEXT_PACKET_AFTER_TASK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_context_packet_after_task_hook() {
+        let hook = CONTEXT_PACKET_AFTER_TASK_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    struct ContextPacketAfterTaskHookReset;
+
+    impl Drop for ContextPacketAfterTaskHookReset {
+        fn drop(&mut self) {
+            let hook = CONTEXT_PACKET_AFTER_TASK_HOOK.with(|slot| slot.borrow_mut().take());
+            drop(hook);
+        }
+    }
+
+    #[test]
+    fn readonly_open_denies_before_observing_board_bytes() {
+        use crate::policy::{Capability, ScopeTuple};
+
+        let corrupt_path = board_db_path("readonly-open-authz-before-bytes");
+        let parent = corrupt_path.parent().unwrap().to_path_buf();
+        let absent_path = parent.join("absent.db");
+        fs::write(&corrupt_path, vec![0xA5_u8; 4096]).unwrap();
+        assert!(!absent_path.exists());
+
+        let board_id = Uuid::new_v4().to_string();
+        let denied_authz = || {
+            AuthzContext::new(
+                crate::routing::Enforcement::Managed,
+                crate::policy::authority([]),
+                board_id.to_owned(),
+            )
+        };
+
+        assert_denied(
+            Store::open_readonly_with_authz(&corrupt_path, denied_authz()).map(|_| ()),
+            "unauthorized corrupt board",
+        );
+        assert_denied(
+            Store::open_readonly_with_authz(&absent_path, denied_authz()).map(|_| ()),
+            "unauthorized absent board",
+        );
+        assert!(!absent_path.exists());
+
+        let allowed_authz = AuthzContext::new(
+            crate::routing::Enforcement::Managed,
+            crate::policy::authority([(
+                ScopeTuple::Board {
+                    board_id: board_id.clone(),
+                },
+                Capability::Read,
+            )]),
+            board_id.to_owned(),
+        );
+        let error = Store::open_readonly_with_authz(&corrupt_path, allowed_authz)
+            .err()
+            .expect("authorized opening of corrupt board must report an actual error");
+        assert!(
+            !error.to_string().contains("denied or not found"),
+            "authorized corrupt-board error must not be an authorization denial: {error}"
+        );
+        drop(error);
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn context_packet_task_and_sprint_share_one_read_snapshot() {
+        let path = board_db_path("context-packet-task-sprint-snapshot");
+        let parent = path.parent().unwrap().to_path_buf();
+        let mut store = Store::open(&path).unwrap();
+        let actor = "codex@driver";
+        store.initialize("snapshot board", actor).unwrap();
+
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        store.add_tag("old", None, Some(actor)).unwrap();
+        store.add_tag("new", None, Some(actor)).unwrap();
+        let task_id = Uuid::new_v4().to_string();
+        store
+            .add_task(task_input(
+                &task_id,
+                "snapshot task",
+                vec!["old".to_owned()],
+                vec![],
+            ))
+            .unwrap();
+
+        for sprint_id in ["sp-old", "sp-new"] {
+            store
+                .create_sprint(NewSprint {
+                    id: Some(sprint_id.to_owned()),
+                    title: sprint_id.to_owned(),
+                    body: None,
+                    target_version: "1.0.0".to_owned(),
+                    scheduled_start: 1_800_000_000,
+                    scheduled_end: 1_800_086_400,
+                    actor: actor.to_owned(),
+                })
+                .unwrap();
+        }
+        store.attach_sprint(&task_id, "sp-old", actor).unwrap();
+
+        let _hook_reset = ContextPacketAfterTaskHookReset;
+        let writer_path = path.clone();
+        let writer_task_id = task_id.clone();
+        CONTEXT_PACKET_AFTER_TASK_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "unexpected preexisting thread-local hook");
+            *slot = Some(Box::new(move || {
+                let mut writer = Connection::open(&writer_path).unwrap();
+                let transaction = writer.transaction().unwrap();
+                assert_eq!(
+                    transaction
+                        .execute(
+                            "UPDATE task_tags SET tag = ?1 WHERE task_id = ?2 AND tag = ?3",
+                            params!["new", &writer_task_id, "old"],
+                        )
+                        .unwrap(),
+                    1,
+                    "writer must replace exactly the old tag"
+                );
+                assert_eq!(
+                    transaction
+                        .execute(
+                            "UPDATE task_sprints SET sprint_id = ?1 \
+                             WHERE task_id = ?2 AND sprint_id = ?3",
+                            params!["sp-new", &writer_task_id, "sp-old"],
+                        )
+                        .unwrap(),
+                    1,
+                    "writer must replace exactly the old sprint attachment"
+                );
+                transaction.commit().unwrap();
+            }));
+        });
+
+        // No external transaction: context_packet must establish its own snapshot.
+        let packet = store.context_packet(&task_id).unwrap();
+        CONTEXT_PACKET_AFTER_TASK_HOOK.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "context_packet did not consume the hook"
+            );
+        });
+        assert_eq!(packet.task.tags, vec!["old".to_owned()]);
+        assert_eq!(
+            packet
+                .sprint
+                .as_ref()
+                .map(|sprint| sprint.sprint_id.as_str()),
+            Some("sp-old"),
+            "task tags and sprint must come from the same pre-write snapshot"
+        );
+
+        let (tags, sprint_id) = store.task_rule_selectors(&task_id).unwrap();
+        let expected_tags: HashSet<String> = ["new".to_owned()].into_iter().collect();
+        assert_eq!(tags, expected_tags);
+        assert_eq!(sprint_id.as_deref(), Some("sp-new"));
+
+        drop(packet);
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn require_restore_write_never_swallows_authority_denial() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement::Managed;
+
+        let path = board_db_path("restore-preflight");
+        let mut store = Store::open(&path).unwrap();
+        store.initialize("RESTORE-PREFLIGHT", "test").unwrap();
+        store.add_tag("private", None, Some("test")).unwrap();
+        store
+            .add_task(task_input(
+                "t-restore",
+                "Private task",
+                vec!["private".to_owned()],
+                vec![],
+            ))
+            .unwrap();
+
+        let parent = path.parent().unwrap();
+        let corrupt = parent.join("corrupt.db");
+        fs::write(&corrupt, b"not a database").unwrap();
+        let board_id = Uuid::new_v4().to_string();
+
+        // A valid database must not hide a denial from the authorization constructor.
+        assert_denied(
+            Store::require_restore_write_with_authz(
+                &path,
+                AuthzContext::new(Managed, authority([]), board_id.clone()),
+            ),
+            "valid database with no grants",
+        );
+
+        // Corruption is not a reason to bypass the base WRITE requirement.
+        assert_denied(
+            Store::require_restore_write_with_authz(
+                &corrupt,
+                AuthzContext::new(
+                    Managed,
+                    authority([(
+                        ScopeTuple::Board {
+                            board_id: board_id.clone(),
+                        },
+                        Capability::Read,
+                    )]),
+                    board_id.clone(),
+                ),
+            ),
+            "corrupt database with board READ only",
+        );
+
+        // An openable board also requires write authority over its tagged content.
+        assert_denied(
+            Store::require_restore_write_with_authz(
+                &path,
+                AuthzContext::new(
+                    Managed,
+                    authority([(
+                        ScopeTuple::Board {
+                            board_id: board_id.clone(),
+                        },
+                        Capability::Write,
+                    )]),
+                    board_id.clone(),
+                ),
+            ),
+            "valid tagged database with board WRITE but no tag WRITE",
+        );
+
+        Store::require_restore_write_with_authz(
+            &path,
+            AuthzContext::new(
+                Managed,
+                authority([
+                    (
+                        ScopeTuple::Board {
+                            board_id: board_id.clone(),
+                        },
+                        Capability::Write,
+                    ),
+                    (
+                        ScopeTuple::BoardWildcard {
+                            board_id: board_id.clone(),
+                        },
+                        Capability::Write,
+                    ),
+                ]),
+                board_id.clone(),
+            ),
+        )
+        .unwrap();
+
+        // Full write authority permits recovery preflight despite corrupt bytes.
+        Store::require_restore_write_with_authz(
+            &corrupt,
+            AuthzContext::new(
+                Managed,
+                authority([
+                    (
+                        ScopeTuple::Board {
+                            board_id: board_id.clone(),
+                        },
+                        Capability::Write,
+                    ),
+                    (
+                        ScopeTuple::BoardWildcard {
+                            board_id: board_id.clone(),
+                        },
+                        Capability::Write,
+                    ),
+                ]),
+                board_id,
+            ),
+        )
+        .unwrap();
+
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     fn query_plan_details<P: rusqlite::Params>(
         connection: &Connection,

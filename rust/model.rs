@@ -857,6 +857,23 @@ pub const ATTENTION_OUTCOMES: [&str; 4] = ["approve", "reject", "defer", "other"
 /// which is why the rewrite verbs refuse them by name.
 pub const SPRINT_STATUSES: [&str; 4] = ["planned", "current", "closed", "abandoned"];
 
+/// Validate the durable sprint identity shared by sprint rows and rule scopes.
+pub fn sprint_id(value: &str) -> Result<String> {
+    if value.len() > 64
+        || value
+            .strip_prefix("sp-")
+            .is_none_or(|suffix| suffix.is_empty())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "sprint id must start with sp-, include a suffix, be at most 64 ASCII characters, and contain only letters, digits, dot, underscore, or hyphen"
+        );
+    }
+    Ok(value.to_owned())
+}
+
 /// The reserved key of the free-text answer every item offers. Never stored
 /// in `choices`, and refused as an authored key (ADR-042 §4 refusal 9).
 pub const CUSTOM_CHOICE: &str = "custom";

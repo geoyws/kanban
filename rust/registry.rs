@@ -7,7 +7,7 @@ use crate::db::{
 use crate::model::{
     Event, ProjectRecord, Rule, RuleMigrationReport, RuleSummary, RuleTransferBundle,
     RuleTransferItem, RuleTransferReport, UnreachableRoot, WorkspaceAdoptReceipt, WorkspaceRecord,
-    board_id_from_path,
+    board_id_from_path, sprint_id,
 };
 use crate::store::{Store, event, validate_tag_name};
 use anyhow::{Context, Result, bail};
@@ -278,7 +278,37 @@ fn validate_active_rule_selectors(
             error.active_board_count
         );
     }
-    Ok(())
+    let sprint_tags = tags
+        .iter()
+        .filter(|tag| tag.starts_with("SPRINT"))
+        .collect::<Vec<_>>();
+    if sprint_tags.is_empty() {
+        return Ok(());
+    }
+    if sprint_tags.len() != 1 {
+        bail!("rule {rule_id} must have exactly one SPRINT:sp-ID selector");
+    }
+    let sprint = sprint_tags[0]
+        .strip_prefix("SPRINT:")
+        .context("sprint rule selector must have shape SPRINT:sp-ID")?;
+    sprint_id(sprint)?;
+    let only = tags
+        .iter()
+        .filter_map(|tag| tag.strip_prefix("ONLY:"))
+        .collect::<Vec<_>>();
+    if only.len() != 1
+        || tags
+            .iter()
+            .any(|tag| tag == "ALL" || tag.starts_with("EXCEPT:"))
+    {
+        bail!("sprint-scoped rule {rule_id} requires exactly one ONLY:active-board selector");
+    }
+    let board_path: String = connection.query_row(
+        "SELECT board_path FROM boards WHERE name=? AND archived=0",
+        [only[0]],
+        |row| row.get(0),
+    )?;
+    Store::open_readonly_as_caller(Path::new(&board_path))?.require_rule_sprint(sprint)
 }
 
 fn selector_tags_apply(tags: &[String], board_name: Option<&str>) -> bool {
@@ -295,17 +325,43 @@ fn selector_tags_apply(tags: &[String], board_name: Option<&str>) -> bool {
     })
 }
 
-fn is_selector_tag(tag: &str) -> bool {
+fn is_board_selector_tag(tag: &str) -> bool {
     tag == "ALL" || tag.starts_with("ONLY:") || tag.starts_with("EXCEPT:")
+}
+
+fn is_selector_tag(tag: &str) -> bool {
+    is_board_selector_tag(tag) || tag.starts_with("SPRINT")
 }
 
 fn rule_tags_apply(
     tags: &[String],
     board_name: Option<&str>,
     task_tags: Option<&HashSet<String>>,
+    task_sprint: Option<&str>,
 ) -> bool {
     if !selector_tags_apply(tags, board_name) {
         return false;
+    }
+    let sprint_tags = tags
+        .iter()
+        .filter(|tag| tag.starts_with("SPRINT"))
+        .collect::<Vec<_>>();
+    if !sprint_tags.is_empty() {
+        if sprint_tags.len() != 1 {
+            return false;
+        }
+        let Some(sprint) = sprint_tags[0].strip_prefix("SPRINT:") else {
+            return false;
+        };
+        if sprint_id(sprint).is_err()
+            || task_sprint != Some(sprint)
+            || tags.iter().filter(|tag| tag.starts_with("ONLY:")).count() != 1
+            || tags
+                .iter()
+                .any(|tag| tag == "ALL" || tag.starts_with("EXCEPT:"))
+        {
+            return false;
+        }
     }
     let subsystems = tags.iter().filter(|tag| !is_selector_tag(tag));
     let mut saw_subsystem = false;
@@ -3402,6 +3458,7 @@ impl Registry {
         let exported_at = now_ms();
         let mut rules = Vec::new();
         for rule in self.rules(false)? {
+            validate_active_rule_selectors(&self.connection, &rule.id, &rule.tags)?;
             deny_secret_material(&rule.body)?;
             if rule
                 .tags
@@ -3839,9 +3896,17 @@ impl Registry {
         &self,
         boards: &[String],
         except_boards: &[String],
+        sprint: Option<&str>,
         subsystem_tags: &[String],
     ) -> Result<Vec<String>> {
         let mut tags = self.canonical_board_tags(boards, except_boards)?;
+        if let Some(sprint) = sprint {
+            sprint_id(sprint)?;
+            if tags.len() != 1 || !tags[0].starts_with("ONLY:") {
+                bail!("--sprint requires exactly one named --board target");
+            }
+            tags.push(format!("SPRINT:{sprint}"));
+        }
         tags.extend(self.canonical_rule_task_tags(subsystem_tags)?);
         Ok(tags)
     }
@@ -3936,12 +4001,13 @@ impl Registry {
         &self,
         board_name: Option<&str>,
         task_tags: Option<&HashSet<String>>,
+        task_sprint: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<RuleSummary>> {
         Ok(self
             .rule_summaries(include_archived)?
             .into_iter()
-            .filter(|rule| rule_tags_apply(&rule.tags, board_name, task_tags))
+            .filter(|rule| rule_tags_apply(&rule.tags, board_name, task_tags, task_sprint))
             .collect())
     }
 
@@ -3949,12 +4015,13 @@ impl Registry {
         &self,
         board_name: Option<&str>,
         task_tags: Option<&HashSet<String>>,
+        task_sprint: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<Rule>> {
         Ok(self
             .rules(include_archived)?
             .into_iter()
-            .filter(|rule| rule_tags_apply(&rule.tags, board_name, task_tags))
+            .filter(|rule| rule_tags_apply(&rule.tags, board_name, task_tags, task_sprint))
             .collect())
     }
 
@@ -3982,12 +4049,14 @@ impl Registry {
         id: &str,
         body: Option<&str>,
         selector_tags: Option<&[String]>,
+        sprint: Option<Option<&str>>,
         subsystem_tags: Option<&[String]>,
         actor: &str,
     ) -> Result<Rule> {
-        if body.is_none() && selector_tags.is_none() && subsystem_tags.is_none() {
+        if body.is_none() && selector_tags.is_none() && sprint.is_none() && subsystem_tags.is_none()
+        {
             bail!(
-                "rule update requires --body/--body-file, --board/--except-board, --tag, or --clear-tags"
+                "rule update requires --body/--body-file, --board/--except-board, --sprint/--clear-sprint, --tag, or --clear-tags"
             );
         }
         if let Some(body) = body {
@@ -4007,7 +4076,13 @@ impl Registry {
         let previous_selectors = previous
             .tags
             .iter()
-            .filter(|tag| is_selector_tag(tag))
+            .filter(|tag| is_board_selector_tag(tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous_sprints = previous
+            .tags
+            .iter()
+            .filter(|tag| tag.starts_with("SPRINT"))
             .cloned()
             .collect::<Vec<_>>();
         let previous_subsystems = previous
@@ -4017,6 +4092,14 @@ impl Registry {
             .cloned()
             .collect::<Vec<_>>();
         let mut tags = selector_tags.unwrap_or(&previous_selectors).to_vec();
+        match sprint {
+            Some(Some(sprint)) => {
+                sprint_id(sprint)?;
+                tags.push(format!("SPRINT:{sprint}"));
+            }
+            Some(None) => {}
+            None => tags.extend(previous_sprints),
+        }
         tags.extend(
             subsystem_tags
                 .as_deref()
@@ -4044,6 +4127,9 @@ impl Registry {
         }
         if selector_tags.is_some() {
             changed.push("selectorTags");
+        }
+        if sprint.is_some() {
+            changed.push("sprint");
         }
         if subsystem_tags.is_some() {
             changed.push("subsystemTags");
@@ -4729,14 +4815,47 @@ mod tests {
         let tags = vec!["ONLY:ONE".to_owned(), "infra".to_owned()];
         let infra = HashSet::from(["infra".to_owned()]);
         let docs = HashSet::from(["docs".to_owned()]);
-        assert!(rule_tags_apply(&tags, Some("ONE"), Some(&infra)));
-        assert!(!rule_tags_apply(&tags, Some("TWO"), Some(&infra)));
-        assert!(!rule_tags_apply(&tags, Some("ONE"), Some(&docs)));
-        assert!(!rule_tags_apply(&tags, Some("ONE"), None));
+        assert!(rule_tags_apply(&tags, Some("ONE"), Some(&infra), None));
+        assert!(!rule_tags_apply(&tags, Some("TWO"), Some(&infra), None));
+        assert!(!rule_tags_apply(&tags, Some("ONE"), Some(&docs), None));
+        assert!(!rule_tags_apply(&tags, Some("ONE"), None, None));
 
         let general = vec!["ALL".to_owned(), "EXCEPT:TWO".to_owned()];
-        assert!(rule_tags_apply(&general, Some("ONE"), None));
-        assert!(!rule_tags_apply(&general, Some("TWO"), None));
+        assert!(rule_tags_apply(&general, Some("ONE"), None, None));
+        assert!(!rule_tags_apply(&general, Some("TWO"), None, None));
+
+        let scoped = vec!["ONLY:ONE".to_owned(), "SPRINT:sp-one".to_owned()];
+        assert!(rule_tags_apply(&scoped, Some("ONE"), None, Some("sp-one")));
+        assert!(!rule_tags_apply(&scoped, Some("ONE"), None, Some("sp-two")));
+        assert!(!rule_tags_apply(&scoped, Some("ONE"), None, None));
+        assert!(!rule_tags_apply(
+            &["ALL".to_owned(), "SPRINT:sp-one".to_owned()],
+            Some("ONE"),
+            None,
+            Some("sp-one"),
+        ));
+        assert!(!rule_tags_apply(
+            &["ONLY:ONE".to_owned(), "SPRINT:bad".to_owned()],
+            Some("ONE"),
+            None,
+            Some("bad"),
+        ));
+        assert!(!rule_tags_apply(
+            &["ONLY:ONE".to_owned(), "SPRINTsp-one".to_owned()],
+            Some("ONE"),
+            None,
+            Some("sp-one"),
+        ));
+        assert!(!rule_tags_apply(
+            &[
+                "ONLY:ONE".to_owned(),
+                "SPRINT:sp-one".to_owned(),
+                "SPRINT:sp-two".to_owned(),
+            ],
+            Some("ONE"),
+            None,
+            Some("sp-one"),
+        ));
     }
 
     #[test]

@@ -14432,6 +14432,10 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
         rule_add["inputSchema"]["properties"]["board"]["type"],
         "array"
     );
+    assert_eq!(
+        rule_add["inputSchema"]["properties"]["sprint"]["type"],
+        "string"
+    );
     // A list-valued flag must be typed as an array, or an agent can only ever
     // pass one dependency and the rest are dropped without a word.
     let add = tools.iter().find(|t| t["name"] == "task_add").unwrap();
@@ -14468,6 +14472,49 @@ fn the_mcp_server_answers_over_stdio_and_runs_the_real_cli() {
         "jsonrpc": "2.0", "id": 31, "method": "tools/call",
         "params": { "name": "search", "arguments": { "query": "Over the wire" } }
     }));
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "MCP release",
+            "--id",
+            "sp-mcp",
+            "--target-version",
+            "1.0.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "update", "t-wire", "--sprint", "sp-mcp", "--as", "geoyws", "--json",
+        ],
+    );
+    let sprint_rule = session.ask(json!({
+        "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+        "params": { "name": "rule_add", "arguments": {
+            "body": "MCP sprint rule.", "board": ["MCP"], "sprint": "sp-mcp", "as": "geoyws"
+        } }
+    }));
+    assert_eq!(sprint_rule["result"]["isError"], false, "{sprint_rule}");
+    let sprint_context = fixture.ok_json(&fixture.main, &["context", "t-wire", "--json"]);
+    assert!(
+        sprint_context["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["headline"] == "MCP sprint rule."
+                    && item["tags"] == json!(["ONLY:MCP", "SPRINT:sp-mcp"])
+            })
+    );
     assert_eq!(found["result"]["isError"], false);
     assert!(
         found["result"]["content"][0]["text"]
@@ -31818,6 +31865,312 @@ fn rule_selector_tags_target_named_boards_or_all_except_named_boards() {
             "accepted {args:?}"
         );
     }
+}
+
+#[test]
+fn sprint_scoped_rules_match_authoritative_task_sprint_and_update_atomically() {
+    let fixture = Fixture::new("sprint-scoped-rules");
+    let second = fixture.root.join("second");
+    fs::create_dir_all(&second).unwrap();
+    fixture.ok_json(&fixture.main, &["init", "--name", "ONE", "--json"]);
+    fixture.ok_json(&second, &["init", "--name", "TWO", "--json"]);
+    for cwd in [&fixture.main, &second] {
+        fixture.ok_json(
+            cwd,
+            &[
+                "sprint",
+                "new",
+                "Scoped sprint",
+                "--id",
+                "sp-shared",
+                "--target-version",
+                "1.0.0",
+                "--start",
+                "0",
+                "--end",
+                "4102444800000",
+                "--as",
+                "operator",
+                "--json",
+            ],
+        );
+    }
+    for cwd in [&fixture.main, &second] {
+        fixture.ok_json(cwd, &["tag", "add", "infra", "--json"]);
+    }
+    let scoped = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Sprint rule.",
+            "--board",
+            "ONE",
+            "--sprint",
+            "sp-shared",
+            "--tag",
+            "infra",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        scoped["tags"],
+        json!(["ONLY:ONE", "SPRINT:sp-shared", "infra"])
+    );
+    let rule_id = scoped["id"].as_str().unwrap();
+
+    for (cwd, id, sprint, tag, expected) in [
+        (&fixture.main, "t-match", true, true, true),
+        (&fixture.main, "t-other", false, true, false),
+        (&fixture.main, "t-no-tag", true, false, false),
+        (&second, "t-other-board", true, true, false),
+    ] {
+        let mut args = vec!["task", "add", id, "--id", id];
+        if sprint {
+            args.extend(["--sprint", "sp-shared"]);
+        }
+        if tag {
+            args.extend(["--tag", "infra"]);
+        }
+        args.push("--json");
+        fixture.ok_json(cwd, &args);
+        let packet = fixture.ok_json(cwd, &["context", id, "--json"]);
+        assert_eq!(
+            packet["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["id"] == rule_id),
+            expected,
+            "wrong applicability for {id}",
+        );
+    }
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-match", "--as", "worker", "--json"],
+    );
+    assert!(
+        claim["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == rule_id)
+    );
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-match",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "worker",
+            "--summary",
+            "continue",
+            "--intent",
+            "finish",
+            "--next-action",
+            "resume",
+            "--reason",
+            "manual",
+            "--json",
+        ],
+    );
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            handoff["id"].as_str().unwrap(),
+            "--as",
+            "next",
+            "--json",
+        ],
+    );
+    assert!(
+        accepted["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["id"] == rule_id)
+    );
+
+    let retained = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            rule_id,
+            "--body",
+            "Retained scope.",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(retained["tags"], scoped["tags"]);
+    let before_invalid = fixture.ok_json(&fixture.main, &["rule", "show", rule_id, "--json"]);
+    let invalid = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            rule_id,
+            "--sprint",
+            "sp-missing",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("does not exist on this board"));
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["rule", "show", rule_id, "--json"]),
+        before_invalid
+    );
+
+    let cleared = fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            rule_id,
+            "--clear-sprint",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(cleared["tags"], json!(["ONLY:ONE", "infra"]));
+    let conflict = fixture.run(
+        &fixture.main,
+        &[
+            "rule",
+            "update",
+            rule_id,
+            "--sprint",
+            "sp-shared",
+            "--clear-sprint",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("mutually exclusive"));
+}
+#[test]
+fn sprint_scoped_rule_transfer_requires_destination_sprint_and_round_trips() {
+    let source = Fixture::new("sprint-rule-transfer-source");
+    source.ok_json(&source.main, &["init", "--name", "ONE", "--json"]);
+    source.ok_json(
+        &source.main,
+        &[
+            "sprint",
+            "new",
+            "Release",
+            "--id",
+            "sp-release",
+            "--target-version",
+            "1.0.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "add",
+            "Release-only.",
+            "--board",
+            "ONE",
+            "--sprint",
+            "sp-release",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let bundle = source.root.join("sprint-rules.json");
+    source.ok_json(
+        &source.main,
+        &[
+            "rule",
+            "export",
+            "--board",
+            "ONE",
+            "--as",
+            "operator",
+            "--output",
+            bundle.to_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    let destination = Fixture::new("sprint-rule-transfer-destination");
+    destination.ok_json(&destination.main, &["init", "--name", "ONE", "--json"]);
+    let missing = destination.run(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle.to_str().unwrap(),
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("sprint sp-release does not exist"));
+    assert!(
+        destination
+            .ok_json(&destination.main, &["rule", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    destination.ok_json(
+        &destination.main,
+        &[
+            "sprint",
+            "new",
+            "Release",
+            "--id",
+            "sp-release",
+            "--target-version",
+            "1.0.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    let report = destination.ok_json(
+        &destination.main,
+        &[
+            "rule",
+            "import",
+            bundle.to_str().unwrap(),
+            "--as",
+            "operator",
+            "--json",
+        ],
+    );
+    assert_eq!(report["importedRules"], 1);
+    let rules = destination.ok_json(&destination.main, &["rule", "list", "--full", "--json"]);
+    assert_eq!(rules[0]["tags"], json!(["ONLY:ONE", "SPRINT:sp-release"]));
 }
 
 #[test]

@@ -3153,7 +3153,7 @@ fn lanes() -> Result<String> {
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None, None, false)?;
-    let rules = Registry::open()?.applicable_rules(Some(&project.name), None, false)?;
+    let rules = Registry::open()?.applicable_rules(Some(&project.name), None, None, false)?;
     let mut html = format!(
         "<h1>{0}</h1><p><a href=\"/sprints/{1}\" data-board-sprints-link>Sprints for {0}</a></p>",
         escape(&project.name),
