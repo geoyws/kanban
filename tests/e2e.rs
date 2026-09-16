@@ -24337,6 +24337,67 @@ fn http_post(port: u16, path: &str, origin: &str, body: &[u8]) -> (u16, String) 
     (status, text)
 }
 
+/// A decision posted through nginx answers at once and is recorded.
+///
+/// The kb.geoy.ws vhost carries `proxy_set_header Connection "upgrade"` so
+/// the live websocket can pass through, and nginx sends that header on every
+/// proxied request, form posts included, with an empty `Upgrade`. tiny_http
+/// treats `Connection: upgrade` as "hand the whole socket to the handler",
+/// so a body read that waited for end-of-stream waited for a close the proxy
+/// never sends: every click at kb.geoy.ws answered with a 504 after
+/// seventy-five seconds (access log, 2026-09-11), which the operator saw as
+/// no feedback at all. The proxy never closes early, so this test never
+/// closes either: the reply must arrive with the socket held open.
+#[test]
+fn a_decision_posted_with_nginx_upgrade_headers_answers_at_once() {
+    use std::io::Write as _;
+    use std::net::TcpStream;
+    let fixture = Fixture::new("serve-proxied-post");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PROXIED", "--json"]);
+    let raised = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Ship the release tonight?",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "approval",
+            "--json",
+        ],
+    );
+    let id = raised["id"].as_str().unwrap();
+    let server = spawn_server(&fixture);
+    let port = server.port;
+    let body = b"decision=approve&reply=Yes%2C+tonight%2E";
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /attention/PROXIED/{id}/reply HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: upgrade\r\nUpgrade: \r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+    let started = Instant::now();
+    let head = read_http_head(&mut stream);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the reply waited on the proxy closing the socket: {head}"
+    );
+    assert!(head.starts_with("HTTP/1.1 303"), "{head}");
+    assert!(head.contains("Location: /?replied="), "{head}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(resolved[0]["id"], id);
+    assert_eq!(resolved[0]["decision"]["outcome"], "approve");
+}
+
 /// One card's markup, from its `<article>` to its close.
 ///
 /// Slicing the page rather than searching all of it is the point: an

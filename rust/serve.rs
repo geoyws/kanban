@@ -48,7 +48,7 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::ffi::CString;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -602,17 +602,15 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
     if length == 0 || length > MAX_REPLY_BYTES {
         return Ok(WebResponse::Html(400, choice_required()));
     }
-    let mut bytes = Vec::with_capacity(length);
-    request
-        .as_reader()
-        .take((MAX_REPLY_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_REPLY_BYTES {
-        return Ok(WebResponse::Html(
-            400,
-            page("Reply too long", "<h1>Reply too long</h1>"),
-        ));
-    }
+    // Read exactly the declared length, never to end-of-stream. nginx sends
+    // `Connection: upgrade` on every proxied request when a location carries
+    // websocket headers, and tiny_http then hands back the whole socket as
+    // the body reader; a read-to-end would wait for a close the proxy never
+    // sends, and the browser saw a 504 seventy-five seconds after a click
+    // (kb.geoy.ws access log, 2026-09-11). The bound above already refuses
+    // anything past `MAX_REPLY_BYTES`.
+    let mut bytes = vec![0; length];
+    request.as_reader().read_exact(&mut bytes)?;
     let Ok(body) = std::str::from_utf8(&bytes) else {
         return Ok(WebResponse::Html(
             400,
