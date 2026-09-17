@@ -1507,6 +1507,11 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
     let mut html = String::from(
         "<div class=heading><h1>Needs you</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
     );
+    html.push_str(
+        "<p class=explain>Each card is one question an agent is waiting on. Pick an answer \
+         and it is recorded on the board at once; the agent continues from there. Undo any \
+         decision from Recent decisions.</p>",
+    );
     if let Some(id) = replied {
         html.push_str(&format!(
             "<p class=success>Decision recorded for <code>{}</code>.</p>",
@@ -1543,11 +1548,13 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
             .expect("project store map built from same iterator");
         html.push_str(&decision_card(project, store, item));
     }
+    // The hint bar sits at the bottom of the viewport rather than at the end
+    // of a list that is 133 cards long: a keyboard map the reader has to
+    // scroll to the end of to find is a keyboard map nobody reads.
     html.push_str(
-        "<p class=keys>Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on, \
-         <kbd>c</kbd> to write a reply, <kbd>u</kbd> to bring back the last decision. \
-         <kbd>Esc</kbd> clears a verdict you picked. Decided items move to \
-         <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a>.</p>",
+        "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
+         <kbd>u</kbd> undo last · <kbd>Esc</kbd> clear · Decided items move to \
+         <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a></p>",
     );
     Ok(page("Needs you", &html))
 }
@@ -1699,18 +1706,37 @@ fn decision_words(item: &Attention) -> String {
 /// A row that authored no card is this same card with the default pair and
 /// its first body line as the question, not a second template.
 ///
+/// One line sits ABOVE the question: which board asked, what kind of ask it
+/// is, who is waiting and for how long (George, 2026-09-17: "I don't know
+/// what everything is doing"). It is orientation rather than a decision, so
+/// it is small, dim and carries no priority pill — that stays in the trailing
+/// meta, where it cannot be mistaken for an answer.
+///
+/// The free-text answer is FOLDED. It is the rarest path and it was the
+/// loudest thing under the choices: a verdict picker, a submit, a release and
+/// a hint standing open on every card in a list of 133, all of it asking to
+/// be read before the one-click answer above it could be trusted.
+///
 /// One reply field serves the whole card, and it sits with the choices rather
 /// than inside the free-text answer: whatever is written in it rides with
 /// whichever choice is clicked, and the free-text answer is that same field
-/// plus a verdict. Two fields would be two drafts to lose.
+/// plus a verdict. Two fields would be two drafts to lose. That is why the
+/// field stays OUTSIDE the fold while the verdict picker goes into it.
 fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     let id = escape(&item.id);
     let id_url = escape(&url_encode(&item.id));
     let project_url = escape(&url_encode(project));
     let mut html = format!(
         "<article class=item tabindex=0 data-item=\"{id}\" data-project=\"{project}\" \
-         aria-labelledby=\"q-{id}\"><h2 id=\"q-{id}\">{question}</h2>",
+         aria-labelledby=\"q-{id}\">\
+         <p class=eyebrow>\
+         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a> \
+         · <span class=\"kind kind-{kind}\">{kind}</span> · asked by {who} · waiting {age}</p>\
+         <h2 id=\"q-{id}\">{question}</h2>",
         project = escape(project),
+        kind = escape(&item.kind),
+        who = escape(&item.raised_by),
+        age = age(item.created_at),
         question = escape(&card_question(item)),
     );
     if let Some(context) = &item.context {
@@ -1731,7 +1757,8 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         );
         if choice.recommended {
             recommended = format!(
-                "<fieldset class=recommended><legend>recommended</legend>{rendered}</fieldset>"
+                "<fieldset class=recommended><legend>Recommended - press 1</legend>\
+                 {rendered}</fieldset>"
             );
         } else {
             alternatives.push_str(&format!("<div class=alternative>{rendered}</div>"));
@@ -1745,19 +1772,20 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         html.push_str(&format!("<div class=alternatives>{alternatives}</div>"));
     }
     html.push_str(&format!(
-        "<div class=reply><label for=\"answer-{id_url}\">Your reply</label>\
+        "<div class=reply><label for=\"answer-{id_url}\">Add a note (optional)</label>\
          <textarea id=\"answer-{id_url}\" name=reply maxlength={max} \
          aria-describedby=\"reply-hint-{id_url}\"></textarea>\
-         <p class=hint id=\"reply-hint-{id_url}\">Sent with whichever choice you click; \
-         required for your own answer.</p></div>\
-         <div class=custom><fieldset class=outcomes>\
-         <legend>Or answer in your own words, recorded as</legend><div class=picks>{picks}</div>\
+         <p class=hint id=\"reply-hint-{id_url}\">Sent with whichever answer you pick. \
+         Required when you answer in your own words.</p></div>\
+         <details class=custom data-custom><summary>Answer in my own words</summary>\
+         <fieldset class=outcomes>\
+         <legend>recorded as</legend><div class=picks>{picks}</div>\
          </fieldset>\
          <div class=actions>\
          <button type=submit class=record name=decision value=custom>Record this answer</button>\
          <button type=button class=clear data-clear hidden>Clear verdict</button>\
          <p class=hint data-hint>Pick a verdict and write your reply above.</p>\
-         </div></div></form>",
+         </div></details></form>",
         picks = ATTENTION_OUTCOMES
             .iter()
             .map(|outcome| format!(
@@ -1772,14 +1800,8 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         markdown(&item.body)
     ));
     html.push_str(&format!(
-        "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
-         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a> \
-         · raised by {who} · waiting {age}{about}{tags}</p></article>",
-        kind = escape(&item.kind),
+        "<p class=meta>{priority}{about}{tags}</p></article>",
         priority = priority_badge(item.priority, item.priority_level.as_deref()),
-        project = escape(project),
-        who = escape(&item.raised_by),
-        age = age(item.created_at),
         about = item
             .task_id
             .as_ref()
@@ -3616,14 +3638,62 @@ let liveConnects = 0;
 // The card posts its own form, is replaced in place by its receipt, and the
 // open count drops by one.
 const CHOICE_KEYS = ['1', '2', '3', '4'];
-// An answer in progress anywhere on the page: words typed into a reply, or a
-// verdict picked for a free-text answer. Both halves are lost the moment the
-// projection is swapped -- the server renders every card empty, with no
-// verdict checked -- so both halves hold the swap. A picked verdict with
-// nothing typed yet is an answer being written, not an idle page.
+// How long a decision may be in flight before the button says so a second
+// time. Chosen to be longer than any answer that is actually going to land:
+// a local board answers in milliseconds and the proxy in tens of them, so
+// eight seconds means something is wrong rather than something is slow.
+const STILL_SENDING_AFTER = 8000;
+// A decision, or an undo, that has been posted and not yet answered. The
+// card it is on must survive a projection swap, so it counts as an answer in
+// progress: the server renders no receipt for a decision it has not recorded
+// yet, so swapping the card away mid-flight would leave the operator looking
+// at a list with no trace of the click they just made.
+const sendingInFlight = () => Boolean(document.querySelector('[data-state=sending]'));
+// An answer in progress anywhere on the page: words typed into a reply, a
+// verdict picked for a free-text answer, or a decision already posted and
+// still in flight. All three are lost the moment the projection is swapped
+// -- the server renders every card empty, with no verdict checked -- so all
+// three hold the swap. A picked verdict with nothing typed yet is an answer
+// being written, not an idle page.
 const answerInProgress = () =>
   [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim().length > 0)
-  || Boolean(document.querySelector('input[name=outcome]:checked'));
+  || Boolean(document.querySelector('input[name=outcome]:checked'))
+  || sendingInFlight();
+// What a click looks like from the instant it is made until the board
+// answers (George, 2026-09-17: "I want to know that what I clicked on
+// actually did something instead of having no feedback like right now").
+//
+// The pressed control says what it is doing, every control that would post
+// again is disabled, the card is marked busy for a screen reader and for the
+// swap guard, and the live line says `sending`. The pressed control's markup
+// is put back verbatim on a refusal -- the label, the key badge and all --
+// because a button that came back reading `Sending…` would be a dead button.
+//
+// `settle` is for a decision that landed and is about to be replaced by its
+// receipt: there is nothing left to restore, only the timer to stop.
+function beginSending(card, pressed, label, stillLabel) {
+  const controls = [...card.querySelectorAll('.choice, .record, .undo-button')];
+  const markup = pressed ? pressed.innerHTML : null;
+  card.dataset.state = 'sending';
+  card.setAttribute('aria-busy', 'true');
+  controls.forEach(control => { control.disabled = true; });
+  if (pressed) pressed.textContent = label;
+  setLive('sending');
+  const timer = pressed
+    ? setTimeout(() => { pressed.textContent = stillLabel; }, STILL_SENDING_AFTER)
+    : null;
+  const settle = () => { if (timer !== null) clearTimeout(timer); };
+  return {
+    settle,
+    revert: () => {
+      settle();
+      controls.forEach(control => { control.disabled = false; });
+      card.removeAttribute('aria-busy');
+      delete card.dataset.state;
+      if (pressed) pressed.innerHTML = markup;
+    },
+  };
+}
 const cardOf = node => (node && node.closest ? node.closest('article.item') : null);
 // What the composer says when it refuses to post a half-written answer, in
 // the page's language.
@@ -3656,6 +3726,12 @@ function syncAnswer(form) {
   hint.hidden = ready;
   const clear = form.querySelector('[data-clear]');
   if (clear) clear.hidden = !verdict;
+  // A picked verdict holds the live projection for the whole page, and the
+  // only way to release it by thumb is the button inside this fold. So the
+  // fold cannot close over one: the hold would be unreachable, which is the
+  // frozen page the release exists to prevent.
+  const custom = form.querySelector('details[data-custom]');
+  if (custom && verdict) custom.open = true;
   if (ready) clearRefusal(form);
 }
 // Only the composer's own pre-flight sentence, never the board's. What the
@@ -3726,7 +3802,10 @@ function replySent(body) {
 }
 function showReceipt(card, label, noted) {
   const receipt = document.createElement('p');
-  receipt.className = 'receipt';
+  // `landed` is the one-shot flash that says the board answered: the card
+  // the eye was already on becomes the receipt, and without it the swap is
+  // easy to miss on a long list.
+  receipt.className = 'receipt landed';
   receipt.dataset.receipt = card.dataset.item;
   receipt.dataset.item = card.dataset.item;
   receipt.dataset.project = card.dataset.project || '';
@@ -3760,12 +3839,14 @@ async function undoDecision(row) {
   const project = row.dataset.project;
   if (!id || !project || row.dataset.undoing) return;
   row.dataset.undoing = '1';
+  const sending = beginSending(row, row.querySelector('[data-undo]'), 'Undoing…', 'Still undoing…');
   try {
     const response = await fetch(
       `/attention/${encodeURIComponent(project)}/${encodeURIComponent(id)}/reopen`,
       {method: 'POST', credentials: 'same-origin', redirect: 'manual'}
     );
     if (response.type === 'opaqueredirect' || response.ok) {
+      sending.settle();
       row.remove();
       // The item is open again: pull the fresh projection so it reappears as
       // a card (on Needs you) or leaves this list (on Recent decisions), then
@@ -3775,11 +3856,13 @@ async function undoDecision(row) {
       if (back) back.focus();
       applyNotice({type: 'notice', key: `undone-${id}-${Date.now()}`, what: `Brought back ${id}. It is open again.`});
     } else {
+      sending.revert();
       const page = new DOMParser().parseFromString(await response.text(), 'text/html');
       const refused = page.querySelector('.error');
       showRowRefusal(row, refused ? refused.textContent : `The board refused to bring back ${id} (${response.status}).`);
     }
   } catch (error) {
+    sending.revert();
     showRowRefusal(row, `The undo did not reach the board. Try again.`);
   } finally {
     delete row.dataset.undoing;
@@ -3853,6 +3936,7 @@ async function decide(form, submitter) {
   const body = decisionBody(form, submitter);
   const label = decidedLabel(form, submitter);
   const noted = replySent(body);
+  const sending = beginSending(card, submitter, 'Sending…', 'Still sending…');
   try {
     const response = await fetch(form.action, {
       method: 'POST',
@@ -3865,18 +3949,31 @@ async function decide(form, submitter) {
     // is shown in the card's own words -- a card left open while the item
     // was rewritten names a choice the row no longer carries, and that is
     // refused by name rather than mapped onto whatever now sits there.
-    if (response.type === 'opaqueredirect' || response.ok) { showReceipt(card, label, noted); return; }
+    if (response.type === 'opaqueredirect' || response.ok) {
+      sending.settle();
+      showReceipt(card, label, noted);
+      return;
+    }
+    // Nothing was recorded, so the card comes all the way back before it is
+    // told why: a refusal under a disabled button reads as a card that can
+    // no longer be answered at all.
+    sending.revert();
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const refused = page.querySelector('.error');
     showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board');
   } catch (error) {
+    sending.revert();
     showRefusal(form, 'The decision did not reach the board. Try again.', 'board');
   } finally {
     delete form.dataset.deciding;
   }
 }
 async function refreshProjection() {
-  if (answerInProgress()) { setLive('update waiting'); return; }
+  // A decision already in flight holds the swap too, and while it does the
+  // live line goes on saying what the page is doing rather than what the
+  // socket is waiting for: `sending` is the answer to the click that was
+  // just made, and it must not be overwritten a tick later.
+  if (answerInProgress()) { setLive(sendingInFlight() ? 'sending' : 'update waiting'); return; }
   const response = await fetch(location.pathname + location.search, {credentials: 'same-origin'});
   if (!response.ok) throw new Error(`refresh ${response.status}`);
   const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
@@ -3885,7 +3982,7 @@ async function refreshProjection() {
   // network round trip ago -- and everything below MOVES live nodes into
   // the detached document: the notices strip, then every receipt. Bailing
   // out after that point would delete them instead of preserving a draft.
-  if (answerInProgress()) { setLive('update waiting'); return; }
+  if (answerInProgress()) { setLive(sendingInFlight() ? 'sending' : 'update waiting'); return; }
   const strip = document.querySelector('[data-notices]');
   if (strip) next.prepend(strip);
   // A receipt outlives the projection it was decided in. The row is gone
@@ -4114,7 +4211,22 @@ document.addEventListener('focusin', event => {
 document.addEventListener('keydown', event => {
   if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing) return;
   const target = event.target;
-  const composing = Boolean(target && target.matches && target.matches('textarea, input'));
+  // Focus that is INSIDE the card's composer is composing, whatever kind of
+  // element the focus happens to be on: the note field, the verdict picker,
+  // the fold's own summary, the submit, the release. It is not about being a
+  // text field -- it is about the operator working the composer, where a
+  // digit is a digit and not a decision.
+  //
+  // A `summary` is a TAB STOP, and the fold's summary is the next one after
+  // the note field. So `Tab` then `1` reached the choice shortcut and
+  // recorded the recommendation over a note the operator was still writing --
+  // the same hole `a_digit_after_tabbing_off_a_picked_verdict...` found on
+  // the submit, reopened by folding the answer, and closed here by the kind
+  // of place focus is rather than by a verdict happening to be picked.
+  // Every `summary` counts, the long form's included: focus on a disclosure
+  // control is focus on that control.
+  const composing = Boolean(target && target.matches
+    && target.matches('textarea, input, summary, details[data-custom] *'));
   if (event.key === 'Escape') {
     if (openPreviews.length) { event.preventDefault(); closeAllPreviews(); return; }
     const escaped = cardOf(target) || cardOf(document.activeElement);
@@ -4144,8 +4256,13 @@ document.addEventListener('keydown', event => {
     if (digit < choices.length) { event.preventDefault(); choices[digit].click(); }
     return;
   }
+  // `c` is the way into the answer nobody authored a button for, and that
+  // answer is folded: the key unfolds it and lands on the field, so one
+  // keystroke still reaches the whole path rather than half of it.
   if (event.key === 'c') {
+    const custom = card.querySelector('details[data-custom]');
     const text = card.querySelector('textarea[name=reply]');
+    if (custom) custom.open = true;
     if (text) { event.preventDefault(); text.focus(); }
   }
 });
@@ -4196,6 +4313,7 @@ button:hover{border-color:var(--accent)}button:active{transform:translateY(1px)}
 .search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
 main{max-width:66rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
 footer{max-width:66rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--muted);font-size:.85rem}\
+body:has(.keys) footer{padding-bottom:calc(5.5rem + env(safe-area-inset-bottom))}\
 h1{font-size:1.35rem;font-weight:650;line-height:1.3;margin:.2rem 0 1rem;color:var(--text)}\
 h1::before{content:'> ';color:var(--mauve);font-family:var(--mono)}\
 h2{font-size:1rem;font-weight:650;margin:1.6rem 0 .5rem;color:var(--subtext)}\
@@ -4237,6 +4355,10 @@ color:var(--muted);border-color:var(--surface1)}\
 .decide textarea{display:block;width:100%;min-height:2.9rem;resize:vertical}\
 .actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.6rem}\
 .actions button{min-width:6.5rem}\
+.explain{max-width:72ch;margin:0 0 1rem;color:var(--subtext);font-size:.9rem}\
+.eyebrow{max-width:72ch;margin:0 0 .4rem;color:var(--muted);font-size:.78rem;line-height:1.45}\
+.eyebrow a{color:var(--subtext)}\
+.eyebrow .kind{font-size:.72rem}\
 .item h2{max-width:72ch;margin:0 0 .6rem;color:var(--text);font-size:1.125rem;line-height:1.45;font-weight:650}\
 .item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 .context{max-width:72ch;margin:0 0 1.1rem;color:var(--subtext)}\
@@ -4245,8 +4367,8 @@ fieldset{min-width:0;margin:0;padding:0;border:0}\
 legend{padding:0;color:var(--muted);font-size:.78rem;letter-spacing:.02em}\
 .recommended{padding:.25rem .85rem .9rem;border:1px solid var(--accent);border-radius:8px}\
 .recommended legend{padding:0 .45em;color:var(--accent)}\
-.choice{display:block;width:100%;margin:0;text-align:left;line-height:1.45;white-space:normal;font-weight:500}\
-.choice .key{display:inline-block;min-width:1.6em;margin-right:.5em;padding:0 .2em;\
+.choice{display:block;width:100%;margin:0;text-align:left;line-height:1.45;white-space:normal;font-weight:650}\
+.choice .key{display:inline-block;min-width:1.6em;margin-right:.5em;padding:0 .2em;font-weight:500;\
 border:1px solid currentColor;border-radius:4px;font-size:.75rem;text-align:center;font-family:var(--mono)}\
 .choice.outcome-approve{color:var(--green);border-color:var(--green)}\
 .choice.outcome-defer{color:var(--peach);border-color:var(--peach)}\
@@ -4255,14 +4377,19 @@ border:1px solid currentColor;border-radius:4px;font-size:.75rem;text-align:cent
 .recommended .choice{color:var(--crust);background:var(--accent);border-color:var(--accent);font-weight:650}\
 .recommended .choice .key{opacity:.75}\
 .recommended .choice:hover{border-color:var(--crust)}\
-.consequence{max-width:72ch;margin:.5rem 0 0;color:var(--muted);font-size:.92rem}\
+.consequence{max-width:72ch;margin:.3rem 0 0;color:var(--muted);font-size:.92rem}\
 .recommended .consequence{color:var(--subtext)}\
 .alternatives{display:grid;gap:1.15rem;margin:1.15rem 0 0}\
-.alternative .consequence{margin-top:.4rem}\
+.alternative .consequence{margin-top:.3rem}\
 .reply{margin-top:1.15rem}\
 .reply>label{display:block;margin:0 0 .35rem;color:var(--subtext);font-size:.8rem}\
 .reply .hint{margin-top:.4rem}\
 .custom{margin-top:1.5rem;padding-top:1rem;border-top:1px dashed var(--surface1)}\
+.custom>summary{display:flex;align-items:center;min-height:2.4rem;color:var(--subtext);\
+font-size:.85rem;cursor:pointer;list-style:none}\
+.custom>summary::-webkit-details-marker{display:none}\
+.custom>summary::before{content:'+';margin-right:.5em;font-family:var(--mono)}\
+.custom[open]>summary::before{content:'-'}\
 .picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
 .picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.4rem;\
 padding:.25rem .6rem;color:var(--subtext);border:1px solid var(--surface1);border-radius:6px;cursor:pointer}\
@@ -4276,6 +4403,12 @@ border:1px solid var(--surface0);border-left:2px solid var(--green);border-radiu
 .receipt .decided{color:var(--green)}\
 .receipt .undo-button{min-height:auto;margin-left:.4rem;padding:.15rem .7rem;font-size:.8rem;\
 color:var(--peach);border-color:var(--peach)}\
+.receipt.landed{animation:receipt-landed .5s ease-out}\
+@keyframes receipt-landed{from{background:var(--surface0);color:var(--text)}to{background:var(--mantle)}}\
+.item[data-state=sending]{border-color:var(--peach)}\
+[data-state=sending] button:disabled{cursor:progress}\
+button:disabled{opacity:.6}\
+button:disabled:hover{border-color:var(--surface1)}\
 .decided{border:1px solid var(--surface0);border-left:2px solid var(--surface1);border-radius:10px;\
 padding:clamp(.8rem,3vw,1.1rem);margin:.8rem 0;background:var(--base)}\
 .decided h2{margin:0 0 .5rem;color:var(--subtext);font-size:1rem;font-weight:600}\
@@ -4295,7 +4428,10 @@ border:1px solid var(--surface1);color:var(--subtext);font-family:var(--mono)}\
 .full summary::before{content:'+ '}\
 .full[open] summary::before{content:'- '}\
 .full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--subtext)}\
-.keys{margin:1.6rem 0 0;color:var(--muted);font-size:.85rem}\
+.keys{position:fixed;left:0;right:0;bottom:0;z-index:20;margin:0;\
+padding:.5rem max(1rem,env(safe-area-inset-right)) calc(.5rem + env(safe-area-inset-bottom)) max(1rem,env(safe-area-inset-left));\
+color:var(--muted);font-size:.85rem;background:var(--mantle);border-top:1px solid var(--surface0)}\
+.keys kbd{color:var(--text)}\
 .search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:var(--muted)}\
 .meta{color:var(--muted);font-size:.85rem;margin:.2rem 0}\
 .body{margin:.5rem 0}\
@@ -4336,7 +4472,8 @@ box-shadow:0 12px 32px rgba(0,0,0,.45);padding:.8rem .9rem;color:var(--text);ani
 .preview-card .body{margin:.4rem 0 0;color:var(--subtext);font-size:.88rem}\
 @media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.actions button{flex:1}.picks{display:grid;grid-template-columns:1fr 1fr}.heading{align-items:flex-start}table{min-width:38rem}}\
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
-.notice{animation:none}.live::after{animation:none}.preview-pop{animation:none}}\
+.notice{animation:none}.live::after{animation:none}.preview-pop{animation:none}\
+.receipt.landed{animation:none}}\
 ";
 
 #[cfg(test)]
@@ -4996,14 +5133,27 @@ mod tests {
         assert_page_title(&home, "Needs you");
         assert_html_contains(&home, "Needs you");
         assert_html_contains(&home, "Please review before release");
+        // Orientation above the question, and the free-text answer folded
+        // out of the way beneath the choices.
         assert_html_contains(
             &home,
-            "<legend>Or answer in your own words, recorded as</legend>",
+            "<p class=explain>Each card is one question an agent is waiting on.",
         );
+        assert_html_contains(&home, "<p class=eyebrow>");
+        assert_html_contains(&home, "· asked by geoyws · waiting ");
+        assert_html_contains(
+            &home,
+            "<details class=custom data-custom><summary>Answer in my own words</summary>",
+        );
+        assert_html_contains(&home, "<legend>recorded as</legend>");
+        // No recommendation is authored on this row, so no recommended
+        // fieldset is rendered for it; the carded case is pinned in the e2e
+        // suite.
+        assert!(!home.contains("class=recommended"), "{home}");
         assert_html_contains(&home, "<div class=reply><label for=\"answer-");
         assert_html_contains(
             &home,
-            "Sent with whichever choice you click; required for your own answer.",
+            "Sent with whichever answer you pick. Required when you answer in your own words.",
         );
         assert_html_contains(&home, "value=\"approve\" data-label=\"Approve - proceed\"");
         // The submit is live in the markup: a rendered `disabled` made the
@@ -5033,7 +5183,7 @@ mod tests {
             &home,
             "<button type=button class=clear data-clear hidden>Clear verdict</button>",
         );
-        assert_html_contains(&home, "<kbd>Esc</kbd> clears a verdict you picked.");
+        assert_html_contains(&home, "<kbd>Esc</kbd> clear ·");
         assert!(
             !home.contains("value=custom disabled"),
             "the free-text submit is rendered disabled, so a click reports nothing: {home}"

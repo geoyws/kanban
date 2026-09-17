@@ -25785,19 +25785,23 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     let (status, home) = http_get(port, "/");
     assert_eq!(status, 200, "{home}");
     // The card's order is the contract (ADR-042 §5), and it is the order the
-    // server renders rather than anything the script arranges: the question,
-    // the context, the recommendation and its consequence, the alternatives
-    // in the order they were declared, the free-text answer, the folded body,
-    // and only then the meta line a priority pill used to lead with.
+    // server renders rather than anything the script arranges: the eyebrow
+    // that says who is waiting and for how long, the question, the context,
+    // the recommendation and its consequence, the alternatives in the order
+    // they were declared, the note field, the folded free-text answer, the
+    // folded body, and only then the meta line a priority pill used to lead
+    // with.
     let card = card_markup(&home, carded_id);
     assert_in_order(
         card,
         &[
+            "<p class=eyebrow>",
+            "· asked by codex@driver · waiting ",
             &format!("<h2 id=\"q-{carded_id}\">"),
             "hax has no logged-in Claude account",
             "<p class=context>",
             "Claude Code 2.1.236 is installed on hax",
-            "<fieldset class=recommended><legend>recommended</legend>",
+            "<fieldset class=recommended><legend>Recommended - press 1</legend>",
             "value=\"assign-and-login\" data-label=\"Assign a Claude seat to hax and log in\"",
             "<span class=key>1</span>",
             "<p class=consequence>You buy or free one Claude seat",
@@ -25807,18 +25811,18 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "value=\"drop-receipt\"",
             "<span class=key>3</span>",
             "<div class=reply><label for=\"answer-",
-            ">Your reply</label>",
+            ">Add a note (optional)</label>",
             "<textarea id=\"answer-",
-            "Sent with whichever choice you click; required for your own answer.",
-            "<div class=custom>",
-            "<legend>Or answer in your own words, recorded as</legend>",
+            "Sent with whichever answer you pick. Required when you answer in your own words.",
+            "<details class=custom data-custom><summary>Answer in my own words</summary>",
+            "<legend>recorded as</legend>",
             "<input type=radio name=outcome value=approve>",
             "<input type=radio name=outcome value=other>",
             "name=decision value=custom>Record this answer",
             "<details class=full><summary>show the full item</summary>",
             "<div class=\"body md\"><p>PARKED - until an account is assigned",
             "<p class=meta>",
-            "raised by codex@driver",
+            "class=\"priority priority-p0\"",
         ],
     );
     // A row that authored no card is the same card with the default pair:
@@ -25833,7 +25837,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "<p class=consequence>The work the body describes goes ahead as written.</p>",
             "value=\"reject\" data-label=\"Reject - do not proceed\"",
             "<div class=reply>",
-            "<div class=custom>",
+            "<details class=custom data-custom>",
         ],
     );
     assert!(
@@ -25850,7 +25854,18 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         "{home}"
     );
     assert!(
-        home.contains("Press <kbd>1</kbd> to <kbd>4</kbd> to answer the card you are on"),
+        home.contains(
+            "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
+             <kbd>u</kbd> undo last · <kbd>Esc</kbd> clear · Decided items move to"
+        ),
+        "{home}"
+    );
+    assert!(
+        home.contains(
+            "<p class=explain>Each card is one question an agent is waiting on. Pick an \
+             answer and it is recorded on the board at once; the agent continues from \
+             there. Undo any decision from Recent decisions.</p>"
+        ),
         "{home}"
     );
 
@@ -26439,6 +26454,50 @@ fn card_args<'a>(fixed: &[&'a str], card: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
+/// Click one control after scrolling it to the middle of the viewport.
+///
+/// The keyboard-hint bar is pinned to the bottom of the viewport, so a
+/// control that happens to sit beneath it cannot be tapped where it is: a
+/// person scrolls it clear first, and so does this. Without the scroll a
+/// click lands on the bar and the page does nothing, which is a fact about
+/// any bottom toolbar rather than about this one.
+fn click_control(tab: &headless_chrome::Tab, selector: &str) {
+    js_value(
+        tab,
+        &format!(
+            "(() => {{ const el = document.querySelector('{selector}'); \
+             if (el) el.scrollIntoView({{block: 'center'}}); return true; }})()"
+        ),
+    );
+    tab.wait_for_element(selector)
+        .unwrap_or_else(|error| panic!("missing {selector}: {error}"))
+        .click()
+        .unwrap_or_else(|error| panic!("click {selector}: {error}"));
+}
+
+/// Unfold one card's free-text answer, the way a thumb does: a click on the
+/// summary.
+///
+/// The verdict picker, its release and the card's own submit live inside a
+/// closed `<details>` now — the common path is the one-click answer above it
+/// — so a case that drives any of them has to open the fold first. Idempotent
+/// on purpose: a click toggles, and a helper that closed the fold on its
+/// second call would be a trap.
+fn open_custom_answer(tab: &headless_chrome::Tab, form: &str) {
+    let is_open = format!("document.querySelector('{form} details[data-custom]').open");
+    if js_value(tab, &is_open) == Value::Bool(true) {
+        return;
+    }
+    click_control(tab, &format!("{form} details[data-custom] > summary"));
+    for _ in 0..100 {
+        if js_value(tab, &is_open) == Value::Bool(true) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the free-text answer never unfolded");
+}
+
 /// Tag the projection the page is holding, so the swap that replaces it is
 /// observable rather than guessed at.
 fn hold_projection(tab: &headless_chrome::Tab) {
@@ -26478,6 +26537,22 @@ fn wait_for_live(tab: &headless_chrome::Tab, text: &str) {
         "the live status never read {text:?}; it reads {}",
         js_value(tab, "document.querySelector('[data-live]').textContent")
     );
+}
+
+/// Block until `expression` is true in the page.
+///
+/// A click travels through CDP and the handler that answers it runs on the
+/// page's own turn, so the state a click puts on screen is only there a
+/// moment later. Polling for it is the difference between measuring the
+/// state and racing it.
+fn wait_for_js_true(tab: &headless_chrome::Tab, expression: &str) {
+    for _ in 0..200 {
+        if js_value(tab, expression) == Value::Bool(true) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("never became true in the page: {expression}");
 }
 
 /// One click on the recommendation settles the item, and the row afterwards
@@ -26534,24 +26609,36 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
         ),
         "show the full item"
     );
-    // The recommendation is marked, and it is the first thing a keyboard or a
-    // thumb reaches in the card.
+    // The recommendation is marked, and it is the first CONTROL in the card:
+    // the only focusable thing ahead of it is the eyebrow's board reference,
+    // which navigates and decides nothing.
     assert_eq!(
         js_value(
             &tab,
             &format!("document.querySelector('{form} fieldset.recommended > legend').textContent")
         ),
-        "recommended"
+        "Recommended - press 1"
     );
     assert_eq!(
         js_value(
             &tab,
             &format!(
                 "document.querySelector('article.item[data-item=\"{id}\"]')\
-                 .querySelector('button, input, textarea, select, a').value"
+                 .querySelector('button, input, textarea, select').value"
             )
         ),
         "assign-and-login"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "(() => {{ const first = document.querySelector('article.item[data-item=\"{id}\"]')\
+                 .querySelector('button, input, textarea, select, a'); \
+                 return first.matches('.eyebrow a') ? first.getAttribute('href') : first.tagName; }})()"
+            )
+        ),
+        "/board/CARDCLICK"
     );
     let recommended = tab
         .wait_for_element(&format!("{form} fieldset.recommended button.choice"))
@@ -26808,17 +26895,12 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
         .type_into("  Buy the seat on 2026-09-09 and log in from the laptop.  ")
         .expect("type the answer");
     assert_eq!(hint_shown(&tab), true);
+    open_custom_answer(&tab, &form);
     // The verdict completes it.
-    tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
-        .expect("the other outcome")
-        .click()
-        .expect("pick other");
+    click_control(&tab, &format!("{form} input[name=outcome][value=other]"));
     assert_eq!(hint_shown(&tab), false);
 
-    tab.wait_for_element(&record)
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    click_control(&tab, &record);
 
     assert_receipt(&tab, id, "Custom answer, recorded as other");
     // That was the last open item, so the live refresh brings back the empty
@@ -27028,12 +27110,10 @@ fn recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome() {
 
     // Undo the newest from its button. The submit is intercepted, so the
     // page stays where it is and the row leaves the projection.
-    tab.wait_for_element(&format!(
-        "article.decided[data-item=\"{second_id}\"] button[data-undo]"
-    ))
-    .expect("the undo button")
-    .click()
-    .expect("undo the newest decision");
+    click_control(
+        &tab,
+        &format!("article.decided[data-item=\"{second_id}\"] button[data-undo]"),
+    );
     tab.wait_for_element(&format!("article.decided[data-item=\"{first_id}\"]"))
         .expect("the older decision stays");
     for _ in 0..100 {
@@ -27424,11 +27504,9 @@ fn a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome() {
     let form = format!("form.decide[action=\"/attention/CARDLIVE/{id}/reply\"]");
     let picked = format!("{form} input[name=outcome][value=other]");
 
+    open_custom_answer(&tab, &form);
     // A verdict, and not one word yet.
-    tab.wait_for_element(&picked)
-        .expect("the other outcome")
-        .click()
-        .expect("pick other");
+    click_control(&tab, &picked);
     hold_projection(&tab);
 
     // A write from outside this browser. Any board write moves the coarse
@@ -27475,11 +27553,10 @@ fn a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome() {
     wait_for_projection_swap(&tab);
     wait_for_live(&tab, "live");
 
+    // The swap rendered a fresh card, so the fold is closed again.
+    open_custom_answer(&tab, &form);
     // Pick it again, on the projection that just landed.
-    tab.wait_for_element(&picked)
-        .expect("the other outcome")
-        .click()
-        .expect("pick other again");
+    click_control(&tab, &picked);
 
     // Both halves now, and the field is focused rather than clicked: picking
     // the verdict scrolled the page, and a headless click's coordinates are
@@ -27492,10 +27569,7 @@ fn a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome() {
         .focus()
         .expect("focus the answer field");
     tab.type_str(typed).expect("type the answer");
-    tab.wait_for_element(&format!("{form} button.record"))
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    click_control(&tab, &format!("{form} button.record"));
 
     assert_receipt(&tab, id, "Custom answer, recorded as other");
     let row = settled_row(&fixture, id);
@@ -27584,10 +27658,8 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
         .expect("the answer field");
     answer.click().expect("focus the answer field");
     answer.type_into(typed).expect("type the answer");
-    tab.wait_for_element(&picked)
-        .expect("the defer outcome")
-        .click()
-        .expect("pick defer");
+    open_custom_answer(&tab, &form);
+    click_control(&tab, &picked);
     // The live line is stamped with a sentinel first, the way hold_projection
     // pokes the DOM: 'update waiting' is written by BOTH gates, so without
     // this the barrier could be satisfied by the first gate refusing a later
@@ -27646,10 +27718,7 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
         "the arriving projection cleared the picked verdict"
     );
 
-    tab.wait_for_element(&format!("{form} button.record"))
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    click_control(&tab, &format!("{form} button.record"));
     assert_receipt(&tab, id, "Custom answer, recorded as defer");
     let row = settled_row(&fixture, id);
     assert_eq!(row["decision"]["choice"], "custom", "{row}");
@@ -27715,10 +27784,8 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
         .expect("the answer field");
     answer.click().expect("focus the answer field");
     answer.type_into(typed).expect("type the answer");
-    tab.wait_for_element(&format!("{} button.record", form(words_id)))
-        .expect("the submit")
-        .click()
-        .expect("click the submit");
+    open_custom_answer(&tab, &form(words_id));
+    click_control(&tab, &format!("{} button.record", form(words_id)));
     assert_eq!(
         refusal(&tab, words_id),
         INCOMPLETE_ANSWER_ON_THE_CARD,
@@ -27748,17 +27815,12 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
     );
 
     // Verdict, no words: the same sentence, the other half focused.
-    tab.wait_for_element(&format!(
-        "{} input[name=outcome][value=approve]",
-        form(verdict_id)
-    ))
-    .expect("the approve outcome")
-    .click()
-    .expect("pick approve");
-    tab.wait_for_element(&format!("{} button.record", form(verdict_id)))
-        .expect("the submit")
-        .click()
-        .expect("click the submit");
+    open_custom_answer(&tab, &form(verdict_id));
+    click_control(
+        &tab,
+        &format!("{} input[name=outcome][value=approve]", form(verdict_id)),
+    );
+    click_control(&tab, &format!("{} button.record", form(verdict_id)));
     assert_eq!(
         refusal(&tab, verdict_id),
         INCOMPLETE_ANSWER_ON_THE_CARD,
@@ -27837,10 +27899,7 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
         false,
         "the release is hidden while there is a verdict to release"
     );
-    tab.wait_for_element(&clear)
-        .expect("the release")
-        .click()
-        .expect("release the verdict");
+    click_control(&tab, &clear);
     assert_eq!(
         js_value(
             &tab,
@@ -27865,22 +27924,16 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
 
     // The other card still holds its words, and completing it clears the
     // refusal rather than leaving a red alert over a recorded answer.
-    tab.wait_for_element(&format!(
-        "{} input[name=outcome][value=defer]",
-        form(words_id)
-    ))
-    .expect("the defer outcome")
-    .click()
-    .expect("pick defer");
+    click_control(
+        &tab,
+        &format!("{} input[name=outcome][value=defer]", form(words_id)),
+    );
     assert_eq!(
         refusal(&tab, words_id),
         Value::Null,
         "the refusal outlived the answer it refused"
     );
-    tab.wait_for_element(&format!("{} button.record", form(words_id)))
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    click_control(&tab, &format!("{} button.record", form(words_id)));
     assert_receipt(&tab, words_id, "Custom answer, recorded as defer");
     let row = settled_row(&fixture, words_id);
     assert_eq!(row["decision"]["choice"], "custom", "{row}");
@@ -27967,10 +28020,8 @@ fn a_digit_in_the_verdict_picker_records_nothing_in_real_chrome() {
         ),
         true
     );
-    tab.wait_for_element(&format!("{form} button.record"))
-        .expect("the submit")
-        .click()
-        .expect("click the submit");
+    open_custom_answer(&tab, &form);
+    click_control(&tab, &format!("{form} button.record"));
     assert_eq!(
         js_value(
             &tab,
@@ -28065,12 +28116,10 @@ fn enter_in_the_verdict_picker_records_the_free_text_answer_in_real_chrome() {
         .expect("the answer field");
     answer.click().expect("focus the answer field");
     answer.type_into(typed).expect("type the answer");
+    open_custom_answer(&tab, &form);
     // Clicking the verdict leaves the cursor on it, which is where Enter is
     // pressed from.
-    tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
-        .expect("the other outcome")
-        .click()
-        .expect("pick other");
+    click_control(&tab, &format!("{form} input[name=outcome][value=other]"));
     assert_eq!(
         js_value(
             &tab,
@@ -28181,10 +28230,8 @@ fn a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome() {
         .expect("the answer field");
     answer.click().expect("focus the answer field");
     answer.type_into(typed).expect("type the answer");
-    tab.wait_for_element(&picked)
-        .expect("the other outcome")
-        .click()
-        .expect("pick other");
+    open_custom_answer(&tab, &form);
+    click_control(&tab, &picked);
     assert_eq!(
         js_value(
             &tab,
@@ -28270,10 +28317,7 @@ fn a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome() {
     // And the answer the operator did write still records, as one POST --
     // which is what makes the empty count above a measurement rather than a
     // wrapper that never saw anything.
-    tab.wait_for_element(&format!("{form} button.record"))
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    click_control(&tab, &format!("{form} button.record"));
     assert_receipt(&tab, id, "Custom answer, recorded as other");
     assert_eq!(
         js_value(&tab, "window.__posts.length"),
@@ -28340,10 +28384,8 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
         .expect("the answer field");
     answer.click().expect("focus the answer field");
     answer.type_into(typed).expect("type the answer");
-    tab.wait_for_element(&format!("{form} input[name=outcome][value=other]"))
-        .expect("the other outcome")
-        .click()
-        .expect("pick other");
+    open_custom_answer(&tab, &form);
+    click_control(&tab, &format!("{form} input[name=outcome][value=other]"));
 
     // The lane that raised it answers it from the CLI while this card sits
     // open. The raiser, rather than a third lane, because the ledger lets
@@ -28364,10 +28406,7 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
         ],
     );
 
-    tab.wait_for_element(&format!("{form} button.record"))
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    click_control(&tab, &format!("{form} button.record"));
     tab.wait_for_element(&board_refusal)
         .expect("the board's refusal");
     let refused = js_value(&tab, &still_the_boards);
@@ -28418,19 +28457,13 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
     // the card is half-written again, and submit: the composer refuses in its
     // own words, on its OWN line. The board's sentence has to still be there,
     // saying the thing that actually happened.
-    tab.wait_for_element(&format!("{form} [data-clear]"))
-        .expect("the release")
-        .click()
-        .expect("release the verdict");
+    click_control(&tab, &format!("{form} [data-clear]"));
     assert_eq!(
         js_value(&tab, &still_the_boards),
         refused,
         "the release took the board's refusal with it"
     );
-    tab.wait_for_element(&format!("{form} button.record"))
-        .expect("the submit")
-        .click()
-        .expect("submit the half-written answer");
+    click_control(&tab, &format!("{form} button.record"));
     assert_eq!(
         js_value(
             &tab,
@@ -28448,10 +28481,7 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
     // And picking a verdict clears the composer's line only. This is where
     // the card used to end up saying nothing at all about a decision that
     // never landed.
-    tab.wait_for_element(&format!("{form} input[name=outcome][value=defer]"))
-        .expect("the defer outcome")
-        .click()
-        .expect("pick defer");
+    click_control(&tab, &format!("{form} input[name=outcome][value=defer]"));
     assert_eq!(
         js_value(
             &tab,
@@ -28471,10 +28501,7 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
     // This POST is refused too, so the card stays and the picker is
     // observable: what is on screen must not claim a verdict that was never
     // part of the decision.
-    tab.wait_for_element(&format!("{form} button.choice"))
-        .expect("the recommendation")
-        .click()
-        .expect("click the recommendation");
+    click_control(&tab, &format!("{form} button.choice"));
     // The POST is asynchronous, so this waits long enough for a receipt to
     // have rendered if the board had taken it.
     std::thread::sleep(Duration::from_millis(1_500));
@@ -28504,6 +28531,527 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
     let row = settled_row(&fixture, id);
     assert_eq!(row["decision"]["choice"], "keep-parked", "{row}");
     assert_eq!(row["decision"]["by"], "codex@driver", "{row}");
+}
+
+/// The page stubs every POST and hands back the promise, so the window
+/// between the click and the board's answer is a fact of the test rather
+/// than a race it hopes to win. The projection GET is left alone.
+const HOLD_THE_POST: &str = r#"(() => {
+  const real = window.fetch;
+  window.__real = real;
+  window.__answer = null;
+  window.fetch = (input, init) => {
+    if (((init && init.method) || 'GET').toUpperCase() !== 'POST') return real.call(window, input, init);
+    return new Promise(resolve => {
+      window.__answer = status => { resolve(new Response('', {status})); return true; };
+    });
+  };
+  return true;
+})()"#;
+
+/// A click says it is sending from the instant it is made until the board
+/// answers, and the receipt then flashes (George, 2026-09-17: "I want to
+/// know that what I clicked on actually did something instead of having no
+/// feedback like right now").
+///
+/// There was nothing at all between the click and the receipt: on a phone
+/// over a slow link that is a card that looks like it ignored the tap, and
+/// the honest response to a dead control is to tap it again. So the pressed
+/// button says `Sending…`, every control that could post again is disabled,
+/// the card is marked busy for a screen reader, and the live line says
+/// `sending`.
+///
+/// Two halves, because a stub proves the states and only the real POST
+/// proves the decision: the first half holds the answer open and reads the
+/// pending state off the card, the second restores the real `fetch` and
+/// settles a second card for real, so the ledger says the round trip still
+/// works with the pending state wrapped around it.
+#[test]
+fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-sending");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDSEND", "--json"]);
+    let held = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let real = raise_carded(
+        &fixture,
+        "PARKED - the second seat request, answered for real.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "1"], &CARD),
+    );
+    let held_id = held["id"].as_str().unwrap();
+    let real_id = real["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let card = |id: &str| format!("article.item[data-item=\"{id}\"]");
+    let recommended = |id: &str| {
+        format!(
+            "{} form.decide fieldset.recommended button.choice",
+            card(id)
+        )
+    };
+    let label = card_choices()[0]["label"].as_str().unwrap().to_owned();
+
+    assert_eq!(js_value(&tab, HOLD_THE_POST), true);
+    let markup = js_value(
+        &tab,
+        &format!(
+            "document.querySelector('{}').innerHTML",
+            recommended(held_id)
+        ),
+    );
+    tab.wait_for_element(&recommended(held_id))
+        .expect("the recommended button")
+        .click()
+        .expect("one click on the recommendation");
+
+    // The POST was made and is unanswered, which is the whole point of the
+    // window the assertions below are read in.
+    wait_for_js_true(&tab, "typeof window.__answer === 'function'");
+    wait_for_js_true(
+        &tab,
+        &format!(
+            "document.querySelector('{}').dataset.state === 'sending'",
+            card(held_id)
+        ),
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{}').getAttribute('aria-busy')",
+                card(held_id)
+            )
+        ),
+        "true",
+        "a card with a decision in flight is not marked busy"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{}').textContent",
+                recommended(held_id)
+            )
+        ),
+        "Sending…",
+        "the pressed button says nothing about what it is doing"
+    );
+    // The label is kept where the receipt reads it from, so the decision the
+    // receipt names is still the decision that was pressed.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{}').dataset.label",
+                recommended(held_id)
+            )
+        ),
+        label.as_str()
+    );
+    // Nothing on the card can post a second time while the first is open.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "(() => {{ const controls = [...document.querySelectorAll('{} .choice, {} .record, {} .undo-button')]; \
+                 return controls.length > 1 && controls.every(control => control.disabled); }})()",
+                card(held_id),
+                card(held_id),
+                card(held_id)
+            )
+        ),
+        Value::Bool(true),
+        "a decision in flight left its own controls live"
+    );
+    wait_for_live(&tab, "sending");
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a receipt was rendered before the board answered"
+    );
+
+    // The board answers, and the card becomes its receipt with the flash
+    // that says so.
+    assert_eq!(js_value(&tab, "window.__answer(200)"), true);
+    assert_receipt(&tab, held_id, &label);
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('p.receipt[data-receipt=\"{held_id}\"]').classList.contains('landed')"
+            )
+        ),
+        Value::Bool(true),
+        "the landed receipt carries no flash, so the swap is easy to miss"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-open-count]').textContent"
+        ),
+        "1",
+        "the open count did not drop"
+    );
+    // The stub answered, not the board: nothing is resolved, which is what
+    // makes the second half a measurement rather than a repeat.
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--status", "resolved", "--json"]
+            )
+            .as_array()
+            .expect("resolved rows")
+            .is_empty(),
+        "the stubbed POST reached the board"
+    );
+
+    // Real `fetch` back, and a real decision through the same pending state.
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { window.fetch = window.__real; return true; })()"
+        ),
+        true
+    );
+    tab.wait_for_element(&recommended(real_id))
+        .expect("the second card's recommendation")
+        .click()
+        .expect("one click on the second recommendation");
+    assert_receipt(&tab, real_id, &label);
+    let row = settled_row(&fixture, real_id);
+    assert_eq!(row["decision"]["choice"], "assign-and-login", "{row}");
+    assert_eq!(row["decision"]["outcome"], "approve", "{row}");
+    assert_eq!(row["decision"]["by"], "geoyws", "{row}");
+    assert_eq!(
+        tab.get_url(),
+        origin,
+        "a decision navigated instead of replacing the card in place"
+    );
+    // And the markup the pressed button started with is the markup a card
+    // that was NOT refused never needs back — pinned by the refusal case,
+    // and captured here so the two cases read the same thing.
+    assert!(
+        markup
+            .as_str()
+            .expect("the button's markup")
+            .contains(&label),
+        "the captured markup is not the button's: {markup:?}"
+    );
+}
+
+/// A refused click puts the whole card back before it says why.
+///
+/// The pending state disables every control on the card, so a refusal that
+/// left them disabled would leave a card that cannot be answered at all —
+/// with a red sentence under a dead button, which reads as the board having
+/// banned the row rather than having declined one attempt. Everything the
+/// send took is given back: the button's own markup, the disabled controls,
+/// the busy flag and the sending state.
+#[test]
+fn a_refused_click_restores_the_card_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-restore");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDRESTORE", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDRESTORE/{id}/reply\"]");
+    let recommended = format!("{form} fieldset.recommended button.choice");
+
+    assert_eq!(
+        js_value(
+            &tab,
+            r#"(() => {
+  const real = window.fetch;
+  window.fetch = (input, init) => {
+    if (((init && init.method) || 'GET').toUpperCase() !== 'POST') return real.call(window, input, init);
+    return Promise.resolve(new Response('<p class=error>nope</p>', {status: 409}));
+  };
+  return true;
+})()"#
+        ),
+        true
+    );
+    let markup = js_value(
+        &tab,
+        &format!("document.querySelector('{recommended}').innerHTML"),
+    );
+    tab.wait_for_element(&recommended)
+        .expect("the recommended button")
+        .click()
+        .expect("one click on the recommendation");
+
+    tab.wait_for_element(&format!("{form} [data-refusal=board]"))
+        .expect("the board's refusal");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} [data-refusal=board]').textContent")
+        ),
+        "nope",
+        "the card is not quoting what the board said"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{recommended}').innerHTML")
+        ),
+        markup,
+        "the refused button kept its sending label"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "(() => {{ const controls = [...document.querySelectorAll('{form} .choice, {form} .record')]; \
+                 return controls.length > 1 && controls.every(control => !control.disabled); }})()"
+            )
+        ),
+        Value::Bool(true),
+        "a refused card is still disabled, so it cannot be answered at all"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "(() => {{ const card = document.querySelector('article.item[data-item=\"{id}\"]'); \
+                 return !card.dataset.state && !card.hasAttribute('aria-busy'); }})()"
+            )
+        ),
+        Value::Bool(true),
+        "a refused card is still marked as sending"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a refused decision rendered a receipt"
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open.as_array().expect("open rows").len(), 1, "{open}");
+    assert!(open[0]["decision"].is_null(), "{open}");
+}
+
+/// The free-text answer is folded away until it is asked for, and `c` is
+/// what asks for it.
+///
+/// It was standing open on every card — a verdict picker, a submit, a
+/// release and a hint — under choices that answer the same question in one
+/// click, so the cheap path had to be read past the expensive one (George,
+/// 2026-09-17: "really hard to use because I don't know what everything is
+/// doing"). Folded, it costs one tap or one keystroke, and that keystroke
+/// has to land on the field rather than merely reveal it.
+#[test]
+fn the_custom_answer_is_folded_until_c_opens_it_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-folded");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDFOLD", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - nothing on this card fits, so the answer has to be written.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDFOLD/{id}/reply\"]");
+    let fold = format!("{form} details[data-custom]");
+
+    assert_eq!(
+        js_value(&tab, &format!("document.querySelector('{fold}').open")),
+        Value::Bool(false),
+        "the free-text answer is standing open on a freshly rendered card"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{fold} > summary').textContent")
+        ),
+        "Answer in my own words"
+    );
+    // Folded means folded: the picker inside it is not on screen. Read
+    // through `checkVisibility`, because Chrome hides a closed `<details>`
+    // with `content-visibility` rather than `display:none` -- its children
+    // still report an `offsetParent` and would pass a weaker check.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} input[name=outcome]').checkVisibility()")
+        ),
+        Value::Bool(false),
+        "the verdict picker is visible while the answer is folded"
+    );
+
+    tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+        .expect("the card")
+        .focus()
+        .expect("focus the card");
+    tab.press_key("c").expect("press c");
+    wait_for_js_true(&tab, &format!("document.querySelector('{fold}').open"));
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.activeElement === document.querySelector('{form} textarea[name=reply]')"
+            )
+        ),
+        Value::Bool(true),
+        "c unfolded the answer without reaching the field it is written in"
+    );
+
+    let typed = "Buy the seat on 2026-09-18 and log in the same evening.";
+    tab.type_str(typed).expect("type the answer");
+    click_control(&tab, &format!("{form} input[name=outcome][value=other]"));
+    click_control(&tab, &format!("{form} button.record"));
+
+    assert_receipt(&tab, id, "Custom answer, recorded as other");
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "custom", "{row}");
+    assert_eq!(row["decision"]["outcome"], "other", "{row}");
+    assert_eq!(row["decision"]["note"], typed, "{row}");
+}
+
+/// A digit pressed on the folded answer's summary records nothing.
+///
+/// `summary` is a TAB STOP, and folding the free-text answer made it the next
+/// one after the note field: one `Tab` off a half-written note and then `1`
+/// reached the card's choice shortcut and recorded the recommendation --
+/// carrying the unfinished note along as its reply. It is the hole
+/// `a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome`
+/// closed on the card's submit, reopened by the fold, and closed for good by
+/// a different rule: focus INSIDE the composer is composing, whatever kind of
+/// element it is on, rather than only a text field or only a card that
+/// happens to carry a picked verdict.
+///
+/// The keystroke is the last thing this case does, because this driver
+/// delivers one `press_key("1")` thousands of times over several seconds
+/// (measured on the two cases named above): moving focus to the card
+/// afterwards would hand those still-arriving digits a legitimate target and
+/// record a real decision, which is a fact about the driver and not about the
+/// guard.
+#[test]
+fn a_digit_on_the_folded_answers_summary_records_nothing_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-fold-digit");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDFOLDKEY", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        "BLOCKED - is it safe to restart the proxy during business hours?",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let form = format!("form.decide[action=\"/attention/CARDFOLDKEY/{id}/reply\"]");
+    let summary = format!("{form} details[data-custom] > summary");
+
+    // A note in hand, and the cursor one Tab past it -- which is the fold.
+    let typed = "Restart it after 19:00 MYT, not during the day.";
+    let answer = tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the answer field");
+    answer.click().expect("focus the answer field");
+    answer.type_into(typed).expect("type the note");
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { window.__digits = 0; window.__posts = 0; \
+             const real = window.fetch; \
+             window.fetch = (input, init) => { \
+             if (((init && init.method) || 'GET').toUpperCase() === 'POST') window.__posts += 1; \
+             return real.call(window, input, init); }; \
+             document.addEventListener('keydown', \
+             event => { if (event.key === '1') window.__digits += 1; }, true); return true; })()"
+        ),
+        true
+    );
+    tab.press_key("Tab").expect("tab off the note field");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.activeElement === document.querySelector('{summary}')")
+        ),
+        Value::Bool(true),
+        "Tab did not land on the fold, so this is not the reported path"
+    );
+
+    tab.press_key("1").expect("press 1 on the fold's summary");
+    // A decision posts and renders its receipt asynchronously, so a snapshot
+    // taken the instant after the keystroke would pass while the wrong POST
+    // was still in flight.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert!(
+        js_value(&tab, "window.__digits").as_u64().unwrap_or(0) >= 1,
+        "the digit never reached the page, so nothing here was actually guarded"
+    );
+    assert_eq!(
+        js_value(&tab, "window.__posts"),
+        0,
+        "a digit pressed on the fold posted a decision"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('p.receipt').length"),
+        0,
+        "a digit pressed on the fold recorded a decision"
+    );
+    // The card, the note and the row are all exactly as they were.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("Boolean(document.querySelector('article.item[data-item=\"{id}\"]'))")
+        ),
+        Value::Bool(true),
+        "a digit pressed on the fold replaced the card with a receipt"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} textarea[name=reply]').value")
+        ),
+        typed,
+        "the digit rewrote or cleared the note"
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array().expect("open rows").len(),
+        1,
+        "a digit pressed on the fold settled the row: {open}"
+    );
+    assert!(
+        open[0]["decision"].is_null(),
+        "a digit pressed on the fold recorded a verdict: {open}"
+    );
 }
 
 /// Three decisions on one page load, each through a different surface: an
@@ -28587,13 +29135,13 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     note_field
         .type_into(" Parked again; a seat frees up on 2026-10-01. ")
         .expect("type the note");
-    tab.wait_for_element(&format!(
-        "{} .alternative button.choice[value=keep-parked]",
-        card_form(noted_id)
-    ))
-    .expect("the deferral alternative")
-    .click()
-    .expect("pick the alternative");
+    click_control(
+        &tab,
+        &format!(
+            "{} .alternative button.choice[value=keep-parked]",
+            card_form(noted_id)
+        ),
+    );
     assert_noted_receipt(&tab, noted_id, "Keep it parked until a seat frees up");
     let row = settled_row(&fixture, noted_id);
     assert_eq!(row["decision"]["choice"], "keep-parked", "{row}");
@@ -28653,17 +29201,15 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     );
     tab.press_key("Backspace").expect("delete the digit");
     assert_eq!(field_value(&tab, deferred_id), draft);
-    tab.wait_for_element(&format!(
-        "{} input[name=outcome][value=defer]",
-        card_form(deferred_id)
-    ))
-    .expect("the defer outcome")
-    .click()
-    .expect("pick defer");
-    tab.wait_for_element(&format!("{} button.record", card_form(deferred_id)))
-        .expect("the submit")
-        .click()
-        .expect("record the answer");
+    open_custom_answer(&tab, &card_form(deferred_id));
+    click_control(
+        &tab,
+        &format!(
+            "{} input[name=outcome][value=defer]",
+            card_form(deferred_id)
+        ),
+    );
+    click_control(&tab, &format!("{} button.record", card_form(deferred_id)));
     assert_receipt(&tab, deferred_id, "Custom answer, recorded as defer");
     let row = settled_row(&fixture, deferred_id);
     assert_eq!(row["decision"]["choice"], "custom", "{row}");
@@ -30421,12 +30967,10 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
     );
 
     hold_projection(&tab);
-    tab.wait_for_element(&format!(
-        "[data-item=\"{attention_id}\"] button.choice[value=approve]"
-    ))
-    .expect("final approval choice")
-    .click()
-    .expect("settle final attention card");
+    click_control(
+        &tab,
+        &format!("[data-item=\"{attention_id}\"] button.choice[value=approve]"),
+    );
     tab.wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
         .expect("final attention receipt");
     wait_for_projection_swap(&tab);
