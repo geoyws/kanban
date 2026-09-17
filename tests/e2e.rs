@@ -834,11 +834,23 @@ fn set_mobile_viewport(tab: &headless_chrome::Tab) {
 /// and the screen agree, so a page laid out against `vh` or against a width
 /// query sees what a phone or a laptop window would show it.
 fn set_viewport(tab: &headless_chrome::Tab, width: u32, height: u32) {
+    set_viewport_with(tab, width, height, width < 700);
+}
+
+/// The same override, with mobile metrics spelled out.
+///
+/// A page of this server carries a viewport meta, so mobile metrics lay it
+/// out at the width asked for. A bare FRAGMENT does not -- it is injected
+/// into a page that has one -- and mobile metrics would lay a fragment out at
+/// Chrome's 980px fallback instead of the width the page gives it. So a
+/// fragment is measured with desktop metrics at the same size, which is the
+/// geometry it actually gets inside the page.
+fn set_viewport_with(tab: &headless_chrome::Tab, width: u32, height: u32, mobile: bool) {
     tab.call_method(Emulation::SetDeviceMetricsOverride {
         width,
         height,
         device_scale_factor: 1.0,
-        mobile: width < 700,
+        mobile,
         scale: None,
         screen_width: Some(width),
         screen_height: Some(height),
@@ -25803,12 +25815,12 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         card,
         &[
             "<p class=eyebrow>",
-            "· asked by codex@driver · waiting ",
+            " asked on ",
             &format!("<h2 id=\"q-{carded_id}\">"),
             "hax has no logged-in Claude account",
             "<p class=context>",
             "Claude Code 2.1.236 is installed on hax",
-            "<fieldset class=recommended><legend>Recommended - press 1</legend>",
+            "<fieldset class=recommended><legend>Recommended</legend>",
             "value=\"assign-and-login\" data-label=\"Assign a Claude seat to hax and log in\"",
             "<span class=key>1</span>",
             "<p class=consequence>You buy or free one Claude seat",
@@ -25818,14 +25830,13 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "value=\"drop-receipt\"",
             "<span class=key>3</span>",
             "<div class=reply><label for=\"answer-",
-            ">Add a note (optional)</label>",
+            ">Add a note</label>",
             "<textarea id=\"answer-",
-            "Sent with whichever answer you pick. Required when you answer in your own words.",
             "<details class=custom data-custom><summary>Answer in my own words</summary>",
             "<legend>recorded as</legend>",
-            "<input type=radio name=outcome value=approve>",
-            "<input type=radio name=outcome value=other>",
-            "name=decision value=custom>Record this answer",
+            "name=outcome value=approve>",
+            "name=outcome value=other>",
+            "name=decision value=custom>Record my answer",
             "<details class=full><summary>show the full item</summary>",
             "<div class=\"body md\"><p>PARKED - until an account is assigned",
             "<p class=meta>",
@@ -26715,15 +26726,16 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
         ),
         "show the full item"
     );
-    // The recommendation is marked, and it is the first CONTROL in the card:
-    // the only focusable thing ahead of it is the eyebrow's board reference,
-    // which navigates and decides nothing.
+    // The recommendation is marked -- by the one word, because the digit is
+    // already on the button itself -- and it is the first CONTROL in the
+    // card: the only focusable thing ahead of it is the eyebrow's board
+    // reference, which navigates and decides nothing.
     assert_eq!(
         js_value(
             &tab,
             &format!("document.querySelector('{form} fieldset.recommended > legend').textContent")
         ),
-        "Recommended - press 1"
+        "Recommended"
     );
     assert_eq!(
         js_value(
@@ -27017,7 +27029,7 @@ fn a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one() {
             .get_inner_text()
             .expect("empty text")
             .trim(),
-        "Nothing is waiting. An empty list here means every raised item has been settled."
+        "Nothing is waiting. Every question an agent raised has an answer."
     );
     assert_receipt(&tab, id, "Custom answer, recorded as other");
     let row = settled_row(&fixture, id);
@@ -27195,7 +27207,7 @@ fn recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome() {
             &tab,
             &format!(
                 "document.querySelector('article.decided[data-item=\"{second_id}\"] \
-                 .outcome').textContent"
+                 .decision .pill.status-approve').textContent"
             )
         ),
         "approve"
@@ -27640,16 +27652,32 @@ fn a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome() {
         true,
         "a live refresh cleared the picked verdict"
     );
-    // Held deliberately, rather than never attempted.
-    wait_for_live(&tab, "update waiting");
+    // Held deliberately, rather than never attempted -- and said in nothing
+    // but the socket's own words: the connection line says whether this
+    // document is hearing from the boards, not what the page is doing with
+    // a draft (WEB-52), so it still reads `live` while the swap waits.
+    wait_for_live(&tab, "live");
 
     // A hold nobody can release is a frozen page, so Escape inside the card
     // unpicks the verdict -- the cursor is still on the radio the click put
     // it on -- and the projection this one write was holding then lands. The
     // swap is provoked by a second write, so the refresh being waited for is
     // one that could not already have happened.
-    tab.press_key("Escape")
-        .expect("escape releases the verdict");
+    //
+    // Escape clears whatever is over the page first, and the boards' own
+    // writes have been putting toasts there throughout this case (WEB-19),
+    // so the key is pressed until the verdict itself is released rather than
+    // once: the outermost thing goes first, deliberately.
+    for _ in 0..8 {
+        if js_value(&tab, &format!("document.querySelector('{picked}').checked"))
+            == Value::Bool(false)
+        {
+            break;
+        }
+        tab.press_key("Escape")
+            .expect("escape releases the verdict");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_eq!(
         js_value(&tab, &format!("document.querySelector('{picked}').checked")),
         false,
@@ -27771,26 +27799,14 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
     answer.type_into(typed).expect("type the answer");
     open_custom_answer(&tab, &form);
     click_control(&tab, &picked);
-    // The live line is stamped with a sentinel first, the way hold_projection
-    // pokes the DOM: 'update waiting' is written by BOTH gates, so without
-    // this the barrier could be satisfied by the first gate refusing a later
-    // refresh frame while the typing was still going on -- and would then
-    // pass with the second gate deleted.
-    assert_eq!(
-        js_value(
-            &tab,
-            "(() => { document.querySelector('[data-live]').textContent = 'gate sentinel'; \
-             return true; })()"
-        ),
-        true
-    );
+    // The barrier is the gate's own record of delivery rather than a word on
+    // the live line: the connection line says only what the socket is doing
+    // (WEB-52), so "a projection arrived and was refused" is observed where
+    // it happens -- the response reached the page, and `<main>` is still the
+    // held one.
     assert_eq!(js_value(&tab, "window.__gate.release()"), true);
     for _ in 0..200 {
-        if js_value(
-            &tab,
-            "window.__gate.delivered && document.querySelector('[data-live]').textContent === 'update waiting'",
-        ) == Value::Bool(true)
-        {
+        if js_value(&tab, "window.__gate.delivered") == Value::Bool(true) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -27801,8 +27817,8 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
         "the held projection response never reached the page"
     );
     assert_eq!(
-        js_value(&tab, "document.querySelector('[data-live]').textContent"),
-        "update waiting",
+        js_value(&tab, "document.querySelector('main').dataset.generation"),
+        "held",
         "the delivered projection was not held back by the gate after the fetch"
     );
     // And it stays unswapped: two more socket ticks with the answer in hand.
@@ -28038,7 +28054,7 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
     );
 
     // The other card still holds its words, and completing it clears the
-    // refusal rather than leaving a red alert over a recorded answer.
+    // refusal rather than leaving a red sentence over a recorded answer.
     click_control(
         &tab,
         &format!("{} input[name=outcome][value=defer]", form(words_id)),
@@ -28771,20 +28787,38 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
         ),
         label.as_str()
     );
-    // Nothing on the card can post a second time while the first is open.
+    // Nothing on the card can post a second time while the first is open --
+    // and the way that is stopped is the form's own guard, not a row of
+    // greyed-out buttons: a disabled answer reads as an answer that can no
+    // longer be given (WEB-17), so the pressed one wears the mark and the
+    // rest stay live.
     assert_eq!(
         js_value(
             &tab,
             &format!(
                 "(() => {{ const controls = [...document.querySelectorAll('{} .choice, {} .record, {} .undo-button')]; \
-                 return controls.length > 1 && controls.every(control => control.disabled); }})()",
+                 return controls.length > 1 && controls.every(control => !control.disabled); }})()",
                 card(held_id),
                 card(held_id),
                 card(held_id)
             )
         ),
         Value::Bool(true),
-        "a decision in flight left its own controls live"
+        "a decision in flight greyed out the answers instead of marking the pressed one"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "(() => {{ const form = document.querySelector('{} form.decide'); \
+                 const pressed = [...form.querySelectorAll('[data-pressed]')]; \
+                 return form.dataset.deciding === '1' && pressed.length === 1 \
+                 && pressed[0].matches('.choice'); }})()",
+                card(held_id)
+            )
+        ),
+        Value::Bool(true),
+        "the card in flight is not guarded by its form, or marks more than the pressed answer"
     );
     wait_for_live(&tab, "sending");
     assert_eq!(
@@ -28793,19 +28827,20 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
         "a receipt was rendered before the board answered"
     );
 
-    // The board answers, and the card becomes its receipt with the flash
-    // that says so.
+    // The board answers, and the card becomes a receipt that carries its
+    // own outcome rather than a flash.
     assert_eq!(js_value(&tab, "window.__answer(200)"), true);
     assert_receipt(&tab, held_id, &label);
     assert_eq!(
         js_value(
             &tab,
             &format!(
-                "document.querySelector('p.receipt[data-receipt=\"{held_id}\"]').classList.contains('landed')"
+                "(() => {{ const r = document.querySelector('p.receipt[data-receipt=\"{held_id}\"]'); \
+                 return r.className; }})()"
             )
         ),
-        Value::Bool(true),
-        "the landed receipt carries no flash, so the swap is easy to miss"
+        "receipt outcome-approve",
+        "the receipt does not carry the outcome it recorded"
     );
     assert_eq!(
         js_value(
@@ -29270,9 +29305,10 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
         format!("{KEEP_PARKED}\nNote: Parked again; a seat frees up on 2026-10-01."),
         "{row}"
     );
-    // The live socket saw that write and the page said so rather than
-    // re-rendering over the draft.
-    wait_for_live(&tab, "update waiting");
+    // The live socket saw that write and refused to re-render over the
+    // draft, while the connection line went on saying only what the socket
+    // is doing (WEB-52).
+    wait_for_live(&tab, "live");
     assert_eq!(field_value(&tab, deferred_id), draft);
 
     // `2` picks the second choice of the card that has focus. This row
@@ -46312,6 +46348,7 @@ const DECK_MEASURE: &str = r#"(() => {
   const body = card.querySelector('details.full .body');
   const decide = card.querySelector('form.decide');
   const heading = card.querySelector('h2');
+  const context = card.querySelector('p.context');
   const round = value => Math.round(value);
   return JSON.stringify({
     width: innerWidth,
@@ -46325,6 +46362,13 @@ const DECK_MEASURE: &str = r#"(() => {
     decideBottom: round(decide.getBoundingClientRect().bottom),
     decideHeight: round(decide.getBoundingClientRect().height),
     headingTop: round(heading.getBoundingClientRect().top),
+    contextTop: round(context.getBoundingClientRect().top),
+    contextBottom: round(context.getBoundingClientRect().bottom),
+    contextScrollHeight: context.scrollHeight,
+    contextClientHeight: context.clientHeight,
+    contextOverflow: getComputedStyle(context).overflowY,
+    cardTop: round(card.getBoundingClientRect().top),
+    cardBottom: round(card.getBoundingClientRect().bottom),
     aside: document.querySelector('[data-side]').checkVisibility(),
     toggle: document.querySelector('[data-history-toggle]').checkVisibility(),
   });
@@ -46394,6 +46438,23 @@ fn the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome() {
             number("headingTop") >= 0,
             "the question is above the top of the screen at {width}x{height}: {measured}"
         );
+        // The raiser's context is INSIDE what scrolls, above the long form,
+        // and it is never a clipped region of its own: George's screenshots
+        // showed it cut off mid-sentence, which is the one thing a card must
+        // never do to the paragraph that says what the question means.
+        assert!(
+            number("contextTop") >= number("cardTop") - 1
+                && number("contextBottom") <= number("cardBottom") + 1,
+            "the context is outside the card's own scroll region at {width}x{height}: {measured}"
+        );
+        assert!(
+            number("contextScrollHeight") <= number("contextClientHeight") + 1,
+            "the context is clipped mid-sentence at {width}x{height}: {measured}"
+        );
+        assert_eq!(
+            measured["contextOverflow"], "visible",
+            "the context clips what it cannot fit at {width}x{height}: {measured}"
+        );
         assert_eq!(
             measured["aside"],
             Value::Bool(width >= 900),
@@ -46460,12 +46521,8 @@ fn pressing_1_sends_and_advances_to_the_next_card_in_real_chrome() {
     let tab = decision_tab(&chrome, &origin);
     let label = card_choices()[0]["label"].as_str().unwrap().to_owned();
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-deck-position]').textContent + ' of ' \
-             + document.querySelector('[data-open-count]').textContent"
-        ),
-        "1 of 3"
+        js_value(&tab, "document.querySelector('.progress').textContent"),
+        "3 left"
     );
 
     hold_projection(&tab);
@@ -46499,13 +46556,9 @@ fn pressing_1_sends_and_advances_to_the_next_card_in_real_chrome() {
         "the deck did not advance to the next card"
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-deck-position]').textContent + ' of ' \
-             + document.querySelector('[data-open-count]').textContent"
-        ),
-        "1 of 2",
-        "the queue's position line disagrees with the queue"
+        js_value(&tab, "document.querySelector('.progress').textContent"),
+        "2 left",
+        "the bar's count disagrees with the queue"
     );
     assert_eq!(
         js_value(
@@ -46569,12 +46622,8 @@ fn skip_moves_the_card_to_the_back_without_recording_in_real_chrome() {
         ),
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-deck-position]').textContent + ' of ' \
-             + document.querySelector('[data-open-count]').textContent"
-        ),
-        "1 of 3",
+        js_value(&tab, "document.querySelector('.progress').textContent"),
+        "3 left",
         "a skip changed how much is open"
     );
     assert_eq!(
@@ -46674,12 +46723,8 @@ fn a_refused_decision_brings_the_card_back_in_real_chrome() {
         "a refused card did not come back as the card on screen"
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-deck-position]').textContent + ' of ' \
-             + document.querySelector('[data-open-count]').textContent"
-        ),
-        "1 of 3",
+        js_value(&tab, "document.querySelector('.progress').textContent"),
+        "3 left",
         "a refusal left the queue counting a decision that never happened"
     );
     assert_eq!(
@@ -46854,7 +46899,7 @@ fn the_all_route_keeps_the_plain_list_in_real_chrome_or_http() {
         "the list is a deck: {list}"
     );
     assert!(
-        list.contains("<p class=count><span data-open-count>3</span> open across 1 board."),
+        list.contains("<p class=count><span data-open-count>3</span> open across 1 board</p>"),
         "{list}"
     );
     assert!(
@@ -46938,14 +46983,30 @@ fn the_last_card_leaves_the_empty_state_in_real_chrome() {
             &tab,
             "document.querySelector('[data-deck-cards] .empty').textContent"
         ),
-        "Nothing is waiting. An empty list here means every raised item has been settled."
+        "Nothing is waiting. Every question an agent raised has an answer."
     );
-    // The position line is gone rather than counting a queue that is not
+    // ...and the way on from it is a link, not a dead end. Whoever rendered
+    // the empty state -- the page from its template, or the projection that
+    // may already have landed -- it is the same block with the same link,
+    // which is the point of shipping one wording.
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { const a = document.querySelector('[data-deck-cards] .empty-queue a'); \
+             return a.getAttribute('href') + '|' + a.textContent; })()"
+        ),
+        "/decided|See what was decided"
+    );
+    // The bar's count is gone rather than counting a queue that is not
     // there, and the decision is on screen in the history.
     assert_eq!(
-        js_value(&tab, "document.querySelector('.deck-head').hidden"),
+        js_value(
+            &tab,
+            "(() => { const bar = document.querySelector('.progress'); \
+             return !bar || bar.hidden; })()"
+        ),
         Value::Bool(true),
-        "the progress line is still counting an empty queue"
+        "the bar is still counting an empty queue"
     );
     wait_for_js_true(&tab, "Boolean(document.querySelector('[data-history] p'))");
 
@@ -47055,5 +47116,1948 @@ fn the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http() {
         measured["navRect"]["width"].as_i64().unwrap_or(0) > 0
             && measured["navRect"]["height"].as_i64().unwrap_or(0) > 0,
         "a link with no box is a link nobody can press: {measured}"
+    );
+}
+
+// --- the spec's own browser-layer cases (docs/specs/web-ui.md §8) -----------
+// Every case below is named by that table. They are the half of this slice
+// that cannot be read off the stylesheet: what Chrome COMPUTED, on a real
+// deck served by the real binary, at the widths George decides on.
+
+/// One deck, one browser, one board behind it: the four lines every §8 case
+/// opens with, in one place.
+///
+/// The field order is the drop order, and it matters: the tab has to go
+/// before the browser that owns it, and the server before the fixture whose
+/// data directory it is reading.
+struct Desk {
+    tab: Arc<headless_chrome::Tab>,
+    _chrome: Browser,
+    server: ServerGuard,
+    fixture: Fixture,
+    ids: Vec<String>,
+}
+
+fn deck_desk(label: &str, board: &str) -> Desk {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture(label, board);
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &server.origin());
+    // `article.item` is in the SERVED markup -- the deck is a plain list
+    // until its script runs -- so a case that presses a key the moment the
+    // element exists can press it into a page with no key handler yet. The
+    // deck is ready when it has made a card current and put the keyboard on
+    // it, which is the same act that makes `1` a decision.
+    wait_for_js_true(
+        &tab,
+        "Boolean(document.querySelector('article.item[data-current]')) \
+         && document.activeElement === document.querySelector('article.item[data-current]')",
+    );
+    Desk {
+        tab,
+        _chrome: chrome,
+        server,
+        fixture,
+        ids,
+    }
+}
+
+/// A design token as the PAGE resolves it, not as a test transcribes it: a
+/// probe takes `color:var(--name)` and reports what Chrome computed, so
+/// "this fill is `--green`" is one comparison of two computed values. The
+/// hexes themselves are pinned at the unit layer (WEB-08).
+fn token(tab: &headless_chrome::Tab, name: &str) -> String {
+    const PROBE: &str = "(() => { const probe = document.createElement('span'); \
+         probe.style.color = 'var(__NAME__)'; document.body.append(probe); \
+         const value = getComputedStyle(probe).color; probe.remove(); return value; })()";
+    let resolved = js_value(tab, &PROBE.replace("__NAME__", name));
+    resolved
+        .as_str()
+        .unwrap_or_else(|| panic!("resolve {name}: {resolved}"))
+        .to_owned()
+}
+
+/// Run one JSON measurement in the page and parse it, so a malformed
+/// measurement fails by name instead of as a serde error with no context.
+fn measure(tab: &headless_chrome::Tab, expression: &str, label: &str) -> Value {
+    let raw = js_value(tab, expression);
+    let text = raw
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} did not return a string: {raw}"));
+    serde_json::from_str(text).unwrap_or_else(|error| panic!("{label} parses ({error}): {text}"))
+}
+
+/// Put the page on one route and wait for it to be the page it names.
+fn go(tab: &headless_chrome::Tab, origin: &str, route: &str) {
+    let url = format!("{}{}", origin.trim_end_matches('/'), route);
+    tab.navigate_to(&url)
+        .unwrap_or_else(|error| panic!("load {route}: {error}"));
+    tab.wait_until_navigated()
+        .unwrap_or_else(|error| panic!("navigate to {route}: {error}"));
+    wait_for_js_true(tab, "document.readyState === 'complete'");
+}
+
+/// Every animation the page starts, recorded at the document so the record
+/// survives the projection swap that replaces `<main>`.
+const ANIMATION_WATCH: &str = r#"(() => {
+  window.__animations = [];
+  document.addEventListener('animationstart', event => {
+    window.__animations.push({
+      name: event.animationName,
+      duration: getComputedStyle(event.target).animationDuration,
+      item: event.target.dataset ? (event.target.dataset.item || null) : null,
+      classes: event.target.className,
+    });
+  }, true);
+  return true;
+})()"#;
+
+const HEADLINE_MEASURE: &str = r#"(() => {
+  const card = document.querySelector('article.item[data-current]');
+  const head = card.querySelector('h2');
+  const style = getComputedStyle(head);
+  const size = el => parseFloat(getComputedStyle(el).fontSize) || 0;
+  const mine = size(head);
+  const bigger = [...document.querySelectorAll('body *')]
+    .filter(el => el !== head && el.checkVisibility() && size(el) >= mine)
+    .map(el => `${el.tagName.toLowerCase()}.${el.className}@${size(el)}`);
+  return JSON.stringify({
+    width: innerWidth,
+    family: style.fontFamily,
+    weight: style.fontWeight,
+    size: mine,
+    lineHeight: parseFloat(style.lineHeight),
+    text: head.textContent.slice(0, 48),
+    bigger,
+  });
+})()"#;
+
+/// WEB-02, WEB-07 — the question is set as a headline, and it is the
+/// largest thing on the screen.
+///
+/// The stylesheet's own declarations are pinned at the unit layer; what this
+/// case adds is that the cascade actually lands them on the card's `h2` on
+/// both screens, and that nothing else on the page grew to match it. The
+/// serif is identified by two faces that appear only in the serif stack --
+/// a `font-family` that merely ENDS in `serif` would also be the sans
+/// stack's `sans-serif`.
+#[test]
+fn the_question_is_set_as_a_headline_in_real_chrome() {
+    let desk = deck_desk("serve-deck-headline", "DECKHEAD");
+    for (width, height, floor) in [(390_u32, 844_u32, 28.0_f64), (1280, 800, 36.0)] {
+        set_viewport(&desk.tab, width, height);
+        wait_for_js_true(&desk.tab, &format!("innerWidth === {width}"));
+        let measured = measure(&desk.tab, HEADLINE_MEASURE, "the headline measurement");
+        eprintln!("headline at {width}x{height}: {measured}");
+        let family = measured["family"].as_str().expect("font-family");
+        assert!(
+            family.contains("ui-serif") && family.contains("Georgia"),
+            "the question is not set in the serif stack at {width}: {measured}"
+        );
+        assert!(
+            !family.contains("-apple-system"),
+            "the question is set in the sans stack at {width}: {measured}"
+        );
+        assert_eq!(measured["weight"], "600", "{measured}");
+        let size = measured["size"].as_f64().expect("font-size");
+        assert!(
+            size >= floor,
+            "the question is below the scale's floor of {floor}px at {width}: {measured}"
+        );
+        assert!(
+            measured["lineHeight"].as_f64().expect("line-height") <= size * 1.15 + 0.5,
+            "the headline is leaded out at {width}: {measured}"
+        );
+        assert_eq!(
+            measured["bigger"].as_array().expect("bigger").len(),
+            0,
+            "something on the page is set as large as the question at {width}: {measured}"
+        );
+    }
+}
+
+const FILL_MEASURE: &str = r#"(() => {
+  const card = document.querySelector('article.item[data-current]');
+  const form = card.querySelector('form.decide');
+  const lead = form.querySelector('fieldset.recommended button.choice');
+  const others = [...form.querySelectorAll('.alternative button.choice')];
+  const panelStyle = getComputedStyle(form);
+  const inner = form.clientWidth
+    - parseFloat(panelStyle.paddingLeft) - parseFloat(panelStyle.paddingRight);
+  const side = document.querySelector('[data-side]');
+  return JSON.stringify({
+    leadBackground: getComputedStyle(lead).backgroundColor,
+    leadColor: getComputedStyle(lead).color,
+    leadWidth: Math.round(lead.getBoundingClientRect().width),
+    panelWidth: Math.round(inner),
+    panelBackground: panelStyle.backgroundColor,
+    panelSurface: panelStyle.backgroundImage,
+    panelStops: (panelStyle.backgroundImage.match(/rgba?\([^)]*\)/g) || []),
+    bodyBackground: getComputedStyle(document.body).backgroundColor,
+    others: others.map(el => getComputedStyle(el).backgroundColor),
+    sideBackground: side && side.checkVisibility()
+      ? getComputedStyle(side).backgroundColor : null,
+  });
+})()"#;
+
+/// WEB-12 — the recommendation leads, on fill.
+///
+/// The critique this slice answers was that the recommendation did not lead:
+/// four outlined boxes of equal weight. So the one filled control on the
+/// page is the advised answer, it is filled in its own outcome's hue with
+/// the desk colour as its text, it spans the panel, and every alternative is
+/// the quiet surface fill. The desk itself is two surfaces and no more.
+#[test]
+fn the_recommendation_leads_on_fill_in_real_chrome() {
+    let desk = deck_desk("serve-deck-fill", "DECKFILL");
+    set_viewport(&desk.tab, 1280, 800);
+    wait_for_js_true(&desk.tab, "innerWidth === 1280");
+    let green = token(&desk.tab, "--green");
+    let base = token(&desk.tab, "--base");
+    let mantle = token(&desk.tab, "--mantle");
+    let surface0 = token(&desk.tab, "--surface0");
+    let measured = measure(&desk.tab, FILL_MEASURE, "the fill measurement");
+    eprintln!("fills at 1280x800: {measured}");
+    // The fixture's recommendation is the `approve` choice, so its fill is
+    // the approve hue and nothing else.
+    assert_eq!(measured["leadBackground"], green.as_str(), "{measured}");
+    assert_eq!(measured["leadColor"], base.as_str(), "{measured}");
+    assert_eq!(
+        measured["leadWidth"], measured["panelWidth"],
+        "the recommendation does not span the answer panel: {measured}"
+    );
+    let others = measured["others"].as_array().expect("the alternatives");
+    assert_eq!(others.len(), 2, "{measured}");
+    for fill in others {
+        assert_eq!(
+            fill,
+            &Value::String(surface0.clone()),
+            "an alternative is filled like the recommendation: {measured}"
+        );
+    }
+    assert_eq!(measured["bodyBackground"], base.as_str(), "{measured}");
+    // The panel's surface is the second desk surface, painted as a gradient
+    // whose first two rem are transparent so the card's own text dissolves
+    // into it instead of meeting an opaque edge. So the claim is read off
+    // the surface rather than off `background-color`: the band on top is
+    // clear, everything below it is `--mantle`, and the band is two rem.
+    let stops = measured["panelStops"]
+        .as_array()
+        .expect("the panel's stops");
+    assert_eq!(
+        stops.len(),
+        2,
+        "the answer panel is not one two-stop surface: {measured}"
+    );
+    assert_eq!(
+        stops[0], "rgba(0, 0, 0, 0)",
+        "the answer panel's top edge is opaque, so text is cut rather than faded: {measured}"
+    );
+    assert_eq!(
+        stops[1],
+        mantle.as_str(),
+        "the answer panel is not the second desk surface: {measured}"
+    );
+    assert!(
+        measured["panelSurface"]
+            .as_str()
+            .expect("the panel's surface")
+            .contains("32px"),
+        "the answer panel's fade is not the two rem the design declares: {measured}"
+    );
+    assert_eq!(
+        measured["sideBackground"],
+        mantle.as_str(),
+        "the side column is not the second desk surface: {measured}"
+    );
+    open_nav_drawer(&desk.tab);
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            "getComputedStyle(document.querySelector('[data-drawer]')).backgroundColor"
+        ),
+        mantle.as_str(),
+        "the open drawer is not the second desk surface"
+    );
+}
+
+/// Every drawn border, outline and shadow on the page, with the one
+/// allowlisted hairline each carrier is allowed named alongside it.
+const BOX_SWEEP: &str = r#"(() => {
+  const ALLOW = 'form.decide, p.receipt, [aria-current=page], tr, th, td, ul.rows>li, ul.children>li';
+  const sides = ['Top', 'Right', 'Bottom', 'Left'];
+  const offenders = [];
+  const hairlines = [];
+  let swept = 0;
+  for (const el of document.querySelectorAll('body *')) {
+    if (!el.checkVisibility()) continue;
+    swept += 1;
+    const style = getComputedStyle(el);
+    const drawn = sides
+      .map(side => ({
+        side,
+        width: parseFloat(style[`border${side}Width`]) || 0,
+        style: style[`border${side}Style`],
+        color: style[`border${side}Color`],
+      }))
+      .filter(edge => edge.width > 0 && edge.style !== 'none');
+    const where = `${el.tagName.toLowerCase()}.${el.className}`;
+    if (drawn.length > 0) {
+      if (!el.matches(ALLOW)) {
+        offenders.push({kind: 'border', where, drawn});
+      } else if (drawn.length > 1) {
+        offenders.push({kind: 'two-sided', where, drawn});
+      } else {
+        hairlines.push({where, width: drawn[0].width, color: drawn[0].color});
+      }
+    }
+    if (style.boxShadow !== 'none') {
+      offenders.push({kind: 'shadow', where, shadow: style.boxShadow});
+    }
+    const outline = parseFloat(style.outlineWidth) || 0;
+    if (outline > 0 && style.outlineStyle !== 'none' && el !== document.activeElement) {
+      offenders.push({kind: 'outline', where, outline, style: style.outlineStyle});
+    }
+  }
+  return JSON.stringify({swept, offenders: offenders.slice(0, 12), offences: offenders.length, hairlines});
+})()"#;
+
+/// WEB-13 — nothing is boxed.
+///
+/// The stylesheet's allowlist is a unit test (WEB-09); this is the same
+/// claim about what Chrome drew, on every page this slice restyles. The
+/// first screenshot round is why it exists: the deck drew a 2px ring around
+/// the whole card -- the focus ring, on a card the deck focuses so `1`
+/// decides without a click -- and no rule in the stylesheet said so.
+///
+/// A border is allowed only on the carriers WEB-09 names, only one edge of
+/// them, and never as a second edge that would make the row a box again.
+#[test]
+fn nothing_is_boxed_in_real_chrome() {
+    let desk = deck_desk("serve-deck-boxes", "DECKBOX");
+    let origin = desk.server.origin();
+    let surface0 = token(&desk.tab, "--surface0");
+    let surface1 = token(&desk.tab, "--surface1");
+    let text = token(&desk.tab, "--text");
+    for route in ["/", "/all", "/decided", "/boards", "/board/DECKBOX"] {
+        go(&desk.tab, &origin, route);
+        let measured = measure(&desk.tab, BOX_SWEEP, "the box sweep");
+        eprintln!("boxes on {route}: {measured}");
+        assert!(
+            measured["swept"].as_i64().unwrap_or(0) > 10,
+            "{route} swept almost nothing, so this proves nothing: {measured}"
+        );
+        assert_eq!(
+            measured["offences"], 0,
+            "{route} draws a box, a shadow or an unfocused outline: {measured}"
+        );
+        // ...and every hairline that IS drawn is the hairline, in one of the
+        // two colours the design has for a separator or a rule.
+        for hairline in measured["hairlines"].as_array().expect("the hairlines") {
+            let width = hairline["width"].as_f64().unwrap_or(0.0);
+            let colour = hairline["color"].as_str().unwrap_or_default();
+            assert!(
+                (width - 1.0).abs() < 0.5 || (width - 2.0).abs() < 0.5 || (width - 3.0).abs() < 0.5,
+                "{route} draws a rule that is none of the three the design has: {hairline}"
+            );
+            assert!(
+                colour == surface0
+                    || colour == surface1
+                    || colour == text
+                    || colour.starts_with("rgb("),
+                "{route} draws a rule in a colour off the token block: {hairline}"
+            );
+        }
+    }
+}
+
+/// Headless Chrome answers `prefers-reduced-motion` with `reduce` unless it
+/// is told otherwise, so every case whose subject is motion states the
+/// preference it is measuring under. Without this, "nothing animated" would
+/// be true of a browser that never animates anything.
+fn emulate_motion(tab: &headless_chrome::Tab, value: &str) {
+    tab.call_method(Emulation::SetEmulatedMedia {
+        media: None,
+        features: Some(vec![Emulation::MediaFeature {
+            name: "prefers-reduced-motion".to_owned(),
+            value: value.to_owned(),
+        }]),
+    })
+    .unwrap_or_else(|error| panic!("emulate prefers-reduced-motion:{value}: {error}"));
+    wait_for_js_true(
+        tab,
+        &format!(
+            "matchMedia('(prefers-reduced-motion: reduce)').matches === {}",
+            value == "reduce"
+        ),
+    );
+}
+
+/// What the stylesheet resolves the advance to, read off a card the deck is
+/// not showing: the two classes the advance is made of, each asked for its
+/// computed `animation-name` and put back.
+const ADVANCE_PROBE: &str = r#"(() => {
+  const probe = [...document.querySelectorAll('[data-deck-cards] article.item')]
+    .find(card => !card.hasAttribute('data-current'));
+  const resolve = name => {
+    probe.classList.add(name);
+    const animation = getComputedStyle(probe).animationName;
+    probe.classList.remove(name);
+    return animation;
+  };
+  return JSON.stringify({entering: resolve('entering'), leaving: resolve('leaving')});
+})()"#;
+
+/// Every `@keyframes` the document actually parsed, frame by frame, out of
+/// the CSSOM rather than out of the source string.
+const KEYFRAME_READ: &str = r#"(() => {
+  const frames = {};
+  for (const sheet of document.styleSheets) {
+    for (const rule of sheet.cssRules) {
+      if (rule.type !== CSSRule.KEYFRAMES_RULE) continue;
+      frames[rule.name] = [...rule.cssRules].map(frame => ({
+        at: frame.keyText,
+        transform: frame.style.transform,
+        opacity: frame.style.opacity,
+      }));
+    }
+  }
+  return JSON.stringify(frames);
+})()"#;
+
+/// WEB-15 — the advance is 140 ms each way.
+///
+/// Read as the spec states it: what the leaving and entering nodes COMPUTE.
+/// Both resolve to 140ms, the out frame ends 16px to the left and the in
+/// frame starts 16px to the right, and one decision produces the advance
+/// once — no third animation and no second run of the same one.
+///
+/// The counted half is deliberately a bound rather than an equality. The
+/// leaving card is a ghost the page destroys 140ms after it is made, so on a
+/// machine whose first frame after the keystroke takes longer than that, its
+/// `animationstart` never fires — a fact about the host's frame budget, not
+/// about the advance. What must never happen is a THIRD animation, or a
+/// second run of one of the two, and that is what is asserted.
+#[test]
+fn the_advance_runs_once_at_140ms_each_way_in_real_chrome() {
+    let desk = deck_desk("serve-deck-advance-motion", "DECKMOTION");
+    // Motion on, explicitly: this case is about the one animation the design
+    // has, and a browser that reports a reduced-motion preference would have
+    // nothing to measure.
+    emulate_motion(&desk.tab, "no-preference");
+
+    // What the two nodes of an advance compute, on a real card.
+    let resolved = measure(
+        &desk.tab,
+        r#"(() => {
+  const probe = [...document.querySelectorAll('[data-deck-cards] article.item')]
+    .find(card => !card.hasAttribute('data-current'));
+  const resolve = name => {
+    probe.classList.add(name);
+    const style = getComputedStyle(probe);
+    const out = {animation: style.animationName, duration: style.animationDuration};
+    probe.classList.remove(name);
+    return out;
+  };
+  return JSON.stringify({entering: resolve('entering'), leaving: resolve('leaving')});
+})()"#,
+        "the advance's computed animations",
+    );
+    eprintln!("advance resolves to: {resolved}");
+    assert_eq!(resolved["leaving"]["animation"], "deck-out", "{resolved}");
+    assert_eq!(resolved["leaving"]["duration"], "0.14s", "{resolved}");
+    assert_eq!(resolved["entering"]["animation"], "deck-in", "{resolved}");
+    assert_eq!(resolved["entering"]["duration"], "0.14s", "{resolved}");
+
+    // ...and where each of them travels, read off the parsed keyframes.
+    let frames = measure(&desk.tab, KEYFRAME_READ, "the keyframes");
+    eprintln!("keyframes: {frames}");
+    let frame = |name: &str, at: &str| -> String {
+        frames[name]
+            .as_array()
+            .unwrap_or_else(|| panic!("@keyframes {name} is missing: {frames}"))
+            .iter()
+            .find(|frame| frame["at"] == at)
+            .unwrap_or_else(|| panic!("@keyframes {name} has no {at} frame: {frames}"))["transform"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(
+        frame("deck-out", "100%"),
+        "translateX(-16px)",
+        "the answered card does not leave 16px to the left: {frames}"
+    );
+    assert_eq!(
+        frame("deck-in", "0%"),
+        "translateX(16px)",
+        "the next card does not arrive from 16px to the right: {frames}"
+    );
+
+    // One decision, and the advance runs once.
+    assert_eq!(js_value(&desk.tab, ANIMATION_WATCH), true);
+    hold_projection(&desk.tab);
+    // The digit is the last input this case makes: the page's own
+    // `preventDefault` is what makes one tap one decision.
+    desk.tab.press_key("1").expect("press 1");
+    wait_for_js_true(
+        &desk.tab,
+        &format!(
+            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            desk.ids[1]
+        ),
+    );
+    wait_for_js_true(&desk.tab, "window.__animations.length >= 1");
+    // Long enough for a second advance to have started if one were coming.
+    std::thread::sleep(Duration::from_millis(400));
+    let ran = measure(
+        &desk.tab,
+        "JSON.stringify({animations: window.__animations})",
+        "the advance that ran",
+    );
+    eprintln!("advance ran: {ran}");
+    let animations = ran["animations"].as_array().expect("the animations");
+    assert!(
+        !animations.is_empty() && animations.len() <= 2,
+        "one decision ran the advance {} times: {ran}",
+        animations.len()
+    );
+    let mut names = animations
+        .iter()
+        .map(|animation| animation["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        animations.len(),
+        "the same half of the advance ran twice: {ran}"
+    );
+    for animation in animations {
+        let name = animation["name"].as_str().unwrap_or_default();
+        assert!(
+            name == "deck-in" || name == "deck-out",
+            "something other than the advance animated on a decision: {ran}"
+        );
+        assert_eq!(
+            animation["duration"], "0.14s",
+            "the advance is not 140ms: {ran}"
+        );
+    }
+    assert!(
+        animations
+            .iter()
+            .any(|animation| animation["name"] == "deck-in"),
+        "the card that arrived did not animate in: {ran}"
+    );
+}
+
+/// Somebody else's question on the same board: ONE ledger event, so the
+/// live socket reports exactly one notice. Two events would be two notices,
+/// and a case counting them would be counting the fixture.
+fn raise_question(fixture: &Fixture, title: &str) {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            title,
+            "--as",
+            "codex@driver-2",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+}
+
+/// Somebody else's task, filed on the same board: also one event, and the
+/// notice it becomes carries the task's own title -- which is what makes
+/// one notice tellable from the next.
+fn file_task(fixture: &Fixture, title: &str, id: &str) {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            title,
+            "--id",
+            id,
+            "--as",
+            "codex@driver-2",
+            "--json",
+        ],
+    );
+}
+
+fn sleep_until(when: Instant) {
+    let now = Instant::now();
+    if when > now {
+        std::thread::sleep(when - now);
+    }
+}
+
+/// WEB-16 — a projection refresh never re-animates the current card.
+///
+/// George's words were "it keeps blinking": every notice swapped all of
+/// `<main>`, so the card being read became a brand new node and the advance
+/// ran again underneath the question. The proof has to be about node
+/// IDENTITY, so a property is written onto the live node before the refresh
+/// and read off whatever node is current afterwards -- markup alone cannot
+/// tell a kept node from an identical replacement.
+#[test]
+fn a_projection_refresh_never_reanimates_the_current_card_in_real_chrome() {
+    let desk = deck_desk("serve-deck-blink", "DECKBLINK");
+    // Motion on: "the card did not re-animate" has to be a fact about the
+    // page rather than about a browser that animates nothing.
+    emulate_motion(&desk.tab, "no-preference");
+    assert_eq!(
+        js_value(&desk.tab, ADVANCE_PROBE),
+        "{\"entering\":\"deck-in\",\"leaving\":\"deck-out\"}",
+        "the advance is not armed, so an unchanged card could not have blinked"
+    );
+    wait_for_live_status(&desk.tab, "live", "the deck's first connect");
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            "(() => { const card = document.querySelector('article.item[data-current]'); \
+             window.__cardAnimations = 0; card.kept = 'the same node'; \
+             card.addEventListener('animationstart', () => { window.__cardAnimations += 1; }, true); \
+             return card.dataset.item; })()"
+        ),
+        desk.ids[0].as_str()
+    );
+    hold_projection(&desk.tab);
+
+    raise_question(&desk.fixture, "An unrelated question from another lane");
+    let rows = wait_for_notice_rows(&desk.tab, 1, "the unrelated change");
+    assert!(
+        rows[0].contains("Attention raised") && rows[0].contains("DECKBLINK"),
+        "the other lane's change did not arrive as a notice: {rows:?}"
+    );
+    wait_for_projection_swap(&desk.tab);
+
+    let measured = measure(
+        &desk.tab,
+        "(() => { const card = document.querySelector('article.item[data-current]'); \
+         return JSON.stringify({item: card.dataset.item, kept: card.kept || null, \
+         animations: window.__cardAnimations, entering: card.classList.contains('entering'), \
+         running: card.getAnimations().length, queue: \
+         document.querySelectorAll('[data-deck-cards] article.item:not([data-sent])').length}); })()",
+        "the refreshed card",
+    );
+    eprintln!("after the refresh: {measured}");
+    assert_eq!(measured["item"], desk.ids[0].as_str(), "{measured}");
+    assert_eq!(
+        measured["kept"], "the same node",
+        "the refresh replaced the card being read: {measured}"
+    );
+    assert_eq!(
+        measured["animations"], 0,
+        "the refresh re-animated the card being read -- the blink: {measured}"
+    );
+    assert_eq!(measured["entering"], false, "{measured}");
+    assert_eq!(
+        measured["running"], 0,
+        "the card being read is still animating after a refresh: {measured}"
+    );
+    // ...and the refresh DID arrive: the raised question is in the queue, so
+    // this is a swap that happened rather than one that never came.
+    assert_eq!(
+        measured["queue"], 4,
+        "the projection did not bring the new question in: {measured}"
+    );
+}
+
+/// WEB-19 — the toast is readable and dismissible.
+///
+/// George: "the toast is too fast". Twenty seconds, held while it is being
+/// read, gone on `Esc`, and never more than three of them -- measured on the
+/// wide desk, where all three have a column to stand in.
+#[test]
+fn a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome() {
+    let desk = deck_desk("serve-deck-toast", "DECKTOAST");
+    set_viewport(&desk.tab, 1280, 800);
+    wait_for_js_true(&desk.tab, "innerWidth === 1280");
+    wait_for_live_status(&desk.tab, "live", "the deck's first connect");
+
+    file_task(&desk.fixture, "The first thing that arrived", "t-toast-1");
+    let rows = wait_for_notice_rows(&desk.tab, 1, "the first notice");
+    let arrived = Instant::now();
+    assert!(rows[0].contains("The first thing that arrived"), "{rows:?}");
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            "document.querySelector('[data-notices] .notice').closest('[role=log]') \
+             === document.querySelector('[data-notices]')"
+        ),
+        true,
+        "a notice arrived outside the log region"
+    );
+
+    // Fifteen seconds in, it is still there. The shipped toast went away
+    // after six, which is the complaint this number answers.
+    sleep_until(arrived + Duration::from_secs(15));
+    assert_eq!(
+        notice_rows_on_page(&desk.tab).len(),
+        1,
+        "the toast went away inside twenty seconds"
+    );
+    // The clock stops while the pointer is on it, so a notice being read is
+    // never taken out from under the eye reading it.
+    desk.tab
+        .find_element("[data-notices] .notice")
+        .expect("the toast")
+        .move_mouse_over()
+        .expect("hover the toast");
+    wait_for_js_true(
+        &desk.tab,
+        "Boolean(document.querySelector('[data-notices] .notice:hover'))",
+    );
+    sleep_until(arrived + Duration::from_secs(24));
+    assert_eq!(
+        notice_rows_on_page(&desk.tab).len(),
+        1,
+        "a hovered toast expired anyway, four seconds past its own life"
+    );
+
+    // And `Esc` takes it away at once, from wherever the keyboard is.
+    desk.tab.press_key("Escape").expect("press Escape");
+    wait_for_js_true(
+        &desk.tab,
+        "document.querySelectorAll('[data-notices] .notice').length === 0",
+    );
+
+    // Three at most, newest first: the fourth arrival pushes the oldest out.
+    let titles = [
+        "The second thing that arrived",
+        "The third thing that arrived",
+        "The fourth thing that arrived",
+        "The fifth thing that arrived",
+    ];
+    for (index, title) in titles.iter().enumerate() {
+        file_task(&desk.fixture, title, &format!("t-toast-{}", index + 2));
+        wait_for_notice_rows(&desk.tab, std::cmp::min(index + 1, 3), title);
+    }
+    let stacked = notice_rows_on_page(&desk.tab);
+    assert_eq!(stacked.len(), 3, "{stacked:?}");
+    assert!(
+        stacked[0].contains("The fifth thing that arrived"),
+        "the stack is not newest first: {stacked:?}"
+    );
+    assert!(
+        stacked[2].contains("The third thing that arrived"),
+        "the stack is not newest first: {stacked:?}"
+    );
+    assert!(
+        !stacked.iter().any(|row| row.contains("The second thing")),
+        "a fourth toast did not push the oldest out: {stacked:?}"
+    );
+}
+
+/// WEB-20 — reduced motion removes the advance too.
+///
+/// The operator who asks for a still page gets a deck that still advances:
+/// the queue moves, nothing slides. The control comes first -- with motion
+/// allowed, the two advance classes resolve to the two keyframes -- so the
+/// `none` below is the media rule doing its job rather than a browser that
+/// never animated anything.
+#[test]
+fn reduced_motion_advances_the_deck_without_animating_in_real_chrome() {
+    let desk = deck_desk("serve-deck-still", "DECKSTILL");
+    emulate_motion(&desk.tab, "no-preference");
+    assert_eq!(
+        js_value(&desk.tab, ADVANCE_PROBE),
+        "{\"entering\":\"deck-in\",\"leaving\":\"deck-out\"}",
+        "the advance is not armed when motion is allowed, so the rule below proves nothing"
+    );
+    emulate_motion(&desk.tab, "reduce");
+    assert_eq!(
+        js_value(&desk.tab, ADVANCE_PROBE),
+        "{\"entering\":\"none\",\"leaving\":\"none\"}",
+        "the advance still resolves to an animation under reduced motion"
+    );
+    assert_eq!(js_value(&desk.tab, ANIMATION_WATCH), true);
+
+    hold_projection(&desk.tab);
+    desk.tab.press_key("1").expect("press 1");
+    wait_for_js_true(
+        &desk.tab,
+        &format!(
+            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            desk.ids[1]
+        ),
+    );
+    let measured = measure(
+        &desk.tab,
+        "JSON.stringify({animations: window.__animations, \
+         current: document.querySelector('[data-current]').dataset.item, \
+         currentAnimation: getComputedStyle(document.querySelector('[data-current]')).animationName, \
+         left: document.querySelector('.progress').textContent})",
+        "the still advance",
+    );
+    eprintln!("reduced motion: {measured}");
+    assert_eq!(
+        measured["animations"].as_array().expect("animations").len(),
+        0,
+        "the deck animated for an operator who asked it not to: {measured}"
+    );
+    assert_eq!(measured["currentAnimation"], "none", "{measured}");
+    assert_eq!(measured["current"], desk.ids[1].as_str(), "{measured}");
+    assert_eq!(
+        measured["left"], "2 left",
+        "the queue did not advance without its animation: {measured}"
+    );
+}
+
+const DRAWER_MEASURE: &str = r#"(() => {
+  const drawer = document.querySelector('[data-drawer]');
+  const search = drawer.querySelector('[data-nav-search] input[name=q]');
+  const links = [...drawer.querySelectorAll('.nav-links a[href]')];
+  const round = value => Math.round(value);
+  return JSON.stringify({
+    background: getComputedStyle(drawer).backgroundColor,
+    searchFirst: links.every(link =>
+      search.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING),
+    searchShown: search.checkVisibility(),
+    links: links.map(link => {
+      const style = getComputedStyle(link);
+      const box = link.getBoundingClientRect();
+      return {
+        nav: link.dataset.nav || null,
+        href: link.getAttribute('href'),
+        height: round(box.height),
+        width: round(box.width),
+        separator: parseFloat(style.borderBottomWidth) || 0,
+        separatorColor: style.borderBottomColor,
+        background: style.backgroundColor,
+        leftRule: parseFloat(style.borderLeftWidth) || 0,
+        leftColor: style.borderLeftColor,
+        current: link.getAttribute('aria-current'),
+      };
+    }),
+  });
+})()"#;
+
+/// WEB-36 — the drawer is rows on the desk surface.
+///
+/// Not a panel of tiles: the second desk surface, one row per destination,
+/// separated by the one hairline, with the search field above all of them --
+/// and every row a thumb can hit.
+#[test]
+fn the_drawer_is_rows_on_the_desk_surface_in_real_chrome() {
+    let desk = deck_desk("serve-deck-drawer", "DECKDRAWER");
+    set_viewport(&desk.tab, 390, 844);
+    wait_for_js_true(&desk.tab, "innerWidth === 390");
+    let mantle = token(&desk.tab, "--mantle");
+    let surface0 = token(&desk.tab, "--surface0");
+    open_nav_drawer(&desk.tab);
+    let measured = measure(&desk.tab, DRAWER_MEASURE, "the drawer measurement");
+    eprintln!("drawer at 390x844: {measured}");
+    assert_eq!(measured["background"], mantle.as_str(), "{measured}");
+    assert_eq!(
+        measured["searchFirst"], true,
+        "search is not above every destination: {measured}"
+    );
+    assert_eq!(measured["searchShown"], true, "{measured}");
+    let links = measured["links"].as_array().expect("the destinations");
+    assert!(
+        links.len() >= 9,
+        "the drawer is missing destinations: {measured}"
+    );
+    for link in links {
+        assert!(
+            link["height"].as_f64().unwrap_or(0.0) >= 44.0,
+            "a destination row is smaller than a thumb: {link}"
+        );
+        assert_eq!(
+            link["separator"].as_f64().unwrap_or(0.0),
+            1.0,
+            "a destination is not separated by the one hairline: {link}"
+        );
+        assert_eq!(
+            link["separatorColor"],
+            surface0.as_str(),
+            "the separator is not the hairline colour: {link}"
+        );
+    }
+}
+
+/// WEB-37 — the current page is marked by a rule, not a fill.
+///
+/// One 2px rule in the text colour on the destination the page is, and
+/// nothing on any other -- checked on two of them, because a mark that is
+/// right on one page and stuck there is not a mark of where you are.
+#[test]
+fn the_current_page_is_marked_by_a_rule_in_real_chrome() {
+    let desk = deck_desk("serve-deck-current", "DECKHERE");
+    let origin = desk.server.origin();
+    let text = token(&desk.tab, "--text");
+    for (route, nav) in [("/", "needs-you"), ("/decided", "decided")] {
+        go(&desk.tab, &origin, route);
+        open_nav_drawer(&desk.tab);
+        let measured = measure(&desk.tab, DRAWER_MEASURE, "the drawer measurement");
+        eprintln!("current page on {route}: {measured}");
+        let drawer_background = measured["background"].as_str().expect("the drawer's fill");
+        let links = measured["links"].as_array().expect("the destinations");
+        let marked = links
+            .iter()
+            .filter(|link| link["current"] == "page")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marked.len(),
+            1,
+            "{route} marks {} destinations as current: {measured}",
+            marked.len()
+        );
+        let here = marked[0];
+        assert_eq!(
+            here["nav"], nav,
+            "{route} marks the wrong destination: {here}"
+        );
+        assert_eq!(
+            here["leftRule"].as_f64().unwrap_or(0.0),
+            2.0,
+            "{route}'s own destination carries no 2px rule: {here}"
+        );
+        assert_eq!(
+            here["leftColor"],
+            text.as_str(),
+            "{route}'s rule is not in the text colour: {here}"
+        );
+        assert_eq!(
+            here["background"], drawer_background,
+            "{route}'s destination is marked by a fill rather than a rule: {here}"
+        );
+        for link in links {
+            if link["current"] == "page" {
+                continue;
+            }
+            assert_eq!(
+                link["leftRule"].as_f64().unwrap_or(0.0),
+                0.0,
+                "{route} rules a destination that is not where we are: {link}"
+            );
+        }
+    }
+}
+
+const WIDTH_SWEEP: &str = r#"(() => {
+  const doc = document.documentElement;
+  let widest = null;
+  let edge = 0;
+  for (const el of document.querySelectorAll('body *')) {
+    if (!el.checkVisibility()) continue;
+    const right = Math.round(el.getBoundingClientRect().right);
+    if (right > edge) { edge = right; widest = el; }
+  }
+  return JSON.stringify({
+    scrollWidth: doc.scrollWidth,
+    clientWidth: doc.clientWidth,
+    innerWidth,
+    heading: (document.querySelector('h1') || {textContent: ''}).textContent.trim(),
+    text: document.body.innerText.slice(0, 2400),
+    widest: widest ? `${widest.tagName.toLowerCase()}.${widest.className}@${edge}` : null,
+    fragment: Boolean(document.querySelector('[data-preview-card]')),
+  });
+})()"#;
+
+/// The server's own source, for the one thing about the server that a test
+/// cannot observe from outside it: which shapes `render` answers at all. The
+/// registry is declared next to that match as `ROUTE_SHAPES`, and a unit test
+/// in `serve.rs` holds the registry to the match's arm count -- so parsing it
+/// here closes the loop without making a module public for a test's sake.
+const SERVE_SOURCE: &str = include_str!("../rust/serve.rs");
+
+/// The shapes `serve.rs` declares, in the order it declares them.
+fn declared_route_shapes() -> Vec<String> {
+    let block = SERVE_SOURCE
+        .split_once("const ROUTE_SHAPES: &[&str] = &[")
+        .expect("serve.rs declares ROUTE_SHAPES")
+        .1
+        .split_once("];")
+        .expect("the registry closes")
+        .0;
+    let mut shapes = Vec::new();
+    let mut rest = block;
+    while let Some(at) = rest.find('"') {
+        let after = &rest[at + 1..];
+        let end = after.find('"').expect("the shape closes");
+        shapes.push(after[..end].to_owned());
+        rest = &after[end + 1..];
+    }
+    assert!(!shapes.is_empty(), "the registry declares no shapes");
+    shapes
+}
+
+/// WEB-44 — nothing overflows sideways, anywhere.
+///
+/// Every route `render` answers, on a board seeded with one of everything
+/// those routes list, at the three widths George reads on. A sideways
+/// scrollbar on a phone is the read pages' commonest way of breaking, and
+/// one route measured is one route proved -- so this sweeps them all, and
+/// names the widest element when one of them fails.
+///
+/// "Them all" is held to the server rather than to this list: every shape
+/// loaded here is checked against `serve.rs`'s own `ROUTE_SHAPES`, which its
+/// unit test holds to `render`'s arm count. The hover previews are in the
+/// sweep too -- they are `render` arms, they are read on a phone, and they
+/// are fragments rather than pages, so they are measured as fragments.
+#[test]
+fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture("serve-deck-routes", "DECKROUTES");
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "sweep", "--as", "fixture-agent", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "A drafted plan the sweep can read",
+            "--id",
+            "e-routes",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "A task the routes sweep can open",
+            "--id",
+            "t-routes",
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--parent",
+            "e-routes",
+            "--tag",
+            "sweep",
+            "--body",
+            "The seeded task's body, written out at the width a raiser writes \
+             it so that a narrow screen has something to wrap.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "new",
+            "The sweep's own sprint",
+            "--id",
+            "sp-routes",
+            "--target-version",
+            "9.9.9",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sprint",
+            "plan",
+            "sp-routes",
+            "--body",
+            "Ship the sweep.",
+            "--candidate",
+            "t-routes",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "sitrep",
+            "post",
+            "The sweep lane has the seeded task in hand.",
+            "--as",
+            "fixture-agent",
+            "--lane",
+            "sweep-lane",
+            "--task",
+            "t-routes",
+            "--json",
+        ],
+    );
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban-sweep",
+            "--commit",
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "--tier",
+            "@_bd",
+            "--environment",
+            "sweep-fixture",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://127.0.0.1:14300",
+            "--task",
+            "t-routes",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"]
+        .as_str()
+        .expect("the deployment")
+        .to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "add",
+            "--id",
+            "sub-routes",
+            "--subject",
+            "task:t-routes",
+            "--relation",
+            "parent:e-routes",
+            "--kind",
+            "checkpoint_added",
+            "--prior-status",
+            "todo",
+            "--current-status",
+            "in_progress",
+            "--tag",
+            "sweep",
+            "--consumer",
+            "codex.queue",
+            "--action",
+            "enqueue-turn",
+            "--timeout-ms",
+            "30000",
+            "--max-retries",
+            "3",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--secret-ref",
+            "codex_queue_token",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    let deployment_route = format!("/deployment/DECKROUTES/{deployment_id}");
+    let attention_preview = format!("/preview/attention/DECKROUTES/{}", ids[0]);
+    let deployment_preview = format!("/preview/deployment/DECKROUTES/{deployment_id}");
+    // Shape, URL, and the seeded record the page must actually have rendered.
+    // The shape is what the registry is compared against; the not-found arm
+    // is the one route with no shape of its own to declare.
+    let routes: Vec<(&str, &str, Option<&str>)> = vec![
+        ("/", "/", Some("DECKROUTES")),
+        ("/all", "/all", Some("open across")),
+        ("/decided", "/decided", None),
+        ("/boards", "/boards", Some("DECKROUTES")),
+        (
+            "/board/{project}",
+            "/board/DECKROUTES",
+            Some("A task the routes sweep can open"),
+        ),
+        ("/lanes", "/lanes", Some("sweep-lane")),
+        ("/sprints", "/sprints", Some("The sweep's own sprint")),
+        (
+            "/sprints/{project}",
+            "/sprints/DECKROUTES",
+            Some("The sweep's own sprint"),
+        ),
+        (
+            "/sprint/{project}/{id}",
+            "/sprint/DECKROUTES/sp-routes",
+            Some("Ship the sweep."),
+        ),
+        (
+            "/plans",
+            "/plans",
+            Some("A drafted plan the sweep can read"),
+        ),
+        ("/deployments", "/deployments", Some("geoyws/kanban-sweep")),
+        ("/subscriptions", "/subscriptions", Some("sub-routes")),
+        ("/search", "/search?q=sweep", Some("sweep")),
+        (
+            "/task/{project}/{id}",
+            "/task/DECKROUTES/t-routes",
+            Some("A task the routes sweep can open"),
+        ),
+        (
+            "/deployment/{project}/{id}",
+            deployment_route.as_str(),
+            Some("geoyws/kanban-sweep"),
+        ),
+        (
+            "/preview/{kind}/{project}/{id}",
+            "/preview/task/DECKROUTES/t-routes",
+            Some("A task the routes sweep can open"),
+        ),
+        (
+            "/preview/{kind}/{project}/{id}",
+            attention_preview.as_str(),
+            Some("pubsub adapter"),
+        ),
+        (
+            "/preview/{kind}/{project}/{id}",
+            deployment_preview.as_str(),
+            Some("geoyws/kanban-sweep"),
+        ),
+        (
+            "/preview/board/{project}",
+            "/preview/board/DECKROUTES",
+            Some("DECKROUTES"),
+        ),
+        ("", "/no-such-page", Some("No page at that address")),
+    ];
+
+    // The list is held to the server: every shape `render` answers is loaded
+    // here, so an arm added without a route in this sweep fails rather than
+    // going unmeasured on a phone.
+    let mut swept = routes
+        .iter()
+        .map(|(shape, _, _)| (*shape).to_owned())
+        .filter(|shape| !shape.is_empty())
+        .collect::<Vec<_>>();
+    swept.sort();
+    swept.dedup();
+    let mut declared = declared_route_shapes();
+    declared.sort();
+    declared.dedup();
+    assert_eq!(
+        swept, declared,
+        "the width sweep does not load every shape render answers"
+    );
+
+    for (shape, route, marker) in routes {
+        // A preview is a fragment rather than a page: no shell, no heading,
+        // and its own card is the thing that has to have rendered.
+        let fragment = shape.starts_with("/preview");
+        for (width, height) in [(390_u32, 844_u32), (820, 1180), (1280, 800)] {
+            set_viewport_with(&tab, width, height, !fragment && width < 700);
+            go(&tab, &origin, route);
+            wait_for_js_true(&tab, &format!("innerWidth === {width}"));
+            let measured = measure(&tab, WIDTH_SWEEP, "the width sweep");
+            let scroll = measured["scrollWidth"].as_i64().expect("scrollWidth");
+            let client = measured["clientWidth"].as_i64().expect("clientWidth");
+            eprintln!(
+                "{route} at {width}x{height}: scrollWidth {scroll} clientWidth {client} widest {}",
+                measured["widest"]
+            );
+            assert!(
+                scroll <= client,
+                "{route} overflows sideways at {width}x{height}: scrollWidth {scroll} > \
+                 clientWidth {client}, widest {}",
+                measured["widest"]
+            );
+            assert_eq!(
+                measured["fragment"],
+                Value::Bool(fragment),
+                "{route} rendered the wrong kind of document at {width}x{height}: {}",
+                measured["text"]
+            );
+            if !fragment {
+                assert!(
+                    !measured["heading"]
+                        .as_str()
+                        .expect("the page's heading")
+                        .is_empty(),
+                    "{route} rendered no heading at {width}x{height}, so nothing was measured"
+                );
+            }
+            if let Some(marker) = marker {
+                assert!(
+                    measured["text"]
+                        .as_str()
+                        .expect("the page's text")
+                        .contains(marker),
+                    "{route} did not render its seeded record ({marker}) at {width}x{height}: {}",
+                    measured["text"]
+                );
+            }
+        }
+    }
+}
+
+const THUMB_SWEEP: &str = r#"(() => {
+  const small = [];
+  let counted = 0;
+  const sweep = (scope, where) => {
+    if (!scope) return;
+    for (const el of scope.querySelectorAll('button, input, textarea, summary, a')) {
+      if (!el.checkVisibility()) continue;
+      // A radio's hit target is the pill its label draws around it, which is
+      // what a thumb lands on; the input itself is a 14px dot by design.
+      const target = el.matches('input[type=radio]') ? (el.closest('label') || el) : el;
+      const box = target.getBoundingClientRect();
+      counted += 1;
+      if (box.height < 44 || box.width < 44) {
+        small.push({
+          where,
+          what: `${el.tagName.toLowerCase()}.${el.className}`,
+          height: Math.round(box.height),
+          width: Math.round(box.width),
+        });
+      }
+    }
+  };
+  sweep(document.querySelector('article.item[data-current] form.decide'), 'panel');
+  sweep(document.querySelector('nav:not(.drawer)'), 'bar');
+  return JSON.stringify({counted, small});
+})()"#;
+
+/// WEB-45 — a thumb can hit every deck control.
+///
+/// 44 CSS px is the platform floor George decides on, and it is asserted on
+/// the two places a thumb goes: the answer panel and the bar above it. The
+/// fold is opened and the sweep run again, because the free-text answer's
+/// own submit is a control a thumb has to hit too.
+#[test]
+fn every_deck_control_is_forty_four_pixels_at_390_in_real_chrome() {
+    let desk = deck_desk("serve-deck-thumb", "DECKTHUMB");
+    set_viewport(&desk.tab, 390, 844);
+    wait_for_js_true(&desk.tab, "innerWidth === 390");
+    let measured = measure(&desk.tab, THUMB_SWEEP, "the thumb sweep");
+    eprintln!("controls at 390x844: {measured}");
+    assert!(
+        measured["counted"].as_i64().unwrap_or(0) >= 6,
+        "the sweep found almost no controls, so it proves nothing: {measured}"
+    );
+    assert_eq!(
+        measured["small"]
+            .as_array()
+            .expect("the small controls")
+            .len(),
+        0,
+        "a deck control is smaller than a thumb at 390: {measured}"
+    );
+
+    let form = format!(
+        "form.decide[action=\"/attention/DECKTHUMB/{}/reply\"]",
+        desk.ids[0]
+    );
+    open_custom_answer(&desk.tab, &format!("[data-current] {form}"));
+    let unfolded = measure(&desk.tab, THUMB_SWEEP, "the thumb sweep, unfolded");
+    eprintln!("controls with the fold open at 390x844: {unfolded}");
+    assert!(
+        unfolded["counted"].as_i64().unwrap_or(0) > measured["counted"].as_i64().unwrap_or(0),
+        "opening the fold revealed no further controls: {unfolded}"
+    );
+    assert_eq!(
+        unfolded["small"]
+            .as_array()
+            .expect("the small controls")
+            .len(),
+        0,
+        "a control inside the free-text answer is smaller than a thumb at 390: {unfolded}"
+    );
+}
+
+const DESK_MEASURE: &str = r#"(() => {
+  const deck = document.querySelector('[data-deck-cards]');
+  const side = document.querySelector('[data-side]');
+  const history = document.querySelector('[data-history]');
+  const toggle = document.querySelector('[data-history-toggle]');
+  const rect = el => {
+    const box = el.getBoundingClientRect();
+    return {left: Math.round(box.left), right: Math.round(box.right), width: Math.round(box.width)};
+  };
+  return JSON.stringify({
+    width: innerWidth,
+    deck: rect(deck),
+    side: side.checkVisibility() ? rect(side) : null,
+    sideBackground: side.checkVisibility() ? getComputedStyle(side).backgroundColor : null,
+    history: rect(history),
+    toggleShown: Boolean(toggle) && toggle.checkVisibility(),
+    open: document.body.hasAttribute('data-history-open'),
+  });
+})()"#;
+
+/// WEB-46 — the desk becomes two columns on a Mac, and a drawer between.
+///
+/// At 1280 the session's decisions stand beside the deck in a column of
+/// their own on the second desk surface; at 820 that column is a drawer
+/// behind a button, off the canvas until the button is pressed, and back off
+/// it when the button is pressed again.
+#[test]
+fn the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome() {
+    let desk = deck_desk("serve-deck-columns", "DECKCOLS");
+    let mantle = token(&desk.tab, "--mantle");
+
+    set_viewport(&desk.tab, 1280, 800);
+    wait_for_js_true(&desk.tab, "innerWidth === 1280");
+    let wide = measure(&desk.tab, DESK_MEASURE, "the desk at 1280");
+    eprintln!("desk at 1280x800: {wide}");
+    let side = wide["side"].as_object().unwrap_or_else(|| {
+        panic!("the side is not a column at 1280: {wide}");
+    });
+    assert_eq!(
+        side["width"].as_f64().unwrap_or(0.0),
+        352.0,
+        "the side column is not 22rem wide: {wide}"
+    );
+    assert!(
+        side["left"].as_f64().unwrap_or(0.0) >= wide["deck"]["right"].as_f64().unwrap_or(0.0),
+        "the side column is not beside the deck: {wide}"
+    );
+    assert!(
+        wide["deck"]["width"].as_f64().unwrap_or(0.0) <= 704.0,
+        "the deck column is wider than 44rem: {wide}"
+    );
+    assert_eq!(wide["sideBackground"], mantle.as_str(), "{wide}");
+    assert_eq!(
+        wide["toggleShown"], false,
+        "the history button is there beside the column it opens: {wide}"
+    );
+
+    set_viewport(&desk.tab, 820, 1180);
+    wait_for_js_true(&desk.tab, "innerWidth === 820");
+    let narrow = measure(&desk.tab, DESK_MEASURE, "the desk at 820");
+    eprintln!("desk at 820x1180: {narrow}");
+    assert_eq!(
+        narrow["side"],
+        Value::Null,
+        "the side is still a column at 820: {narrow}"
+    );
+    assert_eq!(
+        narrow["toggleShown"], true,
+        "there is no button to open the history with at 820: {narrow}"
+    );
+    assert!(
+        narrow["history"]["left"].as_f64().unwrap_or(0.0) >= 820.0,
+        "the history drawer is on the canvas before it was opened: {narrow}"
+    );
+
+    click_control(&desk.tab, "[data-history-toggle]");
+    wait_for_js_true(
+        &desk.tab,
+        "document.body.hasAttribute('data-history-open') \
+         && document.querySelector('[data-history]').getBoundingClientRect().left < innerWidth - 1",
+    );
+    let opened = measure(&desk.tab, DESK_MEASURE, "the opened drawer");
+    eprintln!("history drawer at 820x1180: {opened}");
+    assert!(
+        opened["history"]["right"].as_f64().unwrap_or(0.0) <= 821.0
+            && opened["history"]["width"].as_f64().unwrap_or(0.0) > 100.0,
+        "the opened drawer is not on the screen: {opened}"
+    );
+
+    // And it goes away again the way it is offered: while it is open its own
+    // button is behind the backdrop, which is the drawer pattern -- a press
+    // outside it is what shuts it.
+    click_control(&desk.tab, "[data-backdrop]");
+    wait_for_js_true(
+        &desk.tab,
+        "!document.body.hasAttribute('data-history-open') \
+         && document.querySelector('[data-history]').getBoundingClientRect().left >= innerWidth - 1 \
+         && document.querySelector('[data-backdrop]').hidden",
+    );
+}
+
+const FOCUSED_MEASURE: &str = r#"(() => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) {
+    return JSON.stringify({what: null});
+  }
+  const style = getComputedStyle(el);
+  return JSON.stringify({
+    what: `${el.tagName.toLowerCase()}.${el.className}`,
+    card: el.matches('article.item[data-current]'),
+    width: parseFloat(style.outlineWidth) || 0,
+    style: style.outlineStyle,
+    color: style.outlineColor,
+  });
+})()"#;
+
+/// WEB-51 — focus is always visible.
+///
+/// Tab through the deck and then through a read page, and every element the
+/// keyboard lands on says so with the one ring. The documented exception is
+/// the current card itself: the deck focuses it so `1` decides without a
+/// click first, and a permanent 2px ring around the whole card is the box
+/// WEB-13 forbids -- every control inside it still rings.
+#[test]
+fn focus_is_visible_on_every_focusable_element_in_real_chrome() {
+    let desk = deck_desk("serve-deck-focus", "DECKFOCUS");
+    let origin = desk.server.origin();
+    let focus = token(&desk.tab, "--focus");
+    for (route, steps) in [("/", 14), ("/boards", 8)] {
+        go(&desk.tab, &origin, route);
+        let mut rung = 0;
+        for step in 0..steps {
+            desk.tab.press_key("Tab").expect("tab to the next element");
+            let measured = measure(&desk.tab, FOCUSED_MEASURE, "the focused element");
+            if measured["what"] == Value::Null {
+                continue;
+            }
+            eprintln!("{route} focus step {step}: {measured}");
+            if measured["card"] == true {
+                continue;
+            }
+            assert!(
+                measured["style"].as_str().unwrap_or("none") != "none",
+                "{route} gives the keyboard no ring on {}: {measured}",
+                measured["what"]
+            );
+            assert!(
+                measured["width"].as_f64().unwrap_or(0.0) >= 2.0,
+                "{route}'s focus ring is thinner than 2px on {}: {measured}",
+                measured["what"]
+            );
+            assert_eq!(
+                measured["color"],
+                focus.as_str(),
+                "{route}'s focus ring is not the focus token on {}: {measured}",
+                measured["what"]
+            );
+            rung += 1;
+        }
+        assert!(
+            rung >= 4,
+            "{route} never put the keyboard on four elements, so nothing was proved"
+        );
+    }
+}
+
+/// WEB-53 — the card is named by its question.
+///
+/// A screen reader announces the card by its accessible name, and that name
+/// has to be the question rather than "article". It is computed the way the
+/// accessibility tree computes it: `aria-labelledby` resolved to the text of
+/// the elements it names.
+#[test]
+fn the_card_is_named_by_its_question_in_real_chrome() {
+    let desk = deck_desk("serve-deck-named", "DECKNAME");
+    let measured = measure(
+        &desk.tab,
+        r#"(() => {
+  const card = document.querySelector('article.item[data-current]');
+  const ids = (card.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+  const named = ids.map(id => {
+    const el = document.getElementById(id);
+    return el ? el.textContent.trim() : null;
+  });
+  return JSON.stringify({
+    ids,
+    named,
+    name: named.filter(Boolean).join(' '),
+    question: card.querySelector('h2').textContent.trim(),
+    role: card.getAttribute('role'),
+  });
+})()"#,
+        "the card's accessible name",
+    );
+    eprintln!("the card's name: {measured}");
+    assert_eq!(
+        measured["ids"].as_array().expect("the labelling ids").len(),
+        1,
+        "the card is named by something other than its one question: {measured}"
+    );
+    assert_eq!(
+        measured["named"][0], measured["question"],
+        "the card's aria-labelledby does not resolve to its question: {measured}"
+    );
+    // ...and the question is the raiser's own, not a placeholder that would
+    // satisfy the resolution while naming nothing.
+    assert_eq!(measured["name"], CARD[1], "{measured}");
+}
+
+/// The composer's own refusal, verbatim. It is one fixed sentence, it never
+/// names which half is missing, and it is the PAGE's sentence -- the CLI has
+/// its own words for the same case (`INCOMPLETE_ANSWER` above).
+const PAGE_INCOMPLETE_ANSWER: &str = "Your own answer needs both halves: pick a verdict \
+                                      (approve, reject, defer or other) and write your reply.";
+
+/// WEB-57 — the composer's own refusal is its own sentence, in its own
+/// channel.
+///
+/// A free-text answer with a reply and no verdict is not an answer, and the
+/// page says so before it posts anything: its own sentence in its own
+/// channel, the cursor on the missing half, and the board untouched.
+#[test]
+fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
+    let desk = deck_desk("serve-deck-incomplete", "DECKHALF");
+    let form = "[data-current] form.decide";
+    // Every POST this page makes, recorded where it is made. The projection
+    // GET goes through the same `fetch` and is deliberately not counted.
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            r#"(() => {
+  const real = window.fetch;
+  window.__posts = [];
+  window.fetch = (input, init) => {
+    if (((init && init.method) || 'GET').toUpperCase() === 'POST') {
+      window.__posts.push(String((input && input.url) || input));
+    }
+    return real.call(window, input, init);
+  };
+  return true;
+})()"#
+        ),
+        true
+    );
+    open_custom_answer(&desk.tab, form);
+    let reply = desk
+        .tab
+        .wait_for_element(&format!("{form} textarea[name=reply]"))
+        .expect("the reply field");
+    reply.click().expect("focus the reply field");
+    reply
+        .type_into("Assign the seat, but bill it to the platform budget.")
+        .expect("type the reply");
+    click_control(&desk.tab, &format!("{form} button.record"));
+
+    wait_for_js_true(
+        &desk.tab,
+        &format!("Boolean(document.querySelector('{form} p.error[data-refusal=incomplete]'))"),
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!(
+                "document.querySelector('{form} p.error[data-refusal=incomplete]').textContent"
+            )
+        ),
+        PAGE_INCOMPLETE_ANSWER,
+        "the composer's refusal is not its own sentence"
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!(
+                "document.activeElement === document.querySelector('{form} input[name=outcome]')"
+            )
+        ),
+        true,
+        "the cursor is not on the half that is missing"
+    );
+    // ...and the refusal is inline text tied to that half, not a third
+    // announcement channel. The page has exactly two -- the socket's status
+    // line and the toast log -- and a refusal that shouted through a third
+    // was the page narrating itself, which WEB-52 forbids.
+    let announced = measure(
+        &desk.tab,
+        r#"(() => {
+  const regions = [...document.querySelectorAll('[role=status],[role=log],[role=alert],[aria-live]')];
+  const refusal = document.querySelector('p.error[data-refusal=incomplete]');
+  const focused = document.activeElement;
+  return JSON.stringify({
+    roles: regions.map(el => el.getAttribute('role') || `aria-live=${el.getAttribute('aria-live')}`),
+    alerts: regions.filter(el => el.getAttribute('role') === 'alert').length,
+    refusalRole: refusal.getAttribute('role'),
+    refusalLive: refusal.getAttribute('aria-live'),
+    refusalId: refusal.id,
+    describedBy: focused.getAttribute('aria-describedby'),
+  });
+})()"#,
+        "the page's announcement channels with a refusal on screen",
+    );
+    eprintln!("channels while refused: {announced}");
+    assert_eq!(
+        announced["roles"].as_array().expect("the regions").len(),
+        2,
+        "a refusal opened a third announcement channel: {announced}"
+    );
+    assert_eq!(
+        announced["alerts"], 0,
+        "the refusal is announced as an alert instead of read as the text it is: {announced}"
+    );
+    assert_eq!(announced["refusalRole"], Value::Null, "{announced}");
+    assert_eq!(announced["refusalLive"], Value::Null, "{announced}");
+    assert_eq!(
+        announced["describedBy"], announced["refusalId"],
+        "the half that is missing is not described by the refusal: {announced}"
+    );
+    // The description goes when the sentence does: finishing the answer
+    // clears both, so nothing reads out a refusal that is no longer true.
+    click_control(&desk.tab, &format!("{form} input[name=outcome]"));
+    wait_for_js_true(
+        &desk.tab,
+        &format!("!document.querySelector('{form} p.error[data-refusal=incomplete]')"),
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!("document.querySelectorAll('{form} [aria-describedby]').length")
+        ),
+        0,
+        "a cleared refusal is still described"
+    );
+    // Nothing was sent, and the reply the operator wrote is still theirs to
+    // finish.
+    assert_eq!(
+        js_value(&desk.tab, "window.__posts.length"),
+        0,
+        "an incomplete answer posted anyway: {}",
+        js_value(&desk.tab, "JSON.stringify(window.__posts)")
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!("document.querySelector('{form} textarea[name=reply]').value")
+        ),
+        "Assign the seat, but bill it to the platform budget."
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            "document.querySelector('[data-current]').dataset.item"
+        ),
+        desk.ids[0].as_str(),
+        "a refused composer advanced the deck"
+    );
+    let open = desk.fixture.ok_json(
+        &desk.fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open.as_array().expect("the open rows").len(), 3, "{open}");
+    assert!(
+        open.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["decision"].is_null()),
+        "the board recorded a decision the page refused to post: {open}"
+    );
+}
+
+/// WEB-59 — and each channel says only its own thing.
+///
+/// Two live regions with two jobs: the connection line says what the socket
+/// is and nothing else, and what arrived is a log entry. The line's whole
+/// history is recorded as it changes, because a single reading afterwards
+/// would miss the one word that should never have been there.
+#[test]
+fn the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome() {
+    let desk = deck_desk("serve-deck-channels", "DECKSAYS");
+    wait_for_live_status(&desk.tab, "live", "the deck's first connect");
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            "(() => { const line = document.querySelector('[data-live]'); \
+             window.__words = [line.textContent]; \
+             new MutationObserver(() => { const now = line.textContent; \
+             if (window.__words[window.__words.length - 1] !== now) window.__words.push(now); }) \
+             .observe(line, {subtree: true, childList: true, characterData: true}); \
+             return true; })()"
+        ),
+        true
+    );
+
+    // A decision of our own, then somebody else's change: the two things
+    // that ever wrote to these regions.
+    click_control(
+        &desk.tab,
+        "[data-current] form.decide fieldset.recommended button.choice",
+    );
+    wait_for_js_true(
+        &desk.tab,
+        "Boolean(document.querySelector('[data-history] [data-receipt]'))",
+    );
+    wait_for_projection_swap(&desk.tab);
+    file_task(&desk.fixture, "Another lane filed its own task", "t-says");
+    let rows = wait_for_notice_rows(&desk.tab, 1, "the other lane's change");
+    assert!(
+        rows[0].contains("Another lane filed its own task"),
+        "{rows:?}"
+    );
+
+    let measured = measure(
+        &desk.tab,
+        "(() => { const line = document.querySelector('[role=status]'); \
+         const log = document.querySelector('[role=log]'); \
+         return JSON.stringify({words: window.__words, line: line.textContent, \
+         statuses: document.querySelectorAll('[role=status]').length, \
+         logs: document.querySelectorAll('[role=log]').length, \
+         logIsStatus: log.getAttribute('role') === 'status', \
+         lineIsLog: line.getAttribute('role') === 'log', \
+         noticeInLog: [...document.querySelectorAll('[data-notices] .notice')] \
+           .every(row => row.closest('[role=log]') === log), \
+         receiptOutsideStatus: !line.textContent.includes('Decided')}); })()",
+        "the two channels",
+    );
+    eprintln!("channels: {measured}");
+    let words = measured["words"].as_array().expect("the line's history");
+    assert!(
+        words.iter().all(|word| matches!(
+            word.as_str().unwrap_or_default(),
+            "connecting" | "live" | "reconnecting" | "sending"
+        )),
+        "the connection line said something that is not the socket's state: {measured}"
+    );
+    assert!(
+        words.iter().any(|word| word == "sending"),
+        "the line never said what the click was doing, so nothing was observed: {measured}"
+    );
+    assert_eq!(measured["statuses"], 1, "{measured}");
+    assert_eq!(measured["logs"], 1, "{measured}");
+    assert_eq!(measured["logIsStatus"], false, "{measured}");
+    assert_eq!(measured["lineIsLog"], false, "{measured}");
+    assert_eq!(
+        measured["noticeInLog"], true,
+        "a notice landed outside the log: {measured}"
+    );
+    assert_eq!(
+        measured["receiptOutsideStatus"], true,
+        "the connection line is reporting a decision: {measured}"
+    );
+}
+
+/// WEB-17 — the pressed answer says what it is doing on its own fill.
+///
+/// A disabled grey button is the one control that cannot report its own
+/// refusal, so nothing is disabled: the pressed answer keeps its fill, says
+/// `Sending…` on it, and the OTHER answers step back instead. Read inside
+/// the window a held POST keeps open, which is where a slow link lives.
+#[test]
+fn the_pressed_answer_says_sending_on_its_own_fill_in_real_chrome() {
+    let desk = deck_desk("serve-deck-sending-fill", "DECKSEND");
+    let green = token(&desk.tab, "--green");
+    let pressed = "[data-current] form.decide fieldset.recommended button.choice";
+    let before = js_value(
+        &desk.tab,
+        &format!("getComputedStyle(document.querySelector('{pressed}')).backgroundColor"),
+    );
+    assert_eq!(before, green.as_str(), "the recommendation is not filled");
+
+    assert_eq!(js_value(&desk.tab, HOLD_THE_POST), true);
+    click_control(&desk.tab, pressed);
+    wait_for_js_true(&desk.tab, "typeof window.__answer === 'function'");
+    wait_for_js_true(
+        &desk.tab,
+        "Boolean(document.querySelector('article.item[data-sent] [data-pressed]'))",
+    );
+
+    let measured = measure(
+        &desk.tab,
+        "(() => { const card = document.querySelector('article.item[data-sent]'); \
+         const sent = card.querySelector('[data-pressed]'); \
+         const others = [...card.querySelectorAll('.choice:not([data-pressed]), \
+         .record:not([data-pressed])')]; \
+         return JSON.stringify({text: sent.textContent, \
+         background: getComputedStyle(sent).backgroundColor, \
+         disabled: sent.disabled, opacity: parseFloat(getComputedStyle(sent).opacity), \
+         others: others.map(el => parseFloat(getComputedStyle(el).opacity)), \
+         busy: card.getAttribute('aria-busy')}); })()",
+        "the pressed answer",
+    );
+    eprintln!("sending: {measured}");
+    assert_eq!(measured["text"], "Sending…", "{measured}");
+    assert_eq!(
+        measured["background"], before,
+        "the pressed answer changed fill instead of speaking on its own: {measured}"
+    );
+    assert_eq!(
+        measured["disabled"], false,
+        "the pressed answer was disabled, so it can no longer report a refusal: {measured}"
+    );
+    assert_eq!(measured["opacity"].as_f64(), Some(1.0), "{measured}");
+    assert_eq!(measured["busy"], "true", "{measured}");
+    let others = measured["others"].as_array().expect("the other answers");
+    assert!(others.len() >= 2, "{measured}");
+    for opacity in others {
+        assert!(
+            opacity.as_f64().unwrap_or(1.0) < 1.0,
+            "an answer that was not pressed did not step back: {measured}"
+        );
+    }
+}
+
+/// WEB-18 — the receipt encodes its outcome.
+///
+/// The decision just made reads as a row with a 3px rule in the hue of the
+/// verdict it recorded, and it is the only coloured rule in the history: a
+/// second one would make the colour decoration rather than the one thing a
+/// reader needs from a decision already made.
+#[test]
+fn the_receipt_lands_with_its_outcome_rule_in_real_chrome() {
+    let desk = deck_desk("serve-deck-receipt-rule", "DECKRULE");
+    let green = token(&desk.tab, "--green");
+    let surface1 = token(&desk.tab, "--surface1");
+    // The recommendation of this fixture is the `approve` choice, so the row
+    // it lands has to carry the approve hue and nothing else may carry one.
+    hold_projection(&desk.tab);
+    click_control(
+        &desk.tab,
+        "[data-current] form.decide fieldset.recommended button.choice",
+    );
+    wait_for_js_true(
+        &desk.tab,
+        "document.querySelectorAll('[data-history] p.receipt').length === 1",
+    );
+    let measured = measure(
+        &desk.tab,
+        "(() => { const rows = [...document.querySelectorAll('[data-history] p')]; \
+         return JSON.stringify({rows: rows.map(row => { const style = getComputedStyle(row); \
+         return {classes: row.className, width: parseFloat(style.borderLeftWidth) || 0, \
+         color: style.borderLeftColor}; })}); })()",
+        "the landed receipt",
+    );
+    eprintln!("receipt: {measured}");
+    let rows = measured["rows"].as_array().expect("the history rows");
+    let ruled = rows
+        .iter()
+        .filter(|row| row["width"].as_f64().unwrap_or(0.0) > 0.0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ruled.len(),
+        1,
+        "the history carries more than one left rule: {measured}"
+    );
+    assert!(
+        ruled[0]["classes"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outcome-approve"),
+        "the ruled row is not the receipt just recorded: {measured}"
+    );
+    assert_eq!(
+        ruled[0]["width"].as_f64().unwrap_or(0.0),
+        3.0,
+        "the receipt's rule is not 3px: {measured}"
+    );
+    assert_eq!(
+        ruled[0]["color"],
+        green.as_str(),
+        "the receipt's rule is not the hue of the outcome it recorded: {measured}"
+    );
+    assert_ne!(
+        ruled[0]["color"],
+        surface1.as_str(),
+        "the receipt fell back to the colourless rule: {measured}"
     );
 }

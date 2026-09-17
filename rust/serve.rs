@@ -390,6 +390,33 @@ fn route(request: &mut Request, config: &ServeConfig) -> Result<WebResponse> {
     Ok(WebResponse::Html(200, render(&url)?))
 }
 
+/// Every shape `render` answers, in the order the match below names them.
+///
+/// This is the registry the WEB-44 width sweep loads: a new arm here without
+/// a new shape fails `render_answers_exactly_the_declared_shapes_unit`, and a
+/// new shape without a URL in the sweep fails the sweep itself. So a route
+/// cannot be added and left unmeasured on a phone.
+#[cfg(test)]
+const ROUTE_SHAPES: &[&str] = &[
+    "/",
+    "/all",
+    "/decided",
+    "/boards",
+    "/sprints",
+    "/sprints/{project}",
+    "/sprint/{project}/{id}",
+    "/plans",
+    "/deployments",
+    "/subscriptions",
+    "/lanes",
+    "/search",
+    "/preview/{kind}/{project}/{id}",
+    "/preview/board/{project}",
+    "/board/{project}",
+    "/task/{project}/{id}",
+    "/deployment/{project}/{id}",
+];
+
 /// Route a URL to a rendered page.
 fn render(url: &str) -> Result<String> {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
@@ -1458,12 +1485,11 @@ fn attention_section(project: &str, title: &str, items: &[Attention]) -> String 
     for item in items {
         html.push_str("<li>");
         html.push_str(&format!(
-            "{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
-             · raised by {who} · waiting {age}{tags}",
-            kind = escape(&item.kind),
+            "<p class=meta>{who} raised this {age}, a {kind} ask at {priority}{tags}</p>",
+            kind = escape(&item.kind.replace('_', " ")),
             priority = priority_badge(item.priority, item.priority_level.as_deref()),
             who = escape(&item.raised_by),
-            age = age(item.created_at),
+            age = ago(item.created_at),
             tags = tag_list(&item.tags),
         ));
         html.push_str(&format!(
@@ -1555,23 +1581,20 @@ fn reply_notices(replied: Option<&str>, undone: Option<&str>) -> String {
     html
 }
 
-/// Nothing waiting, in the words both open-item screens use for it.
-const EMPTY_QUEUE: &str = "<p class=empty>Nothing is waiting. \
-                           An empty list here means every raised item has been settled.</p>";
+/// Nothing waiting, in the words both open-item screens use for it: an
+/// answer rather than an absence, and the way on to what was decided.
+const EMPTY_QUEUE: &str = "<div class=empty-queue>\
+                           <p class=empty>Nothing is waiting. \
+                           Every question an agent raised has an answer.</p>\
+                           <p><a href=\"/decided\">See what was decided</a></p></div>";
 
-/// The keyboard map, which sits at the bottom of the viewport rather than at
-/// the end of a list that is 133 cards long: a keyboard map the reader has
-/// to scroll to the end of to find is a keyboard map nobody reads.
-const LIST_KEYS: &str = "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
-     <kbd>u</kbd> undo last · <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · Decided items move to \
-     <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a></p>";
+/// The keyboard map, in ONE quiet line, because the digits live on the
+/// buttons: a second badge for every key was a keyboard hint competing with
+/// the answers it describes.
+const LIST_KEYS: &str = "<p class=keys>1–4 answer · u undo · c own</p>";
 
-/// The deck's map: the same keys plus the ones only a deck has — skip, and
-/// stepping back and forth through the queue.
-const DECK_KEYS: &str = "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
-     <kbd>s</kbd> skip · <kbd>←</kbd><kbd>→</kbd> move · <kbd>u</kbd> undo last · \
-     <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · Decided items move to \
-     <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a></p>";
+/// The deck's map: the same keys plus the one only a deck has, the skip.
+const DECK_KEYS: &str = "<p class=keys>1–4 answer · s skip · u undo · c own</p>";
 
 /// The landing page, and the reason the server exists: every open item as a
 /// DECK — one card on screen, the long form the only thing that scrolls, the
@@ -1591,16 +1614,16 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
     let (items, stores) = open_attention()?;
     let mut html = String::from(
         "<div class=heading><h1>Needs you</h1>\
-         <span class=live data-live role=status aria-live=polite>connecting</span>\
          <button type=button class=history-toggle data-history-toggle aria-expanded=false \
          aria-controls=session-history>Decided <span data-history-count>0</span></button></div>",
     );
     html.push_str(&reply_notices(replied, undone));
+    // The bar counts what is left rather than where in a queue the reader is:
+    // `12 left` is the fact that decides whether to keep going, and `1 of 12`
+    // was a coordinate in a list nobody is reading as a list.
     html.push_str(&format!(
-        "<div class=deck-head><p class=progress><span data-deck-position>{position}</span> of \
-         <span data-open-count>{count}</span></p></div>\
+        "<p class=progress><span data-open-count>{count}</span> left</p>\
          <section class=deck data-deck-cards>",
-        position = usize::from(!items.is_empty()),
         count = items.len(),
     ));
     if items.is_empty() {
@@ -1621,7 +1644,7 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
     // decision, and so a projection swap has one node to carry across.
     html.push_str(
         "<aside class=side data-side>\
-         <div class=toasts data-notices role=status aria-live=polite></div>\
+         <div class=toasts data-notices role=log aria-live=polite></div>\
          <section class=history id=session-history data-history>\
          <h2>Decided this session</h2></section></aside>",
     );
@@ -1633,9 +1656,7 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
 /// after another for a reader who wants the whole queue at once.
 fn all_open(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
     let (items, stores) = open_attention()?;
-    let mut html = String::from(
-        "<div class=heading><h1>Needs you</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
-    );
+    let mut html = String::from("<div class=heading><h1>Needs you</h1></div>");
     html.push_str(
         "<p class=explain>Each card is one question an agent is waiting on. Pick an answer \
          and it is recorded on the board at once; the agent continues from there. Undo any \
@@ -1652,7 +1673,7 @@ fn all_open(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     html.push_str(&format!(
-        "<p class=count><span data-open-count>{}</span> open across {boards} {plural}.</p>",
+        "<p class=count><span data-open-count>{}</span> open across {boards} {plural}</p>",
         items.len(),
         plural = if boards == 1 { "board" } else { "boards" },
     ));
@@ -1693,9 +1714,7 @@ fn decided_page(undone: Option<&str>) -> Result<String> {
     });
     items.truncate(DECIDED_ROWS);
 
-    let mut html = String::from(
-        "<div class=heading><h1>Recent decisions</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
-    );
+    let mut html = String::from("<div class=heading><h1>Recent decisions</h1></div>");
     if let Some(id) = undone {
         html.push_str(&format!(
             "<p class=success>Brought back <code>{}</code> - it is open again \
@@ -1717,9 +1736,7 @@ fn decided_page(undone: Option<&str>) -> Result<String> {
             .expect("project store map built from same iterator");
         html.push_str(&decided_row(project, store, item));
     }
-    html.push_str(
-        "<p class=keys>Focus a row and press <kbd>u</kbd> to undo it, or use its button.</p>",
-    );
+    html.push_str("<p class=keys>u undo</p>");
     Ok(page("Recent decisions", &html))
 }
 
@@ -1737,8 +1754,7 @@ fn decided_row(project: &str, store: &Store, item: &Attention) -> String {
         question = escape(&card_question(item)),
     );
     html.push_str(&format!(
-        "<p class=decision><span class=\"outcome outcome-{outcome}\">{outcome}</span> \
-         {words}</p>",
+        "<p class=decision><span class=\"pill status-{outcome}\">{outcome}</span> {words}</p>",
         outcome = escape(
             item.decision
                 .as_ref()
@@ -1752,20 +1768,23 @@ fn decided_row(project: &str, store: &Store, item: &Attention) -> String {
     {
         html.push_str(&format!("<p class=note>{}</p>", escape(note)));
     }
+    // One sentence, not a chain: who decided it, when, and where it lives.
     html.push_str(&format!(
-        "<p class=meta>{priority} <span class=\"kind kind-{kind}\">{kind}</span> \
-         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a> \
-         · decided by {who} {when}{about}</p>",
-        kind = escape(&item.kind),
-        priority = priority_badge(item.priority, item.priority_level.as_deref()),
+        "<p class=meta>{who} decided this {when} on \
+         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a>\
+         {about}, {priority}</p>",
         project = escape(project),
         who = escape(item.resolved_by.as_deref().unwrap_or("someone")),
-        when = item.resolved_at.map(ago).unwrap_or_default(),
+        when = item
+            .resolved_at
+            .map(ago)
+            .unwrap_or_else(|| "at some point".to_owned()),
         about = item
             .task_id
             .as_ref()
-            .map(|task| format!(" · about {}", task_reference(project, store, task)))
+            .map(|task| format!(", about {}", task_reference(project, store, task)))
             .unwrap_or_default(),
+        priority = priority_badge(item.priority, item.priority_level.as_deref()),
     ));
     html.push_str(&format!(
         "<form class=undo method=post action=\"/attention/{project_url}/{id_url}/reopen\">\
@@ -1831,14 +1850,13 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     let mut html = format!(
         "<article class=item tabindex=0 data-item=\"{id}\" data-project=\"{project}\" \
          aria-labelledby=\"q-{id}\">\
-         <p class=eyebrow>\
-         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a> \
-         · <span class=\"kind kind-{kind}\">{kind}</span> · asked by {who} · waiting {age}</p>\
+         <p class=eyebrow>{who} asked on \
+         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a>, \
+         {age}</p>\
          <h2 id=\"q-{id}\">{question}</h2>",
         project = escape(project),
-        kind = escape(&item.kind),
+        age = ago(item.created_at),
         who = escape(&item.raised_by),
-        age = age(item.created_at),
         question = escape(&card_question(item)),
     );
     if let Some(context) = &item.context {
@@ -1859,7 +1877,7 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         );
         if choice.recommended {
             recommended = format!(
-                "<fieldset class=recommended><legend>Recommended - press 1</legend>\
+                "<fieldset class=recommended><legend>Recommended</legend>\
                  {rendered}</fieldset>"
             );
         } else {
@@ -1874,24 +1892,23 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         html.push_str(&format!("<div class=alternatives>{alternatives}</div>"));
     }
     html.push_str(&format!(
-        "<div class=reply><label for=\"answer-{id_url}\">Add a note (optional)</label>\
-         <textarea id=\"answer-{id_url}\" name=reply maxlength={max} \
-         aria-describedby=\"reply-hint-{id_url}\"></textarea>\
-         <p class=hint id=\"reply-hint-{id_url}\">Sent with whichever answer you pick. \
-         Required when you answer in your own words.</p></div>\
+        "<div class=reply><label for=\"answer-{id_url}\">Add a note</label>\
+         <textarea id=\"answer-{id_url}\" name=reply maxlength={max}></textarea></div>\
          <details class=custom data-custom><summary>Answer in my own words</summary>\
          <fieldset class=outcomes>\
          <legend>recorded as</legend><div class=picks>{picks}</div>\
          </fieldset>\
          <div class=actions>\
-         <button type=submit class=record name=decision value=custom>Record this answer</button>\
+         <button type=submit class=record name=decision value=custom>Record my answer</button>\
          <button type=button class=clear data-clear hidden>Clear verdict</button>\
          <p class=hint data-hint>Pick a verdict and write your reply above.</p>\
          </div></details></form>",
         picks = ATTENTION_OUTCOMES
             .iter()
             .map(|outcome| format!(
-                "<label><input type=radio name=outcome value={outcome}>{outcome}</label>"
+                "<label for=\"outcome-{id_url}-{outcome}\">\
+                 <input type=radio id=\"outcome-{id_url}-{outcome}\" name=outcome \
+                 value={outcome}>{outcome}</label>"
             ))
             .collect::<String>(),
         max = MAX_REPLY_BYTES,
@@ -1901,13 +1918,16 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
          <div class=\"body md\">{}</div></details>",
         markdown(&item.body)
     ));
+    // The trailing meta reads as a sentence, and the priority is the only
+    // thing in it that is not prose: `about` is where the work is, and the
+    // tags are what it was filed under.
     html.push_str(&format!(
         "<p class=meta>{priority}{about}{tags}</p></article>",
         priority = priority_badge(item.priority, item.priority_level.as_deref()),
         about = item
             .task_id
             .as_ref()
-            .map(|task| format!(" · about {}", task_reference(project, store, task)))
+            .map(|task| format!(", about {}", task_reference(project, store, task)))
             .unwrap_or_default(),
         tags = tag_list(&item.tags),
     ));
@@ -1965,22 +1985,22 @@ fn preview_page(project: &str, kind: &str, id: &str) -> Result<String> {
 fn task_preview(project: &str, store: &Store, id: &str) -> Result<String> {
     let task = store.require_task(id)?;
     let mut html = format!(
-        "<h3>{title}</h3><p class=meta><span class=status>{status}</span> \
-         <span class=\"type type-{ty}\">{ty}</span> · {priority} · updated {when}{lane}{parent}</p>",
+        "<h3>{title}</h3><p class=meta>A <span class=\"type type-{ty}\">{ty}</span> at {priority}, \
+         <span class=status>{status}</span>, updated {when}{lane}{parent}</p>",
         title = escape(&task.title),
-        status = escape(&task.status),
+        status = escape(&task.status.replace('_', " ")),
         ty = escape(&task.task_type),
         priority = priority_badge(task.priority, task.priority_level.as_deref()),
         when = ago(task.updated_at),
         lane = task
             .lane
             .as_ref()
-            .map(|lane| format!(" · lane {}", escape(lane)))
+            .map(|lane| format!(" in lane {}", escape(lane)))
             .unwrap_or_default(),
         parent = task
             .parent_id
             .as_ref()
-            .map(|parent| format!(" · part of {}", task_reference(project, store, parent)))
+            .map(|parent| format!(", part of {}", task_reference(project, store, parent)))
             .unwrap_or_default(),
     );
     if let Some(body) = &task.body {
@@ -2023,12 +2043,12 @@ fn attention_preview(project: &str, store: &Store, id: &str) -> Result<String> {
                 )
             })
             .collect::<Vec<_>>()
-            .join(" · ");
+            .join(", ");
         format!("open - {choices}")
     };
     html.push_str(&format!(
-        "<p class=meta><span class=\"kind kind-{kind}\">{kind}</span> {state}</p>",
-        kind = escape(&item.kind),
+        "<p class=meta>A {kind} ask, {state}</p>",
+        kind = escape(&item.kind.replace('_', " ")),
     ));
     if let Some(task) = &item.task_id {
         html.push_str(&format!(
@@ -2042,8 +2062,8 @@ fn attention_preview(project: &str, store: &Store, id: &str) -> Result<String> {
 fn deployment_preview(project: &str, store: &Store, id: &str) -> Result<String> {
     let row = store.require_deployment(id)?;
     Ok(format!(
-        "<h3><code>{id}</code></h3><p class=meta>{repo} · <span class=tag>{tier}</span> \
-         {environment} on {host} · {status} · {when} · board {board}</p>",
+        "<h3><code>{id}</code></h3><p class=meta>{repo} on the {tier} tier, \
+         {environment} on {host}, {status} {when}, from board {board}</p>",
         id = escape(&row.id),
         repo = escape(&row.repo),
         tier = escape(&row.tier),
@@ -2060,8 +2080,8 @@ fn board_preview(project: &str, store: &Store) -> Result<String> {
     let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
     let open_attention = store.count_open_attention()?;
     Ok(format!(
-        "<h3>{project}</h3><p class=meta>{attention} open attention · {todo} to do · \
-         {doing} in progress · {total} tasks</p>",
+        "<h3>{project}</h3><p class=meta>{attention} open attention, {todo} to do, \
+         {doing} in progress, {total} tasks in all</p>",
         project = escape(project),
         attention = open_attention,
         todo = count("todo"),
@@ -2086,7 +2106,8 @@ fn search_page(query: &str) -> Result<String> {
     let query = query.trim();
     let mut html = format!(
         "<h1>Search</h1><form class=search-page action=/search method=get>\
-         <input name=q value=\"{}\" placeholder=\"Task, decision, handoff, rule…\" autofocus>\
+         <input name=q value=\"{}\" aria-label=\"Search Kanban\" \
+         placeholder=\"Task, decision, handoff, rule…\" autofocus>\
          <button type=submit>Search</button></form>",
         escape(query)
     );
@@ -2160,21 +2181,21 @@ fn search_page(query: &str) -> Result<String> {
         };
         html.push_str(&format!(
             "<article class=search-result><h2>{title}</h2>\
-             <p class=meta>{board} · {kind} · score {score:.3}{status}{lane}{tags}</p>\
+             <p class=meta>A {kind} on {board}, scoring {score:.3}{status}{lane}{tags}</p>\
              <p class=body>{snippet}</p><p class=citation><code>{citation}</code></p></article>",
             title = title,
             board = escape(&result.board),
-            kind = escape(&result.source_kind),
+            kind = escape(&result.source_kind.replace('_', " ")),
             score = result.score,
             status = result
                 .status
                 .as_ref()
-                .map(|status| format!(" · {}", escape(status)))
+                .map(|status| format!(", {}", escape(&status.replace('_', " "))))
                 .unwrap_or_default(),
             lane = result
                 .lane
                 .as_ref()
-                .map(|lane| format!(" · {}", escape(lane)))
+                .map(|lane| format!(", in lane {}", escape(lane)))
                 .unwrap_or_default(),
             tags = tag_list(&result.tags),
             snippet = escape(&result.snippet),
@@ -2256,7 +2277,7 @@ fn deployments() -> Result<String> {
     failures.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
 
     let mut html = String::from(
-        "<div class=heading><h1>Deployments</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>\
+        "<div class=heading><h1>Deployments</h1></div>\
          <p class=meta>Verified current releases, derived from immutable attempts. Old non-current terminal attempts self-archive from hot views and remain available with <code>kb deploy list --all</code>.</p>",
     );
     html.push_str("<h2>Current releases</h2>");
@@ -2281,7 +2302,7 @@ fn deployments() -> Result<String> {
     }
     for (project, row) in &active {
         html.push_str(&format!(
-            "<article class=item><p>{attempt} <strong>{repo}</strong> → <span class=tag>{tier}</span> {environment}</p><p class=meta>{commit} · {host} · started {when} by {actor}</p></article>",
+            "<article class=item><p>{attempt} <strong>{repo}</strong> to the <span class=tag>{tier}</span> {environment}</p><p class=meta>{commit} on {host}, started {when} by {actor}</p></article>",
             attempt = deployment_link(project, row), repo = escape(&row.repo), tier = escape(&row.tier),
             environment = escape(&row.environment), commit = build_commit_cell(row),
             host = escape(&row.host), when = escape(&ago(row.created_at)), actor = escape(&row.actor),
@@ -2293,7 +2314,7 @@ fn deployments() -> Result<String> {
     }
     for (project, row) in failures.iter().take(30) {
         html.push_str(&format!(
-            "<article class=item><p>{attempt} <strong>{repo}</strong> <span class=\"status status-{status}\">{status}</span></p><p class=meta>{tier} · {environment} · phase {phase} · {when}</p><p class=body>{receipt}</p></article>",
+            "<article class=item><p>{attempt} <strong>{repo}</strong> <span class=\"status status-{status}\">{status}</span></p><p class=meta>The {tier} tier, {environment}, in phase {phase} {when}</p><p class=body>{receipt}</p></article>",
             attempt = deployment_link(project, row), repo = escape(&row.repo), status = escape(&row.status),
             tier = escape(&row.tier), environment = escape(&row.environment),
             phase = escape(row.phase.as_deref().unwrap_or("unknown")), when = escape(&ago(row.updated_at)),
@@ -2735,8 +2756,9 @@ fn plans(opened: Option<&str>) -> Result<String> {
             html.push_str(&format!(
                 "<h2><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
                  data-ref target=_blank rel=noopener>{title}</a>{attention}</h2>\
-                 <p class=meta><a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a> · \
-                 {id} · {priority} · drafted {age}{tags}</p>",
+                 <p class=meta>Drafted {age} on \
+                 <a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a> \
+                 as <code>{id}</code> at {priority}{tags}</p>",
                 project = escape(&project.name),
                 id = escape(&plan.id),
                 title = escape(&plan.title),
@@ -2868,9 +2890,7 @@ fn subscriptions(show: Option<&str>, changed: Option<&str>) -> Result<String> {
 }
 
 fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Option<&str>) -> String {
-    let mut html = String::from(
-        "<div class=heading><h1>Subscriptions</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
-    );
+    let mut html = String::from("<div class=heading><h1>Subscriptions</h1></div>");
     if let Some(id) = changed {
         html.push_str(&format!(
             "<p class=success>Recorded the change to <code>{}</code>. The dispatcher reads its state on the next pass.</p>",
@@ -3063,19 +3083,19 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
         "started at seq {}{}{}",
         subscription.start_event_seq,
         match position.acked_through_seq {
-            Some(seq) => format!(" · acked through seq {seq}"),
-            None => " · nothing acked yet".to_owned(),
+            Some(seq) => format!(", acked through seq {seq}"),
+            None => ", nothing acked yet".to_owned(),
         },
         if position.leased == 0 {
             String::new()
         } else {
-            format!(" · {} in flight", position.leased)
+            format!(", {} in flight", position.leased)
         },
     );
     format!(
         "<tr data-subscription=\"{id}\"><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\" data-ref target=_blank rel=noopener>{board}</a></div></td>\
          <td>{watches}</td>\
-         <td><code>{consumer}</code><div class=meta>action <code>{action}</code> · {secret}</div></td>\
+         <td><code>{consumer}</code><div class=meta>action <code>{action}</code>, {secret}</div></td>\
          <td><span class=status data-subscription-state>{status}</span>{paused_by}\
          <form method=post action=\"/subscription/{board_path}/{id_path}/{verb}{carry}\">\
          <button class=quick type=submit data-subscription-action=\"{verb}\">{verb_label}</button></form></td>\
@@ -3097,7 +3117,7 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
         status = escape(&subscription.status),
         paused_by = match (&subscription.paused_by, subscription.paused_at) {
             (Some(actor), Some(at)) => format!(
-                "<div class=meta>paused by {} · {}</div>",
+                "<div class=meta>paused by {} {}</div>",
                 escape(actor),
                 escape(&ago(at))
             ),
@@ -3109,7 +3129,7 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
         position_sentence = escape(&position_sentence(view.head_event_seq, acked_position)),
         queued = queued_state(position, &view.dead_letter_codes),
         limits = escape(&format!(
-            "{} ms timeout · {} retries · {}/min · {} at a time",
+            "{} ms timeout, {} retries, {}/min, {} at a time",
             subscription.timeout_ms,
             subscription.max_retries,
             subscription.rate_per_minute,
@@ -3244,7 +3264,7 @@ fn lanes() -> Result<String> {
         ));
         for update in updates {
             html.push_str(&format!(
-                "<p class=meta>{author} · {age}{task}{branch}</p>\
+                "<p class=meta>{author} wrote this {age}{task}{branch}</p>\
                  <div class=\"body md\" data-lane-body>{body}</div>",
                 author = escape(&update.author),
                 age = ago(update.created_at),
@@ -3252,7 +3272,7 @@ fn lanes() -> Result<String> {
                     .task_id
                     .as_ref()
                     .map(|id| format!(
-                        " · <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
+                        ", about <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
                          data-ref target=_blank rel=noopener>{id}</a>",
                         project = escape(project),
                         id = escape(id)
@@ -3261,7 +3281,7 @@ fn lanes() -> Result<String> {
                 branch = update
                     .branch
                     .as_ref()
-                    .map(|branch| format!(" · <span class=lane>{}</span>", escape(branch)))
+                    .map(|branch| format!(", on <span class=lane>{}</span>", escape(branch)))
                     .unwrap_or_default(),
                 body = markdown(&update.body),
             ));
@@ -3292,7 +3312,7 @@ fn board(name: &str) -> Result<String> {
             .join(", ")
     };
     html.push_str(&format!(
-        "<p class=meta>Roots: {} · {} rows</p>",
+        "<p class=meta>Roots: {}, holding {} rows</p>",
         roots,
         tasks.len()
     ));
@@ -3362,9 +3382,9 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         escape(&task.title)
     );
     html.push_str(&format!(
-        "<p class=meta><a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a> · {id} · \
-         <span class=\"type type-{ty}\">{ty}</span> \
-         <span class=status data-task-status>{status}</span> · {priority}{tags}</p>",
+        "<p class=meta>A <span class=\"type type-{ty}\">{ty}</span> on \
+         <a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a>, \
+         <span class=status data-task-status>{status}</span> at {priority}, filed as <code>{id}</code>{tags}</p>",
         project = escape(&project.name),
         id = escape(&task.id),
         ty = escape(&task.task_type),
@@ -3417,7 +3437,7 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         for note in notes {
             html.push_str(&format!(
                 "<article class=note data-task-note><p class=meta><span class=kind>{kind}</span> \
-                 {author} · {when}</p><div class=\"body md\">{body}</div></article>",
+                 by {author} at {when}</p><div class=\"body md\">{body}</div></article>",
                 kind = escape(&note.kind),
                 author = escape(&note.author),
                 when = stamp(note.created_at),
@@ -3432,7 +3452,7 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         for point in checkpoints {
             html.push_str(&format!(
                 "<article class=note><p class=meta><span class=kind>{state}</span> \
-                 {author} · {when}</p><dl>",
+                 by {author} at {when}</p><dl>",
                 state = escape(&point.state),
                 author = escape(&point.author),
                 when = stamp(point.created_at),
@@ -3667,7 +3687,11 @@ fn age(ms: i64) -> String {
         1 => "1 min".to_owned(),
         m if m < 60 => format!("{m} min"),
         m if m < 1440 => format!("{}h{:02}m", m / 60, m % 60),
-        m => format!("{}h", m / 60),
+        // Past a day the coarsest true unit is the day, and it is a word:
+        // the card's eyebrow reads `codex@driver asked on px, 3 days ago`
+        // (spec WEB-23), and `72h ago` is a duration a reader has to divide.
+        m if m < 2880 => "1 day".to_owned(),
+        m => format!("{} days", m / 1440),
     }
 }
 
@@ -3730,15 +3754,16 @@ fn shell(title: &str, body: &str, main_attributes: &str) -> String {
          <nav aria-label=Primary data-primary-nav>\
          <button type=button class=menu data-menu aria-label=Menu aria-expanded=false \
          aria-controls=nav-drawer><span class=bars aria-hidden=true></span></button>\
-         <a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a></nav>\
+         <a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
+         <span class=live data-live role=status aria-live=polite>connecting</span></nav>\
          <div class=backdrop data-backdrop hidden></div>\
          <nav class=drawer id=nav-drawer data-drawer aria-label=Destinations hidden>\
+         <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
          <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/all\" data-nav=all>All open</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
          <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/sprints\" data-nav=sprints>Sprints</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
          <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
-         <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
          </nav><main id=main{main_attributes}>{body}</main>\
-         <footer>live operator view · <code>kanban serve</code></footer>\
+         <footer>The live operator view, served by <code>kanban serve</code>.</footer>\
          <script>{JS}</script></body></html>",
         title = escape(title),
     )
@@ -3769,9 +3794,9 @@ const settleLive = () => setLive(liveSocketUp ? 'live' : 'reconnecting');
 // short recent history, and a page left open for days must not grow a set
 // that never forgets.
 const NOTICE_MEMORY = 200;
-// How many notices stay on screen. The strip is meant to be readable at a
-// glance, not to be a log; `kb ev` is the log.
-const NOTICE_SHOWN = 8;
+// How many notices stay on screen. Three, newest on top: the strip is meant
+// to be readable at a glance, not to be a log; `kb ev` is the log.
+const NOTICE_SHOWN = 3;
 const seenNotices = new Set();
 let liveConnects = 0;
 // A decision is one click and no page load, because the list is long: a
@@ -3804,21 +3829,27 @@ const answerInProgress = () =>
 // answers (George, 2026-09-17: "I want to know that what I clicked on
 // actually did something instead of having no feedback like right now").
 //
-// The pressed control says what it is doing, every control that would post
-// again is disabled, the card is marked busy for a screen reader and for the
-// swap guard, and the live line says `sending`. The pressed control's markup
-// is put back verbatim on a refusal -- the label, the key badge and all --
-// because a button that came back reading `Sending…` would be a dead button.
+// The pressed control says what it is doing ON ITS OWN FILL, and nothing is
+// disabled: a disabled button is greyed out, which reads as an answer that
+// can no longer be given, and it is the one control that cannot report its
+// own refusal. The OTHER answers step back instead -- the card carries
+// `data-state=sending` and the stylesheet dims every answer but the pressed
+// one -- the card is marked busy for a screen reader and for the swap guard,
+// and the live line says `sending`. The pressed control's markup is put back
+// verbatim on a refusal -- the label, the key badge and all -- because a
+// button that came back reading `Sending…` would be a dead button.
+//
+// A second click cannot post twice: `decide` and `undoDecision` each hold
+// their own in-flight flag, which is a guard on the action rather than on
+// the control that reaches it.
 //
 // `settle` is for a decision that landed and is about to be replaced by its
 // receipt: there is nothing left to restore, only the timer to stop.
 function beginSending(card, pressed, label, stillLabel) {
-  const controls = [...card.querySelectorAll('.choice, .record, .undo-button')];
   const markup = pressed ? pressed.innerHTML : null;
   card.dataset.state = 'sending';
   card.setAttribute('aria-busy', 'true');
-  controls.forEach(control => { control.disabled = true; });
-  if (pressed) pressed.textContent = label;
+  if (pressed) { pressed.dataset.pressed = ''; pressed.textContent = label; }
   setLive('sending');
   const timer = pressed
     ? setTimeout(() => { pressed.textContent = stillLabel; }, STILL_SENDING_AFTER)
@@ -3828,10 +3859,9 @@ function beginSending(card, pressed, label, stillLabel) {
     settle,
     revert: () => {
       settle();
-      controls.forEach(control => { control.disabled = false; });
       card.removeAttribute('aria-busy');
       delete card.dataset.state;
-      if (pressed) pressed.innerHTML = markup;
+      if (pressed) { delete pressed.dataset.pressed; pressed.innerHTML = markup; }
     },
   };
 }
@@ -3881,7 +3911,9 @@ function syncAnswer(form) {
 // answer it was asking for has just been abandoned.
 function clearRefusal(form) {
   const refusal = form.querySelector('[data-refusal=incomplete]');
-  if (refusal) refusal.remove();
+  if (!refusal) return;
+  undescribeRefusal(cardOf(form) || form, refusal.id);
+  refusal.remove();
 }
 // The way back out of an answer that was started and is not wanted. HTML
 // offers no way to un-check a radio group, and a picked verdict holds the
@@ -3889,14 +3921,15 @@ function clearRefusal(form) {
 // the swap replaces all of `<main>`, so there is nothing narrower than the
 // page to hold, and the only honest place for the button is beside the
 // verdict it clears. A card scrolled out of view holds the page with its own
-// release off screen, which is what the page-wide `update waiting` line is
-// for. The release therefore has to be reachable by a thumb as well as a
+// release off screen, and the connection line says nothing about it: it is
+// the socket's line, not the page's commentary.
+// The release therefore has to be reachable by a thumb as well as a
 // keyboard: this control, and `Escape` inside the card.
 //
 // The typed words are NOT cleared -- losing them is the thing the hold exists
 // to prevent. The composer's own refusal IS, even though it is still true:
 // it was asking for the two halves of an answer the operator has just said
-// they are not giving, and a red alert standing over an abandoned answer
+// they are not giving, and a red refusal standing over an abandoned answer
 // reads as a failure rather than a prompt. Nothing is lost by removing it --
 // the hint under the submit comes straight back and asks for the same two
 // halves in calmer words. What the BOARD refused stays.
@@ -3916,16 +3949,13 @@ function clearVerdict(form) {
 // on screen and nothing else. A card whose decision is in flight is
 // `data-sent` -- out of the queue, still in the document -- because a
 // refusal has to bring it back to the slot it left.
-const DECK_SLIDE = 160;
+const DECK_SLIDE = 140;
 const deckNode = () => document.querySelector('[data-deck-cards]');
 const deckQueue = () => {
   const deck = deckNode();
   return deck ? [...deck.querySelectorAll('article.item:not([data-sent])')] : [];
 };
 const currentCard = () => document.querySelector('article.item[data-current]');
-// Motion is decoration here: the operator who asked for it not to move is
-// answered by the same code path with the animations left out.
-const stillMotion = () => Boolean(window.matchMedia) && matchMedia('(prefers-reduced-motion: reduce)').matches;
 let deckIndex = 0;
 let deckShown = null;
 // The card that is animating out. It is out of the queue but stays visible
@@ -3948,7 +3978,11 @@ function bindDeck() {
     // is a list of one.
     const full = showing.querySelector('details.full');
     if (full) full.open = true;
-    if (showing !== deckShown && !stillMotion()) {
+    // The advance runs when the card on screen CHANGED, and never because a
+    // projection was refreshed under an unchanged one: that was the blink
+    // (George, 2026-09-17: "it keeps blinking"). `deckShown` survives a
+    // refresh because the node does.
+    if (showing !== deckShown) {
       showing.classList.add('entering');
       setTimeout(() => showing.classList.remove('entering'), DECK_SLIDE);
     }
@@ -3968,11 +4002,9 @@ function bindDeck() {
   }
   // ...and takes it back when a refusal, or an undo, puts a card back.
   if (queue.length && placed) placed.remove();
-  const head = document.querySelector('.deck-head');
-  // Nothing to be at a position in: `1 of 0` is not a place.
-  if (head) head.hidden = queue.length === 0;
-  const position = document.querySelector('[data-deck-position]');
-  if (position) position.textContent = String(queue.length ? deckIndex + 1 : 0);
+  const position = document.querySelector('.progress');
+  // Nothing left to count, and `0 left` over an empty state says it twice.
+  if (position) position.hidden = queue.length === 0;
   syncHistoryCount();
 }
 // Keep the keyboard on the card the deck is showing, so 1-4 keeps deciding
@@ -3988,7 +4020,6 @@ function focusCurrent() {
   card.focus();
 }
 function ghostCard(card, direction) {
-  if (stillMotion()) return;
   if (deckGhostTimer !== null) clearTimeout(deckGhostTimer);
   if (deckGhost && deckGhost !== card) settleGhost();
   deckGhost = card;
@@ -4079,11 +4110,14 @@ function historyRow(row) {
 // receipt: nothing is recorded yet, so it carries no undo and no receipt
 // tag. Offering to reverse a decision that may still be refused would be
 // offering to reverse something that never happened.
+//
+// It carries no `role` of its own either: the connection line is the page's
+// one `role=status` and the toast strip is its one `role=log`, so a third
+// live region here would be two channels claiming the same job.
 function showPending(card, label) {
   const row = document.createElement('p');
   row.className = 'pending';
   row.dataset.pending = card.dataset.item;
-  row.setAttribute('role', 'status');
   row.textContent = `Sending… ${label}`;
   return historyRow(row) ? row : null;
 }
@@ -4142,6 +4176,9 @@ function growNote(field) {
   field.style.height = `${Math.min(field.scrollHeight, line * NOTE_LINES + frame + 16) + frame}px`;
 }
 function bindCards() {
+  // First, and before anything on a card is touched: what the server served
+  // is what a later refresh is diffed against.
+  snapshotCards();
   document.querySelectorAll('form.decide').forEach(form => {
     if (form.dataset.cardBound) return;
     form.dataset.cardBound = '1';
@@ -4176,22 +4213,34 @@ function decidedLabel(form, submitter) {
   const outcome = form.querySelector('input[name=outcome]:checked');
   return outcome ? `Custom answer, recorded as ${outcome.value}` : 'Custom answer';
 }
+// Which of the four outcomes was just recorded, so the receipt can encode it
+// as its own left rule: an authored choice carries its outcome on the button
+// that was pressed, and the free-text answer carries the verdict that was
+// picked for it.
+function decidedOutcome(form, submitter) {
+  if (submitter && submitter.value !== 'custom') {
+    const named = [...submitter.classList].find(name => name.startsWith('outcome-'));
+    if (named) return named.slice('outcome-'.length);
+    return 'other';
+  }
+  const outcome = form.querySelector('input[name=outcome]:checked');
+  return outcome ? outcome.value : 'other';
+}
 // Whether the body about to be posted carries words as well as a choice. The
 // custom answer IS those words and its label already says so, so only an
 // authored key earns the extra sentence.
 function replySent(body) {
   return body.get('decision') !== 'custom' && (body.get('reply') || '').trim().length > 0;
 }
-function showReceipt(card, label, noted) {
+function showReceipt(card, label, noted, outcome) {
   const receipt = document.createElement('p');
-  // `landed` is the one-shot flash that says the board answered: the card
-  // the eye was already on becomes the receipt, and without it the swap is
-  // easy to miss on a long list.
-  receipt.className = 'receipt landed';
+  // No flash: what says the board answered is that the row is THERE, with
+  // the outcome it recorded on its own left rule. A one-shot highlight was
+  // a second motion competing with the card advance.
+  receipt.className = `receipt outcome-${outcome}`;
   receipt.dataset.receipt = card.dataset.item;
   receipt.dataset.item = card.dataset.item;
   receipt.dataset.project = card.dataset.project || '';
-  receipt.setAttribute('role', 'status');
   const decided = document.createElement('span');
   decided.className = 'decided';
   decided.textContent = noted ? `Decided: ${label}. Your reply is recorded.` : `Decided: ${label}.`;
@@ -4271,16 +4320,24 @@ async function undoDecision(row) {
   }
 }
 // A refusal on a decided row has no form to live in, so it lives on the row.
+//
+// It is not a live region: the page has exactly two announcement channels --
+// the socket's status line and the toast log -- and a third one that shouts
+// whatever the board said would be the page narrating itself, which WEB-52
+// forbids. A refusal is inline text tied to the thing that was refused, so
+// the row points at it with `aria-describedby` and a reader reaching the row
+// reads the sentence as part of it.
 function showRowRefusal(row, text) {
   let refusal = row.querySelector('[data-refusal=board]');
   if (!refusal) {
     refusal = document.createElement('p');
     refusal.className = 'error';
     refusal.setAttribute('data-refusal', 'board');
-    refusal.setAttribute('role', 'alert');
+    refusal.id = `refusal-row-${row.dataset.item || 'row'}`;
     row.append(refusal);
   }
   refusal.textContent = text;
+  row.setAttribute('aria-describedby', refusal.id);
 }
 // `CSS.escape` is the standard name; the fallback keeps the selector honest
 // on a browser that predates it, and ids are slugs anyway.
@@ -4297,16 +4354,36 @@ const cssEscape = value => (window.CSS && CSS.escape) ? CSS.escape(value) : valu
 // next keystroke then removed it as the composer's own -- leaving a card that
 // looked as though the board had never refused anything, with nothing
 // recorded anywhere.
+// It is not a live region either, for the reason the row's refusal is not:
+// two channels, and a refusal is not an announcement. It is described text,
+// so it carries an id and the caller points whatever it focuses -- the half
+// of the answer that is missing, or the card the board refused -- at that id
+// with `aria-describedby`. The node is returned for that wiring.
 function showRefusal(form, text, kind) {
+  const card = cardOf(form);
   let refusal = form.querySelector(`[data-refusal="${kind}"]`);
   if (!refusal) {
     refusal = document.createElement('p');
     refusal.className = 'error';
     refusal.setAttribute('data-refusal', kind);
-    refusal.setAttribute('role', 'alert');
+    refusal.id = `refusal-${kind}-${(card && card.dataset.item) || 'card'}`;
     form.append(refusal);
   }
   refusal.textContent = text;
+  return refusal;
+}
+// A refusal describes the control the operator is sent to, and stops
+// describing it the moment the sentence is gone: a reader that still reads
+// out a refusal which is no longer on the page is worse than one that never
+// read it.
+function describeRefusal(target, refusal) {
+  if (target && refusal) target.setAttribute('aria-describedby', refusal.id);
+}
+function undescribeRefusal(scope, id) {
+  if (!scope || !id) return;
+  scope
+    .querySelectorAll(`[aria-describedby="${cssEscape(id)}"]`)
+    .forEach(element => element.removeAttribute('aria-describedby'));
 }
 async function decide(form, submitter) {
   const card = cardOf(form);
@@ -4321,9 +4398,12 @@ async function decide(form, submitter) {
     const text = form.querySelector('textarea[name=reply]');
     const verdict = form.querySelector('input[name=outcome]:checked');
     if (!verdict || !text || text.value.trim().length === 0) {
-      showRefusal(form, INCOMPLETE_ANSWER, 'incomplete');
+      const refusal = showRefusal(form, INCOMPLETE_ANSWER, 'incomplete');
       const missing = verdict ? text : form.querySelector('input[name=outcome]');
-      if (missing) missing.focus();
+      if (missing) {
+        describeRefusal(missing, refusal);
+        missing.focus();
+      }
       return;
     }
   }
@@ -4337,6 +4417,7 @@ async function decide(form, submitter) {
   form.dataset.deciding = '1';
   const body = decisionBody(form, submitter);
   const label = decidedLabel(form, submitter);
+  const outcome = decidedOutcome(form, submitter);
   const noted = replySent(body);
   const sending = beginSending(card, submitter, 'Sending…', 'Still sending…');
   // The deck hands over to the next card now rather than when the board
@@ -4359,7 +4440,7 @@ async function decide(form, submitter) {
     if (response.type === 'opaqueredirect' || response.ok) {
       sending.settle();
       noteOwnChange(card.dataset.project);
-      showReceipt(card, label, noted);
+      showReceipt(card, label, noted, outcome);
       settleLive();
       return;
     }
@@ -4371,24 +4452,40 @@ async function decide(form, submitter) {
     settleLive();
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const refused = page.querySelector('.error');
-    showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board');
+    describeRefusal(card, showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board'));
   } catch (error) {
     sending.revert();
     if (advanced) advanced.restore();
     settleLive();
-    showRefusal(form, 'The decision did not reach the board. Try again.', 'board');
+    describeRefusal(card, showRefusal(form, 'The decision did not reach the board. Try again.', 'board'));
   } finally {
     delete form.dataset.deciding;
   }
+}
+// Every card node the server has rendered into this page, as it was served.
+// It is the only way to know later whether a freshly fetched card SAYS
+// anything new: by the time a refresh arrives the live node carries the
+// deck's own attributes -- `data-current`, `hidden`, an opened fold, a bound
+// form -- so its current markup can never be compared with the server's.
+//
+// Taken before anything is bound, which is why `bindCards` calls it first.
+// A property rather than an attribute: it travels with the node and is not
+// served to anybody.
+function snapshotCards() {
+  document.querySelectorAll('article.item').forEach(card => {
+    if (card.servedMarkup === undefined) card.servedMarkup = card.outerHTML;
+  });
 }
 async function refreshProjection() {
   // A decision already in flight holds the swap too, and while it does the
   // live line goes on saying what the page is doing rather than what the
   // socket is waiting for: `sending` is the answer to the click that was
-  // just made, and it must not be overwritten a tick later.
-  if (answerInProgress()) { setLive(sendingInFlight() ? 'sending' : 'update waiting'); return; }
+  // just made, and it must not be overwritten a tick later. A draft being
+  // written says nothing at all -- the connection line is the connection's,
+  // and the four words it may say are the socket's states.
+  if (answerInProgress()) { if (sendingInFlight()) setLive('sending'); return; }
   // A card that is halfway out of the deck is not a page to swap: the
-  // animation is 160ms and the node it is moving is one of the nodes being
+  // animation is 140ms and the node it is moving is one of the nodes being
   // replaced, so the swap waits for it to land rather than deleting it
   // mid-flight.
   if (deckGhost) await new Promise(resolve => setTimeout(resolve, DECK_SLIDE));
@@ -4400,13 +4497,32 @@ async function refreshProjection() {
   // network round trip ago -- and everything below MOVES live nodes into
   // the detached document: the notices strip, then every receipt. Bailing
   // out after that point would delete them instead of preserving a draft.
-  if (answerInProgress()) { setLive(sendingInFlight() ? 'sending' : 'update waiting'); return; }
+  if (answerInProgress()) { if (sendingInFlight()) setLive('sending'); return; }
   // Where the deck is, so the swap puts it back: the same item if it is
   // still open, and otherwise the same slot in the queue -- a refresh must
   // not throw the operator back to the top of a queue of 133.
   const showing = currentCard();
   const showingItem = showing ? showing.dataset.item : null;
   const slot = deckIndex;
+  // The card the operator is looking at is NOT replaced when the server has
+  // nothing new to say about it (George, 2026-09-17: "it keeps blinking").
+  // Every notice used to swap all of `<main>`, which meant a brand new node
+  // for the same item, which meant the advance ran again on a card that had
+  // not moved -- two or three times a minute, under the question being read.
+  //
+  // So the fresh cards are diffed by `data-item` against what the server
+  // served for the same item, and an identical one hands its place back to
+  // the live node: same object, same scroll position, same focus, no
+  // animation. A card whose markup DID change is replaced, because then the
+  // page is showing something the board no longer says.
+  const live = new Map();
+  document.querySelectorAll('article.item[data-item]').forEach(card => {
+    if (card.servedMarkup !== undefined) live.set(card.dataset.item, card);
+  });
+  next.querySelectorAll('article.item[data-item]').forEach(incoming => {
+    const held = live.get(incoming.dataset.item);
+    if (held && held.servedMarkup === incoming.outerHTML) incoming.replaceWith(held);
+  });
   // The side carries the whole sitting across: the notices and every
   // receipt with its undo live in it, so one node moves instead of a strip
   // plus a list of receipts threaded back in one at a time.
@@ -4429,7 +4545,9 @@ async function refreshProjection() {
   document.querySelector('main').replaceWith(next);
   bindCards();
   deckIndex = slot;
-  deckShown = null;
+  // `deckShown` is NOT cleared: the card that was showing is the same node
+  // when the server said nothing new about it, and clearing this was the
+  // other half of the blink -- `bindDeck` would re-enter the same card.
   bindDeck();
   if (showingItem) deckShow(showingItem);
   focusCurrent();
@@ -4441,7 +4559,9 @@ function noticeStrip() {
     strip = document.createElement('div');
     strip.className = 'notices';
     strip.setAttribute('data-notices', '');
-    strip.setAttribute('role', 'status');
+    // A log, not a status: what arrived is a list of entries, and the
+    // connection line is the page's one status.
+    strip.setAttribute('role', 'log');
     strip.setAttribute('aria-live', 'polite');
     document.querySelector('main').prepend(strip);
   }
@@ -4512,20 +4632,29 @@ function applyNotice(notice) {
   toast(row);
   return true;
 }
-// On the deck a notice is news, not a log: the side belongs to the
-// decisions, so a notice takes itself away after six seconds. Hovering
-// holds it -- a notice that vanished out from under the eye reading it
-// would be worse than one that stayed. `kb ev` is the log, and the list at
-// `/all` still keeps its strip.
-const TOAST_LIFE = 6000;
+// A toast stays twenty seconds (George, 2026-09-17: "the toast is too
+// fast"), and the clock stops while the pointer is on it or the keyboard is
+// in it -- a notice that vanished out from under the eye reading it would be
+// worse than one that stayed. It goes on a click anywhere on it, or on
+// `Escape`; three stay on screen at once, newest first. `kb ev` is the log,
+// and the list at `/all` keeps its strip without a clock at all.
+const TOAST_LIFE = 20000;
 function toast(row) {
   if (!document.querySelector('[data-deck]')) return;
   let timer = setTimeout(() => row.remove(), TOAST_LIFE);
-  row.addEventListener('mouseenter', () => { clearTimeout(timer); timer = null; });
-  row.addEventListener('mouseleave', () => {
-    if (timer === null) timer = setTimeout(() => row.remove(), TOAST_LIFE);
-  });
+  const hold = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
+  const release = () => { if (timer === null) timer = setTimeout(() => row.remove(), TOAST_LIFE); };
+  row.addEventListener('mouseenter', hold);
+  row.addEventListener('mouseleave', release);
+  row.addEventListener('focusin', hold);
+  row.addEventListener('focusout', release);
 }
+// Every toast at once, because `Escape` is not aimed at one of them.
+const dismissToasts = () => {
+  const rows = [...document.querySelectorAll('[data-notices] .notice')];
+  rows.forEach(row => row.remove());
+  return rows.length > 0;
+};
 function connectLive() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const socket = new WebSocket(`${scheme}://${location.host}/live`);
@@ -4543,14 +4672,19 @@ function connectLive() {
       }
       return;
     }
-    if (frame.type === 'refresh') refreshProjection().catch(() => setLive('refresh failed'));
+    // A refresh that did not land leaves the line saying what the socket
+    // is, which is the only thing this line is allowed to say.
+    if (frame.type === 'refresh') refreshProjection().catch(settleLive);
   };
   socket.onclose = () => { liveSocketUp = false; setLive('reconnecting'); setTimeout(connectLive, 1500); };
   socket.onerror = () => socket.close();
 }
+// A click anywhere on a notice takes it away: the dismiss button is the
+// keyboard's way in and the label that says so, and the row itself is the
+// thumb's.
 document.addEventListener('click', event => {
-  const dismiss = event.target.closest('.notice > .dismiss');
-  if (dismiss) dismiss.parentElement.remove();
+  const row = event.target.closest ? event.target.closest('.notice') : null;
+  if (row) row.remove();
 });
 // The undo button on a receipt (Needs you) and the submit on a decided row's
 // form (Recent decisions) are the same action through the same route; the
@@ -4713,7 +4847,10 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
     if (openPreviews.length) { event.preventDefault(); closeAllPreviews(); return; }
     // The menu and the side history are the outermost things Escape closes:
-    // whatever is over the page goes first, and only then the verdict.
+    // whatever is over the page goes first, and only then the verdict. A
+    // toast is over the page too, and it is the thing an operator reaches
+    // for Escape about most often, so it goes first of all.
+    if (dismissToasts()) { event.preventDefault(); return; }
     if (drawerOpen() || historyOpen()) { event.preventDefault(); setDrawer(false); setHistory(false); return; }
     const escaped = cardOf(target) || cardOf(document.activeElement);
     const form = escaped && escaped.querySelector('form.decide');
@@ -4773,6 +4910,19 @@ document.addEventListener('keydown', event => {
     if (text) { event.preventDefault(); text.focus(); }
   }
 });
+// Which destination this is, marked by a rule rather than by a fill: the
+// drawer's own current-page mark. It is read off the address bar rather than
+// rendered, because one shell serves every page and the page it is serving
+// is exactly what `location` says.
+function markCurrentPage() {
+  const here = location.pathname.replace(/\/+$/, '') || '/';
+  document.querySelectorAll('[data-drawer] .nav-links a[href]').forEach(link => {
+    const target = new URL(link.href, location.href).pathname.replace(/\/+$/, '') || '/';
+    if (target === here) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  });
+}
+markCurrentPage();
 bindCards();
 // The deck starts on the first card with the keyboard already on it, so the
 // first thing the page is good for is answering it.
@@ -4780,217 +4930,91 @@ bindDeck();
 focusCurrent();
 connectLive();
 "#;
-/// The OMP skin: the calm dark palette of the harness George reads this from,
-/// not the phosphor terminal it replaced (George, 2026-09-11: "you don't need
-/// to have to use the neon color thing strictly, it can feel more like OMP's
-/// theme here").
+/// One designed system, in one inline stylesheet (ADR-046, spec WEB).
 ///
-/// Tokens follow the `dark-catppuccin-omp` theme installed in his omp — the
-/// same Mocha palette the harness renders in — so the page and the chat it is
-/// decided from share one visual register: deep blue-dark grounds, soft
-/// lavender-white text, blue for what is readable and actionable, green for
-/// settled, red for refusal and P0, peach for waiting. One family for prose
-/// and one for identifiers: the system serif-less stack for reading, mono for
-/// ids, keys and receipts. No webfont, no CRT overlays, no glow: the decision
-/// card is the loudest thing on the page and everything else is quiet on
-/// purpose. Every pill variant is spelled out even where it only restates the
-/// default, so that adding a colour is an edit to a line that already exists
-/// rather than a new rule someone has to invent.
+/// Two desk surfaces and nothing else: `--base` is the page, `--mantle` is
+/// the answer panel, the side column and the drawer. Hierarchy is carried by
+/// fill, size and type — there is no outline but the focus ring, one hairline
+/// between a card's body and its answers, one row separator, and two radii
+/// with one job each (8px for a control, 999px for a pill). A colour is an
+/// outcome: green, red, yellow and blue mean approve, reject, defer and
+/// other, and nothing decorative is ever coloured. The outcome hue travels
+/// on `--hue`, set by the one class that knows the outcome, so exactly one
+/// rule fills the recommended answer and exactly one rule rules a receipt.
+///
+/// One serif, and it is the question: the system serif at 1.75rem on a phone
+/// and 2.25rem on a desk is the largest thing on the screen and the only
+/// thing set in it. Mono is reserved for what is literally code — an id, a
+/// key map, a numeric column. One motion exists, the card advance, at 140ms
+/// each way; a notice, a receipt and a toast simply appear.
+///
+/// Every rule that lays the deck out is scoped to `html.js`, because the deck
+/// is one card only while there is a script to hide the others: without one
+/// the same markup has to stay the plain scrolling list it is served as.
 const CSS: &str = "\
 *{box-sizing:border-box}\
 :root{color-scheme:dark;\
---crust:#11111b;--mantle:#181825;--base:#1e1e2e;--surface0:#313244;--surface1:#45475a;\
---text:#cdd6f4;--subtext:#a6adc8;--muted:#7f849c;\
---accent:#89b4fa;--green:#a6e3a1;--red:#f38ba8;--peach:#fab387;--mauve:#cba6f7;\
+--base:#1e1e2e;--mantle:#181825;--surface0:#313244;--surface1:#45475a;\
+--text:#cdd6f4;--subtext:#a6adc8;--overlay:#9399b2;\
+--green:#a6e3a1;--red:#f38ba8;--yellow:#f9e2af;--blue:#89b4fa;\
+--link:#89b4fa;--focus:#b4befe;\
+--serif:ui-serif,'New York','Iowan Old Style',Charter,Georgia,serif;\
+--sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;\
 --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
-body{margin:0;min-height:100vh;color:var(--text);background:var(--crust);\
-font:15px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;\
-scrollbar-color:var(--surface1) var(--crust)}\
-nav{z-index:10;display:flex;align-items:center;gap:.8rem;padding:.6rem max(1rem,env(safe-area-inset-right)) .6rem max(1rem,env(safe-area-inset-left));\
-background:var(--mantle);border-bottom:1px solid var(--surface0);position:sticky;top:0}\
-.brand,.brand:hover{padding:0;background:transparent;color:var(--accent);font-weight:700;font-family:var(--mono)}\
-.brand::before{content:'>';margin-right:.4em;color:var(--mauve)}\
-.nav-links{display:flex;align-items:center;gap:.15rem}\
-nav a{display:flex;align-items:center;min-height:2.5rem;padding:0 .65rem;color:var(--subtext);\
-text-decoration:none;border-radius:6px;white-space:nowrap;font-size:.9rem}\
-nav a:hover{color:var(--crust);background:var(--accent);text-decoration:none}\
-nav form{margin-left:auto;min-width:8rem}nav form input{width:100%}\
-input,button,textarea{min-height:2.6rem;font:inherit;color:var(--text);background:var(--base);\
-border:1px solid var(--surface1);border-radius:6px;padding:.5rem .7rem}\
-input::placeholder,textarea::placeholder{color:var(--muted)}\
-input:focus-visible,button:focus-visible,textarea:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
-button{cursor:pointer;background:transparent}\
-button:hover{border-color:var(--accent)}button:active{transform:translateY(1px)}\
-.search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
+body{margin:0;min-height:100vh;color:var(--text);background:var(--base);\
+font-family:var(--sans);font-size:1rem;line-height:1.55;\
+scrollbar-color:var(--surface1) var(--base)}\
 main{max-width:66rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
-footer{max-width:66rem;margin:0 auto;padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));color:var(--muted);font-size:.85rem}\
-body:has(.keys) footer{padding-bottom:calc(5.5rem + env(safe-area-inset-bottom))}\
-h1{font-size:1.35rem;font-weight:650;line-height:1.3;margin:.2rem 0 1rem;color:var(--text)}\
-h1::before{content:'> ';color:var(--mauve);font-family:var(--mono)}\
-h2{font-size:1rem;font-weight:650;margin:1.6rem 0 .5rem;color:var(--subtext)}\
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
-code,kbd{color:var(--text);background:var(--surface0);padding:.12em .4em;border-radius:4px;font-family:var(--mono);font-size:.92em}\
-pre{background:var(--base);border:1px solid var(--surface0);border-radius:6px;padding:.8rem;\
-overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem;font-family:var(--mono)}\
-table{width:100%;border-collapse:collapse;font-size:.88rem}\
-th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--surface0);\
-vertical-align:top}\
-th{color:var(--muted);font-weight:500}\
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}\
-td.waiting{color:var(--peach);font-weight:650}\
-.queued{margin-top:.25rem;font-size:.85rem;color:var(--muted)}\
-.queued .retrying{color:var(--peach);font-weight:600}\
-.queued .dead{color:var(--red);font-weight:700}\
-td.when{white-space:nowrap;color:var(--muted)}\
-td.payload{color:var(--muted);font-size:.85rem;word-break:break-word}\
-.item,.note,.plan,.search-result,.card{border:1px solid var(--surface0);border-radius:10px;\
-padding:clamp(.9rem,3vw,1.25rem);margin:1rem 0;background:var(--base)}\
-.item:has(.priority-p0){border-color:var(--red)}.item:has(.priority-p1){border-color:var(--peach)}\
-.card>h2:first-child{margin-top:0}.card.current{border-color:var(--green)}\
-.sprint-version{font-size:1.15rem}.sprint-history{margin-top:1.5rem}\
-.heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}\
-.live{color:var(--green);font-size:.75rem}\
-.live::after{content:'●';margin-left:.35em;animation:pulse 2.4s ease-in-out infinite}\
-@keyframes pulse{50%{opacity:.35}}\
-.success{background:rgba(166,227,161,.08);border:1px solid var(--green);border-radius:8px;padding:.6rem .75rem}\
-.notices{display:grid;gap:.35rem;margin:0 0 1.1rem}\
-.notice{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:0;padding:.4rem .55rem;\
-font-size:.85rem;background:var(--mantle);border:1px solid var(--surface0);\
-border-left:2px solid var(--accent);border-radius:6px;animation:notice-in .18s ease-out}\
-.notice-board{color:var(--muted)}\
-.notice-what{font-weight:400}\
-.notice.summary .notice-what{font-weight:650}\
-.notice .dismiss{margin-left:auto;min-height:auto;padding:.1rem .5rem;font-size:.75rem;\
-color:var(--muted);border-color:var(--surface1)}\
-@keyframes notice-in{from{opacity:0;transform:translateY(-.25rem)}to{opacity:1;transform:none}}\
-.decide textarea{display:block;width:100%;min-height:2.9rem;resize:vertical}\
-.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.6rem}\
-.actions button{min-width:6.5rem}\
-.explain{max-width:72ch;margin:0 0 1rem;color:var(--subtext);font-size:.9rem}\
-.eyebrow{max-width:72ch;margin:0 0 .4rem;color:var(--muted);font-size:.78rem;line-height:1.45}\
-.eyebrow a{color:var(--subtext)}\
-.eyebrow .kind{font-size:.72rem}\
-.item h2{max-width:72ch;margin:0 0 .6rem;color:var(--text);font-size:1.125rem;line-height:1.45;font-weight:650}\
-.item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
-.context{max-width:72ch;margin:0 0 1.1rem;color:var(--subtext)}\
-.decide{margin:0}\
-fieldset{min-width:0;margin:0;padding:0;border:0}\
-legend{padding:0;color:var(--muted);font-size:.78rem;letter-spacing:.02em}\
-.recommended{padding:.25rem .85rem .9rem;border:1px solid var(--accent);border-radius:8px}\
-.recommended legend{padding:0 .45em;color:var(--accent)}\
-.choice{display:block;width:100%;margin:0;text-align:left;line-height:1.45;white-space:normal;font-weight:650}\
-.choice .key{display:inline-block;min-width:1.6em;margin-right:.5em;padding:0 .2em;font-weight:500;\
-border:1px solid currentColor;border-radius:4px;font-size:.75rem;text-align:center;font-family:var(--mono)}\
-.choice.outcome-approve{color:var(--green);border-color:var(--green)}\
-.choice.outcome-defer{color:var(--peach);border-color:var(--peach)}\
-.choice.outcome-reject{color:var(--red);border-color:var(--red)}\
-.choice.outcome-other{color:var(--subtext);border-color:var(--surface1)}\
-.recommended .choice{color:var(--crust);background:var(--accent);border-color:var(--accent);font-weight:650}\
-.recommended .choice .key{opacity:.75}\
-.recommended .choice:hover{border-color:var(--crust)}\
-.consequence{max-width:72ch;margin:.3rem 0 0;color:var(--muted);font-size:.92rem}\
-.recommended .consequence{color:var(--subtext)}\
-.alternatives{display:grid;gap:1.15rem;margin:1.15rem 0 0}\
-.alternative .consequence{margin-top:.3rem}\
-.reply{margin-top:1.15rem}\
-.reply>label{display:block;margin:0 0 .35rem;color:var(--subtext);font-size:.8rem}\
-.reply .hint{margin-top:.4rem}\
-.custom{margin-top:1.5rem;padding-top:1rem;border-top:1px dashed var(--surface1)}\
-.custom>summary{display:flex;align-items:center;min-height:2.4rem;color:var(--subtext);\
-font-size:.85rem;cursor:pointer;list-style:none}\
-.custom>summary::-webkit-details-marker{display:none}\
-.custom>summary::before{content:'+';margin-right:.5em;font-family:var(--mono)}\
-.custom[open]>summary::before{content:'-'}\
-.picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
-.picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.4rem;\
-padding:.25rem .6rem;color:var(--subtext);border:1px solid var(--surface1);border-radius:6px;cursor:pointer}\
-.picks label:has(input:checked){color:var(--accent);border-color:var(--accent)}\
-.picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;border:0;accent-color:var(--accent)}\
-.record{color:var(--accent);border-color:var(--accent)}\
-.clear{color:var(--muted);border-color:var(--surface1)}\
-.hint{margin:0;color:var(--muted);font-size:.8rem}\
-.receipt{margin:1rem 0;padding:.55rem .75rem;color:var(--subtext);background:var(--mantle);\
-border:1px solid var(--surface0);border-left:2px solid var(--green);border-radius:8px}\
-.receipt .decided{color:var(--green)}\
-.receipt .undo-button{min-height:auto;margin-left:.4rem;padding:.15rem .7rem;font-size:.8rem;\
-color:var(--peach);border-color:var(--peach)}\
-.receipt.landed{animation:receipt-landed .5s ease-out}\
-@keyframes receipt-landed{from{background:var(--surface0);color:var(--text)}to{background:var(--mantle)}}\
-.item[data-state=sending]{border-color:var(--peach)}\
-[data-state=sending] button:disabled{cursor:progress}\
-button:disabled{opacity:.6}\
-button:disabled:hover{border-color:var(--surface1)}\
-.decided{border:1px solid var(--surface0);border-left:2px solid var(--surface1);border-radius:10px;\
-padding:clamp(.8rem,3vw,1.1rem);margin:.8rem 0;background:var(--base)}\
-.decided h2{margin:0 0 .5rem;color:var(--subtext);font-size:1rem;font-weight:600}\
-.decided:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
-.decided .decision{margin:.2rem 0;color:var(--text)}\
-.decided .note{margin:.3rem 0;color:var(--subtext);font-style:italic}\
-.decided .undo-button{margin-top:.5rem;color:var(--peach);border-color:var(--peach)}\
-.undo-button:hover{color:var(--crust);background:var(--peach);border-color:var(--peach)}\
-.outcome{display:inline-block;margin-right:.5em;padding:.05em .5em;border-radius:4px;font-size:.75rem;\
-border:1px solid var(--surface1);color:var(--subtext);font-family:var(--mono)}\
-.outcome-approve{color:var(--green);border-color:var(--green)}\
-.outcome-reject{color:var(--red);border-color:var(--red)}\
-.outcome-defer{color:var(--peach);border-color:var(--peach)}\
-.full{margin:1.2rem 0 0}\
-.full summary{color:var(--muted);cursor:pointer;list-style:none}\
-.full summary::-webkit-details-marker{display:none}\
-.full summary::before{content:'+ '}\
-.full[open] summary::before{content:'- '}\
-.full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--subtext)}\
-.keys{position:fixed;left:0;right:0;bottom:0;z-index:20;margin:0;\
-padding:.5rem max(1rem,env(safe-area-inset-right)) calc(.5rem + env(safe-area-inset-bottom)) max(1rem,env(safe-area-inset-left));\
-color:var(--muted);font-size:.85rem;background:var(--mantle);border-top:1px solid var(--surface0)}\
-.keys kbd{color:var(--text)}\
-.search-result h2{margin:.1rem 0}.citation{margin:.4rem 0 0;color:var(--muted)}\
-.meta{color:var(--muted);font-size:.85rem;margin:.2rem 0}\
-.body{margin:.5rem 0}\
-.body.md>*:first-child{margin-top:0}.body.md>*:last-child{margin-bottom:0}\
-.body.md p{margin:.5rem 0;max-width:78ch}\
-.body.md h1,.body.md h2,.body.md h3,.body.md h4{margin:.9rem 0 .35rem;color:var(--text);font-weight:650}\
-.body.md h1{font-size:1.1rem}.body.md h2{font-size:1.05rem}.body.md h3{font-size:1rem}.body.md h4{font-size:.95rem}\
-.body.md ul,.body.md ol{margin:.5rem 0;padding-left:1.4rem;max-width:78ch}\
-.body.md li{margin:.2rem 0}\
-.body.md ul{list-style:disc}.body.md ol{list-style:decimal}\
-.body.md blockquote{margin:.6rem 0;padding:.2rem .9rem;border-left:3px solid var(--surface1);color:var(--muted)}\
-.body.md pre{margin:.6rem 0}\
-.body.md table{margin:.6rem 0}\
-.body.md hr{border:0;border-top:1px solid var(--surface0);margin:1rem 0}\
-.cmd{margin:.5rem 0 0;font-size:.85rem}\
-.empty{color:var(--muted)}\
-.count{color:var(--muted);font-weight:400;font-size:.85rem}\
-.attention-count{display:inline-block;margin-left:.4rem;padding:.05em .45em;border-radius:4px;\
-background:transparent;border:1px solid var(--accent);color:var(--accent);font-size:.75rem;font-weight:600}\
-.kind,.type,.status,.lane,.tag,.priority{display:inline-block;padding:.05em .5em;\
-border-radius:4px;font-size:.75rem;color:var(--subtext);background:transparent;border:1px solid var(--surface1)}\
-.kind-blocking,.priority-p0{color:var(--red);border-color:var(--red)}\
-.kind-risk,.priority-p1{color:var(--peach);border-color:var(--peach)}\
-.kind-review,.kind-approval{color:var(--green);border-color:var(--green)}\
-.kind-decision,.priority-p2,.priority-legacy,.type-epic,.type-story,.type-task{color:var(--subtext);border-color:var(--surface1)}\
-ul.rows,ul.children{list-style:none;padding:0;margin:.3rem 0}\
-ul.rows li,ul.children li{padding:.3rem 0;border-bottom:1px solid var(--surface0)}\
-dl{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:.4rem 0}\
-dt{color:var(--muted);font-size:.85rem}\
-dd{margin:0;font-size:.9rem;word-break:break-word}\
-.plan-body{max-height:28rem;overflow-y:auto}\
-.error{color:var(--red)}\
-.preview-pop{position:fixed;z-index:300;max-width:26rem;max-height:22rem;overflow-y:auto;\
-background:var(--mantle);border:1px solid var(--surface1);border-radius:10px;\
-box-shadow:0 12px 32px rgba(0,0,0,.45);padding:.8rem .9rem;color:var(--text);animation:notice-in .12s ease-out}\
-.preview-card h3{margin:.1rem 0 .4rem;font-size:.95rem;font-weight:650;color:var(--text)}\
-.preview-card h3 a{color:inherit}\
-.preview-card .body{margin:.4rem 0 0;color:var(--subtext);font-size:.88rem}\
-/* --- the menu ------------------------------------------------------------ */\
-.menu{display:flex;align-items:center;justify-content:center;width:2.6rem;min-height:2.6rem;padding:0;\
-border-color:var(--surface0)}\
-.menu .bars{display:block;width:1.1rem;height:.1rem;background:var(--text);box-shadow:0 -.35rem var(--text),0 .35rem var(--text)}\
-.menu[aria-expanded=true]{border-color:var(--accent)}\
-.backdrop{position:fixed;inset:0;z-index:40;background:rgba(17,17,27,.6)}\
-.drawer{position:fixed;left:0;top:0;bottom:0;z-index:50;display:flex;flex-direction:column;gap:.6rem;\
-width:min(17rem,82vw);padding:.8rem max(.7rem,env(safe-area-inset-left));overflow-y:auto;\
-background:var(--mantle);border-right:1px solid var(--surface0);animation:drawer-in .16s ease-out}\
-.drawer .nav-links{display:flex;flex-direction:column;align-items:stretch;gap:.1rem}\
+footer{max-width:66rem;margin:0 auto;\
+padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));\
+color:var(--overlay);font-size:.8125rem}\
+h1{margin:.2rem 0 1rem;font-family:var(--serif);font-size:1.5rem;line-height:1.2;\
+font-weight:600;color:var(--text)}\
+h2{margin:1.6rem 0 .5rem;font-size:1.0625rem;line-height:1.3;font-weight:600;color:var(--subtext)}\
+a{color:var(--link);text-decoration:none}\
+a:hover{text-decoration:underline}\
+code{padding:.12em .4em;color:var(--text);background:var(--surface0);border-radius:8px;\
+font-family:var(--mono);font-size:.92em}\
+pre{margin:.6rem 0;padding:.8rem;background:var(--surface0);border-radius:8px;\
+overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem}\
+input,textarea{min-height:2.75rem;padding:.6rem .7rem;font-family:var(--sans);font-size:1rem;\
+line-height:1.55;color:var(--text);background:var(--surface0);border:0;border-radius:8px}\
+input::placeholder,textarea::placeholder{color:var(--subtext)}\
+button{min-height:2.75rem;padding:.6rem .8rem;font-family:var(--sans);font-size:1rem;\
+line-height:1.2;font-weight:600;color:var(--text);background:var(--surface0);border:0;\
+border-radius:8px;cursor:pointer}\
+*:focus-visible{outline:2px solid var(--focus);outline-offset:2px}\
+/* ...except the card the deck is showing. The deck moves focus to it so\
+   `1` decides without a click first, which means the ring would be drawn\
+   around the whole card permanently -- a box around everything, saying\
+   nothing (WEB-13). Focus is still visible on every control inside it, and\
+   on the same card in the plain list, where it is reached by Tab. */\
+html.js .deck article.item[data-current]:focus-visible{outline:0}\
+/* --- the shell ----------------------------------------------------------- */\
+nav{z-index:10;display:flex;align-items:center;gap:.8rem;\
+padding:.45rem max(1rem,env(safe-area-inset-right)) .45rem max(1rem,env(safe-area-inset-left));\
+background:var(--mantle);position:sticky;top:0}\
+/* Two letters, and a 44px hit box around them: the home link is a control\
+   in the bar, and WEB-45's floor is every control in it. */\
+.brand{justify-content:center;min-width:2.75rem;padding:0;background:none;color:var(--link);\
+font-weight:600}\
+.nav-links{display:flex;align-items:center;gap:.15rem}\
+nav a{display:flex;align-items:center;min-height:2.75rem;padding:0 .7rem;color:var(--subtext);\
+white-space:nowrap}\
+nav form{margin-left:auto;min-width:8rem}nav form input{width:100%}\
+.menu{display:flex;align-items:center;justify-content:center;width:2.75rem;min-height:2.75rem;\
+padding:0;background:none}\
+.menu .bars{display:block;width:1.1rem;height:10px;\
+background:repeating-linear-gradient(var(--text) 0 2px,transparent 2px 4px)}\
+.backdrop{position:fixed;inset:0;z-index:40;background:var(--base);opacity:.72}\
+.drawer{position:fixed;left:0;top:0;bottom:0;z-index:50;display:flex;flex-direction:column;\
+gap:.6rem;width:min(17rem,82vw);padding:.8rem max(.7rem,env(safe-area-inset-left));\
+overflow-y:auto;background:var(--mantle)}\
+.drawer form{margin:0}.drawer form input{width:100%}\
+.drawer .nav-links{display:flex;flex-direction:column;align-items:stretch;gap:0}\
+.drawer .nav-links a{min-height:2.75rem;padding:0 .7rem;color:var(--text);\
+border-bottom:1px solid var(--surface0)}\
+.drawer .nav-links a[aria-current=page]{background:var(--mantle);border-left:2px solid var(--text)}\
 /* `hidden` is a display rule, and so is the one above it -- but only a page\
    with a script has a button to open the drawer with, so only there is the\
    drawer allowed to be shut. Without one it is a block of links under the\
@@ -5000,13 +5024,134 @@ html.js .drawer[hidden]{display:none}\
    no script has no button to open this with, so the attribute the script\
    manages has to lose to the layout that does not need it. */\
 html:not(.js) .drawer[hidden],html:not(.js) .drawer{display:flex!important}\
-html:not(.js) .drawer{position:static;width:auto;padding:.5rem max(1rem,env(safe-area-inset-left));\
-border-right:0;border-bottom:1px solid var(--surface0);animation:none}\
+html:not(.js) .drawer{position:static;width:auto;\
+padding:.5rem max(1rem,env(safe-area-inset-left))}\
 html:not(.js) .drawer .nav-links{flex-direction:row;flex-wrap:wrap}\
+html:not(.js) .drawer .nav-links a{border-bottom:0}\
 html:not(.js) .menu{display:none}\
-.drawer nav a,.drawer a{min-height:2.75rem}\
-.drawer form{margin:0}.drawer form input{width:100%}\
-@keyframes drawer-in{from{transform:translateX(-100%)}to{transform:none}}\
+/* --- rows, tables and pills ---------------------------------------------- */\
+table{width:100%;border-collapse:collapse;font-size:.88rem}\
+th,td{padding:.45rem .6rem;text-align:left;vertical-align:top;\
+border-bottom:1px solid var(--surface0)}\
+th{font-size:.75rem;font-weight:600;color:var(--overlay)}\
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}\
+td.waiting{font-weight:600}\
+td.when{white-space:nowrap;color:var(--subtext)}\
+td.payload{color:var(--subtext);font-size:.85rem;word-break:break-word}\
+ul.rows,ul.children{list-style:none;margin:.3rem 0;padding:0}\
+ul.rows li,ul.children li{padding:.4rem 0;border-bottom:1px solid var(--surface0)}\
+dl{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:.4rem 0}\
+dt{color:var(--overlay);font-size:.8125rem}\
+dd{margin:0;font-size:.9375rem;word-break:break-word}\
+.pill{display:inline-block;padding:.1em .6em;color:var(--subtext);background:var(--surface0);\
+font-size:.75rem;border-radius:999px}\
+.pill.status-done,.pill.status-approve{color:var(--green)}\
+.pill.status-in_progress,.pill.status-other{color:var(--blue)}\
+.pill.status-blocked,.pill.status-reject{color:var(--red)}\
+.pill.status-review,.pill.status-defer{color:var(--yellow)}\
+.priority{font-family:var(--mono);color:var(--overlay)}\
+.priority-p0{color:var(--red)}\
+.meta{margin:.2rem 0;color:var(--overlay);font-size:.8125rem;line-height:1.4}\
+.count,.empty{color:var(--subtext);font-size:.8125rem;font-weight:400}\
+.attention-count{margin-left:.4rem;color:var(--overlay);font-size:.8125rem}\
+.citation{margin:.4rem 0 0;color:var(--overlay)}\
+.cmd{margin:.5rem 0 0;font-size:.8125rem}\
+.success{margin:0 0 1rem;color:var(--subtext)}\
+.error{color:var(--red)}\
+.live{color:var(--overlay);font-size:.75rem}\
+/* The connection line is the shell's, not any one page's: it says whether\
+   this document is still hearing from the boards, so it is announced once\
+   per page from the bar that is on every page. */\
+nav>.live{margin-left:auto}\
+.heading{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem}\
+.search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
+.search-result h2{margin:.1rem 0}\
+.sprint-version{font-size:1.15rem}.sprint-history{margin-top:1.5rem}\
+.plan-body{max-height:28rem;overflow-y:auto}\
+.queued{margin-top:.25rem;color:var(--subtext);font-size:.8125rem}\
+.queued .retrying,.queued .dead{color:var(--text);font-weight:700}\
+/* --- the card (ADR-042 §5) ----------------------------------------------- */\
+.item,.note,.plan,.search-result,.card,.decided{margin:1.4rem 0;padding:0}\
+.eyebrow{max-width:70ch;margin:0 0 .5rem;color:var(--overlay);font-size:.8125rem;line-height:1.4}\
+.item>h2{max-width:70ch;margin:0 0 .7rem;font-family:var(--serif);font-size:1.75rem;\
+line-height:1.15;font-weight:600;color:var(--text)}\
+.context{max-width:70ch;margin:0 0 1rem;color:var(--subtext)}\
+.explain{max-width:70ch;margin:0 0 1rem;color:var(--subtext)}\
+.consequence{max-width:70ch;margin:.35rem 0 0;color:var(--subtext);font-size:.9375rem}\
+.body{max-width:70ch;margin:.5rem 0}\
+.decide{margin:0}\
+fieldset{min-width:0;margin:0;padding:0;border:0}\
+legend{padding:0;color:var(--overlay);font-size:.8125rem}\
+.choice{display:block;width:100%;margin:0;padding:.7rem .9rem;text-align:left;\
+white-space:normal;background:var(--surface0)}\
+.choice .key{display:inline-block;min-width:1.4em;margin-right:.5em;font-family:var(--mono);\
+font-size:.75rem;font-weight:400}\
+.choice.outcome-approve{--hue:var(--green);color:var(--hue)}\
+.choice.outcome-reject{--hue:var(--red);color:var(--hue)}\
+.choice.outcome-defer{--hue:var(--yellow);color:var(--hue)}\
+.choice.outcome-other{--hue:var(--blue);color:var(--hue)}\
+/* The one rule that fills an answer, and it is the recommendation: the hue\
+   rides in on `--hue` from the class that knows the outcome, so adding a\
+   fifth outcome is a token line rather than a fifth fill. */\
+.recommended .choice{color:var(--base);background:var(--hue,var(--surface1))}\
+.alternatives{display:grid;grid-template-columns:1fr 1fr;gap:.6rem .8rem;margin:1rem 0 0}\
+.alternative .consequence{margin-top:.3rem}\
+.reply{margin-top:1rem}\
+.reply>label{display:block;margin:0 0 .35rem;color:var(--subtext);font-size:.8125rem}\
+.reply textarea{display:block;width:100%;resize:vertical}\
+.custom{margin-top:1rem}\
+.custom>summary{display:flex;align-items:center;min-height:2.75rem;color:var(--overlay);\
+font-size:.8125rem;cursor:pointer;list-style:none}\
+.custom>summary::-webkit-details-marker{display:none}\
+.custom>summary::after{content:'\\25be';margin-left:.4em}\
+.custom[open]>summary::after{content:'\\25b4'}\
+.picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
+.picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.75rem;\
+padding:.25rem .8rem;color:var(--subtext);background:var(--surface0);border-radius:999px;\
+cursor:pointer}\
+.picks label:has(input:checked){color:var(--text);background:var(--surface1)}\
+.picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;background:none;\
+accent-color:var(--focus)}\
+.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.7rem}\
+.full{margin:1.2rem 0 0}\
+.full summary{color:var(--subtext);cursor:pointer}\
+.full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--subtext)}\
+p.keys{margin:.9rem 0 0;color:var(--overlay);font-family:var(--mono);font-size:.75rem}\
+/* What a click is doing, said on the pressed answer's own fill: nothing is\
+   disabled -- a disabled button is the one control that cannot report its\
+   own refusal -- so the OTHER answers step back instead. */\
+.item[data-state=sending] .choice:not([data-pressed]),\
+.item[data-state=sending] .record:not([data-pressed]){opacity:.5}\
+.decided h2{margin:0 0 .35rem;color:var(--text)}\
+.decided .decision{margin:.2rem 0;color:var(--text)}\
+.decided .note{margin:.3rem 0;color:var(--subtext);font-style:italic}\
+.undo-button{min-height:2.25rem;margin-top:.4rem;padding:.2rem .7rem;color:var(--subtext);\
+background:none;font-size:.8125rem;font-weight:400}\
+/* --- what arrives: notices, toasts, receipts ----------------------------- */\
+.notices{display:grid;gap:.35rem;margin:0 0 1.1rem}\
+.notice{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:0;padding:.5rem .65rem;\
+background:var(--surface0);border-radius:8px;font-size:.8125rem}\
+.notice-board{color:var(--subtext)}\
+.notice.summary .notice-what{font-weight:600}\
+.notice .dismiss{min-height:auto;margin-left:auto;padding:.1rem .5rem;color:var(--subtext);\
+background:none;font-size:.75rem;font-weight:400}\
+.preview-pop{position:fixed;z-index:300;max-width:26rem;max-height:22rem;overflow-y:auto;\
+padding:.8rem .9rem;color:var(--text);background:var(--surface0);border-radius:8px}\
+.preview-card h3{margin:.1rem 0 .4rem;color:var(--text);font-size:.95rem;font-weight:600}\
+.preview-card h3 a{color:inherit}\
+.preview-card .body{margin:.4rem 0 0;color:var(--subtext);font-size:.88rem}\
+.body.md>*:first-child{margin-top:0}.body.md>*:last-child{margin-bottom:0}\
+.body.md p{margin:.5rem 0;max-width:70ch}\
+.body.md h1,.body.md h2,.body.md h3,.body.md h4{margin:.9rem 0 .35rem;color:var(--text);\
+font-weight:600}\
+.body.md h1{font-size:1.1rem}.body.md h2{font-size:1.05rem}\
+.body.md h3{font-size:1rem}.body.md h4{font-size:.95rem}\
+.body.md ul,.body.md ol{margin:.5rem 0;padding-left:1.4rem;max-width:70ch}\
+.body.md li{margin:.2rem 0}\
+.body.md ul{list-style:disc}.body.md ol{list-style:decimal}\
+.body.md blockquote{margin:.6rem 0;padding:.2rem .9rem;color:var(--subtext)}\
+.body.md table{margin:.6rem 0}\
+.body.md hr{height:1px;margin:1rem 0;background:var(--surface0);border:0}\
 /* --- the deck: one card, and its long form the only thing that scrolls --- */\
 /* Every rule here is scoped to `html.js`, and that scope is load-bearing:\
    the deck is one card because a script hides the others, so without a\
@@ -5024,30 +5169,32 @@ html.js:has(main[data-deck]){height:100%}\
 html.js body:has(main[data-deck]){height:100%;overflow:hidden;display:flex;flex-direction:column}\
 html.js body:has(main[data-deck])>nav[data-primary-nav]{flex:none}\
 html.js main[data-deck]~footer{display:none}\
-html.js main[data-deck]{position:relative;flex:1;min-height:0;width:100%;display:flex;flex-direction:column;\
-gap:.45rem;overflow:hidden;padding:.6rem clamp(.7rem,3vw,1.2rem) 0}\
-html.js main[data-deck]>.heading,html.js main[data-deck]>.deck-head,html.js main[data-deck]>.success{flex:none}\
+html.js main[data-deck]{position:relative;flex:1;min-height:0;width:100%;display:flex;\
+flex-direction:column;gap:.45rem;overflow:hidden;padding:.6rem clamp(.7rem,3vw,1.2rem) 0}\
+html.js main[data-deck]>.heading,html.js main[data-deck]>.success{flex:none}\
 /* Everything that is not the card gives up its room to the card: on a\
    phone every line of page furniture is a line the long form or an answer\
    does not get. */\
-html.js main[data-deck]>.heading{gap:.5rem}\
 html.js main[data-deck]>.heading h1{margin:0;font-size:1rem}\
-html.js main[data-deck]>.heading .live{margin-right:.6rem}\
-html.js main[data-deck]>.keys{flex:none;position:static;font-size:.75rem;\
-padding:.3rem 0 calc(.3rem + env(safe-area-inset-bottom));background:transparent;border:0}\
-html.js .deck-head{margin:0}\
-html.js .progress{margin:0;color:var(--muted);font-size:.78rem;font-variant-numeric:tabular-nums}\
+html.js main[data-deck]>p.keys{flex:none;margin:0;\
+padding:.3rem 0 calc(.3rem + env(safe-area-inset-bottom))}\
+html.js .progress{margin:0;color:var(--overlay);font-size:.8125rem;\
+font-variant-numeric:tabular-nums}\
 html.js .deck{position:relative;flex:1;min-height:0;display:flex}\
-html.js .deck .item{flex:1;min-height:0;display:flex;flex-direction:column;margin:0;overflow:hidden}\
+html.js .deck .item{flex:1;min-height:0;display:flex;flex-direction:column;margin:0;\
+overflow:hidden auto;overscroll-behavior:contain}\
 /* `hidden` is a display rule and the rule above is one too, so the card the\
    deck is not showing needs saying twice to stay off the screen. */\
 html.js .deck .item[hidden]{display:none}\
 html.js .deck .item>.eyebrow{order:1;flex:none;margin-bottom:.25rem}\
 html.js .deck .item>h2{order:2;flex:none}\
-/* A raiser's context runs to a paragraph, and on a short screen a paragraph\
-   at the top leaves no room for the answers. It keeps its place and takes\
-   what it can have. */\
-html.js .deck .item>.context{order:3;flex:0 1 auto;min-height:0;max-height:22vh;overflow-y:auto;margin-bottom:.4rem}\
+/* A raiser's context is the FIRST block of what scrolls, above the long\
+   form: it used to be a clipped region of its own at the top of the card,\
+   which cut the paragraph mid-sentence (George, 2026-09-17, on the deck\
+   screenshots). It is never clipped now -- the card's own column takes the\
+   overflow, so a context too long for the screen scrolls with the body it\
+   introduces and the answers stay stuck to the bottom of the card. */\
+html.js .deck .item>.context{order:3;flex:none;margin-bottom:.4rem}\
 /* The long form is the card's body and the deck's only scroller. It clips:\
    a region that overflowed instead would paint the body straight over the\
    answers, and it keeps a floor so that a card with a long context and four\
@@ -5066,62 +5213,90 @@ html.js .deck .item>.full>summary{display:none}\
    directly rather than by what the column has left. */\
 html.js .deck .item>.full::details-content{flex:1 1 0;min-height:0;overflow:hidden;\
 display:flex;flex-direction:column}\
-html.js .deck .item>.full .body{flex:1;min-height:0;max-height:40vh;overflow-y:auto;padding-right:.3rem}\
+/* The foot of the long form fades, because a hard cut at the panel's edge\
+   says the item ended there. Two rem of it is the plan's figure, and it is\
+   the only fade on the page. */\
+html.js .deck .item>.full .body{flex:1;min-height:0;max-height:40vh;overflow-y:auto;\
+padding-right:.3rem;\
+-webkit-mask-image:linear-gradient(to bottom,var(--text) calc(100% - 2rem),transparent);\
+mask-image:linear-gradient(to bottom,var(--text) calc(100% - 2rem),transparent)}\
 /* The trailing meta line trails: on a short item it sits at the foot of the\
    body region rather than floating in the middle of the card. */\
 html.js .deck .item>.meta{order:5;flex:none;margin:auto 0 0}\
-/* The panel: the answers and the note, at the bottom of the screen where a\
-   thumb is. It keeps half the card whatever else asks for room -- the\
-   answers are what the screen is for -- and when a card's answers are\
-   taller than that the panel scrolls itself, so every control stays\
-   reachable without the page ever scrolling. */\
-html.js .deck .item>.decide{order:6;flex:0 1 auto;min-height:min(8.5rem,50%);overflow-y:auto;\
-margin-top:.45rem;padding-top:.6rem;border-top:1px solid var(--surface0);background:var(--base);\
+/* The panel: the answers and the note, on the desk surface at the bottom of\
+   the screen where a thumb is. It is capped at three fifths of the card and\
+   scrolls its own answers past that, because the height has to come from\
+   somewhere and the only other place to take it from is the question --\
+   and a headline cut mid-word is worse than a paragraph that carries on\
+   below the fold.\
+\
+   Its top two rem is the fade: the card's own column scrolls beneath the\
+   panel, and a line of the raiser's paragraph meeting an opaque edge\
+   mid-sentence reads as text that was cut off, which is the complaint this\
+   slice answers. The fade is the panel's own background rather than a\
+   pseudo-element above it, because the panel is a scroller and a scroller\
+   clips what sits outside its padding box -- but never its own background,\
+   which also means the band stays at the top edge while the answers scroll\
+   under it. The gradient's last stop is the desk's second surface, so the\
+   panel below the band is `--mantle` and the band lets the text behind it\
+   dissolve into it. It is a gradient and not a second mask: the one mask\
+   on the page is the long form's own foot. */\
+html.js .deck .item>.decide{order:6;flex:none;max-height:60%;overflow-y:auto;\
+margin:.45rem calc(-1 * clamp(.7rem,3vw,1.2rem)) 0;\
+padding:0 clamp(.7rem,3vw,1.2rem) calc(.5rem + env(safe-area-inset-bottom));\
+background:linear-gradient(to bottom,transparent,var(--mantle) 2rem);\
 position:sticky;bottom:0}\
-html.js .deck .item>.decide .alternatives{grid-template-columns:1fr 1fr;gap:.6rem .8rem;margin-top:.7rem}\
-html.js .deck .item>.decide .consequence{font-size:.85rem}\
-html.js .deck .item>.decide .reply{margin-top:.6rem}\
-html.js .deck .item>.decide .reply>label{margin-bottom:.2rem;font-size:.75rem}\
-/* The note's own hint is a sentence about a field that is one line tall and\
-   named by its label; the panel says it once, in the fold, where the note\
-   becomes an answer of its own. */\
-html.js .deck .item>.decide .reply .hint{display:none}\
-html.js .deck .item>.decide .custom{margin-top:.6rem;padding-top:.45rem}\
-html.js .deck .item>.decide .custom>summary{min-height:2rem}\
-html.js .deck .item>.decide textarea{min-height:2.6rem;max-height:7.5rem;overflow-y:auto;resize:none}\
-html.js .deck .item.entering{animation:deck-in .16s ease-out}\
-html.js .deck .item.leaving,html.js .deck .item.leaving-back{position:absolute;left:0;right:0;top:0;bottom:0;\
-pointer-events:none;animation:deck-out .16s ease-out forwards}\
+/* The one hairline the design keeps, between the card's body and its\
+   answers -- at the foot of the band and not its head, because a rule\
+   drawn across text that is still dissolving reads as a strikethrough.\
+   It is the panel's own first block: two rem tall, stuck to the top of the\
+   panel's scroller and carrying the same ramp, so the answers fade out\
+   under the band on their way up instead of crossing the rule. */\
+html.js .deck .item>.decide::before{content:'';display:block;position:sticky;top:0;\
+z-index:1;height:2rem;box-sizing:border-box;pointer-events:none;\
+background:linear-gradient(to bottom,transparent,var(--mantle) 2rem);\
+border-bottom:1px solid var(--surface1)}\
+html.js .deck .item>.decide .consequence{font-size:.875rem}\
+html.js .deck .item>.decide .reply{margin-top:.7rem}\
+html.js .deck .item>.decide .custom{margin-top:.5rem}\
+html.js .deck .item>.decide textarea{min-height:2.75rem;max-height:7.5rem;overflow-y:auto;\
+resize:none}\
+/* The one motion: the card that was answered leaves to the left, the next\
+   one arrives from the right, 140ms each way. */\
+html.js .deck .item.entering{animation:deck-in .14s ease-out}\
+html.js .deck .item.leaving,html.js .deck .item.leaving-back{position:absolute;left:0;right:0;\
+top:0;bottom:0;pointer-events:none;animation:deck-out .14s ease-out forwards}\
 html.js .deck .item.leaving-back{animation-name:deck-out-back}\
-@keyframes deck-in{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}\
-@keyframes deck-out{to{opacity:0;transform:translateX(-24px)}}\
-@keyframes deck-out-back{to{opacity:0;transform:translateX(24px)}}\
+@keyframes deck-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}\
+@keyframes deck-out{to{opacity:0;transform:translateX(-16px)}}\
+@keyframes deck-out-back{to{opacity:0;transform:translateX(16px)}}\
 /* --- the side: toasts above, this sitting's decisions below -------------- */\
 /* A list, not a stack of tiles: one heading, then one row per decision on\
-   the same ground as the rest of the page. The newest is the only one\
-   marked, because it is the only one `u` will undo. */\
+   the desk surface. A receipt's own left rule is its outcome, which is the\
+   one thing a reader needs from a decision already made. */\
 html.js .side{display:flex;flex-direction:column;gap:.7rem;min-height:0}\
-html.js .side .toasts{display:grid;gap:.35rem;margin:0}\
-html.js .history{display:flex;flex-direction:column;gap:.5rem;min-height:0;overflow-y:auto;\
-background:transparent;border:0}\
-html.js .history h2{margin:0;padding:0 0 .1rem;font-size:.78rem;font-weight:600;color:var(--muted);\
-letter-spacing:.02em}\
-html.js .history .receipt,html.js .history .pending{margin:0;background:var(--surface0)}\
-html.js .history .receipt:first-of-type{border-left-color:var(--green);background:var(--surface1)}\
-/* The receipt's own sentence is a span that happens to carry the class a\
-   decided ROW is drawn with, and a row inside a row read as a box inside\
-   a box. In the history it is a sentence. */\
-html.js .history .receipt .decided{margin:0;padding:0;border:0;border-radius:0;background:transparent}\
-html.js .pending{margin:0;padding:.55rem .75rem;color:var(--peach);background:var(--surface0);\
-border:1px solid var(--surface0);border-left:2px solid var(--peach);border-radius:8px;font-size:.9rem}\
-html.js .history-toggle{min-height:2.2rem;padding:.1rem .6rem;color:var(--subtext);border-color:var(--surface1);font-size:.8rem}\
-html.js .history-toggle [data-history-count]{margin-left:.4rem;padding:0 .35em;border-radius:4px;\
-background:var(--surface0);color:var(--text);font-family:var(--mono);font-size:.75rem}\
-@media(min-width:900px){html.js main[data-deck]{padding-right:calc(320px + 1.2rem)}\
-/* The side starts below the heading row rather than beside it: its own\
-   heading and the live line were reading as one crowded line. */\
-html.js main[data-deck]>.side{position:absolute;top:2.9rem;right:clamp(.7rem,3vw,1.2rem);bottom:.6rem;width:320px}\
-html.js .history-toggle{display:none}}\
+html.js .toasts{display:grid;gap:.35rem;margin:0}\
+html.js .history{display:flex;flex-direction:column;gap:.5rem;min-height:0;overflow-y:auto}\
+html.js .history h2{margin:0;padding:0;font-size:.75rem;font-weight:600;color:var(--overlay)}\
+html.js .history .receipt,html.js .history .pending{margin:0;padding:.45rem .65rem;\
+color:var(--subtext);background:var(--surface0);font-size:.8125rem}\
+html.js .history .receipt{border-left:3px solid var(--hue,var(--surface1))}\
+html.js .receipt.outcome-approve{--hue:var(--green)}\
+html.js .receipt.outcome-reject{--hue:var(--red)}\
+html.js .receipt.outcome-defer{--hue:var(--yellow)}\
+html.js .receipt.outcome-other{--hue:var(--blue)}\
+html.js .history-toggle{min-height:2.75rem;padding:.2rem .7rem;color:var(--subtext);\
+font-size:.8125rem;font-weight:400}\
+html.js .history-toggle [data-history-count]{margin-left:.4rem;color:var(--text)}\
+/* The desk on a Mac: the deck column left, the side column right on its own\
+   surface, holding the toasts above this sitting's decisions. */\
+@media(min-width:900px){html.js main[data-deck]{padding-right:calc(22rem + 1.2rem)}\
+html.js .deck{max-width:44rem}\
+html.js main[data-deck]>.heading h1{font-size:1.5rem}\
+html.js main[data-deck]>.side{position:absolute;top:0;right:0;bottom:0;width:22rem;\
+padding:.8rem 1rem calc(.8rem + env(safe-area-inset-bottom));background:var(--mantle)}\
+html.js .history-toggle{display:none}\
+.item>h2{font-size:2.25rem;line-height:1.1}}\
 /* Below the desktop column the side is a drawer, and the toasts come out of\
    it: news has to arrive whether or not the history is open. */\
 @media(max-width:899px){html.js main[data-deck]>.side{display:contents}\
@@ -5131,29 +5306,38 @@ html.js .history-toggle{display:none}}\
    being decided -- which is a notice getting in the way of the decision. */\
 html.js main[data-deck]>.heading,html.js main[data-deck]>.success{order:0}\
 html.js main[data-deck] .toasts{order:1;position:static;margin:0;pointer-events:auto}\
-html.js main[data-deck]>.deck-head{order:2}\
 html.js main[data-deck]>.deck{order:3}\
-html.js main[data-deck]>.keys{order:4}\
+html.js main[data-deck]>p.keys{order:4}\
 html.js main[data-deck] .toasts .notice{flex-wrap:nowrap;overflow:hidden}\
-html.js main[data-deck] .toasts .notice .notice-what,html.js main[data-deck] .toasts .notice a{\
-overflow:hidden;white-space:nowrap;text-overflow:ellipsis}\
+html.js main[data-deck] .toasts .notice .notice-what,\
+html.js main[data-deck] .toasts .notice a{overflow:hidden;white-space:nowrap;\
+text-overflow:ellipsis}\
 /* One at a time: the strip is a line of the screen, and the newest notice is\
    the one worth that line. */\
 html.js main[data-deck] .toasts .notice~.notice{display:none}\
-html.js main[data-deck] .history{position:fixed;top:0;right:0;bottom:0;z-index:50;width:min(19rem,86vw);\
+html.js main[data-deck] .history{position:fixed;top:0;right:0;bottom:0;z-index:50;\
+width:min(19rem,86vw);\
 padding:.8rem max(.7rem,env(safe-area-inset-right)) calc(.8rem + env(safe-area-inset-bottom));\
-background:var(--mantle);border-left:1px solid var(--surface0);transform:translateX(100%);\
-transition:transform .16s ease-out}\
+background:var(--mantle);transform:translateX(100%);transition:transform .14s ease-out}\
 html.js body[data-history-open] main[data-deck] .history{transform:none}}\
-@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.actions button{flex:1}.picks{display:grid;grid-template-columns:1fr 1fr}.heading{align-items:flex-start}table{min-width:38rem}\
-.drawer{flex-wrap:nowrap}.drawer .nav-links{flex:none;overflow:visible}.drawer nav form,.drawer form{order:0;flex:none}}\
-/* A short screen -- a laptop window, a phone in landscape -- spends what it\
-   has on the answers rather than on the raiser's paragraph. */\
-@media(max-height:620px){html.js .deck .item>.context{max-height:2.6rem}\
-html.js .deck .item>.full{min-height:0}}\
-@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
-.notice{animation:none}.live::after{animation:none}.preview-pop{animation:none}\
-.receipt.landed{animation:none}.drawer{animation:none}\
+@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}\
+.brand{flex:0 0 2.5rem}\
+.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}\
+.nav-links::-webkit-scrollbar{display:none}\
+nav form{order:3;flex:1 0 100%;margin:0}\
+.actions button{flex:1}\
+.picks{display:grid;grid-template-columns:1fr 1fr}\
+table{min-width:38rem}\
+.drawer{flex-wrap:nowrap}\
+.drawer .nav-links{flex:none;overflow:visible}\
+.drawer nav form,.drawer form{order:0;flex:none}}\
+/* A short screen -- a laptop window, a phone in landscape -- lets the long\
+   form give up its floor, so the answers keep their room and what does not\
+   fit scrolls with the card rather than being cut off. */\
+@media(max-height:620px){html.js .deck .item>.full{min-height:0}}\
+/* The operator who asked for the page not to move gets the same page with\
+   the one motion left out: the queue still advances, in no time at all. */\
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}\
 html.js .deck .item.entering{animation:none}\
 html.js .deck .item.leaving,html.js .deck .item.leaving-back{animation:none;opacity:0}\
 html.js main[data-deck] .history{transition:none}}\
@@ -5164,8 +5348,8 @@ mod tests {
     use super::*;
     use crate::authz::AuthzContext;
     use crate::model::{
-        AddSubscription, AddTask, DecisionCard, DeployIdentity, FinishDeployment, NewSprint,
-        StartDeployment,
+        AddSubscription, AddTask, AttentionDecision, DecisionCard, DeployIdentity,
+        FinishDeployment, NewSprint, StartDeployment,
     };
     use crate::policy::{Capability, ScopeTuple, authority};
     use crate::routing::Enforcement;
@@ -5790,6 +5974,1244 @@ mod tests {
         );
     }
 
+    /// One parsed rule of the stylesheet: the at-rule it sits inside, what
+    /// it selects, and its declarations verbatim.
+    ///
+    /// `css_selectors` above answers "what is this scoped to"; a design
+    /// system has to be asked "what does this DECLARE", so the rules are
+    /// parsed rather than substring-matched. The stylesheet is one authored
+    /// string with no nested plain rules and no braces inside a value, which
+    /// is what makes a parser this small honest about it.
+    struct CssRule {
+        at: Option<String>,
+        selectors: Vec<String>,
+        body: String,
+    }
+
+    fn css_without_comments(css: &str) -> String {
+        let mut stripped = String::with_capacity(css.len());
+        let mut rest = css;
+        while let Some(open) = rest.find("/*") {
+            stripped.push_str(&rest[..open]);
+            rest = match rest[open..].find("*/") {
+                Some(close) => &rest[open + close + 2..],
+                None => "",
+            };
+        }
+        stripped.push_str(rest);
+        stripped
+    }
+
+    fn css_rules(css: &str) -> Vec<CssRule> {
+        let stripped = css_without_comments(css);
+        let chars: Vec<char> = stripped.chars().collect();
+        let mut rules = Vec::new();
+        let mut prelude = String::new();
+        let mut at: Vec<String> = Vec::new();
+        let mut index = 0;
+        while index < chars.len() {
+            match chars[index] {
+                '{' => {
+                    let head = prelude.trim().to_owned();
+                    prelude.clear();
+                    index += 1;
+                    if head.starts_with('@') {
+                        at.push(head);
+                        continue;
+                    }
+                    let mut body = String::new();
+                    while index < chars.len() && chars[index] != '}' {
+                        body.push(chars[index]);
+                        index += 1;
+                    }
+                    index += 1;
+                    rules.push(CssRule {
+                        at: at.last().cloned(),
+                        selectors: head
+                            .split(',')
+                            .map(|part| part.trim().to_owned())
+                            .filter(|part| !part.is_empty())
+                            .collect(),
+                        body,
+                    });
+                }
+                '}' => {
+                    at.pop();
+                    index += 1;
+                }
+                other => {
+                    prelude.push(other);
+                    index += 1;
+                }
+            }
+        }
+        rules
+    }
+
+    /// One rule's declarations as `(property, value)`.
+    fn css_declarations(body: &str) -> Vec<(String, String)> {
+        body.split(';')
+            .filter_map(|declaration| {
+                let declaration = declaration.trim();
+                let (property, value) = declaration.split_once(':')?;
+                Some((property.trim().to_owned(), value.trim().to_owned()))
+            })
+            .collect()
+    }
+
+    /// Every declaration the stylesheet makes, paired with the selectors it
+    /// makes it on. Keyframe stops are dropped: they are a motion's shape,
+    /// not a rule about an element.
+    fn css_styled_declarations() -> Vec<(Vec<String>, String, String)> {
+        let mut out = Vec::new();
+        for rule in css_rules(CSS) {
+            if rule
+                .at
+                .as_deref()
+                .is_some_and(|at| at.starts_with("@keyframes"))
+            {
+                continue;
+            }
+            for (property, value) in css_declarations(&rule.body) {
+                out.push((rule.selectors.clone(), property, value));
+            }
+        }
+        out
+    }
+
+    /// The selectors of every rule whose declarations mention `needle`.
+    fn css_selectors_declaring(needle: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for rule in css_rules(CSS) {
+            if rule
+                .at
+                .as_deref()
+                .is_some_and(|at| at.starts_with("@keyframes"))
+            {
+                continue;
+            }
+            if rule.body.contains(needle) {
+                out.extend(rule.selectors.clone());
+            }
+        }
+        out
+    }
+
+    /// The declarations of the one rule that selects exactly `selector`,
+    /// joined across every rule that names it on its own.
+    fn css_rule_body(selector: &str) -> String {
+        let mut body = String::new();
+        for rule in css_rules(CSS) {
+            if rule.selectors.iter().any(|part| part == selector) {
+                body.push_str(&rule.body);
+                body.push(';');
+            }
+        }
+        assert!(
+            !body.is_empty(),
+            "no rule in the stylesheet selects {selector}"
+        );
+        body
+    }
+
+    /// A colour token's hex, read out of the `:root` block.
+    fn css_token(name: &str) -> String {
+        let root = css_rule_body(":root");
+        css_declarations(&root)
+            .into_iter()
+            .find(|(property, _)| property == name)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("no token {name} in :root"))
+    }
+
+    /// WCAG 2.2 relative luminance of an `#rrggbb` string.
+    fn relative_luminance(hex: &str) -> f64 {
+        let hex = hex.trim_start_matches('#');
+        assert_eq!(hex.len(), 6, "not a six-digit hex: {hex}");
+        let channel = |at: usize| {
+            let raw = u8::from_str_radix(&hex[at..at + 2], 16).expect("hex channel");
+            let unit = f64::from(raw) / 255.0;
+            if unit <= 0.039_28 {
+                unit / 12.92
+            } else {
+                ((unit + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    }
+
+    /// WCAG 2.2 contrast ratio between two token names.
+    fn token_contrast(foreground: &str, background: &str) -> f64 {
+        let first = relative_luminance(&css_token(foreground));
+        let second = relative_luminance(&css_token(background));
+        let (lighter, darker) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// WEB-01, WEB-05 — one serif, and it is the question; mono is for what
+    /// is literally code.
+    ///
+    /// The serif is the page's one memorable element and it is spent on the
+    /// question. A third selector reaching for it is the moment the choice
+    /// stops meaning anything.
+    #[test]
+    fn the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit() {
+        assert!(
+            CSS.contains("--serif:ui-serif,'New York','Iowan Old Style',Charter,Georgia,serif"),
+            "{CSS}"
+        );
+        let mut serif = css_selectors_declaring("var(--serif)");
+        serif.sort();
+        assert_eq!(serif, vec![".item>h2".to_owned(), "h1".to_owned()]);
+        // Mono is for an identifier, a key map and a numeric column, and the
+        // allowlist is the spec's (WEB-05). A selector is judged by the
+        // element it lands on, so `.choice .key` is `.key`.
+        let allowed = ["code", ".id", ".key", ".priority", "p.keys", "td.n", "th.n"];
+        for selector in css_selectors_declaring("var(--mono)") {
+            let landed = selector.split_whitespace().last().unwrap_or(&selector);
+            assert!(
+                allowed.contains(&landed),
+                "{selector} is not one of the places mono belongs"
+            );
+        }
+    }
+
+    /// WEB-04 — the type scale is the plan's, and nothing is tracked out.
+    #[test]
+    fn the_type_scale_is_declared_and_nothing_is_tracked_out_unit() {
+        for (selector, declarations) in [
+            ("h1", vec!["font-size:1.5rem", "line-height:1.2"]),
+            (
+                "h2",
+                vec![
+                    "font-size:1.0625rem",
+                    "line-height:1.3",
+                    "font-weight:600",
+                    "color:var(--subtext)",
+                ],
+            ),
+            ("body", vec!["font-size:1rem", "line-height:1.55"]),
+            ("*.meta", vec![]),
+            (
+                "button",
+                vec!["font-size:1rem", "line-height:1.2", "font-weight:600"],
+            ),
+            (".meta", vec!["font-size:.8125rem", "line-height:1.4"]),
+            (
+                ".choice .key",
+                vec!["font-size:.75rem", "font-family:var(--mono)"],
+            ),
+            (
+                ".item>h2",
+                vec!["font-size:1.75rem", "line-height:1.15", "font-weight:600"],
+            ),
+        ] {
+            if declarations.is_empty() {
+                continue;
+            }
+            let body = css_rule_body(selector);
+            for declaration in declarations {
+                assert!(
+                    body.contains(declaration),
+                    "{selector} does not declare {declaration}: {body}"
+                );
+            }
+        }
+        for (selectors, property, value) in css_styled_declarations() {
+            assert_ne!(
+                property, "text-transform",
+                "{selectors:?} sets text-transform to {value}"
+            );
+            assert_ne!(
+                property, "letter-spacing",
+                "{selectors:?} sets letter-spacing to {value}"
+            );
+        }
+    }
+
+    /// WEB-06 — prose stays readable in line length.
+    #[test]
+    fn prose_blocks_are_bounded_to_seventy_characters_unit() {
+        for selector in [".context", ".consequence", ".explain", ".item>h2", ".body"] {
+            assert!(
+                css_rule_body(selector).contains("max-width:70ch"),
+                "{selector} is not bounded to 70ch"
+            );
+        }
+    }
+
+    /// WEB-08 — the token block is the only place a colour is written.
+    #[test]
+    fn the_token_block_is_the_only_place_a_colour_is_written_unit() {
+        let root = css_rule_body(":root");
+        let declared: Vec<(String, String)> = css_declarations(&root)
+            .into_iter()
+            .filter(|(_, value)| value.starts_with('#'))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                ("--base".to_owned(), "#1e1e2e".to_owned()),
+                ("--mantle".to_owned(), "#181825".to_owned()),
+                ("--surface0".to_owned(), "#313244".to_owned()),
+                ("--surface1".to_owned(), "#45475a".to_owned()),
+                ("--text".to_owned(), "#cdd6f4".to_owned()),
+                ("--subtext".to_owned(), "#a6adc8".to_owned()),
+                ("--overlay".to_owned(), "#9399b2".to_owned()),
+                ("--green".to_owned(), "#a6e3a1".to_owned()),
+                ("--red".to_owned(), "#f38ba8".to_owned()),
+                ("--yellow".to_owned(), "#f9e2af".to_owned()),
+                ("--blue".to_owned(), "#89b4fa".to_owned()),
+                ("--link".to_owned(), "#89b4fa".to_owned()),
+                ("--focus".to_owned(), "#b4befe".to_owned()),
+            ],
+            "the token block is not the plan's"
+        );
+        // And no hex is written anywhere else: a colour picked at a rule is
+        // a colour that means nothing.
+        let stripped = css_without_comments(CSS);
+        let root_at = stripped.find(":root{").expect("the token block");
+        let root_end = root_at + stripped[root_at..].find('}').expect("the block closes");
+        let outside = format!("{}{}", &stripped[..root_at], &stripped[root_end..]);
+        assert!(
+            !outside.contains('#'),
+            "a hex literal is written outside the token block: {outside}"
+        );
+    }
+
+    /// WEB-09 — no outlines except the focus ring, and one hairline.
+    ///
+    /// A zero-valued declaration is a border being TAKEN AWAY, which is what
+    /// this requirement is for: the allowlist is about the borders the design
+    /// draws, and `border:0` draws none.
+    #[test]
+    fn no_border_or_outline_exists_outside_the_allowlist_unit() {
+        let structural = ["border-radius", "border-collapse", "border-spacing"];
+        for (selectors, property, value) in css_styled_declarations() {
+            let is_border = (property.starts_with("border") || property.starts_with("outline"))
+                && !structural.contains(&property.as_str());
+            if !is_border {
+                continue;
+            }
+            if value == "0" || value == "none" {
+                continue;
+            }
+            let selector = selectors.join(",");
+            let allowed =
+                // the focus ring
+                (selector.contains(":focus-visible") && property.starts_with("outline"))
+                // the one hairline, between a card's body and its answers:
+                // the foot of the answer panel's fade band, so the rule
+                // lands where the band is already opaque
+                || (property == "border-bottom"
+                    && value == "1px solid var(--surface1)"
+                    && selector.contains(".decide"))
+                // the row separator
+                || (property == "border-bottom" && value == "1px solid var(--surface0)")
+                // a history receipt's outcome rule
+                || (property == "border-left"
+                    && value.starts_with("3px solid")
+                    && selector.contains(".receipt"))
+                // the drawer's current destination
+                || (property == "border-left"
+                    && value == "2px solid var(--text)"
+                    && selector.contains("aria-current"));
+            assert!(
+                allowed,
+                "{selector} declares {property}:{value}, which is not in the allowlist"
+            );
+        }
+    }
+
+    /// WEB-10 — two radii, each with one job.
+    #[test]
+    fn only_two_radii_exist_and_each_has_one_job_unit() {
+        let mut found = Vec::new();
+        for (selectors, property, value) in css_styled_declarations() {
+            if property != "border-radius" {
+                continue;
+            }
+            assert!(
+                value == "8px" || value == "999px",
+                "{selectors:?} rounds to {value}, which is neither a control nor a pill"
+            );
+            found.push(value);
+        }
+        assert!(
+            found.contains(&"8px".to_owned()),
+            "no control radius at all"
+        );
+        assert!(found.contains(&"999px".to_owned()), "no pill radius at all");
+    }
+
+    /// WEB-11 — a colour is an outcome.
+    ///
+    /// The four hues mean approve, reject, defer and other, and they appear
+    /// only where one of those is being said. A refusal is the one other
+    /// place red is allowed to land, because a refusal IS an outcome the
+    /// board reported (spec WEB-29 requires that sentence in red).
+    #[test]
+    fn an_outcome_hue_appears_only_on_an_outcome_unit() {
+        let hues = ["var(--green)", "var(--red)", "var(--yellow)", "var(--blue)"];
+        let mut filled = Vec::new();
+        for rule in css_rules(CSS) {
+            if rule
+                .at
+                .as_deref()
+                .is_some_and(|at| at.starts_with("@keyframes"))
+            {
+                continue;
+            }
+            if !hues.iter().any(|hue| rule.body.contains(hue)) {
+                continue;
+            }
+            for selector in &rule.selectors {
+                let carries_outcome = (selector.contains(".choice")
+                    && selector.contains(".outcome-"))
+                    || (selector.contains(".receipt") && selector.contains(".outcome-"))
+                    || (selector.contains(".pill") && selector.contains(".status-"))
+                    || selector.contains(".priority-p0")
+                    || selector == "p.error"
+                    || selector == ".error"
+                    || selector == ":root";
+                assert!(
+                    carries_outcome,
+                    "{selector} is coloured without carrying an outcome or a status"
+                );
+            }
+            for (property, value) in css_declarations(&rule.body) {
+                if property == "background" && hues.iter().any(|hue| value.contains(hue)) {
+                    filled.extend(rule.selectors.clone());
+                }
+            }
+        }
+        // Exactly one selector fills an answer, and it is the recommendation.
+        // The hue reaches it through `--hue`, so this is one rule rather than
+        // one per outcome.
+        let fills = css_selectors_declaring("background:var(--hue");
+        assert_eq!(fills, vec![".recommended .choice".to_owned()], "{fills:?}");
+        assert!(
+            filled.is_empty(),
+            "an answer is filled with a literal hue instead of its outcome's: {filled:?}"
+        );
+    }
+
+    /// WEB-14 — one motion exists in the stylesheet.
+    #[test]
+    fn one_motion_is_declared_and_nothing_else_animates_unit() {
+        let stripped = css_without_comments(CSS);
+        let keyframes: Vec<&str> = stripped
+            .match_indices("@keyframes ")
+            .map(|(at, _)| {
+                let rest = &stripped[at + "@keyframes ".len()..];
+                &rest[..rest.find('{').expect("a keyframe block opens")]
+            })
+            .collect();
+        assert_eq!(
+            keyframes,
+            vec!["deck-in", "deck-out", "deck-out-back"],
+            "the stylesheet declares a motion that is not the card advance"
+        );
+        let mut transitions = Vec::new();
+        for (selectors, property, value) in css_styled_declarations() {
+            // `transition:none` is a transition being TAKEN AWAY, which is
+            // what the reduced-motion block does with the one there is.
+            if property.starts_with("transition") && value != "none" {
+                transitions.push((selectors.join(","), value.clone()));
+            }
+            if property.starts_with("animation") && value != "none" {
+                let selector = selectors.join(",");
+                assert!(
+                    selector.contains(".item.entering")
+                        || selector.contains(".item.leaving")
+                        || selector.contains(".item.leaving-back"),
+                    "{selector} animates {value}, and the advance is the only motion"
+                );
+            }
+        }
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert!(
+            transitions[0].1.contains("transform"),
+            "the one transition is not the drawer's transform: {transitions:?}"
+        );
+        // The baseline's decorations are gone by name.
+        for gone in ["pulse", "notice-in", "receipt-landed", "drawer-in"] {
+            assert!(
+                !stripped.contains(gone),
+                "{gone} is still in the stylesheet"
+            );
+        }
+    }
+
+    /// WEB-21 — the long form says there is more.
+    #[test]
+    fn the_deck_body_fades_at_its_foot_unit() {
+        let mut faded = Vec::new();
+        for rule in css_rules(CSS) {
+            if rule.body.contains("mask-image") {
+                faded.push(rule);
+            }
+        }
+        assert_eq!(faded.len(), 1, "more than one element fades");
+        let fade = &faded[0];
+        assert_eq!(
+            fade.selectors,
+            vec!["html.js .deck .item>.full .body".to_owned()]
+        );
+        assert!(fade.body.contains("linear-gradient"), "{}", fade.body);
+        assert!(fade.body.contains("2rem"), "{}", fade.body);
+    }
+
+    /// WEB-47 — three or four alternatives may wrap.
+    #[test]
+    fn alternatives_may_wrap_two_up_unit() {
+        let body = css_rule_body(".alternatives");
+        assert!(body.contains("grid-template-columns:1fr 1fr"), "{body}");
+        assert!(body.contains("display:grid"), "{body}");
+    }
+
+    /// WEB-48 — text contrast is at least 4.5:1 on the surface it sits on.
+    ///
+    /// Computed from the tokens rather than pinned, so a token change that
+    /// drops a pair below AA fails here rather than on George's phone.
+    #[test]
+    fn every_token_pair_clears_four_and_a_half_to_one_unit() {
+        let pairs = [
+            ("--text", "--base"),
+            ("--text", "--mantle"),
+            ("--text", "--surface0"),
+            ("--text", "--surface1"),
+            ("--subtext", "--base"),
+            ("--subtext", "--mantle"),
+            ("--subtext", "--surface0"),
+            ("--overlay", "--base"),
+            ("--overlay", "--mantle"),
+            ("--base", "--green"),
+            ("--base", "--red"),
+            ("--base", "--yellow"),
+            ("--base", "--blue"),
+            ("--green", "--surface0"),
+            ("--red", "--surface0"),
+            ("--yellow", "--surface0"),
+            ("--blue", "--surface0"),
+            ("--link", "--base"),
+            ("--link", "--mantle"),
+        ];
+        for (foreground, background) in pairs {
+            let ratio = token_contrast(foreground, background);
+            assert!(
+                ratio >= 4.5,
+                "{foreground} on {background} is {ratio:.2}:1, below AA for body text"
+            );
+        }
+    }
+
+    /// WEB-49 — `--overlay` never sits on `--surface0`.
+    #[test]
+    fn overlay_never_sits_on_surface0_unit() {
+        // The arithmetic first, so the reason this rule exists is checked
+        // rather than remembered.
+        let ratio = token_contrast("--overlay", "--surface0");
+        assert!(
+            ratio < 4.5,
+            "{ratio:.2}:1 -- if overlay now clears AA on surface0 this rule can go"
+        );
+        for rule in css_rules(CSS) {
+            let declarations = css_declarations(&rule.body);
+            let quiet = declarations
+                .iter()
+                .any(|(property, value)| property == "color" && value == "var(--overlay)");
+            let filled = declarations
+                .iter()
+                .any(|(property, value)| property == "background" && value == "var(--surface0)");
+            assert!(
+                !(quiet && filled),
+                "{:?} puts overlay text on a surface0 fill",
+                rule.selectors
+            );
+        }
+        // The pill is the fill quiet text is most likely to land on, and it
+        // uses `--subtext` for exactly this reason.
+        assert!(
+            css_rule_body(".pill").contains("color:var(--subtext)"),
+            "quiet text inside a pill has to be subtext"
+        );
+    }
+
+    /// WEB-50 — non-text contrast where it identifies something.
+    #[test]
+    fn the_focus_ring_and_the_filled_answer_clear_three_to_one_unit() {
+        for ground in ["--base", "--mantle"] {
+            let ratio = token_contrast("--focus", ground);
+            assert!(ratio >= 3.0, "the focus ring is {ratio:.2}:1 on {ground}");
+        }
+        for hue in ["--green", "--red", "--yellow", "--blue"] {
+            let ratio = token_contrast(hue, "--base");
+            assert!(
+                ratio >= 3.0,
+                "a filled answer in {hue} is {ratio:.2}:1 against the page"
+            );
+        }
+    }
+
+    /// One board with one fully carded open item, three days old.
+    ///
+    /// Opened directly rather than through the registry: the card renderers
+    /// need a store for a task reference and nothing else, so the copy this
+    /// slice is about is readable without a spawned process.
+    struct CardFixture {
+        _dir: TempDataDir,
+        store: Store,
+        board: String,
+        item: Attention,
+    }
+
+    fn card_fixture(label: &str) -> CardFixture {
+        let dir = TempDataDir::new(label);
+        let path = dir.path().join("px.db");
+        let mut store = Store::open(&path).expect("open the card board");
+        store
+            .initialize("px", "seed")
+            .expect("initialize the board");
+        let card = DecisionCard {
+            question: Some("Ship the sprint tonight, or wait for Monday?".to_owned()),
+            context: Some("Gate green at 353/0. Rollback is one command.".to_owned()),
+            choices: vec![
+                AttentionChoice {
+                    key: "ship".to_owned(),
+                    label: "Ship tonight".to_owned(),
+                    consequence: "The release goes out now.".to_owned(),
+                    outcome: "approve".to_owned(),
+                    recommended: true,
+                },
+                AttentionChoice {
+                    key: "wait".to_owned(),
+                    label: "Wait for Monday".to_owned(),
+                    consequence: "Nothing goes out today.".to_owned(),
+                    outcome: "defer".to_owned(),
+                    recommended: false,
+                },
+                AttentionChoice {
+                    key: "stop".to_owned(),
+                    label: "Stop the release".to_owned(),
+                    consequence: "The sprint does not ship at all.".to_owned(),
+                    outcome: "reject".to_owned(),
+                    recommended: false,
+                },
+            ],
+        };
+        let mut item = store
+            .raise_attention(
+                "The long form of the ask, as a raiser writes it.",
+                "decision",
+                "codex@driver",
+                None,
+                0,
+                &[],
+                &card,
+            )
+            .expect("raise a carded item");
+        item.created_at = now_ms() - 3 * 24 * 60 * 60_000;
+        CardFixture {
+            _dir: dir,
+            store,
+            board: "px".to_owned(),
+            item,
+        }
+    }
+
+    /// Everything between `<p class=X>` and its close, for every occurrence.
+    fn rendered_regions(html: &str, class: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for tag in ["p", "div"] {
+            let open = format!("<{tag} class={class}>");
+            let close = format!("</{tag}>");
+            let mut rest = html;
+            while let Some(at) = rest.find(&open) {
+                let body = &rest[at + open.len()..];
+                let end = body.find(&close).expect("the region closes");
+                out.push(body[..end].to_owned());
+                rest = &body[end..];
+            }
+        }
+        out
+    }
+
+    /// WEB-23 — the eyebrow names who asked, where, and when, in one
+    /// sentence.
+    #[test]
+    fn the_eyebrow_names_raiser_board_and_age_unit() {
+        let fixture = card_fixture("eyebrow");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        assert!(
+            card.contains(
+                "<p class=eyebrow>codex@driver asked on \
+                 <a href=\"/board/px\" data-ref target=_blank rel=noopener>px</a>, 3 days ago</p>"
+            ),
+            "{card}"
+        );
+        let eyebrow = rendered_regions(&card, "eyebrow");
+        assert_eq!(eyebrow.len(), 1, "{eyebrow:?}");
+        for absent in ["kind", "waiting", "priority", "decision"] {
+            assert!(
+                !eyebrow[0].contains(absent),
+                "the eyebrow still carries {absent}: {}",
+                eyebrow[0]
+            );
+        }
+    }
+
+    /// WEB-22 — meta is a sentence, never a chain.
+    #[test]
+    fn rendered_meta_is_a_sentence_with_no_dot_chain_unit() {
+        let fixture = card_fixture("meta");
+        let mut settled = fixture.item.clone();
+        settled.status = "resolved".to_owned();
+        settled.resolved_by = Some(OPERATOR_ACTOR.to_owned());
+        settled.resolved_at = Some(now_ms());
+        settled.decision = Some(AttentionDecision {
+            choice: "ship".to_owned(),
+            outcome: "approve".to_owned(),
+            note: Some("go".to_owned()),
+            by: OPERATOR_ACTOR.to_owned(),
+            at: now_ms(),
+        });
+        let surfaces = [
+            decision_card(&fixture.board, &fixture.store, &fixture.item),
+            decided_row(&fixture.board, &fixture.store, &settled),
+            attention_section(
+                &fixture.board,
+                "Open attention",
+                std::slice::from_ref(&fixture.item),
+            ),
+        ];
+        for surface in &surfaces {
+            for class in ["eyebrow", "meta", "decision"] {
+                for region in rendered_regions(surface, class) {
+                    for chain in [" · ", " | "] {
+                        assert!(
+                            !region.contains(chain),
+                            "a {class} line reads as a chain: {region}"
+                        );
+                    }
+                    assert!(!region.trim_end().ends_with('→'), "{region}");
+                }
+            }
+        }
+        // A receipt is built by the script, and its sentences are written
+        // there: no chain, and no arrow.
+        assert!(!JS.contains(" · "), "the script writes a dot chain");
+        assert!(!JS.contains('→'), "the script writes an arrow");
+    }
+
+    /// WEB-24, WEB-25 — the note field's label, and only its label; and the
+    /// custom answer's button says what happens.
+    #[test]
+    fn the_note_field_is_labelled_add_a_note_with_no_hint_unit() {
+        let fixture = card_fixture("note");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        let id = url_encode(&fixture.item.id);
+        assert!(
+            card.contains(&format!(
+                "<div class=reply><label for=\"answer-{id}\">Add a note</label>"
+            )),
+            "{card}"
+        );
+        assert!(!card.contains("Add a note (optional)"), "{card}");
+        assert!(!card.contains("aria-describedby=\"reply-hint"), "{card}");
+        assert!(
+            !card.contains("Sent with whichever answer you pick"),
+            "the note kept its hint paragraph: {card}"
+        );
+    }
+
+    /// WEB-25 — the custom answer's button says what happens.
+    #[test]
+    fn the_custom_answer_button_says_record_my_answer_unit() {
+        let fixture = card_fixture("record");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        assert!(
+            card.contains(
+                "<button type=submit class=record name=decision value=custom>\
+                 Record my answer</button>"
+            ),
+            "{card}"
+        );
+        assert!(!card.contains("Record this answer"), "{card}");
+    }
+
+    /// WEB-26 — the empty deck is an answer, not an absence.
+    #[test]
+    fn the_empty_deck_copy_and_its_link_are_exact_unit() {
+        assert!(
+            EMPTY_QUEUE.contains(
+                "<p class=empty>Nothing is waiting. \
+                 Every question an agent raised has an answer.</p>"
+            ),
+            "{EMPTY_QUEUE}"
+        );
+        assert!(
+            EMPTY_QUEUE.contains("<a href=\"/decided\">See what was decided</a>"),
+            "{EMPTY_QUEUE}"
+        );
+        assert!(
+            !EMPTY_QUEUE.contains("every raised item has been settled"),
+            "the absence wording is still served: {EMPTY_QUEUE}"
+        );
+    }
+
+    /// WEB-27 — one quiet keyboard line, and the digits live on the buttons.
+    #[test]
+    fn one_quiet_keys_line_carries_no_kbd_badges_unit() {
+        assert_eq!(
+            DECK_KEYS,
+            "<p class=keys>1–4 answer · s skip · u undo · c own</p>"
+        );
+        for keys in [DECK_KEYS, LIST_KEYS] {
+            assert!(!keys.contains("<kbd>"), "{keys}");
+            assert_eq!(keys.matches("<p class=keys>").count(), 1, "{keys}");
+        }
+        let body = css_rule_body("p.keys");
+        assert!(body.contains("font-size:.75rem"), "{body}");
+        assert!(body.contains("color:var(--overlay)"), "{body}");
+        assert!(body.contains("font-family:var(--mono)"), "{body}");
+        // And the digits are on the answers themselves -- which is why the
+        // legend over the recommendation says the one word and not the key
+        // a second time (George, 2026-09-17, on the deck screenshots).
+        let fixture = card_fixture("keys");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        for digit in ["1", "2", "3"] {
+            assert!(
+                card.contains(&format!("<span class=key>{digit}</span>")),
+                "{card}"
+            );
+        }
+        assert!(
+            card.contains("<legend>Recommended</legend>"),
+            "the recommendation's legend is not the one word: {card}"
+        );
+        assert!(
+            !card.contains("press 1"),
+            "the legend still repeats the digit the button carries: {card}"
+        );
+        assert!(!card.contains("<kbd>"), "{card}");
+    }
+
+    /// WEB-03 — no glyph prefix anywhere.
+    #[test]
+    fn no_heading_or_link_carries_a_glyph_prefix_unit() {
+        let stripped = css_without_comments(CSS);
+        assert!(!stripped.contains("content:'>'"), "{stripped}");
+        assert!(!stripped.contains("content:'> '"), "{stripped}");
+        let fixture = card_fixture("glyph");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        let rendered = page("Needs you", &format!("<h1>Needs you</h1>{card}"));
+        // Every heading and every link text the renderers produce, read out
+        // of the served bytes.
+        for opener in ["<h1>", "<h2 ", "<h2>", "<a "] {
+            let mut rest = rendered.as_str();
+            while let Some(at) = rest.find(opener) {
+                let after = &rest[at + opener.len()..];
+                let text_at = match after.find('>') {
+                    Some(close) if opener.ends_with(' ') => close + 1,
+                    _ => 0,
+                };
+                let text = &after[text_at..];
+                let end = text.find('<').unwrap_or(text.len());
+                let text = text[..end].trim();
+                assert!(
+                    !text.starts_with('>'),
+                    "{opener} text starts with >: {text}"
+                );
+                assert!(
+                    !text.ends_with('→'),
+                    "{opener} text ends with an arrow: {text}"
+                );
+                rest = after;
+            }
+        }
+    }
+
+    /// WEB-29 — a board refusal is the board's own sentence.
+    #[test]
+    fn a_refusal_is_the_boards_sentence_in_red_unit() {
+        // The two channels are distinguished by attribute and never share a
+        // node: the composer's own sentence is `incomplete`, the board's is
+        // `board`.
+        assert!(
+            JS.contains("refusal.setAttribute('data-refusal', kind)"),
+            "{JS}"
+        );
+        assert!(JS.contains("[data-refusal=board]"), "{JS}");
+        assert!(
+            JS.contains("showRefusal(form, INCOMPLETE_ANSWER, 'incomplete')"),
+            "{JS}"
+        );
+        assert!(
+            JS.contains("showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board')"),
+            "{JS}"
+        );
+        let body = css_rule_body(".error");
+        assert!(body.contains("color:var(--red)"), "{body}");
+        let declarations = css_declarations(&body);
+        for (property, value) in &declarations {
+            assert!(
+                !property.starts_with("background") && !property.starts_with("border"),
+                "a refusal is a sentence, not a box: {property}:{value}"
+            );
+        }
+    }
+
+    /// WEB-39 — search is the first thing in the drawer.
+    #[test]
+    fn the_drawer_puts_search_before_every_destination_unit() {
+        let rendered = page("Boards", "<h1>Boards</h1>");
+        let drawer_at = rendered.find("<nav class=drawer").expect("the drawer");
+        let drawer = &rendered[drawer_at..];
+        let search = drawer.find("data-nav-search").expect("the search form");
+        for destination in [
+            "needs-you",
+            "all",
+            "decided",
+            "lanes",
+            "boards",
+            "sprints",
+            "plans",
+            "deployments",
+            "subscriptions",
+        ] {
+            let at = drawer
+                .find(&format!("data-nav={destination}"))
+                .unwrap_or_else(|| panic!("no {destination} anchor in the drawer"));
+            assert!(
+                search < at,
+                "the search field comes after {destination} in the drawer"
+            );
+        }
+    }
+
+    /// WEB-52 — two announcement channels, each with one role, and every
+    /// field is named.
+    ///
+    /// Asserted here on the shell and the card, which is every input and
+    /// textarea this slice renders; the same helper runs over every in-scope
+    /// route inside the render fixture, where the registry exists.
+    #[test]
+    fn every_field_is_labelled_and_status_is_announced_once_unit() {
+        let fixture = card_fixture("labels");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        let deck = deck_page(
+            "Needs you",
+            &format!(
+                "<div class=heading><h1>Needs you</h1></div>\
+                 {card}\
+                 <aside class=side data-side>\
+                 <div class=toasts data-notices role=log aria-live=polite></div></aside>"
+            ),
+        );
+        assert_announcement_channels(&deck, "/");
+        assert_every_field_is_named(&deck, "/");
+        // The card's own name is its question.
+        let id = escape(&fixture.item.id);
+        assert!(
+            card.contains(&format!("aria-labelledby=\"q-{id}\"")),
+            "{card}"
+        );
+        assert!(card.contains(&format!("<h2 id=\"q-{id}\">")), "{card}");
+        // The markup is only half of it: the script builds nodes too, and a
+        // refusal that carried `role=alert` was a third announcement channel
+        // that shouted whatever the board said. Every role the script writes
+        // is named here, so adding one is a decision rather than an
+        // accident: the toast log it creates when a page has none, and the
+        // hover preview's tooltip, which announces nothing.
+        let mut roles = Vec::new();
+        let mut rest = JS;
+        while let Some(at) = rest.find("setAttribute('role', '") {
+            let after = &rest[at + "setAttribute('role', '".len()..];
+            let end = after.find('\'').expect("the role closes");
+            roles.push(&after[..end]);
+            rest = &after[end..];
+        }
+        assert_eq!(
+            roles,
+            ["log", "tooltip"],
+            "the script writes a role that is neither the toast log nor a hover preview"
+        );
+        assert!(
+            !JS.contains("'alert'") && !JS.contains("\"alert\""),
+            "the script raises an alert region: a refusal is described text, not an announcement"
+        );
+        assert_eq!(
+            JS.matches("aria-live").count(),
+            1,
+            "the script writes aria-live somewhere other than the toast log it creates"
+        );
+        // ...and the refusal it does build is tied to what it focuses.
+        assert!(
+            JS.contains("describeRefusal(missing, refusal)")
+                && JS.contains("setAttribute('aria-describedby', refusal.id)"),
+            "a refusal no longer describes the control the operator is sent to"
+        );
+    }
+
+    /// WEB-44 — every route the server answers is a route the sweep loads.
+    ///
+    /// The sweep is a list of URLs in `tests/e2e.rs`, and a list can fall
+    /// behind the match it is a list of. So `ROUTE_SHAPES` is the registry
+    /// both read, and this counts `render`'s arms in the source to hold the
+    /// registry to the match: adding an arm without declaring its shape
+    /// fails here, and declaring a shape the sweep does not load fails in
+    /// the sweep.
+    #[test]
+    fn render_answers_exactly_the_declared_shapes_unit() {
+        let source = include_str!("serve.rs");
+        let body = source
+            .split_once("fn render(url: &str) -> Result<String> {")
+            .expect("render is declared")
+            .1
+            .split_once("\nfn post(")
+            .expect("render ends before post")
+            .0;
+        let arms = body.matches("=>").count();
+        assert_eq!(
+            arms,
+            ROUTE_SHAPES.len() + 1,
+            "render answers {arms} arms (the last being not-found) but {} shapes are \
+             declared: declare the new shape in ROUTE_SHAPES and load it in \
+             no_route_overflows_sideways_at_three_widths_in_real_chrome",
+            ROUTE_SHAPES.len()
+        );
+    }
+
+    /// One `role=status`, one `role=log`, and no third live region.
+    ///
+    /// Read off the MARKUP: the script is inlined into the same document and
+    /// its comments name the roles it manages, which is prose about the
+    /// contract rather than a region claiming one.
+    fn assert_announcement_channels(html: &str, route: &str) {
+        let markup = html.split("<script>").next().unwrap_or(html);
+        assert_eq!(
+            markup.matches("role=status").count(),
+            1,
+            "{route} does not carry exactly one role=status"
+        );
+        assert!(
+            markup.matches("role=log").count() <= 1,
+            "{route} carries more than one role=log"
+        );
+        assert_eq!(
+            markup.matches("aria-live").count(),
+            markup.matches("role=status").count() + markup.matches("role=log").count(),
+            "{route} has a live region that is neither the status nor the log"
+        );
+    }
+
+    /// Every `input` and `textarea` is named by a label or an aria-label.
+    fn assert_every_field_is_named(html: &str, route: &str) {
+        for opener in ["<input ", "<textarea "] {
+            let mut rest = html;
+            while let Some(at) = rest.find(opener) {
+                let after = &rest[at..];
+                let end = after.find('>').expect("the element closes");
+                let element = &after[..end];
+                rest = &after[end..];
+                if element.contains("type=hidden") {
+                    continue;
+                }
+                if element.contains("aria-label") {
+                    continue;
+                }
+                let id = element
+                    .split_once("id=\"")
+                    .map(|(_, tail)| tail.split('"').next().unwrap_or("").to_owned())
+                    .or_else(|| {
+                        element.split_once("id=").map(|(_, tail)| {
+                            tail.split_whitespace().next().unwrap_or("").to_owned()
+                        })
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    !id.is_empty(),
+                    "{route} renders an unnamed field with no id: {element}"
+                );
+                assert!(
+                    html.contains(&format!("for=\"{id}\"")) || html.contains(&format!("for={id}")),
+                    "{route} renders {element} with no label naming {id}"
+                );
+            }
+        }
+    }
+
+    const COUNTS_CHILD_TEST: &str = "serve::tests::web_counts_child_process";
+    const COUNTS_CHILD_MARKER: &str = "web-counts-child";
+
+    /// WEB-28 — counts read as counts.
+    ///
+    /// The aggregate is every registered board's open queue, so this one
+    /// needs a registry: it runs in a child process with its own data dir,
+    /// the way every other registry-backed case in this module does.
+    #[test]
+    fn counts_read_as_sentences_unit() {
+        let data_dir = TempDataDir::new("web-counts");
+        let output = spawn_fixture_child(
+            data_dir.path(),
+            COUNTS_CHILD_TEST,
+            "KANBAN_WEB_COUNTS_CHILD",
+            COUNTS_CHILD_MARKER,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child counts fixture failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            stdout.contains("test serve::tests::web_counts_child_process ... ok"),
+            "child did not execute the ignored counts fixture\n{stdout}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn web_counts_child_process() {
+        let Ok(marker) = env::var("KANBAN_WEB_COUNTS_CHILD") else {
+            return;
+        };
+        if marker != COUNTS_CHILD_MARKER {
+            return;
+        }
+        let mut registry = Registry::open().expect("open registry");
+        let mut decided = Vec::new();
+        for (board, rows) in [("px", 3), ("atmux", 9)] {
+            let project = registry
+                .register(None, board, false, "geoyws")
+                .expect("register a board");
+            let mut store =
+                Store::open(&PathBuf::from(&project.board_path)).expect("open the board");
+            store.initialize(board, "geoyws").expect("initialize");
+            for row in 0..rows {
+                let item = store
+                    .raise_attention(
+                        &format!("{board} row {row} needs a decision."),
+                        "decision",
+                        "codex@driver",
+                        None,
+                        0,
+                        &[],
+                        &DecisionCard::default(),
+                    )
+                    .expect("raise an open item");
+                if board == "atmux" {
+                    decided.push((project.board_path.clone(), item.id));
+                }
+            }
+        }
+
+        // Twelve open across two boards, said as a count on the list and as
+        // what is left on the deck.
+        let list = render("/all").expect("render the plain list");
+        assert_html_contains(
+            &list,
+            "<p class=count><span data-open-count>12</span> open across 2 boards</p>",
+        );
+        let deck = render("/").expect("render the deck");
+        assert_html_contains(
+            &deck,
+            "<p class=progress><span data-open-count>12</span> left</p>",
+        );
+        assert!(!deck.contains(" of <span data-open-count>"), "{deck}");
+
+        // And the deck's count is the queue's, not the page's: settling the
+        // nine atmux rows leaves three.
+        for (board_path, id) in &decided {
+            let mut store = Store::open(&PathBuf::from(board_path)).expect("reopen the board");
+            store
+                .resolve_attention(
+                    id,
+                    OPERATOR_ACTOR,
+                    &AttentionAnswer {
+                        choice: Some("approve"),
+                        outcome: None,
+                        note: None,
+                    },
+                )
+                .expect("settle an atmux row");
+        }
+        let deck = render("/").expect("re-render the deck");
+        assert_html_contains(
+            &deck,
+            "<p class=progress><span data-open-count>3</span> left</p>",
+        );
+        let list = render("/all").expect("re-render the plain list");
+        assert_html_contains(
+            &list,
+            "<p class=count><span data-open-count>3</span> open across 1 board</p>",
+        );
+
+        // Every in-scope route keeps both announcement channels and reaches
+        // no third party (WEB-52, WEB-54), which is a claim about the routes
+        // and so is made where the routes can be rendered.
+        for route in [
+            "/",
+            "/all",
+            "/decided",
+            "/boards",
+            "/sprints",
+            "/plans",
+            "/deployments",
+            "/subscriptions",
+            "/lanes",
+            "/search",
+            "/board/px",
+            "/no/such/page",
+        ] {
+            let html = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
+            assert_announcement_channels(&html, route);
+            assert_every_field_is_named(&html, route);
+            assert_no_third_party(&html, route);
+        }
+    }
+
+    /// WEB-54 — the document reaches no third party.
+    #[test]
+    fn the_document_references_no_third_party_unit() {
+        let fixture = card_fixture("third-party");
+        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
+        assert_no_third_party(&page("Needs you", &card), "/");
+    }
+
+    fn assert_no_third_party(html: &str, route: &str) {
+        for forbidden in ["<link ", "<img ", "<iframe ", "<script src"] {
+            assert!(
+                !html.contains(forbidden),
+                "{route} reaches outside the document with {forbidden}"
+            );
+        }
+        for attribute in ["href=", "src="] {
+            let mut rest = html;
+            while let Some(at) = rest.find(attribute) {
+                let after = &rest[at + attribute.len()..];
+                let value = if let Some(quoted) = after.strip_prefix('"') {
+                    quoted.split('"').next().unwrap_or("")
+                } else {
+                    after
+                        .split(|c: char| c == '>' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("")
+                };
+                assert!(
+                    value.starts_with('/') || value.starts_with('#'),
+                    "{route} points at {value}, which is not same-site"
+                );
+                rest = after;
+            }
+        }
+    }
+
     /// The ROUTE's refusal for a half-written custom answer is ONE sentence,
     /// whatever the row, the actor or the missing half.
     ///
@@ -5833,7 +7255,10 @@ mod tests {
         );
         assert!(rendered.contains("width=device-width,initial-scale=1"));
         assert!(rendered.contains("role=status aria-live=polite"));
-        assert!(CSS.contains("min-height:2.6rem"));
+        // 44 CSS px is the floor a thumb needs (spec WEB-45, Apple's HIG
+        // minimum), and 2.75rem is that at the root size this page sets.
+        assert!(CSS.contains("min-height:2.75rem"));
+        assert!(!CSS.contains("min-height:2.6rem"), "{CSS}");
         assert!(CSS.contains("env(safe-area-inset-bottom)"));
         assert!(CSS.contains(".attention-count"));
         assert!(CSS.contains("@media(max-width:700px)"));
@@ -5898,20 +7323,20 @@ mod tests {
         assert_page_title(&home, "Needs you");
         assert_html_contains(&home, "Needs you");
         assert_html_contains(&home, "Please review before release");
-        // The deck: one card on screen, with the queue's position above it.
+        // The deck: one card on screen, with what is left counted above it.
         // The page explains itself at length on the plain list it is laid
         // over, where there is room for a paragraph.
         assert_html_contains(&home, "<main id=main data-deck>");
         assert_html_contains(&home, "<section class=deck data-deck-cards>");
         assert_html_contains(
             &home,
-            "<p class=progress><span data-deck-position>1</span> of <span data-open-count>1</span></p>",
+            "<p class=progress><span data-open-count>1</span> left</p>",
         );
         assert!(!home.contains("<p class=explain>"), "{home}");
-        // Orientation above the question, and the free-text answer folded
-        // out of the way beneath the choices.
-        assert_html_contains(&home, "<p class=eyebrow>");
-        assert_html_contains(&home, "· asked by geoyws · waiting ");
+        // Orientation above the question, in one sentence naming who asked,
+        // where, and when -- and the free-text answer folded out of the way
+        // beneath the choices.
+        assert_html_contains(&home, "<p class=eyebrow>geoyws asked on ");
         assert_html_contains(
             &home,
             "<details class=custom data-custom><summary>Answer in my own words</summary>",
@@ -5922,9 +7347,10 @@ mod tests {
         // suite.
         assert!(!home.contains("class=recommended"), "{home}");
         assert_html_contains(&home, "<div class=reply><label for=\"answer-");
-        assert_html_contains(
-            &home,
-            "Sent with whichever answer you pick. Required when you answer in your own words.",
+        assert_html_contains(&home, ">Add a note</label>");
+        assert!(
+            !home.contains("Sent with whichever answer you pick"),
+            "the note field grew a hint paragraph again: {home}"
         );
         assert_html_contains(&home, "value=\"approve\" data-label=\"Approve - proceed\"");
         // The submit is live in the markup: a rendered `disabled` made the
@@ -5932,7 +7358,7 @@ mod tests {
         // reach the route's own validation.
         assert_html_contains(
             &home,
-            "<button type=submit class=record name=decision value=custom>Record this answer</button>",
+            "<button type=submit class=record name=decision value=custom>Record my answer</button>",
         );
         // Two voices. The card refuses in the page's language, naming both
         // halves the way the card itself names them, and nothing served here
@@ -5954,7 +7380,10 @@ mod tests {
             &home,
             "<button type=button class=clear data-clear hidden>Clear verdict</button>",
         );
-        assert_html_contains(&home, "<kbd>Esc</kbd> clear ·");
+        assert_html_contains(
+            &home,
+            "<p class=keys>1–4 answer · s skip · u undo · c own</p>",
+        );
         assert!(
             !home.contains("value=custom disabled"),
             "the free-text submit is rendered disabled, so a click reports nothing: {home}"
@@ -6056,9 +7485,13 @@ mod tests {
         let board = render("/board/SERVE-RENDER").expect("render board");
         assert_page_title(&board, "SERVE-RENDER");
         assert_html_contains(&board, "Rootless");
-        assert_html_contains(&board, "priority-p0");
-        assert_html_contains(&board, "priority-p1");
-        assert_html_contains(&board, "priority-p2");
+        // The rendered rows, not the stylesheet: this board's tasks are P0
+        // and P1, so those are the two classes its markup can carry. `P2`
+        // used to pass here by matching a CSS rule, which proved nothing
+        // about what the page renders.
+        assert_html_contains(&board, "class=\"priority priority-p0\"");
+        assert_html_contains(&board, "class=\"priority priority-p1\"");
+        assert!(!board.contains("priority-p2"), "{board}");
         assert_html_contains(&board, "type-epic");
         assert_html_contains(&board, "type-story");
         assert_html_contains(&board, "type-task");
@@ -6558,7 +7991,8 @@ mod tests {
         assert_eq!(age(now - 60_000), "1 min");
         assert_eq!(age(now - 45 * 60_000), "45 min");
         assert_eq!(age(now - 90 * 60_000), "1h30m");
-        assert_eq!(age(now - 3 * 24 * 60 * 60_000), "72h");
+        assert_eq!(age(now - 3 * 24 * 60 * 60_000), "3 days");
+        assert_eq!(age(now - 25 * 60 * 60_000), "1 day");
         // A stamp from the future is not negative time; it is "just now".
         assert_eq!(age(now + 60_000), "just now");
     }
@@ -6571,6 +8005,7 @@ mod tests {
         assert_eq!(ago(now), "just now");
         assert_eq!(ago(now - 45 * 60_000), "45 min ago");
         assert_eq!(ago(now - 90 * 60_000), "1h30m ago");
+        assert_eq!(ago(now - 3 * 24 * 60 * 60_000), "3 days ago");
     }
 
     #[test]
@@ -6764,11 +8199,8 @@ mod tests {
         assert_html_contains(&html, "<code>codex.queue</code>");
         assert_html_contains(&html, "action <code>enqueue-turn</code>");
         assert_html_contains(&html, "4 board events behind head seq 12.");
-        assert_html_contains(
-            &html,
-            "started at seq 4 · acked through seq 8 · 1 in flight",
-        );
-        assert_html_contains(&html, "30000 ms timeout · 3 retries · 60/min · 1 at a time");
+        assert_html_contains(&html, "started at seq 4, acked through seq 8, 1 in flight");
+        assert_html_contains(&html, "30000 ms timeout, 3 retries, 60/min, 1 at a time");
         assert_html_contains(&html, "action=\"/subscription/PX/sub-one/pause\"");
         assert_html_contains(&html, "Pause delivery");
         assert_html_contains(&html, "2 pending");
@@ -6884,20 +8316,23 @@ mod tests {
             "a subscription with nothing waiting must render no queued line: {quiet}"
         );
 
-        // Three states, three treatments: dim for the ones that are merely
-        // queued, amber for a retry that resolves itself, and red for a dead
-        // letter, because in this UI red is failure and nothing else.
+        // A colour is an outcome now (spec WEB-11): the four hues mean
+        // approve, reject, defer and other, and nothing else is coloured. So
+        // the queued line is quiet prose and a retry or a dead letter is
+        // marked by WEIGHT and by naming itself in words -- which is what
+        // the rest of this case reads -- rather than by an amber or a red
+        // that would make a colour mean two things.
         assert!(
-            CSS.contains(".queued .retrying{color:var(--peach);font-weight:600}"),
+            CSS.contains(".queued{margin-top:.25rem;color:var(--subtext);font-size:.8125rem}"),
             "{CSS}"
         );
         assert!(
-            CSS.contains(".queued .dead{color:var(--red);font-weight:700}"),
+            CSS.contains(".queued .retrying,.queued .dead{color:var(--text);font-weight:700}"),
             "{CSS}"
         );
         assert!(
-            CSS.contains("td.waiting{color:var(--peach);font-weight:650}"),
-            "waiting is the same peach as a retry: attention, not yet failure: {CSS}"
+            CSS.contains("td.waiting{font-weight:600}"),
+            "a board with items waiting is marked by weight, not by a hue: {CSS}"
         );
     }
 
@@ -7047,7 +8482,7 @@ mod tests {
         assert_html_contains(&everything, "sub-halted");
         assert_html_contains(
             &everything,
-            &format!("paused by {OPERATOR_ACTOR} · 1h30m ago"),
+            &format!("paused by {OPERATOR_ACTOR} 1h30m ago"),
         );
         assert_html_contains(&everything, "Resume delivery");
         assert_html_contains(
