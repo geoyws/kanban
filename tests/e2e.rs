@@ -26531,21 +26531,50 @@ fn card_args<'a>(fixed: &[&'a str], card: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
-/// Click one control after scrolling it to the middle of the viewport.
+/// Click one control after scrolling it to the middle of the viewport, and
+/// only once the browser's own hit test says the click will land on it.
 ///
 /// The keyboard-hint bar is pinned to the bottom of the viewport, so a
 /// control that happens to sit beneath it cannot be tapped where it is: a
 /// person scrolls it clear first, and so does this. Without the scroll a
 /// click lands on the bar and the page does nothing, which is a fact about
-/// any bottom toolbar rather than about this one.
+/// any bottom toolbar rather than about this one. `scrollIntoView` walks
+/// every scrollable ancestor, which is what reaches a control inside the
+/// deck's answer panel -- the panel scrolls itself when a card's answers are
+/// taller than the screen has left.
+///
+/// The hit test is the part worth having. `Element::click` asks Chrome for
+/// the node's content quads and polls for twenty seconds when there are
+/// none, then fails with `The event waited for never came` -- which says
+/// nothing about WHY, and a control with no quads is usually a control on a
+/// card the deck is not showing. Measuring it here turns that into a
+/// sentence naming what is in the way.
 fn click_control(tab: &headless_chrome::Tab, selector: &str) {
-    js_value(
-        tab,
-        &format!(
-            "(() => {{ const el = document.querySelector('{selector}'); \
-             if (el) el.scrollIntoView({{block: 'center'}}); return true; }})()"
-        ),
-    );
+    const REACH: &str = "(() => { const el = document.querySelector('__SELECTOR__'); \
+         if (!el) return JSON.stringify({state: 'missing'}); \
+         el.scrollIntoView({block: 'center', inline: 'center'}); \
+         const box = el.getBoundingClientRect(); \
+         if (box.width === 0 || box.height === 0) return JSON.stringify({state: 'unrendered', \
+         visible: el.checkVisibility(), onHiddenCard: Boolean(el.closest('article.item[hidden]'))}); \
+         const x = box.left + box.width / 2, y = box.top + box.height / 2; \
+         const hit = document.elementFromPoint(x, y); \
+         if (hit && (hit === el || el.contains(hit) || hit.contains(el))) \
+         return JSON.stringify({state: 'ready'}); \
+         return JSON.stringify({state: 'obscured', by: hit ? hit.outerHTML.slice(0, 120) : null}); })()";
+    let reach = REACH.replace("__SELECTOR__", selector);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = js_value(tab, &reach);
+        let state = state.as_str().unwrap_or("{}");
+        if state.contains("\"ready\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{selector} never became clickable: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     tab.wait_for_element(selector)
         .unwrap_or_else(|error| panic!("missing {selector}: {error}"))
         .click()
@@ -27823,6 +27852,10 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
 /// Pointer only. The keyboard paths are
 /// `a_digit_in_the_verdict_picker_records_nothing_in_real_chrome` and
 /// `enter_in_the_verdict_picker_records_the_free_text_answer_in_real_chrome`.
+/// It runs on `/all`, the plain list: it composes an answer on one card and
+/// a different half-answer on another, and two cards open at once is what a
+/// list is -- the deck at `/` shows exactly one and hides the rest, so the
+/// second card's fold has no box to click.
 #[test]
 fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() {
     browser_loopback_reservation_supported()
@@ -27846,7 +27879,7 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
     let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
-    let tab = decision_tab(&chrome, &origin);
+    let tab = list_tab(&chrome, &origin);
     let form = |id: &str| format!("form.decide[action=\"/attention/CARDMISSING/{id}/reply\"]");
     let refusal = |tab: &headless_chrome::Tab, id: &str| {
         js_value(
