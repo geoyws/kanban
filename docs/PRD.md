@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** George
-**Updated:** 2026-09-14
+**Updated:** 2026-09-17
 
 ## Product statement
 
@@ -82,11 +82,13 @@ named carry-over sprint with a written note.
 
 ### Decide in one click
 
-The operator opens the decision room, reads a card's question and context, and
-either takes the recommended choice or writes a reply and picks an outcome. The
-card is replaced in place by a one-line receipt naming the decision, with Undo
-one click or one keystroke away, the open count drops, and the lane that raised
-the item reads a machine-readable verdict instead of a paragraph.
+The operator opens the decision room and sees one card: the question as the
+headline, the recommendation leading on its own fill, the rest of the card
+beneath it. He takes a choice with a click or a digit, or writes his own answer
+and picks an outcome. The deck advances to the next card, a one-line receipt
+naming the decision lands in the session history with Undo one key away, the
+count of what is left drops, and the lane that raised the item reads a
+machine-readable verdict instead of a paragraph.
 
 ## Functional requirements
 
@@ -238,31 +240,37 @@ the item reads a machine-readable verdict instead of a paragraph.
 
 ### The decision room
 
-- Render every open attention item on the served "Needs you" page as a decision
-  card, in the order it is decided: the question as the heading, the context,
-  the authored choices with the recommendation first and each choice's
-  consequence beneath its button, the card's one reply field, the free-text
-  answer with its four-value outcome picker, the body folded beneath, then the
-  meta line.
+- Render the open attention items on the served "Needs you" page as a deck of
+  decision cards showing one card at a time, in the order they are decided: the
+  eyebrow naming who asked, where and when in one sentence, the question as the
+  headline, the context, the authored choices with the recommendation first and
+  each choice's consequence beneath its button, the card's one reply field, the
+  free-text answer folded until it is asked for, the body folded beneath, then
+  the meta line. The bar reads how many are left. With no script the same page
+  is a plain list of every card, each with a working form.
 - Settle an item in one click as the operator. Reply text, when written, rides
   with whichever choice is clicked and is recorded as that decision's note; the
   free-text answer must carry both a note and an explicit outcome or be
   refused. A choice key the row no longer carries must be refused by name
   rather than mapped onto whatever now sits in that position, so a card left
   open in a tab stays safe to click.
-- Answer a focused card from the keyboard: the digits select its choices in the
-  order it lists them, so the first is always the recommendation, one key
-  reaches the reply field, and one key undoes the decision just made. A typed
-  reply must not disarm the digits — it rides with whichever choice is clicked
-  — but they must stay inert when no card has focus, while the free-text
-  textarea has focus, and on a card whose free-text verdict is already picked,
-  so an authored key can never drop a chosen verdict.
-- Settle without navigating. The card is replaced in place by a one-line
-  `Decided:` receipt naming the choice, saying whether a reply was recorded,
-  and carrying an Undo control; the open count drops and the receipt survives
-  the live refresh. Recent decisions must be browsable with the same undo, and
-  undoing must reopen the item through the audited reopen operation with a
-  fixed note rather than asking for words.
+- Answer the current card from the keyboard: `1`-`4` select its choices in the
+  order it lists them, so the first is always the recommendation, `s` sends the
+  card to the back of the deck without recording anything, `u` undoes the
+  decision just made, and `c` opens the operator's own answer. A typed reply
+  must not disarm the digits — it rides with whichever choice is clicked — but
+  they must stay inert when no card has focus, while the free-text textarea has
+  focus, and on a card whose free-text verdict is already picked, so an
+  authored key can never drop a chosen verdict.
+- Settle without navigating. The card leaves the deck and a one-line receipt
+  naming the choice lands in the session history, carrying its outcome as a
+  left rule and an Undo control; the count of what is left drops and the
+  receipt survives the live refresh. A refusal — the board's own sentence, or
+  the composer's own when an answer arrives with only one of its two halves —
+  is rendered inline beside what it refused and tied to the focused control
+  with `aria-describedby`, not announced as an alert. Recent decisions must be
+  browsable with the same undo, and undoing must reopen the item through the
+  audited reopen operation with a fixed note rather than asking for words.
 - Serve a row whose raiser authored no card as the default approve/reject pair
   with its first body line as the question and nothing marked recommended.
 - Render long board text as markdown, and answer every reference link with a
@@ -272,6 +280,24 @@ the item reads a machine-readable verdict instead of a paragraph.
   undoing that decision by reopening it from the web, opening a draft plan,
   and pausing or resuming a subscription are the only writes the browser may
   perform.
+- Say what happened in exactly two channels: one live line carrying only the
+  connection's own words, and one log region holding the toasts. A toast stays
+  at least 20 seconds, holds while the pointer or focus is on it, dismisses on
+  a click or `Esc`, and at most three are on screen at once, newest first.
+- Read every other page as rows, not boxes: the title first, one sentence of
+  meta beneath it, one pill style for status, the priority as plain mono text,
+  and tables with no border but the row hairline.
+- Serve the whole UI as one designed system per
+  [the web UI specification](specs/web-ui.md) and
+  [ADR-046](adr/ADR-046-the-web-ui-is-one-designed-system.md): the question is
+  the only serif and the largest thing on the page, one motion, a colour means
+  an outcome, nothing is boxed, and the deck is a progressive enhancement over
+  the plain list. ADR-046 stays Proposed until George has reviewed screenshots
+  of the restyled deck on the phone and the Mac.
+- Requirements trace: `docs/specs/web-ui.md` §3 states WEB-01..WEB-59 with a
+  strength and one evidence layer each, §8 names the test per requirement, and
+  [the compiled Rust E2E matrix](testing/compiled-rust-e2e-matrix.md) maps each
+  one to the test that exists.
 
 ### P0 — first usable slice
 
@@ -402,15 +428,16 @@ Bun are not production or development dependencies of Kanban.
 
 What is shipped is not what is served. The decision room, the pub/sub
 dispatcher, and the harness adapters are shipped and served: the host serves
-commit `3eceab7` at board schema 26. Being served is not the same as being
-proven against a real peer — every adapter smoke receipt outside the Codex
-bridges drives a dependency-free fake, and the Claude print bridge's live
-receipt was dropped with its authentication attention `a-347ff24c`. The sprint
-surface — typed rows, the close gate, the sprint web projections,
-sprint-scoped rules, and sprint search — is published source at `d0fdc9f` and
-is not yet released; it waits on the operator's release approval recorded as
-attention `a-b923d928`. Releasing it advances the board schema to 28, which is
-a migration and not a code-only rollback boundary, so the release runs that
-migration per board.
+commit `8e771ee` at board schema 28, so the sprint surface — typed rows, the
+close gate, the sprint web projections, sprint-scoped rules, and sprint search
+— is released and its per-board migration has run. Being served is not the same
+as being proven against a real peer — every adapter smoke receipt outside the
+Codex bridges drives a dependency-free fake, and the Claude print bridge's live
+receipt was dropped with its authentication attention `a-347ff24c`. The web
+design system is half served: the deck, its shell and its accessibility
+contract are in that served commit, while commit `b98e81e` — every read page as
+rows with one pill, sentence meta and borderless tables — is shipped on its
+branch and pending its deploy. ADR-046 stays Proposed either way, until George
+has reviewed screenshots of the restyled deck on the phone and the Mac.
 
 See [the historical 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).

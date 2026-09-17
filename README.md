@@ -901,7 +901,9 @@ across all of them by priority then age, recent decisions with an undo, the
 dashboard projection, draft plans with the work each holds back, the verified
 deployment matrix and attempt detail, `/lanes` lane sitreps, `/subscriptions`
 delivery state, cross-board cited search, one board's rows, and one task in
-full. Priority badges use P0/P1/P2 everywhere a queued row appears.
+full. Every read page is rows: the title first, one sentence of meta beneath
+it, one pill for a status, the priority as plain mono text with P0 in red, and
+tables carrying no border but the row hairline.
 Every read goes through the same `Store` methods the CLI calls, so there is no
 second implementation to keep in step.
 
@@ -923,40 +925,62 @@ browser would be a claim the server must trust, and a stale one silently skips
 rows (`docs/ui-pubsub-consumption-seams.md`).
 
 The **Needs you** page is the deliberately narrow exception to the read-only
-surface: every open item renders as a decision card and one click settles it as
-`geoyws`. Same-origin checks, strict bounded form decoding and the Store's
-duplicate-resolution refusal guard the write.
+surface: it serves the open items as a deck showing one decision card at a
+time, and one click or one digit settles the current one as `geoyws`.
+Same-origin checks, strict bounded form decoding and the Store's
+duplicate-resolution refusal guard the write. With no script the same page is a
+plain list of every card, each with a form that still posts.
 
 A card reads top to bottom in the order it is decided in
 ([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)
-§5): the question as the heading, the context, then the recommended choice
-first — marked `recommended` and the first interactive element in the card —
+§5): the eyebrow naming who asked, where and when in one sentence, the question
+as the headline — the page's only serif and the largest thing on it — the
+context, then the recommended choice first, marked `recommended`, leading on
+its own outcome-coloured fill and the first interactive element in the card,
 with each choice's consequence beneath its button, then the card's one reply
-field, then the free-text answer with its four-value outcome picker, then the
-body folded under `show the full item`, then the meta line. The reply field
-sits with the choices, above the rule that starts the free-text answer,
-because it serves both: whatever is written in it rides with whichever choice
-is clicked, and the free-text answer is that same field plus a verdict.
-`1`–`4` answer the card that has focus in the order it lists them, so `1` is
-always the recommendation, and `c` reaches the reply field; both are inert
-while a reply is being typed. A row whose raiser authored no card is the same
-card with the `approve`/`reject` default pair, its first body line as the
-question and nothing marked recommended.
+field, then the operator's own answer with its four-value outcome picker folded
+until it is asked for, then the body folded under `show the full item`, then
+the meta line. The reply field sits with the choices, above the rule that
+starts the operator's own answer, because it serves both: whatever is written
+in it rides with whichever choice is clicked, and the own answer is that same
+field plus a verdict. `1`–`4` answer the current card in the order it lists
+them, so `1` is always the recommendation; `s` sends the card to the back of
+the deck and records nothing; `u` undoes the decision just made; `c` opens the
+operator's own answer. The digits stay inert while a reply is being typed and
+on a card whose own verdict is already picked. A row whose raiser authored no
+card is the same card with the `approve`/`reject` default pair, its first body
+line as the question and nothing marked recommended.
 
 One click posts `decision=<key>`, carrying `reply=<text>` as that decision's
 note when the field has words in it; the free-text answer posts
 `decision=custom&outcome=<verdict>&reply=<text>` and is refused without both
 by the page and by the composer that writes the trail. Nothing navigates: the
-card is replaced in place by a one-line receipt naming the choice — and saying
-the reply is recorded when one rode with it — plus the
-`kanban attention reopen <id>` that undoes it, the open count drops, and the
-receipt survives the live refresh — a reload on a 133-item list
+card leaves the deck, the next one becomes current, and a one-line receipt
+naming the choice — and saying the reply is recorded when one rode with it —
+lands in the session history carrying its outcome as a coloured left rule plus
+the `kanban attention reopen <id>` that undoes it; the count of what is left
+drops and the receipt survives the live refresh — a reload on a 133-item list
 would throw the reader back to the top of it. A key the row no longer carries
 is refused by name rather than mapped onto whatever now sits in that position,
 so a card left open in a tab is safe to click. Every other route remains
 read-only: the browser can resolve an attention item, open a draft plan, and
 pause or resume a subscription, and nothing else, enforced by the source
 mutator allowlist and byte-for-byte process-boundary tests.
+
+The page says what happened in two channels and no others: one live line
+carrying only the connection's own words — `connecting`, `live`,
+`reconnecting`, `sending` — and one log region holding the toasts, where a
+change stays at least 20 seconds, holds while the pointer or focus is on it,
+dismisses on a click or `Esc`, and at most three are on screen at once, newest
+first. A refusal — the board's own sentence, or the composer's when an answer
+arrives with only one of its two halves — renders inline beside what it refused
+and is tied to the focused control with `aria-describedby`, not announced as an
+alert. The whole look is one designed system:
+[docs/specs/web-ui.md](docs/specs/web-ui.md) states it as WEB-01..WEB-59 with
+the test that proves each one, and
+[ADR-046](docs/adr/ADR-046-the-web-ui-is-one-designed-system.md) is the
+decision behind it, Proposed until George has reviewed screenshots of the deck
+on the phone and the Mac.
 
 `/live` is a WebSocket notification channel. It sends only revision notices and
 heartbeats; the browser fetches the canonical server-rendered page after a board

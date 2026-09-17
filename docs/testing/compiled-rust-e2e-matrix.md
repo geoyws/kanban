@@ -100,6 +100,7 @@ Instrumentation does not change any test's evidence layer.
 | WEB-57 — the composer refuses before posting (chrome) | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` types a reply, picks no verdict, presses `Record my answer` with every POST recorded at `window.fetch`, and finds the exact `INCOMPLETE_ANSWER` sentence in `p.error[data-refusal=incomplete]`, focus on the verdict radio group, the draft still in the field, zero POSTs, the deck un-advanced and all three rows still `open` with no decision through the compiled CLI. It also holds WEB-52 with the refusal on screen: `[role=status],[role=log],[role=alert],[aria-live]` is still exactly the two channels, the refusal itself carries neither a role nor `aria-live`, the focused half is `aria-describedby` the refusal's id, and picking the verdict clears both the sentence and the description. `every_field_is_labelled_and_status_is_announced_once_unit` names every role the page script writes (`log` for the toast strip it creates, `tooltip` for a hover preview) and fails on an `alert` or a second `aria-live`. |
 | WEB-59 — each channel says only its own thing (chrome) | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` records every value the `role=status` line takes through a `MutationObserver` across a real decision and another agent's change: every word is one of `connecting`/`live`/`reconnecting`/`sending`, `sending` is among them, the page carries exactly one `role=status` and one `role=log`, neither claims the other's role, and the notice lands inside the log. |
 | A11 - read pages are rows with one pill and a mono priority (chrome) | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` is the spec's A11 acceptance (WEB-40, WEB-41, WEB-42, WEB-43) in one measurement, on `/board/BOARD`, `/boards` and `/deployments` of a board holding one `todo`, one `in_progress`, one `blocked`, one `review` and one `done` row with one of them `P0`: every `ul.rows`/`ul.children` row's first element child is its title - an `a` with a site-absolute `href` exactly when the row opens a page, otherwise a `.title` - followed immediately by exactly one `p.meta` whose text carries no ` · `; `span.tag`, `span.kind`, `span.type` and `span.lane` are absent from all three pages; every element carrying a `status-*` class is a `span` whose class list is exactly `pill` plus one status modifier; the `P0` row's `span.priority` computes the `--mono` family, `rgb(243, 139, 168)`, a transparent background and a `0px` radius, so the priority is text and not a pill; and every `th`/`td` draws the WEB-43 hairline or nothing. |
+| M4 - web destinations answer without a script (spec WEB, HTTP) | `every_destination_answers_without_a_script_over_http` is WEB-38 with no browser in it: on the `deck_fixture` board `NAVHTTP` it GETs `/` from the compiled server with the plain HTTP client, reads the `href` off each of the nine `data-nav` anchors out of the served markup rather than assuming the route table, refuses an `href` that is not site-absolute, GETs each one and asserts `200` plus that page's own `h1` (`Needs you` for `needs-you` and `all`, `Recent decisions`, `Lanes`, `Boards`, `Sprints`, `Plans`, `Deployments`, `Subscriptions`), and pins the count of `data-nav` anchors to those nine so a destination cannot be added to the drawer without being answered here. |
 
 Browser discovery for that gate is ordered as `KANBAN_CHROME`, then the existing platform, `PATH`, and fixed-system candidates, then the newest executable Playwright Chromium under `XDG_CACHE_HOME/ms-playwright` or `HOME/.cache/ms-playwright`. Chromium sandboxing stays enabled for non-root launches and is disabled only when the effective UID is `0`, because upstream Chrome refuses sandboxed root.
 
@@ -107,6 +108,84 @@ Passing library/unit tests or invoking `rust/main.rs` through an interpreter is
 not E2E evidence. The gate is incomplete until the compiled executable passes
 this matrix on a clean test data directory, including the real-browser path
 above.
+
+## Requirements trace — `docs/specs/web-ui.md` WEB-01..WEB-59
+
+One row per requirement, on branch `docs/t-5e88b314-release` at 2026-09-17:
+commit `b98e81e` plus the WEB-38 HTTP test written the same day. `Layer` uses
+the specification's own vocabulary: `unit` is a `#[test]` in `rust/serve.rs`'s
+`mod tests` reading served bytes, `chrome` is a compiled-binary test driving
+real Chrome in `tests/e2e.rs`, `http` is a compiled-binary HTTP exchange with
+no browser. Every test named here exists in that build, enumerated with
+`cargo test --locked --lib serve:: -- --list` and
+`cargo test --locked --test e2e -- --list`. The narrative rows above carry what
+each test measures; this table carries only the mapping.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| WEB-01 | MUST | unit | `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` | |
+| WEB-02 | MUST | chrome | `the_question_is_set_as_a_headline_in_real_chrome` | |
+| WEB-03 | MUST | unit | `no_heading_or_link_carries_a_glyph_prefix_unit` | |
+| WEB-04 | MUST | unit | `the_type_scale_is_declared_and_nothing_is_tracked_out_unit` | |
+| WEB-05 | MUST | unit | `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` | one test carries WEB-01 and WEB-05 |
+| WEB-06 | SHOULD | unit | `prose_blocks_are_bounded_to_seventy_characters_unit` | |
+| WEB-07 | MUST | chrome | `the_question_is_set_as_a_headline_in_real_chrome` | one test carries WEB-02 and WEB-07 |
+| WEB-08 | MUST | unit | `the_token_block_is_the_only_place_a_colour_is_written_unit` | |
+| WEB-09 | MUST | unit | `no_border_or_outline_exists_outside_the_allowlist_unit` | |
+| WEB-10 | MUST | unit | `only_two_radii_exist_and_each_has_one_job_unit` | |
+| WEB-11 | MUST | unit | `an_outcome_hue_appears_only_on_an_outcome_unit` | |
+| WEB-12 | MUST | chrome | `the_recommendation_leads_on_fill_in_real_chrome` | |
+| WEB-13 | MUST | chrome | `nothing_is_boxed_in_real_chrome` | |
+| WEB-14 | MUST | unit | `one_motion_is_declared_and_nothing_else_animates_unit` | |
+| WEB-15 | MUST | chrome | `the_advance_runs_once_at_140ms_each_way_in_real_chrome` | |
+| WEB-16 | MUST | chrome | `a_projection_refresh_never_reanimates_the_current_card_in_real_chrome` | |
+| WEB-17 | MUST | chrome | `the_pressed_answer_says_sending_on_its_own_fill_in_real_chrome` | the shipped `a_click_shows_sending_until_the_board_answers_in_real_chrome` was extended to the same contract and holds it too |
+| WEB-18 | MUST | chrome | `the_receipt_lands_with_its_outcome_rule_in_real_chrome` | the same extended shipped test asserts the receipt's `receipt outcome-approve` class |
+| WEB-19 | MUST | chrome | `a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome` | |
+| WEB-20 | MUST | chrome | `reduced_motion_advances_the_deck_without_animating_in_real_chrome` | |
+| WEB-21 | SHOULD | unit | `the_deck_body_fades_at_its_foot_unit` | |
+| WEB-22 | MUST | unit | `rendered_meta_is_a_sentence_with_no_dot_chain_unit` | `a_list_row_is_a_title_and_one_sentence_unit` holds the same rule on every read page that lists rows |
+| WEB-23 | MUST | unit | `the_eyebrow_names_raiser_board_and_age_unit` | |
+| WEB-24 | MUST | unit | `the_note_field_is_labelled_add_a_note_with_no_hint_unit` | |
+| WEB-25 | MUST | unit | `the_custom_answer_button_says_record_my_answer_unit` | |
+| WEB-26 | MUST | unit | `the_empty_deck_copy_and_its_link_are_exact_unit` | the extended `the_last_card_leaves_the_empty_state_in_real_chrome` asserts the same sentence and `/decided` link in the browser |
+| WEB-27 | MUST | unit | `one_quiet_keys_line_carries_no_kbd_badges_unit` | |
+| WEB-28 | MUST | unit | `counts_read_as_sentences_unit` | needs a registry, so it re-runs itself as the child `web_counts_child_process` |
+| WEB-29 | MUST | unit | `a_refusal_is_the_boards_sentence_in_red_unit` | |
+| WEB-30 | MUST | chrome | `pressing_1_sends_and_advances_to_the_next_card_in_real_chrome` | extended shipped test; the bar reads `N left` (Appendix A), not the `2 of n` §3 wrote |
+| WEB-31 | MUST | chrome | `skip_moves_the_card_to_the_back_without_recording_in_real_chrome` | extended shipped test |
+| WEB-32 | MUST | chrome | `the_undo_key_bring_back_the_last_decision_in_real_chrome` | shipped test, unchanged |
+| WEB-33 | MUST | chrome | `a_refused_decision_brings_the_card_back_in_real_chrome` | extended shipped test; `a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome` covers the typed reply surviving |
+| WEB-34 | MUST | chrome | `the_last_card_leaves_the_empty_state_in_real_chrome` | extended shipped test |
+| WEB-35 | MUST | chrome | `the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome` | extended shipped test, at 390×844, 820×1180 and 1280×800 |
+| WEB-36 | MUST | chrome | `the_drawer_is_rows_on_the_desk_surface_in_real_chrome` | |
+| WEB-37 | MUST | chrome | `the_current_page_is_marked_by_a_rule_in_real_chrome` | |
+| WEB-38 | MUST | http | `every_destination_answers_without_a_script_over_http` | row M4 above; reads the nine `data-nav` hrefs off the served `/` and GETs each with no browser. `the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http` holds the same drawer with script execution disabled in Chrome |
+| WEB-39 | MUST | unit | `the_drawer_puts_search_before_every_destination_unit` | |
+| WEB-40 | MUST | unit | `a_list_row_is_a_title_and_one_sentence_unit` | needs a registry, so it re-runs itself as the child `web_rows_child_process` |
+| WEB-41 | MUST | unit | `exactly_one_pill_style_exists_unit` | |
+| WEB-42 | MUST | unit | `tables_declare_only_the_row_hairline_unit` | |
+| WEB-43 | MUST | chrome | `read_tables_are_borderless_but_for_the_hairline_in_real_chrome` | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` measures the same cells as part of acceptance A11 |
+| WEB-44 | MUST | chrome | `no_route_overflows_sideways_at_three_widths_in_real_chrome` | the unit test `render_answers_exactly_the_declared_shapes_unit` keeps the swept route list complete against `render`'s arms |
+| WEB-45 | MUST | chrome | `every_deck_control_is_forty_four_pixels_at_390_in_real_chrome` | |
+| WEB-46 | MUST | chrome | `the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome` | |
+| WEB-47 | MAY | unit | `alternatives_may_wrap_two_up_unit` | |
+| WEB-48 | MUST | unit | `every_token_pair_clears_four_and_a_half_to_one_unit` | |
+| WEB-49 | MUST | unit | `overlay_never_sits_on_surface0_unit` | |
+| WEB-50 | MUST | unit | `the_focus_ring_and_the_filled_answer_clear_three_to_one_unit` | |
+| WEB-51 | MUST | chrome | `focus_is_visible_on_every_focusable_element_in_real_chrome` | |
+| WEB-52 | MUST | unit | `every_field_is_labelled_and_status_is_announced_once_unit` | the browser half is inside `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` (two channels with a refusal on screen) and `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` |
+| WEB-53 | MUST | chrome | `the_card_is_named_by_its_question_in_real_chrome` | |
+| WEB-54 | MUST | unit | `the_document_references_no_third_party_unit` | |
+| WEB-55 | MUST | unit | `the_route_table_and_the_write_allowlist_are_unchanged_unit` | `no_page_can_reach_a_method_that_writes` and `the_served_pages_read_the_real_boards_and_write_to_none_of_them` hold the same surface from the other side |
+| WEB-56 | MUST | chrome | `the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http` | extended shipped test; reads the served markup over HTTP first, then measures the same page in Chrome with script execution disabled |
+| WEB-57 | MUST | chrome | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | |
+| WEB-58 | MUST | unit | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` | shipped test, green against the rewritten stylesheet |
+| WEB-59 | MUST | chrome | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | |
+
+59 requirements: 56 MUST, 2 SHOULD (WEB-06, WEB-21), 1 MAY (WEB-47). By layer,
+31 `unit`, 27 `chrome` and 1 `http` — every requirement maps to an existing
+test at the layer §3 assigns it.
 
 ## Watch coverage note
 

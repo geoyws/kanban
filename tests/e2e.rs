@@ -46869,6 +46869,66 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     assert_eq!(resolved["decision"]["choice"], "keep-parked", "{resolved}");
 }
 
+/// WEB-38 (http): the drawer is nine anchors in the served HTML, and every
+/// one of them answers a plain `GET` with `200` and its own heading. No
+/// browser and no script - the way a phone with JavaScript blocked, a
+/// crawler behind the SSO, or `curl` sees the site.
+#[test]
+fn every_destination_answers_without_a_script_over_http() {
+    let (fixture, _ids) = deck_fixture("serve-nav-http", "NAVHTTP");
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let (status, home) = http_get(port, "/");
+    assert_eq!(status, 200, "{home}");
+    // The destination set is the spec's, in its words; the hrefs are read
+    // from the page rather than assumed, so a renamed route fails here.
+    let expected = [
+        ("needs-you", "<h1>Needs you"),
+        ("all", "<h1>Needs you"),
+        ("decided", "<h1>Recent decisions"),
+        ("lanes", "<h1>Lanes"),
+        ("boards", "<h1>Boards"),
+        ("sprints", "<h1 data-sprints-overview>Sprints"),
+        ("plans", "<h1>Plans"),
+        ("deployments", "<h1>Deployments"),
+        ("subscriptions", "<h1>Subscriptions"),
+    ];
+    for (destination, heading) in expected {
+        let marker = format!(" data-nav={destination}>");
+        let at = home
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no data-nav={destination} anchor on /:\n{home}"));
+        let tag_start = home[..at]
+            .rfind("<a ")
+            .unwrap_or_else(|| panic!("data-nav={destination} is not on an anchor"));
+        let tag = &home[tag_start..at];
+        let href = tag
+            .split_once("href=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(href, _)| href.to_owned())
+            .unwrap_or_else(|| panic!("data-nav={destination} has no href: {tag}"));
+        assert!(
+            href.starts_with('/') && !href.starts_with("//"),
+            "data-nav={destination} leaves the site: {href}"
+        );
+        let (status, page) = http_get(port, &href);
+        assert_eq!(
+            status, 200,
+            "GET {href} for data-nav={destination}:\n{page}"
+        );
+        assert!(
+            page.contains(heading),
+            "GET {href} for data-nav={destination} did not render {heading:?}:\n{page}"
+        );
+    }
+    assert_eq!(
+        home.matches(" data-nav=").count(),
+        expected.len(),
+        "the drawer holds a destination the spec does not name:\n{home}"
+    );
+}
+
 /// `/all` is the queue as one plain list: every card, in order, with no deck
 /// laid over it.
 ///
