@@ -24691,13 +24691,16 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         .to_owned();
     let before = fs::read(&board).unwrap();
 
-    // The landing page is the reason this exists.
+    // The landing page is the reason this exists. The eyebrow is a sentence
+    // naming the raiser, the board and the age (WEB-23); the kind is not on
+    // the card at all, so the item is recognised by its raiser and question.
     let (status, home) = http_get(port, "/");
     assert_eq!(status, 200, "{home}");
     assert!(home.contains("Needs you"), "{home}");
-    assert!(home.contains("approval"), "{home}");
-    assert!(home.contains("claude@driver-1"), "{home}");
+    assert!(home.contains("claude@driver-1 asked on"), "{home}");
+    assert!(home.contains("Staging push needs your call"), "{home}");
     assert!(home.contains("SERVED"), "{home}");
+    assert!(!home.contains("class=\"kind"), "{home}");
 
     // Agent-authored text is escaped everywhere it lands, and the item's own
     // body is agent-authored too.
@@ -25871,27 +25874,19 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         home.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
         "{home}"
     );
-    // The deck's keyboard map carries the two keys only a deck has: the skip
-    // and the step through the queue.
+    // The deck's keyboard map is one quiet line with no badges (WEB-27), and
+    // it carries the one key only a deck has: the skip.
     assert!(
-        home.contains(
-            "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
-             <kbd>s</kbd> skip · <kbd>←</kbd><kbd>→</kbd> move · <kbd>u</kbd> undo last · \
-             <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · Decided items move to"
-        ),
+        home.contains("<p class=keys>1–4 answer · s skip · u undo · c own</p>"),
         "{home}"
     );
-    // The plain list keeps the map it had, plus the menu the destinations
-    // moved into, and it is where the page explains itself at length: the
-    // deck spends its screen on the card.
+    // The plain list keeps its own quiet map (no skip: every card is on
+    // screen), and it is where the page explains itself at length: the deck
+    // spends its screen on the card.
     let (status, list) = http_get(port, "/all");
     assert_eq!(status, 200, "{list}");
     assert!(
-        list.contains(
-            "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
-             <kbd>u</kbd> undo last · <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · \
-             Decided items move to"
-        ),
+        list.contains("<p class=keys>1–4 answer · u undo · c own</p>"),
         "{list}"
     );
     assert!(
