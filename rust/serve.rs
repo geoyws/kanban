@@ -1449,9 +1449,9 @@ fn task_reference(project: &str, store: &Store, task_id: &str) -> String {
     // which is what makes the nesting work.
     match store.require_task(task_id) {
         Ok(task) => format!(
-            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\" \
-             data-ref target=_blank rel=noopener>{title}</a> \
-             <span class=\"type type-{ty}\" data-task-type>{ty}</span>",
+            "the <span data-task-type>{ty}</span> \
+             <a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\" \
+             data-ref target=_blank rel=noopener>{title}</a>",
             project = escape(&url_encode(project)),
             task_id = escape(&url_encode(&task.id)),
             title = escape(&task.title),
@@ -1474,6 +1474,16 @@ fn attention_count_badge(count: usize) -> String {
     }
 }
 
+/// The same count as a clause inside a row's one sentence (WEB-40): it needs
+/// its own connector, or a row with no tags reads `at P0 3 open attention`.
+fn attention_clause(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(", with{}", attention_count_badge(count))
+    }
+}
+
 fn attention_section(project: &str, title: &str, items: &[Attention]) -> String {
     if items.is_empty() {
         return String::new();
@@ -1484,26 +1494,37 @@ fn attention_section(project: &str, title: &str, items: &[Attention]) -> String 
     );
     for item in items {
         html.push_str("<li>");
+        // The row is a title and one sentence (WEB-40): what the item asks
+        // leads it, and everything else about it -- what kind of ask, who
+        // raised it, when, at what priority, under which tags, about which
+        // row -- reads as the one meta sentence under it.
         html.push_str(&format!(
-            "<p class=meta>{who} raised this {age}, a {kind} ask at {priority}{tags}</p>",
+            "<span class=title>{question}</span>\
+             <p class=meta>{article} {kind} ask, raised by {who} {age} \
+             at {priority}{tags}{about}</p>",
+            question = escape(&card_question(item)),
+            article = a_or_an(&item.kind.replace('_', " ")),
             kind = escape(&item.kind.replace('_', " ")),
             priority = priority_badge(item.priority, item.priority_level.as_deref()),
             who = escape(&item.raised_by),
             age = ago(item.created_at),
             tags = tag_list(&item.tags),
+            about = item
+                .task_id
+                .as_ref()
+                .map(|task_id| format!(
+                    ", about <a href=\"/task/{project}/{task_url}\" \
+                     data-ref target=_blank rel=noopener>{task_id}</a>",
+                    project = escape(&url_encode(project)),
+                    task_url = escape(&url_encode(task_id)),
+                    task_id = escape(task_id),
+                ))
+                .unwrap_or_default(),
         ));
         html.push_str(&format!(
             "<div class=\"body md\">{}</div>",
             markdown(&item.body)
         ));
-        if let Some(task_id) = &item.task_id {
-            html.push_str(&format!(
-                "<p class=meta>about <a href=\"/task/{project}/{task_id}\" \
-                 data-ref target=_blank rel=noopener>{task_id}</a></p>",
-                project = escape(&url_encode(project)),
-                task_id = escape(&url_encode(task_id)),
-            ));
-        }
         html.push_str("</li>");
     }
     html.push_str("</ul>");
@@ -1567,7 +1588,7 @@ fn reply_notices(replied: Option<&str>, undone: Option<&str>) -> String {
     let mut html = String::new();
     if let Some(id) = replied {
         html.push_str(&format!(
-            "<p class=success>Decision recorded for <code>{}</code>.</p>",
+            "<p class=success><code>{}</code> is decided and the board has it.</p>",
             escape(id)
         ));
     }
@@ -1985,10 +2006,13 @@ fn preview_page(project: &str, kind: &str, id: &str) -> Result<String> {
 fn task_preview(project: &str, store: &Store, id: &str) -> Result<String> {
     let task = store.require_task(id)?;
     let mut html = format!(
-        "<h3>{title}</h3><p class=meta>A <span class=\"type type-{ty}\">{ty}</span> at {priority}, \
-         <span class=status>{status}</span>, updated {when}{lane}{parent}</p>",
+        "<h3>{title}</h3><p class=meta>{article} {ty} in \
+         <span class=\"pill status-{state}\">{status}</span> \
+         at {priority}, updated {when}{lane}{parent}</p>",
         title = escape(&task.title),
-        status = escape(&task.status.replace('_', " ")),
+        article = a_or_an(&task.task_type),
+        state = escape(&task.status),
+        status = escape(&status_label(&task.status)),
         ty = escape(&task.task_type),
         priority = priority_badge(task.priority, task.priority_level.as_deref()),
         when = ago(task.updated_at),
@@ -2047,7 +2071,8 @@ fn attention_preview(project: &str, store: &Store, id: &str) -> Result<String> {
         format!("open - {choices}")
     };
     html.push_str(&format!(
-        "<p class=meta>A {kind} ask, {state}</p>",
+        "<p class=meta>{article} {kind} ask, {state}</p>",
+        article = a_or_an(&item.kind.replace('_', " ")),
         kind = escape(&item.kind.replace('_', " ")),
     ));
     if let Some(task) = &item.task_id {
@@ -2156,13 +2181,13 @@ fn search_page(query: &str) -> Result<String> {
         options.max_chars,
     );
     html.push_str(&format!(
-        "<p class=count>{} result{} across {} board{} · model <code>{}</code>{}</p>",
+        "<p class=count>{} result{} across {} board{}, model <code>{}</code>{}</p>",
         receipt.results.len(),
         if receipt.results.len() == 1 { "" } else { "s" },
         receipt.boards.len(),
         if receipt.boards.len() == 1 { "" } else { "s" },
         escape(&receipt.embedding_model),
-        if receipt.truncated { " · bounded" } else { "" },
+        if receipt.truncated { ", bounded" } else { "" },
     ));
     if receipt.results.is_empty() {
         html.push_str("<p class=empty>No matching Kanban knowledge.</p>");
@@ -2181,9 +2206,10 @@ fn search_page(query: &str) -> Result<String> {
         };
         html.push_str(&format!(
             "<article class=search-result><h2>{title}</h2>\
-             <p class=meta>A {kind} on {board}, scoring {score:.3}{status}{lane}{tags}</p>\
+             <p class=meta>{article} {kind} on {board}, scoring {score:.3}{status}{lane}{tags}</p>\
              <p class=body>{snippet}</p><p class=citation><code>{citation}</code></p></article>",
             title = title,
+            article = a_or_an(&result.source_kind.replace('_', " ")),
             board = escape(&result.board),
             kind = escape(&result.source_kind.replace('_', " ")),
             score = result.score,
@@ -2278,7 +2304,7 @@ fn deployments() -> Result<String> {
 
     let mut html = String::from(
         "<div class=heading><h1>Deployments</h1></div>\
-         <p class=meta>Verified current releases, derived from immutable attempts. Old non-current terminal attempts self-archive from hot views and remain available with <code>kb deploy list --all</code>.</p>",
+         <p class=meta>Verified current releases, derived from immutable attempts. Old non-current terminal attempts self-archive from hot views, and <code>kb deploy list --all</code> still reaches them.</p>",
     );
     html.push_str("<h2>Current releases</h2>");
     if current.is_empty() {
@@ -2287,7 +2313,7 @@ fn deployments() -> Result<String> {
         html.push_str("<table><thead><tr><th>Repository</th><th>Tier</th><th>Environment</th><th>Commit</th><th>Host</th><th>Attempt</th><th>Verified</th></tr></thead><tbody>");
         for (project, row) in &current {
             html.push_str(&format!(
-                "<tr><td>{repo}<div class=meta>{project}</div></td><td><span class=tag>{tier}</span></td><td>{environment}</td><td>{commit}</td><td>{host}</td><td>{attempt}</td><td class=when>{when}</td></tr>",
+                "<tr><td>{repo}<div class=meta>{project}</div></td><td><code>{tier}</code></td><td>{environment}</td><td>{commit}</td><td>{host}</td><td>{attempt}</td><td class=when>{when}</td></tr>",
                 repo = escape(&row.repo), project = escape(project), tier = escape(&row.tier),
                 environment = escape(&row.environment), commit = build_commit_cell(row),
                 host = escape(&row.host), attempt = deployment_link(project, row),
@@ -2302,7 +2328,7 @@ fn deployments() -> Result<String> {
     }
     for (project, row) in &active {
         html.push_str(&format!(
-            "<article class=item><p>{attempt} <strong>{repo}</strong> to the <span class=tag>{tier}</span> {environment}</p><p class=meta>{commit} on {host}, started {when} by {actor}</p></article>",
+            "<article class=item><p>{attempt} <strong>{repo}</strong> to the <code>{tier}</code> {environment}</p><p class=meta>{commit} on {host}, started {when} by {actor}</p></article>",
             attempt = deployment_link(project, row), repo = escape(&row.repo), tier = escape(&row.tier),
             environment = escape(&row.environment), commit = build_commit_cell(row),
             host = escape(&row.host), when = escape(&ago(row.created_at)), actor = escape(&row.actor),
@@ -2314,7 +2340,7 @@ fn deployments() -> Result<String> {
     }
     for (project, row) in failures.iter().take(30) {
         html.push_str(&format!(
-            "<article class=item><p>{attempt} <strong>{repo}</strong> <span class=\"status status-{status}\">{status}</span></p><p class=meta>The {tier} tier, {environment}, in phase {phase} {when}</p><p class=body>{receipt}</p></article>",
+            "<article class=item><p>{attempt} <strong>{repo}</strong> <span class=\"pill status-{status}\">{status}</span></p><p class=meta>The {tier} tier, {environment}, in phase {phase} {when}</p><p class=body>{receipt}</p></article>",
             attempt = deployment_link(project, row), repo = escape(&row.repo), status = escape(&row.status),
             tier = escape(&row.tier), environment = escape(&row.environment),
             phase = escape(row.phase.as_deref().unwrap_or("unknown")), when = escape(&ago(row.updated_at)),
@@ -2473,7 +2499,7 @@ fn sprint_summary(store: &Store, project: &str, sprint: &Sprint, current: bool) 
         <h2 class=sprint-version><a href="{route}" data-sprint-link="{id}"><code data-sprint-version>{version}</code></a></h2>
         <p><strong data-sprint-title>{title}</strong></p>
         <div class="body md" data-sprint-goal>{goal}</div>
-        <p class=meta><span class="status status-{status}" data-sprint-state>{status}</span>{archived}</p>
+        <p class=meta><span class="pill status-{status}" data-sprint-state>{status}</span>{archived}</p>
         <dl><dt>Scheduled start</dt><dd data-sprint-scheduled-start>{scheduled_start}</dd>
         <dt>Scheduled end</dt><dd data-sprint-scheduled-end>{scheduled_end}</dd>
         <dt>Days remaining</dt><dd data-sprint-days-remaining>{days}</dd>
@@ -2578,10 +2604,11 @@ fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
         .map(stamp)
         .unwrap_or_else(|| "not ended".to_owned());
     let mut html = format!(
-        r#"<h1 data-sprint-detail="{id}"><code data-sprint-version>{version}</code> · <span data-sprint-title>{title}</span></h1>
+        r#"<h1 data-sprint-detail="{id}"><span data-sprint-title>{title}</span></h1>
+        <p class=meta>Release <code data-sprint-version>{version}</code> on {project}.</p>
         <p><a href="/sprints/{board}" data-board-sprints-back>Back to {project} sprints</a></p>
         <div class="card current"><div class="body md" data-sprint-goal>{goal}</div>
-        <dl><dt>State</dt><dd><span class="status status-{status}" data-sprint-state>{status}</span></dd>
+        <dl><dt>State</dt><dd><span class="pill status-{status}" data-sprint-state>{status}</span></dd>
         <dt>Scheduled start</dt><dd data-sprint-scheduled-start>{scheduled_start}</dd>
         <dt>Scheduled end</dt><dd data-sprint-scheduled-end>{scheduled_end}</dd>
         <dt>Actual start</dt><dd data-sprint-actual-start>{actual_start}</dd>
@@ -2638,11 +2665,12 @@ fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
         html.push_str("<ul class=rows data-sprint-tasks>");
         for task in tasks {
             html.push_str(&format!(
-                r#"<li data-task="{id}"><a href="/task/{project}/{task_route}" data-task-link="{id}" data-ref target=_blank rel=noopener>{id}</a> <span class="status status-{status}" data-task-state>{status}</span> <span data-task-title>{title}</span></li>"#,
+                r#"<li data-task="{id}"><a href="/task/{project}/{task_route}" data-task-link="{id}" data-ref target=_blank rel=noopener data-task-title>{title}</a><p class=meta>Attached as <code>{id}</code> in <span class="pill status-{state}" data-task-state>{status}</span></p></li>"#,
                 project = escape(&url_encode(&project.name)),
                 task_route = escape(&url_encode(&task.id)),
                 id = escape(&task.id),
-                status = escape(&task.status),
+                state = escape(&task.status),
+                status = escape(&status_label(&task.status)),
                 title = escape(&task.title),
             ));
         }
@@ -2719,9 +2747,9 @@ fn boards() -> Result<String> {
     }
     html.push_str("</tbody></table>");
     html.push_str(
-        "<p class=meta>Counts come from the same projection as \
-         <code>kb dash</code>. Integrity is <code>kb doctor</code>'s job, \
-         not this page's.</p>",
+        "<p class=meta>Counts come from the same projection \
+         <code>kb dash</code> reads. Integrity is what <code>kb doctor</code> \
+         checks, not what this page claims.</p>",
     );
     Ok(page("Boards", &html))
 }
@@ -2735,7 +2763,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
     let mut html = String::from("<h1>Plans</h1>");
     if let Some(id) = opened {
         html.push_str(&format!(
-            "<p class=success data-plan-opened>Opened plan <code>{}</code>. Its child work is now eligible for claims.</p>",
+            "<p class=success data-plan-opened>Opened plan <code>{}</code> and its child work is now eligible for claims.</p>",
             escape(id)
         ));
     }
@@ -2781,15 +2809,17 @@ fn plans(opened: Option<&str>) -> Result<String> {
                 for child in children {
                     let child_attention = task_attention_count(&store, &child.id)?;
                     html.push_str(&format!(
-                        "<li>{priority} <a href=\"/task/{project}/{id}\" \
-                         data-ref target=_blank rel=noopener>{id}</a> \
-                         <span class=status>{status}</span> {title}{attention}</li>",
+                        "<li><a href=\"/task/{project}/{id}\" \
+                         data-ref target=_blank rel=noopener>{title}</a>\
+                         <p class=meta>In <span class=\"pill status-{state}\">{status}</span> \
+                         at {priority}, filed as <code>{id}</code>{attention}</p></li>",
                         project = escape(&project.name),
                         id = escape(&child.id),
-                        status = escape(&child.status),
+                        state = escape(&child.status),
+                        status = escape(&status_label(&child.status)),
                         title = escape(&child.title),
                         priority = priority_badge(child.priority, child.priority_level.as_deref()),
-                        attention = attention_count_badge(child_attention),
+                        attention = attention_clause(child_attention),
                     ));
                 }
                 html.push_str("</ul>");
@@ -2893,7 +2923,7 @@ fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Optio
     let mut html = String::from("<div class=heading><h1>Subscriptions</h1></div>");
     if let Some(id) = changed {
         html.push_str(&format!(
-            "<p class=success>Recorded the change to <code>{}</code>. The dispatcher reads its state on the next pass.</p>",
+            "<p class=success>Recorded the change to <code>{}</code> and the dispatcher reads its state on the next pass.</p>",
             escape(id)
         ));
     }
@@ -2909,8 +2939,8 @@ fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Optio
                  <code>kb subscription add --consumer NAME --action NAME --timeout-ms 30000 \
                  --max-retries 3 --rate-per-minute 60 --max-concurrency 1 --as {OPERATOR_ACTOR}</code> \
                  registers one, and it starts watching from the event that created it — \
-                 add <code>--kind</code>, <code>--subject</code>, <code>--current-status</code> \
-                 or <code>--tag</code> to narrow what it sees.</p>"
+                 add <code>--kind</code> or <code>--subject</code> or \
+                 <code>--current-status</code> or <code>--tag</code> to narrow what it sees.</p>"
             )
         } else {
             format!(
@@ -2998,7 +3028,7 @@ fn queued_state(position: SubscriptionPosition, dead_letter_codes: &[DeadLetterC
     if parts.is_empty() {
         return String::new();
     }
-    format!("<div class=queued>{}</div>", parts.join(" · "))
+    format!("<div class=queued>{}</div>", parts.join(", "))
 }
 
 /// Which refusal the dead letters are, in the same sentence as how many.
@@ -3095,8 +3125,8 @@ fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
     format!(
         "<tr data-subscription=\"{id}\"><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\" data-ref target=_blank rel=noopener>{board}</a></div></td>\
          <td>{watches}</td>\
-         <td><code>{consumer}</code><div class=meta>action <code>{action}</code>, {secret}</div></td>\
-         <td><span class=status data-subscription-state>{status}</span>{paused_by}\
+         <td><code>{consumer}</code><div class=meta>action <code>{action}</code> and {secret}</div></td>\
+         <td><span class=\"pill status-{status}\" data-subscription-state>{status}</span>{paused_by}\
          <form method=post action=\"/subscription/{board_path}/{id_path}/{verb}{carry}\">\
          <button class=quick type=submit data-subscription-action=\"{verb}\">{verb_label}</button></form></td>\
          <td>{position_sentence}<div class=meta>{position_meta}</div>{queued}</td>\
@@ -3281,7 +3311,7 @@ fn lanes() -> Result<String> {
                 branch = update
                     .branch
                     .as_ref()
-                    .map(|branch| format!(", on <span class=lane>{}</span>", escape(branch)))
+                    .map(|branch| format!(", on {}", escape(branch)))
                     .unwrap_or_default(),
                 body = markdown(&update.body),
             ));
@@ -3323,7 +3353,11 @@ fn board(name: &str) -> Result<String> {
         ));
         for rule in rules {
             let headline = rule.body.lines().next().unwrap_or_default();
-            let targets = format!(" <span class=lane>{}</span>", escape(&rule.tags.join(", ")));
+            let targets = if rule.tags.is_empty() {
+                String::new()
+            } else {
+                format!(", tagged {}", escape(&rule.tags.join(", ")))
+            };
             html.push_str(&format!(
                 "<details class=rule><summary><code>{id}</code> {headline}{targets}</summary>\
                  <pre>{body}</pre></details>",
@@ -3344,27 +3378,32 @@ fn board(name: &str) -> Result<String> {
         }
         html.push_str(&format!(
             "<h2>{} <span class=count>{}</span></h2><ul class=rows>",
-            escape(status),
+            escape(&status_label(status)),
             rows.len()
         ));
         for task in rows {
             let attention = task_attention_count(&store, &task.id)?;
             html.push_str(&format!(
-                "<li data-task=\"{id}\">{priority} <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
-                 data-ref target=_blank rel=noopener>{id}</a> \
-                 <span class=\"type type-{ty}\">{ty}</span> {title}{lane}{tags}{attention}</li>",
+                "<li data-task=\"{id}\"><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
+                 data-ref target=_blank rel=noopener>{title}</a>\
+                 <p class=meta>{article} {ty} in \
+                 <span class=\"pill status-{state}\">{status}</span> \
+                 at {priority}{lane}{tags}{attention}, filed as <code>{id}</code></p></li>",
                 project = escape(&project.name),
                 id = escape(&task.id),
+                article = a_or_an(&task.task_type),
                 ty = escape(&task.task_type),
+                state = escape(&task.status),
+                status = escape(&status_label(&task.status)),
                 title = escape(&task.title),
                 priority = priority_badge(task.priority, task.priority_level.as_deref()),
                 lane = task
                     .lane
                     .as_ref()
-                    .map(|lane| format!(" <span class=lane>{}</span>", escape(lane)))
+                    .map(|lane| format!(", in lane {}", escape(lane)))
                     .unwrap_or_default(),
                 tags = tag_list(&task.tags),
-                attention = attention_count_badge(attention),
+                attention = attention_clause(attention),
             ));
         }
         html.push_str("</ul>");
@@ -3382,13 +3421,16 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         escape(&task.title)
     );
     html.push_str(&format!(
-        "<p class=meta>A <span class=\"type type-{ty}\">{ty}</span> on \
+        "<p class=meta>{article} {ty} on \
          <a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a>, \
-         <span class=status data-task-status>{status}</span> at {priority}, filed as <code>{id}</code>{tags}</p>",
+         in <span class=\"pill status-{state}\" data-task-status>{status}</span> \
+         at {priority}{tags}, filed as <code>{id}</code></p>",
         project = escape(&project.name),
         id = escape(&task.id),
+        article = a_or_an(&task.task_type),
         ty = escape(&task.task_type),
-        status = escape(&task.status),
+        state = escape(&task.status),
+        status = escape(&status_label(&task.status)),
         priority = priority_badge(task.priority, task.priority_level.as_deref()),
         tags = tag_list(&task.tags),
     ));
@@ -3436,8 +3478,9 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         html.push_str("<h2>Notes</h2>");
         for note in notes {
             html.push_str(&format!(
-                "<article class=note data-task-note><p class=meta><span class=kind>{kind}</span> \
+                "<article class=note data-task-note><p class=meta>{article} {kind} note \
                  by {author} at {when}</p><div class=\"body md\">{body}</div></article>",
+                article = a_or_an(&note.kind),
                 kind = escape(&note.kind),
                 author = escape(&note.author),
                 when = stamp(note.created_at),
@@ -3451,8 +3494,9 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         html.push_str("<h2>Checkpoints</h2>");
         for point in checkpoints {
             html.push_str(&format!(
-                "<article class=note><p class=meta><span class=kind>{state}</span> \
+                "<article class=note><p class=meta>{article} {state} checkpoint \
                  by {author} at {when}</p><dl>",
+                article = a_or_an(&point.state),
                 state = escape(&point.state),
                 author = escape(&point.author),
                 when = stamp(point.created_at),
@@ -3492,8 +3536,8 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         }
         html.push_str("</tbody></table>");
         html.push_str(&format!(
-            "<p class=meta>Newest {DETAIL_ROWS} shown. The whole trail is \
-             <code>kb ev --task {id} --project {project} --json</code>.</p>",
+            "<p class=meta>Newest {DETAIL_ROWS} shown, and \
+             <code>kb ev --task {id} --project {project} --json</code> prints the rest.</p>",
             id = escape(&task.id),
             project = escape(&project.name),
         ));
@@ -3540,10 +3584,51 @@ fn row(label: &str, value: &str) -> String {
     format!("<dt>{}</dt><dd>{value}</dd>", escape(label))
 }
 
+/// The tags a row was filed under, as a fragment of the row's own sentence.
+///
+/// A tag is neither a state nor an outcome, so it gets no pill and no hue
+/// (WEB-41): it is the words the row was filed under, read inside the
+/// sentence that already says what the row is.
 fn tag_list(tags: &[String]) -> String {
-    tags.iter()
-        .map(|tag| format!(" <span class=tag>{}</span>", escape(tag)))
-        .collect()
+    if tags.is_empty() {
+        return String::new();
+    }
+    format!(
+        ", tagged {}",
+        tags.iter()
+            .map(|tag| escape(tag))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// `A` or `An`, so a meta sentence that opens with a row's kind reads as
+/// English rather than as a filled-in template.
+fn a_or_an(word: &str) -> &'static str {
+    match word.chars().next().map(|first| first.to_ascii_lowercase()) {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "An",
+        _ => "A",
+    }
+}
+
+/// One board status as a heading and a pill read it.
+///
+/// The stored value is a slug because it is a key (`in_progress`); a section
+/// heading and a pill are prose, and WEB-03 and the plan's fifth principle
+/// want prose. One function, so the heading and the pill beneath it can
+/// never drift into saying the same state two ways.
+fn status_label(status: &str) -> String {
+    // `todo` is two words in English, and the Boards table already writes it
+    // that way; every other status is one word or underscore-joined.
+    if status == "todo" {
+        return "To do".to_owned();
+    }
+    let words = status.replace('_', " ");
+    let mut characters = words.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => words,
+    }
 }
 
 fn priority_badge(priority: i64, level: Option<&str>) -> String {
@@ -3750,7 +3835,7 @@ fn shell(title: &str, body: &str, main_attributes: &str) -> String {
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>{title} · kanban</title><style>{CSS}</style></head><body>\
+         <title>{title} — kanban</title><style>{CSS}</style></head><body>\
          <nav aria-label=Primary data-primary-nav>\
          <button type=button class=menu data-menu aria-label=Menu aria-expanded=false \
          aria-controls=nav-drawer><span class=bars aria-hidden=true></span></button>\
@@ -3763,7 +3848,7 @@ fn shell(title: &str, body: &str, main_attributes: &str) -> String {
          <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/sprints\" data-nav=sprints>Sprints</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
          <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
          </nav><main id=main{main_attributes}>{body}</main>\
-         <footer>The live operator view, served by <code>kanban serve</code>.</footer>\
+         <footer>The live operator view, served by <code>kanban serve</code> on this host.</footer>\
          <script>{JS}</script></body></html>",
         title = escape(title),
     )
@@ -4973,7 +5058,7 @@ font-weight:600;color:var(--text)}\
 h2{margin:1.6rem 0 .5rem;font-size:1.0625rem;line-height:1.3;font-weight:600;color:var(--subtext)}\
 a{color:var(--link);text-decoration:none}\
 a:hover{text-decoration:underline}\
-code{padding:.12em .4em;color:var(--text);background:var(--surface0);border-radius:8px;\
+code{padding:.12em .3em;color:var(--text);background:var(--surface0);border-radius:8px;\
 font-family:var(--mono);font-size:.92em}\
 pre{margin:.6rem 0;padding:.8rem;background:var(--surface0);border-radius:8px;\
 overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem}\
@@ -5040,14 +5125,18 @@ td.when{white-space:nowrap;color:var(--subtext)}\
 td.payload{color:var(--subtext);font-size:.85rem;word-break:break-word}\
 ul.rows,ul.children{list-style:none;margin:.3rem 0;padding:0}\
 ul.rows li,ul.children li{padding:.4rem 0;border-bottom:1px solid var(--surface0)}\
+/* A row's title leads it, so it carries the row's weight; the sentence\
+   under it is the quiet `.meta` every page already declares. */\
+ul.rows li>a,ul.children li>a,.title{font-weight:500}\
+.title{display:inline-block;color:var(--text)}\
 dl{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:.4rem 0}\
 dt{color:var(--overlay);font-size:.8125rem}\
 dd{margin:0;font-size:.9375rem;word-break:break-word}\
-.pill{display:inline-block;padding:.1em .6em;color:var(--subtext);background:var(--surface0);\
+.pill{display:inline-block;padding:.1em .4em;color:var(--subtext);background:var(--surface0);\
 font-size:.75rem;border-radius:999px}\
-.pill.status-done,.pill.status-approve{color:var(--green)}\
+.pill.status-done,.pill.status-approve,.pill.status-succeeded{color:var(--green)}\
 .pill.status-in_progress,.pill.status-other{color:var(--blue)}\
-.pill.status-blocked,.pill.status-reject{color:var(--red)}\
+.pill.status-blocked,.pill.status-reject,.pill.status-failed{color:var(--red)}\
 .pill.status-review,.pill.status-defer{color:var(--yellow)}\
 .priority{font-family:var(--mono);color:var(--overlay)}\
 .priority-p0{color:var(--red)}\
@@ -5897,7 +5986,7 @@ mod tests {
     }
 
     fn assert_page_title(html: &str, title: &str) {
-        assert_html_contains(html, &format!("<title>{title} · kanban</title>"));
+        assert_html_contains(html, &format!("<title>{title} — kanban</title>"));
     }
 
     /// Every selector in the stylesheet, comma-separated parts split out and
@@ -6641,6 +6730,25 @@ mod tests {
         out
     }
 
+    /// One region with its markup taken out, the way a reader hears it.
+    ///
+    /// Entities are left as authored: `&lt;` is what the reader sees, and
+    /// the claims made against this text are about spacing and punctuation,
+    /// which entities do not change.
+    fn strip_tags(markup: &str) -> String {
+        let mut text = String::with_capacity(markup.len());
+        let mut inside = 0usize;
+        for character in markup.chars() {
+            match character {
+                '<' => inside += 1,
+                '>' => inside = inside.saturating_sub(1),
+                other if inside == 0 => text.push(other),
+                _ => {}
+            }
+        }
+        text
+    }
+
     /// WEB-23 — the eyebrow names who asked, where, and when, in one
     /// sentence.
     #[test]
@@ -6984,6 +7092,513 @@ mod tests {
              declared: declare the new shape in ROUTE_SHAPES and load it in \
              no_route_overflows_sideways_at_three_widths_in_real_chrome",
             ROUTE_SHAPES.len()
+        );
+    }
+
+    /// Every row of every `ul.rows`/`ul.children` list on a page, as the
+    /// markup between its `<li …>` and its matching `</li>`.
+    ///
+    /// A row's body is rendered markdown and may carry lists of its own, so
+    /// the nesting is tracked rather than assumed away: a row read from a
+    /// naive split would be a markdown bullet, and a bullet passes every
+    /// claim below for free.
+    fn list_rows(html: &str) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut rest = html;
+        loop {
+            let Some((at, open)) = ["<ul class=rows", "<ul class=children"]
+                .iter()
+                .filter_map(|open| rest.find(open).map(|at| (at, *open)))
+                .min_by_key(|(at, _)| *at)
+            else {
+                return rows;
+            };
+            // A row list may carry hooks of its own (`data-sprint-tasks`), so
+            // the cursor lands past the whole opening tag rather than past a
+            // fixed spelling of it.
+            let opens = rest[at..]
+                .find('>')
+                .unwrap_or_else(|| panic!("a row list's opening tag never closes: {open}"));
+            let mut cursor = at + opens + 1;
+            let mut lists = 1usize;
+            let mut items = 0usize;
+            let mut row_start = None;
+            while lists > 0 {
+                let Some((tag_at, tag)) = ["<ul", "</ul>", "<li", "</li>"]
+                    .iter()
+                    .filter_map(|tag| rest[cursor..].find(tag).map(|off| (cursor + off, *tag)))
+                    .min_by_key(|(at, _)| *at)
+                else {
+                    panic!("a row list never closes: {}", &rest[at..]);
+                };
+                cursor = tag_at + tag.len();
+                match tag {
+                    "<ul" => lists += 1,
+                    "</ul>" => lists -= 1,
+                    "<li" => {
+                        if lists == 1 && items == 0 {
+                            let opens = rest[tag_at..].find('>').expect("the row tag closes");
+                            row_start = Some(tag_at + opens + 1);
+                        }
+                        items += 1;
+                    }
+                    _ => {
+                        items = items.saturating_sub(1);
+                        if lists == 1
+                            && items == 0
+                            && let Some(start) = row_start.take()
+                        {
+                            rows.push(rest[start..tag_at].to_owned());
+                        }
+                    }
+                }
+            }
+            rest = &rest[cursor..];
+        }
+    }
+
+    /// The element a row leads with, as `(tag, attributes)`.
+    fn leading_element(row: &str) -> (String, String) {
+        let row = row.trim_start();
+        assert!(
+            row.starts_with('<'),
+            "a row leads with text rather than an element: {row}"
+        );
+        let end = row.find('>').expect("the leading element's tag closes");
+        let head = &row[1..end];
+        let (tag, attributes) = head.split_once(char::is_whitespace).unwrap_or((head, ""));
+        (tag.to_ascii_lowercase(), attributes.trim().to_owned())
+    }
+
+    /// Every badge class the restyle retired, in the two spellings the
+    /// renderers used.
+    const RETIRED_BADGES: [&str; 8] = [
+        "class=tag",
+        "class=\"tag",
+        "class=kind",
+        "class=\"kind",
+        "class=type",
+        "class=\"type",
+        "class=lane",
+        "class=\"lane",
+    ];
+
+    /// WEB-40, WEB-41, WEB-22 read off one rendered page. Returns how many
+    /// rows it measured, so the caller can prove the sweep was not vacuous.
+    fn assert_rows_are_titles_and_sentences(html: &str, route: &str) -> usize {
+        let rows = list_rows(html);
+        for row in &rows {
+            let (tag, attributes) = leading_element(row);
+            assert!(
+                tag == "a" || attributes.contains("class=title"),
+                "{route}: a row leads with <{tag}> rather than with its title: {row}"
+            );
+            if tag == "a" {
+                assert!(
+                    attributes.contains("href="),
+                    "{route}: a row's title is an anchor that opens nothing: {row}"
+                );
+            }
+            let metas = row.matches("class=meta").count();
+            assert_eq!(
+                metas, 1,
+                "{route}: a row carries {metas} meta lines rather than one sentence: {row}"
+            );
+            let body = row.trim_start();
+            let close = format!("</{tag}>");
+            let end = body
+                .find(&close)
+                .unwrap_or_else(|| panic!("{route}: the row's title never closes: {row}"));
+            assert!(
+                body[end + close.len()..]
+                    .trim_start()
+                    .starts_with("<p class=meta>"),
+                "{route}: a row's title is not followed by its one sentence: {row}"
+            );
+        }
+        // Every sentence the PAGE writes. `body` is excluded on purpose: it
+        // is a raiser's own prose, and the page does not get to punctuate it.
+        for class in [
+            "eyebrow", "meta", "count", "queued", "empty", "success", "explain", "cmd", "progress",
+            "decision", "citation",
+        ] {
+            for region in rendered_regions(html, class) {
+                for chain in [" · ", " | "] {
+                    assert!(
+                        !region.contains(chain),
+                        "{route}: a {class} line reads as a chain: {region}"
+                    );
+                }
+                assert!(
+                    !region.trim_end().ends_with('→'),
+                    "{route}: a {class} line ends in an arrow: {region}"
+                );
+                // A space before punctuation, once the markup is gone: the
+                // sentence read aloud has to be a sentence.
+                let text = strip_tags(&region);
+                for loose in [" ,", " ."] {
+                    assert!(
+                        !text.contains(loose),
+                        "{route}: a {class} line spaces its punctuation ({loose:?}): {text}"
+                    );
+                }
+                // And the space no string comparison can see: `code` and
+                // `.pill` paint their own horizontal padding, so punctuation
+                // set immediately after one reads as a word away from it.
+                // The fix is the sentence rather than the padding, so the
+                // sentence is what is held. Unpadded spans (`.priority`,
+                // `.attention-count`) are prose and may be punctuated.
+                for (open, close) in [("<code", "</code>"), ("<span class=\"pill", "</span>")] {
+                    let mut rest = region.as_str();
+                    while let Some(at) = rest.find(open) {
+                        let after = &rest[at + open.len()..];
+                        let end = after
+                            .find(close)
+                            .unwrap_or_else(|| panic!("{route}: a chip never closes: {region}"));
+                        let tail = &after[end + close.len()..];
+                        assert!(
+                            !tail.starts_with(',') && !tail.starts_with('.'),
+                            "{route}: a {class} line punctuates straight after a chip, which \
+                             reads as a space before the comma: {region}"
+                        );
+                        rest = tail;
+                    }
+                }
+            }
+        }
+        let markup = html.split("<script>").next().unwrap_or(html);
+        for badge in RETIRED_BADGES {
+            assert!(
+                !markup.contains(badge),
+                "{route}: served markup still uses the retired badge {badge}"
+            );
+        }
+        // The only pill is the status pill: a `class="pill …"` list may carry
+        // a status modifier and nothing else.
+        let mut rest = markup;
+        while let Some(at) = rest.find("class=\"pill") {
+            let after = &rest[at + "class=\"pill".len()..];
+            let end = after.find('"').expect("the class list closes");
+            let modifiers = after[..end].trim();
+            assert!(
+                modifiers.starts_with("status-") && !modifiers.contains(' '),
+                "{route}: a pill carries {modifiers} beside its status"
+            );
+            rest = &after[end..];
+        }
+        // The priority is plain levelled text, never a pill.
+        let mut rest = markup;
+        while let Some(at) = rest.find("<span class=\"priority ") {
+            let after = &rest[at..];
+            let end = after.find("</span>").expect("the priority closes");
+            let element = &after[..end];
+            let text = &element[element.find('>').expect("the tag closes") + 1..];
+            assert!(
+                element.contains("priority-legacy") || ["P0", "P1", "P2"].contains(&text),
+                "{route}: a priority reads {text} rather than a level: {element}"
+            );
+            assert!(
+                !element.contains("pill"),
+                "{route}: a priority is rendered as a pill: {element}"
+            );
+            rest = &after[end..];
+        }
+        rows.len()
+    }
+
+    const ROWS_CHILD_TEST: &str = "serve::tests::web_rows_child_process";
+    const ROWS_CHILD_MARKER: &str = "web-rows-child";
+
+    /// WEB-40 — the row is the unit, and its meta is a sentence.
+    ///
+    /// Every read page the server lists rows on, rendered against the same
+    /// seeded registry the render fixture uses, and each row held to the
+    /// same shape: its title leads it, one sentence follows, and nothing in
+    /// that sentence is a chain or a second badge.
+    #[test]
+    fn a_list_row_is_a_title_and_one_sentence_unit() {
+        let data_dir = TempDataDir::new("web-rows");
+        let output = spawn_fixture_child(
+            data_dir.path(),
+            ROWS_CHILD_TEST,
+            "KANBAN_WEB_ROWS_CHILD",
+            ROWS_CHILD_MARKER,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child rows fixture failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            stdout.contains("test serve::tests::web_rows_child_process ... ok"),
+            "child did not execute the ignored rows fixture\n{stdout}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn web_rows_child_process() {
+        let Ok(marker) = env::var("KANBAN_WEB_ROWS_CHILD") else {
+            return;
+        };
+        if marker != ROWS_CHILD_MARKER {
+            return;
+        }
+        let data_dir = env::var_os("KANBAN_DATA_DIR")
+            .map(PathBuf::from)
+            .expect("child data dir");
+        let fixture = seed_render_fixture(&data_dir);
+        let task_route = format!("/task/SERVE-RENDER/{}", fixture.epic_id);
+        let deployment_route =
+            format!("/deployment/SERVE-RENDER/{}", fixture.current_deployment_id);
+        let routes = [
+            "/all",
+            "/decided",
+            "/boards",
+            "/board/SERVE-RENDER",
+            "/lanes",
+            "/sprints",
+            "/sprints/SERVE-RENDER",
+            "/sprint/SERVE-RENDER/sp-render-current",
+            "/plans",
+            "/deployments",
+            "/subscriptions",
+            "/search?q=render",
+            task_route.as_str(),
+            deployment_route.as_str(),
+        ];
+        let mut measured = 0;
+        for route in routes {
+            let html = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
+            measured += assert_rows_are_titles_and_sentences(&html, route);
+        }
+        assert!(
+            measured >= 6,
+            "the sweep measured only {measured} rows, so it proved almost nothing"
+        );
+        // The rows that opened a page did so as anchors, and the row that
+        // opens nothing led with its own title element instead.
+        let board = render("/board/SERVE-RENDER").expect("render the board");
+        assert_html_contains(
+            &board,
+            "<li data-task=\"t-serve-render\"><a href=\"/task/SERVE-RENDER/t-serve-render\" \
+             data-task-link=\"t-serve-render\" data-ref target=_blank rel=noopener>\
+             Implement &lt;i&gt;escape&lt;/i&gt;</a><p class=meta>A task in \
+             <span class=\"pill status-in_progress\">In progress</span> at ",
+        );
+        // Open attention is a clause of the same sentence, with its own
+        // connector, so a row without tags never reads `at P0 3 open attention`.
+        assert_html_contains(
+            &board,
+            ", tagged ops, with <span class=attention-count>1 open attention</span>, \
+             filed as <code>",
+        );
+        for (at, _) in board.match_indices("<span class=attention-count>") {
+            assert!(
+                board[..at].ends_with(", with "),
+                "an attention count sits in a sentence without its connector:\n{}",
+                &board[at.saturating_sub(80)..at]
+            );
+        }
+        let detail = render(&task_route).expect("render the task detail");
+        assert_html_contains(&detail, "<span class=title>Please review ");
+        // The sprint's attached tasks are a row list with a hook of its own,
+        // so it is pinned by name rather than left to the sweep's matcher.
+        let sprint = render("/sprint/SERVE-RENDER/sp-render-current").expect("render the sprint");
+        assert_html_contains(
+            &sprint,
+            "<ul class=rows data-sprint-tasks><li data-task=\"t-render/opaque?#\">\
+             <a href=\"/task/SERVE-RENDER/t-render%2Fopaque%3F%23\" \
+             data-task-link=\"t-render/opaque?#\" data-ref target=_blank rel=noopener \
+             data-task-title>Opaque &lt;task&gt;</a><p class=meta>\
+             Attached as <code>t-render/opaque?#</code> in \
+             <span class=\"pill status-todo\" data-task-state>To do</span></p></li></ul>",
+        );
+    }
+
+    /// WEB-41 — one pill style everywhere.
+    ///
+    /// The stylesheet is asked what it DECLARES: exactly one `.pill` rule,
+    /// status modifiers that only recolour it, and no surviving rule that
+    /// makes a tag, a kind, a type or a priority into a second badge. The
+    /// renderers are asked what they EMIT, because "no served markup uses a
+    /// second badge class" is a claim about every page rather than about the
+    /// pages one fixture happens to seed.
+    #[test]
+    fn exactly_one_pill_style_exists_unit() {
+        let pill_rules = css_rules(CSS)
+            .into_iter()
+            .filter(|rule| rule.selectors == vec![".pill".to_owned()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pill_rules.len(),
+            1,
+            "the stylesheet declares {} rules that select exactly .pill",
+            pill_rules.len()
+        );
+        let body = &pill_rules[0].body;
+        for declaration in [
+            "background:var(--surface0)",
+            "font-size:.75rem",
+            "border-radius:999px",
+        ] {
+            assert!(
+                body.contains(declaration),
+                "the pill does not declare {declaration}: {body}"
+            );
+        }
+        for rule in css_rules(CSS) {
+            if !rule
+                .selectors
+                .iter()
+                .any(|selector| selector.contains(".pill") && selector.contains(".status-"))
+            {
+                continue;
+            }
+            for (property, value) in css_declarations(&rule.body) {
+                assert_eq!(
+                    property, "color",
+                    "{:?} declares {property}:{value}, so a status modifier is more than a hue",
+                    rule.selectors
+                );
+            }
+        }
+        // The baseline's second badges are gone from the stylesheet, and the
+        // priority is plain text: no fill, no radius, no border.
+        for rule in css_rules(CSS) {
+            for selector in &rule.selectors {
+                let landed = selector.split_whitespace().last().unwrap_or(selector);
+                for retired in [".tag", ".kind", ".type"] {
+                    assert_ne!(
+                        landed, retired,
+                        "the stylesheet still styles the retired badge {retired}"
+                    );
+                }
+                if !landed.starts_with(".priority") {
+                    continue;
+                }
+                for (property, value) in css_declarations(&rule.body) {
+                    assert!(
+                        !(property == "background"
+                            || property == "border-radius"
+                            || property.starts_with("border-")),
+                        "{selector} declares {property}:{value}, so the priority is a pill again"
+                    );
+                }
+            }
+        }
+        // What the renderers emit. The source is read rather than one page,
+        // because the claim is about every arm of `render`.
+        const SOURCE: &str = include_str!("serve.rs");
+        let renderers = SOURCE
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("the module has tests")
+            .0;
+        for badge in RETIRED_BADGES {
+            assert!(
+                !renderers.contains(badge),
+                "a renderer still emits the retired badge {badge}"
+            );
+        }
+        assert!(
+            !renderers.contains("class=status") && !renderers.contains("class=\"status"),
+            "a renderer still emits a bare status badge instead of the one pill"
+        );
+    }
+
+    /// WEB-42 — tables lose their borders and keep the hairline.
+    #[test]
+    fn tables_declare_only_the_row_hairline_unit() {
+        let parts = ["table", "th", "td", "th.n", "td.n"];
+        for rule in css_rules(CSS) {
+            if !rule
+                .selectors
+                .iter()
+                .any(|selector| parts.contains(&selector.as_str()))
+            {
+                continue;
+            }
+            for (property, value) in css_declarations(&rule.body) {
+                if property == "border-collapse" || property == "border-spacing" {
+                    continue;
+                }
+                if !property.starts_with("border") {
+                    continue;
+                }
+                assert!(
+                    property == "border-bottom" && value == "1px solid var(--surface0)",
+                    "{:?} declares {property}:{value}, which is not the row hairline",
+                    rule.selectors
+                );
+            }
+        }
+        let cells = css_rule_body("td");
+        assert!(
+            cells.contains("border-bottom:1px solid var(--surface0)"),
+            "a table cell declares no row hairline: {cells}"
+        );
+        let head = css_rule_body("th");
+        assert!(
+            head.contains("font-size:.75rem") && head.contains("color:var(--overlay)"),
+            "the header row is not quiet .75rem overlay: {head}"
+        );
+        for numeric in ["td.n", "th.n"] {
+            let body = css_rule_body(numeric);
+            assert!(
+                body.contains("text-align:right") && body.contains("font-family:var(--mono)"),
+                "{numeric} is not a right-aligned mono column: {body}"
+            );
+        }
+    }
+
+    /// WEB-55 — the HTTP surface does not move.
+    ///
+    /// Two halves, both read off the module: the read routes `render`
+    /// answers, held to the registry the width sweep loads, and the four
+    /// verbs `post` accepts. A route or a verb added or removed here is a
+    /// decision somebody has to make on purpose.
+    #[test]
+    fn the_route_table_and_the_write_allowlist_are_unchanged_unit() {
+        assert_eq!(
+            ROUTE_SHAPES,
+            [
+                "/",
+                "/all",
+                "/decided",
+                "/boards",
+                "/sprints",
+                "/sprints/{project}",
+                "/sprint/{project}/{id}",
+                "/plans",
+                "/deployments",
+                "/subscriptions",
+                "/lanes",
+                "/search",
+                "/preview/{kind}/{project}/{id}",
+                "/preview/board/{project}",
+                "/board/{project}",
+                "/task/{project}/{id}",
+                "/deployment/{project}/{id}",
+            ],
+            "the read surface moved"
+        );
+        const SOURCE: &str = include_str!("serve.rs");
+        let allowlist = SOURCE
+            .split_once("    if !matches!(\n        parts.as_slice(),\n")
+            .expect("post declares an allowlist")
+            .1
+            .split_once("    ) {")
+            .expect("the allowlist closes")
+            .0;
+        // Whitespace-normalised so the claim is about the arms rather than
+        // about how `rustfmt` wrapped them.
+        let verbs = allowlist.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            verbs,
+            "[\"attention\", _, _, \"reply\"] | [\"attention\", _, _, \"reopen\"] \
+             | [\"plan\", _, _, \"open\"] | [\"subscription\", _, _, \"pause\" | \"resume\"]",
+            "the write surface moved"
         );
     }
 
@@ -7418,7 +8033,7 @@ mod tests {
         assert_page_title(&replied, "Needs you");
         assert_html_contains(
             &replied,
-            "Decision recorded for <code>e-serve-render</code>.",
+            "<code>e-serve-render</code> is decided and the board has it.",
         );
 
         let boards = render("/boards").expect("render boards");
@@ -7438,7 +8053,10 @@ mod tests {
         let opened =
             render(&format!("/plans?opened={}", fixture.epic_id)).expect("render opened plans");
         assert_page_title(&opened, "Plans");
-        assert_html_contains(&opened, "Opened plan <code>e-serve-render</code>.");
+        assert_html_contains(
+            &opened,
+            "Opened plan <code>e-serve-render</code> and its child work",
+        );
 
         let deployments = render("/deployments").expect("render deployments");
         assert_page_title(&deployments, "Deployments");
@@ -7492,9 +8110,16 @@ mod tests {
         assert_html_contains(&board, "class=\"priority priority-p0\"");
         assert_html_contains(&board, "class=\"priority priority-p1\"");
         assert!(!board.contains("priority-p2"), "{board}");
-        assert_html_contains(&board, "type-epic");
-        assert_html_contains(&board, "type-story");
-        assert_html_contains(&board, "type-task");
+        // The type is no longer a badge beside the row: it is the first
+        // words of the row's own sentence (WEB-40, WEB-41).
+        assert_html_contains(&board, "<p class=meta>An epic in ");
+        assert_html_contains(&board, "<p class=meta>A story in ");
+        assert_html_contains(&board, "<p class=meta>A task in ");
+        // And the section heading reads as prose rather than as the slug the
+        // status is stored as, through the same `status_label` the pill uses.
+        assert_html_contains(&board, "<h2>In progress <span class=count>1</span>");
+        assert_html_contains(&board, "<h2>To do <span class=count>2</span>");
+        assert!(!board.contains("<h2>in_progress"), "{board}");
         assert_html_contains(&board, "Implement &lt;i&gt;escape&lt;/i&gt;");
         assert_html_contains(&board, "Ship &lt;script&gt;render&lt;/script&gt;");
 
@@ -7511,7 +8136,7 @@ mod tests {
             .expect("render story detail");
         assert_page_title(&story_detail, "Ship &lt;script&gt;render&lt;/script&gt;");
         assert_html_contains(&story_detail, "Story body with markup");
-        assert_html_contains(&story_detail, "type-story");
+        assert_html_contains(&story_detail, "<p class=meta>A story on ");
 
         let task_page =
             render(&format!("/task/SERVE-RENDER/{}", fixture.task_id)).expect("render task detail");
@@ -7585,7 +8210,7 @@ mod tests {
         assert_ne!(current_actual_start, stamp(4_102_444_800_000));
         assert_html_contains(&current_sprint, "data-sprint-actual-end>not ended");
 
-        assert_html_contains(&current_sprint, "data-task-state>todo");
+        assert_html_contains(&current_sprint, "data-task-state>To do");
         assert_html_contains(&current_sprint, "Opaque &lt;task&gt;");
         assert_html_contains(
             &current_sprint,
@@ -8197,7 +8822,7 @@ mod tests {
         );
         assert_html_contains(&html, "Every task_moved event arriving at done.");
         assert_html_contains(&html, "<code>codex.queue</code>");
-        assert_html_contains(&html, "action <code>enqueue-turn</code>");
+        assert_html_contains(&html, "action <code>enqueue-turn</code> and");
         assert_html_contains(&html, "4 board events behind head seq 12.");
         assert_html_contains(&html, "started at seq 4, acked through seq 8, 1 in flight");
         assert_html_contains(&html, "30000 ms timeout, 3 retries, 60/min, 1 at a time");

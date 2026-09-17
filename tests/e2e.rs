@@ -30588,7 +30588,7 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     );
     set_mobile_viewport(&tab);
     assert_element_text(&tab, "[data-task-title]", task_title);
-    assert_element_text(&tab, "[data-task-status]", "todo");
+    assert_element_text(&tab, "[data-task-status]", "To do");
     assert_element_text(&tab, "[data-task-body]", task_body);
     assert_element_text(&tab, "[data-task-note] .body.md", note_body);
     let trail = tab.wait_for_element("[data-task-trail]").unwrap();
@@ -49054,5 +49054,404 @@ fn the_receipt_lands_with_its_outcome_rule_in_real_chrome() {
         ruled[0]["color"],
         surface1.as_str(),
         "the receipt fell back to the colourless rule: {measured}"
+    );
+}
+
+/// A board read as rows: one task in each status the board groups by, one of
+/// them `P0`, plus a verified release so `/deployments` renders its table.
+///
+/// The read pages are what this fixture is for, so nothing here raises an
+/// attention item: a deck card would put a second kind of surface on the
+/// page and the claims below are about rows and tables.
+fn rows_fixture(label: &str, board: &str) -> (Fixture, String) {
+    let fixture = Fixture::new(label);
+    fixture.ok_json(&fixture.main, &["init", "--name", board, "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "rows", "--as", "fixture-agent", "--json"],
+    );
+    for (id, title, status, priority) in [
+        (
+            "t-rows-todo",
+            "The row that is waiting to start",
+            "todo",
+            "P0",
+        ),
+        (
+            "t-rows-doing",
+            "The row somebody is holding",
+            "in_progress",
+            "P1",
+        ),
+        (
+            "t-rows-blocked",
+            "The row that cannot move",
+            "blocked",
+            "P1",
+        ),
+        (
+            "t-rows-review",
+            "The row waiting on a reader",
+            "review",
+            "P1",
+        ),
+        ("t-rows-done", "The row that shipped", "done", "P2"),
+    ] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                title,
+                "--id",
+                id,
+                "--type",
+                "task",
+                "--status",
+                status,
+                "--priority",
+                priority,
+                "--tag",
+                "rows",
+                "--as",
+                "fixture-agent",
+                "--json",
+            ],
+        );
+    }
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban-rows",
+            "--commit",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "--tier",
+            "@_bd",
+            "--environment",
+            "rows-fixture",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://127.0.0.1:14400",
+            "--task",
+            "t-rows-done",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"]
+        .as_str()
+        .expect("the deployment")
+        .to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &deployment_id,
+            "--token",
+            deployment["capabilityToken"]
+                .as_str()
+                .expect("the capability token"),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--served-commit",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "--receipt",
+            "The rows fixture served exact commit dddddddddddd.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    (fixture, deployment_id)
+}
+
+/// Every `th` and `td` on the page, with each drawn edge named.
+const TABLE_SWEEP: &str = r#"(() => {
+  const sides = ['Top', 'Right', 'Bottom', 'Left'];
+  const cells = [...document.querySelectorAll('th, td')].filter(cell => cell.checkVisibility());
+  return JSON.stringify({
+    cells: cells.map(cell => {
+      const style = getComputedStyle(cell);
+      const drawn = sides
+        .map(side => ({
+          side,
+          width: parseFloat(style[`border${side}Width`]) || 0,
+          color: style[`border${side}Color`],
+          style: style[`border${side}Style`],
+        }))
+        .filter(edge => edge.width > 0 && edge.style !== 'none');
+      return {
+        where: `${cell.tagName.toLowerCase()}.${cell.className}`,
+        total: drawn.reduce((sum, edge) => sum + edge.width, 0),
+        drawn,
+        numeric: cell.classList.contains('n'),
+        align: style.textAlign,
+        family: style.fontFamily,
+      };
+    }),
+  });
+})()"#;
+
+/// WEB-43 — the tables lose their borders and keep the hairline, and it
+/// holds in the browser.
+///
+/// The unit layer reads the stylesheet; this reads what Chrome computed on
+/// the two table pages with rows actually seeded under them. A cell either
+/// draws the one row separator or draws nothing, and a numeric column is
+/// right-aligned mono so a column of counts reads as a column.
+#[test]
+fn read_tables_are_borderless_but_for_the_hairline_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, _deployment) = rows_fixture("serve-rows-tables", "ROWSTABLE");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "rows table tab");
+    let surface0 = {
+        go(&tab, &origin, "/boards");
+        token(&tab, "--surface0")
+    };
+    assert_eq!(
+        surface0, "rgb(49, 50, 68)",
+        "the hairline token moved, so the figure this case names is stale"
+    );
+    for route in ["/boards", "/deployments"] {
+        go(&tab, &origin, route);
+        let measured = measure(&tab, TABLE_SWEEP, "the table sweep");
+        let cells = measured["cells"].as_array().expect("the cells");
+        assert!(
+            cells.len() >= 7,
+            "{route} rendered {} cells, so no table was measured: {measured}",
+            cells.len()
+        );
+        let mut hairlines = 0;
+        let mut numeric = 0;
+        for cell in cells {
+            let total = cell["total"].as_f64().unwrap_or(0.0);
+            assert!(
+                total == 0.0 || total == 1.0,
+                "{route}: {} draws {total}px of border: {cell}",
+                cell["where"]
+            );
+            if total == 1.0 {
+                hairlines += 1;
+                let drawn = cell["drawn"].as_array().expect("the drawn edges");
+                assert_eq!(drawn.len(), 1, "{route}: {cell}");
+                assert_eq!(
+                    drawn[0]["side"], "Bottom",
+                    "{route}: the one hairline is not the row separator: {cell}"
+                );
+                assert_eq!(
+                    drawn[0]["color"],
+                    surface0.as_str(),
+                    "{route}: the row separator is not the hairline token: {cell}"
+                );
+            }
+            if cell["numeric"] == Value::Bool(true) {
+                numeric += 1;
+                assert_eq!(
+                    cell["align"], "right",
+                    "{route}: a numeric cell is not right-aligned: {cell}"
+                );
+                let family = cell["family"].as_str().expect("the cell's family");
+                assert!(
+                    family.contains("ui-monospace") && family.contains("monospace"),
+                    "{route}: a numeric cell is not set in the mono stack: {cell}"
+                );
+            }
+        }
+        assert!(
+            hairlines > 0,
+            "{route} drew no row separator at all: {measured}"
+        );
+        if route == "/boards" {
+            assert!(
+                numeric >= 6,
+                "/boards measured {numeric} numeric cells, so the count columns went unproved: \
+                 {measured}"
+            );
+        }
+    }
+}
+
+/// What a read page is made of: its rows, its badges and its priority.
+const ROW_SWEEP: &str = r#"(() => {
+  const rows = [...document.querySelectorAll('ul.rows>li, ul.children>li')];
+  const retired = [...document.querySelectorAll('span.tag, span.kind, span.type, span.lane')];
+  const stated = [...document.querySelectorAll('[class*=status-]')];
+  const p0 = document.querySelector('span.priority.priority-p0');
+  const p0Style = p0 ? getComputedStyle(p0) : null;
+  return JSON.stringify({
+    rows: rows.map(row => {
+      const lead = row.firstElementChild;
+      const after = lead ? lead.nextElementSibling : null;
+      return {
+        lead: lead ? lead.tagName.toLowerCase() : null,
+        leadClass: lead ? lead.className : null,
+        href: lead ? lead.getAttribute('href') : null,
+        metas: row.querySelectorAll('.meta').length,
+        after: after ? `${after.tagName.toLowerCase()}.${after.className}` : null,
+        meta: (row.querySelector('.meta') || {textContent: ''}).textContent,
+      };
+    }),
+    retired: retired.map(el => `${el.tagName.toLowerCase()}.${el.className}`),
+    stated: stated.map(el => `${el.tagName.toLowerCase()}|${el.className}`),
+    p0: p0Style
+      ? {
+          text: p0.textContent,
+          family: p0Style.fontFamily,
+          color: p0Style.color,
+          background: p0Style.backgroundColor,
+          radius: p0Style.borderRadius,
+        }
+      : null,
+  });
+})()"#;
+
+/// A11 — read pages are rows, with one pill and a mono priority (WEB-40,
+/// WEB-41, WEB-42, WEB-43).
+///
+/// The whole acceptance in one measurement, on a board carrying one task in
+/// each status the board groups by and one of them `P0`: each row is a title
+/// and one sentence, status is the only pill and the only badge, the `P0`
+/// priority is red mono text rather than a pill, and the tables draw the one
+/// hairline.
+#[test]
+fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, _deployment) = rows_fixture("serve-rows-a11", "ROWSA11");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "rows acceptance tab");
+    let mut measured_rows = 0;
+    let mut measured_pills = 0;
+    for route in ["/board/ROWSA11", "/boards", "/deployments"] {
+        go(&tab, &origin, route);
+        let measured = measure(&tab, ROW_SWEEP, "the row sweep");
+        eprintln!("{route}: {measured}");
+        for row in measured["rows"].as_array().expect("the rows") {
+            measured_rows += 1;
+            let lead = row["lead"].as_str().unwrap_or_default();
+            let lead_class = row["leadClass"].as_str().unwrap_or_default();
+            assert!(
+                lead == "a" || lead_class.split_whitespace().any(|part| part == "title"),
+                "{route}: a row leads with <{lead}> rather than its title: {row}"
+            );
+            if lead == "a" {
+                assert!(
+                    row["href"]
+                        .as_str()
+                        .is_some_and(|href| href.starts_with('/')),
+                    "{route}: a row's title is an anchor that opens no page: {row}"
+                );
+            }
+            assert_eq!(
+                row["metas"].as_i64(),
+                Some(1),
+                "{route}: a row carries more or less than one sentence: {row}"
+            );
+            assert_eq!(
+                row["after"]
+                    .as_str()
+                    .map(|after| after.starts_with("p.meta")),
+                Some(true),
+                "{route}: a row's title is not followed by its sentence: {row}"
+            );
+            assert!(
+                !row["meta"].as_str().unwrap_or_default().contains(" · "),
+                "{route}: a row's sentence reads as a chain: {row}"
+            );
+        }
+        assert_eq!(
+            measured["retired"]
+                .as_array()
+                .expect("the retired badges")
+                .len(),
+            0,
+            "{route} still renders a second badge class: {measured}"
+        );
+        for stated in measured["stated"].as_array().expect("the status carriers") {
+            let stated = stated.as_str().expect("a status carrier");
+            let (tag, classes) = stated.split_once('|').expect("tag and classes");
+            assert_eq!(
+                tag, "span",
+                "{route}: a status is carried by <{tag}> rather than a pill span: {stated}"
+            );
+            let mut parts = classes.split_whitespace();
+            assert_eq!(
+                parts.next(),
+                Some("pill"),
+                "{route}: a status is not the one pill: {stated}"
+            );
+            let modifier = parts.next().unwrap_or_default();
+            assert!(
+                modifier.starts_with("status-"),
+                "{route}: a pill carries {modifier} beside its status: {stated}"
+            );
+            assert_eq!(
+                parts.next(),
+                None,
+                "{route}: a pill carries a third class: {stated}"
+            );
+            measured_pills += 1;
+        }
+        if route == "/board/ROWSA11" {
+            let p0 = &measured["p0"];
+            assert!(
+                !p0.is_null(),
+                "the board rendered no P0 priority to measure: {measured}"
+            );
+            assert_eq!(p0["text"], "P0", "{measured}");
+            let family = p0["family"].as_str().expect("the priority's family");
+            assert!(
+                family.contains("ui-monospace") && family.contains("monospace"),
+                "the priority is not set in the mono stack: {measured}"
+            );
+            assert_eq!(
+                p0["color"], "rgb(243, 139, 168)",
+                "P0 is not in the red the design reserves for it: {measured}"
+            );
+            assert_eq!(
+                p0["background"], "rgba(0, 0, 0, 0)",
+                "the priority is filled, so it is a pill again: {measured}"
+            );
+            assert_eq!(
+                p0["radius"], "0px",
+                "the priority is rounded, so it is a pill again: {measured}"
+            );
+        }
+        let tables = measure(&tab, TABLE_SWEEP, "the table sweep");
+        for cell in tables["cells"].as_array().expect("the cells") {
+            let total = cell["total"].as_f64().unwrap_or(0.0);
+            assert!(
+                total == 0.0 || total == 1.0,
+                "{route}: {} draws {total}px of border: {cell}",
+                cell["where"]
+            );
+            if total == 1.0 {
+                let drawn = cell["drawn"].as_array().expect("the drawn edges");
+                assert_eq!(drawn[0]["side"], "Bottom", "{route}: {cell}");
+                assert_eq!(drawn[0]["color"], "rgb(49, 50, 68)", "{route}: {cell}");
+            }
+        }
+    }
+    assert!(
+        measured_rows >= 5,
+        "the acceptance measured only {measured_rows} rows"
+    );
+    assert!(
+        measured_pills >= 5,
+        "the acceptance measured only {measured_pills} pills"
     );
 }
