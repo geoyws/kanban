@@ -404,6 +404,10 @@ fn render(url: &str) -> Result<String> {
             query_value(query, "replied").as_deref(),
             query_value(query, "undone").as_deref(),
         ),
+        ["all"] => all_open(
+            query_value(query, "replied").as_deref(),
+            query_value(query, "undone").as_deref(),
+        ),
         ["decided"] => decided_page(query_value(query, "undone").as_deref()),
         ["boards"] => boards(),
         ["sprints"] => sprints(),
@@ -1482,10 +1486,18 @@ fn attention_section(project: &str, title: &str, items: &[Attention]) -> String 
 
 // ---------------------------------------------------------------- the screens
 
-/// The landing page, and the reason the server exists: everything open across
-/// every board, priority first and then oldest, so interrupts lead while age
-/// remains the tie-breaker that prevents starvation within a level.
-fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
+/// The open queue: every waiting item paired with the board that raised it,
+/// and the stores those boards were read from, because every card resolves
+/// its own task reference.
+type OpenQueue = (
+    Vec<(String, Attention)>,
+    std::collections::BTreeMap<String, Store>,
+);
+
+/// Every open item across every board, priority first and then oldest, so
+/// interrupts lead while age remains the tie-breaker that prevents
+/// starvation within a level.
+fn open_attention() -> Result<OpenQueue> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     let mut stores = std::collections::BTreeMap::new();
     for (project, store) in projects()? {
@@ -1503,15 +1515,30 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
             project_b,
         ))
     });
+    Ok((items, stores))
+}
 
-    let mut html = String::from(
-        "<div class=heading><h1>Needs you</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
-    );
-    html.push_str(
-        "<p class=explain>Each card is one question an agent is waiting on. Pick an answer \
-         and it is recorded on the board at once; the agent continues from there. Undo any \
-         decision from Recent decisions.</p>",
-    );
+/// The one card loop both open-item screens render: the deck at `/` and the
+/// plain list at `/all` are the same cards in the same order, so there is
+/// one renderer and the deck is presentation laid over it.
+fn open_cards(
+    items: &[(String, Attention)],
+    stores: &std::collections::BTreeMap<String, Store>,
+) -> String {
+    let mut html = String::new();
+    for (project, item) in items {
+        let store = stores
+            .get(project)
+            .expect("project store map built from same iterator");
+        html.push_str(&decision_card(project, store, item));
+    }
+    html
+}
+
+/// What a no-script POST comes back to: the redirect carries the id it
+/// settled or reopened, and both open-item screens say so.
+fn reply_notices(replied: Option<&str>, undone: Option<&str>) -> String {
+    let mut html = String::new();
     if let Some(id) = replied {
         html.push_str(&format!(
             "<p class=success>Decision recorded for <code>{}</code>.</p>",
@@ -1525,11 +1552,98 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
             escape(id)
         ));
     }
+    html
+}
+
+/// Nothing waiting, in the words both open-item screens use for it.
+const EMPTY_QUEUE: &str = "<p class=empty>Nothing is waiting. \
+                           An empty list here means every raised item has been settled.</p>";
+
+/// The keyboard map, which sits at the bottom of the viewport rather than at
+/// the end of a list that is 133 cards long: a keyboard map the reader has
+/// to scroll to the end of to find is a keyboard map nobody reads.
+const LIST_KEYS: &str = "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
+     <kbd>u</kbd> undo last · <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · Decided items move to \
+     <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a></p>";
+
+/// The deck's map: the same keys plus the ones only a deck has — skip, and
+/// stepping back and forth through the queue.
+const DECK_KEYS: &str = "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
+     <kbd>s</kbd> skip · <kbd>←</kbd><kbd>→</kbd> move · <kbd>u</kbd> undo last · \
+     <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · Decided items move to \
+     <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a></p>";
+
+/// The landing page, and the reason the server exists: every open item as a
+/// DECK — one card on screen, the long form the only thing that scrolls, the
+/// answers and the note within thumb reach at the bottom of the screen, and
+/// the next card one keystroke away (George, 2026-09-17: "we are looking at
+/// one item at a time, with the scrollable being only the body of the text
+/// and the 4 questions and the optional note wisely having a bit of space at
+/// the bottom of the screen in a sticky way, and then we quickly advance
+/// through item by item without scrolling").
+///
+/// Every card is still served here, in the order `/all` serves them: the
+/// deck shows one and hides the rest, so a browser without script gets the
+/// same list it always got and every card on it still submits. The panel is
+/// not separate markup either — it is the card, laid out as a column whose
+/// long form is the only scroller.
+fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
+    let (items, stores) = open_attention()?;
+    let mut html = String::from(
+        "<div class=heading><h1>Needs you</h1>\
+         <span class=live data-live role=status aria-live=polite>connecting</span>\
+         <button type=button class=history-toggle data-history-toggle aria-expanded=false \
+         aria-controls=session-history>Decided <span data-history-count>0</span></button></div>",
+    );
+    html.push_str(&reply_notices(replied, undone));
+    html.push_str(&format!(
+        "<div class=deck-head><p class=progress><span data-deck-position>{position}</span> of \
+         <span data-open-count>{count}</span></p></div>\
+         <section class=deck data-deck-cards>",
+        position = usize::from(!items.is_empty()),
+        count = items.len(),
+    ));
     if items.is_empty() {
-        html.push_str(
-            "<p class=empty>Nothing is waiting. \
-             An empty list here means every raised item has been settled.</p>",
-        );
+        html.push_str(EMPTY_QUEUE);
+    } else {
+        html.push_str(&open_cards(&items, &stores));
+        // The same sentence, as a template: the deck empties the moment the
+        // last card is posted, which is a round trip before the server can
+        // say so. One wording, served once, used by whichever of the two
+        // notices the reader gets first.
+        html.push_str(&format!("<template data-empty>{EMPTY_QUEUE}</template>"));
+    }
+    html.push_str("</section>");
+    html.push_str(DECK_KEYS);
+    // The side area is what a decision leaves behind: the notices the board
+    // sends, and every receipt this tab produced with its own undo. It is
+    // server markup so the strip has somewhere to live before the first
+    // decision, and so a projection swap has one node to carry across.
+    html.push_str(
+        "<aside class=side data-side>\
+         <div class=toasts data-notices role=status aria-live=polite></div>\
+         <section class=history id=session-history data-history>\
+         <h2>Decided this session</h2></section></aside>",
+    );
+    Ok(deck_page("Needs you", &html))
+}
+
+/// Every open item as one plain list, which is what this page was before the
+/// deck and what the deck is laid over: the same cards in the same order, one
+/// after another for a reader who wants the whole queue at once.
+fn all_open(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
+    let (items, stores) = open_attention()?;
+    let mut html = String::from(
+        "<div class=heading><h1>Needs you</h1><span class=live data-live role=status aria-live=polite>connecting</span></div>",
+    );
+    html.push_str(
+        "<p class=explain>Each card is one question an agent is waiting on. Pick an answer \
+         and it is recorded on the board at once; the agent continues from there. Undo any \
+         decision from Recent decisions.</p>",
+    );
+    html.push_str(&reply_notices(replied, undone));
+    if items.is_empty() {
+        html.push_str(EMPTY_QUEUE);
         return Ok(page("Needs you", &html));
     }
     let boards = items
@@ -1542,20 +1656,8 @@ fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
         items.len(),
         plural = if boards == 1 { "board" } else { "boards" },
     ));
-    for (project, item) in &items {
-        let store = stores
-            .get(project)
-            .expect("project store map built from same iterator");
-        html.push_str(&decision_card(project, store, item));
-    }
-    // The hint bar sits at the bottom of the viewport rather than at the end
-    // of a list that is 133 cards long: a keyboard map the reader has to
-    // scroll to the end of to find is a keyboard map nobody reads.
-    html.push_str(
-        "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
-         <kbd>u</kbd> undo last · <kbd>Esc</kbd> clear · Decided items move to \
-         <a href=\"/decided\" data-ref target=_blank rel=noopener>Recent decisions</a></p>",
-    );
+    html.push_str(&open_cards(&items, &stores));
+    html.push_str(LIST_KEYS);
     Ok(page("Needs you", &html))
 }
 
@@ -3603,17 +3705,39 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 ///
 /// A phone-first operator shell. It stays inline because a second request for a
 /// stylesheet is another route and cache contract for a page this small.
+///
+/// The links live behind a hamburger rather than across the top (George,
+/// 2026-09-17). Eight destinations and a search box on a 390-wide screen was
+/// a scrolling strip of tabs above every page, and on the deck it was the
+/// screen's whole top edge spent on navigation nobody uses while deciding.
+/// The drawer is one button, and the links inside it keep their `data-nav`
+/// names: the destinations did not change, only where they are kept.
 fn page(title: &str, body: &str) -> String {
+    shell(title, body, "")
+}
+
+/// The same shell with `<main>` marked as the deck, which is what turns the
+/// list into one card and pins its answers to the bottom of the screen.
+fn deck_page(title: &str, body: &str) -> String {
+    shell(title, body, " data-deck")
+}
+
+fn shell(title: &str, body: &str, main_attributes: &str) -> String {
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} · kanban</title><style>{CSS}</style></head><body>\
-         <nav aria-label=Primary data-primary-nav><a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
-         <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
+         <nav aria-label=Primary data-primary-nav>\
+         <button type=button class=menu data-menu aria-label=Menu aria-expanded=false \
+         aria-controls=nav-drawer><span class=bars aria-hidden=true></span></button>\
+         <a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a></nav>\
+         <div class=backdrop data-backdrop hidden></div>\
+         <nav class=drawer id=nav-drawer data-drawer aria-label=Destinations hidden>\
+         <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/all\" data-nav=all>All open</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
          <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/sprints\" data-nav=sprints>Sprints</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
          <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
          <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
-         </nav><main id=main>{body}</main>\
+         </nav><main id=main{main_attributes}>{body}</main>\
          <footer>live operator view · <code>kanban serve</code></footer>\
          <script>{JS}</script></body></html>",
         title = escape(title),
@@ -3621,7 +3745,24 @@ fn page(title: &str, body: &str) -> String {
 }
 
 const JS: &str = r#"
+// The first thing this script does is say that it ran. Every rule that turns
+// the open list into a deck is scoped to `html.js`, because the deck is one
+// card only while there is a script to hide the others: without one the same
+// markup has to stay the plain scrolling list it is served as, with every
+// card's form posting on its own. This line is what makes that true, so it
+// comes before anything that could throw.
+document.documentElement.classList.add('js');
 const setLive = text => { const el = document.querySelector('[data-live]'); if (el) el.textContent = text; };
+// Whether the live socket is up, which is a different question from whether
+// a decision is in flight -- and the live line has to answer both.
+let liveSocketUp = false;
+// A decision that has landed, or been refused, is no longer `sending`. The
+// line went on saying so until the socket happened to say something next,
+// which on a quiet board was minutes and on a reconnect was the word
+// `reconnecting` standing over a decision that had already been recorded.
+// So the answer to the click is retired by the click's own path, and the
+// line goes back to saying what the socket is: live, or not.
+const settleLive = () => setLive(liveSocketUp ? 'live' : 'reconnecting');
 // A redelivered notice must not act twice, so every key the page has already
 // rendered is remembered. Bounded at 200: a reconnect never replays (the
 // server starts a new connection at the head), so this only ever holds a
@@ -3764,6 +3905,242 @@ function clearVerdict(form) {
   clearRefusal(form);
   syncAnswer(form);
 }
+// --- the deck ---------------------------------------------------------------
+// One card on screen, and the next one a keystroke away (George, 2026-09-17:
+// "we are looking at one item at a time ... and then we quickly advance
+// through item by item without scrolling, e.g. when i hit 1 it sends it off
+// and gives me the next item via a quick animation").
+//
+// The queue is the DOM order the server rendered, which is the priority
+// order every other surface uses: the deck decides which of those cards is
+// on screen and nothing else. A card whose decision is in flight is
+// `data-sent` -- out of the queue, still in the document -- because a
+// refusal has to bring it back to the slot it left.
+const DECK_SLIDE = 160;
+const deckNode = () => document.querySelector('[data-deck-cards]');
+const deckQueue = () => {
+  const deck = deckNode();
+  return deck ? [...deck.querySelectorAll('article.item:not([data-sent])')] : [];
+};
+const currentCard = () => document.querySelector('article.item[data-current]');
+// Motion is decoration here: the operator who asked for it not to move is
+// answered by the same code path with the animations left out.
+const stillMotion = () => Boolean(window.matchMedia) && matchMedia('(prefers-reduced-motion: reduce)').matches;
+let deckIndex = 0;
+let deckShown = null;
+// The card that is animating out. It is out of the queue but stays visible
+// until the animation lands, so the swap is a move rather than a blink.
+let deckGhost = null;
+let deckGhostTimer = null;
+function bindDeck() {
+  const deck = deckNode();
+  if (!deck) return;
+  const queue = deckQueue();
+  deckIndex = Math.min(Math.max(deckIndex, 0), Math.max(0, queue.length - 1));
+  const showing = queue[deckIndex] || null;
+  [...deck.querySelectorAll('article.item')].forEach(card => {
+    if (card === showing) card.dataset.current = ''; else delete card.dataset.current;
+    card.hidden = card !== showing && card !== deckGhost;
+  });
+  if (showing) {
+    // The long form is this card's body and the deck's only scroller, so on
+    // the deck it is open. The fold exists for a list of 133 cards; a deck
+    // is a list of one.
+    const full = showing.querySelector('details.full');
+    if (full) full.open = true;
+    if (showing !== deckShown && !stillMotion()) {
+      showing.classList.add('entering');
+      setTimeout(() => showing.classList.remove('entering'), DECK_SLIDE);
+    }
+  }
+  deckShown = showing;
+  // An empty queue says so at once, rather than after the board answers.
+  // Deciding the last card used to leave a blank deck for the length of a
+  // round trip: the card was gone the instant it was posted and the
+  // server's empty state was a projection away. The server ships the
+  // sentence as a template so there is one wording, not two.
+  const template = deck.querySelector('template[data-empty]');
+  const placed = deck.querySelector('[data-deck-empty]');
+  if (!queue.length && !placed && !deck.querySelector('.empty') && template) {
+    const empty = template.content.firstElementChild.cloneNode(true);
+    empty.dataset.deckEmpty = '';
+    deck.append(empty);
+  }
+  // ...and takes it back when a refusal, or an undo, puts a card back.
+  if (queue.length && placed) placed.remove();
+  const head = document.querySelector('.deck-head');
+  // Nothing to be at a position in: `1 of 0` is not a place.
+  if (head) head.hidden = queue.length === 0;
+  const position = document.querySelector('[data-deck-position]');
+  if (position) position.textContent = String(queue.length ? deckIndex + 1 : 0);
+  syncHistoryCount();
+}
+// Keep the keyboard on the card the deck is showing, so 1-4 keeps deciding
+// without a click first. Focus is only taken when it is not already
+// somewhere the operator put it: a swap must never pull the cursor out of a
+// note being written, out of the menu, or out of the side history.
+function focusCurrent() {
+  const card = currentCard();
+  if (!card) return;
+  const focus = document.activeElement;
+  if (focus && focus.isConnected && focus !== document.body && focus.matches
+    && (card.contains(focus) || focus.closest('[data-drawer], [data-side]') || focus.matches('input, textarea'))) return;
+  card.focus();
+}
+function ghostCard(card, direction) {
+  if (stillMotion()) return;
+  if (deckGhostTimer !== null) clearTimeout(deckGhostTimer);
+  if (deckGhost && deckGhost !== card) settleGhost();
+  deckGhost = card;
+  card.classList.add(direction === 'back' ? 'leaving-back' : 'leaving');
+  deckGhostTimer = setTimeout(settleGhost, DECK_SLIDE);
+}
+function settleGhost() {
+  if (deckGhostTimer !== null) clearTimeout(deckGhostTimer);
+  deckGhostTimer = null;
+  const card = deckGhost;
+  deckGhost = null;
+  if (!card) return;
+  card.classList.remove('leaving', 'leaving-back');
+  if (card.isConnected) bindDeck();
+}
+// Step through the queue without recording anything: `ArrowRight` to the
+// next card, `ArrowLeft` back to the one before it.
+function deckMove(step) {
+  const queue = deckQueue();
+  if (queue.length < 2) return;
+  const leaving = currentCard();
+  const next = Math.min(Math.max(deckIndex + step, 0), queue.length - 1);
+  if (next === deckIndex) return;
+  deckIndex = next;
+  if (leaving) ghostCard(leaving, step < 0 ? 'back' : 'forward');
+  bindDeck();
+  focusCurrent();
+}
+// `s` puts this card at the back of the queue and shows the next one, with
+// nothing recorded: the answer needs thinking about and there are 132 other
+// cards. The position does not move -- the same slot now holds the next
+// card -- and the skipped card comes round again at the end.
+function deckSkip() {
+  const deck = deckNode();
+  const card = currentCard();
+  if (!deck || !card || deckQueue().length < 2) return;
+  deck.append(card);
+  ghostCard(card, 'forward');
+  bindDeck();
+  focusCurrent();
+}
+// A decision leaves the queue the instant it is posted, which is the whole
+// point: the next card is on screen while the board is still answering. The
+// posted card stays in the document, hidden and out of the queue, so a
+// refusal can bring it back to exactly the slot it left.
+function deckSend(card, label) {
+  if (!deckNode() || !card.closest('[data-deck-cards]')) return null;
+  const slot = deckQueue().indexOf(card);
+  card.dataset.sent = '1';
+  const pending = showPending(card, label);
+  ghostCard(card, 'forward');
+  if (slot >= 0) deckIndex = slot;
+  bindDeck();
+  focusCurrent();
+  return {
+    restore: () => {
+      if (pending) pending.remove();
+      delete card.dataset.sent;
+      if (deckGhost === card) settleGhost();
+      card.classList.remove('leaving', 'leaving-back');
+      const back = deckQueue().indexOf(card);
+      if (back >= 0) deckIndex = back;
+      bindDeck();
+      const returned = currentCard();
+      if (returned) returned.focus();
+    },
+  };
+}
+// Put the deck on one item by id: what an undo needs, because the card it
+// brought back is the card the operator is now looking at.
+function deckShow(id) {
+  if (!deckNode()) return;
+  const at = deckQueue().findIndex(card => card.dataset.item === id);
+  if (at >= 0) { deckIndex = at; bindDeck(); }
+}
+// --- the side: toasts above, this sitting's decisions below ------------------
+// Every receipt this tab produced, newest first, each with its undo. A
+// receipt used to sit where the card had been, which on a deck is a place
+// nobody is looking any more -- the next card is there.
+function historyRow(row) {
+  const history = document.querySelector('[data-history]');
+  if (!history) return false;
+  const heading = history.querySelector('h2');
+  if (heading) heading.after(row); else history.prepend(row);
+  return true;
+}
+// What the history says while the board is still answering. It is NOT a
+// receipt: nothing is recorded yet, so it carries no undo and no receipt
+// tag. Offering to reverse a decision that may still be refused would be
+// offering to reverse something that never happened.
+function showPending(card, label) {
+  const row = document.createElement('p');
+  row.className = 'pending';
+  row.dataset.pending = card.dataset.item;
+  row.setAttribute('role', 'status');
+  row.textContent = `Sending… ${label}`;
+  return historyRow(row) ? row : null;
+}
+function syncHistoryCount() {
+  const badge = document.querySelector('[data-history-count]');
+  if (badge) badge.textContent = String(document.querySelectorAll('[data-history] [data-receipt]').length);
+}
+// --- the menu and the side drawer -------------------------------------------
+// Eight destinations and a search box used to stand across the top of every
+// page, which on a 390-wide screen is a scrolling strip of tabs above the
+// thing being read and, on the deck, the whole top edge of the screen spent
+// on navigation nobody uses while deciding. One button now, and `m`.
+const drawerOpen = () => {
+  const drawer = document.querySelector('[data-drawer]');
+  return Boolean(drawer) && !drawer.hidden;
+};
+const historyOpen = () => document.body.hasAttribute('data-history-open');
+function syncBackdrop() {
+  const backdrop = document.querySelector('[data-backdrop]');
+  if (backdrop) backdrop.hidden = !(drawerOpen() || historyOpen());
+}
+function setDrawer(open) {
+  const drawer = document.querySelector('[data-drawer]');
+  const button = document.querySelector('[data-menu]');
+  if (!drawer) return;
+  drawer.hidden = !open;
+  if (button) button.setAttribute('aria-expanded', open ? 'true' : 'false');
+  syncBackdrop();
+  if (open) { const first = drawer.querySelector('a'); if (first) first.focus(); }
+  else if (button && drawer.contains(document.activeElement)) button.focus();
+}
+function setHistory(open) {
+  const button = document.querySelector('[data-history-toggle]');
+  if (!document.querySelector('[data-side]')) return;
+  document.body.toggleAttribute('data-history-open', open);
+  if (button) button.setAttribute('aria-expanded', open ? 'true' : 'false');
+  syncBackdrop();
+}
+document.addEventListener('click', event => {
+  if (!event.target.closest) return;
+  if (event.target.closest('[data-menu]')) { setDrawer(!drawerOpen()); return; }
+  if (event.target.closest('[data-history-toggle]')) { setHistory(!historyOpen()); return; }
+  if (event.target.closest('[data-backdrop]')) { setDrawer(false); setHistory(false); return; }
+  // A destination chosen is a menu finished with, and the click still
+  // navigates: the drawer only decides where the links are kept.
+  if (event.target.closest('[data-drawer] a')) setDrawer(false);
+});
+// The note field starts one line tall and grows to four as it is written:
+// on a deck it sits in the panel with the answers, where an empty box three
+// lines deep is three lines of the screen spent on nothing.
+const NOTE_LINES = 4;
+function growNote(field) {
+  field.style.height = 'auto';
+  const line = parseFloat(getComputedStyle(field).lineHeight) || 20;
+  const frame = field.offsetHeight - field.clientHeight;
+  field.style.height = `${Math.min(field.scrollHeight, line * NOTE_LINES + frame + 16) + frame}px`;
+}
 function bindCards() {
   document.querySelectorAll('form.decide').forEach(form => {
     if (form.dataset.cardBound) return;
@@ -3774,6 +4151,11 @@ function bindCards() {
       if (event.target.closest('[data-clear]')) clearVerdict(form);
     });
     form.addEventListener('submit', event => { event.preventDefault(); decide(form, event.submitter); });
+    const note = form.querySelector('textarea[name=reply]');
+    if (note && document.querySelector('[data-deck]')) {
+      form.addEventListener('input', () => growNote(note));
+      growNote(note);
+    }
     syncAnswer(form);
   });
 }
@@ -3822,9 +4204,20 @@ function showReceipt(card, label, noted) {
   lastDecided = receipt;
   const following = card.nextElementSibling;
   const held = card.contains(document.activeElement);
-  card.replaceWith(receipt);
+  // On the deck the card has already left the queue and the next one is on
+  // screen, so a receipt where the card used to be is a receipt nobody is
+  // looking at. It goes to the side history instead, newest first, and the
+  // row that said `Sending…` becomes it.
+  const pending = document.querySelector(`[data-pending="${cssEscape(card.dataset.item)}"]`);
+  const filed = pending ? (pending.replaceWith(receipt), true) : historyRow(receipt);
+  if (filed) card.remove(); else card.replaceWith(receipt);
   const counter = document.querySelector('[data-open-count]');
   if (counter) counter.textContent = Math.max(0, Number(counter.textContent) - 1);
+  if (filed) {
+    bindDeck();
+    focusCurrent();
+    return;
+  }
   // Keep the keyboard where the work is: the next card, so 1-4 keeps deciding.
   if (held && following && following.matches('article.item')) following.focus();
 }
@@ -3847,11 +4240,16 @@ async function undoDecision(row) {
     );
     if (response.type === 'opaqueredirect' || response.ok) {
       sending.settle();
+      noteOwnChange(project);
       row.remove();
+      syncHistoryCount();
       // The item is open again: pull the fresh projection so it reappears as
       // a card (on Needs you) or leaves this list (on Recent decisions), then
-      // put the keyboard back on the returned card so 1-4 keeps working.
+      // put the deck and the keyboard back on the returned card so 1-4 keeps
+      // working. The deck has to be moved onto it first: a card the deck is
+      // not showing is hidden, and a hidden card cannot take focus.
       await refreshProjection();
+      deckShow(id);
       const back = document.querySelector(`article.item[data-item="${cssEscape(id)}"]`);
       if (back) back.focus();
       applyNotice({type: 'notice', key: `undone-${id}-${Date.now()}`, what: `Brought back ${id}. It is open again.`});
@@ -3866,6 +4264,10 @@ async function undoDecision(row) {
     showRowRefusal(row, `The undo did not reach the board. Try again.`);
   } finally {
     delete row.dataset.undoing;
+    // Every exit, not just the one that worked: a refused reopen, or one
+    // that never reached the board, is no longer `sending` either, and the
+    // line used to go on saying so until the socket happened to speak.
+    settleLive();
   }
 }
 // A refusal on a decided row has no form to live in, so it lives on the row.
@@ -3937,6 +4339,11 @@ async function decide(form, submitter) {
   const label = decidedLabel(form, submitter);
   const noted = replySent(body);
   const sending = beginSending(card, submitter, 'Sending…', 'Still sending…');
+  // The deck hands over to the next card now rather than when the board
+  // answers: `1` sends this one off and shows the next one, and what this
+  // one is doing is said in the side history instead of on a card that is
+  // no longer on screen.
+  const advanced = deckSend(card, label);
   try {
     const response = await fetch(form.action, {
       method: 'POST',
@@ -3951,18 +4358,24 @@ async function decide(form, submitter) {
     // refused by name rather than mapped onto whatever now sits there.
     if (response.type === 'opaqueredirect' || response.ok) {
       sending.settle();
+      noteOwnChange(card.dataset.project);
       showReceipt(card, label, noted);
+      settleLive();
       return;
     }
     // Nothing was recorded, so the card comes all the way back before it is
     // told why: a refusal under a disabled button reads as a card that can
     // no longer be answered at all.
     sending.revert();
+    if (advanced) advanced.restore();
+    settleLive();
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const refused = page.querySelector('.error');
     showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board');
   } catch (error) {
     sending.revert();
+    if (advanced) advanced.restore();
+    settleLive();
     showRefusal(form, 'The decision did not reach the board. Try again.', 'board');
   } finally {
     delete form.dataset.deciding;
@@ -3974,6 +4387,11 @@ async function refreshProjection() {
   // socket is waiting for: `sending` is the answer to the click that was
   // just made, and it must not be overwritten a tick later.
   if (answerInProgress()) { setLive(sendingInFlight() ? 'sending' : 'update waiting'); return; }
+  // A card that is halfway out of the deck is not a page to swap: the
+  // animation is 160ms and the node it is moving is one of the nodes being
+  // replaced, so the swap waits for it to land rather than deleting it
+  // mid-flight.
+  if (deckGhost) await new Promise(resolve => setTimeout(resolve, DECK_SLIDE));
   const response = await fetch(location.pathname + location.search, {credentials: 'same-origin'});
   if (!response.ok) throw new Error(`refresh ${response.status}`);
   const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
@@ -3983,19 +4401,38 @@ async function refreshProjection() {
   // the detached document: the notices strip, then every receipt. Bailing
   // out after that point would delete them instead of preserving a draft.
   if (answerInProgress()) { setLive(sendingInFlight() ? 'sending' : 'update waiting'); return; }
-  const strip = document.querySelector('[data-notices]');
-  if (strip) next.prepend(strip);
-  // A receipt outlives the projection it was decided in. The row is gone
-  // from the new one, so the receipts move to the head of the list in the
-  // order they were decided; an undo that vanished a second after the click
-  // would be no undo at all.
-  let cursor = next.querySelector('.count');
-  document.querySelectorAll('[data-receipt]').forEach(receipt => {
-    if (cursor) cursor.after(receipt); else next.prepend(receipt);
-    cursor = receipt;
-  });
+  // Where the deck is, so the swap puts it back: the same item if it is
+  // still open, and otherwise the same slot in the queue -- a refresh must
+  // not throw the operator back to the top of a queue of 133.
+  const showing = currentCard();
+  const showingItem = showing ? showing.dataset.item : null;
+  const slot = deckIndex;
+  // The side carries the whole sitting across: the notices and every
+  // receipt with its undo live in it, so one node moves instead of a strip
+  // plus a list of receipts threaded back in one at a time.
+  const side = document.querySelector('[data-side]');
+  const fresh = side ? next.querySelector('[data-side]') : null;
+  if (side && fresh) fresh.replaceWith(side);
+  if (!side) {
+    const strip = document.querySelector('[data-notices]');
+    if (strip) next.prepend(strip);
+    // A receipt outlives the projection it was decided in. The row is gone
+    // from the new one, so the receipts move to the head of the list in the
+    // order they were decided; an undo that vanished a second after the
+    // click would be no undo at all.
+    let cursor = next.querySelector('.count');
+    document.querySelectorAll('[data-receipt]').forEach(receipt => {
+      if (cursor) cursor.after(receipt); else next.prepend(receipt);
+      cursor = receipt;
+    });
+  }
   document.querySelector('main').replaceWith(next);
   bindCards();
+  deckIndex = slot;
+  deckShown = null;
+  bindDeck();
+  if (showingItem) deckShow(showingItem);
+  focusCurrent();
   setLive('live');
 }
 function noticeStrip() {
@@ -4010,9 +4447,40 @@ function noticeStrip() {
   }
   return strip;
 }
+// What this tab has just done to a board, so the socket does not report the
+// operator to themselves. A decision made here is already on screen as a
+// receipt in the side history; the same change arriving a second later as
+// `Attention resolved` is noise over the card being read next (George,
+// 2026-09-17). Only the words this page can cause are suppressed, only on
+// the board it just wrote to, and only for half a minute: a change somebody
+// else makes is still news.
+//
+// The board and the words are the whole match, because that is all the
+// notice frame carries -- and the frame's shape is pinned on purpose. An id
+// on the wire would be a new field on every notice for the sake of one
+// tab's echo.
+//
+// The trade, named: a row settled by SOMEBODY ELSE on the same board within
+// ten seconds of a decision made here is silent. Ten seconds is about one
+// refresh cycle, so that change still arrives -- as the projection swap that
+// takes its card out of the queue -- it just arrives without a sentence. The
+// alternative was leaving every operator's own decision reported back to
+// them a second after they made it, over the card they are reading next.
+const ECHO_WINDOW = 10000;
+const OWN_WORDS = ['Attention resolved', 'Attention reopened'];
+const ownChanges = new Map();
+const noteOwnChange = board => { if (board) ownChanges.set(board, Date.now()); };
+const ownEcho = notice => {
+  if (!notice.board || notice.type !== 'notice' || !OWN_WORDS.includes(notice.what)) return false;
+  const at = ownChanges.get(notice.board);
+  return typeof at === 'number' && Date.now() - at < ECHO_WINDOW;
+};
 function applyNotice(notice) {
   if (!notice || !notice.key || seenNotices.has(notice.key)) return false;
   seenNotices.add(notice.key);
+  // Remembered, then dropped: an echo that is redelivered must not be
+  // rendered the second time either.
+  if (ownEcho(notice)) return false;
   while (seenNotices.size > NOTICE_MEMORY) seenNotices.delete(seenNotices.values().next().value);
   const row = document.createElement('p');
   row.className = notice.type === 'notice' ? 'notice' : 'notice summary';
@@ -4041,12 +4509,27 @@ function applyNotice(notice) {
   const strip = noticeStrip();
   strip.prepend(row);
   while (strip.children.length > NOTICE_SHOWN) strip.lastElementChild.remove();
+  toast(row);
   return true;
+}
+// On the deck a notice is news, not a log: the side belongs to the
+// decisions, so a notice takes itself away after six seconds. Hovering
+// holds it -- a notice that vanished out from under the eye reading it
+// would be worse than one that stayed. `kb ev` is the log, and the list at
+// `/all` still keeps its strip.
+const TOAST_LIFE = 6000;
+function toast(row) {
+  if (!document.querySelector('[data-deck]')) return;
+  let timer = setTimeout(() => row.remove(), TOAST_LIFE);
+  row.addEventListener('mouseenter', () => { clearTimeout(timer); timer = null; });
+  row.addEventListener('mouseleave', () => {
+    if (timer === null) timer = setTimeout(() => row.remove(), TOAST_LIFE);
+  });
 }
 function connectLive() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const socket = new WebSocket(`${scheme}://${location.host}/live`);
-  socket.onopen = () => setLive('live');
+  socket.onopen = () => { liveSocketUp = true; setLive('live'); };
   socket.onmessage = event => {
     let frame;
     try { frame = JSON.parse(event.data); } catch (_) { return; }
@@ -4062,7 +4545,7 @@ function connectLive() {
     }
     if (frame.type === 'refresh') refreshProjection().catch(() => setLive('refresh failed'));
   };
-  socket.onclose = () => { setLive('reconnecting'); setTimeout(connectLive, 1500); };
+  socket.onclose = () => { liveSocketUp = false; setLive('reconnecting'); setTimeout(connectLive, 1500); };
   socket.onerror = () => socket.close();
 }
 document.addEventListener('click', event => {
@@ -4229,6 +4712,9 @@ document.addEventListener('keydown', event => {
     && target.matches('textarea, input, summary, details[data-custom] *'));
   if (event.key === 'Escape') {
     if (openPreviews.length) { event.preventDefault(); closeAllPreviews(); return; }
+    // The menu and the side history are the outermost things Escape closes:
+    // whatever is over the page goes first, and only then the verdict.
+    if (drawerOpen() || historyOpen()) { event.preventDefault(); setDrawer(false); setHistory(false); return; }
     const escaped = cardOf(target) || cardOf(document.activeElement);
     const form = escaped && escaped.querySelector('form.decide');
     if (form) { event.preventDefault(); clearVerdict(form); }
@@ -4247,7 +4733,28 @@ document.addEventListener('keydown', event => {
     if (row) { event.preventDefault(); undoDecision(row); }
     return;
   }
-  const card = cardOf(document.activeElement);
+  // `m` is the menu, which is now the only way to the other pages: eight
+  // links across the top of a phone were eight links in the way.
+  //
+  // Every key below calls `preventDefault`, and not only to stop the
+  // browser's own default. A keydown this page leaves unhandled arrives
+  // again, and again: the driver the browser tests run through delivers one
+  // keypress as thousands of keydowns (measured 2026-09-17: 18,000 in three
+  // seconds) until one of them is prevented. A skip that fired on every one
+  // of those would walk the whole queue on one tap of `s`.
+  if (event.key === 'm') { event.preventDefault(); setDrawer(!drawerOpen()); return; }
+  // The deck's own keys: the card that cannot be answered yet goes to the
+  // back of the queue, and the arrows walk it without recording anything.
+  if (deckNode()) {
+    if (event.key === 's') { event.preventDefault(); deckSkip(); return; }
+    if (event.key === 'ArrowRight') { event.preventDefault(); deckSkip(); return; }
+    if (event.key === 'ArrowLeft') { event.preventDefault(); deckMove(-1); return; }
+  }
+  // The deck answers for the card it is showing even when focus has been
+  // put somewhere that is not a card at all -- a tap on the backdrop, a
+  // link followed back -- because on a deck there is exactly one card a
+  // digit could mean.
+  const card = cardOf(document.activeElement) || (deckNode() ? currentCard() : null);
   if (!card) return;
   const digit = CHOICE_KEYS.indexOf(event.key);
   if (digit >= 0) {
@@ -4267,6 +4774,10 @@ document.addEventListener('keydown', event => {
   }
 });
 bindCards();
+// The deck starts on the first card with the keyboard already on it, so the
+// first thing the page is good for is answering it.
+bindDeck();
+focusCurrent();
 connectLive();
 "#;
 /// The OMP skin: the calm dark palette of the harness George reads this from,
@@ -4470,10 +4981,182 @@ box-shadow:0 12px 32px rgba(0,0,0,.45);padding:.8rem .9rem;color:var(--text);ani
 .preview-card h3{margin:.1rem 0 .4rem;font-size:.95rem;font-weight:650;color:var(--text)}\
 .preview-card h3 a{color:inherit}\
 .preview-card .body{margin:.4rem 0 0;color:var(--subtext);font-size:.88rem}\
-@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.actions button{flex:1}.picks{display:grid;grid-template-columns:1fr 1fr}.heading{align-items:flex-start}table{min-width:38rem}}\
+/* --- the menu ------------------------------------------------------------ */\
+.menu{display:flex;align-items:center;justify-content:center;width:2.6rem;min-height:2.6rem;padding:0;\
+border-color:var(--surface0)}\
+.menu .bars{display:block;width:1.1rem;height:.1rem;background:var(--text);box-shadow:0 -.35rem var(--text),0 .35rem var(--text)}\
+.menu[aria-expanded=true]{border-color:var(--accent)}\
+.backdrop{position:fixed;inset:0;z-index:40;background:rgba(17,17,27,.6)}\
+.drawer{position:fixed;left:0;top:0;bottom:0;z-index:50;display:flex;flex-direction:column;gap:.6rem;\
+width:min(17rem,82vw);padding:.8rem max(.7rem,env(safe-area-inset-left));overflow-y:auto;\
+background:var(--mantle);border-right:1px solid var(--surface0);animation:drawer-in .16s ease-out}\
+.drawer .nav-links{display:flex;flex-direction:column;align-items:stretch;gap:.1rem}\
+/* `hidden` is a display rule, and so is the one above it -- but only a page\
+   with a script has a button to open the drawer with, so only there is the\
+   drawer allowed to be shut. Without one it is a block of links under the\
+   top bar, which is what this shell was before the menu. */\
+html.js .drawer[hidden]{display:none}\
+/* `!important`, because the UA rule for `[hidden]` is one too: a page with\
+   no script has no button to open this with, so the attribute the script\
+   manages has to lose to the layout that does not need it. */\
+html:not(.js) .drawer[hidden],html:not(.js) .drawer{display:flex!important}\
+html:not(.js) .drawer{position:static;width:auto;padding:.5rem max(1rem,env(safe-area-inset-left));\
+border-right:0;border-bottom:1px solid var(--surface0);animation:none}\
+html:not(.js) .drawer .nav-links{flex-direction:row;flex-wrap:wrap}\
+html:not(.js) .menu{display:none}\
+.drawer nav a,.drawer a{min-height:2.75rem}\
+.drawer form{margin:0}.drawer form input{width:100%}\
+@keyframes drawer-in{from{transform:translateX(-100%)}to{transform:none}}\
+/* --- the deck: one card, and its long form the only thing that scrolls --- */\
+/* Every rule here is scoped to `html.js`, and that scope is load-bearing:\
+   the deck is one card because a script hides the others, so without a\
+   script the same markup has to stay what it is -- a plain scrolling list\
+   of cards whose forms post on their own. A page laid out as a deck with\
+   nothing to drive it would show one crushed card and no way past it.\
+\
+   The answers have to be where the thumb is, so the card is a column: what\
+   the item is at the top, the long form in the middle taking whatever is\
+   left, and the form at the bottom of the screen. The form is rendered\
+   before the long form (ADR-042 §5 keeps the answers above the detail in\
+   the markup, and that is the order a scriptless browser reads), so the\
+   deck orders the column visually and leaves the document alone. */\
+html.js:has(main[data-deck]){height:100%}\
+html.js body:has(main[data-deck]){height:100%;overflow:hidden;display:flex;flex-direction:column}\
+html.js body:has(main[data-deck])>nav[data-primary-nav]{flex:none}\
+html.js main[data-deck]~footer{display:none}\
+html.js main[data-deck]{position:relative;flex:1;min-height:0;width:100%;display:flex;flex-direction:column;\
+gap:.45rem;overflow:hidden;padding:.6rem clamp(.7rem,3vw,1.2rem) 0}\
+html.js main[data-deck]>.heading,html.js main[data-deck]>.deck-head,html.js main[data-deck]>.success{flex:none}\
+/* Everything that is not the card gives up its room to the card: on a\
+   phone every line of page furniture is a line the long form or an answer\
+   does not get. */\
+html.js main[data-deck]>.heading{gap:.5rem}\
+html.js main[data-deck]>.heading h1{margin:0;font-size:1rem}\
+html.js main[data-deck]>.heading .live{margin-right:.6rem}\
+html.js main[data-deck]>.keys{flex:none;position:static;font-size:.75rem;\
+padding:.3rem 0 calc(.3rem + env(safe-area-inset-bottom));background:transparent;border:0}\
+html.js .deck-head{margin:0}\
+html.js .progress{margin:0;color:var(--muted);font-size:.78rem;font-variant-numeric:tabular-nums}\
+html.js .deck{position:relative;flex:1;min-height:0;display:flex}\
+html.js .deck .item{flex:1;min-height:0;display:flex;flex-direction:column;margin:0;overflow:hidden}\
+/* `hidden` is a display rule and the rule above is one too, so the card the\
+   deck is not showing needs saying twice to stay off the screen. */\
+html.js .deck .item[hidden]{display:none}\
+html.js .deck .item>.eyebrow{order:1;flex:none;margin-bottom:.25rem}\
+html.js .deck .item>h2{order:2;flex:none}\
+/* A raiser's context runs to a paragraph, and on a short screen a paragraph\
+   at the top leaves no room for the answers. It keeps its place and takes\
+   what it can have. */\
+html.js .deck .item>.context{order:3;flex:0 1 auto;min-height:0;max-height:22vh;overflow-y:auto;margin-bottom:.4rem}\
+/* The long form is the card's body and the deck's only scroller. It clips:\
+   a region that overflowed instead would paint the body straight over the\
+   answers, and it keeps a floor so that a card with a long context and four\
+   answers still shows some of what it is about. */\
+html.js .deck .item>.full{order:4;flex:1 1 0;min-height:8rem;overflow:hidden;\
+display:flex;flex-direction:column;margin:0}\
+/* The disclosure control goes: on the deck the long form is not folded, so\
+   a control that says `show the full item` above an item already shown is\
+   one line of a phone spent saying nothing. */\
+html.js .deck .item>.full>summary{display:none}\
+/* Chrome wraps what a `<details>` reveals in `::details-content`, so the\
+   long form is a grandchild of the card's column and not a child: the\
+   wrapper has to carry the column through, or the body sizes itself to its\
+   content and paints over the answers. The viewport bound behind it is for\
+   a browser without that pseudo-element, where the body is bounded\
+   directly rather than by what the column has left. */\
+html.js .deck .item>.full::details-content{flex:1 1 0;min-height:0;overflow:hidden;\
+display:flex;flex-direction:column}\
+html.js .deck .item>.full .body{flex:1;min-height:0;max-height:40vh;overflow-y:auto;padding-right:.3rem}\
+/* The trailing meta line trails: on a short item it sits at the foot of the\
+   body region rather than floating in the middle of the card. */\
+html.js .deck .item>.meta{order:5;flex:none;margin:auto 0 0}\
+/* The panel: the answers and the note, at the bottom of the screen where a\
+   thumb is. It keeps half the card whatever else asks for room -- the\
+   answers are what the screen is for -- and when a card's answers are\
+   taller than that the panel scrolls itself, so every control stays\
+   reachable without the page ever scrolling. */\
+html.js .deck .item>.decide{order:6;flex:0 1 auto;min-height:min(8.5rem,50%);overflow-y:auto;\
+margin-top:.45rem;padding-top:.6rem;border-top:1px solid var(--surface0);background:var(--base);\
+position:sticky;bottom:0}\
+html.js .deck .item>.decide .alternatives{grid-template-columns:1fr 1fr;gap:.6rem .8rem;margin-top:.7rem}\
+html.js .deck .item>.decide .consequence{font-size:.85rem}\
+html.js .deck .item>.decide .reply{margin-top:.6rem}\
+html.js .deck .item>.decide .reply>label{margin-bottom:.2rem;font-size:.75rem}\
+/* The note's own hint is a sentence about a field that is one line tall and\
+   named by its label; the panel says it once, in the fold, where the note\
+   becomes an answer of its own. */\
+html.js .deck .item>.decide .reply .hint{display:none}\
+html.js .deck .item>.decide .custom{margin-top:.6rem;padding-top:.45rem}\
+html.js .deck .item>.decide .custom>summary{min-height:2rem}\
+html.js .deck .item>.decide textarea{min-height:2.6rem;max-height:7.5rem;overflow-y:auto;resize:none}\
+html.js .deck .item.entering{animation:deck-in .16s ease-out}\
+html.js .deck .item.leaving,html.js .deck .item.leaving-back{position:absolute;left:0;right:0;top:0;bottom:0;\
+pointer-events:none;animation:deck-out .16s ease-out forwards}\
+html.js .deck .item.leaving-back{animation-name:deck-out-back}\
+@keyframes deck-in{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}\
+@keyframes deck-out{to{opacity:0;transform:translateX(-24px)}}\
+@keyframes deck-out-back{to{opacity:0;transform:translateX(24px)}}\
+/* --- the side: toasts above, this sitting's decisions below -------------- */\
+/* A list, not a stack of tiles: one heading, then one row per decision on\
+   the same ground as the rest of the page. The newest is the only one\
+   marked, because it is the only one `u` will undo. */\
+html.js .side{display:flex;flex-direction:column;gap:.7rem;min-height:0}\
+html.js .side .toasts{display:grid;gap:.35rem;margin:0}\
+html.js .history{display:flex;flex-direction:column;gap:.5rem;min-height:0;overflow-y:auto;\
+background:transparent;border:0}\
+html.js .history h2{margin:0;padding:0 0 .1rem;font-size:.78rem;font-weight:600;color:var(--muted);\
+letter-spacing:.02em}\
+html.js .history .receipt,html.js .history .pending{margin:0;background:var(--surface0)}\
+html.js .history .receipt:first-of-type{border-left-color:var(--green);background:var(--surface1)}\
+/* The receipt's own sentence is a span that happens to carry the class a\
+   decided ROW is drawn with, and a row inside a row read as a box inside\
+   a box. In the history it is a sentence. */\
+html.js .history .receipt .decided{margin:0;padding:0;border:0;border-radius:0;background:transparent}\
+html.js .pending{margin:0;padding:.55rem .75rem;color:var(--peach);background:var(--surface0);\
+border:1px solid var(--surface0);border-left:2px solid var(--peach);border-radius:8px;font-size:.9rem}\
+html.js .history-toggle{min-height:2.2rem;padding:.1rem .6rem;color:var(--subtext);border-color:var(--surface1);font-size:.8rem}\
+html.js .history-toggle [data-history-count]{margin-left:.4rem;padding:0 .35em;border-radius:4px;\
+background:var(--surface0);color:var(--text);font-family:var(--mono);font-size:.75rem}\
+@media(min-width:900px){html.js main[data-deck]{padding-right:calc(320px + 1.2rem)}\
+/* The side starts below the heading row rather than beside it: its own\
+   heading and the live line were reading as one crowded line. */\
+html.js main[data-deck]>.side{position:absolute;top:2.9rem;right:clamp(.7rem,3vw,1.2rem);bottom:.6rem;width:320px}\
+html.js .history-toggle{display:none}}\
+/* Below the desktop column the side is a drawer, and the toasts come out of\
+   it: news has to arrive whether or not the history is open. */\
+@media(max-width:899px){html.js main[data-deck]>.side{display:contents}\
+/* A toast is IN the column on a phone, between the heading and the card: one\
+   line that pushes the card down while it is there. Floated over the card it\
+   covered the eyebrow and the question -- the two lines that say what is\
+   being decided -- which is a notice getting in the way of the decision. */\
+html.js main[data-deck]>.heading,html.js main[data-deck]>.success{order:0}\
+html.js main[data-deck] .toasts{order:1;position:static;margin:0;pointer-events:auto}\
+html.js main[data-deck]>.deck-head{order:2}\
+html.js main[data-deck]>.deck{order:3}\
+html.js main[data-deck]>.keys{order:4}\
+html.js main[data-deck] .toasts .notice{flex-wrap:nowrap;overflow:hidden}\
+html.js main[data-deck] .toasts .notice .notice-what,html.js main[data-deck] .toasts .notice a{\
+overflow:hidden;white-space:nowrap;text-overflow:ellipsis}\
+/* One at a time: the strip is a line of the screen, and the newest notice is\
+   the one worth that line. */\
+html.js main[data-deck] .toasts .notice~.notice{display:none}\
+html.js main[data-deck] .history{position:fixed;top:0;right:0;bottom:0;z-index:50;width:min(19rem,86vw);\
+padding:.8rem max(.7rem,env(safe-area-inset-right)) calc(.8rem + env(safe-area-inset-bottom));\
+background:var(--mantle);border-left:1px solid var(--surface0);transform:translateX(100%);\
+transition:transform .16s ease-out}\
+html.js body[data-history-open] main[data-deck] .history{transform:none}}\
+@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}.brand{flex:0 0 2.5rem}.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}nav form{order:3;flex:1 0 100%;margin:0}.actions button{flex:1}.picks{display:grid;grid-template-columns:1fr 1fr}.heading{align-items:flex-start}table{min-width:38rem}\
+.drawer{flex-wrap:nowrap}.drawer .nav-links{flex:none;overflow:visible}.drawer nav form,.drawer form{order:0;flex:none}}\
+/* A short screen -- a laptop window, a phone in landscape -- spends what it\
+   has on the answers rather than on the raiser's paragraph. */\
+@media(max-height:620px){html.js .deck .item>.context{max-height:2.6rem}\
+html.js .deck .item>.full{min-height:0}}\
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}button:active{transform:none}\
 .notice{animation:none}.live::after{animation:none}.preview-pop{animation:none}\
-.receipt.landed{animation:none}}\
+.receipt.landed{animation:none}.drawer{animation:none}\
+html.js .deck .item.entering{animation:none}\
+html.js .deck .item.leaving,html.js .deck .item.leaving-back{animation:none;opacity:0}\
+html.js main[data-deck] .history{transition:none}}\
 ";
 
 #[cfg(test)]
@@ -5001,6 +5684,14 @@ mod tests {
         }
     }
 
+    /// What a page renders inside `<main>`: the page itself, without the
+    /// shell's own navigation and controls around it.
+    fn main_of(html: &str) -> &str {
+        let start = html.find("<main").expect("a main element");
+        let end = html[start..].find("</main>").expect("main closes");
+        &html[start..start + end]
+    }
+
     fn assert_html_contains(html: &str, needle: &str) {
         assert!(html.contains(needle), "missing {needle:?} in {html}");
     }
@@ -5023,6 +5714,80 @@ mod tests {
 
     fn assert_page_title(html: &str, title: &str) {
         assert_html_contains(html, &format!("<title>{title} · kanban</title>"));
+    }
+
+    /// Every selector in the stylesheet, comma-separated parts split out and
+    /// keyframe stops dropped: enough to ask what a rule is scoped to.
+    fn css_selectors(css: &str) -> Vec<String> {
+        let mut stripped = String::with_capacity(css.len());
+        let mut rest = css;
+        while let Some(open) = rest.find("/*") {
+            stripped.push_str(&rest[..open]);
+            rest = match rest[open..].find("*/") {
+                Some(close) => &rest[open + close + 2..],
+                None => "",
+            };
+        }
+        stripped.push_str(rest);
+        let mut selectors = Vec::new();
+        for chunk in stripped.split('{') {
+            let tail = chunk.rsplit('}').next().unwrap_or("").trim();
+            if tail.is_empty() || tail.starts_with('@') {
+                continue;
+            }
+            for part in tail.split(',') {
+                let part = part.trim();
+                if part.is_empty() || part == "from" || part == "to" || part.ends_with('%') {
+                    continue;
+                }
+                selectors.push(part.to_owned());
+            }
+        }
+        selectors
+    }
+
+    /// The deck's layout is scoped to a page whose script ran, and nothing
+    /// else is allowed to claim it.
+    ///
+    /// The deck is one card because the script hides the others. The same
+    /// markup with no script has to stay the plain scrolling list it is
+    /// served as: a viewport-height column with `overflow:hidden` and a flex
+    /// row of cards, applied with nothing to drive it, is one crushed card
+    /// and no way past it — every open item unreachable on the page whose
+    /// whole job is to reach them. So every rule that mentions the deck, or
+    /// styles the parts only the deck renders, MUST be behind `html.js`.
+    #[test]
+    fn every_deck_rule_is_scoped_to_a_page_whose_script_ran() {
+        let deck_parts = [
+            "data-deck",
+            ".deck",
+            ".progress",
+            ".side",
+            ".history",
+            ".pending",
+            ".toasts",
+        ];
+        let mut unscoped = Vec::new();
+        for selector in css_selectors(CSS) {
+            let mentions_deck = deck_parts.iter().any(|part| selector.contains(part));
+            if mentions_deck && !selector.starts_with("html.js") {
+                unscoped.push(selector);
+            }
+        }
+        assert!(
+            unscoped.is_empty(),
+            "these deck rules would apply to a page with no script: {unscoped:?}"
+        );
+        // And the script says so before it can throw: the class is added on
+        // the first line, not after the page is wired up.
+        let marker = "document.documentElement.classList.add('js');";
+        let at = JS.find(marker).expect("the script marks the document");
+        assert!(
+            JS[..at]
+                .lines()
+                .all(|line| line.trim().is_empty() || line.trim_start().starts_with("//")),
+            "something runs before the document is marked as scripted"
+        );
     }
 
     /// The ROUTE's refusal for a half-written custom answer is ONE sentence,
@@ -5133,12 +5898,18 @@ mod tests {
         assert_page_title(&home, "Needs you");
         assert_html_contains(&home, "Needs you");
         assert_html_contains(&home, "Please review before release");
-        // Orientation above the question, and the free-text answer folded
-        // out of the way beneath the choices.
+        // The deck: one card on screen, with the queue's position above it.
+        // The page explains itself at length on the plain list it is laid
+        // over, where there is room for a paragraph.
+        assert_html_contains(&home, "<main id=main data-deck>");
+        assert_html_contains(&home, "<section class=deck data-deck-cards>");
         assert_html_contains(
             &home,
-            "<p class=explain>Each card is one question an agent is waiting on.",
+            "<p class=progress><span data-deck-position>1</span> of <span data-open-count>1</span></p>",
         );
+        assert!(!home.contains("<p class=explain>"), "{home}");
+        // Orientation above the question, and the free-text answer folded
+        // out of the way beneath the choices.
         assert_html_contains(&home, "<p class=eyebrow>");
         assert_html_contains(&home, "· asked by geoyws · waiting ");
         assert_html_contains(
@@ -5190,6 +5961,29 @@ mod tests {
         );
         assert_html_contains(&home, "/board/SERVE-RENDER");
         assert!(!home.contains("<strong>before release</strong>"));
+
+        // `/all` is the same queue as one plain list: the same cards, from
+        // the same loop, byte for byte. Two renderers would be two card
+        // orders to keep in step.
+        let list = render("/all").expect("render all open");
+        assert_page_title(&list, "Needs you");
+        assert_html_contains(
+            &list,
+            "<p class=explain>Each card is one question an agent is waiting on.",
+        );
+        assert_html_contains(
+            &list,
+            "<p class=count><span data-open-count>1</span> open across",
+        );
+        // The page script is the same on every page, and it names the deck's
+        // hooks; what says this page is not a deck is its `<main>`.
+        assert_html_contains(&list, "<main id=main>");
+        let card_of = |html: &str| {
+            let start = html.find("<article class=item").expect("a card");
+            let end = html[start..].find("</article>").expect("the card closes");
+            html[start..start + end + "</article>".len()].to_owned()
+        };
+        assert_eq!(card_of(&home), card_of(&list));
 
         let replied = render(&format!("/?replied={}", fixture.epic_id)).expect("render replied");
         assert_page_title(&replied, "Needs you");
@@ -5365,7 +6159,9 @@ mod tests {
             "href=\"/task/SERVE-RENDER/t-render%2Fopaque%3F%23\"",
         );
         assert!(!current_sprint.contains("<main id=main><form"));
-        assert!(!current_sprint.contains("<button"));
+        // A read-only page offers no write control of its own. The shell's
+        // menu button is the shell's, so the claim is about `<main>`.
+        assert!(!main_of(&current_sprint).contains("<button"));
 
         let closed_sprint =
             render("/sprint/SERVE-RENDER/sp-render-closed").expect("render closed sprint detail");

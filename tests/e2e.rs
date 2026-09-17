@@ -827,14 +827,21 @@ fn launch_mobile_browser(chrome_path: PathBuf) -> Browser {
 }
 
 fn set_mobile_viewport(tab: &headless_chrome::Tab) {
+    set_viewport(tab, 390, 844);
+}
+
+/// Put the tab on one viewport, the way a device does: the layout viewport
+/// and the screen agree, so a page laid out against `vh` or against a width
+/// query sees what a phone or a laptop window would show it.
+fn set_viewport(tab: &headless_chrome::Tab, width: u32, height: u32) {
     tab.call_method(Emulation::SetDeviceMetricsOverride {
-        width: 390,
-        height: 844,
+        width,
+        height,
         device_scale_factor: 1.0,
-        mobile: true,
+        mobile: width < 700,
         scale: None,
-        screen_width: Some(390),
-        screen_height: Some(844),
+        screen_width: Some(width),
+        screen_height: Some(height),
         position_x: None,
         position_y: None,
         dont_set_visible_size: None,
@@ -843,7 +850,7 @@ fn set_mobile_viewport(tab: &headless_chrome::Tab) {
         display_feature: None,
         device_posture: None,
     })
-    .expect("set the 390x844 mobile viewport");
+    .unwrap_or_else(|error| panic!("set the {width}x{height} viewport: {error}"));
 }
 fn effective_uid() -> u32 {
     unsafe { libc::geteuid() as u32 }
@@ -25853,20 +25860,40 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         home.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
         "{home}"
     );
+    // The deck's keyboard map carries the two keys only a deck has: the skip
+    // and the step through the queue.
     assert!(
         home.contains(
             "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
-             <kbd>u</kbd> undo last · <kbd>Esc</kbd> clear · Decided items move to"
+             <kbd>s</kbd> skip · <kbd>←</kbd><kbd>→</kbd> move · <kbd>u</kbd> undo last · \
+             <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · Decided items move to"
         ),
         "{home}"
     );
+    // The plain list keeps the map it had, plus the menu the destinations
+    // moved into, and it is where the page explains itself at length: the
+    // deck spends its screen on the card.
+    let (status, list) = http_get(port, "/all");
+    assert_eq!(status, 200, "{list}");
     assert!(
-        home.contains(
+        list.contains(
+            "<p class=keys><kbd>1</kbd>-<kbd>4</kbd> answer · <kbd>c</kbd> own words · \
+             <kbd>u</kbd> undo last · <kbd>m</kbd> menu · <kbd>Esc</kbd> clear · \
+             Decided items move to"
+        ),
+        "{list}"
+    );
+    assert!(
+        list.contains(
             "<p class=explain>Each card is one question an agent is waiting on. Pick an \
              answer and it is recorded on the board at once; the agent continues from \
              there. Undo any decision from Recent decisions.</p>"
         ),
-        "{home}"
+        "{list}"
+    );
+    assert!(
+        list.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
+        "{list}"
     );
 
     let path = format!("/attention/SERVEWRITE/{approve_id}/reply");
@@ -26136,6 +26163,51 @@ fn decision_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
     tab
 }
 
+/// The same tab on `/all`: every open item as one plain list.
+///
+/// The deck at `/` shows one card and hides the rest, so a case that works
+/// two or three cards at once -- a draft held on one while another is
+/// decided -- is a case about the list, and this is where the list is.
+fn list_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
+    let tab = opened_tab(chrome, "list tab");
+    tab.set_extra_http_headers(std::collections::HashMap::from([(
+        "X-Auth-Request-Email",
+        "geoyws",
+    )]))
+    .expect("set the trusted edge actor header");
+    tab.navigate_to(&format!("{}all", origin))
+        .expect("load the open list");
+    tab.wait_until_navigated().expect("initial navigation");
+    tab.wait_for_element("article.item")
+        .expect("a decision card");
+    tab
+}
+
+/// Open the hamburger menu, which is where every destination lives now.
+fn open_nav_drawer(tab: &headless_chrome::Tab) {
+    if js_value(tab, "!document.querySelector('[data-drawer]').hidden") == Value::Bool(true) {
+        return;
+    }
+    click_control(tab, "[data-menu]");
+    wait_for_js_true(tab, "!document.querySelector('[data-drawer]').hidden");
+}
+
+/// Open the side history on a viewport narrow enough to keep it behind its
+/// toggle. Idempotent, and a no-op where the side is already a column.
+fn open_side_history(tab: &headless_chrome::Tab) {
+    if js_value(
+        tab,
+        "!document.querySelector('[data-history-toggle]') \
+         || !document.querySelector('[data-history-toggle]').checkVisibility() \
+         || document.body.hasAttribute('data-history-open')",
+    ) == Value::Bool(true)
+    {
+        return;
+    }
+    click_control(tab, "[data-history-toggle]");
+    wait_for_js_true(tab, "document.body.hasAttribute('data-history-open')");
+}
+
 /// What the card became after a decision that carried no words: one line
 /// naming the choice in the same words the ledger uses, and the Undo that
 /// brings it back — a button on the page, not a command to go and type.
@@ -26255,6 +26327,11 @@ fn assert_no_horizontal_overflow(tab: &headless_chrome::Tab, page_name: &str) {
 /// assertion below -- the document really was replaced, the arrival selector
 /// really is there -- is unchanged.
 fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, label: &str) {
+    // Every destination is behind the hamburger now, so reaching one starts
+    // with the menu -- which is what a reader does too.
+    if selector.starts_with("[data-nav") {
+        open_nav_drawer(tab);
+    }
     const MEASURE: &str = "(() => {
         const element = document.querySelector(__SELECTOR__);
         if (!element) return JSON.stringify({state: 'missing'});
@@ -27410,12 +27487,17 @@ fn markdown_renders_in_real_chrome_and_raw_html_stays_inert() {
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
 
-    tab.wait_for_element(&format!(
-        "article.item[data-item=\"{id}\"] details.full > summary"
-    ))
-    .expect("the folded body")
-    .click()
-    .expect("unfold the body");
+    // The deck opens the long form and hides its disclosure control: the
+    // body IS the card's scrolling region here, so there is no fold to
+    // click. What is rendered in it is what this case is about.
+    wait_for_js_true(
+        &tab,
+        &format!(
+            "document.querySelector('article.item[data-item=\"{id}\"] details.full').open \
+             && document.querySelector('article.item[data-item=\"{id}\"] \
+             details.full .body.md').checkVisibility()"
+        ),
+    );
     let details = format!("article.item[data-item=\"{id}\"] details.full .body.md");
     assert_eq!(
         js_value(
@@ -29064,6 +29146,10 @@ fn a_digit_on_the_folded_answers_summary_records_nothing_in_real_chrome() {
 /// plus the three things nothing else covers: a note attached to an authored
 /// choice, `2` picking the second listed choice, and `c` reaching the answer
 /// field while digits stay inert inside it.
+///
+/// It runs on `/all`, the plain list, because it holds a draft on a third
+/// card while it decides the first two: three cards open at once is what a
+/// list is, and the deck at `/` shows exactly one.
 #[test]
 fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     browser_loopback_reservation_supported()
@@ -29097,7 +29183,7 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
-    let tab = decision_tab(&chrome, &origin);
+    let tab = list_tab(&chrome, &origin);
     let card_form =
         |id: &str| format!("form.decide[action=\"/attention/SERVE-BROWSER/{id}/reply\"]");
     let answer_field = |id: &str| format!("{} textarea[name=reply]", card_form(id));
@@ -29238,7 +29324,7 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
         js_value(&tab, "document.querySelectorAll('p.receipt').length"),
         3
     );
-    assert_eq!(tab.get_url(), origin);
+    assert_eq!(tab.get_url(), format!("{origin}all"));
 }
 
 /// Dead-letter one delivery of `event_seq` with `code`, by walking the
@@ -29522,7 +29608,12 @@ fn a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload() {
 
     let chrome = launch_browser(chrome_binary());
     let tab = opened_tab(&chrome, "initial tab");
-    tab.navigate_to(&origin).expect("load Needs you");
+    // The notices strip is the same on every page, and these cases are
+    // about the socket rather than the deck: the plain list keeps the strip
+    // on screen, while the deck turns each notice into a toast that takes
+    // itself away after six seconds.
+    tab.navigate_to(&format!("{origin}all"))
+        .expect("load the open list");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
     // A marker only a document load can clear, so "without a reload" is
@@ -29607,7 +29698,12 @@ fn a_reconnected_notice_socket_in_real_chrome_does_not_replay_history() {
 
     let chrome = launch_browser(chrome_binary());
     let tab = opened_tab(&chrome, "initial tab");
-    tab.navigate_to(&origin).expect("load Needs you");
+    // The notices strip is the same on every page, and these cases are
+    // about the socket rather than the deck: the plain list keeps the strip
+    // on screen, while the deck turns each notice into a toast that takes
+    // itself away after six seconds.
+    tab.navigate_to(&format!("{origin}all"))
+        .expect("load the open list");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
 
@@ -29708,7 +29804,12 @@ fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
 
     let chrome = launch_browser(chrome_binary());
     let tab = opened_tab(&chrome, "initial tab");
-    tab.navigate_to(&origin).expect("load Needs you");
+    // The notices strip is the same on every page, and these cases are
+    // about the socket rather than the deck: the plain list keeps the strip
+    // on screen, while the deck turns each notice into a toast that takes
+    // itself away after six seconds.
+    tab.navigate_to(&format!("{origin}all"))
+        .expect("load the open list");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
 
@@ -29804,7 +29905,12 @@ fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
 
     let chrome = launch_browser(chrome_binary());
     let tab = opened_tab(&chrome, "initial tab");
-    tab.navigate_to(&origin).expect("load Needs you");
+    // The notices strip is the same on every page, and these cases are
+    // about the socket rather than the deck: the plain list keeps the strip
+    // on screen, while the deck turns each notice into a toast that takes
+    // itself away after six seconds.
+    tab.navigate_to(&format!("{origin}all"))
+        .expect("load the open list");
     tab.wait_until_navigated().expect("initial navigation");
     wait_for_live_status(&tab, "live", "first connect");
 
@@ -30433,6 +30539,9 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     );
     assert_no_horizontal_overflow(&tab, "task detail");
 
+    // The search box moved into the menu with the destinations, so reaching
+    // it is the same one tap.
+    open_nav_drawer(&tab);
     let search = tab
         .wait_for_element("[data-nav-search] input[name=q]")
         .expect("navigation search");
@@ -30974,6 +31083,10 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
     tab.wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
         .expect("final attention receipt");
     wait_for_projection_swap(&tab);
+    // The receipt is kept in the side history now, which on a narrow window
+    // is behind its own button: the decision is still one tap from the eye,
+    // and that tap is this one.
+    open_side_history(&tab);
     let receipt = tab
         .wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
         .expect("receipt after WebSocket-refreshed empty projection");
@@ -46124,5 +46237,790 @@ Only verified serving closes",
     assert_eq!(
         fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
         true
+    );
+}
+
+/// A long body: enough lines that the region holding it has to scroll on any
+/// screen, so "the body is the scroller" is measured rather than assumed.
+fn long_body(lead: &str) -> String {
+    let mut body = String::from(lead);
+    for line in 0..70 {
+        body.push_str(&format!(
+            "\n\nLine {line:02} of the long form, written out at the length a raiser writes it, \
+             so that the card's own body is taller than the region the deck gives it."
+        ));
+    }
+    body
+}
+
+/// Three open items on one board, each a full card with the same three
+/// choices, so a deck has a queue to walk.
+fn deck_fixture(label: &str, board: &str) -> (Fixture, Vec<String>) {
+    let fixture = Fixture::new(label);
+    fixture.ok_json(&fixture.main, &["init", "--name", board, "--json"]);
+    let mut ids = Vec::new();
+    for (index, priority) in ["0", "1", "2"].iter().enumerate() {
+        let item = raise_carded(
+            &fixture,
+            &long_body(&format!("Card {index} of the deck fixture.")),
+            "codex@driver",
+            &card_args(&["--kind", "blocking", "--priority", priority], &CARD),
+        );
+        ids.push(item["id"].as_str().expect("raised id").to_owned());
+    }
+    (fixture, ids)
+}
+
+/// What the deck measures to, on one viewport.
+const DECK_MEASURE: &str = r#"(() => {
+  const cards = [...document.querySelectorAll('article.item')];
+  const shown = cards.filter(card => card.checkVisibility());
+  const card = document.querySelector('article.item[data-current]');
+  const body = card.querySelector('details.full .body');
+  const decide = card.querySelector('form.decide');
+  const heading = card.querySelector('h2');
+  const round = value => Math.round(value);
+  return JSON.stringify({
+    width: innerWidth,
+    height: innerHeight,
+    shown: shown.length,
+    current: card.dataset.item,
+    pageScrollHeight: document.scrollingElement.scrollHeight,
+    pageScrollWidth: document.documentElement.scrollWidth,
+    bodyScrollHeight: body.scrollHeight,
+    bodyClientHeight: body.clientHeight,
+    decideBottom: round(decide.getBoundingClientRect().bottom),
+    decideHeight: round(decide.getBoundingClientRect().height),
+    headingTop: round(heading.getBoundingClientRect().top),
+    aside: document.querySelector('[data-side]').checkVisibility(),
+    toggle: document.querySelector('[data-history-toggle]').checkVisibility(),
+  });
+})()"#;
+
+/// One card at a time, and the only thing that scrolls is that card's body
+/// (George, 2026-09-17: "we are looking at one item at a time, with the
+/// scrollable being only the body of the text and the 4 questions and the
+/// optional note wisely having a bit of space at the bottom of the screen in
+/// a sticky way").
+///
+/// Measured on three screens, because this is a layout claim and a layout
+/// claim on one viewport is an anecdote: a phone, a tablet and a laptop
+/// window. On each one the page itself must not scroll in either direction,
+/// the long form must have more to show than it can fit, the answers must be
+/// on the screen, and the question must not have been pushed off the top of
+/// it.
+///
+/// The side history is the other half: a column of its own where there is
+/// room for one, and behind a button where there is not.
+#[test]
+fn the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture("serve-deck-scroll", "DECKSCROLL");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    for (width, height) in [(390, 844), (820, 1180), (1280, 800)] {
+        set_viewport(&tab, width, height);
+        // A resize is a relayout, and the measurement has to be of the
+        // relaid-out page rather than of the one before it.
+        wait_for_js_true(&tab, &format!("innerWidth === {width}"));
+        let measured: Value = serde_json::from_str(
+            js_value(&tab, DECK_MEASURE)
+                .as_str()
+                .expect("the deck measurement"),
+        )
+        .expect("the deck measurement parses");
+        eprintln!("deck at {width}x{height}: {measured}");
+        let number = |key: &str| measured[key].as_i64().unwrap_or_else(|| panic!("{key}"));
+        assert_eq!(measured["shown"], 1, "{measured}");
+        assert_eq!(measured["current"], ids[0].as_str(), "{measured}");
+        assert!(
+            number("pageScrollHeight") <= i64::from(height),
+            "the page itself scrolls at {width}x{height}: {measured}"
+        );
+        assert!(
+            number("pageScrollWidth") <= i64::from(width),
+            "the page overflows sideways at {width}x{height}: {measured}"
+        );
+        assert!(
+            number("bodyScrollHeight") > number("bodyClientHeight"),
+            "the long form is not the scroller at {width}x{height}: {measured}"
+        );
+        assert!(
+            number("decideBottom") <= i64::from(height),
+            "the answers are off the bottom of the screen at {width}x{height}: {measured}"
+        );
+        assert!(
+            number("decideHeight") > 0,
+            "the answers have no height at {width}x{height}: {measured}"
+        );
+        assert!(
+            number("headingTop") >= 0,
+            "the question is above the top of the screen at {width}x{height}: {measured}"
+        );
+        assert_eq!(
+            measured["aside"],
+            Value::Bool(width >= 900),
+            "the side history is a column only where there is room for one: {measured}"
+        );
+        assert_eq!(
+            measured["toggle"],
+            Value::Bool(width < 900),
+            "the side history's button is there only when the column is not: {measured}"
+        );
+    }
+
+    // Back on the phone, the menu is one button and one key, and Escape puts
+    // it away: eight destinations across the top is what the deck reclaimed.
+    set_viewport(&tab, 390, 844);
+    wait_for_js_true(&tab, "innerWidth === 390");
+    tab.press_key("m").expect("press m");
+    wait_for_js_true(&tab, "!document.querySelector('[data-drawer]').hidden");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-menu]').getAttribute('aria-expanded')"
+        ),
+        "true"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-nav=all]').getAttribute('href')"
+        ),
+        "/all",
+        "the menu has to hold the plain list, which is where the whole queue is"
+    );
+    tab.press_key("Escape").expect("press Escape");
+    wait_for_js_true(&tab, "document.querySelector('[data-drawer]').hidden");
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-backdrop]').hidden \
+             && document.querySelector('[data-menu]').getAttribute('aria-expanded') === 'false'"
+        ),
+        Value::Bool(true),
+        "the menu closed without taking its backdrop with it"
+    );
+}
+
+/// `1` sends the answer off and brings the next card, which is the whole
+/// point of a deck (George, 2026-09-17: "when i hit 1 it sends it off and
+/// gives me the next item via a quick animation").
+///
+/// The keystroke is the last input this case makes: this driver delivers one
+/// `press_key` as thousands of keydowns until one of them is prevented, so
+/// the page's own `preventDefault` is what makes a tap one decision -- and
+/// anything typed afterwards would be typed into a page still receiving the
+/// first key.
+#[test]
+fn pressing_1_sends_and_advances_to_the_next_card_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture("serve-deck-advance", "DECKNEXT");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let label = card_choices()[0]["label"].as_str().unwrap().to_owned();
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deck-position]').textContent + ' of ' \
+             + document.querySelector('[data-open-count]').textContent"
+        ),
+        "1 of 3"
+    );
+
+    hold_projection(&tab);
+    tab.press_key("1").expect("press 1");
+
+    // The side history is where a decision lands now: the card it was made
+    // on is gone and the next one is in its place. The receipt is read where
+    // it lies -- the history is off-canvas until its button is pressed on a
+    // narrow window, which hides it without unrendering it.
+    wait_for_js_true(
+        &tab,
+        "Boolean(document.querySelector('[data-history] [data-receipt]'))",
+    );
+    // The decision's own live refresh lands before anything else is asked of
+    // the page: a swap replaces every node in `<main>`, and a handle taken
+    // before it is a handle to a node that is no longer in the document.
+    wait_for_projection_swap(&tab);
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-history] [data-receipt]').textContent"
+        ),
+        format!("Decided: {label}. Undo")
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-current]').dataset.item"
+        ),
+        ids[1].as_str(),
+        "the deck did not advance to the next card"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deck-position]').textContent + ' of ' \
+             + document.querySelector('[data-open-count]').textContent"
+        ),
+        "1 of 2",
+        "the queue's position line disagrees with the queue"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('article.item[data-item=\"{}\"]') === null",
+                ids[0]
+            )
+        ),
+        Value::Bool(true),
+        "the decided card is still in the deck"
+    );
+    // One decision, not a thousand: the digit that arrived again and again
+    // for three seconds recorded exactly the card it was pressed on.
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    assert_eq!(
+        resolved.as_array().expect("resolved rows").len(),
+        1,
+        "{resolved}"
+    );
+    assert_eq!(resolved[0]["id"], ids[0].as_str(), "{resolved}");
+    assert_eq!(
+        resolved[0]["decision"]["choice"], "assign-and-login",
+        "{resolved}"
+    );
+    assert_eq!(resolved[0]["decision"]["outcome"], "approve", "{resolved}");
+    assert_eq!(resolved[0]["decision"]["by"], "geoyws", "{resolved}");
+}
+
+/// `s` puts a card at the back of the queue and shows the next one, with
+/// nothing recorded: the answer needs thinking about, and the rest of the
+/// queue should not wait for it.
+///
+/// Three skips of a three-card queue bring the first card round again, which
+/// is the difference between a skip and a dismissal.
+#[test]
+fn skip_moves_the_card_to_the_back_without_recording_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture("serve-deck-skip", "DECKSKIP");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let current = || {
+        js_value(
+            &tab,
+            "document.querySelector('[data-current]').dataset.item",
+        )
+    };
+
+    tab.press_key("s").expect("skip the first card");
+    wait_for_js_true(
+        &tab,
+        &format!(
+            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            ids[1]
+        ),
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deck-position]').textContent + ' of ' \
+             + document.querySelector('[data-open-count]').textContent"
+        ),
+        "1 of 3",
+        "a skip changed how much is open"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('[data-history] p').length"),
+        0,
+        "a skip left a receipt"
+    );
+
+    tab.press_key("s").expect("skip the second card");
+    wait_for_js_true(
+        &tab,
+        &format!(
+            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            ids[2]
+        ),
+    );
+    tab.press_key("s").expect("skip the third card");
+    wait_for_js_true(
+        &tab,
+        &format!(
+            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            ids[0]
+        ),
+    );
+    assert_eq!(current(), ids[0].as_str());
+
+    // Nothing was decided by any of it, and the board says so.
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open.as_array().expect("open rows").len(), 3, "{open}");
+    assert!(
+        open.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["decision"].is_null()),
+        "a skip recorded a decision: {open}"
+    );
+}
+
+/// A refused decision brings its card back, in a deck that has already moved
+/// on to the next one.
+///
+/// This is what the advance costs: the card leaves the queue the instant the
+/// POST is made, so a refusal has to put it back where it was -- on screen,
+/// with the board's own words on it, and with nothing left in the history
+/// claiming it was decided.
+#[test]
+fn a_refused_decision_brings_the_card_back_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture("serve-deck-refused", "DECKREFUSE");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    assert_eq!(
+        js_value(
+            &tab,
+            r#"(() => {
+  const real = window.fetch;
+  window.fetch = (input, init) => {
+    if (((init && init.method) || 'GET').toUpperCase() !== 'POST') return real.call(window, input, init);
+    return Promise.resolve(new Response('<p class=error>nope</p>', {status: 409}));
+  };
+  return true;
+})()"#
+        ),
+        true
+    );
+
+    tab.press_key("1").expect("press 1");
+
+    let form = format!(
+        "form.decide[action=\"/attention/DECKREFUSE/{}/reply\"]",
+        ids[0]
+    );
+    wait_for_js_true(
+        &tab,
+        &format!("Boolean(document.querySelector('{form} [data-refusal=board]'))"),
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{form} [data-refusal=board]').textContent")
+        ),
+        "nope",
+        "the card is not quoting what the board said"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-current]').dataset.item"
+        ),
+        ids[0].as_str(),
+        "a refused card did not come back as the card on screen"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deck-position]').textContent + ' of ' \
+             + document.querySelector('[data-open-count]').textContent"
+        ),
+        "1 of 3",
+        "a refusal left the queue counting a decision that never happened"
+    );
+    assert_eq!(
+        js_value(&tab, "document.querySelectorAll('[data-history] p').length"),
+        0,
+        "a refused decision left a row in the history"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "(() => { const card = document.querySelector('[data-current]'); \
+             return !card.dataset.state && !card.hasAttribute('aria-busy') && !card.dataset.sent; })()"
+        ),
+        Value::Bool(true),
+        "a refused card is still marked as sending"
+    );
+    let open = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open.as_array().expect("open rows").len(), 3, "{open}");
+}
+
+/// Every receipt of this sitting collects in the side history, newest first,
+/// and each one still undoes.
+///
+/// The receipt used to sit where the card had been, which on a deck is where
+/// the NEXT card is: a decision would either overwrite the card in front of
+/// the operator or vanish. So the decisions get their own place, with a
+/// count on the button that opens it where there is no room for a column.
+#[test]
+fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let (fixture, ids) = deck_fixture("serve-deck-history", "DECKHIST");
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    set_viewport(&tab, 390, 844);
+    wait_for_js_true(&tab, "innerWidth === 390");
+    let second = card_choices()[1]["label"].as_str().unwrap().to_owned();
+    let rows = "[...document.querySelectorAll('[data-history] [data-receipt]')].map(row => row.dataset.item).join(',')";
+
+    // Clicks, not keys: two decisions in one sitting, each on the card the
+    // deck put in front of the operator.
+    hold_projection(&tab);
+    click_control(
+        &tab,
+        "[data-current] form.decide fieldset.recommended button.choice",
+    );
+    wait_for_js_true(
+        &tab,
+        "document.querySelectorAll('[data-history] [data-receipt]').length === 1",
+    );
+    // The first decision's own live refresh replaces every node in `<main>`,
+    // so the second card is only safe to click once that swap has landed.
+    wait_for_projection_swap(&tab);
+    hold_projection(&tab);
+    click_control(
+        &tab,
+        "[data-current] form.decide .alternative button.choice[value=keep-parked]",
+    );
+    wait_for_js_true(
+        &tab,
+        "document.querySelectorAll('[data-history] [data-receipt]').length === 2",
+    );
+
+    // Newest first: the decision just made reads at the top.
+    assert_eq!(
+        js_value(&tab, rows),
+        format!("{},{}", ids[1], ids[0]),
+        "the history is not newest first"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-history] [data-receipt]').textContent"
+        ),
+        format!("Decided: {second}. Undo")
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-history-count]').textContent"
+        ),
+        "2",
+        "the button that opens the history does not say how much is in it"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-current]').dataset.item"
+        ),
+        ids[2].as_str()
+    );
+
+    // The older row undoes from where it is, and leaves the history when it
+    // does: the item is open again and back in the deck.
+    wait_for_projection_swap(&tab);
+    open_side_history(&tab);
+    click_control(
+        &tab,
+        &format!(
+            "[data-history] [data-receipt=\"{}\"] button[data-undo]",
+            ids[0]
+        ),
+    );
+    wait_for_js_true(
+        &tab,
+        &format!(
+            "document.querySelectorAll('[data-history] [data-receipt]').length === 1 \
+             && Boolean(document.querySelector('article.item[data-item=\"{}\"]'))",
+            ids[0]
+        ),
+    );
+    assert_eq!(js_value(&tab, rows), ids[1].as_str());
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-history-count]').textContent"
+        ),
+        "1"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-current]').dataset.item"
+        ),
+        ids[0].as_str(),
+        "an undo has to put the card it brought back in front of the operator"
+    );
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    let row = reopened
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == ids[0].as_str())
+        .unwrap_or_else(|| panic!("{} did not come back open: {reopened}", ids[0]));
+    assert_eq!(row["decision"], Value::Null, "{row}");
+    assert_eq!(row["reopenedBy"], "geoyws", "{row}");
+    // The other decision is untouched by the undo of the first.
+    let resolved = settled_row(&fixture, &ids[1]);
+    assert_eq!(resolved["decision"]["choice"], "keep-parked", "{resolved}");
+}
+
+/// `/all` is the queue as one plain list: every card, in order, with no deck
+/// laid over it.
+///
+/// It is the page the deck was made out of, and it stays because a deck is a
+/// bad way to read a queue of 133: the list is where the whole thing is
+/// visible at once, and where a browser with no script lands.
+#[test]
+fn the_all_route_keeps_the_plain_list_in_real_chrome_or_http() {
+    let (fixture, ids) = deck_fixture("serve-deck-all", "DECKALL");
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let (status, list) = http_get(port, "/all");
+    assert_eq!(status, 200, "{list}");
+    for id in &ids {
+        assert!(
+            list.contains(&format!("data-item=\"{id}\"")),
+            "the list is missing {id}: {list}"
+        );
+    }
+    assert!(
+        list.contains("<main id=main>"),
+        "the list is a deck: {list}"
+    );
+    assert!(
+        list.contains("<p class=count><span data-open-count>3</span> open across 1 board."),
+        "{list}"
+    );
+    assert!(
+        list.contains("<p class=explain>Each card is one question an agent is waiting on."),
+        "{list}"
+    );
+    // The page script and stylesheet are the same on every page and both
+    // name the deck's hooks, so what says this page is not a deck is the
+    // markup: no deck `<main>` and no deck wrapper around the cards.
+    assert!(
+        !list.contains("<section class=deck data-deck-cards>"),
+        "the list renders the deck's own wrapper: {list}"
+    );
+
+    // The deck serves the same cards from the same loop: one renderer, so the
+    // order the operator answers in cannot drift from the order the list
+    // shows.
+    let (status, deck) = http_get(port, "/");
+    assert_eq!(status, 200, "{deck}");
+    assert!(deck.contains("<main id=main data-deck>"), "{deck}");
+    assert!(
+        deck.contains("<section class=deck data-deck-cards>"),
+        "{deck}"
+    );
+    for id in &ids {
+        assert_eq!(
+            card_markup(&deck, id),
+            card_markup(&list, id),
+            "the deck and the list render different cards for {id}"
+        );
+    }
+}
+
+/// Deciding the LAST card says so at once.
+///
+/// The card leaves the deck the instant its answer is posted, so on the last
+/// one the deck went blank -- no card, no empty state, a progress line
+/// reading `0 of 1` -- for the length of a round trip, and longer if the
+/// board was slow. The sentence the server ends the queue with is shipped
+/// with the deck as a template so the page can say it without waiting.
+#[test]
+fn the_last_card_leaves_the_empty_state_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-deck-empty");
+    fixture.ok_json(&fixture.main, &["init", "--name", "DECKEMPTY", "--json"]);
+    let item = raise_carded(
+        &fixture,
+        &long_body("The only card in the queue."),
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = item["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+    let empty_shown = "(() => { const empty = document.querySelector('[data-deck-cards] .empty'); \
+                       return Boolean(empty) && empty.checkVisibility(); })()";
+    assert_eq!(js_value(&tab, empty_shown), Value::Bool(false));
+
+    hold_projection(&tab);
+    tab.press_key("1").expect("press 1");
+
+    // Within the animation and well inside a round trip: the deck never
+    // shows an empty frame with nothing in it.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while js_value(&tab, empty_shown) != Value::Bool(true) {
+        assert!(
+            Instant::now() < deadline,
+            "the emptied deck said nothing for 300ms: {}",
+            js_value(
+                &tab,
+                "document.querySelector('[data-deck-cards]').innerHTML.slice(0, 400)"
+            )
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-deck-cards] .empty').textContent"
+        ),
+        "Nothing is waiting. An empty list here means every raised item has been settled."
+    );
+    // The position line is gone rather than counting a queue that is not
+    // there, and the decision is on screen in the history.
+    assert_eq!(
+        js_value(&tab, "document.querySelector('.deck-head').hidden"),
+        Value::Bool(true),
+        "the progress line is still counting an empty queue"
+    );
+    wait_for_js_true(&tab, "Boolean(document.querySelector('[data-history] p'))");
+
+    // And it survives the settle: the server's own empty state arrives with
+    // the swap, and there is exactly one of them.
+    wait_for_projection_swap(&tab);
+    assert_eq!(js_value(&tab, empty_shown), Value::Bool(true));
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelectorAll('[data-deck-cards] .empty').length"
+        ),
+        1,
+        "the page and the server both rendered an empty state"
+    );
+    assert_receipt(&tab, id, card_choices()[0]["label"].as_str().unwrap());
+    let row = settled_row(&fixture, id);
+    assert_eq!(row["decision"]["choice"], "assign-and-login", "{row}");
+}
+
+/// With no script, `/` is still the list it is served as.
+///
+/// The deck is one card because the script hides the others, so every rule
+/// that lays it out is behind `html.js`. Without that scope the same markup
+/// got a viewport-height column with `overflow:hidden` and a flex row of
+/// cards -- one crushed card and no way to the rest -- which is every open
+/// item unreachable on the page whose whole job is to reach them.
+#[test]
+fn the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http() {
+    let (fixture, ids) = deck_fixture("serve-deck-nojs", "DECKNOJS");
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let (status, deck) = http_get(port, "/");
+    assert_eq!(status, 200, "{deck}");
+    // Nothing is hidden in the served markup, and every card carries its own
+    // form: what a scriptless browser needs is a list and a submit.
+    for id in &ids {
+        let card = card_markup(&deck, id);
+        // The card element itself, not its contents: the clear-verdict
+        // button inside it is rendered hidden on purpose, and a script is
+        // what reveals it.
+        let element = &card[..card.find('>').expect("the card element opens")];
+        assert!(
+            !element.contains("hidden"),
+            "a served card is hidden from a browser that cannot unhide it: {element}"
+        );
+        assert!(
+            card.contains(&format!(
+                "<form class=decide method=post action=\"/attention/DECKNOJS/{id}/reply\">"
+            )),
+            "{card}"
+        );
+    }
+    // And the layout that turns those cards into a deck names the class the
+    // script sets, so none of it applies until the script has run.
+    assert!(
+        deck.contains("html.js .deck{"),
+        "the deck layout is unscoped"
+    );
+    assert!(
+        deck.contains("document.documentElement.classList.add('js');"),
+        "nothing sets the class the deck layout is scoped to"
+    );
+
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "scriptless tab");
+    tab.call_method(Emulation::SetScriptExecutionDisabled { value: true })
+        .expect("disable script execution");
+    tab.navigate_to(&server.origin()).expect("load Needs you");
+    tab.wait_until_navigated().expect("initial navigation");
+    tab.wait_for_element("article.item").expect("a card");
+    let measured: Value = serde_json::from_str(
+        js_value(
+            &tab,
+            "JSON.stringify({\
+             shown: [...document.querySelectorAll('article.item')].filter(card => card.checkVisibility()).length, \
+             scrolls: document.scrollingElement.scrollHeight > innerHeight, \
+             overflows: document.documentElement.scrollWidth > innerWidth, \
+             submits: document.querySelectorAll('form.decide button.choice').length, \
+             navShown: document.querySelector('[data-nav=all]').checkVisibility(), \
+             navRect: (() => { const r = document.querySelector('[data-nav=all]').getBoundingClientRect(); \
+             return {width: Math.round(r.width), height: Math.round(r.height)}; })(), \
+             searchShown: document.querySelector('[data-nav-search] input[name=q]').checkVisibility()})",
+        )
+        .as_str()
+        .expect("the scriptless measurement"),
+    )
+    .expect("the scriptless measurement parses");
+    eprintln!("no-script /: {measured}");
+    assert_eq!(measured["shown"], 3, "{measured}");
+    assert_eq!(measured["scrolls"], Value::Bool(true), "{measured}");
+    assert_eq!(measured["overflows"], Value::Bool(false), "{measured}");
+    assert!(
+        measured["submits"].as_i64().unwrap_or(0) >= 9,
+        "every card's answers have to be there to press: {measured}"
+    );
+    // The destinations too: the menu is a button a script opens, so without
+    // one the drawer has to be a strip of links that is simply there. The
+    // `[hidden]` attribute the script manages loses to that, which needs
+    // saying in CSS because the UA rule for `[hidden]` says it too.
+    assert_eq!(measured["navShown"], Value::Bool(true), "{measured}");
+    assert_eq!(measured["searchShown"], Value::Bool(true), "{measured}");
+    assert!(
+        measured["navRect"]["width"].as_i64().unwrap_or(0) > 0
+            && measured["navRect"]["height"].as_i64().unwrap_or(0) > 0,
+        "a link with no box is a link nobody can press: {measured}"
     );
 }
