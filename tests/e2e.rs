@@ -18177,6 +18177,38 @@ const CARD: [&str; 18] = [
     "assign-and-login",
 ];
 
+/// The card George was looking at on 2026-09-18, at the bounds: a question
+/// of exactly 160 characters, 793 of context, and FOUR choices each with its
+/// consequence. This is the shape that broke the deck — the two-column
+/// answers squeezed a 46-character label onto four lines, and the context as
+/// a free block in the card's column pushed the recommended answer off the
+/// first screen of a 390×844 phone. Nothing measures a layout like the
+/// longest thing the product accepts.
+const LONG_CARD: [&str; 22] = [
+    "--question",
+    "Which fix first: strip the upgrade header at the nginx edge, or teach the server to ignore it on non-upgrade routes, and does the other one follow as hardening?",
+    "--context",
+    "Measured 2026-09-17 on hax: every card click between 09:09 and 09:11 got a 504 after 75 s, and it reproduced at loopback with the header alone. The nginx vhost proxies every request to kanban-serve on loopback 14200 and the websocket upgrade header is a fixed string added for the live line; the server treats that header as hand the handler the raw socket, so a reply POST that carried it waited 75 seconds and then answered 504. Two fixes are possible and they are not equivalent: strip the header at the edge for everything but /live, or teach the server to ignore it on non-upgrade routes. The first ships in minutes and leaves the server trusting its edge; the second is a release proven on hax first. Only you can pick the order, and nothing else is waiting on it.",
+    "--choice",
+    "edge-now=Edge now, server hardening as a follow-up task|approve",
+    "--consequence",
+    "edge-now=Fast fix plus a durable one; the edge stops sending the header today and the server stops trusting it in the next release, which costs a second release.",
+    "--choice",
+    "edge-only=Strip the header at nginx for everything but /live|approve",
+    "--consequence",
+    "edge-only=Ships in minutes; the server keeps trusting its edge and a future edge misconfiguration would reopen the hole on every reply POST.",
+    "--choice",
+    "server-only=Teach the server to ignore the header on non-upgrade routes|approve",
+    "--consequence",
+    "server-only=A release through the container gate, proven on hax and hig first; the queue stays broken until that release lands.",
+    "--choice",
+    "wait-for-spa=Leave it until the SPA cutover replaces the server|defer",
+    "--consequence",
+    "wait-for-spa=The queue stays unsafe for the weeks the cutover takes, and every reply POST that carries the header goes on waiting 75 seconds.",
+    "--recommend",
+    "edge-now",
+];
+
 /// What `--choice keep-parked` composes from [`CARD`]: the label, then the
 /// consequence.
 const KEEP_PARKED: &str = "Decision: Keep it parked until a seat frees up. Nothing changes and \
@@ -25827,7 +25859,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "value=\"assign-and-login\" data-label=\"Assign a Claude seat to hax and log in\"",
             "<span class=key>1</span>",
             "<p class=consequence>You buy or free one Claude seat",
-            "<div class=alternatives>",
+            "<div class=alternatives data-testid=deck-answers>",
             "value=\"keep-parked\"",
             "<span class=key>2</span>",
             "value=\"drop-receipt\"",
@@ -25841,7 +25873,7 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
             "name=outcome value=other>",
             "name=decision value=custom>Record my answer",
             "<details class=full><summary>show the full item</summary>",
-            "<div class=\"body md\"><p>PARKED - until an account is assigned",
+            "<div class=\"body md\" data-testid=deck-body><p>PARKED - until an account is assigned",
             "<p class=meta>",
             "class=\"priority priority-p0\"",
         ],
@@ -25877,7 +25909,9 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     // The deck's keyboard map is one quiet line with no badges (WEB-27), and
     // it carries the one key only a deck has: the skip.
     assert!(
-        home.contains("<p class=keys>1–4 answer · s skip · u undo · c own</p>"),
+        home.contains(
+            "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>"
+        ),
         "{home}"
     );
     // The plain list keeps its own quiet map (no skip: every card is on
@@ -26171,6 +26205,19 @@ mod ui {
     pub const HISTORY_TOGGLE: &str = "[data-history-toggle]";
     pub const HISTORY_COUNT: &str = "[data-history-count]";
     pub const SIDE: &str = "[data-side]";
+    /// The nodes the 2026-09-18 responsiveness delta measures, each named by
+    /// the `data-testid` the server writes on it rather than by its class or
+    /// its text: a layout assertion that selects on prose breaks when the
+    /// prose is rewritten, which is exactly the churn px t-bcd482e3 banned.
+    pub const DECK_PANEL: &str = "[data-testid=deck-panel]";
+    pub const DECK_ANSWERS: &str = "[data-testid=deck-answers]";
+    /// Every answer button on the card, recommended one included.
+    pub const DECK_CHOICES: &str = "[data-testid^=\"deck-choice-\"]";
+    pub const DECK_NOTE: &str = "[data-testid=deck-note]";
+    pub const DECK_KEYS: &str = "[data-testid=deck-keys]";
+    pub const DECK_BODY: &str = "[data-testid=deck-body]";
+    /// The priority pill, wherever the deck has put it.
+    pub const DECK_PRIORITY: &str = "[data-testid=deck-priority]";
 
     /// `[data-testid="<id>"]` -- the readiness hook a client mount can offer
     /// that is neither a sleep nor a text match.
@@ -26248,6 +26295,13 @@ mod ui {
         ("__HISTORY_COUNT__", HISTORY_COUNT),
         ("__HISTORY__", HISTORY),
         ("__SIDE__", SIDE),
+        ("__DECK_PANEL__", DECK_PANEL),
+        ("__DECK_ANSWERS__", DECK_ANSWERS),
+        ("__DECK_CHOICES__", DECK_CHOICES),
+        ("__DECK_NOTE__", DECK_NOTE),
+        ("__DECK_KEYS__", DECK_KEYS),
+        ("__DECK_BODY__", DECK_BODY),
+        ("__DECK_PRIORITY__", DECK_PRIORITY),
     ];
 }
 
@@ -26898,7 +26952,8 @@ fn card_args<'a>(fixed: &[&'a str], card: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Click one control after scrolling it to the middle of the viewport, and
-/// only once the browser's own hit test says the click will land on it.
+/// only once the browser's own hit test says the click will land on it --
+/// then prove it landed there.
 ///
 /// The keyboard-hint bar is pinned to the bottom of the viewport, so a
 /// control that happens to sit beneath it cannot be tapped where it is: a
@@ -26906,7 +26961,7 @@ fn card_args<'a>(fixed: &[&'a str], card: &[&'a str]) -> Vec<&'a str> {
 /// click lands on the bar and the page does nothing, which is a fact about
 /// any bottom toolbar rather than about this one. `scrollIntoView` walks
 /// every scrollable ancestor, which is what reaches a control inside the
-/// deck's answer panel -- the panel scrolls itself when a card's answers are
+/// deck's card column -- the card scrolls itself when what it holds is
 /// taller than the screen has left.
 ///
 /// The hit test is the part worth having. `Element::click` asks Chrome for
@@ -26915,6 +26970,16 @@ fn card_args<'a>(fixed: &[&'a str], card: &[&'a str]) -> Vec<&'a str> {
 /// nothing about WHY, and a control with no quads is usually a control on a
 /// card the deck is not showing. Measuring it here turns that into a
 /// sentence naming what is in the way.
+///
+/// The click is aimed at the point this probe just measured, rather than at
+/// whatever `Element::click` measures for itself a round trip later. Since
+/// 2026-09-18 the deck's one scroller is the CARD, so a control below the
+/// fold is only under the pointer while that scroller stays where the probe
+/// left it -- and a projection swap, which a `/live` notice can land at any
+/// moment, puts it back to the top and moves the control hundreds of pixels.
+/// A click that misses is retried rather than reported as a page that did
+/// nothing: the probe arms a one-shot listener on the control, and the
+/// landing is read back off it.
 fn click_control(tab: &headless_chrome::Tab, selector: &str) {
     const REACH: &str = "(() => { const el = document.querySelector('__SELECTOR__'); \
          if (!el) return JSON.stringify({state: 'missing'}); \
@@ -26924,16 +26989,32 @@ fn click_control(tab: &headless_chrome::Tab, selector: &str) {
          visible: el.checkVisibility(), onHiddenCard: Boolean(el.closest('__HIDDEN_CARD__'))}); \
          const x = box.left + box.width / 2, y = box.top + box.height / 2; \
          const hit = document.elementFromPoint(x, y); \
-         if (hit && (hit === el || el.contains(hit) || hit.contains(el))) \
-         return JSON.stringify({state: 'ready'}); \
-         return JSON.stringify({state: 'obscured', by: hit ? hit.outerHTML.slice(0, 120) : null}); })()";
+         if (!(hit && (hit === el || el.contains(hit) || hit.contains(el)))) \
+         return JSON.stringify({state: 'obscured', by: hit ? hit.outerHTML.slice(0, 120) : null}); \
+         window.__clickLanded = false; \
+         el.addEventListener('click', () => { window.__clickLanded = true; }, {once: true}); \
+         return JSON.stringify({state: 'ready', x, y}); })()";
     let reach = REACH.replace("__SELECTOR__", selector);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let state = js_value(tab, &reach);
-        let state = state.as_str().unwrap_or("{}");
+        let state = state.as_str().unwrap_or("{}").to_owned();
         if state.contains("\"ready\"") {
-            break;
+            let aim: Value = serde_json::from_str(&state).expect("the reach measurement parses");
+            let point = headless_chrome::browser::tab::point::Point {
+                x: aim["x"].as_f64().expect("the aim's x"),
+                y: aim["y"].as_f64().expect("the aim's y"),
+            };
+            tab.click_point(point)
+                .unwrap_or_else(|error| panic!("click {selector} at {point:?}: {error}"));
+            if js_value(tab, "Boolean(window.__clickLanded)") == Value::Bool(true) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{selector} never received the click aimed at {point:?}"
+            );
+            continue;
         }
         assert!(
             Instant::now() < deadline,
@@ -26941,10 +27022,6 @@ fn click_control(tab: &headless_chrome::Tab, selector: &str) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    tab.wait_for_element(selector)
-        .unwrap_or_else(|error| panic!("missing {selector}: {error}"))
-        .click()
-        .unwrap_or_else(|error| panic!("click {selector}: {error}"));
 }
 
 /// Unfold one card's free-text answer, the way a thumb does: a click on the
@@ -46736,23 +46813,35 @@ const DECK_MEASURE: &str = r#"(() => {
     contextOverflow: getComputedStyle(context).overflowY,
     cardTop: round(card.getBoundingClientRect().top),
     cardBottom: round(card.getBoundingClientRect().bottom),
+    cardScrollHeight: card.scrollHeight,
+    cardClientHeight: card.clientHeight,
     aside: document.querySelector('__SIDE__').checkVisibility(),
     toggle: document.querySelector('__HISTORY_TOGGLE__').checkVisibility(),
   });
 })()"#;
 
-/// One card at a time, and the only thing that scrolls is that card's body
-/// (George, 2026-09-17: "we are looking at one item at a time, with the
-/// scrollable being only the body of the text and the 4 questions and the
-/// optional note wisely having a bit of space at the bottom of the screen in
-/// a sticky way").
+/// One card at a time, the long form scrolling inside its own region, and
+/// the card's own column the one thing that takes the overflow (George,
+/// 2026-09-17: "we are looking at one item at a time, with the scrollable
+/// being only the body of the text and the 4 questions and the optional note
+/// wisely having a bit of space at the bottom of the screen in a sticky
+/// way").
+///
+/// Superseded 2026-09-18: this case used to require the answer panel's
+/// bottom edge to be inside the viewport, which the panel bought by capping
+/// itself at three fifths of the card and scrolling its own answers -- the
+/// nested scroller that put the note off a 390x844 phone. The panel is a
+/// block at the foot of the card's column now, so what is asserted here is
+/// that it is REACHABLE inside that column; that scrolling there actually
+/// lands the note and the answers on screen is
+/// `the_deck_answers_stack_and_the_note_is_reached_by_one_scroller_at_three_widths_in_real_chrome`.
 ///
 /// Measured on three screens, because this is a layout claim and a layout
 /// claim on one viewport is an anecdote: a phone, a tablet and a laptop
 /// window. On each one the page itself must not scroll in either direction,
 /// the long form must have more to show than it can fit, the answers must be
-/// on the screen, and the question must not have been pushed off the top of
-/// it.
+/// inside the card's own scroll extent, and the question must not have been
+/// pushed off the top of the screen.
 ///
 /// The side history is the other half: a column of its own where there is
 /// room for one, and behind a button where there is not.
@@ -46793,9 +46882,13 @@ fn the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome() {
             number("bodyScrollHeight") > number("bodyClientHeight"),
             "the long form is not the scroller at {width}x{height}: {measured}"
         );
+        // The panel's foot IS the foot of the card's scroll content, so this
+        // is an equality with a pixel of slack: every rect here is rounded
+        // to whole pixels and two of them are subtracted.
         assert!(
-            number("decideBottom") <= i64::from(height),
-            "the answers are off the bottom of the screen at {width}x{height}: {measured}"
+            number("decideBottom") - number("cardTop") <= number("cardScrollHeight") + 1,
+            "the answers are outside the card's own scroll extent, so no amount of \
+             scrolling reaches them at {width}x{height}: {measured}"
         );
         assert!(
             number("decideHeight") > 0,
@@ -46865,6 +46958,446 @@ fn the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome() {
         ),
         Value::Bool(true),
         "the menu closed without taking its backdrop with it"
+    );
+}
+
+/// What one card measures to once the answers stack and the card's own
+/// column is the one scroller (2026-09-18).
+///
+/// The headline's line count is its height over its computed `line-height`
+/// and not `getClientRects().length`: `h2` is a block, so it has exactly one
+/// client rect however many lines of text are inside it.
+const DECK_STACK_MEASURE: &str = r#"(() => {
+  const card = document.querySelector('__CURRENT_CARD__');
+  const panel = card.querySelector('__DECK_PANEL__');
+  const answers = card.querySelector('__DECK_ANSWERS__');
+  const choices = [...card.querySelectorAll('__DECK_CHOICES__')];
+  const note = card.querySelector('__DECK_NOTE__');
+  const keys = document.querySelector('__DECK_KEYS__');
+  const body = card.querySelector('__DECK_BODY__');
+  const lead = card.querySelector('fieldset.recommended __DECK_CHOICES__');
+  const context = card.querySelector('p.context');
+  const heading = card.querySelector('h2');
+  const pill = card.querySelector('__DECK_PRIORITY__');
+  // What, if anything, has text in the band between the foot of the long
+  // form and the head of the answer panel. Ancestors of either span the
+  // band by definition and their descendants are inside one of them, so the
+  // only nodes left are the ones that really sit in the gap -- which is
+  // where the priority pill used to sit, directly under text dissolving
+  // into the fade.
+  const bandOccupants = () => {
+    const from = body.getBoundingClientRect().bottom;
+    const to = panel.getBoundingClientRect().top;
+    return [...card.querySelectorAll('*')]
+      .filter(node => node !== body && node !== panel
+        && !node.contains(body) && !node.contains(panel)
+        && !body.contains(node) && !panel.contains(node)
+        && (node.textContent || '').trim().length > 0
+        && node.checkVisibility())
+      .map(node => ({node, box: node.getBoundingClientRect()}))
+      .filter(({box}) => box.height > 0 && box.bottom > from + 0.5 && box.top < to - 0.5)
+      .map(({node}) => `${node.tagName.toLowerCase()}.${node.className}=`
+        + (node.textContent || '').trim().slice(0, 40));
+  };
+  const round = value => Math.round(value);
+  const rect = el => {
+    const box = el.getBoundingClientRect();
+    return {top: round(box.top), bottom: round(box.bottom), left: round(box.left),
+            right: round(box.right), width: round(box.width), height: round(box.height)};
+  };
+  const style = getComputedStyle(heading);
+  return JSON.stringify({
+    width: innerWidth,
+    height: innerHeight,
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+    cardScrollTop: round(card.scrollTop),
+    cardScrollHeight: card.scrollHeight,
+    cardClientHeight: card.clientHeight,
+    panel: rect(panel),
+    panelScrollHeight: panel.scrollHeight,
+    panelClientHeight: panel.clientHeight,
+    answers: rect(answers),
+    choices: choices.map(choice => Object.assign({id: choice.dataset.testid}, rect(choice))),
+    lead: rect(lead),
+    contextInBody: Boolean(context) && context.parentElement === body,
+    note: rect(note),
+    pill: rect(pill),
+    band: bandOccupants(),
+    keys: rect(keys),
+    body: Object.assign(rect(body),
+      {scrollHeight: body.scrollHeight, clientHeight: body.clientHeight}),
+    heading: rect(heading),
+    headingLines: Math.round(heading.getBoundingClientRect().height
+      / parseFloat(style.lineHeight)),
+    headingFontSize: style.fontSize,
+  });
+})()"#;
+
+/// Scroll the current card's own column to its end and report where it
+/// landed, which is the one gesture that reaches the note now.
+const SCROLL_CARD_TO_END: &str = "(() => { \
+     const card = document.querySelector('__CURRENT_CARD__'); \
+     card.scrollTo(0, card.scrollHeight); return Math.round(card.scrollTop); })()";
+
+/// Put the current card's column back to its top, which is where the deck
+/// opens a card: the sweep scrolls it to its end at every width, so the next
+/// width has to start from the same place a reader does.
+const SCROLL_CARD_TO_TOP: &str = "(() => { \
+     const card = document.querySelector('__CURRENT_CARD__'); \
+     card.scrollTo(0, 0); return Math.round(card.scrollTop); })()";
+
+/// WEB-47, WEB-35, WEB-02 as superseded on 2026-09-18 — one answer per row,
+/// one scroller, and the note reached by it.
+///
+/// George, 2026-09-18, on the served deck: "it's up but it's squished and
+/// not mobile responsive"; "the web version looks mushed up ... (iPad has it
+/// squished up)". What was measured then: the answers were a two-column grid
+/// of 177px buttons with three- and four-line labels on a 390px phone, and
+/// the panel was capped at three fifths of the card and scrolled its own
+/// content, which put the note field at y=961 on an 844px screen with
+/// nothing to say it was there and cut the fourth answer at the cap.
+///
+/// So this case measures the whole claim on the three screens George decides
+/// on: every answer on a row of its own at the card's full content width,
+/// nothing scrolling inside the panel, the long form still scrolling inside
+/// its own region and never reaching over the answers, the keyboard line on
+/// screen throughout, the RECOMMENDED answer on the screen the card opens
+/// on, and the note landing fully inside the viewport and above the keyboard
+/// line once the card's own column is scrolled to its end.
+///
+/// Two cards, because a layout claim proved on the short one is a claim
+/// about the short one: the shipped fixture card (133-char question, 452 of
+/// context, three answers) and [`LONG_CARD`], which is the product's own
+/// bounds — 160-char question, 793 of context, four answers. The long one is
+/// why the raiser's context moved inside the body region: as a free block it
+/// put the recommendation two scrolls down on a phone.
+#[test]
+fn the_deck_answers_stack_and_the_note_is_reached_by_one_scroller_at_three_widths_in_real_chrome() {
+    let desk = deck_stack_desk("serve-deck-stack", "DECKSTACK");
+    let num = |value: &Value| {
+        value
+            .as_i64()
+            .unwrap_or_else(|| panic!("a measured number, not {value}"))
+    };
+    let current_item = || {
+        js_value(
+            &desk.tab,
+            "document.querySelector('__CURRENT_CARD__').dataset.item",
+        )
+        .as_str()
+        .expect("the current card's item")
+        .to_owned()
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for card in 0..2 {
+        let item = current_item();
+        eprintln!("the stacked deck is showing {item}");
+        // The deck opens a card at its top, and that is not something the
+        // sweep below arranged: this card has never been scrolled.
+        let opened = measure(
+            &desk.tab,
+            DECK_STACK_MEASURE,
+            "the card as the deck opened it",
+        );
+        assert_eq!(
+            num(&opened["cardScrollTop"]),
+            0,
+            "the deck opened {item} part-way down: {opened}"
+        );
+        // The raiser's context is the body region's first block, which is
+        // what keeps the answers on the first screen.
+        assert_eq!(
+            opened["contextInBody"],
+            Value::Bool(true),
+            "the context is not inside the card's body region on {item}: {opened}"
+        );
+        for (width, height) in [(390_u32, 844_u32), (820, 1180), (1280, 800)] {
+            set_viewport_with(&desk.tab, width, height, width < 700);
+            wait_for_js_true(&desk.tab, &format!("innerWidth === {width}"));
+            js_value(&desk.tab, SCROLL_CARD_TO_TOP);
+            let at = measure(&desk.tab, DECK_STACK_MEASURE, "the stacked deck");
+            eprintln!("the stacked deck ({item}) at {width}x{height}: {at}");
+            assert_eq!(num(&at["cardScrollTop"]), 0, "{at}");
+
+            // (i) Nothing overflows sideways at any of the three widths.
+            assert_eq!(
+                num(&at["scrollWidth"]),
+                i64::from(width),
+                "the deck overflows sideways at {width}x{height}: {at}"
+            );
+            assert_eq!(num(&at["clientWidth"]), i64::from(width), "{at}");
+
+            // (ii) One answer per row, each as wide as the answers' own column.
+            let choices = at["choices"].as_array().expect("the answer buttons");
+            assert!(
+                choices.len() >= 3,
+                "the card carries too few answers to prove a stack: {at}"
+            );
+            let answers_width = num(&at["answers"]["width"]);
+            for choice in choices {
+                assert!(
+                    (num(&choice["width"]) - answers_width).abs() <= 1,
+                    "an answer is not the width of the card's answers at \
+                 {width}x{height}: {choice} in {at}"
+                );
+            }
+            for (index, choice) in choices.iter().enumerate() {
+                for other in &choices[index + 1..] {
+                    assert!(
+                        num(&choice["bottom"]) <= num(&other["top"])
+                            || num(&other["bottom"]) <= num(&choice["top"]),
+                        "two answers share a row at {width}x{height}: {choice} and {other}"
+                    );
+                }
+            }
+
+            // (iii) The panel is not a scroller of its own any more.
+            assert_eq!(
+                num(&at["panelScrollHeight"]),
+                num(&at["panelClientHeight"]),
+                "the answer panel scrolls its own content at {width}x{height}: {at}"
+            );
+
+            // (iv) The keyboard line is on screen before the card is scrolled,
+            // and (vi) the long form scrolls inside its own region without
+            // reaching over the answers.
+            assert!(
+                num(&at["keys"]["top"]) >= 0 && num(&at["keys"]["bottom"]) <= i64::from(height),
+                "the keyboard line is off the screen at {width}x{height}: {at}"
+            );
+            assert!(
+                num(&at["body"]["scrollHeight"]) > num(&at["body"]["clientHeight"]),
+                "the long form is not the scroller of its own region at \
+             {width}x{height}: {at}"
+            );
+            assert!(
+                num(&at["body"]["bottom"]) <= num(&at["panel"]["top"]),
+                "the long form reaches over the answers at {width}x{height}: {at}"
+            );
+
+            // (v) One scroller, and it reaches the note.
+            let landed = js_value(&desk.tab, SCROLL_CARD_TO_END);
+            eprintln!("the card's column scrolled to {landed} at {width}x{height}");
+            let ended = measure(&desk.tab, DECK_STACK_MEASURE, "the stacked deck, scrolled");
+            eprintln!("the stacked deck scrolled to its end at {width}x{height}: {ended}");
+            assert_eq!(
+                num(&ended["cardScrollTop"]),
+                num(&ended["cardScrollHeight"]) - num(&ended["cardClientHeight"]),
+                "the card's own column did not reach its end at {width}x{height}: {ended}"
+            );
+            assert!(
+                num(&ended["note"]["top"]) >= 0
+                    && num(&ended["note"]["bottom"]) <= i64::from(height),
+                "the note is not on the screen after one scroll at {width}x{height}: {ended}"
+            );
+            assert!(
+                num(&ended["note"]["bottom"]) <= num(&ended["keys"]["top"]),
+                "the note is under the keyboard line at {width}x{height}: {ended}"
+            );
+            assert!(
+                num(&ended["keys"]["top"]) >= 0
+                    && num(&ended["keys"]["bottom"]) <= i64::from(height),
+                "scrolling the card took the keyboard line off the screen at \
+             {width}x{height}: {ended}"
+            );
+            assert!(
+                num(&ended["panel"]["bottom"]) <= num(&ended["keys"]["top"]),
+                "the card's own foot is below the keyboard line at {width}x{height}: {ended}"
+            );
+            assert!(
+                num(&ended["body"]["bottom"]) <= num(&ended["panel"]["top"]),
+                "the long form reaches over the answers once scrolled at \
+             {width}x{height}: {ended}"
+            );
+
+            // (vii) The question is a headline and not a paragraph: it is the
+            // largest thing on the card, so its line count is what a viewport
+            // has left for the answers.
+            let lines = num(&at["headingLines"]);
+            // Six lines of 22px on the phone, four of the 28px ceiling above
+            // it. One declaration sizes the question at every width since
+            // the deck's >=900px `2.25rem`/`1.1` override went, so the
+            // longest question the product accepts costs four lines on the
+            // desk instead of five.
+            let most = if width <= 390 { 6 } else { 4 };
+            assert!(
+                lines <= most,
+                "the question is {lines} lines at {width}x{height}, over {most}: {at}"
+            );
+
+            // (viii) And the answer a deck exists to offer is on the screen the
+            // card opens on, at every width (George, 2026-09-18: a deck whose
+            // recommendation is two scrolls down is not a deck). Measured at the
+            // top of the card, which is where a reader arrives.
+            assert!(
+                num(&at["lead"]["top"]) >= 0 && num(&at["lead"]["bottom"]) <= i64::from(height),
+                "the recommended answer is off the first screen at {width}x{height}: {at}"
+            );
+            assert!(
+                num(&at["lead"]["height"]) >= 44,
+                "the recommended answer is under a thumb's height at {width}x{height}: {at}"
+            );
+
+            // (ix) The priority pill is ABOVE the question, on the eyebrow's
+            // line, where it cannot be read as an answer and cannot sit on
+            // text that is dissolving into the fade.
+            assert!(
+                num(&at["pill"]["bottom"]) <= num(&at["heading"]["top"]),
+                "the priority pill is below the question at {width}x{height}: {at}"
+            );
+
+            // (x) ...and the band between the foot of the long form and the
+            // head of the panel holds nothing with text in it. That band is
+            // the fade: anything standing in it reads as text that was cut
+            // off, which is the complaint this slice answers.
+            assert_eq!(
+                at["band"].as_array().map(Vec::len),
+                Some(0),
+                "something with text stands in the fade band at {width}x{height}: {at}"
+            );
+        }
+        seen.push(item.clone());
+        // On to the other card, so the sweep is not a claim about one piece
+        // of writing. `s` is the deck's own skip, and it is the last input
+        // this round makes.
+        if card == 0 {
+            desk.tab.press_key("s").expect("press s");
+            wait_for_js_true(
+                &desk.tab,
+                &format!("document.querySelector('__CURRENT_CARD__').dataset.item !== '{item}'"),
+            );
+        }
+    }
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_ne!(
+        seen[0], seen[1],
+        "the sweep measured the same card twice: {seen:?}"
+    );
+}
+
+/// Put the reader somewhere inside the card, and make the next projection
+/// swap a REPLACEMENT of that card: the card's column to its end, the body
+/// region 60px down, and the served-markup snapshot poisoned so the diff in
+/// `refreshProjection` cannot hand the live node back.
+///
+/// Poisoning the snapshot is the honest way to reach the case that matters.
+/// A swap keeps the live node when the server says nothing new about the
+/// card, and then the scroll position survives because the NODE survives;
+/// the position is only lost when the board did say something new and the
+/// card came back as a fresh node. That is what this sets up, by the same
+/// property the page itself compares.
+const PLACE_THE_READER: &str = "(() => { \
+     const card = document.querySelector('__CURRENT_CARD__'); \
+     const body = card.querySelector('__DECK_BODY__'); \
+     card.scrollTo(0, card.scrollHeight); \
+     body.scrollTo(0, 60); \
+     card.dataset.probe = 'before the swap'; \
+     card.servedMarkup = 'the board said something new about this card'; \
+     return JSON.stringify({item: card.dataset.item, card: Math.round(card.scrollTop), \
+     body: Math.round(body.scrollTop)}); })()";
+
+/// Where the reader is, and whether the node they are reading is the one
+/// they were reading.
+const READER_PLACE: &str = "(() => { \
+     const card = document.querySelector('__CURRENT_CARD__'); \
+     const body = card.querySelector('__DECK_BODY__'); \
+     const note = card.querySelector('__DECK_NOTE__').getBoundingClientRect(); \
+     const keys = document.querySelector('__DECK_KEYS__').getBoundingClientRect(); \
+     return JSON.stringify({item: card.dataset.item, replaced: !card.dataset.probe, \
+     card: Math.round(card.scrollTop), body: Math.round(body.scrollTop), \
+     noteTop: Math.round(note.top), noteBottom: Math.round(note.bottom), \
+     keysTop: Math.round(keys.top), height: innerHeight, \
+     cards: document.querySelectorAll('__CARD__').length}); })()";
+
+/// A projection swap does not move the reader inside the card.
+///
+/// The deck's one scroller is the card's own column since 2026-09-18, which
+/// means the position of everything the reader can see is a property of a
+/// NODE — and a `/live` notice replaces that node two or three times a
+/// minute. Unheld, the card comes back at its top: the paragraph being read,
+/// the answers and the note all jump while George is looking at them. This
+/// is the same mechanism that moved a click target out from under the
+/// pointer while this slice was being written, so it is proved rather than
+/// assumed.
+///
+/// The trigger is the ordinary one: another lane raises a card through the
+/// CLI, the socket says so, and the page fetches the canonical projection
+/// (the path `a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload`
+/// proves for the notice itself).
+#[test]
+fn a_projection_swap_keeps_the_reader_where_they_were_in_the_card_in_real_chrome() {
+    let desk = deck_stack_desk("serve-deck-keep-place", "DECKKEEP");
+    set_viewport_with(&desk.tab, 390, 844, true);
+    wait_for_js_true(&desk.tab, "innerWidth === 390");
+    let before = measure(&desk.tab, PLACE_THE_READER, "where the reader was put");
+    eprintln!("the reader is at {before}");
+    let placed_card = before["card"].as_i64().expect("the card's scrollTop");
+    let placed_body = before["body"].as_i64().expect("the body's scrollTop");
+    assert!(
+        placed_card > 0,
+        "the card had nothing to scroll, so this proves nothing: {before}"
+    );
+    assert_eq!(placed_body, 60, "{before}");
+
+    hold_projection(&desk.tab);
+    desk.fixture.ok_json(
+        &desk.fixture.main,
+        &[
+            "attention",
+            "raise",
+            "A third question arrives while the first one is being read.",
+            "--as",
+            "codex@driver",
+            "--kind",
+            "blocking",
+            "--priority",
+            "2",
+            "--json",
+        ],
+    );
+    wait_for_projection_swap(&desk.tab);
+
+    let after = measure(
+        &desk.tab,
+        READER_PLACE,
+        "where the reader is after the swap",
+    );
+    eprintln!("after the swap the reader is at {after}");
+    assert_eq!(
+        after["item"], before["item"],
+        "the swap changed which card is on screen: {after}"
+    );
+    assert_eq!(
+        after["replaced"],
+        Value::Bool(true),
+        "the card was handed back rather than replaced, so nothing was \
+         restored and nothing is proved: {after}"
+    );
+    assert_eq!(
+        after["cards"].as_i64(),
+        Some(3),
+        "the projection that replaced it is not the one with the new card: {after}"
+    );
+    assert_eq!(
+        after["card"].as_i64(),
+        Some(placed_card),
+        "the swap moved the card's own column: {after}"
+    );
+    assert_eq!(
+        after["body"].as_i64(),
+        Some(placed_body),
+        "the swap moved the long form inside the card: {after}"
+    );
+    let height = after["height"].as_i64().expect("the viewport height");
+    assert!(
+        after["noteTop"].as_i64().unwrap_or(-1) >= 0
+            && after["noteBottom"].as_i64().unwrap_or(height + 1) <= height,
+        "the note is off the screen after the swap: {after}"
+    );
+    assert!(
+        after["noteBottom"].as_i64().unwrap_or(0) <= after["keysTop"].as_i64().unwrap_or(0),
+        "the note is under the keyboard line after the swap: {after}"
     );
 }
 
@@ -47474,7 +48007,8 @@ fn the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http() {
         );
         assert!(
             card.contains(&format!(
-                "<form class=decide method=post action=\"/attention/DECKNOJS/{id}/reply\">"
+                "<form class=decide data-testid=deck-panel method=post \
+                 action=\"/attention/DECKNOJS/{id}/reply\">"
             )),
             "{card}"
         );
@@ -47582,6 +48116,46 @@ fn deck_desk(label: &str, board: &str) -> Desk {
     }
 }
 
+/// The same desk over two cards of deliberately different length: the
+/// product's own bounds first ([`LONG_CARD`] at `P0`), the shipped fixture
+/// card behind it ([`CARD`] at `P1`). A layout that holds for both holds.
+///
+/// Its own fixture rather than [`deck_fixture`]'s three: the queue length is
+/// on screen as `3 left` and half a dozen cases read it, so a fourth card in
+/// the shared fixture would be a sentence changed everywhere to measure a
+/// layout here.
+fn deck_stack_desk(label: &str, board: &str) -> Desk {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new(label);
+    fixture.ok_json(&fixture.main, &["init", "--name", board, "--json"]);
+    let mut ids = Vec::new();
+    for (priority, card) in [("0", &LONG_CARD[..]), ("1", &CARD[..])] {
+        let item = raise_carded(
+            &fixture,
+            &long_body("The card the deck is measured on."),
+            "codex@driver",
+            &card_args(&["--kind", "blocking", "--priority", priority], card),
+        );
+        ids.push(item["id"].as_str().expect("raised id").to_owned());
+    }
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &server.origin());
+    wait_for_js_true(
+        &tab,
+        "Boolean(document.querySelector('__CURRENT_CARD__')) \
+         && document.activeElement === document.querySelector('__CURRENT_CARD__')",
+    );
+    Desk {
+        tab,
+        _chrome: chrome,
+        server,
+        fixture,
+        ids,
+    }
+}
+
 /// A design token as the PAGE resolves it, not as a test transcribes it: a
 /// probe takes `color:var(--name)` and reports what Chrome computed, so
 /// "this fill is `--green`" is one comparison of two computed values. The
@@ -47661,10 +48235,21 @@ const HEADLINE_MEASURE: &str = r#"(() => {
 /// serif is identified by two faces that appear only in the serif stack --
 /// a `font-family` that merely ENDS in `serif` would also be the sans
 /// stack's `sans-serif`.
+///
+/// Superseded 2026-09-18: one declaration sizes the question at every width
+/// now, `clamp(1.375rem,1.1rem + 1vw,1.75rem)` over `line-height:1.15`, and
+/// the deck's own `>=900px` override of `2.25rem`/`1.1` is gone with it. The
+/// figures were 28px on the phone and 36px on the desk: 28 spent six lines
+/// of a 390x844 screen on a 160-character question before the reader reached
+/// the context, and 36 spent five of an 800px-tall desk window on the same
+/// question while the answers waited below it (George, 2026-09-18: "it's up
+/// but it's squished and not mobile responsive"; "the web version looks
+/// mushed up ... (iPad has it squished up)"). The clamp resolves to 22px at
+/// 390, 25.8px at 820 and its 28px ceiling at 1280.
 #[test]
 fn the_question_is_set_as_a_headline_in_real_chrome() {
     let desk = deck_desk("serve-deck-headline", "DECKHEAD");
-    for (width, height, floor) in [(390_u32, 844_u32, 28.0_f64), (1280, 800, 36.0)] {
+    for (width, height, floor) in [(390_u32, 844_u32, 22.0_f64), (1280, 800, 28.0)] {
         set_viewport(&desk.tab, width, height);
         wait_for_js_true(&desk.tab, &format!("innerWidth === {width}"));
         let measured = measure(&desk.tab, HEADLINE_MEASURE, "the headline measurement");

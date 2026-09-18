@@ -1615,7 +1615,8 @@ const EMPTY_QUEUE: &str = "<div class=empty-queue>\
 const LIST_KEYS: &str = "<p class=keys>1–4 answer · u undo · c own</p>";
 
 /// The deck's map: the same keys plus the one only a deck has, the skip.
-const DECK_KEYS: &str = "<p class=keys>1–4 answer · s skip · u undo · c own</p>";
+const DECK_KEYS: &str =
+    "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>";
 
 /// The landing page, and the reason the server exists: every open item as a
 /// DECK — one card on screen, the long form the only thing that scrolls, the
@@ -1888,7 +1889,8 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     for (index, choice) in ordered_choices(item).iter().enumerate() {
         let rendered = format!(
             "<button type=submit class=\"choice outcome-{outcome}\" name=decision \
-             value=\"{key}\" data-label=\"{label}\"><span class=key>{digit}</span>{label}</button>\
+             value=\"{key}\" data-label=\"{label}\" data-testid=\"deck-choice-{key}\">\
+             <span class=key>{digit}</span>{label}</button>\
              <p class=consequence>{consequence}</p>",
             outcome = escape(&choice.outcome),
             key = escape(&choice.key),
@@ -1906,15 +1908,19 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         }
     }
     html.push_str(&format!(
-        "<form class=decide method=post action=\"/attention/{project_url}/{id_url}/reply\">\
+        "<form class=decide data-testid=deck-panel method=post \
+         action=\"/attention/{project_url}/{id_url}/reply\">\
          {recommended}"
     ));
     if !alternatives.is_empty() {
-        html.push_str(&format!("<div class=alternatives>{alternatives}</div>"));
+        html.push_str(&format!(
+            "<div class=alternatives data-testid=deck-answers>{alternatives}</div>"
+        ));
     }
     html.push_str(&format!(
         "<div class=reply><label for=\"answer-{id_url}\">Add a note</label>\
-         <textarea id=\"answer-{id_url}\" name=reply maxlength={max}></textarea></div>\
+         <textarea id=\"answer-{id_url}\" name=reply maxlength={max} \
+         data-testid=deck-note></textarea></div>\
          <details class=custom data-custom><summary>Answer in my own words</summary>\
          <fieldset class=outcomes>\
          <legend>recorded as</legend><div class=picks>{picks}</div>\
@@ -1936,7 +1942,7 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     ));
     html.push_str(&format!(
         "<details class=full><summary>show the full item</summary>\
-         <div class=\"body md\">{}</div></details>",
+         <div class=\"body md\" data-testid=deck-body>{}</div></details>",
         markdown(&item.body)
     ));
     // The trailing meta reads as a sentence, and the priority is the only
@@ -3634,12 +3640,14 @@ fn status_label(status: &str) -> String {
 fn priority_badge(priority: i64, level: Option<&str>) -> String {
     match level {
         Some(level) => format!(
-            "<span class=\"priority priority-{class}\" title=\"stored priority {priority}\">{level}</span>",
+            "<span class=\"priority priority-{class}\" data-testid=deck-priority \
+             title=\"stored priority {priority}\">{level}</span>",
             class = escape(&level.to_ascii_lowercase()),
             level = escape(level),
         ),
         None => format!(
-            "<span class=\"priority priority-legacy\" title=\"legacy out-of-band priority\">{priority}</span>"
+            "<span class=\"priority priority-legacy\" data-testid=deck-priority \
+             title=\"legacy out-of-band priority\">{priority}</span>"
         ),
     }
 }
@@ -4058,11 +4066,46 @@ function bindDeck() {
     card.hidden = card !== showing && card !== deckGhost;
   });
   if (showing) {
-    // The long form is this card's body and the deck's only scroller, so on
-    // the deck it is open. The fold exists for a list of 133 cards; a deck
-    // is a list of one.
+    // The long form is this card's body and the region the deck scrolls, so
+    // on the deck it is open. The fold exists for a list of 133 cards; a
+    // deck is a list of one.
     const full = showing.querySelector('details.full');
     if (full) full.open = true;
+    // ...and the raiser's context is its first block. The server renders it
+    // above the answers, which is the order ADR-042 §5 fixes and the order
+    // a scriptless browser reads; the DECK moves it inside the body region
+    // so the two share one capped, fading scroller. Left as a free block in
+    // the card's column it pushed the recommended answer off the first
+    // screen of a phone -- 790 characters of context and the answer a deck
+    // exists to offer was two scrolls away (George, 2026-09-18).
+    //
+    // Idempotent by construction: once moved the paragraph is no longer a
+    // child of the card, so a re-bind finds nothing to move. A card the
+    // server re-rendered arrives with it back in place and is moved again.
+    const body = full && full.querySelector('.body');
+    const context = showing.querySelector('p.context');
+    if (body && context && context.parentElement === showing) body.prepend(context);
+    // The trailing meta goes UP, onto the end of the eyebrow: one line of
+    // orientation instead of two. It trailed, which on the deck meant the
+    // priority pill sat directly under the dissolving last line of the long
+    // form with two rem of empty band below it -- the pill over clipped text
+    // George objected to on 2026-09-17, moved a few pixels down (George,
+    // 2026-09-18, on the v6 screenshots). Above the question it cannot be
+    // read as an answer, which is why it left the head of the card in the
+    // first place, and beside the eyebrow it is what it is: who asked, where,
+    // when, and how urgent.
+    //
+    // Same bargain as the context: the SERVER still renders the meta line
+    // last (ADR-042 §5), so a scriptless page keeps both paragraphs where
+    // they were, and the deck's own script joins them. Idempotent for the
+    // same reason -- the node is gone once its contents have moved.
+    const eyebrow = showing.querySelector('p.eyebrow');
+    const meta = showing.querySelector('p.meta');
+    if (eyebrow && meta && meta.parentElement === showing) {
+      eyebrow.append(' · ');
+      while (meta.firstChild) eyebrow.append(meta.firstChild);
+      meta.remove();
+    }
     // The advance runs when the card on screen CHANGED, and never because a
     // projection was refreshed under an unchanged one: that was the blink
     // (George, 2026-09-17: "it keeps blinking"). `deckShown` survives a
@@ -4589,6 +4632,17 @@ async function refreshProjection() {
   const showing = currentCard();
   const showingItem = showing ? showing.dataset.item : null;
   const slot = deckIndex;
+  // ...and WHERE IN THE CARD the reader is, for the same reason one step
+  // smaller. Since the panel stopped being its own scroller the card's own
+  // column carries the whole card (2026-09-18), so a card the server
+  // re-rendered comes back as a fresh node scrolled to the top: the
+  // paragraph being read, the answers, the note, all of it jumps while
+  // George is looking at it. Two positions are enough to put him back --
+  // the card's column and the body region inside it -- and they are
+  // restored only if the SAME item is still the card on screen.
+  const showingScroll = showing ? showing.scrollTop : 0;
+  const showingBody = showing ? showing.querySelector('.full .body') : null;
+  const showingBodyScroll = showingBody ? showingBody.scrollTop : 0;
   // The card the operator is looking at is NOT replaced when the server has
   // nothing new to say about it (George, 2026-09-17: "it keeps blinking").
   // Every notice used to swap all of `<main>`, which meant a brand new node
@@ -4635,6 +4689,16 @@ async function refreshProjection() {
   // other half of the blink -- `bindDeck` would re-enter the same card.
   bindDeck();
   if (showingItem) deckShow(showingItem);
+  // The reader goes back where they were, in the card as well as in the
+  // queue. After `deckShow`, because a card that is still hidden has no
+  // scrollport to put a position into, and only for the same item: a
+  // different card is a different piece of writing and starts at its top.
+  const shown = currentCard();
+  if (shown && showingItem && shown.dataset.item === showingItem) {
+    shown.scrollTop = showingScroll;
+    const body = shown.querySelector('.full .body');
+    if (body) body.scrollTop = showingBodyScroll;
+  }
   focusCurrent();
   setLive('live');
 }
@@ -5027,11 +5091,11 @@ connectLive();
 /// on `--hue`, set by the one class that knows the outcome, so exactly one
 /// rule fills the recommended answer and exactly one rule rules a receipt.
 ///
-/// One serif, and it is the question: the system serif at 1.75rem on a phone
-/// and 2.25rem on a desk is the largest thing on the screen and the only
-/// thing set in it. Mono is reserved for what is literally code — an id, a
-/// key map, a numeric column. One motion exists, the card advance, at 140ms
-/// each way; a notice, a receipt and a toast simply appear.
+/// One serif, and it is the question: the system serif, sized by the
+/// viewport between 1.375rem and 1.75rem, is the largest thing on the screen
+/// and the only thing set in it. Mono is reserved for what is literally code
+/// — an id, a key map, a numeric column. One motion exists, the card
+/// advance, at 140ms each way; a notice, a receipt and a toast simply appear.
 ///
 /// Every rule that lays the deck out is scoped to `html.js`, because the deck
 /// is one card only while there is a script to hide the others: without one
@@ -5162,8 +5226,9 @@ nav>.live{margin-left:auto}\
 /* --- the card (ADR-042 §5) ----------------------------------------------- */\
 .item,.note,.plan,.search-result,.card,.decided{margin:1.4rem 0;padding:0}\
 .eyebrow{max-width:70ch;margin:0 0 .5rem;color:var(--overlay);font-size:.8125rem;line-height:1.4}\
-.item>h2{max-width:70ch;margin:0 0 .7rem;font-family:var(--serif);font-size:1.75rem;\
-line-height:1.15;font-weight:600;color:var(--text)}\
+.item>h2{max-width:70ch;margin:0 0 .7rem;font-family:var(--serif);\
+font-size:clamp(1.375rem,1.1rem + 1vw,1.75rem);line-height:1.15;font-weight:600;\
+color:var(--text)}\
 .context{max-width:70ch;margin:0 0 1rem;color:var(--subtext)}\
 .explain{max-width:70ch;margin:0 0 1rem;color:var(--subtext)}\
 .consequence{max-width:70ch;margin:.35rem 0 0;color:var(--subtext);font-size:.9375rem}\
@@ -5183,7 +5248,12 @@ font-size:.75rem;font-weight:400}\
    rides in on `--hue` from the class that knows the outcome, so adding a\
    fifth outcome is a token line rather than a fifth fill. */\
 .recommended .choice{color:var(--base);background:var(--hue,var(--surface1))}\
-.alternatives{display:grid;grid-template-columns:1fr 1fr;gap:.6rem .8rem;margin:1rem 0 0}\
+/* One answer per row, at every width. Two-up put a 37-character label on\
+   three or four wrapped lines in a 177px button on a 390px phone and read\
+   as a squeezed table of fragments (George, 2026-09-18: \"it's up but it's\
+   squished and not mobile responsive\"). A choice is a sentence, so it gets\
+   the card's whole width and its consequence sits under it. */\
+.alternatives{display:grid;grid-template-columns:1fr;gap:.6rem .8rem;margin:1rem 0 0}\
 .alternative .consequence{margin-top:.3rem}\
 .reply{margin-top:1rem}\
 .reply>label{display:block;margin:0 0 .35rem;color:var(--subtext);font-size:.8125rem}\
@@ -5241,7 +5311,7 @@ font-weight:600}\
 .body.md blockquote{margin:.6rem 0;padding:.2rem .9rem;color:var(--subtext)}\
 .body.md table{margin:.6rem 0}\
 .body.md hr{height:1px;margin:1rem 0;background:var(--surface0);border:0}\
-/* --- the deck: one card, and its long form the only thing that scrolls --- */\
+/* --- the deck: one card, and its own column the one thing that scrolls -- */\
 /* Every rule here is scoped to `html.js`, and that scope is load-bearing:\
    the deck is one card because a script hides the others, so without a\
    script the same markup has to stay what it is -- a plain scrolling list\
@@ -5277,17 +5347,29 @@ overflow:hidden auto;overscroll-behavior:contain}\
 html.js .deck .item[hidden]{display:none}\
 html.js .deck .item>.eyebrow{order:1;flex:none;margin-bottom:.25rem}\
 html.js .deck .item>h2{order:2;flex:none}\
-/* A raiser's context is the FIRST block of what scrolls, above the long\
-   form: it used to be a clipped region of its own at the top of the card,\
-   which cut the paragraph mid-sentence (George, 2026-09-17, on the deck\
-   screenshots). It is never clipped now -- the card's own column takes the\
-   overflow, so a context too long for the screen scrolls with the body it\
-   introduces and the answers stay stuck to the bottom of the card. */\
+/* A raiser's context is the FIRST block of the long form on the deck, and\
+   it is the DECK that puts it there: the served markup keeps the ADR-042\
+   §5 order (question, context, answers, folded body), and `bindDeck` moves\
+   the paragraph into the body region so the two share one soft-edged,\
+   capped scroller. It used to be a clipped region of its own at the top of\
+   the card, which cut the paragraph mid-sentence with the priority pill\
+   over it (George, 2026-09-17, on the deck screenshots); then it was a\
+   free block in the card's column, which pushed the recommended answer off\
+   the first screen of a phone whenever a raiser wrote 790 characters of\
+   context (George, 2026-09-18). Now it scrolls inside the body region with\
+   the long form it introduces, under the same fade, and the answers are on\
+   the screen the card opens on.\
+\
+   The rule below is what the paragraph is while it is still a child of the\
+   card -- one frame at most, before the deck's script has moved it, and\
+   every frame on a page whose script never ran. */\
 html.js .deck .item>.context{order:3;flex:none;margin-bottom:.4rem}\
-/* The long form is the card's body and the deck's only scroller. It clips:\
-   a region that overflowed instead would paint the body straight over the\
-   answers, and it keeps a floor so that a card with a long context and four\
-   answers still shows some of what it is about. */\
+html.js .deck .item .body>.context{margin:0 0 .8rem}\
+/* The long form is the card's body and clips: a region that overflowed\
+   instead would paint the body straight over the answers. It keeps a floor\
+   so that a card with a long context and four answers still shows some of\
+   what it is about, and a 40vh cap so it scrolls inside itself rather than\
+   pushing the answers down the card. */\
 html.js .deck .item>.full{order:4;flex:1 1 0;min-height:8rem;overflow:hidden;\
 display:flex;flex-direction:column;margin:0}\
 /* The disclosure control goes: on the deck the long form is not folded, so\
@@ -5309,40 +5391,47 @@ html.js .deck .item>.full .body{flex:1;min-height:0;max-height:40vh;overflow-y:a
 padding-right:.3rem;\
 -webkit-mask-image:linear-gradient(to bottom,var(--text) calc(100% - 2rem),transparent);\
 mask-image:linear-gradient(to bottom,var(--text) calc(100% - 2rem),transparent)}\
-/* The trailing meta line trails: on a short item it sits at the foot of the\
-   body region rather than floating in the middle of the card. */\
+/* The trailing meta line does not trail on the deck: the script moves its\
+   contents onto the end of the eyebrow, above the question, because trailing\
+   put the priority pill directly under the dissolving last line of the long\
+   form (George, 2026-09-18, on the v6 screenshots) -- the pill over clipped\
+   text, which is the thing it was moved out of the card's head to avoid.\
+   The rule below is what the paragraph is before the script has moved it,\
+   and on every card the deck is not showing: at the foot of the body region\
+   rather than floating in the middle of a short card. */\
 html.js .deck .item>.meta{order:5;flex:none;margin:auto 0 0}\
-/* The panel: the answers and the note, on the desk surface at the bottom of\
-   the screen where a thumb is. It is capped at three fifths of the card and\
-   scrolls its own answers past that, because the height has to come from\
-   somewhere and the only other place to take it from is the question --\
-   and a headline cut mid-word is worse than a paragraph that carries on\
-   below the fold.\
+/* The panel: the answers and the note, on the desk surface at the foot of\
+   the card. It is sized to its content and scrolls nothing of its own.\
 \
-   Its top two rem is the fade: the card's own column scrolls beneath the\
-   panel, and a line of the raiser's paragraph meeting an opaque edge\
-   mid-sentence reads as text that was cut off, which is the complaint this\
-   slice answers. The fade is the panel's own background rather than a\
-   pseudo-element above it, because the panel is a scroller and a scroller\
-   clips what sits outside its padding box -- but never its own background,\
-   which also means the band stays at the top edge while the answers scroll\
-   under it. The gradient's last stop is the desk's second surface, so the\
-   panel below the band is `--mantle` and the band lets the text behind it\
-   dissolve into it. It is a gradient and not a second mask: the one mask\
-   on the page is the long form's own foot. */\
-html.js .deck .item>.decide{order:6;flex:none;max-height:60%;overflow-y:auto;\
+   It used to be capped at three fifths of the card and scroll its answers\
+   past that cap. That put the note field at y=961 on a 390x844 phone --\
+   off the screen, inside a nested scroller with no affordance -- and cut\
+   the fourth answer at the cap (George, 2026-09-18, on the served deck:\
+   \"it's up but it's squished and not mobile responsive\"; \"the web version\
+   looks mushed up ... (iPad has it squished up)\"). So the cap is gone and\
+   with it the panel's own overflow: the card's column above is the ONE\
+   scroller, and the note is reached by scrolling the card the reader is\
+   already scrolling.\
+\
+   Its top two rem is the fade, because a line of the raiser's paragraph\
+   meeting an opaque edge mid-sentence reads as text that was cut off. The\
+   gradient's last stop is the desk's second surface, so the panel below\
+   the band is `--mantle` and the band lets the text above it dissolve into\
+   it. It is a gradient and not a second mask: the one mask on the page is\
+   the long form's own foot. */\
+html.js .deck .item>.decide{order:6;flex:none;\
 margin:.45rem calc(-1 * clamp(.7rem,3vw,1.2rem)) 0;\
 padding:0 clamp(.7rem,3vw,1.2rem) calc(.5rem + env(safe-area-inset-bottom));\
-background:linear-gradient(to bottom,transparent,var(--mantle) 2rem);\
-position:sticky;bottom:0}\
+background:linear-gradient(to bottom,transparent,var(--mantle) 2rem)}\
 /* The one hairline the design keeps, between the card's body and its\
    answers -- at the foot of the band and not its head, because a rule\
    drawn across text that is still dissolving reads as a strikethrough.\
-   It is the panel's own first block: two rem tall, stuck to the top of the\
-   panel's scroller and carrying the same ramp, so the answers fade out\
-   under the band on their way up instead of crossing the rule. */\
-html.js .deck .item>.decide::before{content:'';display:block;position:sticky;top:0;\
-z-index:1;height:2rem;box-sizing:border-box;pointer-events:none;\
+   It is the panel's own first block, two rem tall, carrying the same ramp.\
+   It is a plain block and no longer a sticky one: the panel scrolls\
+   nothing, so `position:sticky` here would resolve against the CARD's\
+   scrollport and float the band over the long form. */\
+html.js .deck .item>.decide::before{content:'';display:block;\
+height:2rem;box-sizing:border-box;pointer-events:none;\
 background:linear-gradient(to bottom,transparent,var(--mantle) 2rem);\
 border-bottom:1px solid var(--surface1)}\
 html.js .deck .item>.decide .consequence{font-size:.875rem}\
@@ -5384,8 +5473,7 @@ html.js .deck{max-width:44rem}\
 html.js main[data-deck]>.heading h1{font-size:1.5rem}\
 html.js main[data-deck]>.side{position:absolute;top:0;right:0;bottom:0;width:22rem;\
 padding:.8rem 1rem calc(.8rem + env(safe-area-inset-bottom));background:var(--mantle)}\
-html.js .history-toggle{display:none}\
-.item>h2{font-size:2.25rem;line-height:1.1}}\
+html.js .history-toggle{display:none}}\
 /* Below the desktop column the side is a drawer, and the toasts come out of\
    it: news has to arrive whether or not the history is open. */\
 @media(max-width:899px){html.js main[data-deck]>.side{display:contents}\
@@ -6296,7 +6384,11 @@ mod tests {
             ),
             (
                 ".item>h2",
-                vec!["font-size:1.75rem", "line-height:1.15", "font-weight:600"],
+                vec![
+                    "font-size:clamp(1.375rem,1.1rem + 1vw,1.75rem)",
+                    "line-height:1.15",
+                    "font-weight:600",
+                ],
             ),
         ] {
             if declarations.is_empty() {
@@ -6555,12 +6647,34 @@ mod tests {
         assert!(fade.body.contains("2rem"), "{}", fade.body);
     }
 
-    /// WEB-47 — three or four alternatives may wrap.
+    /// WEB-47 — every answer gets a row of its own, and the panel is not a
+    /// scroller.
+    ///
+    /// Superseded 2026-09-18: the requirement used to permit two-up and the
+    /// panel used to be capped at three fifths of the card with its own
+    /// `overflow-y`, which squeezed a 37-character label into a 177px
+    /// button and put the note field off a 390x844 phone (George: "it's up
+    /// but it's squished and not mobile responsive").
     #[test]
-    fn alternatives_may_wrap_two_up_unit() {
-        let body = css_rule_body(".alternatives");
-        assert!(body.contains("grid-template-columns:1fr 1fr"), "{body}");
-        assert!(body.contains("display:grid"), "{body}");
+    fn every_answer_gets_its_own_row_and_the_panel_scrolls_nothing_unit() {
+        let answers = css_rule_body(".alternatives");
+        assert!(answers.contains("display:grid"), "{answers}");
+        assert!(
+            answers.contains("grid-template-columns:1fr;"),
+            "the answers are not one column: {answers}"
+        );
+        let panel = css_rule_body("html.js .deck .item>.decide");
+        assert!(panel.contains("flex:none"), "{panel}");
+        for banned in ["max-height", "overflow"] {
+            assert!(
+                !panel.contains(banned),
+                "the answer panel still declares {banned}, so it is a nested \
+                 scroller again: {panel}"
+            );
+        }
+        // The card's own column is the one scroller the deck has.
+        let card = css_rule_body("html.js .deck .item");
+        assert!(card.contains("overflow:hidden auto"), "{card}");
     }
 
     /// WEB-48 — text contrast is at least 4.5:1 on the surface it sits on.
@@ -6811,8 +6925,22 @@ mod tests {
             }
         }
         // A receipt is built by the script, and its sentences are written
-        // there: no chain, and no arrow.
-        assert!(!JS.contains(" · "), "the script writes a dot chain");
+        // there: no chain, and no arrow. The ONE separator the script writes
+        // is the deck's own eyebrow join (WEB-22, superseded 2026-09-18):
+        // the card's meta line moves onto the end of the eyebrow so the
+        // priority pill stops sitting under text dissolving into the fade,
+        // and one line of orientation carries who asked, where, when and how
+        // urgent. Counted rather than banned, so a second chain written
+        // anywhere in the script still fails here.
+        assert_eq!(
+            JS.matches(" · ").count(),
+            1,
+            "the script writes a dot chain somewhere other than the eyebrow join"
+        );
+        assert!(
+            JS.contains("eyebrow.append(' · ')"),
+            "the one separator the script writes is not the eyebrow join"
+        );
         assert!(!JS.contains('→'), "the script writes an arrow");
     }
 
@@ -6877,11 +7005,11 @@ mod tests {
     fn one_quiet_keys_line_carries_no_kbd_badges_unit() {
         assert_eq!(
             DECK_KEYS,
-            "<p class=keys>1–4 answer · s skip · u undo · c own</p>"
+            "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>"
         );
         for keys in [DECK_KEYS, LIST_KEYS] {
             assert!(!keys.contains("<kbd>"), "{keys}");
-            assert_eq!(keys.matches("<p class=keys>").count(), 1, "{keys}");
+            assert_eq!(keys.matches("<p class=keys").count(), 1, "{keys}");
         }
         let body = css_rule_body("p.keys");
         assert!(body.contains("font-size:.75rem"), "{body}");
@@ -7997,7 +8125,7 @@ mod tests {
         );
         assert_html_contains(
             &home,
-            "<p class=keys>1–4 answer · s skip · u undo · c own</p>",
+            "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>",
         );
         assert!(
             !home.contains("value=custom disabled"),

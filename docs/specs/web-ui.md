@@ -93,11 +93,30 @@ Strength: MUST · Layer: unit · Source: plan §Type, §Principles 1.
 `var(--serif)` on exactly two selectors: the card question (`.item>h2`) and the page title (`h1`).
 No third selector in `CSS` contains `var(--serif)`.
 
-**WEB-02** — the question is set as a headline.
-Strength: MUST · Layer: chrome · Source: plan §Type scale.
+**WEB-02** — the question is set as a headline that leaves room for the answers.
+Strength: MUST · Layer: chrome · Source: plan §Type scale; George, 2026-09-18 (the served deck
+at 390, 820 and 1280).
 `getComputedStyle` of the current card's `h2` reports `font-weight: 600`, a `font-family` string
-equal to the `--serif` stack, `font-size: 28px` with `line-height` ≤ `32.2px` at a 390 px
-viewport, and `font-size: 36px` with `line-height` ≤ `39.6px` at 1280 px.
+equal to the `--serif` stack, and one `font-size` declaration at every width —
+`clamp(1.375rem, 1.1rem + 1vw, 1.75rem)` — with `line-height` ≤ `1.15 ×` the size the viewport
+resolves it to: `22px`/`≤25.3px` at 390 px, `25.8px`/`≤29.7px` at 820 px and the `28px` ceiling
+with `line-height` `≤32.2px` at 1280 px. The rendered question occupies at most 6 line boxes at
+390 px and at most 4 above it, for a question at the 160-character bound as well as for the
+133-character card the tests measure.
+
+*Superseded 2026-09-18.* The wording this replaces read: "`font-size: 28px` with `line-height`
+≤ `32.2px` at a 390 px viewport, and `font-size: 36px` with `line-height` ≤ `39.6px` at
+1280 px." 28px put a 160-character question on six lines of a 390×844 phone before the reader
+reached the context, and nothing bounded the line count at any width. George, 2026-09-18: "it's
+up but it's squished and not mobile responsive"; "the web version looks mushed up ... (iPad has
+it squished up)".
+
+*And the desk figure with it, the same day.* `36px` came from the deck's own
+`@media(min-width:900px){.item>h2{font-size:2.25rem;line-height:1.1}}`, which spent five lines
+of an 800 px-tall desk window on a 160-character question while the answers waited below it.
+That override is gone: one declaration sizes the question at every width, its ceiling raised
+from `1.625rem` to `1.75rem` so the desk keeps a headline rather than a large paragraph, and
+`28px` at 1280 px is the same figure this requirement asked of the PHONE at the baseline.
 
 **WEB-03** — no glyph prefix anywhere.
 Strength: MUST · Layer: unit · Source: plan §critique ("a `> ` glyph in front"), §Principles 5.
@@ -224,9 +243,20 @@ The deck's scrolling body region declares a `2rem` bottom fade (a `mask-image` o
 
 **WEB-22** — meta is a sentence, never a chain.
 Strength: MUST · Layer: unit · Source: plan §Copy, §Principles 5.
-No string rendered inside `.eyebrow`, `.meta`, a list row's meta line or a receipt contains
-` · `, ` | ` or a trailing `→`. (The single keyboard hint line of WEB-27 is the one place a
-separator is still allowed, because it is a key map and not meta.)
+No string RENDERED BY THE SERVER inside `.eyebrow`, `.meta`, a list row's meta line or a receipt
+contains ` · `, ` | ` or a trailing `→`, and the inline script writes exactly one ` · ` and no
+`→`. Two separators are allowed, each named: the single keyboard hint line of WEB-27, because it
+is a key map and not meta; and the deck's own eyebrow join.
+
+*Superseded 2026-09-18 for the second of those.* The wording this replaces read: "No string
+rendered inside `.eyebrow` ... contains ` · ` ... (The single keyboard hint line of WEB-27 is
+the one place a separator is still allowed ...)". On the deck the script now moves the card's
+meta line onto the end of its eyebrow, joined with ` · `, so the priority pill stops sitting
+directly under the last line of the long form as it dissolves into the fade — the pill over
+clipped text George objected to on 2026-09-17, which trailing had only moved a few pixels down
+(George, 2026-09-18, on the v6 screenshots). One line of orientation carries who asked, where,
+when and how urgent; the SERVED markup still renders two paragraphs in the ADR-042 §5 order, so
+a scriptless page is unchanged, and the script's one separator is counted rather than banned.
 
 **WEB-23** — the eyebrow names who asked, where, and when, in one sentence.
 Strength: MUST · Layer: unit · Source: plan §Layout, §Copy.
@@ -299,11 +329,55 @@ Strength: MUST · Layer: chrome · Source: plan §Copy.
 Answering the only remaining card renders the WEB-26 copy and its link, and no card element
 remains in the deck.
 
-**WEB-35** — the page never scrolls on the deck; the body region does.
-Strength: MUST · Layer: chrome · Source: plan §Layout.
+**WEB-35** — the page never scrolls on the deck; the card's own column does, and the long form
+inside it.
+Strength: MUST · Layer: chrome · Source: plan §Layout; George, 2026-09-18.
 At 390, 820 and 1280 px wide, `documentElement.scrollHeight <= documentElement.clientHeight` on
-`/` with a card whose body is longer than the viewport, and that body region's
-`scrollHeight > clientHeight`.
+`/` with a card whose body is longer than the viewport; the current card's own element is the one
+scroller that carries the overflow of the whole card, the long-form body region's
+`scrollHeight > clientHeight` inside its 40vh cap, and the answer panel has no scroll of its own
+(`scrollHeight == clientHeight`). The raiser's context is the body region's FIRST block on the
+deck, so the two share that one capped, fading scroller; the long-form region's bottom edge is
+never below the answer panel's top edge; the recommended answer's bounding box is fully inside
+the viewport on the screen the card opens on, at all three widths, for a card at the product's
+bounds (160-char question, 793 of context, four answers); the keyboard line is inside the
+viewport whatever the card is scrolled to; no two answer buttons share a row and each is as wide
+as the answers' own content width within 1 px; and scrolling the card's column to its end puts
+the note field fully inside the viewport and above the keyboard line. The priority pill's rect
+bottom is above the question's rect top, and nothing carrying text stands in the band between
+the long-form region's bottom edge and the answer panel's top edge. A projection swap that
+replaces the current card's node restores both scroll positions — the card's column and the body
+region inside it — whenever the same item is still the card on screen.
+
+*Superseded 2026-09-18.* The wording this replaces read: "the page never scrolls on the deck;
+the body region does. ... `documentElement.scrollHeight <= documentElement.clientHeight` ... and
+that body region's `scrollHeight > clientHeight`." It was satisfied by a panel capped at three
+fifths of the card that scrolled its own answers — a second, unannounced scroller which put the
+note field at y=961 on an 844 px screen and cut the fourth answer at the cap (George,
+2026-09-18, on the served deck). One scroller now carries the card, and the note is reached by
+the gesture the reader is already making.
+
+*Superseded again, the same day, by what that first fix cost.* Two things followed from making
+the card the one scroller, and both are now part of this requirement rather than left as
+consequences:
+
+- With the context a free block in the card's column, 793 characters of it pushed the
+  recommended answer to y=948 on a 390×844 phone — off the screen the card opens on, which is
+  the one thing a deck is for. The context is INSIDE the capped, fading body region now, as its
+  first block, so the paragraph and the long form it introduces scroll together under one soft
+  edge. The served markup is unchanged: ADR-042 §5's order (question, context, answers, folded
+  body) is what a scriptless browser still reads, and the deck's own script moves the paragraph.
+  George's 2026-09-17 objection was to a hard cut with the priority pill over it, not to a
+  scrollable region with a fade.
+- A `/live` notice that replaces the current card's node used to hand it back scrolled to the
+  top, because the position now lives on a node the swap replaces. Both positions are carried
+  across the swap.
+- The card's trailing meta line, the priority pill in it, ended up directly under the last line
+  of the long form as that line dissolves into the fade, with the two-rem band empty below it:
+  the pill over clipped text of 2026-09-17, moved a few pixels down (George, 2026-09-18, on the
+  v6 screenshots). On the deck the script moves the meta's contents onto the end of the eyebrow,
+  above the question, where it is orientation and cannot be read as an answer. WEB-22 records
+  the separator that join uses. The served order is again unchanged.
 
 **WEB-57** — the composer's own refusal is its own sentence, in its own channel.
 Strength: MUST · Layer: chrome · Source: `rust/serve.rs:3850` (`INCOMPLETE_ANSWER`); ADR-042 §1
@@ -408,10 +482,19 @@ At 1280 px the deck column's width is ≤ 44rem and the side column's is 22rem o
 holding the toasts above the session history; at 820 px the side column is a drawer behind the
 history button and is hidden until that button is pressed.
 
-**WEB-47** — three or four alternatives may wrap.
-Strength: MAY · Layer: unit · Source: plan §Layout ("2-up; a 3rd/4th alternative wraps").
-The alternatives container may lay out two per row and wrap; nothing in this slice requires a
-single row.
+**WEB-47** — every answer gets a row of its own.
+Strength: MUST · Layer: unit · Source: George, 2026-09-18 (the served deck at 390 and 820).
+`.alternatives` declares `display:grid` with `grid-template-columns:1fr`, so every answer is one
+row at every width, and the answer panel's rule declares neither `max-height` nor an `overflow`
+of its own, so the card's own column is the deck's one scroller. What that renders as is
+measured in the browser by WEB-35.
+
+*Superseded 2026-09-18.* The wording this replaces read: "three or four alternatives may wrap.
+Strength: MAY ... The alternatives container may lay out two per row and wrap; nothing in this
+slice requires a single row." Two-up rendered a 37-character label as three or four wrapped
+lines inside a 177 px button on a 390 px phone and as two lines in a 384 px button at 820 px
+(George, 2026-09-18: "it's up but it's squished and not mobile responsive"). The strength rises
+from MAY to MUST because the single row is now the requirement rather than the tolerance.
 
 ### Accessibility
 
@@ -508,8 +591,10 @@ proves the group; the IDs it proves are named on each scenario.
 **A1 — the hero (WEB-01, WEB-02, WEB-04, WEB-07).**
 *Given* a board with one open carded attention item and `kanban serve` running,
 *when* George opens `/` in Chrome at 390 px and then at 1280 px,
-*then* the question is set in the `--serif` stack at weight 600, 28px/≤32.2px on the phone and
-36px/≤39.6px on the Mac, and no other element on screen is larger.
+*then* the question is set in the `--serif` stack at weight 600, 22px/≤25.3px on the phone and
+28px/≤32.2px on the Mac — one `clamp` declaration, no breakpoint of its own — no other element
+on screen is larger, and the question occupies at most 6 line boxes on the phone and at most 4
+on the Mac whether it is 133 or 160 characters long.
 
 **A2 — no glyphs, no tracking, no chains (WEB-03, WEB-22, WEB-23, WEB-27, WEB-28, WEB-40).**
 *Given* its own fixture — board `px` with 3 open carded items, the oldest raised by
@@ -550,8 +635,9 @@ position reads `2 of 3`; *when* he presses `s`, *then* the next card is current 
 item is last in the queue with its board row still `open` and no `decision`; *when* he presses
 `u`, *then* the item he just decided is reopened on the board and is current again; *when* he
 answers the last card, *then* `Nothing is waiting. Every question an agent raised has an answer.`
-and `See what was decided` are on screen; throughout, the page itself never scrolls and only the
-card's long form does.
+and `See what was decided` are on screen; throughout, the page itself never scrolls, the card's
+own column is the one thing that carries the card's overflow, and the long form scrolls inside
+its own region.
 
 **A7 — refusal (WEB-29, WEB-33).**
 *Given* a card whose board will refuse the write (the item was settled by another process),
@@ -622,6 +708,65 @@ exactly one element per page carries `role=status` (its text only ever `connecti
 *Given* the restyled build, *when* the served markup and the route table are read, *then* no
 `href`/`src` leaves the site, there is no `<link>`/`<img>`/`<iframe>`/`<script src>`, and the
 sixteen read routes and four POST verbs are exactly those of the baseline.
+
+**A15 — the deck on the three screens George decides on (WEB-02, WEB-22, WEB-35, WEB-47).**
+*Given* board `DECKSTACK` with two open carded items, both with a body far longer than any of
+the viewports: the card at the product's bounds — a 160-char question, 793 of context, four
+authored choices each with its consequence, one recommended — at `P0`, and the shipped fixture
+card — 133-char question, 452 of context, three choices — at `P1`,
+*when* `/` is loaded in real Chrome at 390 × 844,
+*then* the deck opens the `P0` card at its own top (`scrollTop` 0) with the raiser's context
+inside the long-form region rather than above it and the card's meta joined onto the end of the
+eyebrow above the question; `documentElement.scrollWidth` is 390; the four answers are at `top`
+502, 649, 789 and 908, no two sharing a row, each 367 px wide, which is the answers' own content
+width; the RECOMMENDED answer's box is 502–563, inside the 844 px viewport — the screen the card
+opens on; `form.decide` reports `scrollHeight == clientHeight == 755`; the long-form region
+reports `scrollHeight` 6226 over `clientHeight` 118 with its bottom edge (443) above the panel's
+top edge (450) and nothing carrying text standing between them; `p.keys` is at 816–844; the
+priority pill is at 156–171, above the question's top (177); and the question is 5 line boxes
+of 22px.
+*And when* the card's own column is scrolled to its end (396 px, its full extent),
+*then* the note field is at 680–749 — fully inside the viewport and above `p.keys`, which is
+still at 816–844 — and the panel's own foot (809) is above it.
+
+*And when* the same page is loaded at 820 × 1180,
+*then* the four answers are at `top` 574, 683, 785 and 887, each 782 px wide, the recommended
+one 574–618; the card's column needs no scroll at that height (`scrollHeight == clientHeight ==
+991`), so the note is already at 1016–1085 with `p.keys` at 1152–1180; the panel reports
+`scrollHeight == clientHeight == 623`; the long form reports 4292 over 228 with its bottom (515)
+above the panel's top (522); the pill is at 156–171 above the question's 177; and the question
+is 3 line boxes of 25.8px.
+
+*And when* the same page is loaded at 1280 × 800,
+*then* the deck column is 704 px with the side column beside it; the four answers are at `top`
+482, 591, 692 and 794, each 666 px wide, the recommended one 482–526 inside the 800 px viewport;
+the panel reports `scrollHeight == clientHeight == 623`; the long form reports 4292 over 118
+with its bottom (422) above the panel's top (430); the pill is at 133–148 above the question's
+154; the question is 4 line boxes of 28px — the clamp's ceiling, with no desk breakpoint of its
+own; and *when* the card's column is scrolled to its end (288 px), *then* the note is at
+635–704, inside the viewport and above `p.keys` at 772–800.
+
+*And when* `s` skips to the `P1` card and the same sweep runs on it,
+*then* the same holds with three answers instead of four: the recommended one is at 502–546 at
+390, 697–741 at 820 and 450–494 at 1280, each the answers' own width (367, 782, 666 px), the
+panel scrolls nothing at any width (559, 499, 499), and the note lands at 680–749, 1016–1085 and
+636–705 respectively. Its shorter question is 5, 3 and 3 line boxes.
+
+In all of them, nothing in the card paints under the priority pill: no `.priority` or `.pill`
+client rect intersects any `.context` or long-form client rect — the pill is above the question
+at every width, so there is no text near it to paint under.
+
+**A16 — a notice does not move the reader inside the card (WEB-35).**
+*Given* the `P0` card on a 390 × 844 phone with the reader placed inside it — the card's own
+column scrolled to its end (414 px) and the long-form region 60 px down — and the served-markup
+snapshot the page diffs against poisoned, so the next projection cannot hand the live node back,
+*when* another lane raises a third card through the CLI and the live socket brings the
+projection,
+*then* the current card's node HAS been replaced, the projection is the one with three cards,
+the same item is still on screen, its column is still at 414 px and its long-form region still
+at 60 px, and the note field is still at 716–785 — inside the viewport and above `p.keys` at
+816. Without the restore the same scenario reports both positions at 0 and the note at
+1130–1199, off the screen.
 
 **Categories deliberately not exercised here.** Unauthenticated access, session handling and
 CSRF-token design are the edge's and are already proven where they live: kanban implements no
@@ -750,7 +895,7 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | Requirement | Planned test | Layer | Matrix row |
 | --- | --- | --- | --- |
 | WEB-01 | `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` | unit | M1 |
-| WEB-02 | `the_question_is_set_as_a_headline_in_real_chrome` | chrome | M2 |
+| WEB-02 | `the_question_is_set_as_a_headline_in_real_chrome` †, `the_deck_answers_stack_and_the_note_is_reached_by_one_scroller_at_three_widths_in_real_chrome` | chrome | M2 |
 | WEB-03 | `no_heading_or_link_carries_a_glyph_prefix_unit` | unit | M1 |
 | WEB-04 | `the_type_scale_is_declared_and_nothing_is_tracked_out_unit` | unit | M1 |
 | WEB-05 | `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` | unit | M1 |
@@ -783,7 +928,7 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-32 | `the_undo_key_bring_back_the_last_decision_in_real_chrome` † | chrome | M2 |
 | WEB-33 | `a_refused_decision_brings_the_card_back_in_real_chrome` † | chrome | M2 |
 | WEB-34 | `the_last_card_leaves_the_empty_state_in_real_chrome` † | chrome | M2 |
-| WEB-35 | `the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome` † | chrome | M2 |
+| WEB-35 | `the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome` †, `the_deck_answers_stack_and_the_note_is_reached_by_one_scroller_at_three_widths_in_real_chrome`, `a_projection_swap_keeps_the_reader_where_they_were_in_the_card_in_real_chrome` | chrome | M2 |
 | WEB-36 | `the_drawer_is_rows_on_the_desk_surface_in_real_chrome` | chrome | M3 |
 | WEB-37 | `the_current_page_is_marked_by_a_rule_in_real_chrome` | chrome | M3 |
 | WEB-38 | `every_destination_answers_without_a_script_over_http` | http | M4 |
@@ -795,7 +940,7 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-44 | `no_route_overflows_sideways_at_three_widths_in_real_chrome` | chrome | M3 |
 | WEB-45 | `every_deck_control_is_forty_four_pixels_at_390_in_real_chrome` | chrome | M3 |
 | WEB-46 | `the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome` | chrome | M3 |
-| WEB-47 | `alternatives_may_wrap_two_up_unit` | unit | M1 |
+| WEB-47 | `every_answer_gets_its_own_row_and_the_panel_scrolls_nothing_unit` | unit | M1 |
 | WEB-48 | `every_token_pair_clears_four_and_a_half_to_one_unit` | unit | M1 |
 | WEB-49 | `overlay_never_sits_on_surface0_unit` | unit | M1 |
 | WEB-50 | `the_focus_ring_and_the_filled_answer_clear_three_to_one_unit` | unit | M1 |
@@ -809,8 +954,8 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-58 | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` † | unit | M1 |
 | WEB-59 | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | chrome | M2 |
 
-Counts: 59 requirements — 56 MUST, 2 SHOULD (WEB-06, WEB-21), 1 MAY (WEB-47); by layer, 31
-`unit`, 27 `chrome`, 1 `http`.
+Counts: 59 requirements — 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 31
+`unit`, 27 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18.
 
 ## Appendix A — the design plan, verbatim
 
