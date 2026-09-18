@@ -26124,6 +26124,360 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_ne!(changed["revision"], ready["revision"]);
 }
 
+/// Every selector the browser cases use to find the product's own elements,
+/// in one place.
+///
+/// The page under test is server-rendered today and becomes a client-mounted
+/// one (t-eed0a923), so a cutover that renames a card or moves a control has
+/// to be one edit here rather than forty-three searches through this file.
+/// A selector therefore appears exactly once: a Rust-side value is one of
+/// these names, and a selector written inside a page expression is the
+/// `__NAME__` placeholder `js` splices -- every expression this harness
+/// evaluates goes through `js_value`, which splices before Chrome sees it.
+mod ui {
+    /// The one element the server-rendered shell puts on every page:
+    /// `rust/serve.rs`'s `shell` writes `<main>` for the deck, for a list,
+    /// for a board and for a refusal alike. `wait_for_shell_ready` resolves
+    /// against it, and the client-mounted cutover retargets that single
+    /// function at `wait_for_app_root(tab, APP_ROOT)`.
+    pub const SHELL: &str = "main";
+    /// The test id the mounted application root is expected to carry. Not
+    /// served yet -- the mount is t-eed0a923's -- so today only the harness
+    /// smoke case mounts something under this name.
+    pub const APP_ROOT: &str = "app-root";
+    pub const PRIMARY_NAV: &str = "[data-primary-nav]";
+    pub const CARD: &str = "article.item";
+    pub const HIDDEN_CARD: &str = "article.item[hidden]";
+    pub const CURRENT: &str = "[data-current]";
+    pub const CURRENT_CARD: &str = "article.item[data-current]";
+    pub const SENT_CARD: &str = "article.item[data-sent]";
+    pub const DECK_CARDS: &str = "[data-deck-cards]";
+    pub const DECIDE: &str = "form.decide";
+    pub const CURRENT_DECIDE: &str = "[data-current] form.decide";
+    pub const RECOMMENDED_CHOICE: &str = "fieldset.recommended button.choice";
+    pub const ALTERNATIVE_CHOICE: &str = ".alternative button.choice";
+    pub const CHOICE: &str = "button.choice";
+    pub const CUSTOM_ANSWER: &str = "details[data-custom]";
+    pub const FULL_ITEM: &str = "details.full";
+    pub const RECEIPT: &str = "p.receipt";
+    pub const ERROR: &str = "p.error";
+    /// A refusal the page is showing, whatever reason it names.
+    pub const REFUSAL: &str = "[data-refusal]";
+    pub const LIVE: &str = "[data-live]";
+    pub const NOTICES: &str = "[data-notices]";
+    pub const NOTICE: &str = "[data-notices] .notice";
+    pub const HISTORY: &str = "[data-history]";
+    pub const HISTORY_RECEIPT: &str = "[data-history] [data-receipt]";
+    pub const HISTORY_TOGGLE: &str = "[data-history-toggle]";
+    pub const HISTORY_COUNT: &str = "[data-history-count]";
+    pub const SIDE: &str = "[data-side]";
+
+    /// `[data-testid="<id>"]` -- the readiness hook a client mount can offer
+    /// that is neither a sleep nor a text match.
+    pub fn test_id(id: &str) -> String {
+        format!("[data-testid=\"{id}\"]")
+    }
+
+    /// One card by the item it carries.
+    pub fn card(id: &str) -> String {
+        format!("{CARD}[data-item=\"{id}\"]")
+    }
+
+    /// The receipt one decided item was replaced by.
+    pub fn receipt(id: &str) -> String {
+        format!("{RECEIPT}[data-receipt=\"{id}\"]")
+    }
+
+    /// The same row wherever it is carried -- the side history writes one
+    /// without the paragraph class the card's own receipt has.
+    pub fn receipt_row(id: &str) -> String {
+        format!("[data-receipt=\"{id}\"]")
+    }
+
+    /// One card's decision form, named by the route it posts to.
+    pub fn decide(action: &str) -> String {
+        format!("{DECIDE}[action=\"{action}\"]")
+    }
+
+    /// A refusal the page is showing, by the reason it names.
+    pub fn refusal(reason: &str) -> String {
+        format!("[data-refusal={reason}]")
+    }
+
+    /// The same refusal where it is the form's own error line.
+    pub fn error_refusal(reason: &str) -> String {
+        format!("{ERROR}[data-refusal={reason}]")
+    }
+
+    /// Splice the names above into a page expression: every `__NAME__`
+    /// placeholder becomes the selector `NAME` stands for, and anything else
+    /// -- `window.__animations`, the `__SELECTOR__` a caller already
+    /// substituted -- is left alone.
+    pub fn js(expression: &str) -> String {
+        let mut spliced = expression.to_owned();
+        for (placeholder, selector) in PLACEHOLDERS {
+            if spliced.contains(placeholder) {
+                spliced = spliced.replace(placeholder, selector);
+            }
+        }
+        spliced
+    }
+
+    const PLACEHOLDERS: &[(&str, &str)] = &[
+        ("__SHELL__", SHELL),
+        ("__CARD__", CARD),
+        ("__HIDDEN_CARD__", HIDDEN_CARD),
+        ("__CURRENT_CARD__", CURRENT_CARD),
+        ("__CURRENT__", CURRENT),
+        ("__SENT_CARD__", SENT_CARD),
+        ("__DECK_CARDS__", DECK_CARDS),
+        ("__DECIDE__", DECIDE),
+        ("__RECOMMENDED_CHOICE__", RECOMMENDED_CHOICE),
+        ("__ALTERNATIVE_CHOICE__", ALTERNATIVE_CHOICE),
+        ("__CHOICE__", CHOICE),
+        ("__CUSTOM__", CUSTOM_ANSWER),
+        ("__FULL__", FULL_ITEM),
+        ("__RECEIPT__", RECEIPT),
+        ("__ERROR__", ERROR),
+        ("__REFUSAL__", REFUSAL),
+        ("__LIVE__", LIVE),
+        ("__NOTICES__", NOTICES),
+        ("__NOTICE__", NOTICE),
+        ("__HISTORY_RECEIPT__", HISTORY_RECEIPT),
+        ("__HISTORY_TOGGLE__", HISTORY_TOGGLE),
+        ("__HISTORY_COUNT__", HISTORY_COUNT),
+        ("__HISTORY__", HISTORY),
+        ("__SIDE__", SIDE),
+    ];
+}
+
+/// Block until the application root named by `test_id` has been mounted and
+/// is visible, and return it.
+///
+/// A client-mounted page answers its first request with a shell that holds
+/// none of the page: the root appears when the bundle has parsed, run and
+/// committed, which is some unknown number of milliseconds later and is not
+/// a number any test may hard-code. So this polls -- bounded, and for the
+/// two facts that together mean "mounted": the node is in the document, and
+/// Chrome says it is visible, which a root that mounted into a hidden
+/// subtree or with zero size is not. A transient evaluate error is tolerated
+/// rather than fatal, because a mount replaces the execution context under
+/// the read.
+///
+/// Failure names the id and how long it waited, so a mount that never
+/// happened reads as a mount that never happened rather than as
+/// `wait_for_element` timing out on a selector nobody recognises.
+fn wait_for_app_root<'tab>(
+    tab: &'tab headless_chrome::Tab,
+    test_id: &str,
+) -> headless_chrome::Element<'tab> {
+    let selector = ui::test_id(test_id);
+    let mounted = format!(
+        "(() => {{ const root = document.querySelector('{selector}'); \
+         return Boolean(root) && root.checkVisibility(); }})()"
+    );
+    let waited = Duration::from_secs(30);
+    let deadline = Instant::now() + waited;
+    loop {
+        let visible = tab
+            .evaluate(&mounted, false)
+            .ok()
+            .and_then(|result| result.value)
+            == Some(Value::Bool(true));
+        if visible {
+            return tab
+                .find_element(&selector)
+                .unwrap_or_else(|error| panic!("the mounted {test_id} root: {error}"));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no visible {selector} was mounted within {waited:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Block until the page's shell has arrived -- the one readiness signal
+/// every tab helper shares.
+///
+/// Today that is the server-rendered `<main>`, which is in the first
+/// response's markup. It is deliberately the only thing the three tab
+/// helpers agree on: when the page mounts its own body, this function
+/// becomes `wait_for_app_root(tab, ui::APP_ROOT)` and nothing else in the
+/// file has to know.
+fn wait_for_shell_ready(tab: &headless_chrome::Tab) {
+    tab.wait_for_element(ui::SHELL)
+        .unwrap_or_else(|error| panic!("the page shell ({}) never arrived: {error}", ui::SHELL));
+}
+
+/// One page, served to every request on a loopback port this case owns.
+///
+/// The product does not serve a client-mounted page yet -- the mount is
+/// t-eed0a923's and its bundle is t-992e40aa's -- so the readiness helper
+/// above cannot be proved against the binary without inventing a product
+/// change. It is proved against a page this test wrote instead: the same
+/// Chrome, the same CDP, the same helper, and a body that arrives late for
+/// the same reason a mounted one does.
+struct FixturePage {
+    origin: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FixturePage {
+    fn serving(page: &'static str) -> Self {
+        use std::io::Read as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve a loopback port");
+        let origin = format!(
+            "http://{}/",
+            listener.local_addr().expect("the listener's address")
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("poll the fixture listener");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        // The request is not the subject: read enough to let
+                        // Chrome finish sending it, then answer the one page.
+                        let mut request = [0_u8; 2048];
+                        let _ = connection.set_read_timeout(Some(Duration::from_secs(5)));
+                        let _ = connection.read(&mut request);
+                        let _ = connection.write_all(response.as_bytes());
+                        let _ = connection.flush();
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept on the fixture page listener: {error}"),
+                }
+            }
+        });
+        Self {
+            origin,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for FixturePage {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// A shell that holds none of its page, and mounts one a second and a half
+/// later.
+///
+/// The delay is measured rather than chosen: the naive look this case
+/// compares against is itself two CDP round trips that Chrome answers only
+/// once the new document exists, and on this machine it returns 245ms after
+/// `navigate_to` does. A mount at 300ms lands inside that window, which
+/// would make the comparison a race rather than a measurement. A second and
+/// a half puts the mount well after both looks have been taken, and nothing
+/// here sleeps for it: the helper polls, and the flag is read back so a
+/// failure says which of the two orderings actually happened.
+const ASYNC_MOUNT_PAGE: &str = "<!doctype html><title>late mount</title><body></body>\
+<script>\
+window.__mounted = false;\
+setTimeout(() => { const root = document.createElement('div'); \
+root.dataset.testid = 'app-root'; root.textContent = 'mounted'; \
+document.body.append(root); window.__mounted = true; }, 1500);\
+</script>";
+
+/// The readiness signal a client-mounted page will be waited on by, proved
+/// in the browser the rest of this file drives.
+///
+/// Two claims, and the second is what makes the first worth having: the
+/// helper finds a root that appears after the document was committed, and
+/// the naive look -- `find_element` the moment the navigation returns,
+/// which is all any tab helper in this file needs while the shell carries
+/// the page -- does not. So the helper is doing work rather than restating
+/// something the page had already done.
+///
+/// Both looks are taken at the same instant, which is what makes this a
+/// measurement rather than a race: `navigate_to` returns with the document
+/// committed and its body still empty, the naive look fails there, and the
+/// helper polls from there across the mount. `wait_until_navigated` is
+/// deliberately not called first -- on this machine it returns after the
+/// mount has already landed, which would compare the helper against a page
+/// that no longer needed it.
+///
+/// Blocked half, deliberately not faked: the brief's "a trivial React root
+/// served by the binary" needs the SPA spec (t-eed0a923) and its bundle
+/// (t-992e40aa), and serving one from `rust/serve.rs` would be a product
+/// change this ticket is not allowed to make (ADR-047 §6). The page below is
+/// this test's own; what it proves is the harness half.
+#[test]
+fn an_async_mounted_root_is_found_by_test_id_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let page = FixturePage::serving(ASYNC_MOUNT_PAGE);
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "async mount tab");
+    let started = Instant::now();
+    tab.navigate_to(&page.origin)
+        .expect("load the late-mounting page");
+    eprintln!("navigate_to returned after {:?}", started.elapsed());
+
+    let root_selector = ui::test_id(ui::APP_ROOT);
+    let naive = tab.find_element(&root_selector);
+    eprintln!("naive find_element returned after {:?}", started.elapsed());
+    // Tolerated: a read taken this early can land while Chrome is still
+    // swapping execution contexts, and a page that cannot answer has
+    // certainly not mounted.
+    let mounted_already = tab
+        .evaluate("window.__mounted === true", false)
+        .ok()
+        .and_then(|result| result.value)
+        == Some(Value::Bool(true));
+    assert!(
+        !mounted_already,
+        "the page mounted before the naive look, so this run proves nothing"
+    );
+    assert!(
+        naive.is_err(),
+        "{root_selector} was already there when the navigation returned, so waiting for it proves \
+         nothing"
+    );
+
+    let root = wait_for_app_root(&tab, ui::APP_ROOT);
+    eprintln!("wait_for_app_root returned after {:?}", started.elapsed());
+    assert_eq!(
+        root.get_inner_text()
+            .expect("the mounted root's text")
+            .trim(),
+        "mounted"
+    );
+    assert_eq!(
+        js_value(&tab, "window.__mounted === true"),
+        Value::Bool(true),
+        "the helper returned before the page said it had mounted"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{root_selector}').dataset.testid")
+        ),
+        ui::APP_ROOT,
+        "the helper resolved something other than the test id it was given"
+    );
+}
+
 /// A new Chrome tab, retried while the browser is still warming up.
 ///
 /// `Browser::new_tab` waits ten seconds for `Target.createTarget` to answer
@@ -26164,8 +26518,8 @@ fn decision_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
     .expect("set the trusted edge actor header");
     tab.navigate_to(origin).expect("load Needs you");
     tab.wait_until_navigated().expect("initial navigation");
-    tab.wait_for_element("article.item")
-        .expect("a decision card");
+    wait_for_shell_ready(&tab);
+    tab.wait_for_element(ui::CARD).expect("a decision card");
     tab
 }
 
@@ -26184,8 +26538,8 @@ fn list_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
     tab.navigate_to(&format!("{}all", origin))
         .expect("load the open list");
     tab.wait_until_navigated().expect("initial navigation");
-    tab.wait_for_element("article.item")
-        .expect("a decision card");
+    wait_for_shell_ready(&tab);
+    tab.wait_for_element(ui::CARD).expect("a decision card");
     tab
 }
 
@@ -26203,14 +26557,14 @@ fn open_nav_drawer(tab: &headless_chrome::Tab) {
 fn open_side_history(tab: &headless_chrome::Tab) {
     if js_value(
         tab,
-        "!document.querySelector('[data-history-toggle]') \
-         || !document.querySelector('[data-history-toggle]').checkVisibility() \
+        "!document.querySelector('__HISTORY_TOGGLE__') \
+         || !document.querySelector('__HISTORY_TOGGLE__').checkVisibility() \
          || document.body.hasAttribute('data-history-open')",
     ) == Value::Bool(true)
     {
         return;
     }
-    click_control(tab, "[data-history-toggle]");
+    click_control(tab, ui::HISTORY_TOGGLE);
     wait_for_js_true(tab, "document.body.hasAttribute('data-history-open')");
 }
 
@@ -26234,7 +26588,7 @@ fn assert_noted_receipt(tab: &headless_chrome::Tab, id: &str, label: &str) {
 
 fn assert_receipt_reads(tab: &headless_chrome::Tab, id: &str, decided: &str) {
     let receipt = tab
-        .wait_for_element(&format!("p.receipt[data-receipt=\"{id}\"]"))
+        .wait_for_element(&ui::receipt(id))
         .unwrap_or_else(|error| panic!("receipt for {id}: {error}"));
     assert_eq!(
         receipt.get_inner_text().expect("receipt text").trim(),
@@ -26246,7 +26600,7 @@ fn assert_receipt_reads(tab: &headless_chrome::Tab, id: &str, decided: &str) {
         js_value(
             tab,
             &format!(
-                "(() => {{ const r = document.querySelector('p.receipt[data-receipt=\"{id}\"]'); \
+                "(() => {{ const r = document.querySelector('__RECEIPT__[data-receipt=\"{id}\"]'); \
                  const b = r && r.querySelector('button[data-undo]'); \
                  return Boolean(b) && r.dataset.project.length > 0; }})()"
             )
@@ -26279,8 +26633,13 @@ fn settled_row(fixture: &Fixture, id: &str) -> Value {
         .clone()
 }
 
+/// Evaluate one expression in the page, with `ui`'s selector placeholders
+/// spliced in first: this is the single funnel every page expression in this
+/// file goes through, which is what lets a selector inside a probe be a name
+/// rather than a copy.
 fn js_value(tab: &headless_chrome::Tab, expression: &str) -> Value {
-    tab.evaluate(expression, false)
+    let expression = ui::js(expression);
+    tab.evaluate(&expression, false)
         .unwrap_or_else(|error| panic!("evaluate {expression}: {error}"))
         .value
         .unwrap_or(Value::Null)
@@ -26295,7 +26654,8 @@ fn trusted_web_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> 
     .expect("set the trusted edge actor header");
     tab.navigate_to(origin).expect("load Kanban");
     tab.wait_until_navigated().expect("initial navigation");
-    tab.wait_for_element("[data-primary-nav]")
+    wait_for_shell_ready(&tab);
+    tab.wait_for_element(ui::PRIMARY_NAV)
         .expect("primary navigation");
     tab
 }
@@ -26561,7 +26921,7 @@ fn click_control(tab: &headless_chrome::Tab, selector: &str) {
          el.scrollIntoView({block: 'center', inline: 'center'}); \
          const box = el.getBoundingClientRect(); \
          if (box.width === 0 || box.height === 0) return JSON.stringify({state: 'unrendered', \
-         visible: el.checkVisibility(), onHiddenCard: Boolean(el.closest('article.item[hidden]'))}); \
+         visible: el.checkVisibility(), onHiddenCard: Boolean(el.closest('__HIDDEN_CARD__'))}); \
          const x = box.left + box.width / 2, y = box.top + box.height / 2; \
          const hit = document.elementFromPoint(x, y); \
          if (hit && (hit === el || el.contains(hit) || hit.contains(el))) \
@@ -26596,11 +26956,11 @@ fn click_control(tab: &headless_chrome::Tab, selector: &str) {
 /// on purpose: a click toggles, and a helper that closed the fold on its
 /// second call would be a trap.
 fn open_custom_answer(tab: &headless_chrome::Tab, form: &str) {
-    let is_open = format!("document.querySelector('{form} details[data-custom]').open");
+    let is_open = format!("document.querySelector('{form} __CUSTOM__').open");
     if js_value(tab, &is_open) == Value::Bool(true) {
         return;
     }
-    click_control(tab, &format!("{form} details[data-custom] > summary"));
+    click_control(tab, &format!("{form} {} > summary", ui::CUSTOM_ANSWER));
     for _ in 0..100 {
         if js_value(tab, &is_open) == Value::Bool(true) {
             return;
@@ -26615,7 +26975,7 @@ fn open_custom_answer(tab: &headless_chrome::Tab, form: &str) {
 fn hold_projection(tab: &headless_chrome::Tab) {
     js_value(
         tab,
-        "(() => { document.querySelector('main').dataset.generation = 'held'; return true; })()",
+        "(() => { document.querySelector('__SHELL__').dataset.generation = 'held'; return true; })()",
     );
 }
 
@@ -26628,7 +26988,10 @@ fn hold_projection(tab: &headless_chrome::Tab) {
 /// after it happened.
 fn wait_for_projection_swap(tab: &headless_chrome::Tab) {
     for _ in 0..200 {
-        if js_value(tab, "!document.querySelector('main').dataset.generation") == Value::Bool(true)
+        if js_value(
+            tab,
+            "!document.querySelector('__SHELL__').dataset.generation",
+        ) == Value::Bool(true)
         {
             return;
         }
@@ -26640,14 +27003,14 @@ fn wait_for_projection_swap(tab: &headless_chrome::Tab) {
 /// Block until the live status line reads `text`.
 fn wait_for_live(tab: &headless_chrome::Tab, text: &str) {
     for _ in 0..200 {
-        if js_value(tab, "document.querySelector('[data-live]').textContent") == text {
+        if js_value(tab, "document.querySelector('__LIVE__').textContent") == text {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
         "the live status never read {text:?}; it reads {}",
-        js_value(tab, "document.querySelector('[data-live]').textContent")
+        js_value(tab, "document.querySelector('__LIVE__').textContent")
     );
 }
 
@@ -26705,7 +27068,7 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
 
     // The question is the heading, and the body is folded beneath the card.
     assert_eq!(
-        tab.wait_for_element(&format!("article.item[data-item=\"{id}\"] h2"))
+        tab.wait_for_element(&format!("{} h2", ui::card(id)))
             .expect("the question")
             .get_inner_text()
             .expect("question text")
@@ -26716,7 +27079,7 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
         js_value(
             &tab,
             &format!(
-                "document.querySelector('article.item[data-item=\"{id}\"] details.full > summary').textContent"
+                "document.querySelector('__CARD__[data-item=\"{id}\"] __FULL__ > summary').textContent"
             )
         ),
         "show the full item"
@@ -26736,7 +27099,7 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
         js_value(
             &tab,
             &format!(
-                "document.querySelector('article.item[data-item=\"{id}\"]')\
+                "document.querySelector('__CARD__[data-item=\"{id}\"]')\
                  .querySelector('button, input, textarea, select').value"
             )
         ),
@@ -26746,7 +27109,7 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
         js_value(
             &tab,
             &format!(
-                "(() => {{ const first = document.querySelector('article.item[data-item=\"{id}\"]')\
+                "(() => {{ const first = document.querySelector('__CARD__[data-item=\"{id}\"]')\
                  .querySelector('button, input, textarea, select, a'); \
                  return first.matches('.eyebrow a') ? first.getAttribute('href') : first.tagName; }})()"
             )
@@ -26754,7 +27117,7 @@ fn a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_out
         "/board/CARDCLICK"
     );
     let recommended = tab
-        .wait_for_element(&format!("{form} fieldset.recommended button.choice"))
+        .wait_for_element(&format!("{form} {}", ui::RECOMMENDED_CHOICE))
         .expect("the recommended button");
     let choice = card_choices()[0].clone();
     let label = choice["label"].as_str().unwrap();
@@ -26879,7 +27242,7 @@ fn a_choice_clicked_with_a_reply_records_the_note_in_real_chrome() {
     );
 
     hold_projection(&tab);
-    tab.wait_for_element(&format!("{form} fieldset.recommended button.choice"))
+    tab.wait_for_element(&format!("{form} {}", ui::RECOMMENDED_CHOICE))
         .expect("the recommended button")
         .click()
         .expect("one click on the recommendation");
@@ -27073,7 +27436,7 @@ fn the_undo_key_bring_back_the_last_decision_in_real_chrome() {
     let tab = decision_tab(&chrome, &origin);
 
     // Decide with the keyboard, the way the undo is meant to follow.
-    tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+    tab.wait_for_element(&ui::card(id))
         .expect("the card")
         .focus()
         .expect("focus the card");
@@ -27087,7 +27450,7 @@ fn the_undo_key_bring_back_the_last_decision_in_real_chrome() {
     // `u` undoes it. Focus sits on the next card after a decision, so this
     // exercises the "newest receipt on the page" arm of the key.
     tab.press_key("u").expect("press u");
-    tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+    tab.wait_for_element(&ui::card(id))
         .expect("the brought-back card");
     assert_eq!(
         js_value(&tab, "document.activeElement.dataset.item"),
@@ -27097,7 +27460,7 @@ fn the_undo_key_bring_back_the_last_decision_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            &format!("Boolean(document.querySelector('p.receipt[data-receipt=\"{id}\"]'))")
+            &format!("Boolean(document.querySelector('__RECEIPT__[data-receipt=\"{id}\"]'))")
         ),
         Value::Bool(false),
         "the receipt outlived its own undo"
@@ -27133,7 +27496,7 @@ fn the_undo_key_bring_back_the_last_decision_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            &format!("Boolean(document.querySelector('article.item[data-item=\"{spare_id}\"]'))")
+            &format!("Boolean(document.querySelector('__CARD__[data-item=\"{spare_id}\"]'))")
         ),
         Value::Bool(true),
         "the untouched card vanished"
@@ -27171,13 +27534,12 @@ fn recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome() {
     // Decide both from the page, in order, so the resolutions carry real
     // timestamps from the store rather than seeds.
     for (id, key) in [(first_id, "1"), (second_id, "1")] {
-        tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+        tab.wait_for_element(&ui::card(id))
             .expect("the card")
             .focus()
             .expect("focus the card");
         tab.press_key(key).expect("decide");
-        tab.wait_for_element(&format!("p.receipt[data-receipt=\"{id}\"]"))
-            .expect("the receipt");
+        tab.wait_for_element(&ui::receipt(id)).expect("the receipt");
     }
 
     tab.navigate_to(&format!("{origin}decided"))
@@ -27396,8 +27758,7 @@ fn reference_links_preview_on_hover_nest_and_open_a_new_tab_in_real_chrome() {
     let tab = decision_tab(&chrome, &origin);
 
     // The card's task reference carries the preview contract.
-    let about =
-        format!("article.item[data-item=\"{id}\"] a[data-ref][data-task-link=\"{task_id}\"]");
+    let about = format!("{} a[data-ref][data-task-link=\"{task_id}\"]", ui::card(id));
     tab.wait_for_element(&about)
         .expect("the task reference on the card")
         .focus()
@@ -27529,12 +27890,12 @@ fn markdown_renders_in_real_chrome_and_raw_html_stays_inert() {
     wait_for_js_true(
         &tab,
         &format!(
-            "document.querySelector('article.item[data-item=\"{id}\"] details.full').open \
-             && document.querySelector('article.item[data-item=\"{id}\"] \
-             details.full .body.md').checkVisibility()"
+            "document.querySelector('__CARD__[data-item=\"{id}\"] __FULL__').open \
+             && document.querySelector('__CARD__[data-item=\"{id}\"] \
+             __FULL__ .body.md').checkVisibility()"
         ),
     );
-    let details = format!("article.item[data-item=\"{id}\"] details.full .body.md");
+    let details = format!("{} {} .body.md", ui::card(id), ui::FULL_ITEM);
     assert_eq!(
         js_value(
             &tab,
@@ -27638,7 +27999,10 @@ fn a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome() {
     // The socket ticks once a second, so this is two chances to swap.
     std::thread::sleep(Duration::from_millis(2_500));
     assert_eq!(
-        js_value(&tab, "document.querySelector('main').dataset.generation"),
+        js_value(
+            &tab,
+            "document.querySelector('__SHELL__').dataset.generation"
+        ),
         "held",
         "the live refresh swapped the projection out from under a picked verdict"
     );
@@ -27812,7 +28176,10 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
         "the held projection response never reached the page"
     );
     assert_eq!(
-        js_value(&tab, "document.querySelector('main').dataset.generation"),
+        js_value(
+            &tab,
+            "document.querySelector('__SHELL__').dataset.generation"
+        ),
         "held",
         "the delivered projection was not held back by the gate after the fetch"
     );
@@ -27820,7 +28187,10 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
     let deadline = Instant::now() + Duration::from_millis(2_500);
     while Instant::now() < deadline {
         assert_eq!(
-            js_value(&tab, "document.querySelector('main').dataset.generation"),
+            js_value(
+                &tab,
+                "document.querySelector('__SHELL__').dataset.generation"
+            ),
             "held",
             "the in-flight projection was applied over an answer started while it was fetching"
         );
@@ -27896,7 +28266,7 @@ fn a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it() 
         js_value(
             tab,
             &format!(
-                "(() => {{ const el = document.querySelector('{} [data-refusal]'); \
+                "(() => {{ const el = document.querySelector('{} __REFUSAL__'); \
                  return el && el.offsetParent !== null ? el.textContent : null; }})()",
                 form(id)
             ),
@@ -28494,8 +28864,8 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
     let form = format!("form.decide[action=\"/attention/CARDREFUSED/{id}/reply\"]");
-    let board_refusal = format!("{form} [data-refusal=board]");
-    let own_refusal = format!("{form} [data-refusal=incomplete]");
+    let board_refusal = format!("{form} {}", ui::refusal("board"));
+    let own_refusal = format!("{form} {}", ui::refusal("incomplete"));
     // Read as text rather than through an element handle, so that a missing
     // line comes back as null instead of a panic and every comparison below
     // is against the same kind of value.
@@ -28627,7 +28997,7 @@ fn a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome() {
     // This POST is refused too, so the card stays and the picker is
     // observable: what is on screen must not claim a verdict that was never
     // part of the decision.
-    click_control(&tab, &format!("{form} button.choice"));
+    click_control(&tab, &format!("{form} {}", ui::CHOICE));
     // The POST is asynchronous, so this waits long enough for a receipt to
     // have rendered if the board had taken it.
     std::thread::sleep(Duration::from_millis(1_500));
@@ -28716,13 +29086,8 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
-    let card = |id: &str| format!("article.item[data-item=\"{id}\"]");
-    let recommended = |id: &str| {
-        format!(
-            "{} form.decide fieldset.recommended button.choice",
-            card(id)
-        )
-    };
+    let card = ui::card;
+    let recommended = |id: &str| format!("{} {} {}", card(id), ui::DECIDE, ui::RECOMMENDED_CHOICE);
     let label = card_choices()[0]["label"].as_str().unwrap().to_owned();
 
     assert_eq!(js_value(&tab, HOLD_THE_POST), true);
@@ -28805,7 +29170,7 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
         js_value(
             &tab,
             &format!(
-                "(() => {{ const form = document.querySelector('{} form.decide'); \
+                "(() => {{ const form = document.querySelector('{} __DECIDE__'); \
                  const pressed = [...form.querySelectorAll('[data-pressed]')]; \
                  return form.dataset.deciding === '1' && pressed.length === 1 \
                  && pressed[0].matches('.choice'); }})()",
@@ -28830,7 +29195,7 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
         js_value(
             &tab,
             &format!(
-                "(() => {{ const r = document.querySelector('p.receipt[data-receipt=\"{held_id}\"]'); \
+                "(() => {{ const r = document.querySelector('__RECEIPT__[data-receipt=\"{held_id}\"]'); \
                  return r.className; }})()"
             )
         ),
@@ -28919,7 +29284,7 @@ fn a_refused_click_restores_the_card_in_real_chrome() {
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
     let form = format!("form.decide[action=\"/attention/CARDRESTORE/{id}/reply\"]");
-    let recommended = format!("{form} fieldset.recommended button.choice");
+    let recommended = format!("{form} {}", ui::RECOMMENDED_CHOICE);
 
     assert_eq!(
         js_value(
@@ -28944,12 +29309,15 @@ fn a_refused_click_restores_the_card_in_real_chrome() {
         .click()
         .expect("one click on the recommendation");
 
-    tab.wait_for_element(&format!("{form} [data-refusal=board]"))
+    tab.wait_for_element(&format!("{form} {}", ui::refusal("board")))
         .expect("the board's refusal");
     assert_eq!(
         js_value(
             &tab,
-            &format!("document.querySelector('{form} [data-refusal=board]').textContent")
+            &format!(
+                "document.querySelector('{form} {}').textContent",
+                ui::refusal("board")
+            )
         ),
         "nope",
         "the card is not quoting what the board said"
@@ -28977,7 +29345,7 @@ fn a_refused_click_restores_the_card_in_real_chrome() {
         js_value(
             &tab,
             &format!(
-                "(() => {{ const card = document.querySelector('article.item[data-item=\"{id}\"]'); \
+                "(() => {{ const card = document.querySelector('__CARD__[data-item=\"{id}\"]'); \
                  return !card.dataset.state && !card.hasAttribute('aria-busy'); }})()"
             )
         ),
@@ -29024,7 +29392,7 @@ fn the_custom_answer_is_folded_until_c_opens_it_in_real_chrome() {
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
     let form = format!("form.decide[action=\"/attention/CARDFOLD/{id}/reply\"]");
-    let fold = format!("{form} details[data-custom]");
+    let fold = format!("{form} {}", ui::CUSTOM_ANSWER);
 
     assert_eq!(
         js_value(&tab, &format!("document.querySelector('{fold}').open")),
@@ -29051,7 +29419,7 @@ fn the_custom_answer_is_folded_until_c_opens_it_in_real_chrome() {
         "the verdict picker is visible while the answer is folded"
     );
 
-    tab.wait_for_element(&format!("article.item[data-item=\"{id}\"]"))
+    tab.wait_for_element(&ui::card(id))
         .expect("the card")
         .focus()
         .expect("focus the card");
@@ -29116,7 +29484,7 @@ fn a_digit_on_the_folded_answers_summary_records_nothing_in_real_chrome() {
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
     let form = format!("form.decide[action=\"/attention/CARDFOLDKEY/{id}/reply\"]");
-    let summary = format!("{form} details[data-custom] > summary");
+    let summary = format!("{form} {} > summary", ui::CUSTOM_ANSWER);
 
     // A note in hand, and the cursor one Tab past it -- which is the fold.
     let typed = "Restart it after 19:00 MYT, not during the day.";
@@ -29171,7 +29539,7 @@ fn a_digit_on_the_folded_answers_summary_records_nothing_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            &format!("Boolean(document.querySelector('article.item[data-item=\"{id}\"]'))")
+            &format!("Boolean(document.querySelector('__CARD__[data-item=\"{id}\"]'))")
         ),
         Value::Bool(true),
         "a digit pressed on the fold replaced the card with a receipt"
@@ -29287,8 +29655,9 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
     click_control(
         &tab,
         &format!(
-            "{} .alternative button.choice[value=keep-parked]",
-            card_form(noted_id)
+            "{} {}[value=keep-parked]",
+            card_form(noted_id),
+            ui::ALTERNATIVE_CHOICE
         ),
     );
     assert_noted_receipt(&tab, noted_id, "Keep it parked until a seat frees up");
@@ -29308,7 +29677,7 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
 
     // `2` picks the second choice of the card that has focus. This row
     // authored none, so its second choice is the default pair's rejection.
-    tab.wait_for_element(&format!("article.item[data-item=\"{keyed_id}\"]"))
+    tab.wait_for_element(&ui::card(keyed_id))
         .expect("the card")
         .focus()
         .expect("focus the card");
@@ -29321,7 +29690,7 @@ fn needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome() {
 
     // `c` reaches the answer field, and a digit typed there is a digit
     // rather than a decision.
-    tab.wait_for_element(&format!("article.item[data-item=\"{deferred_id}\"]"))
+    tab.wait_for_element(&ui::card(deferred_id))
         .expect("the card")
         .focus()
         .expect("focus the card");
@@ -29603,7 +29972,7 @@ fn wait_for_live_status(tab: &headless_chrome::Tab, want: &str, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         let status = tab
-            .find_element("[data-live]")
+            .find_element(ui::LIVE)
             .ok()
             .and_then(|element| element.get_inner_text().ok());
         if status
@@ -29621,7 +29990,7 @@ fn wait_for_live_status(tab: &headless_chrome::Tab, want: &str, label: &str) {
 }
 
 fn notice_rows_on_page(tab: &headless_chrome::Tab) -> Vec<String> {
-    tab.find_elements("[data-notices] .notice")
+    tab.find_elements(ui::NOTICE)
         .map(|rows| {
             rows.iter()
                 .filter_map(|row| row.get_inner_text().ok())
@@ -29728,7 +30097,7 @@ fn a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload() {
     );
     let seq = raised[0]["seq"].as_i64().expect("the raised event's seq");
     assert_eq!(
-        tab.find_element("[data-notices] .notice")
+        tab.find_element(ui::NOTICE)
             .expect("notice row")
             .get_attribute_value("data-key")
             .expect("read data-key"),
@@ -29939,7 +30308,7 @@ fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
         "a summary names no row: {rows:?}"
     );
     let classes = tab
-        .find_element("[data-notices] .notice")
+        .find_element(ui::NOTICE)
         .expect("summary row")
         .get_attribute_value("class")
         .expect("read class");
@@ -29995,7 +30364,7 @@ fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
     );
     wait_for_notice_rows(&tab, 1, "first delivery");
     let key = tab
-        .find_element("[data-notices] .notice")
+        .find_element(ui::NOTICE)
         .expect("notice row")
         .get_attribute_value("data-key")
         .expect("read data-key")
@@ -30020,7 +30389,7 @@ fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
 
     // Dismissing is the action a notice offers. A redelivery must not undo it:
     // the key is remembered, so the answer stays "already seen".
-    tab.find_element("[data-notices] .notice > .dismiss")
+    tab.find_element(&format!("{} > .dismiss", ui::NOTICE))
         .expect("dismiss button")
         .click()
         .expect("dismiss the notice");
@@ -31142,9 +31511,12 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
     hold_projection(&tab);
     click_control(
         &tab,
-        &format!("[data-item=\"{attention_id}\"] button.choice[value=approve]"),
+        &format!(
+            "[data-item=\"{attention_id}\"] {}[value=approve]",
+            ui::CHOICE
+        ),
     );
-    tab.wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
+    tab.wait_for_element(&ui::receipt_row(attention_id))
         .expect("final attention receipt");
     wait_for_projection_swap(&tab);
     // The receipt is kept in the side history now, which on a narrow window
@@ -31152,7 +31524,7 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
     // and that tap is this one.
     open_side_history(&tab);
     let receipt = tab
-        .wait_for_element(&format!("[data-receipt=\"{attention_id}\"]"))
+        .wait_for_element(&ui::receipt_row(attention_id))
         .expect("receipt after WebSocket-refreshed empty projection");
     receipt
         .scroll_into_view()
@@ -31171,7 +31543,7 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
         "the exact receipt was not visible after scrolling"
     );
     assert_eq!(
-        js_value(&tab, "document.querySelectorAll('article.item').length"),
+        js_value(&tab, "document.querySelectorAll('__CARD__').length"),
         0
     );
     let open = fixture.ok_json(
@@ -46337,11 +46709,11 @@ fn deck_fixture(label: &str, board: &str) -> (Fixture, Vec<String>) {
 
 /// What the deck measures to, on one viewport.
 const DECK_MEASURE: &str = r#"(() => {
-  const cards = [...document.querySelectorAll('article.item')];
+  const cards = [...document.querySelectorAll('__CARD__')];
   const shown = cards.filter(card => card.checkVisibility());
-  const card = document.querySelector('article.item[data-current]');
-  const body = card.querySelector('details.full .body');
-  const decide = card.querySelector('form.decide');
+  const card = document.querySelector('__CURRENT_CARD__');
+  const body = card.querySelector('__FULL__ .body');
+  const decide = card.querySelector('__DECIDE__');
   const heading = card.querySelector('h2');
   const context = card.querySelector('p.context');
   const round = value => Math.round(value);
@@ -46364,8 +46736,8 @@ const DECK_MEASURE: &str = r#"(() => {
     contextOverflow: getComputedStyle(context).overflowY,
     cardTop: round(card.getBoundingClientRect().top),
     cardBottom: round(card.getBoundingClientRect().bottom),
-    aside: document.querySelector('[data-side]').checkVisibility(),
-    toggle: document.querySelector('[data-history-toggle]').checkVisibility(),
+    aside: document.querySelector('__SIDE__').checkVisibility(),
+    toggle: document.querySelector('__HISTORY_TOGGLE__').checkVisibility(),
   });
 })()"#;
 
@@ -46529,7 +46901,7 @@ fn pressing_1_sends_and_advances_to_the_next_card_in_real_chrome() {
     // narrow window, which hides it without unrendering it.
     wait_for_js_true(
         &tab,
-        "Boolean(document.querySelector('[data-history] [data-receipt]'))",
+        "Boolean(document.querySelector('__HISTORY_RECEIPT__'))",
     );
     // The decision's own live refresh lands before anything else is asked of
     // the page: a swap replaces every node in `<main>`, and a handle taken
@@ -46538,15 +46910,12 @@ fn pressing_1_sends_and_advances_to_the_next_card_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            "document.querySelector('[data-history] [data-receipt]').textContent"
+            "document.querySelector('__HISTORY_RECEIPT__').textContent"
         ),
         format!("Decided: {label}. Undo")
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-current]').dataset.item"
-        ),
+        js_value(&tab, "document.querySelector('__CURRENT__').dataset.item"),
         ids[1].as_str(),
         "the deck did not advance to the next card"
     );
@@ -46559,7 +46928,7 @@ fn pressing_1_sends_and_advances_to_the_next_card_in_real_chrome() {
         js_value(
             &tab,
             &format!(
-                "document.querySelector('article.item[data-item=\"{}\"]') === null",
+                "document.querySelector('__CARD__[data-item=\"{}\"]') === null",
                 ids[0]
             )
         ),
@@ -46601,18 +46970,13 @@ fn skip_moves_the_card_to_the_back_without_recording_in_real_chrome() {
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
     let tab = decision_tab(&chrome, &origin);
-    let current = || {
-        js_value(
-            &tab,
-            "document.querySelector('[data-current]').dataset.item",
-        )
-    };
+    let current = || js_value(&tab, "document.querySelector('__CURRENT__').dataset.item");
 
     tab.press_key("s").expect("skip the first card");
     wait_for_js_true(
         &tab,
         &format!(
-            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            "document.querySelector('__CURRENT__').dataset.item === \"{}\"",
             ids[1]
         ),
     );
@@ -46622,7 +46986,7 @@ fn skip_moves_the_card_to_the_back_without_recording_in_real_chrome() {
         "a skip changed how much is open"
     );
     assert_eq!(
-        js_value(&tab, "document.querySelectorAll('[data-history] p').length"),
+        js_value(&tab, "document.querySelectorAll('__HISTORY__ p').length"),
         0,
         "a skip left a receipt"
     );
@@ -46631,7 +46995,7 @@ fn skip_moves_the_card_to_the_back_without_recording_in_real_chrome() {
     wait_for_js_true(
         &tab,
         &format!(
-            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            "document.querySelector('__CURRENT__').dataset.item === \"{}\"",
             ids[2]
         ),
     );
@@ -46639,7 +47003,7 @@ fn skip_moves_the_card_to_the_back_without_recording_in_real_chrome() {
     wait_for_js_true(
         &tab,
         &format!(
-            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            "document.querySelector('__CURRENT__').dataset.item === \"{}\"",
             ids[0]
         ),
     );
@@ -46693,27 +47057,27 @@ fn a_refused_decision_brings_the_card_back_in_real_chrome() {
 
     tab.press_key("1").expect("press 1");
 
-    let form = format!(
-        "form.decide[action=\"/attention/DECKREFUSE/{}/reply\"]",
-        ids[0]
-    );
+    let form = ui::decide(&format!("/attention/DECKREFUSE/{}/reply", ids[0]));
     wait_for_js_true(
         &tab,
-        &format!("Boolean(document.querySelector('{form} [data-refusal=board]'))"),
+        &format!(
+            "Boolean(document.querySelector('{form} {}'))",
+            ui::refusal("board")
+        ),
     );
     assert_eq!(
         js_value(
             &tab,
-            &format!("document.querySelector('{form} [data-refusal=board]').textContent")
+            &format!(
+                "document.querySelector('{form} {}').textContent",
+                ui::refusal("board")
+            )
         ),
         "nope",
         "the card is not quoting what the board said"
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-current]').dataset.item"
-        ),
+        js_value(&tab, "document.querySelector('__CURRENT__').dataset.item"),
         ids[0].as_str(),
         "a refused card did not come back as the card on screen"
     );
@@ -46723,14 +47087,14 @@ fn a_refused_decision_brings_the_card_back_in_real_chrome() {
         "a refusal left the queue counting a decision that never happened"
     );
     assert_eq!(
-        js_value(&tab, "document.querySelectorAll('[data-history] p').length"),
+        js_value(&tab, "document.querySelectorAll('__HISTORY__ p').length"),
         0,
         "a refused decision left a row in the history"
     );
     assert_eq!(
         js_value(
             &tab,
-            "(() => { const card = document.querySelector('[data-current]'); \
+            "(() => { const card = document.querySelector('__CURRENT__'); \
              return !card.dataset.state && !card.hasAttribute('aria-busy') && !card.dataset.sent; })()"
         ),
         Value::Bool(true),
@@ -46762,18 +47126,18 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     set_viewport(&tab, 390, 844);
     wait_for_js_true(&tab, "innerWidth === 390");
     let second = card_choices()[1]["label"].as_str().unwrap().to_owned();
-    let rows = "[...document.querySelectorAll('[data-history] [data-receipt]')].map(row => row.dataset.item).join(',')";
+    let rows = "[...document.querySelectorAll('__HISTORY_RECEIPT__')].map(row => row.dataset.item).join(',')";
 
     // Clicks, not keys: two decisions in one sitting, each on the card the
     // deck put in front of the operator.
     hold_projection(&tab);
     click_control(
         &tab,
-        "[data-current] form.decide fieldset.recommended button.choice",
+        &format!("{} {}", ui::CURRENT_DECIDE, ui::RECOMMENDED_CHOICE),
     );
     wait_for_js_true(
         &tab,
-        "document.querySelectorAll('[data-history] [data-receipt]').length === 1",
+        "document.querySelectorAll('__HISTORY_RECEIPT__').length === 1",
     );
     // The first decision's own live refresh replaces every node in `<main>`,
     // so the second card is only safe to click once that swap has landed.
@@ -46781,11 +47145,15 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     hold_projection(&tab);
     click_control(
         &tab,
-        "[data-current] form.decide .alternative button.choice[value=keep-parked]",
+        &format!(
+            "{} {}[value=keep-parked]",
+            ui::CURRENT_DECIDE,
+            ui::ALTERNATIVE_CHOICE
+        ),
     );
     wait_for_js_true(
         &tab,
-        "document.querySelectorAll('[data-history] [data-receipt]').length === 2",
+        "document.querySelectorAll('__HISTORY_RECEIPT__').length === 2",
     );
 
     // Newest first: the decision just made reads at the top.
@@ -46797,23 +47165,20 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            "document.querySelector('[data-history] [data-receipt]').textContent"
+            "document.querySelector('__HISTORY_RECEIPT__').textContent"
         ),
         format!("Decided: {second}. Undo")
     );
     assert_eq!(
         js_value(
             &tab,
-            "document.querySelector('[data-history-count]').textContent"
+            "document.querySelector('__HISTORY_COUNT__').textContent"
         ),
         "2",
         "the button that opens the history does not say how much is in it"
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-current]').dataset.item"
-        ),
+        js_value(&tab, "document.querySelector('__CURRENT__').dataset.item"),
         ids[2].as_str()
     );
 
@@ -46824,15 +47189,16 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     click_control(
         &tab,
         &format!(
-            "[data-history] [data-receipt=\"{}\"] button[data-undo]",
+            "{} [data-receipt=\"{}\"] button[data-undo]",
+            ui::HISTORY,
             ids[0]
         ),
     );
     wait_for_js_true(
         &tab,
         &format!(
-            "document.querySelectorAll('[data-history] [data-receipt]').length === 1 \
-             && Boolean(document.querySelector('article.item[data-item=\"{}\"]'))",
+            "document.querySelectorAll('__HISTORY_RECEIPT__').length === 1 \
+             && Boolean(document.querySelector('__CARD__[data-item=\"{}\"]'))",
             ids[0]
         ),
     );
@@ -46840,15 +47206,12 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            "document.querySelector('[data-history-count]').textContent"
+            "document.querySelector('__HISTORY_COUNT__').textContent"
         ),
         "1"
     );
     assert_eq!(
-        js_value(
-            &tab,
-            "document.querySelector('[data-current]').dataset.item"
-        ),
+        js_value(&tab, "document.querySelector('__CURRENT__').dataset.item"),
         ids[0].as_str(),
         "an undo has to put the card it brought back in front of the operator"
     );
@@ -47028,7 +47391,7 @@ fn the_last_card_leaves_the_empty_state_in_real_chrome() {
             "the emptied deck said nothing for 300ms: {}",
             js_value(
                 &tab,
-                "document.querySelector('[data-deck-cards]').innerHTML.slice(0, 400)"
+                "document.querySelector('__DECK_CARDS__').innerHTML.slice(0, 400)"
             )
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -47063,7 +47426,7 @@ fn the_last_card_leaves_the_empty_state_in_real_chrome() {
         Value::Bool(true),
         "the bar is still counting an empty queue"
     );
-    wait_for_js_true(&tab, "Boolean(document.querySelector('[data-history] p'))");
+    wait_for_js_true(&tab, "Boolean(document.querySelector('__HISTORY__ p'))");
 
     // And it survives the settle: the server's own empty state arrives with
     // the swap, and there is exactly one of them.
@@ -47135,15 +47498,15 @@ fn the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http() {
         .expect("disable script execution");
     tab.navigate_to(&server.origin()).expect("load Needs you");
     tab.wait_until_navigated().expect("initial navigation");
-    tab.wait_for_element("article.item").expect("a card");
+    tab.wait_for_element(ui::CARD).expect("a card");
     let measured: Value = serde_json::from_str(
         js_value(
             &tab,
             "JSON.stringify({\
-             shown: [...document.querySelectorAll('article.item')].filter(card => card.checkVisibility()).length, \
+             shown: [...document.querySelectorAll('__CARD__')].filter(card => card.checkVisibility()).length, \
              scrolls: document.scrollingElement.scrollHeight > innerHeight, \
              overflows: document.documentElement.scrollWidth > innerWidth, \
-             submits: document.querySelectorAll('form.decide button.choice').length, \
+             submits: document.querySelectorAll('__DECIDE__ __CHOICE__').length, \
              navShown: document.querySelector('[data-nav=all]').checkVisibility(), \
              navRect: (() => { const r = document.querySelector('[data-nav=all]').getBoundingClientRect(); \
              return {width: Math.round(r.width), height: Math.round(r.height)}; })(), \
@@ -47207,8 +47570,8 @@ fn deck_desk(label: &str, board: &str) -> Desk {
     // it, which is the same act that makes `1` a decision.
     wait_for_js_true(
         &tab,
-        "Boolean(document.querySelector('article.item[data-current]')) \
-         && document.activeElement === document.querySelector('article.item[data-current]')",
+        "Boolean(document.querySelector('__CURRENT_CARD__')) \
+         && document.activeElement === document.querySelector('__CURRENT_CARD__')",
     );
     Desk {
         tab,
@@ -47270,7 +47633,7 @@ const ANIMATION_WATCH: &str = r#"(() => {
 })()"#;
 
 const HEADLINE_MEASURE: &str = r#"(() => {
-  const card = document.querySelector('article.item[data-current]');
+  const card = document.querySelector('__CURRENT_CARD__');
   const head = card.querySelector('h2');
   const style = getComputedStyle(head);
   const size = el => parseFloat(getComputedStyle(el).fontSize) || 0;
@@ -47334,14 +47697,14 @@ fn the_question_is_set_as_a_headline_in_real_chrome() {
 }
 
 const FILL_MEASURE: &str = r#"(() => {
-  const card = document.querySelector('article.item[data-current]');
-  const form = card.querySelector('form.decide');
-  const lead = form.querySelector('fieldset.recommended button.choice');
-  const others = [...form.querySelectorAll('.alternative button.choice')];
+  const card = document.querySelector('__CURRENT_CARD__');
+  const form = card.querySelector('__DECIDE__');
+  const lead = form.querySelector('__RECOMMENDED_CHOICE__');
+  const others = [...form.querySelectorAll('__ALTERNATIVE_CHOICE__')];
   const panelStyle = getComputedStyle(form);
   const inner = form.clientWidth
     - parseFloat(panelStyle.paddingLeft) - parseFloat(panelStyle.paddingRight);
-  const side = document.querySelector('[data-side]');
+  const side = document.querySelector('__SIDE__');
   return JSON.stringify({
     leadBackground: getComputedStyle(lead).backgroundColor,
     leadColor: getComputedStyle(lead).color,
@@ -47441,7 +47804,7 @@ fn the_recommendation_leads_on_fill_in_real_chrome() {
 /// Every drawn border, outline and shadow on the page, with the one
 /// allowlisted hairline each carrier is allowed named alongside it.
 const BOX_SWEEP: &str = r#"(() => {
-  const ALLOW = 'form.decide, p.receipt, [aria-current=page], tr, th, td, ul.rows>li, ul.children>li';
+  const ALLOW = '__DECIDE__, __RECEIPT__, [aria-current=page], tr, th, td, ul.rows>li, ul.children>li';
   const sides = ['Top', 'Right', 'Bottom', 'Left'];
   const offenders = [];
   const hairlines = [];
@@ -47554,7 +47917,7 @@ fn emulate_motion(tab: &headless_chrome::Tab, value: &str) {
 /// not showing: the two classes the advance is made of, each asked for its
 /// computed `animation-name` and put back.
 const ADVANCE_PROBE: &str = r#"(() => {
-  const probe = [...document.querySelectorAll('[data-deck-cards] article.item')]
+  const probe = [...document.querySelectorAll('__DECK_CARDS__ __CARD__')]
     .find(card => !card.hasAttribute('data-current'));
   const resolve = name => {
     probe.classList.add(name);
@@ -47607,7 +47970,7 @@ fn the_advance_runs_once_at_140ms_each_way_in_real_chrome() {
     let resolved = measure(
         &desk.tab,
         r#"(() => {
-  const probe = [...document.querySelectorAll('[data-deck-cards] article.item')]
+  const probe = [...document.querySelectorAll('__DECK_CARDS__ __CARD__')]
     .find(card => !card.hasAttribute('data-current'));
   const resolve = name => {
     probe.classList.add(name);
@@ -47660,7 +48023,7 @@ fn the_advance_runs_once_at_140ms_each_way_in_real_chrome() {
     wait_for_js_true(
         &desk.tab,
         &format!(
-            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            "document.querySelector('__CURRENT__').dataset.item === \"{}\"",
             desk.ids[1]
         ),
     );
@@ -47777,7 +48140,7 @@ fn a_projection_refresh_never_reanimates_the_current_card_in_real_chrome() {
     assert_eq!(
         js_value(
             &desk.tab,
-            "(() => { const card = document.querySelector('article.item[data-current]'); \
+            "(() => { const card = document.querySelector('__CURRENT_CARD__'); \
              window.__cardAnimations = 0; card.kept = 'the same node'; \
              card.addEventListener('animationstart', () => { window.__cardAnimations += 1; }, true); \
              return card.dataset.item; })()"
@@ -47796,11 +48159,11 @@ fn a_projection_refresh_never_reanimates_the_current_card_in_real_chrome() {
 
     let measured = measure(
         &desk.tab,
-        "(() => { const card = document.querySelector('article.item[data-current]'); \
+        "(() => { const card = document.querySelector('__CURRENT_CARD__'); \
          return JSON.stringify({item: card.dataset.item, kept: card.kept || null, \
          animations: window.__cardAnimations, entering: card.classList.contains('entering'), \
          running: card.getAnimations().length, queue: \
-         document.querySelectorAll('[data-deck-cards] article.item:not([data-sent])').length}); })()",
+         document.querySelectorAll('__DECK_CARDS__ __CARD__:not([data-sent])').length}); })()",
         "the refreshed card",
     );
     eprintln!("after the refresh: {measured}");
@@ -47845,8 +48208,8 @@ fn a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome() {
     assert_eq!(
         js_value(
             &desk.tab,
-            "document.querySelector('[data-notices] .notice').closest('[role=log]') \
-             === document.querySelector('[data-notices]')"
+            "document.querySelector('__NOTICE__').closest('[role=log]') \
+             === document.querySelector('__NOTICES__')"
         ),
         true,
         "a notice arrived outside the log region"
@@ -47863,13 +48226,13 @@ fn a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome() {
     // The clock stops while the pointer is on it, so a notice being read is
     // never taken out from under the eye reading it.
     desk.tab
-        .find_element("[data-notices] .notice")
+        .find_element(ui::NOTICE)
         .expect("the toast")
         .move_mouse_over()
         .expect("hover the toast");
     wait_for_js_true(
         &desk.tab,
-        "Boolean(document.querySelector('[data-notices] .notice:hover'))",
+        "Boolean(document.querySelector('__NOTICE__:hover'))",
     );
     sleep_until(arrived + Duration::from_secs(24));
     assert_eq!(
@@ -47882,7 +48245,7 @@ fn a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome() {
     desk.tab.press_key("Escape").expect("press Escape");
     wait_for_js_true(
         &desk.tab,
-        "document.querySelectorAll('[data-notices] .notice').length === 0",
+        "document.querySelectorAll('__NOTICE__').length === 0",
     );
 
     // Three at most, newest first: the fourth arrival pushes the oldest out.
@@ -47941,15 +48304,15 @@ fn reduced_motion_advances_the_deck_without_animating_in_real_chrome() {
     wait_for_js_true(
         &desk.tab,
         &format!(
-            "document.querySelector('[data-current]').dataset.item === \"{}\"",
+            "document.querySelector('__CURRENT__').dataset.item === \"{}\"",
             desk.ids[1]
         ),
     );
     let measured = measure(
         &desk.tab,
         "JSON.stringify({animations: window.__animations, \
-         current: document.querySelector('[data-current]').dataset.item, \
-         currentAnimation: getComputedStyle(document.querySelector('[data-current]')).animationName, \
+         current: document.querySelector('__CURRENT__').dataset.item, \
+         currentAnimation: getComputedStyle(document.querySelector('__CURRENT__')).animationName, \
          left: document.querySelector('.progress').textContent})",
         "the still advance",
     );
@@ -48490,7 +48853,7 @@ const THUMB_SWEEP: &str = r#"(() => {
       }
     }
   };
-  sweep(document.querySelector('article.item[data-current] form.decide'), 'panel');
+  sweep(document.querySelector('__CURRENT_CARD__ __DECIDE__'), 'panel');
   sweep(document.querySelector('nav:not(.drawer)'), 'bar');
   return JSON.stringify({counted, small});
 })()"#;
@@ -48521,11 +48884,8 @@ fn every_deck_control_is_forty_four_pixels_at_390_in_real_chrome() {
         "a deck control is smaller than a thumb at 390: {measured}"
     );
 
-    let form = format!(
-        "form.decide[action=\"/attention/DECKTHUMB/{}/reply\"]",
-        desk.ids[0]
-    );
-    open_custom_answer(&desk.tab, &format!("[data-current] {form}"));
+    let form = ui::decide(&format!("/attention/DECKTHUMB/{}/reply", desk.ids[0]));
+    open_custom_answer(&desk.tab, &format!("{} {form}", ui::CURRENT));
     let unfolded = measure(&desk.tab, THUMB_SWEEP, "the thumb sweep, unfolded");
     eprintln!("controls with the fold open at 390x844: {unfolded}");
     assert!(
@@ -48543,10 +48903,10 @@ fn every_deck_control_is_forty_four_pixels_at_390_in_real_chrome() {
 }
 
 const DESK_MEASURE: &str = r#"(() => {
-  const deck = document.querySelector('[data-deck-cards]');
-  const side = document.querySelector('[data-side]');
-  const history = document.querySelector('[data-history]');
-  const toggle = document.querySelector('[data-history-toggle]');
+  const deck = document.querySelector('__DECK_CARDS__');
+  const side = document.querySelector('__SIDE__');
+  const history = document.querySelector('__HISTORY__');
+  const toggle = document.querySelector('__HISTORY_TOGGLE__');
   const rect = el => {
     const box = el.getBoundingClientRect();
     return {left: Math.round(box.left), right: Math.round(box.right), width: Math.round(box.width)};
@@ -48617,11 +48977,11 @@ fn the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome() {
         "the history drawer is on the canvas before it was opened: {narrow}"
     );
 
-    click_control(&desk.tab, "[data-history-toggle]");
+    click_control(&desk.tab, ui::HISTORY_TOGGLE);
     wait_for_js_true(
         &desk.tab,
         "document.body.hasAttribute('data-history-open') \
-         && document.querySelector('[data-history]').getBoundingClientRect().left < innerWidth - 1",
+         && document.querySelector('__HISTORY__').getBoundingClientRect().left < innerWidth - 1",
     );
     let opened = measure(&desk.tab, DESK_MEASURE, "the opened drawer");
     eprintln!("history drawer at 820x1180: {opened}");
@@ -48638,7 +48998,7 @@ fn the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome() {
     wait_for_js_true(
         &desk.tab,
         "!document.body.hasAttribute('data-history-open') \
-         && document.querySelector('[data-history]').getBoundingClientRect().left >= innerWidth - 1 \
+         && document.querySelector('__HISTORY__').getBoundingClientRect().left >= innerWidth - 1 \
          && document.querySelector('[data-backdrop]').hidden",
     );
 }
@@ -48651,7 +49011,7 @@ const FOCUSED_MEASURE: &str = r#"(() => {
   const style = getComputedStyle(el);
   return JSON.stringify({
     what: `${el.tagName.toLowerCase()}.${el.className}`,
-    card: el.matches('article.item[data-current]'),
+    card: el.matches('__CURRENT_CARD__'),
     width: parseFloat(style.outlineWidth) || 0,
     style: style.outlineStyle,
     color: style.outlineColor,
@@ -48720,7 +49080,7 @@ fn the_card_is_named_by_its_question_in_real_chrome() {
     let measured = measure(
         &desk.tab,
         r#"(() => {
-  const card = document.querySelector('article.item[data-current]');
+  const card = document.querySelector('__CURRENT_CARD__');
   const ids = (card.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
   const named = ids.map(id => {
     const el = document.getElementById(id);
@@ -48766,7 +49126,7 @@ const PAGE_INCOMPLETE_ANSWER: &str = "Your own answer needs both halves: pick a 
 #[test]
 fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
     let desk = deck_desk("serve-deck-incomplete", "DECKHALF");
-    let form = "[data-current] form.decide";
+    let form = ui::CURRENT_DECIDE;
     // Every POST this page makes, recorded where it is made. The projection
     // GET goes through the same `fetch` and is deliberately not counted.
     assert_eq!(
@@ -48799,13 +49159,17 @@ fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
 
     wait_for_js_true(
         &desk.tab,
-        &format!("Boolean(document.querySelector('{form} p.error[data-refusal=incomplete]'))"),
+        &format!(
+            "Boolean(document.querySelector('{form} {}'))",
+            ui::error_refusal("incomplete")
+        ),
     );
     assert_eq!(
         js_value(
             &desk.tab,
             &format!(
-                "document.querySelector('{form} p.error[data-refusal=incomplete]').textContent"
+                "document.querySelector('{form} {}').textContent",
+                ui::error_refusal("incomplete")
             )
         ),
         PAGE_INCOMPLETE_ANSWER,
@@ -48829,7 +49193,7 @@ fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
         &desk.tab,
         r#"(() => {
   const regions = [...document.querySelectorAll('[role=status],[role=log],[role=alert],[aria-live]')];
-  const refusal = document.querySelector('p.error[data-refusal=incomplete]');
+  const refusal = document.querySelector('__ERROR__[data-refusal=incomplete]');
   const focused = document.activeElement;
   return JSON.stringify({
     roles: regions.map(el => el.getAttribute('role') || `aria-live=${el.getAttribute('aria-live')}`),
@@ -48863,7 +49227,10 @@ fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
     click_control(&desk.tab, &format!("{form} input[name=outcome]"));
     wait_for_js_true(
         &desk.tab,
-        &format!("!document.querySelector('{form} p.error[data-refusal=incomplete]')"),
+        &format!(
+            "!document.querySelector('{form} {}')",
+            ui::error_refusal("incomplete")
+        ),
     );
     assert_eq!(
         js_value(
@@ -48891,7 +49258,7 @@ fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
     assert_eq!(
         js_value(
             &desk.tab,
-            "document.querySelector('[data-current]').dataset.item"
+            "document.querySelector('__CURRENT__').dataset.item"
         ),
         desk.ids[0].as_str(),
         "a refused composer advanced the deck"
@@ -48923,7 +49290,7 @@ fn the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome() {
     assert_eq!(
         js_value(
             &desk.tab,
-            "(() => { const line = document.querySelector('[data-live]'); \
+            "(() => { const line = document.querySelector('__LIVE__'); \
              window.__words = [line.textContent]; \
              new MutationObserver(() => { const now = line.textContent; \
              if (window.__words[window.__words.length - 1] !== now) window.__words.push(now); }) \
@@ -48937,11 +49304,11 @@ fn the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome() {
     // that ever wrote to these regions.
     click_control(
         &desk.tab,
-        "[data-current] form.decide fieldset.recommended button.choice",
+        &format!("{} {}", ui::CURRENT_DECIDE, ui::RECOMMENDED_CHOICE),
     );
     wait_for_js_true(
         &desk.tab,
-        "Boolean(document.querySelector('[data-history] [data-receipt]'))",
+        "Boolean(document.querySelector('__HISTORY_RECEIPT__'))",
     );
     wait_for_projection_swap(&desk.tab);
     file_task(&desk.fixture, "Another lane filed its own task", "t-says");
@@ -48960,7 +49327,7 @@ fn the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome() {
          logs: document.querySelectorAll('[role=log]').length, \
          logIsStatus: log.getAttribute('role') === 'status', \
          lineIsLog: line.getAttribute('role') === 'log', \
-         noticeInLog: [...document.querySelectorAll('[data-notices] .notice')] \
+         noticeInLog: [...document.querySelectorAll('__NOTICE__')] \
            .every(row => row.closest('[role=log]') === log), \
          receiptOutsideStatus: !line.textContent.includes('Decided')}); })()",
         "the two channels",
@@ -49002,7 +49369,7 @@ fn the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome() {
 fn the_pressed_answer_says_sending_on_its_own_fill_in_real_chrome() {
     let desk = deck_desk("serve-deck-sending-fill", "DECKSEND");
     let green = token(&desk.tab, "--green");
-    let pressed = "[data-current] form.decide fieldset.recommended button.choice";
+    let pressed = format!("{} {}", ui::CURRENT_DECIDE, ui::RECOMMENDED_CHOICE);
     let before = js_value(
         &desk.tab,
         &format!("getComputedStyle(document.querySelector('{pressed}')).backgroundColor"),
@@ -49010,16 +49377,16 @@ fn the_pressed_answer_says_sending_on_its_own_fill_in_real_chrome() {
     assert_eq!(before, green.as_str(), "the recommendation is not filled");
 
     assert_eq!(js_value(&desk.tab, HOLD_THE_POST), true);
-    click_control(&desk.tab, pressed);
+    click_control(&desk.tab, &pressed);
     wait_for_js_true(&desk.tab, "typeof window.__answer === 'function'");
     wait_for_js_true(
         &desk.tab,
-        "Boolean(document.querySelector('article.item[data-sent] [data-pressed]'))",
+        "Boolean(document.querySelector('__SENT_CARD__ [data-pressed]'))",
     );
 
     let measured = measure(
         &desk.tab,
-        "(() => { const card = document.querySelector('article.item[data-sent]'); \
+        "(() => { const card = document.querySelector('__SENT_CARD__'); \
          const sent = card.querySelector('[data-pressed]'); \
          const others = [...card.querySelectorAll('.choice:not([data-pressed]), \
          .record:not([data-pressed])')]; \
@@ -49068,15 +49435,15 @@ fn the_receipt_lands_with_its_outcome_rule_in_real_chrome() {
     hold_projection(&desk.tab);
     click_control(
         &desk.tab,
-        "[data-current] form.decide fieldset.recommended button.choice",
+        &format!("{} {}", ui::CURRENT_DECIDE, ui::RECOMMENDED_CHOICE),
     );
     wait_for_js_true(
         &desk.tab,
-        "document.querySelectorAll('[data-history] p.receipt').length === 1",
+        "document.querySelectorAll('__HISTORY__ __RECEIPT__').length === 1",
     );
     let measured = measure(
         &desk.tab,
-        "(() => { const rows = [...document.querySelectorAll('[data-history] p')]; \
+        "(() => { const rows = [...document.querySelectorAll('__HISTORY__ p')]; \
          return JSON.stringify({rows: rows.map(row => { const style = getComputedStyle(row); \
          return {classes: row.className, width: parseFloat(style.borderLeftWidth) || 0, \
          color: style.borderLeftColor}; })}); })()",
