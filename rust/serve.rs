@@ -99,6 +99,8 @@ const MAX_ACTOR_BYTES: usize = 254;
 enum WebResponse {
     Html(u16, String),
     Redirect(String),
+    /// One embedded bundle asset, served as itself.
+    Asset(&'static crate::bundle::Asset),
 }
 
 struct ServeConfig {
@@ -338,15 +340,27 @@ fn handle(mut request: Request, config: &ServeConfig) {
     let response =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(&mut request, config)))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("the page renderer panicked")));
-    let (status, html, location) = match response {
-        Ok(WebResponse::Html(status, html)) => (status, html, None),
+    let (status, body, content_type, location, immutable) = match response {
+        Ok(WebResponse::Html(status, html)) => (
+            status,
+            html.into_bytes(),
+            "text/html; charset=utf-8",
+            None,
+            false,
+        ),
+        Ok(WebResponse::Asset(asset)) => {
+            (200, asset.bytes.to_vec(), asset.content_type, None, true)
+        }
         Ok(WebResponse::Redirect(location)) => (
             303,
             page(
                 "Reply recorded",
                 "<h1>Reply recorded</h1><p><a href=\"/\">Return to Needs you</a>.</p>",
-            ),
+            )
+            .into_bytes(),
+            "text/html; charset=utf-8",
             Some(location),
+            false,
         ),
         Err(error) => (
             500,
@@ -356,15 +370,30 @@ fn handle(mut request: Request, config: &ServeConfig) {
                     "<h1>Error</h1><p class=error>{}</p>",
                     escape(&error.to_string())
                 ),
-            ),
+            )
+            .into_bytes(),
+            "text/html; charset=utf-8",
             None,
+            false,
         ),
     };
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+    let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
         .expect("a static header is always valid");
-    let mut response = Response::from_string(html)
+    let mut response = Response::from_data(body)
         .with_status_code(status)
         .with_header(header);
+    if immutable {
+        // Safe for a year because the name is the content: a changed asset
+        // is a changed name, and a stale page asking for the old one gets
+        // the old one or a 404, never the new bytes under the old name.
+        response = response.with_header(
+            Header::from_bytes(
+                &b"Cache-Control"[..],
+                &b"public, max-age=31536000, immutable"[..],
+            )
+            .expect("a static header is always valid"),
+        );
+    }
     if let Some(location) = location {
         response = response.with_header(
             Header::from_bytes(&b"Location"[..], location.as_bytes())
@@ -387,7 +416,67 @@ fn route(request: &mut Request, config: &ServeConfig) -> Result<WebResponse> {
             page("Method not allowed", "<h1>Method not allowed</h1>"),
         ));
     }
+    // The application and its assets are served ahead of the page router and
+    // outside `ROUTE_SHAPES`: they are one artefact rather than page arms,
+    // and neither is a server-rendered page the width sweep can measure. The
+    // cutover (`t-1f495a7f`) is what moves `/app` onto `/` and folds it into
+    // the route table.
+    if let Some(response) = bundle_response(&url) {
+        return Ok(response);
+    }
     Ok(WebResponse::Html(200, render(&url)?))
+}
+
+/// The two addresses the embedded bundle answers, or `None` for a URL that
+/// belongs to the page router.
+///
+/// `/assets/<name>` is served from the embedded table and from nowhere else:
+/// there is no filesystem path here to traverse, so a name that is not in
+/// the table is 404 and that is the whole of the story (SPA-01).
+fn bundle_response(url: &str) -> Option<WebResponse> {
+    let path = url.split('?').next().unwrap_or(url);
+    match path {
+        "/app" => Some(WebResponse::Html(200, app_shell())),
+        _ => {
+            let name = path.strip_prefix("/assets/")?;
+            Some(match crate::bundle::asset(name) {
+                Some(asset) => WebResponse::Asset(asset),
+                None => WebResponse::Html(
+                    404,
+                    page(
+                        "Not found",
+                        "<h1>Not found</h1><p>No asset at that address. \
+                         <a href=\"/app\">Start over</a>.</p>",
+                    ),
+                ),
+            })
+        }
+    }
+}
+
+/// The application shell: the smallest document that can load the bundle.
+///
+/// It holds none of the page — the page is what the bundle mounts into
+/// `#root` (SPA-05) — and it is written out here rather than committed as a
+/// built artefact so that the asset names, which carry a content hash, come
+/// from the same table the assets are served from.
+///
+/// The literal `</head>` is load-bearing: the hax edge injects WebMCP with
+/// nginx `sub_filter '</head>' ...` and `sub_filter_once on`, so a shell that
+/// spelled the head's close any other way, or emitted it twice, would lose
+/// the injection or take it twice (ADR-048's 2026-09-19 addendum).
+/// `the_app_shell_closes_its_head_exactly_once_unit` holds it.
+fn app_shell() -> String {
+    format!(
+        "<!doctype html><html lang=en><head><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>kanban</title>\
+         <link rel=stylesheet href=/assets/{stylesheet}></head><body>\
+         <div id=root data-testid=app-root-shell></div>\
+         <script type=module src=/assets/{script}></script></body></html>",
+        stylesheet = crate::bundle::STYLESHEET,
+        script = crate::bundle::SCRIPT,
+    )
 }
 
 /// Every shape `render` answers, in the order the match below names them.
@@ -6277,8 +6366,14 @@ mod tests {
     /// The declarations of the one rule that selects exactly `selector`,
     /// joined across every rule that names it on its own.
     fn css_rule_body(selector: &str) -> String {
+        css_rule_body_in(CSS, selector)
+    }
+
+    /// The same, in a named stylesheet: the served `CSS`, or the bundle's own
+    /// (SPA-56 runs ADR-046's token proofs over both).
+    fn css_rule_body_in(css: &str, selector: &str) -> String {
         let mut body = String::new();
-        for rule in css_rules(CSS) {
+        for rule in css_rules(css) {
             if rule.selectors.iter().any(|part| part == selector) {
                 body.push_str(&rule.body);
                 body.push(';');
@@ -6291,9 +6386,9 @@ mod tests {
         body
     }
 
-    /// A colour token's hex, read out of the `:root` block.
-    fn css_token(name: &str) -> String {
-        let root = css_rule_body(":root");
+    /// A colour token's hex, read out of a stylesheet's `:root` block.
+    fn css_token_in(css: &str, name: &str) -> String {
+        let root = css_rule_body_in(css, ":root");
         css_declarations(&root)
             .into_iter()
             .find(|(property, _)| property == name)
@@ -6319,8 +6414,12 @@ mod tests {
 
     /// WCAG 2.2 contrast ratio between two token names.
     fn token_contrast(foreground: &str, background: &str) -> f64 {
-        let first = relative_luminance(&css_token(foreground));
-        let second = relative_luminance(&css_token(background));
+        token_contrast_in(CSS, foreground, background)
+    }
+
+    fn token_contrast_in(css: &str, foreground: &str, background: &str) -> f64 {
+        let first = relative_luminance(&css_token_in(css, foreground));
+        let second = relative_luminance(&css_token_in(css, background));
         let (lighter, darker) = if first >= second {
             (first, second)
         } else {
@@ -6677,34 +6776,38 @@ mod tests {
         assert!(card.contains("overflow:hidden auto"), "{card}");
     }
 
+    /// Every foreground/background pair ADR-046 puts text on, as one list:
+    /// the served stylesheet and the bundle's are held to the same one
+    /// (WEB-48, SPA-56), and two lists would be two standards.
+    const AA_TOKEN_PAIRS: &[(&str, &str)] = &[
+        ("--text", "--base"),
+        ("--text", "--mantle"),
+        ("--text", "--surface0"),
+        ("--text", "--surface1"),
+        ("--subtext", "--base"),
+        ("--subtext", "--mantle"),
+        ("--subtext", "--surface0"),
+        ("--overlay", "--base"),
+        ("--overlay", "--mantle"),
+        ("--base", "--green"),
+        ("--base", "--red"),
+        ("--base", "--yellow"),
+        ("--base", "--blue"),
+        ("--green", "--surface0"),
+        ("--red", "--surface0"),
+        ("--yellow", "--surface0"),
+        ("--blue", "--surface0"),
+        ("--link", "--base"),
+        ("--link", "--mantle"),
+    ];
+
     /// WEB-48 — text contrast is at least 4.5:1 on the surface it sits on.
     ///
     /// Computed from the tokens rather than pinned, so a token change that
     /// drops a pair below AA fails here rather than on George's phone.
     #[test]
     fn every_token_pair_clears_four_and_a_half_to_one_unit() {
-        let pairs = [
-            ("--text", "--base"),
-            ("--text", "--mantle"),
-            ("--text", "--surface0"),
-            ("--text", "--surface1"),
-            ("--subtext", "--base"),
-            ("--subtext", "--mantle"),
-            ("--subtext", "--surface0"),
-            ("--overlay", "--base"),
-            ("--overlay", "--mantle"),
-            ("--base", "--green"),
-            ("--base", "--red"),
-            ("--base", "--yellow"),
-            ("--base", "--blue"),
-            ("--green", "--surface0"),
-            ("--red", "--surface0"),
-            ("--yellow", "--surface0"),
-            ("--blue", "--surface0"),
-            ("--link", "--base"),
-            ("--link", "--mantle"),
-        ];
-        for (foreground, background) in pairs {
+        for (foreground, background) in AA_TOKEN_PAIRS {
             let ratio = token_contrast(foreground, background);
             assert!(
                 ratio >= 4.5,
@@ -6759,6 +6862,253 @@ mod tests {
                 "a filled answer in {hue} is {ratio:.2}:1 against the page"
             );
         }
+    }
+
+    /// The bundle's stylesheet, as the browser receives it.
+    fn bundle_stylesheet() -> String {
+        let asset = crate::bundle::asset(crate::bundle::STYLESHEET)
+            .expect("the bundle's stylesheet is embedded under the name the shell links");
+        String::from_utf8(asset.bytes.to_vec()).expect("the stylesheet is UTF-8")
+    }
+
+    /// SPA-56 — ADR-046's token proofs, re-run over the bundle's own CSS.
+    ///
+    /// The served `CSS` const and the bundle's stylesheet are two stylesheets
+    /// for one product, and the cutover moves rules from the first to the
+    /// second one page at a time. A token block that drifted while it moved
+    /// would be a different palette wearing the same names, so the bundle's
+    /// block must be the served one exactly, the contrast arithmetic is
+    /// re-run on it, and no colour may be written outside it.
+    ///
+    /// What this does NOT yet re-run, because the rules it judges have not
+    /// moved: `.pill`'s quiet-text rule, and the type-scale, serif/mono,
+    /// prose-width and glyph-prefix proofs, all of which select elements the
+    /// deck brings with it (`t-1f495a7f`, `t-bf255880`).
+    #[test]
+    fn the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit() {
+        let bundle = bundle_stylesheet();
+        let colours = |css: &str| -> Vec<(String, String)> {
+            css_declarations(&css_rule_body_in(css, ":root"))
+                .into_iter()
+                .filter(|(_, value)| value.starts_with('#'))
+                .collect()
+        };
+        assert_eq!(
+            colours(&bundle),
+            colours(CSS),
+            "the bundle's token block is not the served stylesheet's"
+        );
+
+        // No hex outside the token block, in the bundle as in the document.
+        let stripped = css_without_comments(&bundle);
+        let root_at = stripped.find(":root").expect("the token block");
+        let root_end = root_at + stripped[root_at..].find('}').expect("the block closes");
+        let outside = format!("{}{}", &stripped[..root_at], &stripped[root_end..]);
+        assert!(
+            !outside.contains('#'),
+            "the bundle writes a hex literal outside its token block: {outside}"
+        );
+
+        for (foreground, background) in AA_TOKEN_PAIRS {
+            let ratio = token_contrast_in(&bundle, foreground, background);
+            assert!(
+                ratio >= 4.5,
+                "in the bundle, {foreground} on {background} is {ratio:.2}:1, below AA"
+            );
+        }
+        for ground in ["--base", "--mantle"] {
+            let ratio = token_contrast_in(&bundle, "--focus", ground);
+            assert!(
+                ratio >= 3.0,
+                "the bundle's focus ring is {ratio:.2}:1 on {ground}"
+            );
+        }
+        for hue in ["--green", "--red", "--yellow", "--blue"] {
+            let ratio = token_contrast_in(&bundle, hue, "--base");
+            assert!(
+                ratio >= 3.0,
+                "a filled answer in {hue} is {ratio:.2}:1 against the bundle's page"
+            );
+        }
+        for rule in css_rules(&bundle) {
+            let declarations = css_declarations(&rule.body);
+            let quiet = declarations
+                .iter()
+                .any(|(property, value)| property == "color" && value == "var(--overlay)");
+            let filled = declarations
+                .iter()
+                .any(|(property, value)| property == "background" && value == "var(--surface0)");
+            assert!(
+                !(quiet && filled),
+                "{:?} puts overlay text on a surface0 fill",
+                rule.selectors
+            );
+        }
+    }
+
+    /// SPA-05, and the edge's injection point.
+    ///
+    /// The shell is the smallest document that can load the bundle: it links
+    /// the two embedded assets by the names they are embedded under, it
+    /// carries the mount point and NOT the application root, and it closes
+    /// its head exactly once. That last one is the hax edge's: nginx injects
+    /// WebMCP with `sub_filter '</head>'` and `sub_filter_once on`, so one
+    /// literal `</head>` means the injection lands exactly once.
+    #[test]
+    fn the_app_shell_closes_its_head_exactly_once_unit() {
+        let shell = app_shell();
+        assert_eq!(
+            shell.matches("</head>").count(),
+            1,
+            "the edge injects WebMCP at the literal </head>: {shell}"
+        );
+        assert!(
+            shell.starts_with("<!doctype html><html lang=en><head><meta charset=utf-8>"),
+            "{shell}"
+        );
+        assert!(
+            shell.contains("<meta name=viewport content=\"width=device-width,initial-scale=1\">"),
+            "{shell}"
+        );
+        assert!(shell.contains("<title>kanban</title>"), "{shell}");
+        assert!(
+            shell.contains("<div id=root data-testid=app-root-shell></div>"),
+            "{shell}"
+        );
+        // The shell is not the page: the application root is mounted by the
+        // bundle, and a test that waits for the shell must not find it here.
+        assert!(
+            !shell.contains("data-testid=app-root>") && !shell.contains("\"app-root\""),
+            "the shell carries the application root: {shell}"
+        );
+        assert!(
+            shell.contains(&format!(
+                "<link rel=stylesheet href=/assets/{}>",
+                crate::bundle::STYLESHEET
+            )),
+            "{shell}"
+        );
+        assert!(
+            shell.contains(&format!(
+                "<script type=module src=/assets/{}></script>",
+                crate::bundle::SCRIPT
+            )),
+            "{shell}"
+        );
+        // Everything it reaches for, it reaches for in this binary.
+        for attribute in ["href=", "src="] {
+            let mut rest = shell.as_str();
+            while let Some(at) = rest.find(attribute) {
+                let after = &rest[at + attribute.len()..];
+                let value = after
+                    .split(|character: char| character == '>' || character.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                assert!(
+                    value.starts_with("/assets/"),
+                    "the shell points at {value}, which is not an embedded asset"
+                );
+                rest = after;
+            }
+        }
+    }
+
+    /// SPA-01 — an asset answers under the name its bytes hash to, and
+    /// nothing else answers at all.
+    #[test]
+    fn an_asset_answers_only_under_its_own_content_hashed_name_unit() {
+        assert!(
+            !crate::bundle::ASSETS.is_empty(),
+            "the binary carries no bundle"
+        );
+        for asset in crate::bundle::ASSETS {
+            let url = format!("/assets/{}", asset.name);
+            let Some(WebResponse::Asset(served)) = bundle_response(&url) else {
+                panic!("{url} is not served from the embedded table");
+            };
+            assert_eq!(served.bytes, asset.bytes, "{url} served other bytes");
+            let extension = asset.name.rsplit_once('.').expect("an extension").1;
+            let expected = match extension {
+                "js" => "text/javascript; charset=utf-8",
+                "css" => "text/css; charset=utf-8",
+                other => panic!("nothing decides the Content-Type of a .{other}"),
+            };
+            assert_eq!(served.content_type, expected, "{url}");
+        }
+
+        // A name that is not in the table is not found: not the nearest
+        // file, not a path walked out of the tree, and never the filesystem.
+        for miss in [
+            "/assets/app.0000000000000000.js",
+            "/assets/app.0000000000000000.css",
+            "/assets/app.js",
+            "/assets/",
+            "/assets/../Cargo.toml",
+            "/assets/web/dist/app.js",
+        ] {
+            assert!(
+                matches!(bundle_response(miss), Some(WebResponse::Html(404, _))),
+                "{miss} was not refused"
+            );
+        }
+
+        // And the bundle answers exactly two addresses: everything else is
+        // the page router's, including a URL that merely starts like one.
+        assert!(matches!(
+            bundle_response("/app"),
+            Some(WebResponse::Html(200, _))
+        ));
+        for page_route in ["/", "/boards", "/apps", "/app/extra", "/assets"] {
+            assert!(
+                bundle_response(page_route).is_none(),
+                "{page_route} was answered by the bundle"
+            );
+        }
+    }
+
+    /// SPA-03 — the version banner's second line is the embedded bundle.
+    ///
+    /// Recomputed here from the bytes that are actually in this binary, so
+    /// the number the release receipt records and the installer compares
+    /// against cannot be a constant somebody typed.
+    #[test]
+    fn the_version_banner_names_the_embedded_bundle_unit() {
+        use sha2::{Digest, Sha256};
+
+        let names: Vec<&str> = crate::bundle::ASSETS
+            .iter()
+            .map(|asset| asset.name)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the asset table is not sorted by name");
+
+        let hex =
+            |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+        let mut listing = String::new();
+        for asset in crate::bundle::ASSETS {
+            listing.push_str(&format!(
+                "{}  {}\n",
+                hex(&Sha256::digest(asset.bytes)),
+                asset.name
+            ));
+        }
+        let recomputed = hex(&Sha256::digest(listing.as_bytes()));
+        assert_eq!(
+            recomputed,
+            crate::bundle::SHA256,
+            "the stamped fingerprint is not the embedded bytes'"
+        );
+
+        let banner = crate::version_string();
+        let lines: Vec<&str> = banner.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the version banner is not two lines: {banner}"
+        );
+        assert!(lines[0].starts_with("kanban "), "{banner}");
+        assert_eq!(lines[1], format!("bundle {recomputed}"), "{banner}");
     }
 
     /// One board with one fully carded open item, three days old.
@@ -9476,6 +9826,14 @@ mod tests {
             Ok(WebResponse::Html(status, html)) => {
                 panic!("expected a redirect from {url}, got {status}: {html}")
             }
+            // `post` answers a page or a redirect; the bundle is a GET-only
+            // surface, so this arm can only mean the two were crossed.
+            Ok(WebResponse::Asset(asset)) => {
+                panic!(
+                    "posting {url} answered with the bundle asset {}",
+                    asset.name
+                )
+            }
             Err(error) => panic!("posting {url} failed: {error}"),
         }
     }
@@ -9485,6 +9843,12 @@ mod tests {
             Ok(WebResponse::Html(status, _)) => status,
             Ok(WebResponse::Redirect(location)) => {
                 panic!("expected a refusal from {url}, got a redirect to {location}")
+            }
+            Ok(WebResponse::Asset(asset)) => {
+                panic!(
+                    "posting {url} answered with the bundle asset {}",
+                    asset.name
+                )
             }
             Err(error) => panic!("posting {url} failed: {error}"),
         }

@@ -7628,15 +7628,60 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     );
     let version = fixture.run(&fixture.main, &["version"]);
     let version = String::from_utf8_lossy(&version.stdout);
-    assert!(version.contains("kanban"));
+    let lines: Vec<&str> = version.lines().collect();
+    assert!(lines[0].contains("kanban"), "version output: {version}");
     assert!(
-        version.contains("board schema 28"),
+        lines[0].contains("board schema 28"),
         "version output: {version}"
     );
     assert!(
-        version.contains("registry schema 14"),
+        lines[0].contains("registry schema 14"),
         "version output: {version}"
     );
+    // The second line is the embedded operator UI bundle, and it is the
+    // half of the release proof a deploy receipt records as `bundleSha256`
+    // (SPA-03). Compared against the bundle this build embedded rather than
+    // against a literal: the fingerprint changes with every rebuild of the
+    // web tree.
+    assert_eq!(lines.len(), 2, "version output: {version}");
+    let fingerprint = lines[1]
+        .strip_prefix("bundle ")
+        .unwrap_or_else(|| panic!("version output: {version}"));
+    assert_eq!(fingerprint.len(), 64, "version output: {version}");
+    assert!(
+        fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+        "version output: {version}"
+    );
+    assert_eq!(
+        fingerprint,
+        committed_bundle_sha256(),
+        "the binary does not name the bundle in this worktree"
+    );
+}
+
+/// The fingerprint of the committed bundle, computed the way `build.rs`
+/// computes it: sha256 over the `"<sha256>  <name>"` listing, sorted by name.
+fn committed_bundle_sha256() -> String {
+    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("web/dist");
+    let mut lines: Vec<String> = fs::read_dir(&dist)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dist.display()))
+        .map(|entry| entry.expect("one web/dist entry").path())
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy()
+                .into_owned();
+            format!("{}  {name}\n", file_sha256(&path))
+        })
+        .collect();
+    // Sorted by name, which is what the listing is keyed on: the hash is the
+    // line's head, so sorting the lines themselves would sort on the wrong
+    // field.
+    lines.sort_by_key(|line| line.split_once("  ").expect("a listing line").1.to_owned());
+    let mut hasher = Sha256::new();
+    hasher.update(lines.concat().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[test]
@@ -14015,13 +14060,17 @@ fn assert_release_view(install_root: &Path, bin_dir: &Path, release_dir: &Path) 
     }
 }
 
-/// The one diagnostic an install writes on a host with no `kanban-serve`
-/// unit: it names the restart proof it skipped and why. Everything else on
-/// stderr is still unexpected output from a successful install.
-fn stderr_beyond_the_serve_skip_notice(stderr: &[u8]) -> String {
+/// The two diagnostics an install writes: the restart proof it skipped on a
+/// host with no `kanban-serve` unit and why, and the bundle the installed
+/// executable was proved to be carrying (SPA-03). Everything else on stderr
+/// is still unexpected output from a successful install.
+fn stderr_beyond_the_install_notices(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
-        .filter(|line| !line.starts_with("hig-release: serve restart skipped: "))
+        .filter(|line| {
+            !line.starts_with("hig-release: serve restart skipped: ")
+                && !line.starts_with("hig-release: the installed kanban carries bundle ")
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
@@ -26532,6 +26581,146 @@ fn an_async_mounted_root_is_found_by_test_id_in_real_chrome() {
     );
 }
 
+/// SPA-04 and SPA-05 on the PRODUCT: `/app` mounts the bundle's React root.
+///
+/// The fixture case above proves the harness against a page the test wrote.
+/// This one proves the binary: a compiled `kanban serve`, real Chrome, the
+/// shell the server generated, the bundle it embedded, and the root React
+/// mounted into it.
+///
+/// The "shell is not the page" half is asserted over the SERVED BYTES rather
+/// than over a race: the first response carries `app-root-shell` and no
+/// `app-root`, which is a fact about the document the server writes and is
+/// true however fast the browser is. The naive look right after
+/// `navigate_to` is taken as well and reported, but it is only ASSERTED to
+/// have failed when the page has not mounted by then: unlike the fixture,
+/// which mounts on a measured 1.5s timer, the product's mount is a real
+/// bundle over loopback and its timing is the machine's, not the test's. A
+/// hard assertion there would be a stopwatch, not a contract.
+#[test]
+fn the_app_shell_mounts_the_react_root_by_test_id_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-app-shell-mount");
+    fixture.ok_json(&fixture.main, &["init", "--name", "APPSHELL", "--json"]);
+    let server = spawn_server(&fixture);
+
+    // The shell first, as bytes: it holds the mount point and none of the
+    // page, it links the bundle, and it closes its head exactly once so the
+    // edge's WebMCP `sub_filter` still lands.
+    let (status, shell) = http_get(server.port, "/app");
+    assert_eq!(status, 200, "GET /app: {shell}");
+    assert!(
+        shell.contains("data-testid=app-root-shell"),
+        "the shell has no mount point: {shell}"
+    );
+    assert!(
+        !shell.contains(&ui::test_id(ui::APP_ROOT)) && !shell.contains("data-testid=app-root>"),
+        "the first response already carries the application root: {shell}"
+    );
+    assert_eq!(
+        shell.matches("</head>").count(),
+        1,
+        "the shell does not close its head exactly once: {shell}"
+    );
+
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "app shell tab");
+    let started = Instant::now();
+    tab.navigate_to(&format!("{}app", server.origin()))
+        .expect("load the application shell");
+    eprintln!("navigate_to returned after {:?}", started.elapsed());
+
+    let root_selector = ui::test_id(ui::APP_ROOT);
+    let naive = tab.find_element(&root_selector);
+    eprintln!(
+        "naive find_element returned {} after {:?}",
+        if naive.is_ok() { "a root" } else { "nothing" },
+        started.elapsed()
+    );
+
+    let root = wait_for_app_root(&tab, ui::APP_ROOT);
+    eprintln!("wait_for_app_root returned after {:?}", started.elapsed());
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{root_selector}').tagName")
+        ),
+        "MAIN",
+        "the mounted root is not the application's <main>"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{root_selector} h1').textContent")
+        ),
+        "Needs you",
+        "the mounted root does not head the queue it is for"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("document.querySelector('{root_selector} [data-live]').textContent")
+        ),
+        "live",
+        "the mounted root carries no live line"
+    );
+    assert!(
+        root.get_inner_text()
+            .expect("the mounted root's text")
+            .contains("Needs you"),
+        "the root the helper returned is not the one that was asserted on"
+    );
+    // The bundle is served from the binary's own bytes: everything the
+    // mounted page loaded, it loaded from this server, and the two embedded
+    // assets are what it loaded (SPA-01).
+    let loaded = js_value(
+        &tab,
+        "JSON.stringify(performance.getEntriesByType('resource').map(entry => entry.name))",
+    );
+    let loaded: Vec<String> = serde_json::from_str(
+        loaded
+            .as_str()
+            .unwrap_or_else(|| panic!("resource timing came back as {loaded}")),
+    )
+    .expect("resource timing is a list of URLs");
+    let origin = server.origin().trim_end_matches('/').to_owned();
+    for name in &loaded {
+        assert!(
+            name.starts_with(&origin),
+            "the page loaded {name}, which is not served by this binary"
+        );
+    }
+    for asset in [bundle_asset_name(".css"), bundle_asset_name(".js")] {
+        let url = format!("{origin}/assets/{asset}");
+        assert!(
+            loaded.contains(&url),
+            "the page never loaded {url}; it loaded {loaded:?}"
+        );
+    }
+}
+
+/// The name of the committed bundle asset with `suffix`, read off the tree
+/// the binary embedded: the name carries a content hash, so no test may
+/// write it down.
+fn bundle_asset_name(suffix: &str) -> String {
+    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("web/dist");
+    let mut matching: Vec<String> = fs::read_dir(&dist)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dist.display()))
+        .map(|entry| entry.expect("one web/dist entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(suffix))
+        .collect();
+    matching.sort();
+    assert_eq!(
+        matching.len(),
+        1,
+        "web/dist carries {} files ending in {suffix}",
+        matching.len()
+    );
+    matching.remove(0)
+}
+
 /// A new Chrome tab, retried while the browser is still warming up.
 ///
 /// `Browser::new_tab` waits ten seconds for `Target.createTarget` to answer
@@ -34880,7 +35069,7 @@ fn hig_release_script_installs_every_declared_binary_without_remote_hax_access_a
         String::from_utf8_lossy(&installed.stderr)
     );
     assert!(
-        stderr_beyond_the_serve_skip_notice(&installed.stderr).is_empty(),
+        stderr_beyond_the_install_notices(&installed.stderr).is_empty(),
         "HIG install wrote unexpected stderr: {}",
         String::from_utf8_lossy(&installed.stderr)
     );
@@ -35185,7 +35374,7 @@ fn hig_release_script_keeps_the_previous_view_when_reactivation_fails_after_curr
         String::from_utf8_lossy(&installed.stderr)
     );
     assert!(
-        stderr_beyond_the_serve_skip_notice(&installed.stderr).is_empty(),
+        stderr_beyond_the_install_notices(&installed.stderr).is_empty(),
         "HIG install wrote unexpected stderr: {}",
         String::from_utf8_lossy(&installed.stderr)
     );
@@ -35739,7 +35928,12 @@ fn hig_release_script_runs_target_binaries_through_the_configured_target_runner(
             .output()
             .unwrap();
         assert!(answered.status.success(), "the real binary refused {probe}");
+        // The FIRST line: `kanban version` answers with the version and then
+        // `bundle <sha256>`, and files[].version is the version (ADR-048).
         String::from_utf8_lossy(&answered.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
             .trim_end()
             .to_string()
     };
@@ -36159,7 +36353,12 @@ fn hig_release_script_package_records_the_pinned_builder_image_digest_on_the_con
             .output()
             .unwrap();
         assert!(answered.status.success(), "the real binary refused {probe}");
+        // The FIRST line: `kanban version` answers with the version and then
+        // `bundle <sha256>`, and files[].version is the version (ADR-048).
         String::from_utf8_lossy(&answered.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
             .trim_end()
             .to_string()
     };
@@ -36920,9 +37119,12 @@ fn hig_release_script_package_records_which_branch_measured_the_version() {
 }
 
 /// The six provenance fields went into the receipt and NOT into the manifest,
-/// which keeps its five fields and its formatVersion 1. That is what leaves
-/// every `releaseId` on both hosts where it is: the identity is derived from
-/// the manifest bytes, and the manifest bytes did not move.
+/// which keeps its formatVersion 1 and gains nothing about the BUILD. That is
+/// what leaves every `releaseId` on both hosts where it is: the identity is
+/// derived from the manifest bytes, and the manifest bytes move only when
+/// what is IN the package moves. `bundleSha256` is in the manifest for
+/// exactly that reason — it names an artefact the package carries, like
+/// `files[]`, not a fact about the machine that built it (ADR-048).
 #[test]
 fn hig_release_script_provenance_fields_leave_the_manifest_bytes_and_release_id_unchanged() {
     let case = ReleasePackagingCase::new("hig-release-manifest-untouched");
@@ -36939,6 +37141,7 @@ fn hig_release_script_provenance_fields_leave_the_manifest_bytes_and_release_id_
     assert_eq!(
         manifest.as_object().unwrap().keys().collect::<Vec<_>>(),
         vec![
+            "bundleSha256",
             "files",
             "formatVersion",
             "sourceCommit",
@@ -36946,6 +37149,11 @@ fn hig_release_script_provenance_fields_leave_the_manifest_bytes_and_release_id_
             "targets"
         ],
         "the manifest gained or lost a field"
+    );
+    assert_eq!(
+        manifest["bundleSha256"],
+        json!(committed_bundle_sha256()),
+        "the manifest names a bundle the packaged binary does not carry"
     );
     for field in [
         "host",
@@ -38419,8 +38627,6 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
     let remote_end = script[remote_start..].find("\nREMOTE\n").unwrap() + remote_start;
     for name in [
         "physical_dir",
-        "managed_symlink",
-        "ensure_safe_release_view",
         "ensure_managed_activation_receipt",
         "atomic_symlink",
         "reject_carried_release_identity",
@@ -38431,6 +38637,13 @@ fn hig_release_script_local_and_remote_install_guards_are_identical() {
         // refusal - would install versions the package never claimed.
         "file_version",
         "release_binary_known",
+        // The probe both of those read, and the bundle fingerprint the
+        // INSTALLED executable is asked for: a remote copy that drifted here
+        // would prove a different thing about the release than the local leg
+        // proved about the package (SPA-03).
+        "file_probe",
+        "file_bundle_sha256",
+        "prove_installed_bundle",
         // The branch the version probe took, which the package receipt
         // records as versionProbe: a remote copy reading a different variable
         // would take a different branch from the one the receipt names.
@@ -40844,14 +41057,17 @@ fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases
     clone_release_package(&harness.package_dir, &second, commit);
 
     // The second build ships a different `kanban` reporting a different
-    // version: one commit, two builds, which is what the manifest hash is
-    // there to tell apart. It is still the platform a release targets - a
-    // rebuild that is not is refused, and that is a different case - so the
-    // reporting payload sits under the header the installer reads.
+    // version and a different embedded bundle: one commit, two builds, which
+    // is what the manifest hash is there to tell apart. It is still the
+    // platform a release targets - a rebuild that is not is refused, and that
+    // is a different case - so the reporting payload sits under the header
+    // the installer reads.
     let rebuilt = second.join("kanban");
+    let rebuilt_bundle = "bb".repeat(32);
     write_release_platform_image(
         &rebuilt,
-        b"#!/bin/sh\nset -eu\nprintf 'kanban 0.3.0-rebuild\\n'\n",
+        format!("#!/bin/sh\nset -eu\nprintf 'kanban 0.3.0-rebuild\\nbundle {rebuilt_bundle}\\n'\n")
+            .as_bytes(),
     );
     let entry = json!({
         "name": "kanban",
@@ -40870,6 +41086,10 @@ fn hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases
             "the release set no longer starts with kanban, so this rewrite patches the wrong entry"
         );
         document["files"][0] = entry.clone();
+        // The rebuild carries its own operator UI, so the artefacts name it:
+        // a package whose binary and manifest disagree about the bundle is a
+        // different case, and the installer refuses it (SPA-03).
+        document["bundleSha256"] = json!(rebuilt_bundle);
         fs::write(&artifact, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
     let receipt_path = second.with_extension("receipt.json");

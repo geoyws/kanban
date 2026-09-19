@@ -5,6 +5,7 @@ mod audit;
 mod authz;
 #[allow(dead_code)]
 mod broker;
+mod bundle;
 #[allow(dead_code)]
 mod claude_print_adapter;
 #[allow(dead_code)]
@@ -7775,12 +7776,21 @@ fn run_access(args: &Args, sub: Option<&str>) -> Result<()> {
     }
 }
 
+/// The version banner, on two lines.
+///
+/// The first line is the program: its version and the two schema versions it
+/// speaks. The second is the operator UI bundle it carries, by the
+/// fingerprint `build.rs` derived from the embedded bytes — the half of the
+/// release proof that `readlink /proc/<pid>/exe` cannot give (SPA-03). A
+/// deploy receipt records the same number as `bundleSha256`, and the install
+/// asks the installed binary for this line to prove the two agree.
 fn version_string() -> String {
     format!(
-        "kanban {} (board schema {}; registry schema {})",
+        "kanban {} (board schema {}; registry schema {})\nbundle {}",
         env!("CARGO_PKG_VERSION"),
         db::BOARD_SCHEMA_VERSION,
-        db::REGISTRY_SCHEMA_VERSION
+        db::REGISTRY_SCHEMA_VERSION,
+        bundle::SHA256
     )
 }
 

@@ -229,11 +229,11 @@ measures rather than re-pointed at the new one (SPA-51).
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `SPA-01` | MUST | process | `hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe` | proves the served executable today; extended by `t-992e40aa` to prove the bundle is served from its bytes |
-| `SPA-02` | MUST | process | `none` | no e2e coverage — to be written by `t-992e40aa` (a release package and a serving host carrying no Node-shaped runtime) |
-| `SPA-03` | MUST | process | `none` | no e2e coverage — to be written by `t-992e40aa`; blocked on OQ-4 |
-| `SPA-04` | MUST | chrome | `none` | no e2e coverage — harness proven by `an_async_mounted_root_is_found_by_test_id_in_real_chrome` (a fixture page the test wrote, not the product); product observation owed by `t-1f495a7f` |
-| `SPA-05` | MUST | chrome | `none` | no e2e coverage — harness proven by `an_async_mounted_root_is_found_by_test_id_in_real_chrome` (fixture); product observation owed by `t-1f495a7f`. That case is also where `wait_for_shell_ready` (`tests/e2e.rs:26362`) becomes `wait_for_app_root(tab, ui::APP_ROOT)` and nothing else in the file has to know |
+| `SPA-01` | MUST | process | `hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe` | the served executable; the bundle half landed 2026-09-19 with `t-992e40aa` — `an_asset_answers_only_under_its_own_content_hashed_name_unit` (every asset answers from the embedded table under the name its bytes hash to, a wrong hash is 404, and nothing is read from the filesystem) and `the_app_shell_mounts_the_react_root_by_test_id_in_real_chrome` (the mounted page loaded the two embedded assets and nothing from any other origin) |
+| `SPA-02` | MUST | process | `none` | no automated coverage. The build-host half is proved by a gate command rather than a test: `PATH=/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin cargo build --locked --release` succeeds with no Node, Bun or npm on `PATH`, because `web/dist` is committed and `build.rs` only reads it (run 2026-09-19 by `t-992e40aa`). The package half is held by `validate_release_files`'s exact-entries rule — a package may contain `manifest.json` and the declared binaries and nothing else. The serving-host half is an inventory of `hax` and `hig` that no compiled test can take, and stays owed by the epic |
+| `SPA-03` | MUST | process | `compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board` | OQ-4 resolved 2026-09-19: the field is `bundleSha256`, verified against the running process. That case asserts the `bundle <sha256>` second line of `kanban version` against the bundle committed in this worktree; `the_version_banner_names_the_embedded_bundle_unit` recomputes the fingerprint from the embedded bytes; `hig_release_script_provenance_fields_leave_the_manifest_bytes_and_release_id_unchanged` pins `bundleSha256` in the manifest; and `hig_release_script_installs_two_distinct_builds_of_one_commit_as_two_releases` installs a rebuild carrying a different bundle through `prove_installed_bundle`, which runs the INSTALLED executable before the activation receipt is written |
+| `SPA-04` | MUST | chrome | `the_app_shell_mounts_the_react_root_by_test_id_in_real_chrome` | the product rather than the fixture, landed 2026-09-19: `/app` on a spawned `kanban serve`, `wait_for_app_root(&tab, ui::APP_ROOT)` returns the mounted `<main>`, its heading reads `Needs you` and its live line reads `live`. `an_async_mounted_root_is_found_by_test_id_in_real_chrome` keeps the harness half. The id is stable across routes only in the sense the first wave can prove — one route mounts today; the cutover (`t-1f495a7f`) is what puts a second one under the same root |
+| `SPA-05` | MUST | chrome | `the_app_shell_mounts_the_react_root_by_test_id_in_real_chrome` | the same case proves the split over the SERVED BYTES — the first response carries `data-testid=app-root-shell` and no `app-root` — because the product's mount is a real bundle over loopback, and asserting that a naive look loses the race to it would be a stopwatch rather than a contract; the naive look is still taken and reported. `the_app_shell_closes_its_head_exactly_once_unit` holds the shell's shape. `wait_for_shell_ready` (`tests/e2e.rs`) still serves the server-rendered pages and becomes `wait_for_app_root(tab, ui::APP_ROOT)` at the cutover (`t-1f495a7f`) |
 | `SPA-06` | MUST | http | `none` | no e2e coverage — to be written by `t-19d4c16d`; blocked on OQ-3 |
 | `SPA-07` | MUST | unit | `none` | no e2e coverage — to be written by `t-88814b7a`, as a source-reading unit test of the same shape as `no_page_can_reach_a_method_that_writes` (`rust/serve.rs:8442`), asserting the absence of a capability over the projection module rather than the absence of a write |
 | `SPA-08` | MUST | http | `serve_hides_retired_boards_from_the_board_index_and_board_route` | authorization parity on the served surface today; extended to the JSON routes by `t-88814b7a` |
@@ -284,7 +284,7 @@ measures rather than re-pointed at the new one (SPA-51).
 | `SPA-53` | MUST | chrome | `the_question_is_set_as_a_headline_in_real_chrome` | |
 | `SPA-54` | MUST | chrome | `focus_is_visible_on_every_focusable_element_in_real_chrome` | `every_deck_control_is_forty_four_pixels_at_390_in_real_chrome` holds the 44 px floor |
 | `SPA-55` | MUST | chrome | `the_card_is_named_by_its_question_in_real_chrome` | `every_field_is_labelled_and_status_is_announced_once_unit` holds the labelling over served bytes today |
-| `SPA-56` | MUST | unit | `none` | no e2e coverage — to be written by `t-992e40aa`, as the four shipped contrast and token proofs re-run over the bundle's CSS instead of the `CSS` const: `every_token_pair_clears_four_and_a_half_to_one_unit` (`rust/serve.rs:6685`), `overlay_never_sits_on_surface0_unit` (`:6718`), `the_focus_ring_and_the_filled_answer_clear_three_to_one_unit` (`:6750`) and `the_token_block_is_the_only_place_a_colour_is_written_unit` (`:6430`). The remaining WEB unit proofs — `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit`, `prose_blocks_are_bounded_to_seventy_characters_unit`, `no_border_or_outline_exists_outside_the_allowlist_unit`, `only_two_radii_exist_and_each_has_one_job_unit`, `an_outcome_hue_appears_only_on_an_outcome_unit`, `the_deck_body_fades_at_its_foot_unit`, `rendered_meta_is_a_sentence_with_no_dot_chain_unit`, `the_eyebrow_names_raiser_board_and_age_unit`, `the_note_field_is_labelled_add_a_note_with_no_hint_unit`, `one_quiet_keys_line_carries_no_kbd_badges_unit`, `counts_read_as_sentences_unit`, `a_refusal_is_the_boards_sentence_in_red_unit`, `the_drawer_puts_search_before_every_destination_unit`, `exactly_one_pill_style_exists_unit`, `tables_declare_only_the_row_hairline_unit`, `every_answer_gets_its_own_row_and_the_panel_scrolls_nothing_unit` and `every_field_is_labelled_and_status_is_announced_once_unit` — are the same shape and move with them |
+| `SPA-56` | MUST | unit | `the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit` | landed 2026-09-19 over the bundle's own stylesheet: its `:root` block is asserted equal to the served `CSS`'s, no hex is written outside it, and WEB-48/49/50's arithmetic re-runs on the bundle's tokens (the AA pair list is now one `AA_TOKEN_PAIRS` const both proofs read). Not re-run over the bundle yet, because the rules they judge have not moved into it: the `.pill` clause of `overlay_never_sits_on_surface0_unit`, and `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` and `prose_blocks_are_bounded_to_seventy_characters_unit` — those arrive with the deck (`t-1f495a7f`, `t-bf255880`) |
 | `SPA-57` | MUST | unit | `the_document_references_no_third_party_unit` | extended by `t-992e40aa` to sweep the bundle as well as the document |
 
 57 requirements: 57 MUST, no SHOULD and no MAY. By layer, 43 `chrome`, 6
@@ -293,15 +293,16 @@ its specification `Source` line says so, which excludes SPA-51 — it retires
 two WEB requirements rather than preserving any: on that rule 42 requirements
 preserve at least one `WEB-nn` (SPA-10, SPA-13, SPA-14..SPA-47 and
 SPA-52..SPA-57) and 36 of those also name an existing Chrome test here. The
-six that do not are SPA-10, SPA-13 and SPA-57, proved at `unit`/`http`, and
-the `none` rows SPA-22, SPA-31 and SPA-56. Twelve rows carry no evidence yet
-— SPA-02, SPA-03, SPA-04, SPA-05, SPA-06, SPA-07, SPA-09, SPA-22, SPA-31,
-SPA-50, SPA-51 and SPA-56 — each naming the epic `e-9306a1d9` row that must
-write it. SPA-56 is the `unit` half of the WEB design system, held over the
-bundle's own stylesheet bytes; the `chrome`-layer WEB obligations in the same
-range are preserved with named evidence by SPA-14..SPA-54 and are not
-restated there. SPA-51 supersedes `docs/specs/web-ui.md` WEB-56 and WEB-58 by
-reference.
+six that do not are SPA-10, SPA-13 and SPA-57, proved at `unit`/`http`,
+SPA-56, proved at `unit` over the bundle's own stylesheet since 2026-09-19,
+and the `none` rows SPA-22 and SPA-31. Eight rows carry no evidence yet —
+SPA-02, SPA-06, SPA-07, SPA-09, SPA-22, SPA-31, SPA-50 and SPA-51 — each
+naming the epic `e-9306a1d9` row that must write it. Four left that list on
+2026-09-19 with `t-992e40aa`, which landed the embedded bundle: SPA-03 (the
+`bundleSha256` receipt field, verified by running the installed executable),
+SPA-04 and SPA-05 (the product's mounted root, no longer a fixture page the
+test wrote) and SPA-56. SPA-51 supersedes `docs/specs/web-ui.md` WEB-56 and
+WEB-58 by reference.
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.

@@ -226,6 +226,32 @@ the server-rendered ones, and fixing the 1.32 MB landing payload of §3).
 specification decides them, under ADR-047 §6 — and anything mobile-native, which §4(c) records
 as withdrawn rather than settled.
 
+### Addendum, 2026-09-19 — what `t-992e40aa` decided building it
+
+**React 19.2.0, TypeScript 5.9.3 `strict`, bundled by esbuild 0.25.12 run under Bun** (OQ-1,
+resolved). esbuild rather than Bun's own bundler for one reason: `web/dist` is committed, so the
+bundler's version must be pinned by the lockfile, and Bun's is whatever is on `PATH`. Bun stays
+the package manager and script runner, where it cannot reach the output. Lint is `tsc --noEmit`
+plus Biome 2.3.14 — one pinned binary, not four ESLint packages, for what `strict` misses.
+
+**The bundle is committed and the cargo build embeds it.** `web/dist` is tracked (`.gitignore`
+re-includes exactly that path), `build.rs` generates the `include_bytes!` table from it, checks
+each file against the content hash in its name and stamps the bundle fingerprint. This keeps the
+release path cargo-only and offline — the pinned Rust container has no Node and the serving
+hosts must not need one (§1, ADR-044, ADR-047's `r-cf2b2b9f`). A committed artefact is worth its
+check, so `web/check-reproducible.sh` reinstalls from the frozen lockfile, rebuilds into a
+temporary directory and `cmp`s every file; the build is deterministic by construction (no
+sourcemaps, banners, legal comments or timestamps, output directory emptied first).
+
+**WebMCP still lands.** `rust/serve.rs`'s `app_shell` writes the literal `</head>` exactly once,
+so the hax edge's `sub_filter '</head>'` with `sub_filter_once on` injects exactly once, as on
+the server-rendered pages. `the_app_shell_closes_its_head_exactly_once_unit` holds it.
+
+**The release proof's second half** (OQ-4, resolved) is `bundleSha256`, added additively beside
+`manifestSha256` in the ADR-044 §2 package receipt and manifest, measured by running the
+packaged executable, and verified at install by running the INSTALLED executable's `--version`
+and comparing its `bundle <sha256>` line.
+
 ## References
 
 - Epic `e-9306a1d9` (the `SPA` rebuild, and the source of §3's measurements); task `t-aed0352a`
