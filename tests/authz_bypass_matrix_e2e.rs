@@ -2309,11 +2309,24 @@ fn the_json_routes_answer_the_same_rows_as_the_cli_over_http() {
         &["taskID", "agentID", "claimedAt", "expiresAt", "heartbeatAt"],
         "the claim summary",
     );
+    // A note row is `{note, bodyHtml}` since `t-bf255880` wave 1: the page
+    // is the client now, so the server sends the note's own text and the
+    // typeset copy of its body beside it. The CLI serves the note itself,
+    // so the comparison is against the wrapper's `note`.
     let api_notes = detail["notes"]["items"].as_array().unwrap();
     let cli_notes = shown["notes"].as_array().unwrap();
     assert_eq!(api_notes.len(), cli_notes.len(), "{detail}\n{shown}");
     for (api, cli) in api_notes.iter().zip(cli_notes) {
-        agrees_on_shared_keys(api, cli, &["seq", "author", "body", "createdAt"], "a note");
+        agrees_on_shared_keys(
+            &api["note"],
+            cli,
+            &["seq", "author", "body", "createdAt"],
+            "a note",
+        );
+        assert!(
+            api["bodyHtml"].is_string(),
+            "the task detail served a note without its typeset body: {api}"
+        );
     }
 
     // 3. The lanes grouping against `sitrep list --lane`, per group, in the

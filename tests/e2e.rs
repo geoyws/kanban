@@ -25276,9 +25276,11 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     assert_eq!(status, 200, "{deployment_detail}");
     assert!(deployment_detail.contains("served bundle carried exact release"));
 
-    let (status, search) = http_get(port, "/search?q=migration");
+    // Search is the mounted application now (`t-bf255880`): `/search`
+    // answers the shell and its rows arrive on the projection, so that is
+    // where this read moved.
+    let (status, search) = http_get(port, "/api/v1/search?q=migration");
     assert_eq!(status, 200, "{search}");
-    assert!(search.contains("Search"), "{search}");
     assert!(search.contains("Plan the migration"), "{search}");
     assert!(
         search.contains("kanban://SERVED/task/e-plan"),
@@ -25434,35 +25436,48 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "a retired rule remained in force on the board projection: {one}"
     );
 
-    let (status, detail) = http_get(port, "/task/SERVED/t-hostile");
-    assert_eq!(status, 200);
-    assert!(!detail.contains("<script>alert"), "{detail}");
+    // The task detail is mounted too, so what the server answers for it is
+    // the projection: the row's own text, the typeset body with the
+    // raiser's markup neutralised, and the trail.
+    let (status, detail) = http_get(port, "/api/v1/task/SERVED/t-hostile");
+    assert_eq!(status, 200, "{detail}");
+    let row: Value = serde_json::from_str(&detail).expect("the task detail as JSON");
+    assert!(
+        !row["bodyHtml"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("<script>alert"),
+        "a script survived the server's typesetting: {detail}"
+    );
     assert!(
         detail.contains("task_added"),
-        "the trail must render: {detail}"
+        "the trail must be served: {detail}"
     );
 
-    // A lease token is a capability. A read surface that renders one hands
+    // A lease token is a capability. A read surface that serves one hands
     // whoever loads the page the ability to write.
     let claim = fixture.ok_json(
         &fixture.main,
         &["claim", "t-hostile", "--as", "driver-1", "--json"],
     );
     let token = claim["leaseToken"].as_str().unwrap().to_owned();
-    let (_, held) = http_get(port, "/task/SERVED/t-hostile");
+    let (_, held) = http_get(port, "/api/v1/task/SERVED/t-hostile");
     assert!(
         held.contains("driver-1"),
         "the holder must be named: {held}"
     );
     assert!(
         !held.contains(&token),
-        "the lease token was rendered into a page"
+        "the lease token was served to a reader"
     );
 
-    // An address that names nothing is a page, not a dropped connection.
-    let (status, missing) = http_get(port, "/task/SERVED/t-nope");
-    assert_eq!(status, 500, "{missing}");
-    assert!(missing.contains("t-nope"), "{missing}");
+    // An address that names nothing is the one non-enumerating refusal.
+    let (status, missing) = http_get(port, "/api/v1/task/SERVED/t-nope");
+    assert_eq!(status, 404, "{missing}");
+    assert!(
+        !missing.contains("t-nope"),
+        "the refusal named the row it could not find: {missing}"
+    );
     let (status, nowhere) = http_get(port, "/no/such/page");
     assert_eq!(status, 200, "{nowhere}");
     assert!(nowhere.contains("Not found"), "{nowhere}");
@@ -26583,12 +26598,13 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(status, 404, "an unknown board write was accepted");
     let unresolved = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
     assert_eq!(unresolved.as_array().unwrap().len(), 4);
-    let (status, task_page) = http_get(port, "/task/SERVEWRITE/e-web-open");
+    // `/task/{project}/{id}` is the mounted application, so the open ask it
+    // still carries is read off the projection it renders from.
+    let (status, task_page) = http_get(port, "/api/v1/task/SERVEWRITE/e-web-open");
     assert_eq!(status, 200, "{task_page}");
-    assert!(task_page.contains("Open attention"), "{task_page}");
     assert!(
         task_page.contains("Choose the rollout window"),
-        "{task_page}"
+        "the open ask is not on the task's projection: {task_page}"
     );
     let (status, board) = http_get(port, "/api/v1/board/SERVEWRITE");
     assert_eq!(status, 200, "{board}");
@@ -27550,7 +27566,7 @@ fn assert_no_horizontal_overflow(tab: &headless_chrome::Tab, page_name: &str) {
     );
 }
 
-/// A click that navigates, dispatched at a point this helper measured itself
+/// A click that ROUTES, dispatched at a point this helper measured itself
 /// instead of through the element handle.
 ///
 /// The handle was the flake. `Element::click` re-resolves the node, scrolls
@@ -27564,78 +27580,16 @@ fn assert_no_horizontal_overflow(tab: &headless_chrome::Tab, page_name: &str) {
 ///
 /// Measuring the control, scrolling it and hit-testing the point in one
 /// in-page expression closes that window: nothing can interleave inside it,
-/// and a swap that happens anyway is retried from scratch because no input has
-/// been dispatched yet. What is dispatched is still a real trusted mouse press
-/// and release, at a point that hit-tests to the control itself, and every
-/// assertion below -- the document really was replaced, the arrival selector
-/// really is there -- is unchanged.
-fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, label: &str) {
-    // Every destination is behind the hamburger now, so reaching one starts
-    // with the menu -- which is what a reader does too.
-    if selector.starts_with("[data-nav") {
-        open_nav_drawer(tab);
-    }
-    let replaced = || {
-        tab.evaluate("!document.documentElement.dataset.navigationProbe", false)
-            .ok()
-            .and_then(|result| result.value)
-            == Some(json!(true))
-    };
-    assert_eq!(
-        js_value(
-            tab,
-            "(() => { document.documentElement.dataset.navigationProbe = 'before'; return true; })()",
-        ),
-        true
-    );
-    // Measure, dispatch, and prove the document was replaced -- and if it was
-    // not, measure and dispatch again rather than declare the page broken.
-    //
-    // A projection swap can move the control between the measurement and the
-    // press, and a press that lands where the control no longer is does
-    // nothing at all. Re-dispatching is only safe because the probe is still
-    // on the document: had the earlier press been accepted, the reply from
-    // the local server -- which has never taken anything like eight seconds
-    // to answer -- would already have replaced it. The test still fails, with
-    // the same message, if no press ever navigates.
-    let deadline = Instant::now() + Duration::from_secs(40);
-    loop {
-        tab.click_point(clickable_point(tab, selector, label))
-            .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
-        // Only a settling wait: the probe below, not this event, is what
-        // proves a new document arrived.
-        let _ = tab.wait_until_navigated();
-        let grace = Instant::now() + Duration::from_secs(8);
-        while !replaced() {
-            assert!(
-                Instant::now() < deadline,
-                "{label}: the clicked control never replaced the document"
-            );
-            if Instant::now() > grace {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        if replaced() {
-            break;
-        }
-    }
-    tab.wait_for_element(arrived)
-        .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
-}
-
-/// The same press, for a control that ROUTES rather than navigates.
+/// and a swap that happens anyway is retried from scratch because no input
+/// has been dispatched yet. What is dispatched is still a real trusted mouse
+/// press and release, at a point that hit-tests to the control itself.
 ///
-/// A client-side route change never replaces the document, so
-/// `click_navigating`'s probe -- a dataset flag that has to disappear --
-/// can never clear and every such leg would time out. What is observed
-/// instead is the two things a route change actually does: the address bar
-/// moves to `pathname`, and the page that address names is on screen.
-///
-/// The measurement, the hit test and the re-dispatch are the same as
-/// `click_navigating`'s, shared rather than copied, because the flake they
-/// close -- a projection swap moving the control between the measure and
-/// the press -- is the same flake on a routed link.
+/// Every destination is the mounted application since `t-bf255880`, and a
+/// client-side route change never replaces the document -- so a probe that
+/// waited for the document to be replaced could never clear and every leg
+/// would time out. What is observed instead is the two things a route change
+/// actually does: the address bar moves to `pathname`, and the page that
+/// address names is on screen.
 fn click_routing(
     tab: &headless_chrome::Tab,
     selector: &str,
@@ -27643,6 +27597,8 @@ fn click_routing(
     pathname: &str,
     label: &str,
 ) {
+    // Every destination is behind the hamburger now, so reaching one starts
+    // with the menu -- which is what a reader does too.
     if selector.starts_with("[data-nav") {
         open_nav_drawer(tab);
     }
@@ -31081,6 +31037,40 @@ fn wait_for_notice_rows(tab: &headless_chrome::Tab, count: usize, label: &str) -
     }
 }
 
+/// Every notice's `data-key`, read in ONE page-side expression.
+///
+/// Not through a node handle: `find_element` resolves a node id and then
+/// describes it, and a projection swap landing between those two calls
+/// invalidates the id -- which the driver reports as `No element found` for
+/// a row that is on the page the whole time. Every refresh this strip is
+/// built to survive moves it into a brand new `<main>`, so that window is
+/// open on every notice case rather than rarely.
+fn notice_keys_on_page(tab: &headless_chrome::Tab) -> Vec<String> {
+    let read = js_value(
+        tab,
+        "JSON.stringify([...document.querySelectorAll('[data-notices] .notice')]\
+         .map(row => row.dataset.key || ''))",
+    );
+    read.as_str()
+        .and_then(|keys| serde_json::from_str(keys).ok())
+        .unwrap_or_default()
+}
+
+fn wait_for_notice_keys(tab: &headless_chrome::Tab, count: usize, label: &str) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let keys = notice_keys_on_page(tab);
+        if keys.len() == count {
+            return keys;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: wanted {count} notice key(s), the page shows {keys:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Long enough for several server ticks to pass, so "nothing else arrived" is
 /// a measurement and not the absence of a measurement. The live loop polls at
 /// one second.
@@ -31164,11 +31154,8 @@ fn a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload() {
     );
     let seq = raised[0]["seq"].as_i64().expect("the raised event's seq");
     assert_eq!(
-        tab.find_element(ui::NOTICE)
-            .expect("notice row")
-            .get_attribute_value("data-key")
-            .expect("read data-key"),
-        Some(format!("NOTICE#{seq}"))
+        wait_for_notice_keys(&tab, 1, "the notice's key"),
+        vec![format!("NOTICE#{seq}")]
     );
     // The strip survives the projection re-fetch the same revision triggers:
     // a notice that vanished a second after arriving would be no notice.
@@ -32719,10 +32706,11 @@ fn last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_r
         &[("X-Auth-Request-Email", "geoyws")],
     );
     assert_element_text(&tab, "[data-task-title]", task_title);
-    click_navigating(
+    click_routing(
         &tab,
         "[data-nav=needs-you]",
         &format!("[data-item=\"{attention_id}\"]"),
+        "/",
         "return to Needs you",
     );
     assert_eq!(
@@ -46462,6 +46450,294 @@ fn a_capped_json_listing_says_it_was_capped_over_http() {
 }
 
 #[test]
+fn the_json_search_projection_answers_the_same_rows_as_the_cli_over_http() {
+    // SPA-06, SPA-39. The search page's data arrives as JSON, and the
+    // load-bearing claim is the same one the Needs-you case makes: this is
+    // the retrieval the CLI already runs, not a second one written for the
+    // browser. So the rows are asserted against `kb search` at the page's
+    // own bound, citation for citation and in the same ranked order.
+    let fixture = Fixture::new("json-search");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONSEARCH", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Seleniumquartz retrieval audit",
+            "--id",
+            "t-search",
+            "--body",
+            "seleniumquartz is the token only this fixture's rows carry.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-search",
+            "The seleniumquartz receipt, written as a note.",
+            "--as",
+            "fixture-agent",
+            "--kind",
+            "evidence",
+            "--json",
+        ],
+    );
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/search?q=seleniumquartz");
+    assert_eq!(status, 200, "{body}");
+    let page: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/search is not JSON: {error}\n{body}"));
+    let cli = fixture.ok_json(
+        &fixture.main,
+        &["search", "seleniumquartz", "--limit", "30", "--json"],
+    );
+    let served = page["items"].as_array().expect("the served rows");
+    let rows = cli["results"].as_array().expect("the CLI rows");
+    assert!(
+        !rows.is_empty(),
+        "the fixture seeded nothing to find: {cli}"
+    );
+    assert_eq!(
+        served.len(),
+        rows.len(),
+        "the JSON search and `kb search` disagree on how many rows match:\n{body}\n{cli}"
+    );
+    for (served, row) in served.iter().zip(rows) {
+        for field in ["board", "sourceKind", "sourceId", "title", "citation"] {
+            assert_eq!(
+                served[field], row[field],
+                "{field} differs between the JSON row and the CLI row:\n{served}\n{row}"
+            );
+        }
+    }
+    assert!(
+        served
+            .iter()
+            .any(|row| row["citation"] == "kanban://JSONSEARCH/task/t-search"),
+        "the seeded task is not among the served rows: {body}"
+    );
+    // The envelope is the page's own bound, and the receipt beside it says
+    // which boards were searched with what.
+    assert_eq!(page["limit"], 30, "{body}");
+    assert_eq!(page["returned"], served.len(), "{body}");
+    assert_eq!(page["truncated"], cli["truncated"], "{body}\n{cli}");
+    assert_eq!(page["query"], "seleniumquartz", "{body}");
+    assert_eq!(page["embeddingModel"], cli["embeddingModel"], "{body}");
+    assert_eq!(page["boards"], serde_json::json!(["JSONSEARCH"]), "{body}");
+    assert_eq!(page["missingBoards"], serde_json::json!([]), "{body}");
+    assert_eq!(page["unreadableBoards"], serde_json::json!([]), "{body}");
+
+    // A question that was not asked is answered with nothing, not with
+    // every row on every board.
+    for path in [
+        "/api/v1/search",
+        "/api/v1/search?q=",
+        "/api/v1/search?q=%20%20",
+    ] {
+        let (status, empty) = http_get(server.port, path);
+        assert_eq!(status, 200, "{path}: {empty}");
+        let empty: Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty["items"], serde_json::json!([]), "{path} searched");
+        assert_eq!(empty["returned"], 0, "{path}");
+        assert_eq!(empty["truncated"], Value::Bool(false), "{path}");
+        assert_eq!(empty["boards"], serde_json::json!([]), "{path}");
+    }
+}
+
+#[test]
+fn the_json_preview_projection_answers_every_kind_and_refuses_the_rest_over_http() {
+    // SPA-40. The hover card is data now, not a served fragment, so each of
+    // the four kinds has to answer with the record the fragment rendered --
+    // including the two references that make previews nest, which are what
+    // the client cannot derive from the record alone. A kind that is not one
+    // of the four gets the same non-enumerating refusal as an unknown board
+    // (SPA-08), which is what the fragment's "Nothing to preview here." said
+    // without naming anything.
+    let fixture = Fixture::new("json-preview");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONPREVIEW", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ship the decision room",
+            "--id",
+            "e-room",
+            "--type",
+            "epic",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Pin the hover preview",
+            "--id",
+            "t-hover",
+            "--parent",
+            "e-room",
+            "--body",
+            "## The body\n\nThe preview shows the first part of it.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let item = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "The body about the task, unchanged.",
+            "--as",
+            "fixture-agent",
+            "--kind",
+            "blocking",
+            "--task",
+            "t-hover",
+            "--question",
+            "Hold or ship the hover?",
+            "--context",
+            "The hover is the last thing between the deck and a reader.",
+            "--choice",
+            "ship=Ship it|approve",
+            "--choice",
+            "hold=Hold it|defer",
+            "--consequence",
+            "ship=The hover ships tonight.",
+            "--consequence",
+            "hold=The hover waits for the next pass.",
+            "--recommend",
+            "ship",
+            "--json",
+        ],
+    );
+    let attention_id = item["id"].as_str().expect("the raised item").to_owned();
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban-preview",
+            "--commit",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "--tier",
+            "@_bd",
+            "--environment",
+            "preview-fixture",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://127.0.0.1:14301",
+            "--task",
+            "t-hover",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"].as_str().expect("the attempt").to_owned();
+
+    let server = spawn_server(&fixture);
+    let json = |path: &str| -> Value {
+        let (status, body) = http_get(server.port, path);
+        assert_eq!(status, 200, "{path}: {body}");
+        serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("{path} is not JSON: {error}\n{body}"))
+    };
+
+    let task = json("/api/v1/preview/task/JSONPREVIEW/t-hover");
+    assert_eq!(task["kind"], "task", "{task}");
+    assert_eq!(task["board"], "JSONPREVIEW", "{task}");
+    assert_eq!(task["task"]["title"], "Pin the hover preview", "{task}");
+    assert_eq!(task["openAttention"], 1, "{task}");
+    // The parent is resolved here, because it is the anchor a nested
+    // preview hangs off and the client has no second call to make.
+    assert_eq!(task["parent"]["id"], "e-room", "{task}");
+    assert_eq!(task["parent"]["title"], "Ship the decision room", "{task}");
+    assert_eq!(task["parent"]["taskType"], "epic", "{task}");
+    // The body is typeset by the server's one markdown renderer, bounded.
+    let typeset = task["bodyHtml"].as_str().expect("the typeset body");
+    assert!(typeset.contains("<h2>"), "the body was not typeset: {task}");
+    assert!(
+        !typeset.contains("## The body"),
+        "the body reached the client as markdown source: {task}"
+    );
+
+    let ask = json(&format!(
+        "/api/v1/preview/attention/JSONPREVIEW/{attention_id}"
+    ));
+    assert_eq!(ask["kind"], "attention", "{ask}");
+    assert_eq!(ask["attention"]["id"], attention_id.as_str(), "{ask}");
+    assert_eq!(
+        ask["attention"]["question"], "Hold or ship the hover?",
+        "{ask}"
+    );
+    assert_eq!(ask["about"]["id"], "t-hover", "{ask}");
+    assert_eq!(ask["about"]["title"], "Pin the hover preview", "{ask}");
+
+    let attempt = json(&format!(
+        "/api/v1/preview/deployment/JSONPREVIEW/{deployment_id}"
+    ));
+    assert_eq!(attempt["kind"], "deployment", "{attempt}");
+    assert_eq!(
+        attempt["deployment"]["repo"], "geoyws/kanban-preview",
+        "{attempt}"
+    );
+    assert_eq!(
+        attempt["deployment"]["environment"], "preview-fixture",
+        "{attempt}"
+    );
+
+    let board = json("/api/v1/preview/board/JSONPREVIEW/JSONPREVIEW");
+    assert_eq!(board["kind"], "board", "{board}");
+    assert_eq!(board["boardCounts"]["tasks"], 2, "{board}");
+    assert_eq!(board["boardCounts"]["openAttention"], 1, "{board}");
+    assert_eq!(board["boardCounts"]["todo"], 2, "{board}");
+    assert_eq!(board["boardCounts"]["inProgress"], 0, "{board}");
+
+    // No lease token, and no payload from a kind this card is not about.
+    for card in [&task, &ask, &attempt, &board] {
+        assert!(
+            card.get("leaseToken").is_none(),
+            "a preview carried a lease token: {card}"
+        );
+    }
+    assert!(
+        task.get("attention").is_none() && task.get("deployment").is_none(),
+        "the task card carried another kind's payload: {task}"
+    );
+    assert!(
+        board.get("task").is_none(),
+        "the board card carried a task: {board}"
+    );
+
+    for path in [
+        "/api/v1/preview/rule/JSONPREVIEW/r-anything",
+        "/api/v1/preview/board/JSONPREVIEW/NOT-THE-BOARD",
+        "/api/v1/preview/task/JSONPREVIEW/t-no-such-row",
+        "/api/v1/preview/task/NO-SUCH-BOARD/t-hover",
+    ] {
+        let (status, body) = http_get(server.port, path);
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(
+            body, JSON_DENIED_OR_NOT_FOUND,
+            "{path} answered a refusal of its own"
+        );
+    }
+}
+
+#[test]
 fn a_listing_says_whether_each_task_is_held_and_by_whom() {
     // Measured 2026-09-04 across eight boards: `task list --status
     // in_progress` carried no claim key at all, so 32 leased tasks read as
@@ -50312,11 +50588,16 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
 /// the shell the bundle mounts into - a mount point rather than a heading,
 /// which is the cutover's recorded consequence (spec SPA-51, ADR-048).
 ///
-/// `t-bf255880` wave 1 moved seven more destinations onto the bundle -
-/// `/decided`, `/lanes`, `/boards`, `/sprints`, `/plans`, `/deployments`
-/// and `/subscriptions` - so their scriptless answer is the same mount
-/// point. What this case still holds for all nine is the part that is
-/// about the drawer rather
+/// `t-bf255880` wave 1 moved every remaining drawer destination onto the
+/// bundle - `/decided`, `/lanes`, `/boards`, `/sprints`, `/plans`,
+/// `/deployments` and `/subscriptions` - so their scriptless answer is the
+/// same mount point, and with `/` that is eight of the nine answering it.
+/// `/all` is the one the drawer still points at that the server renders.
+/// The wave moved routes the drawer does not name too - `/board/{project}`,
+/// `/sprints/{project}`, `/sprint/{project}/{id}`, `/task/{project}/{id}`,
+/// `/deployment/{project}/{id}` and `/search` - which is why the shapes
+/// this case can reach are fewer than the shapes `render` answers. What it
+/// holds for all nine anchors is the part that is about the drawer rather
 /// than the renderer: every anchor the spec names is there, every href is
 /// site-local, every one answers `200`, and the drawer holds no tenth
 /// destination.
@@ -50769,16 +51050,18 @@ fn go(tab: &headless_chrome::Tab, origin: &str, route: &str) {
     tab.wait_until_navigated()
         .unwrap_or_else(|error| panic!("navigate to {route}: {error}"));
     wait_for_js_true(tab, "document.readyState === 'complete'");
-    // Several of these routes are the mounted application now
-    // (`t-bf255880`), whose `<main>` arrives when the bundle runs rather
-    // than in the first response. `readyState` alone would hand a sweep an
-    // empty shell. A preview fragment has no `<main>` and never had one, so
-    // the wait is asked only of a document that IS the shell.
-    wait_for_js_true(
+    // A route that answers the application shell has nothing in it until
+    // the bundle mounts, and `readyState` is complete long before that. The
+    // shell is recognised by the node it exists to hold, so this branch
+    // needs no list of which routes are mounted -- one more route moving
+    // onto the application changes nothing here.
+    if js_value(
         tab,
-        "!document.querySelector('[data-testid=app-root-shell]') \
-         || Boolean(document.querySelector('main'))",
-    );
+        "document.querySelector('[data-testid=app-root-shell]') !== null",
+    ) == Value::Bool(true)
+    {
+        wait_for_app_root(tab, ui::APP_ROOT);
+    }
 }
 
 /// Every animation the page starts, recorded at the document so the record
@@ -51980,12 +52263,11 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
         // read its projection: the server sends the shell, and the seeded
         // record arrives one fetch later. Waiting for the record rather
         // than for the root is what makes the marker assertion below an
-        // assertion instead of a race. (t-bf255880 wave 1 moved these three;
-        // the rest of the list is still server-rendered.)
-        let mounted = matches!(
-            shape,
-            "/deployments" | "/subscriptions" | "/deployment/{project}/{id}"
-        );
+        // assertion instead of a race. After `t-bf255880` wave 1 that is
+        // every shape but three: `/all` is still the served list, the
+        // preview fragments are still served cards, and the not-found arm
+        // is still a served page.
+        let mounted = !fragment && !shape.is_empty() && shape != "/all";
         for (width, height) in [(390_u32, 844_u32), (820, 1180), (1280, 800)] {
             set_viewport_with(&tab, width, height, !fragment && width < 700);
             go(&tab, &origin, route);
@@ -53090,11 +53372,13 @@ fn the_receipt_lands_with_its_outcome_rule_in_real_chrome() {
 }
 
 /// A board read as rows: one task in each status the board groups by, one of
-/// them `P0`, plus a verified release so `/deployments` renders its table.
+/// them `P0`, plus a verified release so `/deployments` renders its table,
+/// plus one open ask so `/task/{project}/{id}` renders its own row list.
 ///
-/// The read pages are what this fixture is for, so nothing here raises an
-/// attention item: a deck card would put a second kind of surface on the
-/// page and the claims below are about rows and tables.
+/// The ask is the task detail's rows, not the deck's: `/task` is the mounted
+/// application since `t-bf255880` wave 1, and the row shape it renders is
+/// held by the same sweep as every other read page rather than by a
+/// server-rendered-bytes assertion that can no longer reach it.
 fn rows_fixture(label: &str, board: &str) -> (Fixture, String) {
     let fixture = Fixture::new(label);
     fixture.ok_json(&fixture.main, &["init", "--name", board, "--json"]);
@@ -53197,6 +53481,21 @@ fn rows_fixture(label: &str, board: &str) -> (Fixture, String) {
             "dddddddddddddddddddddddddddddddddddddddd",
             "--receipt",
             "The rows fixture served exact commit dddddddddddd.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Please review the row somebody is holding.",
+            "--task",
+            "t-rows-doing",
+            "--kind",
+            "decision",
             "--as",
             "fixture-agent",
             "--json",
@@ -53334,6 +53633,7 @@ const ROW_SWEEP: &str = r#"(() => {
       return {
         lead: lead ? lead.tagName.toLowerCase() : null,
         leadClass: lead ? lead.className : null,
+        leadText: lead ? lead.textContent : null,
         href: lead ? lead.getAttribute('href') : null,
         metas: row.querySelectorAll('.meta').length,
         after: after ? `${after.tagName.toLowerCase()}.${after.className}` : null,
@@ -53362,6 +53662,12 @@ const ROW_SWEEP: &str = r#"(() => {
 /// and one sentence, status is the only pill and the only badge, the `P0`
 /// priority is red mono text rather than a pill, and the tables draw the one
 /// hairline.
+///
+/// The task detail is swept here too since `t-bf255880` wave 1 mounted it:
+/// its open-attention list is the one row list that leads with a title
+/// element rather than an anchor, and the bytes assertion that used to hold
+/// it (`serve::tests::web_rows_child_process`) can no longer reach a route
+/// that answers the shell.
 #[test]
 fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     browser_loopback_reservation_supported()
@@ -53373,16 +53679,30 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     let tab = opened_tab(&chrome, "rows acceptance tab");
     let mut measured_rows = 0;
     let mut measured_pills = 0;
-    for route in ["/board/ROWSA11", "/boards", "/deployments"] {
+    // `/task/{project}/{id}` last: it is the row list whose lead is a title
+    // element, and the only one of the four with an anti-vacuity floor of
+    // its own below.
+    let task_route = "/task/ROWSA11/t-rows-doing";
+    let mut task_rows = 0;
+    let mut task_titles = Vec::new();
+    for route in ["/board/ROWSA11", "/boards", "/deployments", task_route] {
         go(&tab, &origin, route);
-        // `/deployments` is mounted since `t-bf255880` wave 1.
+        // Both are mounted since `t-bf255880` wave 1, so the measurement
+        // waits for the page the bundle renders rather than for the shell.
         if route == "/deployments" {
             wait_for_mounted_page(&tab, "[data-testid=deployments-current]");
+        }
+        if route == task_route {
+            wait_for_mounted_page(&tab, "[data-task-attention]");
         }
         let measured = measure(&tab, ROW_SWEEP, "the row sweep");
         eprintln!("{route}: {measured}");
         for row in measured["rows"].as_array().expect("the rows") {
             measured_rows += 1;
+            if route == task_route {
+                task_rows += 1;
+                task_titles.push(row["leadText"].as_str().unwrap_or_default().to_owned());
+            }
             let lead = row["lead"].as_str().unwrap_or_default();
             let lead_class = row["leadClass"].as_str().unwrap_or_default();
             assert!(
@@ -53490,6 +53810,20 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     assert!(
         measured_rows >= 5,
         "the acceptance measured only {measured_rows} rows"
+    );
+    // The floor the server-rendered sweep used to carry: the task detail's
+    // row list is the one it could still measure, and it moved here with
+    // the route. A sweep that found no row on it would pass while proving
+    // nothing about the page that renders them.
+    assert!(
+        task_rows >= 1,
+        "the task detail rendered no open-attention row, so its rows went unmeasured"
+    );
+    assert!(
+        task_titles
+            .iter()
+            .any(|title| title.starts_with("Please review ")),
+        "the task detail's row does not lead with the ask it was seeded with: {task_titles:?}"
     );
     assert!(
         measured_pills >= 5,

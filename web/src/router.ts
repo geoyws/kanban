@@ -44,8 +44,16 @@ export interface Route {
  */
 const ROUTE_CHANGE = "routechange";
 
-/** The parameterless pages, by the single segment that names each. */
+/**
+ * The parameterless pages, by the single segment that names each.
+ *
+ * `app` is the deck under its own address: `/app` has served the shell
+ * since the cutover and is what spec SPA-04 loads, so it names the same
+ * page `/` does. Without it the bundle would answer its own entry point
+ * with `not-found`.
+ */
 const PAGES: Record<string, string> = {
+  app: "needs-you",
   all: "all",
   decided: "decided",
   boards: "boards",

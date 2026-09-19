@@ -21,12 +21,14 @@
 
 use crate::model::{
     Attention, Checkpoint, ClaimSummary, DeadLetterCode, DeploymentAttempt, Event, RuleSummary,
-    Sitrep, Sprint, Subscription, SubscriptionPosition, Task, TaskNote,
+    SearchResult, Sitrep, Sprint, Subscription, SubscriptionPosition, Task, TaskNote,
+    UnreadableBoard,
 };
 use crate::registry::Registry;
 use crate::serve::{
-    DECIDED_ROWS, DECIDED_SCAN, DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS, lane_groups,
-    markdown, project_named, projects, sort_decided_queue, sort_open_queue, task_attention_count,
+    DECIDED_ROWS, DECIDED_SCAN, DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS,
+    PREVIEW_BODY_CHARS, SEARCH_LIMIT, excerpt, lane_groups, markdown, project_named, projects,
+    search_receipt, sort_decided_queue, sort_open_queue, task_attention_count,
 };
 use crate::store::Store;
 use serde::Serialize;
@@ -134,6 +136,20 @@ impl<T> Listing<T> {
             items: rows,
             limit: None,
             truncated: false,
+        }
+    }
+
+    /// The same listing over a richer row, with the envelope untouched.
+    ///
+    /// Typesetting a body is not free, so the rows are mapped after the
+    /// bound has already dropped the over-fetched one: the reader pays for
+    /// what is served and nothing else.
+    fn map<U>(self, convert: impl FnMut(T) -> U) -> Listing<U> {
+        Listing {
+            items: self.items.into_iter().map(convert).collect(),
+            returned: self.returned,
+            limit: self.limit,
+            truncated: self.truncated,
         }
     }
 }
@@ -255,18 +271,43 @@ pub struct LaneUpdate {
 }
 
 /// One task, who holds it, and its trail.
+///
+/// Three fields carry agent-authored prose already typeset by [`markdown`],
+/// for the reason [`AttentionCard::body_html`] does: the page renders those
+/// bytes, and a second renderer in the client would be a second sanitiser
+/// (SPA-41). The server-rendered page typeset the task body, every note and
+/// every open attention row, so the projection that replaces it carries the
+/// same three.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDetail {
     board: String,
     task: Task,
+    /// The task's own body, typeset. `None` when the row has no body.
+    body_html: Option<String>,
     /// `Store::get_claim`, converted. Never [`crate::model::Claim`], which
     /// carries the lease token (SPA-09).
     claim: Option<ClaimSummary>,
-    open_attention: Vec<Attention>,
-    notes: Listing<TaskNote>,
+    open_attention: Vec<RenderedAttention>,
+    notes: Listing<RenderedNote>,
     checkpoints: Listing<Checkpoint>,
     events: Listing<Event>,
+}
+
+/// One note and its body as the page shows it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderedNote {
+    note: TaskNote,
+    body_html: String,
+}
+
+/// One attention row and its body as the page shows it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderedAttention {
+    attention: Attention,
+    body_html: String,
 }
 
 /// Every open attention item across every board, in the order the deck shows
@@ -518,10 +559,20 @@ pub fn task(project_name: &str, id: &str) -> Projected<TaskDetail> {
     let events = store.events(Some(&task.id), None, DETAIL_ROWS + 1, true)?;
     Ok(TaskDetail {
         board: project.name,
+        body_html: task.body.as_deref().map(markdown),
         task,
         claim: claim.as_ref().map(ClaimSummary::from),
-        open_attention,
-        notes: Listing::capped(notes, DETAIL_ROWS),
+        open_attention: open_attention
+            .into_iter()
+            .map(|attention| RenderedAttention {
+                body_html: markdown(&attention.body),
+                attention,
+            })
+            .collect(),
+        notes: Listing::capped(notes, DETAIL_ROWS).map(|note| RenderedNote {
+            body_html: markdown(&note.body),
+            note,
+        }),
         checkpoints: Listing::capped(checkpoints, DETAIL_ROWS),
         events: Listing::capped(events, DETAIL_ROWS),
     })
@@ -936,4 +987,198 @@ pub fn plans() -> Projected<Listing<PlanCard>> {
         }
     }
     Ok(Listing::complete(cards))
+}
+
+// --- search and previews ---
+
+/// The bounded result set and the receipt that bounds it.
+///
+/// [`crate::model::SearchReceipt`] with its results promoted into the
+/// listing, so a search answers the same envelope every other listing does
+/// and a reader learns from one field whether the bound was reached.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPage {
+    #[serde(flatten)]
+    listing: Listing<SearchResult>,
+    query: String,
+    embedding_model: String,
+    boards: Vec<String>,
+    missing_boards: Vec<String>,
+    unreadable_boards: Vec<UnreadableBoard>,
+    result_chars: usize,
+    generated_at: i64,
+}
+
+/// What a reference link answers on hover, discriminated by `kind`.
+///
+/// Exactly the four the page has: the payload field that matches `kind` is
+/// present and the others are absent, rather than null, because a card that
+/// is not about a deployment has no deployment to be null about.
+///
+/// Three fields beyond the records, each of them something the served
+/// fragment showed and the client cannot derive:
+///
+/// - `body_html` is the task body's first [`PREVIEW_BODY_CHARS`] characters
+///   typeset by [`markdown`], as `task_preview` typeset them; the client
+///   renders those bytes rather than parsing agent prose a second time.
+/// - `open_attention` is how many open items name the task, which is the
+///   sentence "it is on Needs you" the preview ends on.
+/// - `parent` and `about` are the references the fragment carried as links:
+///   a task's parent, and the row an attention item was raised against.
+///   They are what makes a preview nest, so they are resolved here exactly
+///   as `task_reference` resolves them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preview {
+    kind: String,
+    board: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<Task>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_attention: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<TaskReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attention: Option<Attention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    about: Option<TaskReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deployment: Option<DeploymentAttempt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    board_counts: Option<BoardCounts>,
+}
+
+/// The four numbers a board's own preview prints.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardCounts {
+    open_attention: i64,
+    todo: usize,
+    in_progress: usize,
+    tasks: usize,
+}
+
+impl Preview {
+    /// One kind's card, with every other kind's payload absent.
+    fn of(kind: &str, board: String) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            board,
+            task: None,
+            body_html: None,
+            open_attention: None,
+            parent: None,
+            attention: None,
+            about: None,
+            deployment: None,
+            board_counts: None,
+        }
+    }
+}
+
+/// How many rows the attention listing a preview reads is bounded to, as
+/// `attention_preview` bounds it: no single-row getter exists and a hover is
+/// not the reason to add one.
+const PREVIEW_ATTENTION_ROWS: i64 = 500;
+
+/// Hybrid search across every readable board, and the rules.
+///
+/// The whole retrieval is [`search_receipt`], shared with the page rather
+/// than reimplemented: same boards, same ranking, same bound. `truncated` is
+/// the receipt's own, promoted into the envelope rather than recomputed from
+/// the rows that survived it.
+pub fn search(query: &str) -> Projected<SearchPage> {
+    let mut receipt = search_receipt(query)?;
+    let results = std::mem::take(&mut receipt.results);
+    let limit = i64::try_from(SEARCH_LIMIT).unwrap_or(i64::MAX);
+    Ok(SearchPage {
+        listing: Listing::merged(results, limit, receipt.truncated),
+        query: receipt.query,
+        embedding_model: receipt.embedding_model,
+        boards: receipt.boards,
+        missing_boards: receipt.missing_boards,
+        unreadable_boards: receipt.unreadable_boards,
+        result_chars: receipt.result_chars,
+        generated_at: receipt.generated_at,
+    })
+}
+
+/// One reference answered on hover: what the item is, in one glance.
+///
+/// A kind that is not one of the four, and `board` with an id that is not
+/// the board's name, are the same refusal an unknown board gets: the served
+/// fragment answered "Nothing to preview here.", which says the same thing
+/// without naming anything.
+pub fn preview(kind: &str, project_name: &str, id: &str) -> Projected<Preview> {
+    let (record, store) = project_named(project_name).map_err(|_| Refusal::DeniedOrNotFound)?;
+    let board = record.name;
+    let reference = |task_id: &str| -> Option<TaskReference> {
+        store.require_task(task_id).ok().map(|task| TaskReference {
+            id: task.id,
+            task_type: task.task_type,
+            title: task.title,
+        })
+    };
+    match kind {
+        "task" => {
+            let task = store
+                .require_task(id)
+                .map_err(|_| Refusal::DeniedOrNotFound)?;
+            let open = store
+                .attention(
+                    Some("open"),
+                    None,
+                    Some(&task.id),
+                    None,
+                    None,
+                    OPEN_ATTENTION_ROWS,
+                    false,
+                )?
+                .len();
+            let mut card = Preview::of(kind, board);
+            card.body_html = task
+                .body
+                .as_ref()
+                .map(|body| markdown(&excerpt(body, PREVIEW_BODY_CHARS)));
+            card.parent = task.parent_id.as_deref().and_then(reference);
+            card.open_attention = Some(open);
+            card.task = Some(task);
+            Ok(card)
+        }
+        "attention" => {
+            let item = store
+                .attention(None, None, None, None, None, PREVIEW_ATTENTION_ROWS, false)?
+                .into_iter()
+                .find(|item| item.id == id)
+                .ok_or(Refusal::DeniedOrNotFound)?;
+            let mut card = Preview::of(kind, board);
+            card.about = item.task_id.as_deref().and_then(reference);
+            card.attention = Some(item);
+            Ok(card)
+        }
+        "deployment" => {
+            let row = store
+                .require_deployment(id)
+                .map_err(|_| Refusal::DeniedOrNotFound)?;
+            let mut card = Preview::of(kind, board);
+            card.deployment = Some(row);
+            Ok(card)
+        }
+        "board" if id == board => {
+            let tasks = store.list_tasks(None, None, None, None, false)?;
+            let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
+            let mut card = Preview::of(kind, board.clone());
+            card.board_counts = Some(BoardCounts {
+                open_attention: store.count_open_attention()?,
+                todo: count("todo"),
+                in_progress: count("in_progress"),
+                tasks: tasks.len(),
+            });
+            Ok(card)
+        }
+        _ => Err(Refusal::DeniedOrNotFound),
+    }
 }

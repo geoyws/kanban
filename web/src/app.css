@@ -1489,3 +1489,52 @@ td > form {
 .plan {
   overflow-wrap: anywhere;
 }
+
+/* search and task -- the two pages' own rules, and nothing the read-page
+   primitives above already declare. */
+
+/* The field is the page: it takes the width the page has, and the button
+   keeps only the room its word needs. */
+.search-page {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.search-page input {
+  flex: 1;
+}
+
+/* A result is a title, a sentence, the snippet and the citation. It is not a
+   card and gets no box (SPA-53): the separation is the space between them. */
+.search-result {
+  margin: 1.4rem 0;
+  padding: 0;
+}
+
+.search-result h2 {
+  margin: 0.1rem 0;
+}
+
+/* The citation is how the row is retrieved, so it reads as a reference
+   rather than as prose: quiet, and in the mono the ids are already in. */
+.citation {
+  margin: 0.4rem 0 0;
+  color: var(--overlay);
+}
+
+/* Ported from writer D's branch (feat/t-bf255880-d-search) at merge: the
+   two declarations its pages need that the shared primitives above do not
+   have. The trail's payload is an agent's own JSON, so it is quiet and it
+   breaks rather than widening the table; `.title` is the attention row's
+   question on the task page, which is a title without being a link. */
+td.payload {
+  color: var(--subtext);
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+
+.title {
+  display: inline-block;
+  color: var(--text);
+  font-weight: 500;
+}

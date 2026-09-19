@@ -936,7 +936,7 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-37 | `the_current_page_is_marked_by_a_rule_in_real_chrome` | chrome | M3 |
 | WEB-38 | `every_destination_answers_without_a_script_over_http` | http | M4 |
 | WEB-39 | `the_drawer_puts_search_before_every_destination_unit` | unit | M1 |
-| WEB-40 | `a_list_row_is_a_title_and_one_sentence_unit` | unit | M1 |
+| WEB-40 | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | chrome | M3 |
 | WEB-41 | `exactly_one_pill_style_exists_unit` | unit | M1 |
 | WEB-42 | `tables_declare_only_the_row_hairline_unit` | unit | M1 |
 | WEB-43 | `read_tables_are_borderless_but_for_the_hairline_in_real_chrome` | chrome | M3 |
@@ -957,8 +957,10 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-58 | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` † | unit | M1 |
 | WEB-59 | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | chrome | M2 |
 
-Counts: 59 requirements — 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 31
-`unit`, 27 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18.
+Counts: 59 requirements — 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
+`unit`, 28 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18, and
+WEB-40 moved from `unit` to `chrome` with `t-bf255880` wave 1, when every page
+that lists rows became the bundle's.
 
 ## Appendix A — the design plan, verbatim
 

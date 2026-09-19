@@ -19,9 +19,11 @@ import DeploymentPage from "./pages/deployment";
 import DeploymentsPage from "./pages/deployments";
 import LanesPage from "./pages/lanes";
 import PlansPage from "./pages/plans";
+import SearchPage from "./pages/search";
 import SprintPage from "./pages/sprint";
 import SprintsPage from "./pages/sprints";
 import SubscriptionsPage from "./pages/subscriptions";
+import TaskPage from "./pages/task";
 import { bindPreviews, dismissPreviews } from "./previews";
 import { type Route, setMountedRoutes, useRoute } from "./router";
 import { Chrome, RefreshProvider } from "./shell";
@@ -1025,6 +1027,8 @@ const PAGES: Record<string, (route: Route) => ReactElement> = {
   "board-sprints": (route) => <BoardSprintsPage route={route} />,
   sprint: (route) => <SprintPage route={route} />,
   plans: (route) => <PlansPage route={route} />,
+  search: (route) => <SearchPage route={route} />,
+  task: (route) => <TaskPage route={route} />,
 };
 
 setMountedRoutes(["needs-you", ...Object.keys(PAGES)]);
