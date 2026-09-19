@@ -1392,11 +1392,17 @@ See the [product requirements](docs/PRD.md),
 ## Development
 
 ```bash
+./web/gate.sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --release --locked
 ```
+
+`web/gate.sh` typechecks and lints the operator UI's TypeScript and proves
+the committed `web/dist` bundle is byte-for-byte reproducible from the frozen
+lockfile (`web/check-reproducible.sh`); `cargo build` only embeds those
+committed bytes, so the release build needs no Node on the host (ADR-048).
 
 `cargo test` runs unit tests for the pure logic (flag validation, the
 nearest-match hint, the alias tables, context trimming) alongside the E2E
