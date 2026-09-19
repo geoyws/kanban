@@ -44806,6 +44806,9 @@ fn the_json_projection_never_serialises_a_lease_token_over_http() {
     let detail: Value = serde_json::from_str(&body).unwrap();
     let claim = detail["claim"].as_object().unwrap();
     assert_eq!(claim["agentID"], "driver-2", "{body}");
+    // The claim declared no model, so the field is present and null: a
+    // ClaimSummary field since BOARD_V30 (ADR-049), never a lease token.
+    assert!(claim["model"].is_null(), "{body}");
     let mut keys = claim.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     assert_eq!(
@@ -44815,6 +44818,7 @@ fn the_json_projection_never_serialises_a_lease_token_over_http() {
             "claimedAt".to_owned(),
             "expiresAt".to_owned(),
             "heartbeatAt".to_owned(),
+            "model".to_owned(),
             "sessionID".to_owned(),
             "taskID".to_owned(),
         ],

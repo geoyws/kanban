@@ -1807,7 +1807,7 @@ components:
         `From<&Claim>` conversion already exists (`rust/model.rs:571`). The
         projection converts; it does not filter, because a filter can be
         forgotten and a type cannot (SPA-09).
-      required: [taskID, agentID, claimedAt, heartbeatAt, expiresAt]
+      required: [taskID, agentID, claimedAt, heartbeatAt, expiresAt, model]
       additionalProperties: false
       properties:
         taskID: { type: string }
@@ -1816,6 +1816,13 @@ components:
         claimedAt: { $ref: "#/components/schemas/EpochMillis" }
         heartbeatAt: { $ref: "#/components/schemas/EpochMillis" }
         expiresAt: { $ref: "#/components/schemas/EpochMillis" }
+        model:
+          type: string
+          nullable: true
+          description: |
+            The model the claim declared with `--model` (ADR-049, slice MODEL);
+            `null` for a claim that declared none, including every claim
+            recorded before board schema 30. Never a lease token.
 
     TaskNote:
       type: object
