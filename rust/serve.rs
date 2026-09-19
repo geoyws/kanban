@@ -3451,13 +3451,28 @@ fn or_list(values: &[String]) -> String {
 /// forever, and alphabetical order parks it at the top of the page. Sorting
 /// by recency lets a dead lane sink out of the way without destroying what
 /// it said, which is the same answer archiving gives within a lane.
+///
+/// Every board this caller may read, not every board: `Store::sitreps` is
+/// guarded, and a board it refuses is skipped rather than propagated, so the
+/// page and the route answer the readable estate (SPA-08).
 #[allow(clippy::type_complexity)]
 pub(crate) fn lane_groups(limit: i64) -> Result<(Vec<((String, String), Vec<Sitrep>)>, bool)> {
     let mut by_lane: std::collections::BTreeMap<(String, String), Vec<Sitrep>> =
         std::collections::BTreeMap::new();
     let mut truncated = false;
     for (project, store) in projects()? {
-        let mut updates = store.sitreps(None, false, None, limit + 1)?;
+        // A board this caller may not read contributes no lanes, and the page
+        // still answers for the boards they may. Skipping rather than
+        // refusing keeps the enumeration from becoming an existence oracle:
+        // the absent board is indistinguishable from a board with no sitreps.
+        // Any other failure is a real fault and propagates.
+        let mut updates = match store.sitreps(None, false, None, limit + 1) {
+            Ok(updates) => updates,
+            Err(error) => match projection::Refusal::from(error) {
+                projection::Refusal::DeniedOrNotFound => continue,
+                projection::Refusal::Failed(error) => return Err(error),
+            },
+        };
         if i64::try_from(updates.len()).unwrap_or(i64::MAX) > limit {
             truncated = true;
             updates.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
