@@ -205,6 +205,103 @@ became a MUST on 2026-09-18. By layer,
 31 `unit`, 27 `chrome` and 1 `http` — every requirement maps to an existing
 test at the layer §3 assigns it.
 
+## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-57
+
+One row per requirement, on branch `docs/t-eed0a923-spa-spec` at 2026-09-19:
+commit `e3ae94a`. The specification is at `Draft — gate requested 2026-09-19`;
+these rows land with it so the gate reviewer reads the trace rather than a
+promise of one. `Layer` uses the specification's own vocabulary: `unit` is an
+in-process `#[test]` in `rust/serve.rs`'s `mod tests` reading produced bytes,
+`chrome` is a compiled-binary test driving real Chrome in `tests/e2e.rs`,
+`http` is a compiled-binary HTTP exchange with no browser, `process` is a
+compiled-binary process-boundary exchange. `Existing test` is the test that
+observes the behaviour on the SERVER-RENDERED surface today; the SPA
+implementation rows (`t-19d4c16d`, `t-88814b7a`, `t-992e40aa`, `t-1f495a7f`,
+`t-bf255880`) re-point it at the mounted page, which is what ADR-048 §6's
+"WEB's real-Chrome contracts are re-proven on the SPA" requires. Chrome and
+HTTP names were enumerated with `cargo test --locked --test e2e -- --list`;
+unit names were verified as `fn <name>(` in `rust/serve.rs`, because the lib
+test target does not compile in the documentation worktree this trace was
+written in. A `none` row says `no e2e coverage` plainly and names the row that
+must write it — including the rows whose only shipped evidence is a harness
+fixture (SPA-04, SPA-05) or a test that is deleted with the surface it
+measures rather than re-pointed at the new one (SPA-51).
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `SPA-01` | MUST | process | `hig_release_script_install_restarts_kanban_serve_and_proves_the_served_exe` | proves the served executable today; extended by `t-992e40aa` to prove the bundle is served from its bytes |
+| `SPA-02` | MUST | process | `none` | no e2e coverage — to be written by `t-992e40aa` (a release package and a serving host carrying no Node-shaped runtime) |
+| `SPA-03` | MUST | process | `none` | no e2e coverage — to be written by `t-992e40aa`; blocked on OQ-4 |
+| `SPA-04` | MUST | chrome | `none` | no e2e coverage — harness proven by `an_async_mounted_root_is_found_by_test_id_in_real_chrome` (a fixture page the test wrote, not the product); product observation owed by `t-1f495a7f` |
+| `SPA-05` | MUST | chrome | `none` | no e2e coverage — harness proven by `an_async_mounted_root_is_found_by_test_id_in_real_chrome` (fixture); product observation owed by `t-1f495a7f`. That case is also where `wait_for_shell_ready` (`tests/e2e.rs:26362`) becomes `wait_for_app_root(tab, ui::APP_ROOT)` and nothing else in the file has to know |
+| `SPA-06` | MUST | http | `none` | no e2e coverage — to be written by `t-19d4c16d`; blocked on OQ-3 |
+| `SPA-07` | MUST | unit | `none` | no e2e coverage — to be written by `t-88814b7a`, as a source-reading unit test of the same shape as `no_page_can_reach_a_method_that_writes` (`rust/serve.rs:8442`), asserting the absence of a capability over the projection module rather than the absence of a write |
+| `SPA-08` | MUST | http | `serve_hides_retired_boards_from_the_board_index_and_board_route` | authorization parity on the served surface today; extended to the JSON routes by `t-88814b7a` |
+| `SPA-09` | MUST | http | `none` | no e2e coverage — to be written by `t-88814b7a`; `compiled_binary_persists_across_processes_and_rotates_handoff_lease` is the same assertion on the CLI read model |
+| `SPA-10` | MUST | unit | `the_route_table_and_the_write_allowlist_are_unchanged_unit` | |
+| `SPA-11` | MUST | unit | `same_origin_post_is_csrf_defence_and_grants_no_capability` | the in-process proof over the handler; `serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests` keeps same-origin required across a compiled HTTP exchange |
+| `SPA-12` | MUST | http | `serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests` | `trusted_edge_resolution_stays_on_the_single_web_call_site` and `the_trusted_edge_actor_header_records_the_same_actor_over_a_socket` hold the other halves |
+| `SPA-13` | MUST | http | `the_served_pages_read_the_real_boards_and_write_to_none_of_them` | `no_page_can_reach_a_method_that_writes` holds the same boundary as a source-reading unit test |
+| `SPA-14` | MUST | chrome | `a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_outcome` | `the_pressed_answer_says_sending_on_its_own_fill_in_real_chrome` and `pressing_1_sends_and_advances_to_the_next_card_in_real_chrome` hold the in-flight label and the digit |
+| `SPA-15` | MUST | chrome | `last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_real_chrome` | |
+| `SPA-16` | MUST | chrome | `a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded` | `a_choice_clicked_with_a_reply_records_the_note_in_real_chrome` proves the surviving text still records |
+| `SPA-17` | MUST | chrome | `a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome` | |
+| `SPA-18` | MUST | chrome | `a_click_shows_sending_until_the_board_answers_in_real_chrome` | |
+| `SPA-19` | MUST | chrome | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | `a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it` holds the focus move |
+| `SPA-20` | MUST | chrome | `a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one` | `enter_in_the_verdict_picker_records_the_free_text_answer_in_real_chrome` holds the keyboard commit |
+| `SPA-21` | MUST | chrome | `a_refused_click_restores_the_card_in_real_chrome` | `a_refused_decision_brings_the_card_back_in_real_chrome` and `a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome` hold the queue position and the surviving draft |
+| `SPA-22` | MUST | chrome | `none` | no e2e coverage — to be written by `t-1f495a7f`; both shipped refusal cases stub a `409` at `window.fetch`, so no test lets the board refuse by name |
+| `SPA-23` | MUST | chrome | `a_digit_in_the_verdict_picker_records_nothing_in_real_chrome` | `a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome` and `a_digit_on_the_folded_answers_summary_records_nothing_in_real_chrome` hold the other two focus states |
+| `SPA-24` | MUST | chrome | `a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome` | the same case presses `Escape` inside the card and asserts the verdict was released |
+| `SPA-25` | MUST | chrome | `a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change` | `a_reconnected_notice_socket_in_real_chrome_does_not_replay_history` and `a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome` hold reconnect and redelivery |
+| `SPA-26` | MUST | chrome | `skip_moves_the_card_to_the_back_without_recording_in_real_chrome` | |
+| `SPA-27` | MUST | chrome | `the_undo_key_bring_back_the_last_decision_in_real_chrome` | |
+| `SPA-28` | MUST | chrome | `the_last_card_leaves_the_empty_state_in_real_chrome` | |
+| `SPA-29` | MUST | chrome | `the_deck_answers_stack_and_the_note_is_reached_by_one_scroller_at_three_widths_in_real_chrome` | `the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome` holds the single-scroller rule |
+| `SPA-30` | MUST | chrome | `a_projection_swap_keeps_the_reader_where_they_were_in_the_card_in_real_chrome` | |
+| `SPA-31` | MUST | chrome | `none` | no e2e coverage — to be written by `t-1f495a7f`; the shipped proof is `one_quiet_keys_line_carries_no_kbd_badges_unit` over served bytes the SPA retires. `needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome` and `the_custom_answer_is_folded_until_c_opens_it_in_real_chrome` observe the keys' behaviour but not the rendered line |
+| `SPA-32` | MUST | chrome | `a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome` | |
+| `SPA-33` | MUST | chrome | `decided_receipts_collect_in_the_side_history_in_real_chrome` | `the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome` holds the phone's history control |
+| `SPA-34` | MUST | chrome | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | |
+| `SPA-35` | MUST | chrome | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | |
+| `SPA-36` | MUST | chrome | `read_tables_are_borderless_but_for_the_hairline_in_real_chrome` | |
+| `SPA-37` | MUST | chrome | `no_route_overflows_sideways_at_three_widths_in_real_chrome` | `render_answers_exactly_the_declared_shapes_unit` keeps the swept route list complete against `render`'s arms |
+| `SPA-38` | MUST | chrome | `the_drawer_is_rows_on_the_desk_surface_in_real_chrome` | `the_current_page_is_marked_by_a_rule_in_real_chrome` holds the current-page rule |
+| `SPA-39` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | the same journey enters a query and lands on `/search` |
+| `SPA-40` | MUST | chrome | `reference_links_preview_on_hover_nest_and_open_a_new_tab_in_real_chrome` | |
+| `SPA-41` | MUST | chrome | `markdown_renders_in_real_chrome_and_raw_html_stays_inert` | |
+| `SPA-42` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | |
+| `SPA-43` | MUST | chrome | `recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome` | |
+| `SPA-44` | MUST | chrome | `opening_a_draft_plan_in_real_chrome_moves_the_real_task_to_todo` | |
+| `SPA-45` | MUST | chrome | `subscription_pause_and_resume_in_real_chrome_persist_each_state` | |
+| `SPA-46` | MUST | chrome | `subscription_dead_letters_name_their_codes_in_real_chrome` | |
+| `SPA-47` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | sprints index, board sprints and sprint detail; `no_route_overflows_sideways_at_three_widths_in_real_chrome` loads `/deployments` and `/deployment/{project}/{id}` with a seeded release |
+| `SPA-48` | MUST | chrome | `a_cli_change_reaches_real_chrome_as_a_notice_without_a_reload` | |
+| `SPA-49` | MUST | chrome | `a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change` | the summary rule; the no-body/no-token half has no browser test today and is written by `t-88814b7a` with SPA-09 |
+| `SPA-50` | MUST | http | `none` | no e2e coverage — to be written by `t-bf255880`; the comparison is against ADR-048 §3's 1.32 MB baseline, which is an observation and not a budget |
+| `SPA-51` | MUST | chrome | `none` | no e2e coverage — to be written by `t-1f495a7f`; `the_open_page_without_a_script_is_still_a_list_in_real_chrome_or_http` asserts WEB-56 and retires with it, as `every_deck_rule_is_scoped_to_a_page_whose_script_ran` does for WEB-58 |
+| `SPA-52` | MUST | chrome | `nothing_is_boxed_in_real_chrome` | `the_recommendation_leads_on_fill_in_real_chrome`, `the_advance_runs_once_at_140ms_each_way_in_real_chrome`, `a_projection_refresh_never_reanimates_the_current_card_in_real_chrome` and `reduced_motion_advances_the_deck_without_animating_in_real_chrome` hold the fills and the one motion |
+| `SPA-53` | MUST | chrome | `the_question_is_set_as_a_headline_in_real_chrome` | |
+| `SPA-54` | MUST | chrome | `focus_is_visible_on_every_focusable_element_in_real_chrome` | `every_deck_control_is_forty_four_pixels_at_390_in_real_chrome` holds the 44 px floor |
+| `SPA-55` | MUST | chrome | `the_card_is_named_by_its_question_in_real_chrome` | `every_field_is_labelled_and_status_is_announced_once_unit` holds the labelling over served bytes today |
+| `SPA-56` | MUST | unit | `none` | no e2e coverage — to be written by `t-992e40aa`, as the four shipped contrast and token proofs re-run over the bundle's CSS instead of the `CSS` const: `every_token_pair_clears_four_and_a_half_to_one_unit` (`rust/serve.rs:6685`), `overlay_never_sits_on_surface0_unit` (`:6718`), `the_focus_ring_and_the_filled_answer_clear_three_to_one_unit` (`:6750`) and `the_token_block_is_the_only_place_a_colour_is_written_unit` (`:6430`). The remaining WEB unit proofs — `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit`, `prose_blocks_are_bounded_to_seventy_characters_unit`, `no_border_or_outline_exists_outside_the_allowlist_unit`, `only_two_radii_exist_and_each_has_one_job_unit`, `an_outcome_hue_appears_only_on_an_outcome_unit`, `the_deck_body_fades_at_its_foot_unit`, `rendered_meta_is_a_sentence_with_no_dot_chain_unit`, `the_eyebrow_names_raiser_board_and_age_unit`, `the_note_field_is_labelled_add_a_note_with_no_hint_unit`, `one_quiet_keys_line_carries_no_kbd_badges_unit`, `counts_read_as_sentences_unit`, `a_refusal_is_the_boards_sentence_in_red_unit`, `the_drawer_puts_search_before_every_destination_unit`, `exactly_one_pill_style_exists_unit`, `tables_declare_only_the_row_hairline_unit`, `every_answer_gets_its_own_row_and_the_panel_scrolls_nothing_unit` and `every_field_is_labelled_and_status_is_announced_once_unit` — are the same shape and move with them |
+| `SPA-57` | MUST | unit | `the_document_references_no_third_party_unit` | extended by `t-992e40aa` to sweep the bundle as well as the document |
+
+57 requirements: 57 MUST, no SHOULD and no MAY. By layer, 43 `chrome`, 6
+`http`, 5 `unit` and 3 `process`. A requirement *preserves* a `WEB-nn` when
+its specification `Source` line says so, which excludes SPA-51 — it retires
+two WEB requirements rather than preserving any: on that rule 42 requirements
+preserve at least one `WEB-nn` (SPA-10, SPA-13, SPA-14..SPA-47 and
+SPA-52..SPA-57) and 36 of those also name an existing Chrome test here. The
+six that do not are SPA-10, SPA-13 and SPA-57, proved at `unit`/`http`, and
+the `none` rows SPA-22, SPA-31 and SPA-56. Twelve rows carry no evidence yet
+— SPA-02, SPA-03, SPA-04, SPA-05, SPA-06, SPA-07, SPA-09, SPA-22, SPA-31,
+SPA-50, SPA-51 and SPA-56 — each naming the epic `e-9306a1d9` row that must
+write it. SPA-56 is the `unit` half of the WEB design system, held over the
+bundle's own stylesheet bytes; the `chrome`-layer WEB obligations in the same
+range are preserved with named evidence by SPA-14..SPA-54 and are not
+restated there. SPA-51 supersedes `docs/specs/web-ui.md` WEB-56 and WEB-58 by
+reference.
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
