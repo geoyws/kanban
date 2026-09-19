@@ -710,7 +710,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
                 page("Board not found", "<h1>Board not found</h1>"),
             ));
         };
-        let tasks = store.list_tasks(None, None, None, false)?;
+        let tasks = store.list_tasks(None, None, None, None, false)?;
         let is_draft_epic = tasks
             .iter()
             .any(|task| task.id == *id && task.task_type == "epic" && task.status == "draft");
@@ -2324,7 +2324,7 @@ fn deployment_preview(project: &str, store: &Store, id: &str) -> Result<String> 
 }
 
 fn board_preview(project: &str, store: &Store) -> Result<String> {
-    let tasks = store.list_tasks(None, None, None, false)?;
+    let tasks = store.list_tasks(None, None, None, None, false)?;
     let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
     let open_attention = store.count_open_attention()?;
     Ok(format!(
@@ -2960,7 +2960,7 @@ fn plans(opened: Option<&str>) -> Result<String> {
     }
     let mut found = 0;
     for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None, None, false)?;
+        let tasks = store.list_tasks(None, None, None, None, false)?;
         let drafts = tasks
             .iter()
             .filter(|task| task.status == "draft" && task.task_type == "epic")
@@ -3536,7 +3536,7 @@ fn lanes() -> Result<String> {
 /// One board's rows, grouped by status in workflow order.
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
-    let tasks = store.list_tasks(None, None, None, false)?;
+    let tasks = store.list_tasks(None, None, None, None, false)?;
     let rules = Registry::open()?.applicable_rules(Some(&project.name), None, None, false)?;
     let mut html = format!(
         "<h1>{0}</h1><p><a href=\"/sprints/{1}\" data-board-sprints-link>Sprints for {0}</a></p>",
@@ -3654,28 +3654,8 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
         ));
     }
 
-    // Provenance: where the work actually happened. Captured rather than
-    // asked for, so it is present when there was a repository and absent
-    // when there was not -- never invented.
     if let Some(claim) = store.get_claim(&task.id)? {
-        html.push_str("<h2>Held by</h2><dl>");
-        html.push_str(&row("agent", &escape(&claim.agent_id)));
-        html.push_str(&row("claimed", &stamp(claim.claimed_at)));
-        html.push_str(&row("expires", &stamp(claim.expires_at)));
-        for (label, value) in [
-            ("worktree", claim.worktree.as_deref()),
-            ("kind", claim.worktree_kind.as_deref()),
-            ("branch", claim.branch.as_deref()),
-            ("HEAD", claim.head_sha.as_deref()),
-            ("root HEAD", claim.root_head.as_deref()),
-        ] {
-            if let Some(value) = value {
-                html.push_str(&row(label, &escape(value)));
-            }
-        }
-        html.push_str("</dl>");
-        // Never the lease token: it is a capability, and a read surface that
-        // renders one hands whoever loads the page the ability to write.
+        html.push_str(&held_by(&claim));
     }
 
     let open_attention = task_open_attention(&store, &task.id)?;
@@ -3759,6 +3739,34 @@ fn task_detail(project_name: &str, id: &str) -> Result<String> {
 
 // ------------------------------------------------------------------ rendering
 
+/// The live lease, as the reader needs to see it.
+///
+/// Provenance: where the work actually happened, and now which model is
+/// doing it. Captured rather than asked for, so each line is present when
+/// there was something to capture and absent when there was not — never
+/// invented. Never the lease token: it is a capability, and a read surface
+/// that renders one hands whoever loads the page the ability to write.
+fn held_by(claim: &crate::model::Claim) -> String {
+    let mut html = String::from("<h2>Held by</h2><dl>");
+    html.push_str(&row("agent", &escape(&claim.agent_id)));
+    html.push_str(&row("claimed", &stamp(claim.claimed_at)));
+    html.push_str(&row("expires", &stamp(claim.expires_at)));
+    for (label, value) in [
+        ("model", claim.model.as_deref()),
+        ("worktree", claim.worktree.as_deref()),
+        ("kind", claim.worktree_kind.as_deref()),
+        ("branch", claim.branch.as_deref()),
+        ("HEAD", claim.head_sha.as_deref()),
+        ("root HEAD", claim.root_head.as_deref()),
+    ] {
+        if let Some(value) = value {
+            html.push_str(&row(label, &escape(value)));
+        }
+    }
+    html.push_str("</dl>");
+    html
+}
+
 fn facts(project: &str, task: &Task) -> String {
     let mut html = String::from("<dl class=facts>");
     html.push_str(&row("created", &stamp(task.created_at)));
@@ -3787,6 +3795,20 @@ fn facts(project: &str, task: &Task) -> String {
     }
     if task.driver_only {
         html.push_str(&row("driver only", "yes"));
+    }
+    if !task.allowed_models.is_empty() {
+        // Only when the row is restricted: an empty list is the default every
+        // row carries, and a `allowed models —` line on every page would be
+        // noise that says nothing.
+        html.push_str(&row(
+            "allowed models",
+            &task
+                .allowed_models
+                .iter()
+                .map(|model| escape(model))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
     }
     html.push_str("</dl>");
     html
@@ -5746,6 +5768,73 @@ mod tests {
     const RENDER_CHILD_TEST: &str = "serve::tests::serve_render_fixture_child_process";
     const RENDER_CHILD_MARKER: &str = "serve-render-fixture-child";
 
+    /// A restricted row says so, and the lease says which model holds it.
+    ///
+    /// Both are conditional: an unrestricted row must carry no `allowed
+    /// models` line at all, and a claim taken without `--model` must not
+    /// render an empty `model` row, because a blank fact reads as a fact.
+    #[test]
+    fn task_detail_lists_allowed_models_and_the_holders_model_unit() {
+        let mut task = crate::model::Task {
+            id: "t-model".to_owned(),
+            task_type: "task".to_owned(),
+            parent_id: None,
+            title: "Blender scene".to_owned(),
+            body: None,
+            assignee: None,
+            lane: None,
+            deliverable: None,
+            stale_minutes: None,
+            driver_only: false,
+            status: "todo".to_owned(),
+            priority: 3,
+            priority_level: Some("P1".to_owned()),
+            created_at: 1,
+            updated_at: 2,
+            completed_at: None,
+            archived: false,
+            archived_at: None,
+            metadata: serde_json::json!({}),
+            tags: Vec::new(),
+            allowed_models: Vec::new(),
+        };
+        assert!(
+            !facts("px", &task).contains("allowed models"),
+            "an unrestricted row must carry no allow-list row"
+        );
+        task.allowed_models = vec!["Astra".to_owned(), "Blender-1".to_owned()];
+        assert!(
+            facts("px", &task).contains("<dt>allowed models</dt><dd>Astra, Blender-1</dd>"),
+            "{}",
+            facts("px", &task)
+        );
+
+        let mut claim = crate::model::Claim {
+            task_id: "t-model".to_owned(),
+            agent_id: "driver-2".to_owned(),
+            session_id: None,
+            lease_token: "secret-token".to_owned(),
+            claimed_at: 1,
+            heartbeat_at: 1,
+            expires_at: 2,
+            worktree: None,
+            worktree_kind: None,
+            branch: None,
+            head_sha: None,
+            root_head: None,
+            model: None,
+        };
+        let without = held_by(&claim);
+        assert!(!without.contains("<dt>model</dt>"), "{without}");
+        claim.model = Some("Astra".to_owned());
+        let with = held_by(&claim);
+        assert!(with.contains("<dt>model</dt><dd>Astra</dd>"), "{with}");
+        assert!(
+            !with.contains("secret-token"),
+            "the lease token must never reach the page: {with}"
+        );
+    }
+
     struct RenderFixture {
         epic_id: String,
         story_id: String,
@@ -5831,6 +5920,7 @@ mod tests {
                 metadata: serde_json::json!({"workflowStatus": "planning"}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["ops".to_owned()],
+                allowed_models: vec![],
             })
             .expect("add epic");
         let story = store
@@ -5851,6 +5941,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["release".to_owned()],
+                allowed_models: vec![],
             })
             .expect("add story");
         let task = store
@@ -5871,6 +5962,7 @@ mod tests {
                 metadata: serde_json::json!({"focus": "render"}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["ops".to_owned(), "release".to_owned()],
+                allowed_models: vec![],
             })
             .expect("add task");
         let done = store
@@ -5891,6 +5983,7 @@ mod tests {
                 metadata: serde_json::json!({"done": true}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["release".to_owned()],
+                allowed_models: vec![],
             })
             .expect("add done task");
         // The two edges are attached after the rows exist rather than declared
@@ -6107,6 +6200,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 actor: Some("geoyws".to_owned()),
                 tags: vec!["release".to_owned()],
+                allowed_models: vec![],
             })
             .expect("add opaque sprint task");
         let current_sprint = store
@@ -10358,6 +10452,7 @@ mod tests {
                     metadata: serde_json::json!({}),
                     actor: Some("seed".to_owned()),
                     tags: vec![tag.to_owned()],
+                    allowed_models: vec![],
                 })
                 .expect("add tagged sprint task")
                 .id

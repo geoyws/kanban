@@ -1990,6 +1990,51 @@ const BOARD_V29: &str = r#"
 ALTER TABLE tags ADD COLUMN renamed_from TEXT;
 ALTER TABLE tags ADD COLUMN renamed_at INTEGER;
 "#;
+
+/// Which models may claim a task, and which model a claim runs as.
+///
+/// A table rather than a JSON column on `tasks`: the allow-list is a set that
+/// is read back sorted, filtered on (`task list --allowed-model`) and joined
+/// per listing, and `task_tags` already establishes that shape for the one
+/// other set a task carries. `idx_task_models_model` is what makes the filter
+/// an index seek rather than a scan of every row's list.
+///
+/// `task_claims.model` is nullable and stays NULL for every claim taken before
+/// this migration and for every claim that declares no model: a claim without
+/// one is legal on an unrestricted task, so absent is a value here rather than
+/// a gap to backfill.
+///
+/// Re-run safe, for the reason `BOARD_V24` and `BOARD_V25` give: the ladder's
+/// LAST step must survive being run against a board whose `user_version` was
+/// lowered without its schema being reverted, and `ALTER TABLE ADD COLUMN`
+/// answers that with `duplicate column name`. So the table is `IF NOT EXISTS`
+/// and the column arrives by rebuild, naming every copied column, exactly as
+/// `BOARD_V24` does: a re-run against a `task_claims` that already carries
+/// `model` copies the original twelve and leaves the new one NULL instead of
+/// failing. No view or trigger reads `task_claims`, so the rebuild is the
+/// table and its one index and nothing else.
+const BOARD_V30: &str = r#"
+CREATE TABLE IF NOT EXISTS task_models (
+ task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ model TEXT NOT NULL,
+ PRIMARY KEY(task_id,model)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_task_models_model ON task_models(model);
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE task_claims RENAME TO task_claims_old;
+CREATE TABLE task_claims (
+ task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL,session_id TEXT,lease_token TEXT NOT NULL UNIQUE,
+ claimed_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,
+ worktree TEXT,worktree_kind TEXT,branch TEXT,head_sha TEXT,root_head TEXT,
+ model TEXT
+) STRICT;
+INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head)
+ SELECT task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head FROM task_claims_old;
+DROP TABLE task_claims_old;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_task_claims_expiry ON task_claims(expires_at);
+"#;
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -2291,7 +2336,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 29;
+pub const BOARD_SCHEMA_VERSION: usize = 30;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2751,7 +2796,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
-    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29,
+    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still

@@ -1210,6 +1210,7 @@ mod tests {
                     metadata: Value::Null,
                     actor: Some("geoyws".to_owned()),
                     tags: vec![],
+                    allowed_models: vec![],
                 })
                 .expect("write through the direct path");
         }

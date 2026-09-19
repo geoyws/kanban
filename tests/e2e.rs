@@ -1728,6 +1728,22 @@ fn serve_readiness_banner_matches_exact_output() {
     ));
 }
 
+/// Restore the pre-restriction shape before any older fixture is built.
+///
+/// First in the chain for the same reason [`remove_v29_tag_rename_schema`]
+/// used to be: every "behind" board here is a CURRENT board stripped
+/// downward, so the newest migration is undone first or the ladder meets its
+/// own output. `task_claims.model` drops as a column because nothing but the
+/// claim readers name it, and `task_models` drops outright.
+fn remove_v30_model_restriction_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TABLE task_models; \
+             ALTER TABLE task_claims DROP COLUMN model;",
+        )
+        .unwrap();
+}
+
 /// Restore the pre-rename `tags` shape before any older fixture is built.
 ///
 /// Every "behind" board here is a CURRENT board stripped downward, so the
@@ -1735,6 +1751,7 @@ fn serve_readiness_banner_matches_exact_output() {
 /// `ALTER TABLE tags ADD COLUMN` meets a column that is already there. No view
 /// or trigger reads these two, so dropping them is the whole of it.
 fn remove_v29_tag_rename_schema(connection: &Connection) {
+    remove_v30_model_restriction_schema(connection);
     connection
         .execute_batch(
             "ALTER TABLE tags DROP COLUMN renamed_from; \
@@ -2403,9 +2420,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 29);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 29);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 29);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 30);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 30);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 30);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -3594,7 +3611,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        29
+        30
     );
     assert_eq!(
         reopened
@@ -7647,7 +7664,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let lines: Vec<&str> = version.lines().collect();
     assert!(lines[0].contains("kanban"), "version output: {version}");
     assert!(
-        lines[0].contains("board schema 29"),
+        lines[0].contains("board schema 30"),
         "version output: {version}"
     );
     assert!(
@@ -18211,7 +18228,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        29
+        30
     );
 }
 
@@ -19338,7 +19355,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        29
+        30
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -21981,7 +21998,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        29
+        30
     );
     assert_eq!(
         connection
@@ -24554,7 +24571,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 30_i64)
+        .pragma_update(None, "user_version", 31_i64)
         .unwrap();
     drop(newer_connection);
 
@@ -51518,5 +51535,856 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     assert!(
         measured_pills >= 5,
         "the acceptance measured only {measured_pills} pills"
+    );
+}
+
+// -------------------------------------------------- model-restricted tasks
+
+/// The refusal a restricted task gives, and the claim that gets through.
+///
+/// George's ask, in his words: "only a subset of models, or one model, can
+/// claim this task. Blender must only be used by Astra." What makes that
+/// scheduling rather than documentation is that the refusal happens on the
+/// claim path, beside `driver_only` and `assignee` — so this also pins where
+/// in the order it sits: a driver-only restricted row refuses driver-only
+/// first, and an assigned restricted row refuses the model first.
+#[test]
+fn model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list() {
+    let fixture = Fixture::new("model-claim");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MODEL", "--json"]);
+    // Duplicates collapse and the set reads back sorted, so the wire shape
+    // cannot depend on the order the flags arrived in.
+    let added = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "render the scene",
+            "--id",
+            "t-blender",
+            "--allowed-model",
+            "Blender",
+            "--allowed-model",
+            "Astra",
+            "--allowed-model",
+            "Blender",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(added["allowedModels"], json!(["Astra", "Blender"]));
+
+    let no_model = fixture.run(
+        &fixture.main,
+        &["claim", "t-blender", "--as", "d1", "--json"],
+    );
+    assert_eq!(
+        refusal_object(&no_model),
+        "task t-blender is restricted to models [Astra, Blender]; \
+         pass --model with one of them to claim it"
+    );
+    let wrong = fixture.run(
+        &fixture.main,
+        &[
+            "claim",
+            "t-blender",
+            "--as",
+            "d1",
+            "--model",
+            "Kimi",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&wrong),
+        "task t-blender is restricted to models [Astra, Blender]; model Kimi may not claim it"
+    );
+    // Case is not folded: there is no master file to fold toward.
+    let cased = fixture.run(
+        &fixture.main,
+        &[
+            "claim",
+            "t-blender",
+            "--as",
+            "d1",
+            "--model",
+            "astra",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&cased),
+        "task t-blender is restricted to models [Astra, Blender]; model astra may not claim it"
+    );
+    let malformed = fixture.run(
+        &fixture.main,
+        &[
+            "claim",
+            "t-blender",
+            "--as",
+            "d1",
+            "--model",
+            "bad name",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&malformed),
+        "model name bad name is not a usable name: \
+         it must match ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$"
+    );
+
+    let claimed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim",
+            "t-blender",
+            "--as",
+            "d1",
+            "--model",
+            "Astra",
+            "--json",
+        ],
+    );
+    assert_eq!(claimed["model"], "Astra");
+    let shown = fixture.ok_json(&fixture.main, &["task", "show", "t-blender", "--json"]);
+    assert_eq!(shown["claim"]["model"], "Astra");
+    assert_eq!(shown["allowedModels"], json!(["Astra", "Blender"]));
+
+    // The declared model rides on the ledger only when it was declared.
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "t-blender", "--json"]);
+    let claimed_payload = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "task_claimed")
+        .expect("a task_claimed event")["payload"]
+        .clone();
+    assert_eq!(claimed_payload["model"], "Astra");
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "open work",
+            "--id",
+            "t-open",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(&fixture.main, &["claim", "t-open", "--as", "d2", "--json"]);
+    let open_events = fixture.ok_json(&fixture.main, &["events", "--task", "t-open", "--json"]);
+    let open_payload = open_events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "task_claimed")
+        .expect("a task_claimed event")["payload"]
+        .clone();
+    assert!(
+        open_payload.get("model").is_none(),
+        "an unrestricted claim that declared no model carried one anyway: {open_payload}"
+    );
+
+    // Order: driver-only is refused BEFORE the model, and the model BEFORE
+    // the assignee. Either pair would otherwise silently swap when the
+    // refusals moved.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "driver work",
+            "--id",
+            "t-dr",
+            "--driver-only",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let driver_first = fixture.run(&fixture.main, &["claim", "t-dr", "--as", "d3", "--json"]);
+    assert_eq!(refusal_object(&driver_first), "task t-dr is driver-only");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "assigned work",
+            "--id",
+            "t-as",
+            "--assignee",
+            "someone-else",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let model_before_assignee =
+        fixture.run(&fixture.main, &["claim", "t-as", "--as", "d3", "--json"]);
+    assert_eq!(
+        refusal_object(&model_before_assignee),
+        "task t-as is restricted to models [Astra]; pass --model with one of them to claim it"
+    );
+}
+
+/// The scheduler must not offer work the claim path would refuse.
+///
+/// `--candidates` inspects the same pool `--next` hands out, so a restricted
+/// row that is invisible to one must be invisible to the other, and an
+/// unrestricted row must be unaffected by `--model` either way.
+#[test]
+fn claim_next_and_candidates_skip_restricted_rows_unless_the_model_matches() {
+    let fixture = Fixture::new("model-candidates");
+    fixture.ok_json(&fixture.main, &["init", "--name", "POOL", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "blender work",
+            "--id",
+            "t-restricted",
+            "--priority",
+            "0",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "anyone work",
+            "--id",
+            "t-free",
+            "--priority",
+            "1",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        fixture
+            .ok_json(&fixture.main, args)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["claim", "--candidates", "--as", "d1", "--json"]),
+        vec!["t-free".to_owned()],
+        "a restricted row was offered to a caller that named no model"
+    );
+    assert_eq!(
+        ids(&[
+            "claim",
+            "--candidates",
+            "--as",
+            "d1",
+            "--model",
+            "Kimi",
+            "--json"
+        ]),
+        vec!["t-free".to_owned()],
+        "a restricted row was offered to a model outside its list"
+    );
+    assert_eq!(
+        ids(&[
+            "claim",
+            "--candidates",
+            "--as",
+            "d1",
+            "--model",
+            "Astra",
+            "--json"
+        ]),
+        vec!["t-restricted".to_owned(), "t-free".to_owned()],
+        "the matching model was not offered the restricted row, or lost the free one"
+    );
+
+    // `--next` hands out what `--candidates` showed: the free row for a
+    // caller with no model, and the higher-priority restricted row for Astra.
+    let without = fixture.ok_json(&fixture.main, &["claim", "--next", "--as", "d1", "--json"]);
+    assert_eq!(without["taskID"], "t-free");
+    assert!(without["model"].is_null());
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "release",
+            "t-free",
+            "--lease",
+            without["leaseToken"].as_str().unwrap(),
+        ],
+    );
+    let with = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim", "--next", "--as", "d1", "--model", "Astra", "--json",
+        ],
+    );
+    assert_eq!(with["taskID"], "t-restricted");
+    assert_eq!(with["model"], "Astra");
+}
+
+/// Accepting a handoff mints a lease, so it answers to the same rule.
+#[test]
+fn handoff_accept_honours_the_task_model_allow_list() {
+    let fixture = Fixture::new("model-handoff");
+    fixture.ok_json(&fixture.main, &["init", "--name", "HANDOFF", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "blender work",
+            "--id",
+            "t-h",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &[
+            "claim", "t-h", "--as", "outgoing", "--model", "Astra", "--json",
+        ],
+    );
+    let token = claim["leaseToken"].as_str().unwrap().to_owned();
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-h",
+            "--lease",
+            &token,
+            "--as",
+            "outgoing",
+            "--summary",
+            "half rendered",
+            "--intent",
+            "finish the render",
+            "--next-action",
+            "render frames 40-90",
+            "--reason",
+            "session_end",
+            "--json",
+        ],
+    );
+    let handoff_id = handoff["id"].as_str().unwrap().to_owned();
+
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &handoff_id,
+            "--as",
+            "incoming",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&refused),
+        "task t-h is restricted to models [Astra]; pass --model with one of them to claim it"
+    );
+    let wrong = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &handoff_id,
+            "--as",
+            "incoming",
+            "--model",
+            "Kimi",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&wrong),
+        "task t-h is restricted to models [Astra]; model Kimi may not claim it"
+    );
+
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &handoff_id,
+            "--as",
+            "incoming",
+            "--model",
+            "Astra",
+            "--json",
+        ],
+    );
+    assert_eq!(accepted["claim"]["model"], "Astra");
+    let events = fixture.ok_json(&fixture.main, &["events", "--task", "t-h", "--json"]);
+    let payload = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "handoff_accepted")
+        .expect("a handoff_accepted event")["payload"]
+        .clone();
+    assert_eq!(payload["model"], "Astra");
+}
+
+/// The allow-list is replaced wholesale or emptied, never merged.
+#[test]
+fn task_update_replaces_or_clears_the_allow_list_and_refuses_both_flags() {
+    let fixture = Fixture::new("model-update");
+    fixture.ok_json(&fixture.main, &["init", "--name", "UPDATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "scene",
+            "--id",
+            "t-u",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "other", "--id", "t-other", "--as", "geoyws", "--json",
+        ],
+    );
+
+    let both = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-u",
+            "--allowed-model",
+            "Kimi",
+            "--clear-allowed-models",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&both),
+        "--allowed-model and --clear-allowed-models are mutually exclusive"
+    );
+    let malformed = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-u",
+            "--allowed-model",
+            "-leading",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&malformed),
+        "model name -leading is not a usable name: \
+         it must match ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$"
+    );
+    // The refused update left the row exactly as it was.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-u", "--json"])["allowedModels"],
+        json!(["Astra"])
+    );
+
+    let replaced = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-u",
+            "--allowed-model",
+            "zeta",
+            "--allowed-model",
+            "Kimi",
+            "--allowed-model",
+            "zeta",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        replaced["allowedModels"],
+        json!(["Kimi", "zeta"]),
+        "the update merged instead of replacing, or lost the sort"
+    );
+
+    // Server-side filter: only rows whose list holds the name come back.
+    let filtered = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--allowed-model", "Kimi", "--json"],
+    );
+    assert_eq!(
+        filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["t-u"]
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["task", "list", "--allowed-model", "Astra", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the replaced model still filters to the row"
+    );
+
+    let cleared = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-u",
+            "--clear-allowed-models",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(cleared["allowedModels"], json!([]));
+    // And an unrestricted row is claimable by anyone again.
+    fixture.ok_json(&fixture.main, &["claim", "t-u", "--as", "anyone", "--json"]);
+
+    let changed = fixture
+        .ok_json(&fixture.main, &["events", "--task", "t-u", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "task_updated")
+        .map(|event| event["payload"]["changed"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changed,
+        vec![json!(["allowedModels"]), json!(["allowedModels"])],
+        "task_updated did not name the field that moved"
+    );
+
+    // A no-op replace says nothing moved.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-other",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "update",
+            "t-other",
+            "--allowed-model",
+            "Astra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let other_changed = fixture
+        .ok_json(&fixture.main, &["events", "--task", "t-other", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "task_updated")
+        .map(|event| event["payload"]["changed"].clone())
+        .collect::<Vec<_>>();
+    // Newest first, as `events` lists: the second update moved nothing.
+    assert_eq!(other_changed, vec![json!([]), json!(["allowedModels"])]);
+}
+
+/// A board written before the feature opens, migrates, and reads as
+/// unrestricted — with its existing claim's model absent rather than invented.
+#[test]
+fn a_v29_board_gains_task_models_and_claim_model_and_existing_claims_read_null() {
+    let fixture = Fixture::new("model-migration");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OLD", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "older work",
+            "--id",
+            "t-old",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    fixture.ok_json(&fixture.main, &["claim", "t-old", "--as", "d1", "--json"]);
+    let board = board_path_for_project(&fixture, &fixture.main, "OLD");
+
+    {
+        let connection = Connection::open(&board).unwrap();
+        remove_v30_model_restriction_schema(&connection);
+        connection.execute_batch("PRAGMA user_version=29;").unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='task_models'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "the fixture did not actually reach v29"
+        );
+    }
+
+    let shown = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "show",
+            "t-old",
+            "--db",
+            board.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(shown["allowedModels"], json!([]));
+    assert!(
+        shown["claim"]["model"].is_null(),
+        "a pre-migration claim invented a model: {}",
+        shown["claim"]
+    );
+
+    let connection = Connection::open(&board).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        30
+    );
+    // The table, its index, and the column are all there.
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM task_models", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' \
+                 AND name='idx_task_models_model'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    // The rebuilt claims table kept the row it copied, its lease included.
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM task_claims WHERE task_id='t-old' AND model IS NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' \
+                 AND name='idx_task_claims_expiry'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    // And the migrated board restricts exactly as a fresh one does.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "new work",
+            "--id",
+            "t-new",
+            "--allowed-model",
+            "Astra",
+            "--db",
+            board.to_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "claim",
+            "t-new",
+            "--as",
+            "d2",
+            "--db",
+            board.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&refused),
+        "task t-new is restricted to models [Astra]; pass --model with one of them to claim it"
+    );
+}
+
+/// The MCP tool schemas follow the surface table, so a client reads the
+/// allow-list as an array and the claim's model as a string (ADR-010).
+#[test]
+fn mcp_schema_exposes_allowed_model_array_and_claim_model_string() {
+    let fixture = Fixture::new("model-mcp");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MCPMODEL", "--json"]);
+
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let kind = |operation: &str, flag: &str| -> String {
+        schema["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == operation)
+            .unwrap_or_else(|| panic!("no operation named {operation}"))["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == flag)
+            .unwrap_or_else(|| panic!("{operation} does not accept --{flag}"))["kind"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(kind("task add", "allowed-model"), "list");
+    assert_eq!(kind("task update", "allowed-model"), "list");
+    assert_eq!(kind("task update", "clear-allowed-models"), "boolean");
+    // Scalar where one name is asked about or declared.
+    assert_eq!(kind("task list", "allowed-model"), "value");
+    assert_eq!(kind("claim", "model"), "value");
+    assert_eq!(kind("handoff accept", "model"), "value");
+
+    let mut session = Session::start(
+        Path::new(env!("CARGO_BIN_EXE_kanban")),
+        &fixture.main,
+        &fixture.data,
+    );
+    let _ = session.ask(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    let listed = session.ask(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let tool = |name: &str| -> Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no tool named {name}: {listed}"))
+            .clone()
+    };
+    let add = tool("task_add");
+    assert_eq!(
+        add["inputSchema"]["properties"]["allowed-model"]["type"],
+        "array"
+    );
+    assert_eq!(
+        add["inputSchema"]["properties"]["allowed-model"]["items"]["type"],
+        "string"
+    );
+    let update = tool("task_update");
+    assert_eq!(
+        update["inputSchema"]["properties"]["allowed-model"]["type"],
+        "array"
+    );
+    assert_eq!(
+        update["inputSchema"]["properties"]["clear-allowed-models"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        tool("task_list")["inputSchema"]["properties"]["allowed-model"]["type"],
+        "string"
+    );
+    assert_eq!(
+        tool("claim")["inputSchema"]["properties"]["model"]["type"],
+        "string"
+    );
+    assert_eq!(
+        tool("handoff_accept")["inputSchema"]["properties"]["model"]["type"],
+        "string"
+    );
+
+    // And the tool actually restricts through the MCP path, not only the CLI.
+    let called = session.ask(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "task_add", "arguments": {
+            "title": "mcp scene", "id": "t-mcp", "as": "geoyws",
+            "allowed-model": ["Astra", "Blender"]
+        }}
+    }));
+    assert_eq!(
+        called["result"]["isError"],
+        json!(false),
+        "task_add through MCP failed: {called}"
+    );
+    let refused = session.ask(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "claim", "arguments": { "id": "t-mcp", "as": "d1" }}
+    }));
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(
+            "task t-mcp is restricted to models [Astra, Blender]; \
+             pass --model with one of them to claim it"
+        ),
+        "{refused}"
     );
 }

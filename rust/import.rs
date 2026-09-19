@@ -148,6 +148,7 @@ struct Input {
     completed_at: Option<i64>,
     metadata: Value,
     dependencies: Vec<String>,
+    allowed_models: Vec<String>,
     note: Option<String>,
 }
 
@@ -195,6 +196,22 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The model allow-list an imported row declares, sorted, under either
+/// spelling the rest of this file already accepts for a two-word key.
+///
+/// Absent means unrestricted, which is what every atmux export written before
+/// the feature says. Names are not validated here: the write below refuses a
+/// bad one by name, and refusing during parse would name no row.
+fn imported_allowed_models(row: &Map<String, Value>) -> Vec<String> {
+    let mut models = string_array(
+        row.get("allowedModels")
+            .or_else(|| row.get("allowed_models")),
+    );
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn status(value: Option<String>, workflow: bool) -> Result<String> {
@@ -258,6 +275,7 @@ fn epic(row: Map<String, Value>, imported_at: i64, source: &str) -> Result<Input
         completed_at: completed,
         metadata: json!({"importedFrom":source,"workflowStatus":workflow,"driverRef":row.get("driverRef").or_else(||row.get("driver_ref")).cloned().unwrap_or(Value::Null),"isReady":boolean(&row,"isReady")||boolean(&row,"is_ready"),"spawnedAt":row.get("spawnedAt").or_else(||row.get("spawned_at")).cloned().unwrap_or(Value::Null),"legacyStories":parse_json(row.get("stories"),json!([])),"atmuxExtra":parse_json(row.get("extra"),Value::Object(row.clone()))}),
         dependencies,
+        allowed_models: imported_allowed_models(&row),
         note: None,
     })
 }
@@ -294,6 +312,7 @@ fn story(row: Map<String, Value>, imported_at: i64, source: &str) -> Result<Inpu
         completed_at: completed,
         metadata: json!({"importedFrom":source,"workflowStatus":workflow,"acceptanceCriteria":row.get("acceptanceCriteria").or_else(||row.get("acceptance_criteria")).cloned().unwrap_or(Value::Null),"reviewSignoff":boolean(&row,"reviewSignoff")||boolean(&row,"review_signoff"),"mergeTaskID":row.get("mergeTaskId").or_else(||row.get("merge_task_id")).cloned().unwrap_or(Value::Null),"mergeMode":text(&row,"mergeMode").or_else(||text(&row,"merge_mode")).unwrap_or_else(||"feature-branch".into()),"advancedAt":advanced,"atmuxExtra":parse_json(row.get("extra"),Value::Object(row.clone()))}),
         dependencies: vec![],
+        allowed_models: imported_allowed_models(&row),
         note: None,
     })
 }
@@ -332,6 +351,7 @@ fn task(row: Map<String, Value>, imported_at: i64, source: &str) -> Result<Input
         completed_at: completed,
         metadata,
         dependencies,
+        allowed_models: imported_allowed_models(&row),
         note: text(&row, "note"),
     })
 }
@@ -537,6 +557,10 @@ fn normalize_and_insert(
                 params![input.id, dependency],
             )?;
         }
+        // Replaced wholesale, like the row itself: re-importing a source that
+        // dropped a model must not leave the board restricted to it. The
+        // helper validates every name before its first INSERT.
+        crate::store::set_allowed_models(&transaction, &input.id, &input.allowed_models)?;
     }
     crate::store::event_at(
         &transaction,
@@ -594,7 +618,7 @@ fn verify(
     source: String,
     counts: ImportCounts,
 ) -> Result<ParityReceipt> {
-    const FIELDS: [&str; 15] = [
+    const FIELDS: [&str; 16] = [
         "type",
         "parentID",
         "title",
@@ -609,6 +633,7 @@ fn verify(
         "createdAt",
         "completedAt",
         "dependencies",
+        "allowedModels",
         "atmuxExtra",
     ];
     let mut missing = Vec::new();
@@ -664,6 +689,13 @@ fn verify(
             "completedAt",
             json!(input.completed_at),
             json!(board.completed_at),
+        );
+        // Both sides are sorted sets by construction, so this is an equality
+        // of lists and not an order comparison dressed up as one.
+        check(
+            "allowedModels",
+            json!(input.allowed_models),
+            json!(board.allowed_models),
         );
 
         // Dependencies the source declares but the board dropped. A dangling

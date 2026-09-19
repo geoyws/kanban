@@ -76,8 +76,9 @@ kanban claim --candidates --project my-project --as atmux@_superbot \
 The result is priority ordered and contains task fields, including tags, lane,
 assignee and `driverOnly`, but never a lease token. It excludes containers,
 work behind an unmet completion gate, work under draft plans, active leases,
-incompatible assignees and driver-only work unless `--caller-scope driver` is
-supplied. Inspection is read-only: it does not migrate or touch registry
+incompatible assignees, driver-only work unless `--caller-scope driver` is
+supplied, and model-restricted work unless `--model` names an allowed model.
+Inspection is read-only: it does not migrate or touch registry
 recency, expire leases, update task state, append events, or cache a result. A
 returned row is still only a candidate; take it with atomic `claim ID` or
 `claim --next`.
