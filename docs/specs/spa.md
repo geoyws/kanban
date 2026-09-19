@@ -322,16 +322,19 @@ field. Further typing after the refusal does not clear the refusal or the draft.
 *Data rules:* the board row is untouched — `status` stays `open`, `decision` stays absent.
 
 **SPA-22** — a refusal names the card that changed underneath.
-Strength: MUST · Layer: chrome · Source: preserves `WEB-29`; `rust/store.rs:6094`-`rust/store.rs:6098`,
-`rust/model.rs:1292`-`rust/model.rs:1298`.
+Strength: MUST · Layer: chrome · Source: preserves `WEB-29`; `rust/store.rs:6403`-`rust/store.rs:6408`,
+`rust/model.rs:1377`-`rust/model.rs:1386`.
 When the item was resolved or its authored choices were rewritten between the card being rendered
 and the answer being sent, the write is refused by the store and the operator reads the store's
 own sentence — `attention {id} was already resolved by {who} — it is history, not a queue entry`,
 or `attention {id} has no choice {key}; its choices are {keys}` — through the SPA-21 channel, not
 a client-invented message and not a silent re-render. The refreshed card then shows the choices
 that now exist, and answering one of those records normally.
-*Note:* no test observes this today — both shipped refusal cases stub a `409` at `window.fetch`
-rather than letting the board refuse. §8 records it as `none`.
+*Note:* landed 2026-09-19 with `t-e978824a`. `a_card_another_lane_resolved_is_refused_by_the_board_in_real_chrome`
+and `a_stale_choice_is_refused_by_name_and_the_rewritten_keys_record_in_real_chrome` let the
+BOARD refuse — nothing is stubbed at `window.fetch` — and read the store's sentence off
+`[data-refusal=board]`. The two shipped refusal cases keep the stubbed `409`, which is how the
+client's handling of a refusal is measured without a board that has to be made to refuse.
 
 **SPA-23** — a digit outside the answers records nothing.
 Strength: MUST · Layer: chrome · Source: preserves `WEB-27`.
@@ -388,8 +391,12 @@ Strength: MUST · Layer: chrome · Source: preserves `WEB-27`.
 The deck renders exactly one keyboard hint line naming the answer digits, skip, undo and the
 own-words fold, in the quiet register; each answer button carries its own digit; and no separate
 key-badge cluster competes with the answers.
-*Note:* the shipped evidence for the rendered line is a `unit` test over served bytes, which the
-SPA retires with the server-rendered markup. §8 records the browser row as `none`.
+*Note:* landed 2026-09-19 with `t-e978824a`.
+`one_quiet_keys_line_names_the_digits_on_the_answers_in_real_chrome` reads the rule off the
+MOUNTED deck: one `[data-testid=deck-keys]` line outside every card, each key named beside what
+it does, the overlay token and the mono stack below the page's own text size, one
+`[data-testid=deck-digit]` node per answer button carrying that button's digit, and no `kbd`
+anywhere in the document. The `unit` test over served bytes retires with the markup it reads.
 
 **SPA-32** — a toast is readable and dismissible.
 Strength: MUST · Layer: chrome · Source: preserves `WEB-19`.
@@ -924,19 +931,19 @@ row that must write one.
 | `SPA-18` | MUST | chrome | `a_click_shows_sending_until_the_board_answers_in_real_chrome` | the guard is the card's own state — `data-state=sending` with `aria-busy`, exactly one control marked `data-pressed`, nothing disabled (WEB-17) — rather than a flag on the form. The journey runs against the MOUNTED deck since `t-1f495a7f`: `/` answers the application shell and the bundle renders the queue, so this row is the SPA's evidence and not the server-rendered surface's. |
 | `SPA-19` | MUST | chrome | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | `a_click_on_an_incomplete_custom_answer_says_what_is_missing_and_focuses_it` holds the focus move |
 | `SPA-20` | MUST | chrome | `a_custom_answer_in_real_chrome_requires_an_outcome_and_records_one` | `enter_in_the_verdict_picker_records_the_free_text_answer_in_real_chrome` holds the keyboard commit |
-| `SPA-21` | MUST | chrome | `a_refused_click_restores_the_card_in_real_chrome` | `a_refused_decision_brings_the_card_back_in_real_chrome` and `a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome` hold the queue position and the surviving draft |
-| `SPA-22` | MUST | chrome | `none` | no e2e coverage — to be written by `t-e978824a`; both shipped refusal cases stub a `409` at `window.fetch`, so no test lets the board refuse by name |
+| `SPA-21` | MUST | chrome | `a_refused_click_restores_the_card_in_real_chrome` | `a_refused_decision_brings_the_card_back_in_real_chrome` and `a_board_refusal_survives_more_typing_in_the_reply_in_real_chrome` hold the queue position and the surviving draft; the two SPA-22 cases hold the same channel with a REAL board refusal rather than a stubbed one |
+| `SPA-22` | MUST | chrome | `a_card_another_lane_resolved_is_refused_by_the_board_in_real_chrome` | landed 2026-09-19 with `t-e978824a`, and the first refusal case in this file that is not a stubbed `409`: A6 runs `attention resolve` through the binary as the raiser while the card is on screen — the typed note is what holds the arriving projection (`answerInProgress`), which is the only way a rendered card can outlive the row it names — then clicks an answer and asserts `rust/store.rs`'s sentence verbatim on `[data-refusal=board]`, the card current at slot 0 with every control enabled, the count still `3`, no receipt, and `hold it` still in the note. `a_stale_choice_is_refused_by_name_and_the_rewritten_keys_record_in_real_chrome` is A7: the choices are rewritten through `attention update`, the stale key is refused by `rust/model.rs`'s composer naming it, nothing is recorded, and the held projection then lands so the rewritten keys are on screen and `go` records. `a_reply_naming_a_choice_the_row_no_longer_carries_is_refused_by_name_over_http` holds the same rule across the process boundary with no browser |
 | `SPA-23` | MUST | chrome | `a_digit_in_the_verdict_picker_records_nothing_in_real_chrome` | `a_digit_after_tabbing_off_a_picked_verdict_records_nothing_in_real_chrome` and `a_digit_on_the_folded_answers_summary_records_nothing_in_real_chrome` hold the other two focus states |
 | `SPA-24` | MUST | chrome | `a_picked_verdict_survives_a_live_refresh_and_still_records_in_real_chrome` | the same case presses `Escape` inside the card and asserts the verdict was released |
-| `SPA-25` | MUST | chrome | `a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change` | `a_reconnected_notice_socket_in_real_chrome_does_not_replay_history` and `a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome` hold reconnect and redelivery |
+| `SPA-25` | MUST | chrome | `a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change` | `a_reconnected_notice_socket_in_real_chrome_does_not_replay_history` and `a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome` hold reconnect and redelivery; `a_redelivered_notice_does_not_act_or_render_twice_on_the_deck_in_real_chrome` holds the same seen-set on the MOUNTED deck, which dedupes in the client rather than in the served script |
 | `SPA-26` | MUST | chrome | `skip_moves_the_card_to_the_back_without_recording_in_real_chrome` | |
 | `SPA-27` | MUST | chrome | `the_undo_key_bring_back_the_last_decision_in_real_chrome` | |
 | `SPA-28` | MUST | chrome | `the_last_card_leaves_the_empty_state_in_real_chrome` | |
 | `SPA-29` | MUST | chrome | `the_deck_answers_stack_and_the_note_is_reached_by_one_scroller_at_three_widths_in_real_chrome` | `the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome` holds the single-scroller rule |
 | `SPA-30` | MUST | chrome | `a_projection_swap_keeps_the_reader_where_they_were_in_the_card_in_real_chrome` | the case marks the card's node before the swap and asserts the same node afterwards: the mounted deck reconciles the card the reader is in, which is why the two scroll positions survive. The journey runs against the MOUNTED deck since `t-1f495a7f`: `/` answers the application shell and the bundle renders the queue, so this row is the SPA's evidence and not the server-rendered surface's. |
-| `SPA-31` | MUST | chrome | `none` | no e2e coverage — to be written by `t-e978824a`; the shipped proof is `one_quiet_keys_line_carries_no_kbd_badges_unit` over served bytes the SPA retires. `needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome` and `the_custom_answer_is_folded_until_c_opens_it_in_real_chrome` observe the keys' behaviour but not the rendered line |
+| `SPA-31` | MUST | chrome | `one_quiet_keys_line_names_the_digits_on_the_answers_in_real_chrome` | landed 2026-09-19 with `t-e978824a`, off the MOUNTED deck: exactly one `[data-testid=deck-keys]` line in the document and none inside a card, naming `1–4 answer`, `s skip`, `u undo` and `c own`; its computed colour is the `--overlay` token, its family the `--mono` stack and its size below the body's; every `[data-testid^=deck-choice-]` button on the current card carries exactly one `[data-testid=deck-digit]` child, reading `1`, `2`, `3` in the order the map promises; and `document.querySelectorAll('kbd')` is empty. `data-testid=deck-digit` was added to `web/src/card.tsx`'s `Answer` for it, because the digit had no name of its own. The retiring proof is `one_quiet_keys_line_carries_no_kbd_badges_unit` over served bytes; `needs_you_cards_take_a_note_a_keyboard_pick_and_a_deferral_in_real_chrome` and `the_custom_answer_is_folded_until_c_opens_it_in_real_chrome` hold the keys' behaviour |
 | `SPA-32` | MUST | chrome | `a_toast_stays_twenty_seconds_and_dismisses_in_real_chrome` | |
-| `SPA-33` | MUST | chrome | `decided_receipts_collect_in_the_side_history_in_real_chrome` | `the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome` holds the phone's history control; the open drawer is flagged on the `<body>` by the mounted deck as it was by the served script, so one flag drives the panel, the backdrop and `Escape`. The journey runs against the MOUNTED deck since `t-1f495a7f`: `/` answers the application shell and the bundle renders the queue, so this row is the SPA's evidence and not the server-rendered surface's. |
+| `SPA-33` | MUST | chrome | `decided_receipts_collect_in_the_side_history_in_real_chrome` | `the_desk_is_two_columns_at_1280_and_a_drawer_at_820_in_real_chrome` holds the phone's history control; `the_receipt_lands_with_its_outcome_rule_in_real_chrome` holds the outcome each collected receipt carries — the one coloured rule in the history, in the verdict's hue; the open drawer is flagged on the `<body>` by the mounted deck as it was by the served script, so one flag drives the panel, the backdrop and `Escape`. The journey runs against the MOUNTED deck since `t-1f495a7f`: `/` answers the application shell and the bundle renders the queue, so this row is the SPA's evidence and not the server-rendered surface's. |
 | `SPA-34` | MUST | chrome | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | the status channel is matched by the role it HAS: the deck's connection line is an `<output>`, whose role is `status` without the attribute, and `/all` writes the attribute on a span — one status region and one log either way. The journey runs against the MOUNTED deck since `t-1f495a7f`: `/` answers the application shell and the bundle renders the queue, so this row is the SPA's evidence and not the server-rendered surface's. |
 | `SPA-35` | MUST | chrome | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | |
 | `SPA-36` | MUST | chrome | `read_tables_are_borderless_but_for_the_hairline_in_real_chrome` | |
@@ -973,17 +980,17 @@ and deployments 5 (`SPA-43`..`SPA-47`), the live channel 2 (`SPA-48`..`SPA-49`),
 **How the WEB figures below are counted.** A requirement *preserves* a `WEB-nn` when its
 `Source` line says so; `SPA-51` is excluded because it retires two WEB requirements rather than
 preserving any. On that rule **42** requirements preserve at least one `WEB-nn` — `SPA-10`,
-`SPA-13`, `SPA-14`..`SPA-47` and `SPA-52`..`SPA-57` — and **36** of those also name, in the
-table above, an existing Chrome test that observes the behaviour today: the six that do not are
-`SPA-10` and `SPA-13` (proved at `unit` and `http`), `SPA-57` (proved at `unit`), `SPA-56`
-(proved at `unit` over the bundle's stylesheet since 2026-09-19), and the two `none` rows
-`SPA-22` and `SPA-31`.
+`SPA-13`, `SPA-14`..`SPA-47` and `SPA-52`..`SPA-57` — and **38** of those also name, in the
+table above, an existing Chrome test that observes the behaviour today: the four that do not are
+`SPA-10` and `SPA-13` (proved at `unit` and `http`), `SPA-57` (proved at `unit`) and `SPA-56`
+(proved at `unit` over the bundle's stylesheet since 2026-09-19). `SPA-22` and `SPA-31` joined
+the 38 on 2026-09-19 with `t-e978824a`.
 
-**Rows with no evidence yet: 4.** `SPA-02`, `SPA-22`, `SPA-31` and `SPA-50`, each
-naming the epic `e-9306a1d9` row that must write it. `SPA-02` is `none` because its remaining
-half is a host inventory rather than a test; `SPA-22` and `SPA-31` are owed by `t-e978824a`,
-which owns the refusal-by-name case and the rendered keys line. `SPA-51` left the list on
-2026-09-19 with `t-1f495a7f`: the case that asserted the scriptless list was REWRITTEN rather
+**Rows with no evidence yet: 2.** `SPA-02` and `SPA-50`, each naming the epic `e-9306a1d9` row
+that must write it. `SPA-02` is `none` because its remaining half is a host inventory rather
+than a test. `SPA-22` and `SPA-31` left the list on 2026-09-19 with `t-e978824a`, which wrote
+the two real-board refusal cases (A6 and A7) and the rendered keys line. `SPA-51` left it the
+same day with `t-1f495a7f`: the case that asserted the scriptless list was REWRITTEN rather
 than deleted, and now asserts that `/` without a script is the shell and carries nothing
 data-bearing. Four rows left the list on
 2026-09-19 with `t-992e40aa`: `SPA-03` (the `bundleSha256` receipt field and the installed
@@ -1018,3 +1025,18 @@ absent from both the detail and the index).
   `the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http`, its
   `#[ignore]` is gone, and `docs/testing/compiled-rust-e2e-matrix.md` carries the same row
   verbatim. Two divergences remain recorded in `docs/api/README.md`.
+- `2026-09-19` — `t-e978824a` closed the last two Needs-you `none` rows against the mounted
+  deck. `SPA-22` names `a_card_another_lane_resolved_is_refused_by_the_board_in_real_chrome`
+  (A6) and `a_stale_choice_is_refused_by_name_and_the_rewritten_keys_record_in_real_chrome`
+  (A7): both let the BOARD refuse through `attention resolve` and `attention update` on the
+  running binary instead of stubbing a `409` at `window.fetch`, and assert the store's and the
+  composer's sentences verbatim on `[data-refusal=board]`. `SPA-31` names
+  `one_quiet_keys_line_names_the_digits_on_the_answers_in_real_chrome`, for which
+  `web/src/card.tsx`'s `Answer` gained `data-testid=deck-digit` — the digit had no name of its
+  own, and a matcher clever enough to find it without one would be the test the selector rule
+  forbids. Three rows gained the cases that already proved them and were not named:
+  `SPA-25` (`a_redelivered_notice_does_not_act_or_render_twice_on_the_deck_in_real_chrome`),
+  `SPA-33` (`the_receipt_lands_with_its_outcome_rule_in_real_chrome`) and `SPA-21` (the two
+  new refusal cases). `SPA-22`'s `Source` line now names the sentences at their current lines,
+  `rust/store.rs:6403`-`6408` and `rust/model.rs:1377`-`1386`.
+  `docs/testing/compiled-rust-e2e-matrix.md` carries the same rows verbatim.
