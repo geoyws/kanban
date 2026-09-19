@@ -206,8 +206,8 @@ machine-readable verdict instead of a paragraph.
   semver-shaped target version, planned start and end dates, and the closed
   status set planned/current/closed/abandoned. A sprint is not work: it must
   never be claimable, gated, or handed off.
-- Offer plan, start, close, and abandon over that row plus read-only list and
-  show, and allow at most one current sprint per board. Planning must record a
+- Offer new, plan, start, close, and abandon over that row plus read-only list
+  and show, and allow at most one current sprint per board. Planning must record a
   deliberate scope — explicit candidates, a parent epic, already attached
   scope, or an explicit empty-scope decision — and starting must additionally
   require a non-empty goal body. Attaching an epic attaches its subtree;
