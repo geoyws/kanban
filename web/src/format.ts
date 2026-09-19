@@ -56,3 +56,25 @@ export function cardQuestion(
   }
   return `${glyphs.slice(0, QUESTION_BOUND - 1).join("")}…`;
 }
+
+/* SCRATCH COPY OF WRITER A's format.ts ADDITIONS (feat/t-bf255880-a-core),
+   to A's published names and signatures. Take A's at the merge. */
+
+/** `rust/serve.rs`'s `status_label`: the slug as prose. */
+export function statusLabel(status: string): string {
+  if (status === "todo") {
+    return "To do";
+  }
+  const words = status.replace(/_/g, " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** `rust/serve.rs`'s `stamp`: the UTC instant, to the second. */
+export function stamp(ms: number): string {
+  return `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")}Z`;
+}
+
+/** `rust/serve.rs`'s `tag_list`: the clause a row's sentence carries. */
+export function tagSentence(tags: string[]): string {
+  return tags.length === 0 ? "" : `, tagged ${tags.join(", ")}`;
+}

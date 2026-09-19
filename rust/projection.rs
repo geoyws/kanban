@@ -19,16 +19,17 @@
 //! [`ClaimSummary`], which has no token field to forget to strip; the
 //! conversion from [`crate::model::Claim`] is the model's own.
 
-use serde::Serialize;
-
 use crate::model::{
-    Attention, Checkpoint, ClaimSummary, Event, RuleSummary, Sitrep, Task, TaskNote,
+    Attention, Checkpoint, ClaimSummary, DeploymentAttempt, Event, RuleSummary, Sitrep, Sprint,
+    Task, TaskNote,
 };
 use crate::registry::Registry;
 use crate::serve::{
     DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS, lane_groups, markdown, project_named,
-    projects, sort_open_queue,
+    projects, sort_open_queue, task_attention_count,
 };
+use crate::store::Store;
+use serde::Serialize;
 
 /// Why a projection could not answer.
 ///
@@ -36,6 +37,10 @@ use crate::serve::{
 /// own non-enumerating denial and becomes `404` with the generic sentence, and
 /// the other keeps its cause here — where a log or a test can read it — while
 /// the route answers a sentence that names nothing.
+// `Debug` so a refusal can be printed where it is read: a log line, and a
+// test that expects a projection to answer and has to say what came back
+// instead.
+#[derive(Debug)]
 pub enum Refusal {
     /// The board or the row named is unknown, retired, ambiguous, or invisible
     /// to this caller. One answer for all four, because a refusal that
@@ -419,4 +424,197 @@ pub fn task(project_name: &str, id: &str) -> Projected<TaskDetail> {
         checkpoints: Listing::capped(checkpoints, DETAIL_ROWS),
         events: Listing::capped(events, DETAIL_ROWS),
     })
+}
+
+// --- sprints and plans ---
+
+/// One sprint with the two counts its card shows and its goal, typeset.
+///
+/// `sprint_summary` (`rust/serve.rs`) renders exactly these values, from
+/// exactly this pair of store calls, so a card on the page and a card on
+/// the wire cannot disagree about how much of a sprint is still open.
+///
+/// `goal_html` is the sprint body through [`markdown`] — the same renderer
+/// and the same sanitiser the served card used, because a second markdown
+/// implementation in the client would be a second sanitiser (SPA-41).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SprintCard {
+    sprint: Sprint,
+    open_tasks: i64,
+    done_tasks: i64,
+    goal_html: Option<String>,
+}
+
+/// One board's release boundary and everything either side of it.
+///
+/// `current` is `null` rather than absent when the board has none: a board
+/// between sprints is a state the page names, and a missing key would leave
+/// the client to decide whether it meant "none" or "not asked".
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardSprints {
+    board: String,
+    current: Option<SprintCard>,
+    history: Vec<SprintCard>,
+}
+
+/// One sprint's goal, dates, visible scope and the deployment that closed it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SprintDetail {
+    board: String,
+    sprint: Sprint,
+    open_tasks: i64,
+    done_tasks: i64,
+    /// The goal, typeset by [`markdown`], as on [`SprintCard`].
+    goal_html: Option<String>,
+    /// `Store::sprint_tasks` takes no bound, so this is the whole visible
+    /// scope and needs no envelope to say so.
+    tasks: Vec<Task>,
+    closing_deployment: Option<DeploymentAttempt>,
+}
+
+/// One draft epic: the plan, what it holds back, and the plan itself.
+///
+/// Three fields beyond the row, each of them something the page renders and
+/// the client must not derive:
+///
+/// - `body_html` is the plan body through [`markdown`], the one renderer and
+///   the one sanitiser this crate has for agent-authored text.
+/// - `children` are the rows the draft gates — the page lists them because
+///   opening the plan is what releases them, so they are the plan's meaning
+///   rather than a related listing.
+/// - `open_attention` is the count the page badges, on the plan and on each
+///   child alike.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanCard {
+    board: String,
+    task: Task,
+    body_html: Option<String>,
+    open_attention: usize,
+    children: Vec<PlanChild>,
+}
+
+/// One row a draft plan holds back.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanChild {
+    task: Task,
+    open_attention: usize,
+}
+
+/// One sprint's card: the row and `Store::sprint_task_counts`' own pair.
+fn sprint_card(store: &Store, sprint: Sprint) -> Projected<SprintCard> {
+    let (open_tasks, done_tasks) = store.sprint_task_counts(&sprint.id)?;
+    Ok(SprintCard {
+        goal_html: sprint.body.as_deref().map(markdown),
+        sprint,
+        open_tasks,
+        done_tasks,
+    })
+}
+
+/// One board's sprint state, as `board_sprints_content` assembles it.
+///
+/// The history call is `Store::sprints(None, true, i64::MAX)` — the page's
+/// own, bound included — and everything whose status is not `current` is
+/// history, planned rows and abandoned ones with the closed ones. There is
+/// no cap to report because the store call has none.
+fn board_sprint_state(board: String, store: &Store) -> Projected<BoardSprints> {
+    let current = match store.current_sprint()? {
+        Some(sprint) => Some(sprint_card(store, sprint)?),
+        None => None,
+    };
+    let mut history = Vec::new();
+    for sprint in store.sprints(None, true, i64::MAX)? {
+        if sprint.status != "current" {
+            history.push(sprint_card(store, sprint)?);
+        }
+    }
+    Ok(BoardSprints {
+        board,
+        current,
+        history,
+    })
+}
+
+/// Every readable board's release boundary and sprint history.
+///
+/// Uncapped by construction: the history call passes `i64::MAX` and the
+/// board enumeration takes no bound, so `limit` is null and `truncated` is
+/// false rather than a number nothing enforces.
+pub fn sprints() -> Projected<Listing<BoardSprints>> {
+    let mut boards = Vec::new();
+    for (project, store) in projects()? {
+        boards.push(board_sprint_state(project.name.clone(), &store)?);
+    }
+    Ok(Listing::complete(boards))
+}
+
+/// One named board's release boundary and sprint history.
+pub fn board_sprints(name: &str) -> Projected<BoardSprints> {
+    let (project, store) = project_named(name).map_err(|_| Refusal::DeniedOrNotFound)?;
+    board_sprint_state(project.name.clone(), &store)
+}
+
+/// One sprint, its visible scope and the attempt that proved its version.
+///
+/// A sprint this principal may not read and a sprint that does not exist
+/// answer the same way, which is the answer `require_sprint` already gives.
+pub fn sprint(project_name: &str, id: &str) -> Projected<SprintDetail> {
+    let (project, store) = project_named(project_name).map_err(|_| Refusal::DeniedOrNotFound)?;
+    let sprint = store
+        .require_sprint(id)
+        .map_err(|_| Refusal::DeniedOrNotFound)?;
+    let tasks = store.sprint_tasks(&sprint.id)?;
+    let (open_tasks, done_tasks) = store.sprint_task_counts(&sprint.id)?;
+    let closing_deployment = match &sprint.closed_by_deployment {
+        Some(deployment_id) => Some(store.require_deployment(deployment_id)?),
+        None => None,
+    };
+    Ok(SprintDetail {
+        board: project.name,
+        goal_html: sprint.body.as_deref().map(markdown),
+        sprint,
+        open_tasks,
+        done_tasks,
+        tasks,
+        closing_deployment,
+    })
+}
+
+/// Every draft epic on every readable board, with the work each one gates.
+///
+/// The filter is the page's and the write verb's: type `epic`, status
+/// `draft`. `Store::list_tasks` takes no bound, so the listing is complete.
+pub fn plans() -> Projected<Listing<PlanCard>> {
+    let mut cards = Vec::new();
+    for (project, store) in projects()? {
+        let tasks = store.list_tasks(None, None, None, None, false)?;
+        for plan in tasks
+            .iter()
+            .filter(|task| task.status == "draft" && task.task_type == "epic")
+        {
+            let mut children = Vec::new();
+            for child in tasks
+                .iter()
+                .filter(|task| task.parent_id.as_deref() == Some(plan.id.as_str()))
+            {
+                children.push(PlanChild {
+                    task: child.clone(),
+                    open_attention: task_attention_count(&store, &child.id)?,
+                });
+            }
+            cards.push(PlanCard {
+                board: project.name.clone(),
+                body_html: plan.body.as_deref().map(markdown),
+                open_attention: task_attention_count(&store, &plan.id)?,
+                task: plan.clone(),
+                children,
+            });
+        }
+    }
+    Ok(Listing::complete(cards))
 }

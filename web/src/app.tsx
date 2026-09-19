@@ -11,7 +11,13 @@ import {
 } from "./card";
 import { connectLive, type Notice } from "./live";
 import { NOTICE_SHOWN, Notices } from "./notices";
+import BoardSprintsPage from "./pages/board-sprints";
+import PlansPage from "./pages/plans";
+import SprintPage from "./pages/sprint";
+import SprintsPage from "./pages/sprints";
 import { bindPreviews, dismissPreviews } from "./previews";
+import type { Route } from "./router";
+import { useRoute } from "./router";
 
 /**
  * The Needs-you deck: one card on screen, the next one a keystroke away.
@@ -86,7 +92,25 @@ type Drafts = Record<string, Draft>;
 
 const EMPTY_DRAFT: Draft = { note: "", outcome: null };
 
+/* SCRATCH: writer A's router switch, to the published contract. Take A's
+   app.tsx at the merge; the four lines below are writer C's cases. */
+function renderPage(route: Route): ReactElement | null {
+  switch (route.name) {
+    case "sprints":
+      return <SprintsPage route={route} />;
+    case "board-sprints":
+      return <BoardSprintsPage route={route} />;
+    case "sprint":
+      return <SprintPage route={route} />;
+    case "plans":
+      return <PlansPage route={route} />;
+    default:
+      return null;
+  }
+}
+
 export function App(): ReactElement {
+  const route = useRoute();
   const [cards, setCards] = useState<Card[] | null>(null);
   const [order, setOrder] = useState<string[]>([]);
   const [position, setPosition] = useState(0);
@@ -837,152 +861,159 @@ export function App(): ReactElement {
           ))}
         </div>
       </nav>
-      <main
-        id="main"
-        data-deck
-        data-testid="app-root"
-        data-deck-position={index}
-        data-projection={applied}
-      >
-        <div className="heading">
-          <h1>Needs you</h1>
-          <button
-            type="button"
-            className="history-toggle"
-            data-history-toggle
-            data-testid="history-toggle"
-            aria-expanded={historyOpen}
-            aria-controls="session-history"
-            onClick={() => setHistoryOpen((open) => !open)}
+      {route.name === "needs-you" ? null : renderPage(route)}
+      {route.name !== "needs-you" ? null : (
+        <main
+          id="main"
+          data-deck
+          data-testid="app-root"
+          data-deck-position={index}
+          data-projection={applied}
+        >
+          <div className="heading">
+            <h1>Needs you</h1>
+            <button
+              type="button"
+              className="history-toggle"
+              data-history-toggle
+              data-testid="history-toggle"
+              aria-expanded={historyOpen}
+              aria-controls="session-history"
+              onClick={() => setHistoryOpen((open) => !open)}
+            >
+              Decided{" "}
+              <span data-history-count data-testid="history-count">
+                {receipts}
+              </span>
+            </button>
+          </div>
+          {replied === null ? null : (
+            <p className="success">
+              <code>{replied}</code> is decided and the board has it.
+            </p>
+          )}
+          {undone === null ? null : (
+            <p className="success">
+              Brought back <code>{undone}</code> - it is open again and back at its
+              place in this list.
+            </p>
+          )}
+          <p
+            className="progress"
+            data-testid="deck-progress"
+            hidden={queue.length === 0}
           >
-            Decided{" "}
-            <span data-history-count data-testid="history-count">
-              {receipts}
-            </span>
-          </button>
-        </div>
-        {replied === null ? null : (
-          <p className="success">
-            <code>{replied}</code> is decided and the board has it.
+            <span data-open-count>{queue.length}</span> left
           </p>
-        )}
-        {undone === null ? null : (
-          <p className="success">
-            Brought back <code>{undone}</code> - it is open again and back at its place
-            in this list.
-          </p>
-        )}
-        <p className="progress" data-testid="deck-progress" hidden={queue.length === 0}>
-          <span data-open-count>{queue.length}</span> left
-        </p>
-        <section className="deck" data-deck-cards data-testid="deck-cards">
-          {rendered.map((id) => {
-            const card = byId.get(id);
-            return card === undefined ? null : (
-              <DecisionCard
-                key={id}
-                card={card}
-                state={stateOf(id)}
-                cardRef={cardRef}
-                handlers={{
-                  onNote: (item, note) => {
-                    setDraft(item, { note });
-                    // The refusal named what was missing. Once both halves
-                    // are there it has been answered, so it goes as the
-                    // words are typed rather than waiting for the next
-                    // click to take it away.
-                    if (note.trim().length > 0 && draftOf(item).outcome !== null) {
+          <section className="deck" data-deck-cards data-testid="deck-cards">
+            {rendered.map((id) => {
+              const card = byId.get(id);
+              return card === undefined ? null : (
+                <DecisionCard
+                  key={id}
+                  card={card}
+                  state={stateOf(id)}
+                  cardRef={cardRef}
+                  handlers={{
+                    onNote: (item, note) => {
+                      setDraft(item, { note });
+                      // The refusal named what was missing. Once both halves
+                      // are there it has been answered, so it goes as the
+                      // words are typed rather than waiting for the next
+                      // click to take it away.
+                      if (note.trim().length > 0 && draftOf(item).outcome !== null) {
+                        setRefusal(item, { incomplete: null });
+                      }
+                    },
+                    onOutcome: (item, outcome) => {
+                      setDraft(item, { outcome });
                       setRefusal(item, { incomplete: null });
-                    }
-                  },
-                  onOutcome: (item, outcome) => {
-                    setDraft(item, { outcome });
-                    setRefusal(item, { incomplete: null });
-                  },
-                  onClear: clearVerdict,
-                  onCustomOpen: (item, open) =>
-                    setCustomOpen((previous) => ({ ...previous, [item]: open })),
-                  onChoice,
-                  onCustom,
-                }}
-              />
-            );
-          })}
-          {cards !== null && queue.length === 0 ? (
-            // The empty queue says so at once rather than after the board
-            // answers: deciding the last card used to leave a blank deck for
-            // the length of a round trip.
-            <div className="empty-queue" data-deck-empty data-testid="deck-empty">
-              <p className="empty">
-                Nothing is waiting. Every question an agent raised has an answer.
-              </p>
-              <p>
-                <a href="/decided">See what was decided</a>
-              </p>
-            </div>
-          ) : null}
-        </section>
-        <p className="keys" data-testid="deck-keys">
-          1–4 answer · s skip · u undo · c own
-        </p>
-        <aside className="side" data-side data-testid="deck-side">
-          <Notices notices={notices} onDismiss={dismiss} />
-          <section
-            className="history"
-            id="session-history"
-            data-history
-            data-testid="deck-history"
-          >
-            <h2>Decided this session</h2>
-            {history.map((row) =>
-              row.recorded ? (
-                <p
-                  key={row.id}
-                  className={`receipt outcome-${row.outcome}`}
-                  data-receipt={row.id}
-                  data-testid="deck-receipt"
-                  data-item={row.id}
-                  data-project={row.board}
-                  {...(row.refusal === null
-                    ? {}
-                    : { "aria-describedby": `refusal-row-${row.id}` })}
-                >
-                  <span className="decided">
-                    {row.noted
-                      ? `Decided: ${row.label}. Your reply is recorded.`
-                      : `Decided: ${row.label}.`}
-                  </span>{" "}
-                  <button
-                    type="button"
-                    className="undo-button"
-                    data-undo
-                    {...(row.undoing ? { "data-pressed": "" } : {})}
-                    onClick={() => void undo(row)}
-                  >
-                    {row.undoing ? "Undoing…" : "Undo"}
-                  </button>
-                  {row.refusal === null ? null : (
-                    <span
-                      className="error"
-                      data-refusal="board"
-                      id={`refusal-row-${row.id}`}
-                    >
-                      {row.refusal}
-                    </span>
-                  )}
+                    },
+                    onClear: clearVerdict,
+                    onCustomOpen: (item, open) =>
+                      setCustomOpen((previous) => ({ ...previous, [item]: open })),
+                    onChoice,
+                    onCustom,
+                  }}
+                />
+              );
+            })}
+            {cards !== null && queue.length === 0 ? (
+              // The empty queue says so at once rather than after the board
+              // answers: deciding the last card used to leave a blank deck for
+              // the length of a round trip.
+              <div className="empty-queue" data-deck-empty data-testid="deck-empty">
+                <p className="empty">
+                  Nothing is waiting. Every question an agent raised has an answer.
                 </p>
-              ) : (
-                // What the history says while the board is still answering.
-                // It is NOT a receipt: nothing is recorded yet, so it carries
-                // no undo and no receipt tag.
-                <p key={row.id} className="pending" data-pending={row.id}>
-                  {`Sending… ${row.label}`}
+                <p>
+                  <a href="/decided">See what was decided</a>
                 </p>
-              ),
-            )}
+              </div>
+            ) : null}
           </section>
-        </aside>
-      </main>
+          <p className="keys" data-testid="deck-keys">
+            1–4 answer · s skip · u undo · c own
+          </p>
+          <aside className="side" data-side data-testid="deck-side">
+            <Notices notices={notices} onDismiss={dismiss} />
+            <section
+              className="history"
+              id="session-history"
+              data-history
+              data-testid="deck-history"
+            >
+              <h2>Decided this session</h2>
+              {history.map((row) =>
+                row.recorded ? (
+                  <p
+                    key={row.id}
+                    className={`receipt outcome-${row.outcome}`}
+                    data-receipt={row.id}
+                    data-testid="deck-receipt"
+                    data-item={row.id}
+                    data-project={row.board}
+                    {...(row.refusal === null
+                      ? {}
+                      : { "aria-describedby": `refusal-row-${row.id}` })}
+                  >
+                    <span className="decided">
+                      {row.noted
+                        ? `Decided: ${row.label}. Your reply is recorded.`
+                        : `Decided: ${row.label}.`}
+                    </span>{" "}
+                    <button
+                      type="button"
+                      className="undo-button"
+                      data-undo
+                      {...(row.undoing ? { "data-pressed": "" } : {})}
+                      onClick={() => void undo(row)}
+                    >
+                      {row.undoing ? "Undoing…" : "Undo"}
+                    </button>
+                    {row.refusal === null ? null : (
+                      <span
+                        className="error"
+                        data-refusal="board"
+                        id={`refusal-row-${row.id}`}
+                      >
+                        {row.refusal}
+                      </span>
+                    )}
+                  </p>
+                ) : (
+                  // What the history says while the board is still answering.
+                  // It is NOT a receipt: nothing is recorded yet, so it carries
+                  // no undo and no receipt tag.
+                  <p key={row.id} className="pending" data-pending={row.id}>
+                    {`Sending… ${row.label}`}
+                  </p>
+                ),
+              )}
+            </section>
+          </aside>
+        </main>
+      )}
     </>
   );
 }

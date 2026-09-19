@@ -380,8 +380,18 @@ paths:
 
         `Store::list_tasks` takes no limit, so this listing is uncapped:
         `truncated` is `false` and `limit` is `null`.
-      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
-      x-store-method: Store::list_tasks
+
+        **Widened from `BoardTask` to `PlanCard` by `t-bf255880`**, because
+        the page this replaces is not a list of epics: it renders each
+        plan's BODY (the plan itself) and the children the draft holds back,
+        and it badges the open-attention count on the plan and on each
+        child. A client cannot derive any of the three — the body must be
+        typeset by `serve::markdown`, which is the one sanitiser
+        (`SPA-41`), and the children and the counts are store reads. Serving
+        `BoardTask` would have moved a rendering rule and a second read into
+        the client.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-44]
+      x-store-method: Store::list_tasks, Store::attention
       responses:
         "200":
           description: Every draft epic on every readable board.
@@ -395,7 +405,7 @@ paths:
                     properties:
                       items:
                         type: array
-                        items: { $ref: "#/components/schemas/BoardTask" }
+                        items: { $ref: "#/components/schemas/PlanCard" }
         "403": { $ref: "#/components/responses/Refused" }
         "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "500": { $ref: "#/components/responses/ServerError" }
@@ -1365,6 +1375,38 @@ components:
       properties:
         board: { type: string }
         task: { $ref: "#/components/schemas/Task" }
+
+    PlanCard:
+      type: object
+      description: |
+        One draft epic as the plans page reads it: the plan, the plan
+        itself, and the work it holds back. Added by `t-bf255880` when
+        `/plans` became a client-rendered page — see `getPlans`.
+      required: [board, task, bodyHtml, openAttention, children]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        task: { $ref: "#/components/schemas/Task" }
+        bodyHtml:
+          type: string
+          nullable: true
+          description: The plan's body through `serve::markdown`, or `null` when it has none. One renderer and one sanitiser for agent-authored text (SPA-41).
+        openAttention:
+          type: integer
+          description: Open items on the plan itself, at the page's `OPEN_ATTENTION_ROWS` bound.
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/PlanChild" }
+          description: The rows the draft gates — none of them claimable until the plan is opened, which is why the page lists them with it.
+
+    PlanChild:
+      type: object
+      description: One row a draft plan holds back.
+      required: [task, openAttention]
+      additionalProperties: false
+      properties:
+        task: { $ref: "#/components/schemas/Task" }
+        openAttention: { type: integer }
 
     BoardSummary:
       type: object

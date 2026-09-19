@@ -971,3 +971,35 @@ main[data-deck] > p.keys {
     transition: none;
   }
 }
+.sprint-card {
+  margin: 0.6rem 0;
+  padding: 0.55rem 0.75rem;
+  background: var(--mantle);
+  border-left: 2px solid var(--surface1);
+}
+.sprint-card.is-current {
+  border-left-color: var(--blue);
+}
+.sprint-version {
+  margin: 0 0 0.15rem;
+  font-family: var(--mono);
+  font-size: 1rem;
+  font-weight: 600;
+}
+.sprint-history {
+  margin-top: 1.1rem;
+}
+.plan {
+  margin: 0 0 1.4rem;
+}
+.plan > h2 {
+  margin: 0 0 0.15rem;
+  font-size: 1rem;
+}
+.plan-body {
+  margin: 0.5rem 0 0.7rem;
+}
+.sprint-card,
+.plan {
+  overflow-wrap: anywhere;
+}

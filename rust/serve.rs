@@ -507,6 +507,10 @@ fn api(method: &Method, path: &str) -> WebResponse {
         ["lanes"] => encode(projection::lanes()),
         ["board", project] => encode(projection::board(project)),
         ["task", project, id] => encode(projection::task(project, id)),
+        ["sprints"] => encode(projection::sprints()),
+        ["sprints", project] => encode(projection::board_sprints(project)),
+        ["sprint", project, id] => encode(projection::sprint(project, id)),
+        ["plans"] => encode(projection::plans()),
         _ => Err(projection::Refusal::DeniedOrNotFound),
     };
     match body {
@@ -636,10 +640,10 @@ fn render(url: &str) -> Result<String> {
         ),
         ["decided"] => decided_page(query_value(query, "undone").as_deref()),
         ["boards"] => boards(),
-        ["sprints"] => sprints(),
-        ["sprints", project] => board_sprints(project),
-        ["sprint", project, id] => sprint_detail(project, id),
-        ["plans"] => plans(query_value(query, "opened").as_deref()),
+        ["sprints"] => Ok(app_shell()),
+        ["sprints", _] => Ok(app_shell()),
+        ["sprint", _, _] => Ok(app_shell()),
+        ["plans"] => Ok(app_shell()),
         ["deployments"] => deployments(),
         ["subscriptions"] => subscriptions(
             query_value(query, "show").as_deref(),
@@ -1645,7 +1649,11 @@ fn task_open_attention(store: &Store, task_id: &str) -> Result<Vec<Attention>> {
     )
 }
 
-fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
+/// How many open items one task is carrying, at the page's own bound.
+///
+/// Shared with [`crate::projection`] rather than counted twice: the plans
+/// listing badges this number and a second count would be a second answer.
+pub(crate) fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
     Ok(task_open_attention(store, task_id)?.len())
 }
 
@@ -2657,6 +2665,8 @@ fn deployment_detail(project: &str, id: &str) -> Result<String> {
 
 const DAY_MS: i64 = 86_400_000;
 
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn sprint_days_remaining(scheduled_end: i64) -> i64 {
     let remaining = scheduled_end.saturating_sub(now_ms());
     if remaining <= 0 {
@@ -2666,6 +2676,8 @@ fn sprint_days_remaining(scheduled_end: i64) -> i64 {
     }
 }
 
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn sprint_summary(store: &Store, project: &str, sprint: &Sprint, current: bool) -> Result<String> {
     let (open, done) = store.sprint_task_counts(&sprint.id)?;
     let route = format!("/sprint/{}/{}", url_encode(project), url_encode(&sprint.id));
@@ -2704,6 +2716,8 @@ fn sprint_summary(store: &Store, project: &str, sprint: &Sprint, current: bool) 
     ))
 }
 
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn board_sprints_content(project: &ProjectRecord, store: &Store) -> Result<String> {
     let current = store.current_sprint()?;
     let history = store.sprints(None, true, i64::MAX)?;
@@ -2741,6 +2755,8 @@ fn board_sprints_content(project: &ProjectRecord, store: &Store) -> Result<Strin
 }
 
 /// Every registered board's current release boundary and complete sprint history.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn sprints() -> Result<String> {
     let mut html = String::from("<h1 data-sprints-overview>Sprints</h1>");
     let boards = projects()?;
@@ -2760,6 +2776,8 @@ fn sprints() -> Result<String> {
 }
 
 /// One board's current release boundary and complete planned/closed/abandoned history.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn board_sprints(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let mut html = format!(
@@ -2772,6 +2790,8 @@ fn board_sprints(name: &str) -> Result<String> {
 }
 
 /// One sprint's release goal, dates, visible scope and authoritative deployment proof.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
     let (project, store) = project_named(project_name)?;
     let sprint = store.require_sprint(id)?;
@@ -2911,6 +2931,8 @@ fn boards() -> Result<String> {
 /// A draft holds back everything beneath it, so this page is also the answer to
 /// "what work is currently gated" — the children are listed with each plan
 /// because opening the plan is what releases them.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn plans(opened: Option<&str>) -> Result<String> {
     let mut html = String::from("<h1>Plans</h1>");
     if let Some(id) = opened {
@@ -6319,32 +6341,8 @@ mod tests {
         }
     }
 
-    /// What a page renders inside `<main>`: the page itself, without the
-    /// shell's own navigation and controls around it.
-    fn main_of(html: &str) -> &str {
-        let start = html.find("<main").expect("a main element");
-        let end = html[start..].find("</main>").expect("main closes");
-        &html[start..start + end]
-    }
-
     fn assert_html_contains(html: &str, needle: &str) {
         assert!(html.contains(needle), "missing {needle:?} in {html}");
-    }
-
-    fn sprint_card<'a>(html: &'a str, id: &str) -> &'a str {
-        let marker = format!("data-sprint-summary=\"{id}\"");
-        let marker_at = html
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing sprint card {id:?} in {html}"));
-        let start = html[..marker_at]
-            .rfind("<article")
-            .expect("sprint marker belongs to an article");
-        let end = marker_at
-            + html[marker_at..]
-                .find("</article>")
-                .expect("sprint article closes")
-            + "</article>".len();
-        &html[start..end]
     }
 
     fn assert_page_title(html: &str, title: &str) {
@@ -8022,10 +8020,9 @@ mod tests {
             "/boards",
             "/board/SERVE-RENDER",
             "/lanes",
-            "/sprints",
-            "/sprints/SERVE-RENDER",
-            "/sprint/SERVE-RENDER/sp-render-current",
-            "/plans",
+            // The sprint and plan routes left this sweep with
+            // `t-bf255880`: they are mounted, so their rows are measured
+            // in Chrome instead.
             "/deployments",
             "/subscriptions",
             "/search?q=render",
@@ -8067,18 +8064,6 @@ mod tests {
         }
         let detail = render(&task_route).expect("render the task detail");
         assert_html_contains(&detail, "<span class=title>Please review ");
-        // The sprint's attached tasks are a row list with a hook of its own,
-        // so it is pinned by name rather than left to the sweep's matcher.
-        let sprint = render("/sprint/SERVE-RENDER/sp-render-current").expect("render the sprint");
-        assert_html_contains(
-            &sprint,
-            "<ul class=rows data-sprint-tasks><li data-task=\"t-render/opaque?#\">\
-             <a href=\"/task/SERVE-RENDER/t-render%2Fopaque%3F%23\" \
-             data-task-link=\"t-render/opaque?#\" data-ref target=_blank rel=noopener \
-             data-task-title>Opaque &lt;task&gt;</a><p class=meta>\
-             Attached as <code>t-render/opaque?#</code> in \
-             <span class=\"pill status-todo\" data-task-state>To do</span></p></li></ul>",
-        );
     }
 
     /// WEB-41 — one pill style everywhere.
@@ -8447,8 +8432,6 @@ mod tests {
             "/all",
             "/decided",
             "/boards",
-            "/sprints",
-            "/plans",
             "/deployments",
             "/subscriptions",
             "/lanes",
@@ -8600,9 +8583,16 @@ mod tests {
         let data_dir = env::var_os("KANBAN_DATA_DIR")
             .map(PathBuf::from)
             .expect("child data dir");
-        let no_boards = render("/sprints").expect("render overview with no boards");
-        assert_html_contains(&no_boards, "No boards are registered.");
-        assert!(!no_boards.contains("data-sprint-board="));
+        // An empty registry has no boards to group sprints by, and the
+        // projection says so with an empty listing -- the sentence a
+        // reader sees is the mounted page's (`t-bf255880`).
+        let no_boards =
+            serde_json::to_string(&projection::sprints().expect("project sprints with no boards"))
+                .expect("the empty index serialises");
+        assert_eq!(
+            no_boards, "{\"items\":[],\"returned\":0,\"limit\":null,\"truncated\":false}",
+            "the empty sprint index is not empty"
+        );
 
         let fixture = seed_render_fixture(&data_dir);
 
@@ -8717,20 +8707,43 @@ mod tests {
         assert_html_contains(&boards, "SERVE-RENDER");
         assert_html_contains(&boards, "<td class=\"n waiting\">1</td>");
 
-        let plans = render("/plans").expect("render plans");
-        assert_page_title(&plans, "Plans");
-        assert_html_contains(&plans, "Open plan");
-        assert_html_contains(&plans, "Holds back 3 rows");
-        assert_html_contains(&plans, "Plan &lt;b&gt;render&lt;/b&gt;");
-        assert_html_contains(&plans, "Ship &lt;script&gt;render&lt;/script&gt;");
-        assert_html_contains(&plans, "Implement &lt;i&gt;escape&lt;/i&gt;");
-
-        let opened =
-            render(&format!("/plans?opened={}", fixture.epic_id)).expect("render opened plans");
-        assert_page_title(&opened, "Plans");
-        assert_html_contains(
-            &opened,
-            "Opened plan <code>e-serve-render</code> and its child work",
+        // `/plans` is mounted since `t-bf255880`, and what it renders is
+        // the projection below. The open control, the banner and the real
+        // write are proved in Chrome by
+        // `opening_a_draft_plan_in_real_chrome_moves_the_real_task_to_todo`.
+        assert_eq!(
+            render("/plans").expect("render plans"),
+            app_shell(),
+            "/plans is not the application shell"
+        );
+        assert_eq!(
+            render(&format!("/plans?opened={}", fixture.epic_id)).expect("render opened plans"),
+            app_shell(),
+            "?opened= is a different page from /plans"
+        );
+        let plans = serde_json::to_value(projection::plans().expect("project the plans"))
+            .expect("the plans listing serialises");
+        let plan = plans["items"]
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .find(|card| card["task"]["id"] == fixture.epic_id)
+            .unwrap_or_else(|| panic!("the drafted plan is not in the listing: {plans}"));
+        // Agent-authored text reaches the client typeset by the one
+        // renderer, with its raw HTML inert rather than carried through as
+        // markup.
+        assert_eq!(
+            plan["bodyHtml"], "<p>Draft body with alert(1)</p>\n",
+            "{plans}"
+        );
+        assert_eq!(plan["task"]["title"], "Plan <b>render</b>", "{plans}");
+        let children = plan["children"].as_array().expect("the gated rows");
+        assert_eq!(children.len(), 3, "{plans}");
+        assert!(
+            children
+                .iter()
+                .any(|child| child["task"]["title"] == "Implement <i>escape</i>"),
+            "{plans}"
         );
 
         let deployments = render("/deployments").expect("render deployments");
@@ -8831,125 +8844,153 @@ mod tests {
         assert_html_contains(&failed_detail, "failed");
         assert_html_contains(&failed_detail, "build &lt;failed&gt;");
 
-        let sprint_overview = render("/sprints").expect("render sprint overview");
-        assert_page_title(&sprint_overview, "Sprints");
-        assert_html_contains(&sprint_overview, "data-sprint-board=\"SERVE-RENDER\"");
-        let current_card = sprint_card(&sprint_overview, "sp-render-current");
-        assert_html_contains(current_card, "data-sprint-current");
-        assert_html_contains(current_card, "data-sprint-version>3.2.0");
-        assert_html_contains(current_card, "data-sprint-state>current");
-        assert_html_contains(current_card, "data-sprint-open>1");
-        assert_html_contains(current_card, "data-sprint-done>0");
+        // The three sprint routes are mounted since `t-bf255880`: each
+        // answers the shell, and everything the pages used to be asserted
+        // on is asserted where it now comes from -- the projection. The
+        // rendered result is judged in Chrome, by
+        // `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records`.
+        for route in [
+            "/sprints",
+            "/sprints/SERVE-RENDER",
+            "/sprint/SERVE-RENDER/sp-render-current",
+        ] {
+            let shell = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
+            assert_eq!(shell, app_shell(), "{route} is not the application shell");
+        }
+
+        let sprints = serde_json::to_value(projection::sprints().expect("project every board"))
+            .expect("the sprint index serialises");
+        let board_of = |name: &str| {
+            sprints["items"]
+                .as_array()
+                .expect("the index is a listing")
+                .iter()
+                .find(|item| item["board"] == name)
+                .unwrap_or_else(|| panic!("{name} is not in the sprint index: {sprints}"))
+                .clone()
+        };
+        let seeded = board_of("SERVE-RENDER");
+        let current = &seeded["current"];
+        assert_eq!(current["sprint"]["id"], "sp-render-current", "{sprints}");
+        assert_eq!(current["sprint"]["targetVersion"], "3.2.0", "{sprints}");
+        assert_eq!(current["sprint"]["status"], "current", "{sprints}");
+        assert_eq!(current["openTasks"], 1, "{sprints}");
+        assert_eq!(current["doneTasks"], 0, "{sprints}");
+        let history = seeded["history"].as_array().expect("a history");
         for (id, state) in [
             ("sp-render-planned", "planned"),
             ("sp-render-closed", "closed"),
             ("sp-render-abandoned", "abandoned"),
             ("sp-render-archived", "planned"),
         ] {
-            let card = sprint_card(&sprint_overview, id);
-            assert_html_contains(card, &format!("data-sprint-state>{state}"));
-            if id == "sp-render-archived" {
-                assert_html_contains(card, "data-sprint-archived>archived");
-            } else {
-                assert!(
-                    !card.contains("data-sprint-archived"),
-                    "{id} was mislabeled archived"
-                );
-            }
+            let card = history
+                .iter()
+                .find(|card| card["sprint"]["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is not in the history: {sprints}"));
+            assert_eq!(card["sprint"]["status"], state, "{sprints}");
+            assert_eq!(
+                card["sprint"]["archived"],
+                serde_json::Value::Bool(id == "sp-render-archived"),
+                "{id} was mislabeled archived: {sprints}"
+            );
         }
-
-        assert_html_contains(&sprint_overview, "data-sprint-board=\"SERVE-SPRINT-EMPTY\"");
-        assert_html_contains(&sprint_overview, "data-no-current-sprint");
-        assert_html_contains(&sprint_overview, "data-no-sprints");
-
-        let sprint_board = render("/sprints/SERVE-RENDER").expect("render board sprints");
-        assert_page_title(&sprint_board, "SERVE-RENDER sprints");
-        assert_html_contains(&sprint_board, "data-board-sprints=\"SERVE-RENDER\"");
-        assert_html_contains(&sprint_board, "data-sprint-history");
-        assert_html_contains(&sprint_board, "2023-11-14 22:13:20Z");
-        assert_html_contains(&sprint_board, "2100-01-01 00:00:00Z");
-
-        let current_sprint =
-            render("/sprint/SERVE-RENDER/sp-render-current").expect("render current sprint detail");
-        assert_page_title(&current_sprint, "Sprint sp-render-current");
-        assert_html_contains(
-            &current_sprint,
-            "Current <strong>goal</strong> and criteria.",
-        );
-        let current_actual_start = stamp(fixture.current_sprint_started_at);
-        assert_html_contains(
-            &current_sprint,
-            &format!("data-sprint-actual-start>{current_actual_start}"),
-        );
-        assert_ne!(current_actual_start, stamp(1_700_000_000_000));
-        assert_ne!(current_actual_start, stamp(4_102_444_800_000));
-        assert_html_contains(&current_sprint, "data-sprint-actual-end>not ended");
-
-        assert_html_contains(&current_sprint, "data-task-state>To do");
-        assert_html_contains(&current_sprint, "Opaque &lt;task&gt;");
-        assert_html_contains(
-            &current_sprint,
-            "href=\"/task/SERVE-RENDER/t-render%2Fopaque%3F%23\"",
-        );
-        assert!(!current_sprint.contains("<main id=main><form"));
-        // A read-only page offers no write control of its own. The shell's
-        // menu button is the shell's, so the claim is about `<main>`.
-        assert!(!main_of(&current_sprint).contains("<button"));
-
-        let closed_sprint =
-            render("/sprint/SERVE-RENDER/sp-render-closed").expect("render closed sprint detail");
-        assert_html_contains(&closed_sprint, "data-sprint-deployment-proof");
-        assert_html_contains(&closed_sprint, "data-sprint-served-version>3.1.0");
-        assert_html_contains(
-            &closed_sprint,
-            "data-sprint-served-commit><code>cccccccccccccccccccccccccccccccccccccccc</code>",
-        );
-        let closed_actual_start = stamp(fixture.closed_sprint_started_at);
-        let closed_actual_end = stamp(fixture.closed_sprint_ended_at);
-        assert_html_contains(
-            &closed_sprint,
-            &format!("data-sprint-actual-start>{closed_actual_start}"),
-        );
-        assert_html_contains(
-            &closed_sprint,
-            &format!("data-sprint-actual-end>{closed_actual_end}"),
-        );
-        assert_ne!(closed_actual_start, stamp(1_700_000_000_000));
-        assert_ne!(closed_actual_end, stamp(4_102_444_800_000));
-
-        assert!(!closed_sprint.contains("unsafe()"));
-
-        let archived_sprint = render("/sprint/SERVE-RENDER/sp-render-archived")
-            .expect("render archived sprint without goal");
-        assert_html_contains(
-            &archived_sprint,
-            "data-sprint-goal><p class=empty>No goal or success criteria recorded.</p>",
+        // A board between sprints is in the index saying so, rather than
+        // absent from it.
+        let empty = board_of("SERVE-SPRINT-EMPTY");
+        assert!(empty["current"].is_null(), "{sprints}");
+        assert!(
+            empty["history"].as_array().expect("a history").is_empty(),
+            "{sprints}"
         );
 
-        let missing_proof = render("/sprint/SERVE-RENDER/sp-render-missing-proof")
-            .expect("render legacy sprint without proof");
-        assert_html_contains(&missing_proof, "data-no-sprint-proof");
-        assert!(!missing_proof.contains("data-sprint-deployment-proof"));
-        let planned_sprint =
-            render("/sprint/SERVE-RENDER/sp-render-planned").expect("render planned sprint detail");
-        assert_html_contains(&planned_sprint, "data-sprint-actual-start>not started");
-        assert_html_contains(&planned_sprint, "data-sprint-actual-end>not ended");
-        let abandoned_sprint = render("/sprint/SERVE-RENDER/sp-render-abandoned")
-            .expect("render abandoned sprint detail");
-        assert_html_contains(&abandoned_sprint, "data-sprint-state>abandoned");
-        assert_html_contains(&abandoned_sprint, "data-sprint-days-remaining>0");
-        let empty_sprints =
-            render("/sprints/SERVE-SPRINT-EMPTY").expect("render empty board sprint page");
-        assert_html_contains(&empty_sprints, "data-no-current-sprint");
-        assert_html_contains(&empty_sprints, "data-no-sprints");
-        let current_only = render("/sprints/SERVE-SPRINT-CURRENT-ONLY")
-            .expect("render board with only a current sprint");
-        assert_html_contains(&current_only, "data-sprint-current");
-        assert_html_contains(&current_only, "data-no-sprint-history");
-        assert!(!current_only.contains("data-no-sprints"));
+        let board_sprints =
+            serde_json::to_value(projection::board_sprints("SERVE-RENDER").expect("one board"))
+                .expect("one board's sprints serialise");
+        assert_eq!(board_sprints, seeded, "one board differs from the index");
 
-        assert!(render("/sprints/NO-SUCH-SPRINT-BOARD").is_err());
-        assert!(render("/sprint/SERVE-RENDER/sp-no-such").is_err());
+        let sprint_value = |id: &str| {
+            serde_json::to_value(
+                projection::sprint("SERVE-RENDER", id)
+                    .unwrap_or_else(|_| panic!("project sprint {id}")),
+            )
+            .expect("a sprint serialises")
+        };
+        let current_sprint = sprint_value("sp-render-current");
+        assert_eq!(
+            current_sprint["goalHtml"], "<p>Current <strong>goal</strong> and criteria.</p>\n",
+            "{current_sprint}"
+        );
+        // The actual start is the stamp `sprint start` wrote, which is
+        // neither end of the schedule.
+        assert_eq!(
+            current_sprint["sprint"]["startsAt"], fixture.current_sprint_started_at,
+            "{current_sprint}"
+        );
+        assert_ne!(current_sprint["sprint"]["startsAt"], 1_700_000_000_000_i64);
+        assert_ne!(current_sprint["sprint"]["startsAt"], 4_102_444_800_000_i64);
+        assert!(
+            current_sprint["sprint"]["endsAt"].is_null(),
+            "{current_sprint}"
+        );
+        let scope = current_sprint["tasks"].as_array().expect("a scope");
+        assert_eq!(scope.len(), 1, "{current_sprint}");
+        assert_eq!(scope[0]["id"], "t-render/opaque?#", "{current_sprint}");
+        assert_eq!(scope[0]["status"], "todo", "{current_sprint}");
+        assert_eq!(scope[0]["title"], "Opaque <task>", "{current_sprint}");
+
+        let closed_sprint = sprint_value("sp-render-closed");
+        let proof = &closed_sprint["closingDeployment"];
+        assert_eq!(proof["servedVersion"], "3.1.0", "{closed_sprint}");
+        assert_eq!(
+            proof["servedCommit"], "cccccccccccccccccccccccccccccccccccccccc",
+            "{closed_sprint}"
+        );
+        assert_eq!(
+            closed_sprint["sprint"]["startsAt"], fixture.closed_sprint_started_at,
+            "{closed_sprint}"
+        );
+        assert_eq!(
+            closed_sprint["sprint"]["endsAt"], fixture.closed_sprint_ended_at,
+            "{closed_sprint}"
+        );
+
+        // A sprint that recorded no goal carries none, rather than a
+        // sentence the projection invented for the page.
+        assert!(
+            sprint_value("sp-render-archived")["goalHtml"].is_null(),
+            "an absent goal was filled in by the projection"
+        );
+        // A closed sprint from before the proof gate has no attempt to
+        // point at, and says so by carrying none.
+        assert!(
+            sprint_value("sp-render-missing-proof")["closingDeployment"].is_null(),
+            "a sprint without proof grew one"
+        );
+        let planned = sprint_value("sp-render-planned");
+        assert_eq!(planned["sprint"]["startsAt"], 0, "{planned}");
+        assert!(planned["sprint"]["endsAt"].is_null(), "{planned}");
+        let abandoned = sprint_value("sp-render-abandoned");
+        assert_eq!(abandoned["sprint"]["status"], "abandoned", "{abandoned}");
+        assert!(!abandoned["sprint"]["endsAt"].is_null(), "{abandoned}");
+
+        let current_only = serde_json::to_value(
+            projection::board_sprints("SERVE-SPRINT-CURRENT-ONLY").expect("one board"),
+        )
+        .expect("one board's sprints serialise");
+        assert!(!current_only["current"].is_null(), "{current_only}");
+        assert!(
+            current_only["history"]
+                .as_array()
+                .expect("a history")
+                .is_empty(),
+            "{current_only}"
+        );
+
+        // The refusal moved with the read: the routes answer the shell to
+        // everyone, and the projection is where a board or a sprint that
+        // cannot be read is denied.
+        assert!(projection::board_sprints("NO-SUCH-SPRINT-BOARD").is_err());
+        assert!(projection::sprint("SERVE-RENDER", "sp-no-such").is_err());
 
         let not_found = render("/no/such/page").expect("render 404 page");
         assert_page_title(&not_found, "Not found");

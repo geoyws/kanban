@@ -49,10 +49,6 @@ export interface Card {
   task?: TaskReference;
 }
 
-interface Listing {
-  items: Card[];
-}
-
 /** The projection this page is: every open item, in deck order. */
 export async function fetchNeedsYou(): Promise<Card[]> {
   const response = await fetch("/api/v1/needs-you", {
@@ -62,8 +58,31 @@ export async function fetchNeedsYou(): Promise<Card[]> {
   if (!response.ok) {
     throw new Error(`needs-you ${response.status}`);
   }
-  const listing = (await response.json()) as Listing;
+  const listing = (await response.json()) as Listing<Card>;
   return listing.items;
+}
+
+/* SCRATCH COPY OF WRITER A's api.ts ADDITIONS (feat/t-bf255880-a-core).
+   Take A's at the merge. */
+
+/** A bounded listing and whether the store call that filled it was cut. */
+export interface Listing<T> {
+  items: T[];
+  returned: number;
+  limit: number | null;
+  truncated: boolean;
+}
+
+/** One read of the JSON projection. */
+export async function fetchJson<T>(path: string): Promise<T> {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(`${path} ${response.status}`);
+  }
+  return (await response.json()) as T;
 }
 
 /**
@@ -78,7 +97,10 @@ export type WriteResult =
   | { recorded: true }
   | { recorded: false; refusal: string | null; status: number };
 
-async function post(path: string, body?: URLSearchParams): Promise<WriteResult> {
+export async function postForm(
+  path: string,
+  body?: URLSearchParams,
+): Promise<WriteResult> {
   const response = await fetch(path, {
     method: "POST",
     credentials: "same-origin",
@@ -105,7 +127,7 @@ export function postDecision(
   id: string,
   body: URLSearchParams,
 ): Promise<WriteResult> {
-  return post(
+  return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reply`,
     body,
   );
@@ -116,7 +138,7 @@ export function postDecision(
  * undo that demanded words would be a dialog wearing a button.
  */
 export function postReopen(board: string, id: string): Promise<WriteResult> {
-  return post(
+  return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reopen`,
   );
 }
