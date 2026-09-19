@@ -1321,11 +1321,41 @@ components:
 
         `board` is this document's wire name for that pairing; `attention` is
         the row verbatim.
-      required: [board, attention]
+
+        `bodyHtml` and `task` are what the card is RENDERED from, and they are
+        on the wire because the deck at `/` is a mounted client since
+        `t-1f495a7f`: the body is the same Markdown the served pages render
+        through `serve::markdown`, so one renderer and one sanitiser answer
+        both surfaces, and the task reference is the row the card's meta
+        sentence names. `task` is absent when the item is not about a task.
+      required: [board, attention, bodyHtml]
       additionalProperties: false
+      x-requirement: [SPA-14, SPA-15, WEB-27]
       properties:
         board: { type: string }
         attention: { $ref: "#/components/schemas/Attention" }
+        bodyHtml:
+          type: string
+          description: |
+            The item's body as sanitised HTML, from `serve::markdown`
+            (`rust/serve.rs`), which is the renderer the server-rendered
+            pages use. Raw HTML in the source is inert, as WEB-27 requires.
+          example: "<p>BLOCKED — is it safe to restart the proxy?</p>"
+        task:
+          allOf: [{ $ref: "#/components/schemas/TaskReference" }]
+          description: The row this item is about, when it is about one.
+
+    TaskReference:
+      type: object
+      description: |
+        Enough of a task for the card's meta sentence and nothing that is not
+        in it (`projection::TaskReference`).
+      required: [id, taskType, title]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        taskType: { type: string }
+        title: { type: string }
 
     BoardTask:
       type: object

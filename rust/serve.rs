@@ -617,10 +617,19 @@ fn render(url: &str) -> Result<String> {
         .collect::<Vec<_>>();
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
-        [] => needs_you(
-            query_value(query, "replied").as_deref(),
-            query_value(query, "undone").as_deref(),
-        ),
+        // The Needs-you deck is the mounted application (`t-1f495a7f`): the
+        // route answers the shell, the bundle mounts the deck into it, and
+        // the data comes from `/api/v1/needs-you` rather than from a second
+        // rendering of the same queue here. `?replied=` and `?undone=` are
+        // the same page and are read off the address bar by the client, so
+        // they need no arm of their own — which is why this arm ignores the
+        // query it used to interpolate.
+        //
+        // Every other route below is still server-rendered until
+        // `t-bf255880`, and `/all` is still the plain list this deck was
+        // laid over: `decision_card` and its renderers stay exactly where
+        // they are.
+        [] => Ok(app_shell()),
         ["all"] => all_open(
             query_value(query, "replied").as_deref(),
             query_value(query, "undone").as_deref(),
@@ -1831,64 +1840,12 @@ const EMPTY_QUEUE: &str = "<div class=empty-queue>\
 /// the answers it describes.
 const LIST_KEYS: &str = "<p class=keys>1–4 answer · u undo · c own</p>";
 
-/// The deck's map: the same keys plus the one only a deck has, the skip.
-const DECK_KEYS: &str =
-    "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>";
-
-/// The landing page, and the reason the server exists: every open item as a
-/// DECK — one card on screen, the long form the only thing that scrolls, the
-/// answers and the note within thumb reach at the bottom of the screen, and
-/// the next card one keystroke away (George, 2026-09-17: "we are looking at
-/// one item at a time, with the scrollable being only the body of the text
-/// and the 4 questions and the optional note wisely having a bit of space at
-/// the bottom of the screen in a sticky way, and then we quickly advance
-/// through item by item without scrolling").
-///
-/// Every card is still served here, in the order `/all` serves them: the
-/// deck shows one and hides the rest, so a browser without script gets the
-/// same list it always got and every card on it still submits. The panel is
-/// not separate markup either — it is the card, laid out as a column whose
-/// long form is the only scroller.
-fn needs_you(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
-    let (items, stores) = open_attention()?;
-    let mut html = String::from(
-        "<div class=heading><h1>Needs you</h1>\
-         <button type=button class=history-toggle data-history-toggle aria-expanded=false \
-         aria-controls=session-history>Decided <span data-history-count>0</span></button></div>",
-    );
-    html.push_str(&reply_notices(replied, undone));
-    // The bar counts what is left rather than where in a queue the reader is:
-    // `12 left` is the fact that decides whether to keep going, and `1 of 12`
-    // was a coordinate in a list nobody is reading as a list.
-    html.push_str(&format!(
-        "<p class=progress><span data-open-count>{count}</span> left</p>\
-         <section class=deck data-deck-cards>",
-        count = items.len(),
-    ));
-    if items.is_empty() {
-        html.push_str(EMPTY_QUEUE);
-    } else {
-        html.push_str(&open_cards(&items, &stores));
-        // The same sentence, as a template: the deck empties the moment the
-        // last card is posted, which is a round trip before the server can
-        // say so. One wording, served once, used by whichever of the two
-        // notices the reader gets first.
-        html.push_str(&format!("<template data-empty>{EMPTY_QUEUE}</template>"));
-    }
-    html.push_str("</section>");
-    html.push_str(DECK_KEYS);
-    // The side area is what a decision leaves behind: the notices the board
-    // sends, and every receipt this tab produced with its own undo. It is
-    // server markup so the strip has somewhere to live before the first
-    // decision, and so a projection swap has one node to carry across.
-    html.push_str(
-        "<aside class=side data-side>\
-         <div class=toasts data-notices role=log aria-live=polite></div>\
-         <section class=history id=session-history data-history>\
-         <h2>Decided this session</h2></section></aside>",
-    );
-    Ok(deck_page("Needs you", &html))
-}
+// The deck itself is no longer rendered here: `/` answers the application
+// shell and the bundle mounts the deck (`t-1f495a7f`, spec SPA-51). What
+// stayed behind is everything the deck was laid OVER — `open_attention`,
+// `open_cards`, `decision_card`, `EMPTY_QUEUE`, `reply_notices` — because
+// `/all` still serves the plain list from exactly those pieces, and the
+// mounted deck reads the same queue through `/api/v1/needs-you`.
 
 /// Every open item as one plain list, which is what this page was before the
 /// deck and what the deck is laid over: the same cards in the same order, one
@@ -2087,8 +2044,8 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
     let id_url = escape(&url_encode(&item.id));
     let project_url = escape(&url_encode(project));
     let mut html = format!(
-        "<article class=item tabindex=0 data-item=\"{id}\" data-project=\"{project}\" \
-         aria-labelledby=\"q-{id}\">\
+        "<article class=item tabindex=0 data-testid=deck-card data-item=\"{id}\" \
+         data-project=\"{project}\" aria-labelledby=\"q-{id}\">\
          <p class=eyebrow>{who} asked on \
          <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a>, \
          {age}</p>\
@@ -2117,8 +2074,8 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         );
         if choice.recommended {
             recommended = format!(
-                "<fieldset class=recommended><legend>Recommended</legend>\
-                 {rendered}</fieldset>"
+                "<fieldset class=recommended data-testid=deck-recommended>\
+                 <legend>Recommended</legend>{rendered}</fieldset>"
             );
         } else {
             alternatives.push_str(&format!("<div class=alternative>{rendered}</div>"));
@@ -2138,27 +2095,31 @@ fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
         "<div class=reply><label for=\"answer-{id_url}\">Add a note</label>\
          <textarea id=\"answer-{id_url}\" name=reply maxlength={max} \
          data-testid=deck-note></textarea></div>\
-         <details class=custom data-custom><summary>Answer in my own words</summary>\
+         <details class=custom data-custom data-testid=deck-custom>\
+         <summary>Answer in my own words</summary>\
          <fieldset class=outcomes>\
          <legend>recorded as</legend><div class=picks>{picks}</div>\
          </fieldset>\
          <div class=actions>\
-         <button type=submit class=record name=decision value=custom>Record my answer</button>\
-         <button type=button class=clear data-clear hidden>Clear verdict</button>\
-         <p class=hint data-hint>Pick a verdict and write your reply above.</p>\
+         <button type=submit class=record name=decision value=custom \
+         data-testid=deck-record>Record my answer</button>\
+         <button type=button class=clear data-clear data-testid=deck-clear hidden>\
+         Clear verdict</button>\
+         <p class=hint data-hint data-testid=deck-hint>Pick a verdict and write your \
+         reply above.</p>\
          </div></details></form>",
         picks = ATTENTION_OUTCOMES
             .iter()
             .map(|outcome| format!(
                 "<label for=\"outcome-{id_url}-{outcome}\">\
                  <input type=radio id=\"outcome-{id_url}-{outcome}\" name=outcome \
-                 value={outcome}>{outcome}</label>"
+                 data-testid=\"deck-outcome-{outcome}\" value={outcome}>{outcome}</label>"
             ))
             .collect::<String>(),
         max = MAX_REPLY_BYTES,
     ));
     html.push_str(&format!(
-        "<details class=full><summary>show the full item</summary>\
+        "<details class=full data-testid=deck-full><summary>show the full item</summary>\
          <div class=\"body md\" data-testid=deck-body>{}</div></details>",
         markdown(&item.body)
     ));
@@ -3929,7 +3890,11 @@ fn compact(payload: &serde_json::Value) -> String {
 /// before this, and a receipt's SHA line or a `RESOLVE-WHEN` clause is
 /// line-shaped on purpose: markdown's default "newline means space" would
 /// reflow those into prose the moment the renderer touched them.
-fn markdown(text: &str) -> String {
+/// The JSON projection typesets a card's body through this same function
+/// (`rust/projection.rs`), so the mounted deck renders bytes this parser
+/// produced rather than growing a second markdown renderer — and a second
+/// sanitiser with it.
+pub(crate) fn markdown(text: &str) -> String {
     let mut options = pulldown_cmark::Options::empty();
     options.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
     options.insert(pulldown_cmark::Options::ENABLE_TABLES);
@@ -4072,17 +4037,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// screen's whole top edge spent on navigation nobody uses while deciding.
 /// The drawer is one button, and the links inside it keep their `data-nav`
 /// names: the destinations did not change, only where they are kept.
+/// `<main>` carries no deck marker any more: the deck is the mounted
+/// application's, so every page this shell serves is a server-rendered read
+/// page (`t-1f495a7f`).
 fn page(title: &str, body: &str) -> String {
-    shell(title, body, "")
-}
-
-/// The same shell with `<main>` marked as the deck, which is what turns the
-/// list into one card and pins its answers to the bottom of the screen.
-fn deck_page(title: &str, body: &str) -> String {
-    shell(title, body, " data-deck")
-}
-
-fn shell(title: &str, body: &str, main_attributes: &str) -> String {
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
@@ -4098,7 +4056,7 @@ fn shell(title: &str, body: &str, main_attributes: &str) -> String {
          <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/all\" data-nav=all>All open</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
          <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/sprints\" data-nav=sprints>Sprints</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
          <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
-         </nav><main id=main{main_attributes}>{body}</main>\
+         </nav><main id=main>{body}</main>\
          <footer>The live operator view, served by <code>kanban serve</code> on this host.</footer>\
          <script>{JS}</script></body></html>",
         title = escape(title),
@@ -4609,6 +4567,7 @@ function showReceipt(card, label, noted, outcome) {
   // the outcome it recorded on its own left rule. A one-shot highlight was
   // a second motion competing with the card advance.
   receipt.className = `receipt outcome-${outcome}`;
+  receipt.dataset.testid = 'deck-receipt';
   receipt.dataset.receipt = card.dataset.item;
   receipt.dataset.item = card.dataset.item;
   receipt.dataset.project = card.dataset.project || '';
@@ -7548,8 +7507,8 @@ mod tests {
         let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
         assert!(
             card.contains(
-                "<button type=submit class=record name=decision value=custom>\
-                 Record my answer</button>"
+                "<button type=submit class=record name=decision value=custom \
+                 data-testid=deck-record>Record my answer</button>"
             ),
             "{card}"
         );
@@ -7577,16 +7536,17 @@ mod tests {
     }
 
     /// WEB-27 — one quiet keyboard line, and the digits live on the buttons.
+    ///
+    /// The DECK's line moved into the bundle with the deck itself
+    /// (`t-1f495a7f`), where it is observed in the browser by
+    /// `the_deck_keeps_one_quiet_keys_line_in_real_chrome`; what is still
+    /// served here is the plain list's, and the digits on the card are the
+    /// half both surfaces share.
     #[test]
     fn one_quiet_keys_line_carries_no_kbd_badges_unit() {
-        assert_eq!(
-            DECK_KEYS,
-            "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>"
-        );
-        for keys in [DECK_KEYS, LIST_KEYS] {
-            assert!(!keys.contains("<kbd>"), "{keys}");
-            assert_eq!(keys.matches("<p class=keys").count(), 1, "{keys}");
-        }
+        assert_eq!(LIST_KEYS, "<p class=keys>1–4 answer · u undo · c own</p>");
+        assert!(!LIST_KEYS.contains("<kbd>"), "{LIST_KEYS}");
+        assert_eq!(LIST_KEYS.matches("<p class=keys").count(), 1, "{LIST_KEYS}");
         let body = css_rule_body("p.keys");
         assert!(body.contains("font-size:.75rem"), "{body}");
         assert!(body.contains("color:var(--overlay)"), "{body}");
@@ -7716,7 +7676,7 @@ mod tests {
     fn every_field_is_labelled_and_status_is_announced_once_unit() {
         let fixture = card_fixture("labels");
         let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        let deck = deck_page(
+        let deck = page(
             "Needs you",
             &format!(
                 "<div class=heading><h1>Needs you</h1></div>\
@@ -8394,6 +8354,16 @@ mod tests {
         );
     }
 
+    /// How many open items the deck's queue holds, read where the deck
+    /// reads it: the JSON projection, which is the one place the count the
+    /// mounted page renders comes from.
+    fn queue_length() -> usize {
+        let listing = projection::needs_you().unwrap_or_else(|_| panic!("project the queue"));
+        serde_json::to_value(&listing).expect("the listing serialises")["returned"]
+            .as_u64()
+            .expect("a returned count") as usize
+    }
+
     #[test]
     #[ignore]
     fn web_counts_child_process() {
@@ -8431,20 +8401,18 @@ mod tests {
         }
 
         // Twelve open across two boards, said as a count on the list and as
-        // what is left on the deck.
+        // the length of the queue the deck reads. The deck's own `12 left`
+        // is rendered by the bundle now (`t-1f495a7f`) and is observed in
+        // the browser; what the SERVER owes both surfaces is one queue, so
+        // that is what is counted here.
         let list = render("/all").expect("render the plain list");
         assert_html_contains(
             &list,
             "<p class=count><span data-open-count>12</span> open across 2 boards</p>",
         );
-        let deck = render("/").expect("render the deck");
-        assert_html_contains(
-            &deck,
-            "<p class=progress><span data-open-count>12</span> left</p>",
-        );
-        assert!(!deck.contains(" of <span data-open-count>"), "{deck}");
+        assert_eq!(queue_length(), 12, "the deck's queue is not the list's");
 
-        // And the deck's count is the queue's, not the page's: settling the
+        // And the queue is the open rows', not the page's: settling the
         // nine atmux rows leaves three.
         for (board_path, id) in &decided {
             let mut store = Store::open(&PathBuf::from(board_path)).expect("reopen the board");
@@ -8460,22 +8428,22 @@ mod tests {
                 )
                 .expect("settle an atmux row");
         }
-        let deck = render("/").expect("re-render the deck");
-        assert_html_contains(
-            &deck,
-            "<p class=progress><span data-open-count>3</span> left</p>",
-        );
+        assert_eq!(queue_length(), 3, "settled rows are still in the queue");
         let list = render("/all").expect("re-render the plain list");
         assert_html_contains(
             &list,
             "<p class=count><span data-open-count>3</span> open across 1 board</p>",
         );
 
-        // Every in-scope route keeps both announcement channels and reaches
-        // no third party (WEB-52, WEB-54), which is a claim about the routes
-        // and so is made where the routes can be rendered.
+        // Every in-scope SERVER-RENDERED route keeps both announcement
+        // channels and reaches no third party (WEB-52, WEB-54), which is a
+        // claim about the routes and so is made where the routes can be
+        // rendered. `/` is not in the list because it is no longer one of
+        // them: it answers the application shell, whose own shape is held
+        // by `the_app_shell_closes_its_head_exactly_once_unit` (it links
+        // the two embedded assets and nothing else) and whose rendered page
+        // is judged in the browser.
         for route in [
-            "/",
             "/all",
             "/decided",
             "/boards",
@@ -8638,83 +8606,37 @@ mod tests {
 
         let fixture = seed_render_fixture(&data_dir);
 
-        let home = render("/").expect("render needs-you");
-        assert_page_title(&home, "Needs you");
-        assert_html_contains(&home, "Needs you");
-        assert_html_contains(&home, "Please review before release");
-        // The deck: one card on screen, with what is left counted above it.
-        // The page explains itself at length on the plain list it is laid
-        // over, where there is room for a paragraph.
-        assert_html_contains(&home, "<main id=main data-deck>");
-        assert_html_contains(&home, "<section class=deck data-deck-cards>");
-        assert_html_contains(
-            &home,
-            "<p class=progress><span data-open-count>1</span> left</p>",
-        );
-        assert!(!home.contains("<p class=explain>"), "{home}");
-        // Orientation above the question, in one sentence naming who asked,
-        // where, and when -- and the free-text answer folded out of the way
-        // beneath the choices.
-        assert_html_contains(&home, "<p class=eyebrow>geoyws asked on ");
-        assert_html_contains(
-            &home,
-            "<details class=custom data-custom><summary>Answer in my own words</summary>",
-        );
-        assert_html_contains(&home, "<legend>recorded as</legend>");
-        // No recommendation is authored on this row, so no recommended
-        // fieldset is rendered for it; the carded case is pinned in the e2e
-        // suite.
-        assert!(!home.contains("class=recommended"), "{home}");
-        assert_html_contains(&home, "<div class=reply><label for=\"answer-");
-        assert_html_contains(&home, ">Add a note</label>");
-        assert!(
-            !home.contains("Sent with whichever answer you pick"),
-            "the note field grew a hint paragraph again: {home}"
-        );
-        assert_html_contains(&home, "value=\"approve\" data-label=\"Approve - proceed\"");
-        // The submit is live in the markup: a rendered `disabled` made the
-        // click do nothing at all, and with no script the native POST has to
-        // reach the route's own validation.
-        assert_html_contains(
-            &home,
-            "<button type=submit class=record name=decision value=custom>Record my answer</button>",
-        );
-        // Two voices. The card refuses in the page's language, naming both
-        // halves the way the card itself names them, and nothing served here
-        // speaks CLI flags: the route's wording is quoted only when the route
-        // has actually said it.
-        assert_html_contains(
-            &home,
-            "Your own answer needs both halves: pick a verdict \
-             (approve, reject, defer or other) and write your reply.",
-        );
-        assert!(
-            !home.contains("--outcome"),
-            "the card is refusing in command-line flags to somebody on a phone: {home}"
-        );
-        // The release for a picked verdict, rendered away until there is one
-        // to release. It is a control and not only a keystroke because this
-        // shell is phone-first and a phone has no Escape key.
-        assert_html_contains(
-            &home,
-            "<button type=button class=clear data-clear hidden>Clear verdict</button>",
-        );
-        assert_html_contains(
-            &home,
-            "<p class=keys data-testid=deck-keys>1–4 answer · s skip · u undo · c own</p>",
-        );
-        assert!(
-            !home.contains("value=custom disabled"),
-            "the free-text submit is rendered disabled, so a click reports nothing: {home}"
-        );
-        assert_html_contains(&home, "/board/SERVE-RENDER");
-        assert!(!home.contains("<strong>before release</strong>"));
+        // `/` is the mounted application now (`t-1f495a7f`): the route
+        // answers the shell and nothing data-bearing, which is SPA-51's
+        // whole claim. Everything the CARD owes is asserted on `/all`
+        // below, which renders it from the same `decision_card` the deck
+        // reads through `/api/v1/needs-you`.
+        let home = render("/").expect("render the landing route");
+        assert_eq!(home, app_shell(), "/ is not the application shell");
+        for data_bearing in [
+            "<article class=item",
+            "<form class=decide",
+            "data-deck-cards",
+            "data-testid=app-root>",
+            "Please review before release",
+        ] {
+            assert!(
+                !home.contains(data_bearing),
+                "the shell carries {data_bearing}: {home}"
+            );
+        }
+        // ...and the query the deck used to be rendered with is the
+        // client's to read off the address bar: the same shell answers it.
+        let replied = render(&format!("/?replied={}", fixture.epic_id)).expect("render replied");
+        assert_eq!(replied, home, "?replied= is a different page from /");
 
-        // `/all` is the same queue as one plain list: the same cards, from
-        // the same loop, byte for byte. Two renderers would be two card
-        // orders to keep in step.
+        // `/all` is the queue as one plain list, and the card is the card:
+        // the page explains itself at length here, where there is room for
+        // a paragraph.
         let list = render("/all").expect("render all open");
         assert_page_title(&list, "Needs you");
+        assert_html_contains(&list, "Needs you");
+        assert_html_contains(&list, "Please review before release");
         assert_html_contains(
             &list,
             "<p class=explain>Each card is one question an agent is waiting on.",
@@ -8726,17 +8648,66 @@ mod tests {
         // The page script is the same on every page, and it names the deck's
         // hooks; what says this page is not a deck is its `<main>`.
         assert_html_contains(&list, "<main id=main>");
-        let card_of = |html: &str| {
-            let start = html.find("<article class=item").expect("a card");
-            let end = html[start..].find("</article>").expect("the card closes");
-            html[start..start + end + "</article>".len()].to_owned()
-        };
-        assert_eq!(card_of(&home), card_of(&list));
-
-        let replied = render(&format!("/?replied={}", fixture.epic_id)).expect("render replied");
-        assert_page_title(&replied, "Needs you");
+        // Orientation above the question, in one sentence naming who asked,
+        // where, and when -- and the free-text answer folded out of the way
+        // beneath the choices.
+        assert_html_contains(&list, "<p class=eyebrow>geoyws asked on ");
         assert_html_contains(
-            &replied,
+            &list,
+            "<details class=custom data-custom data-testid=deck-custom>\
+             <summary>Answer in my own words</summary>",
+        );
+        assert_html_contains(&list, "<legend>recorded as</legend>");
+        // No recommendation is authored on this row, so no recommended
+        // fieldset is rendered for it; the carded case is pinned in the e2e
+        // suite.
+        assert!(!list.contains("class=recommended"), "{list}");
+        assert_html_contains(&list, "<div class=reply><label for=\"answer-");
+        assert_html_contains(&list, ">Add a note</label>");
+        assert!(
+            !list.contains("Sent with whichever answer you pick"),
+            "the note field grew a hint paragraph again: {list}"
+        );
+        assert_html_contains(&list, "value=\"approve\" data-label=\"Approve - proceed\"");
+        // The submit is live in the markup: a rendered `disabled` made the
+        // click do nothing at all, and the native POST has to reach the
+        // route's own validation.
+        assert_html_contains(
+            &list,
+            "<button type=submit class=record name=decision value=custom \
+             data-testid=deck-record>Record my answer</button>",
+        );
+        // Two voices. The card refuses in the page's language, naming both
+        // halves the way the card itself names them, and nothing served here
+        // speaks CLI flags: the route's wording is quoted only when the route
+        // has actually said it.
+        assert_html_contains(
+            &list,
+            "Your own answer needs both halves: pick a verdict \
+             (approve, reject, defer or other) and write your reply.",
+        );
+        assert!(
+            !list.contains("--outcome"),
+            "the card is refusing in command-line flags to somebody on a phone: {list}"
+        );
+        // The release for a picked verdict, rendered away until there is one
+        // to release. It is a control and not only a keystroke because this
+        // shell is phone-first and a phone has no Escape key.
+        assert_html_contains(
+            &list,
+            "<button type=button class=clear data-clear data-testid=deck-clear hidden>\
+             Clear verdict</button>",
+        );
+        assert!(
+            !list.contains("value=custom disabled"),
+            "the free-text submit is rendered disabled, so a click reports nothing: {list}"
+        );
+        assert_html_contains(&list, "/board/SERVE-RENDER");
+        assert!(!list.contains("<strong>before release</strong>"));
+        let replied_list =
+            render(&format!("/all?replied={}", fixture.epic_id)).expect("render replied");
+        assert_html_contains(
+            &replied_list,
             "<code>e-serve-render</code> is decided and the board has it.",
         );
 
