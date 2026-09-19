@@ -514,6 +514,12 @@ pub struct Task {
 /// This is a projection of task_dependencies, never stored separately. The
 /// source identity is retained because an inherited epic gate must tell a leaf
 /// which plan owns the edge rather than presenting the prerequisite as local.
+///
+/// The title is optional because a gate may name a row this caller may not
+/// read (`t-3548303e`). Under managed enforcement that title is `null` while
+/// the id and the status stay: the gate is why a claim is refused, so hiding
+/// the whole blocker would make a blocked row read as claimable, and the
+/// prose is the only part of it that is disclosure rather than function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateBlocker {
     #[serde(rename = "sourceTaskID")]
@@ -521,7 +527,7 @@ pub struct GateBlocker {
     #[serde(rename = "prerequisiteID")]
     pub prerequisite_id: String,
     #[serde(rename = "prerequisiteTitle")]
-    pub prerequisite_title: String,
+    pub prerequisite_title: Option<String>,
     #[serde(rename = "prerequisiteStatus")]
     pub prerequisite_status: String,
 }

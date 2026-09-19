@@ -4804,11 +4804,23 @@ impl Store {
         Ok((where_clause, values))
     }
 
+    /// The prerequisites declared on one row, as rows.
+    ///
+    /// A listing, so it obeys the listing rule (`t-34f6eed5`): a prerequisite
+    /// whose tags this caller may not read is absent, exactly as it is absent
+    /// from [`Store::list_tasks`], and for the same reason — an enumeration
+    /// that carried it would hand over its title, its tags and its status to
+    /// a caller whose named read of it is refused. The EDGE is not hidden
+    /// with it: [`Store::blocking_gates`] still reports the gate that
+    /// prerequisite holds, by id and status, so a row whose claim is refused
+    /// never reads as claimable.
     pub fn dependencies(&self, id: &str) -> Result<Vec<Task>> {
-        // Relations carry no tags of their own: board scope only.
+        // The subject row's existence is the caller's to establish; the
+        // prerequisites are filtered here, per row, on their own tags.
         self.authz.check_read(&[])?;
         let mut rows = dependencies(&self.connection, id)?;
         attach_tags(&self.connection, rows.iter_mut())?;
+        rows.retain(|task| self.authz.permits_read(&task.tags));
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
@@ -4823,12 +4835,20 @@ impl Store {
     /// empty list means no dependency gate, which is not the same as claimable:
     /// a draft ancestor, a live lease, routing and authorization are separate
     /// rules with their own answers.
+    ///
+    /// A prerequisite this caller may not read is REDUCED here, never dropped
+    /// (`t-3548303e`): dropping it would leave a readable row reporting an
+    /// empty gate while every claim on it is refused by that same gate, which
+    /// is a worse answer than a partial one. What survives is the gate's
+    /// function — which row holds this one, and whether it is finished — and
+    /// what goes is its prose, the title.
     pub fn blocking_gates(&self, id: &str) -> Result<Vec<GateBlocker>> {
-        // Relations carry no tags of their own: board scope only, exactly as
-        // [`Store::dependencies`] reads them.
-        self.authz.check_read(&[])?;
-        require_task(&self.connection, id)?;
-        blocking_gates(&self.connection, id, &lapsed_leases(&self.connection)?)
+        // A named read of the subject row: a gate is read through the row it
+        // gates, so that row's own tags gate it.
+        self.require_task(id)?;
+        let mut blockers = blocking_gates(&self.connection, id, &lapsed_leases(&self.connection)?)?;
+        self.redact_denied_gate_titles(&mut blockers)?;
+        Ok(blockers)
     }
 
     /// The same answer for a listing, which asks it of every row.
@@ -4837,16 +4857,55 @@ impl Store {
     /// board-wide (see `LapsedLeases`), so a listing reads it once here
     /// rather than once per row.
     pub fn blocking_gates_for(&self, ids: &[String]) -> Result<Vec<Vec<GateBlocker>>> {
-        self.authz.check_read(&[])?;
         let lapsed = lapsed_leases(&self.connection)?;
         ids.iter()
             .map(|id| {
-                require_task(&self.connection, id)?;
-                blocking_gates(&self.connection, id, &lapsed)
+                self.require_task(id)?;
+                let mut blockers = blocking_gates(&self.connection, id, &lapsed)?;
+                self.redact_denied_gate_titles(&mut blockers)?;
+                Ok(blockers)
             })
             .collect()
     }
 
+    /// Blank the title of every prerequisite this caller may not read.
+    ///
+    /// Outside `Managed` nothing can be denied, so the whole walk — one tag
+    /// read per DISTINCT prerequisite, and a gate names the same prerequisite
+    /// once per owner that declared it — is skipped, and the direct estate
+    /// pays nothing for a guard that cannot deny.
+    fn redact_denied_gate_titles(&self, blockers: &mut [GateBlocker]) -> Result<()> {
+        if !self.authz.is_enforcing() {
+            return Ok(());
+        }
+        let mut readable: BTreeMap<String, bool> = BTreeMap::new();
+        for blocker in blockers {
+            let permitted = match readable.get(&blocker.prerequisite_id) {
+                Some(known) => *known,
+                None => {
+                    let tags = task_tags(&self.connection, &blocker.prerequisite_id)?;
+                    let permitted = self.authz.permits_read(&tags);
+                    readable.insert(blocker.prerequisite_id.clone(), permitted);
+                    permitted
+                }
+            };
+            if !permitted {
+                blocker.prerequisite_title = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// The chain of plans above this row, outermost first.
+    ///
+    /// The walk stops at the first ancestor this caller may not read rather
+    /// than refusing the whole chain or punching a hole in it (`t-3548303e`):
+    /// a chain with a gap misreports which plan owns which, and refusing
+    /// outright let one denied epic hide a row the caller IS authorized to
+    /// read — `context` answered `denied or not found` for the readable leaf.
+    /// What is returned is the contiguous readable run nearest the row, and
+    /// it discloses nothing the row does not already carry: the row's own
+    /// `parentID` is on the row.
     pub fn ancestors(&self, id: &str) -> Result<Vec<Task>> {
         let mut current = self.require_task(id)?;
         let mut out = Vec::new();
@@ -4854,6 +4913,15 @@ impl Store {
         while let Some(parent) = current.parent_id.clone() {
             if !seen.insert(parent.clone()) {
                 bail!("parent cycle detected at {parent}");
+            }
+            // The tags are read and decided on first, so a DENIED ancestor
+            // truncates the chain while a genuinely broken one — a dangling
+            // parent id — still surfaces as the fault it is.
+            if !self
+                .authz
+                .permits_read(&task_tags(&self.connection, &parent)?)
+            {
+                break;
             }
             current = self.require_task(&parent)?;
             out.insert(0, current.clone());
@@ -9536,6 +9604,241 @@ mod tests {
             listed.len(),
             2,
             "the total counts rows this caller may not read"
+        );
+    }
+
+    /// The relations of a READABLE row: a prerequisite the caller may not read
+    /// leaves the dependency listing, keeps its gate, and loses its title
+    /// there; an ancestor it may not read truncates the chain instead of
+    /// refusing the whole row (`t-3548303e`).
+    ///
+    /// The three answers are deliberately different because the three
+    /// questions are:
+    ///
+    /// * `dependencies` ENUMERATES rows, so it obeys the listing rule
+    ///   `t-34f6eed5` set — the denied row is absent, exactly as it is absent
+    ///   from `list_tasks`.
+    /// * `blocking_gates` is the one read every refusal is taken through, so
+    ///   the denied prerequisite must stay: dropped, a row whose every claim
+    ///   the gate refuses would report itself ungated. Its id and status are
+    ///   its function and stay; its title is prose and goes.
+    /// * `ancestors` is a CHAIN, so neither dropping (a hole misreports which
+    ///   plan owns which) nor refusing (one denied epic hides a readable leaf,
+    ///   which is what `context` did) is right: it stops at the boundary.
+    ///
+    /// Every assertion is paired with its positive control — the readable
+    /// prerequisite `t-open` is present in full, with its title, in all three
+    /// answers — so a reader that had simply broken would fail here too.
+    /// Remove either `retain` line or the redaction and this test fails.
+    #[test]
+    fn managed_relations_drop_a_tag_denied_prerequisite_but_keep_its_gate() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "dddddddd-7777-4777-8777-777777777777";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-relations-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+
+            let mut epic = task_input("t-epic", "secret epic", vec!["secret".to_owned()], vec![]);
+            epic.task_type = "epic".to_owned();
+            seed.add_task(epic).expect("seed epic");
+            seed.add_task(task_input(
+                "t-secret",
+                "secret prerequisite",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret prerequisite");
+            seed.add_task(task_input(
+                "t-open",
+                "open prerequisite",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed open prerequisite");
+
+            let mut story = task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec!["t-secret".to_owned(), "t-open".to_owned()],
+            );
+            story.task_type = "story".to_owned();
+            story.parent_id = Some("t-epic".to_owned());
+            seed.add_task(story).expect("seed visible row");
+
+            let mut child =
+                task_input("t-child", "secret child", vec!["secret".to_owned()], vec![]);
+            child.parent_id = Some("t-visible".to_owned());
+            seed.add_task(child).expect("seed secret child");
+            let mut leaf = task_input("t-leaf", "visible leaf", vec!["visible".to_owned()], vec![]);
+            leaf.parent_id = Some("t-visible".to_owned());
+            seed.add_task(leaf).expect("seed visible leaf");
+        }
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+
+        // The control: the row whose relations are read IS readable, and the
+        // rows hanging off it are not.
+        store
+            .require_task("t-visible")
+            .expect("task show t-visible");
+        for hidden in ["t-secret", "t-epic", "t-child"] {
+            assert_denied(store.require_task(hidden), &format!("task show {hidden}"));
+        }
+
+        // 1. The dependency listing: the denied prerequisite is absent, the
+        //    readable one is there in full.
+        let dependencies = store.dependencies("t-visible").expect("dependencies");
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|task| (task.id.as_str(), task.title.as_str()))
+                .collect::<Vec<_>>(),
+            [("t-open", "open prerequisite")],
+            "the dependency listing handed over a prerequisite this caller may not read"
+        );
+
+        // 2. The gate: BOTH prerequisites, because the gate is what refuses
+        //    the claim — with the denied one's title blanked and nothing else.
+        let gates = store.blocking_gates("t-visible").expect("blocking gates");
+        assert_eq!(
+            gates
+                .iter()
+                .map(|gate| (
+                    gate.source_task_id.as_str(),
+                    gate.prerequisite_id.as_str(),
+                    gate.prerequisite_title.as_deref(),
+                    gate.prerequisite_status.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("t-visible", "t-open", Some("open prerequisite"), "todo"),
+                ("t-visible", "t-secret", None, "todo"),
+            ],
+            "the gate must keep the denied prerequisite and lose only its title"
+        );
+        // The listing form answers identically, including for a row that
+        // INHERITS the gate from the readable story above it.
+        let listed_gates = store
+            .blocking_gates_for(&["t-visible".to_owned(), "t-leaf".to_owned()])
+            .expect("blocking gates for a listing");
+        assert_eq!(
+            listed_gates[0], gates,
+            "the listing gate differs from the row's"
+        );
+        assert_eq!(
+            listed_gates[1]
+                .iter()
+                .map(|gate| (
+                    gate.source_task_id.as_str(),
+                    gate.prerequisite_id.as_str(),
+                    gate.prerequisite_title.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("t-visible", "t-open", Some("open prerequisite")),
+                ("t-visible", "t-secret", None),
+            ],
+            "the inherited gate must read the same way"
+        );
+
+        // 3. The chain: truncated at the denied epic, never refused, and the
+        //    readable run nearest the row is intact.
+        assert!(
+            store.ancestors("t-visible").expect("ancestors").is_empty(),
+            "a denied ancestor must not be in the chain"
+        );
+        assert_eq!(
+            store
+                .ancestors("t-leaf")
+                .expect("the chain of a readable leaf must answer, not refuse")
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-visible"],
+            "the chain must keep the readable run and stop at the boundary"
+        );
+
+        // 4. The context packet reads all three through the store, so it is
+        //    true by construction — asserted because it is the surface the
+        //    finding was filed against.
+        let packet = store.context_packet("t-visible").expect("context packet");
+        assert!(
+            packet.ancestors.is_empty(),
+            "the packet leaked the denied epic"
+        );
+        assert_eq!(
+            packet
+                .dependencies
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-open"],
+            "the packet leaked the denied prerequisite"
+        );
+        assert_eq!(
+            packet.blocking_gates, gates,
+            "the packet's gate differs from the store's"
+        );
+
+        // 5. The same board read with full authority: every title is there.
+        //    Outside `Managed` nothing is filtered and nothing is blanked, so
+        //    the direct estate's answer is unchanged.
+        let direct = Store::open(&path).expect("open direct");
+        assert_eq!(
+            direct
+                .dependencies("t-visible")
+                .expect("direct dependencies")
+                .len(),
+            2,
+            "the direct estate must still see both prerequisites"
+        );
+        assert_eq!(
+            direct
+                .blocking_gates("t-visible")
+                .expect("direct gate")
+                .iter()
+                .map(|gate| gate.prerequisite_title.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("open prerequisite"), Some("secret prerequisite")],
+            "the direct estate must still see both titles"
+        );
+        assert_eq!(
+            direct
+                .ancestors("t-visible")
+                .expect("direct ancestors")
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-epic"],
+            "the direct estate must still see the whole chain"
         );
     }
 
