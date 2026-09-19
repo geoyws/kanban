@@ -504,6 +504,10 @@ pub struct Task {
     /// Registered tags carried by this row, sorted. What the row is *about*,
     /// as opposed to `lane`, which is what kind of work it is.
     pub tags: Vec<String>,
+    /// The models allowed to claim this row, sorted. Empty is unrestricted,
+    /// which is what every row on a board that never used the feature reads
+    /// as; a non-empty list refuses every claim from outside it.
+    pub allowed_models: Vec<String>,
 }
 /// One incomplete prerequisite inherited by a task from itself or an ancestor.
 ///
@@ -544,6 +548,10 @@ pub struct Claim {
     pub head_sha: Option<String>,
     /// The outermost superproject's commit, for a nested checkout.
     pub root_head: Option<String>,
+    /// The model this claim declared it runs as, when it declared one. NULL
+    /// on every claim taken before `BOARD_V30` and on every claim that passed
+    /// no `--model`, which an unrestricted task still accepts.
+    pub model: Option<String>,
 }
 
 /// A newly granted lease plus the active rules that frame its work.
@@ -592,6 +600,7 @@ pub struct ClaimSummary {
     pub claimed_at: i64,
     pub heartbeat_at: i64,
     pub expires_at: i64,
+    pub model: Option<String>,
 }
 
 impl From<&Claim> for ClaimSummary {
@@ -603,6 +612,7 @@ impl From<&Claim> for ClaimSummary {
             claimed_at: value.claimed_at,
             heartbeat_at: value.heartbeat_at,
             expires_at: value.expires_at,
+            model: value.model.clone(),
         }
     }
 }
@@ -829,6 +839,55 @@ pub struct AddTask {
     pub actor: Option<String>,
     /// Registered tags to apply. Unregistered ones are refused.
     pub tags: Vec<String>,
+    /// The models allowed to claim the new row. Empty leaves it unrestricted.
+    pub allowed_models: Vec<String>,
+}
+
+/// The longest model name this board will store.
+const MODEL_NAME_MAX: usize = 64;
+
+/// A model name a task's allow-list or a claim will accept.
+///
+/// `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`, matched case-sensitively — the
+/// alphabet every harness already spells its models in (`claude-opus-4.1`,
+/// `openai/gpt-5`, `z.ai:glm-4.6`), and nothing else. Case is kept rather
+/// than folded because there is no master file to fold toward: the claimant's
+/// `--model` is free text on `checkpoint` and `handoff create` already, and
+/// an allow-list that quietly matched a different spelling would be a second
+/// vocabulary with no registry to arbitrate it.
+///
+/// The shape is checked at the door on BOTH sides. A typo in an allow-list
+/// then fails closed — nobody can claim the row — and the refusal prints the
+/// set, so the typo is visible rather than silent.
+pub fn validate_model_name(name: &str) -> Result<String> {
+    let usable = |name: &str| {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && name.len() <= MODEL_NAME_MAX
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+    };
+    if !usable(name) {
+        bail!(
+            "model name {name} is not a usable name: it must match \
+             ^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,63}}$"
+        );
+    }
+    Ok(name.to_owned())
+}
+
+/// Validate a whole allow-list, and return it sorted with duplicates dropped.
+///
+/// Sorted at the door rather than at every read: the list is a set, and the
+/// wire shape promises a sorted array, so the one place that can guarantee it
+/// is the one place that writes it.
+pub fn validate_model_names(names: &[String]) -> Result<Vec<String>> {
+    let mut canonical = names
+        .iter()
+        .map(|name| validate_model_name(name))
+        .collect::<Result<Vec<_>>>()?;
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
 }
 
 #[derive(Debug, Clone)]
@@ -2129,6 +2188,61 @@ mod tests {
         // never consults.
         assert_eq!(board_id_from_path("/"), None);
         assert_eq!(board_id_from_path(""), None);
+    }
+
+    /// The whole of `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`, boundary by
+    /// boundary: what a harness actually calls its models, and what the
+    /// refusal must catch before a typo reaches an allow-list nobody can
+    /// satisfy.
+    #[test]
+    fn a_model_name_has_one_shape() {
+        for good in [
+            "Astra",
+            "blender",
+            "claude-opus-4.1",
+            "openai/gpt-5",
+            "z.ai:glm-4.6",
+            "kimi_k2",
+            "4",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(validate_model_name(good).unwrap(), good, "{good} refused");
+        }
+        for bad in [
+            "",
+            "-leading",
+            ".leading",
+            "/leading",
+            "has space",
+            "has\ttab",
+            "bang!",
+            "emoji🙂",
+            &"a".repeat(65),
+        ] {
+            let error = validate_model_name(bad).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "model name {bad} is not a usable name: it must match \
+                     ^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,63}}$"
+                ),
+                "{bad} was accepted or refused with the wrong sentence"
+            );
+        }
+        // Case is kept, never folded: there is no master file to fold toward.
+        assert_eq!(validate_model_name("Astra").unwrap(), "Astra");
+        // A list is a sorted set, so the wire shape cannot depend on the
+        // order the flags arrived in.
+        assert_eq!(
+            validate_model_names(&[
+                "blender".to_owned(),
+                "Astra".to_owned(),
+                "blender".to_owned(),
+            ])
+            .unwrap(),
+            vec!["Astra".to_owned(), "blender".to_owned()]
+        );
+        assert!(validate_model_names(&["has space".to_owned()]).is_err());
     }
 
     /// One well-formed pair of tokens, which every refusal case breaks in

@@ -130,8 +130,8 @@ Usage:
              [--body TEXT | --body-file PATH] [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled]
              [--priority P0|P1|P2|0-9] [--depends-on ID ...] [--tag NAME ...]
              [--assignee AGENT] [--lane LANE] [--deliverable TEXT]
-             [--stale-minutes N] [--driver-only] [--sprint sp-…]
-  kanban task list [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled] [--tag NAME] [--lane LANE] [--all]
+             [--stale-minutes N] [--driver-only] [--sprint sp-…] [--allowed-model NAME ...]
+  kanban task list [--status draft|backlog|todo|in_progress|blocked|review|done|cancelled] [--tag NAME] [--lane LANE] [--allowed-model NAME] [--all]
              [--with-claims] [--with-relations]
              [--fields id,title,status,... | --no-body] [--json]
   kanban task show ID [--limit N] [--json]
@@ -148,20 +148,23 @@ Usage:
              [--tag NAME ... | --clear-tags] [--depends-on ID ... | --clear-dependencies]
              [--assignee AGENT | --unassign] [--lane LANE | --clear-lane]
              [--deliverable TEXT | --clear-deliverable] [--stale-minutes N]
-             [--driver-only | --no-driver-only] [--sprint sp-… | --clear-sprint] [--json]
+             [--driver-only | --no-driver-only] [--sprint sp-… | --clear-sprint]
+             [--allowed-model NAME ... | --clear-allowed-models] [--json]
   kanban task metadata ID --as ACTOR --patch-json JSON_OBJECT
   kanban story advance ID --as ACTOR [--to planning|ready|in-progress|testing|review|merging|done] [--reviewer AGENT] [--committer AGENT]
   kanban story signoff|unsignoff ID --as ACTOR [--note TEXT]
   kanban claim [ID | --next] --as AGENT [--session ID] [--lease-minutes N]
              [--lane LANE] [--role ROLE] [--caller-scope driver]
              [--no-cross-lane] [--allow-reassign]
-             [--sprint sp-… | --any-sprint] [--json]
+             [--sprint sp-… | --any-sprint] [--model NAME] [--json]
+             (a task restricted to models refuses a claim whose --model is
+             missing or outside its list, and the refusal prints the list)
              (when a current sprint exists, claims are scoped to it; the
              override is recorded on the task_claim event; unattached rows
              are NOT offered — outside the boundary, not inside it)
   kanban claim --candidates --as AGENT [--tag NAME] [--lane LANE] [--role ROLE]
              [--caller-scope driver] [--no-cross-lane] [--allow-reassign]
-             [--limit N] [--json]
+             [--limit N] [--model NAME] [--json]
   kanban heartbeat ID --lease TOKEN [--lease-minutes N]
   kanban release ID --lease TOKEN [--keep-status]
   kanban note ID TEXT --as AGENT [--kind plan|progress|blocker|decision|evidence|done]
@@ -179,7 +182,7 @@ Usage:
              git checkout when omitted; an explicit flag overrides the capture)
   kanban handoff list [--task ID] [--status pending|accepted|cancelled|retired] [--to AGENT] [--limit N] [--all] [--json]
   kanban handoff accept ID --as AGENT [--session ID] [--lease-minutes N]
-             [--caller-scope driver] [--sprint sp-… | --any-sprint] [--json]
+             [--caller-scope driver] [--sprint sp-… | --any-sprint] [--model NAME] [--json]
   kanban handoff retire ID --as AGENT --note TEXT [--json]
   kanban import atmux-json|atmux-sqlite PATH --as ACTOR [--reconcile] [--force]
              [--dry-run] [--verify] [--json]
@@ -328,7 +331,7 @@ unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 34] = [
+pub(crate) const BOOLEAN: [&str; 35] = [
     "help",
     "json",
     "version",
@@ -350,6 +353,7 @@ pub(crate) const BOOLEAN: [&str; 34] = [
     "clear-parent",
     "clear-dependencies",
     "clear-tags",
+    "clear-allowed-models",
     "reconcile",
     "dry-run",
     "verify",
@@ -413,6 +417,13 @@ pub(crate) const ARTIFACT_EXPECTED_REPEATABLE: [&str; 1] = ["artifact"];
 pub(crate) const ARTIFACT_OBSERVED_REPEATABLE: [&str; 1] = ["observed"];
 pub(crate) const SPRINT_PLAN_REPEATABLE: [&str; 1] = ["candidate"];
 
+/// The model allow-list flag, list-valued where it AUTHORS a set — `task add`
+/// and `task update` — and scalar on `task list`, `claim` and
+/// `handoff accept`, where one name is asked about or declared. Kept out of
+/// [`REPEATABLE`] for exactly that split: a second `--allowed-model` on
+/// `task list` would be two filters for one listing.
+pub(crate) const ALLOWED_MODEL_REPEATABLE: [&str; 1] = ["allowed-model"];
+
 /// One operation's list-valued flags, keyed on the command AND the
 /// subcommand.
 ///
@@ -427,7 +438,7 @@ struct ListValued {
     flags: &'static [&'static str],
 }
 
-const LIST_VALUED: [ListValued; 8] = [
+const LIST_VALUED: [ListValued; 10] = [
     ListValued {
         command: "watch",
         sub: None,
@@ -467,6 +478,16 @@ const LIST_VALUED: [ListValued; 8] = [
         command: "sprint",
         sub: Some("plan"),
         flags: &SPRINT_PLAN_REPEATABLE,
+    },
+    ListValued {
+        command: "task",
+        sub: Some("add"),
+        flags: &ALLOWED_MODEL_REPEATABLE,
+    },
+    ListValued {
+        command: "task",
+        sub: Some("update"),
+        flags: &ALLOWED_MODEL_REPEATABLE,
     },
 ];
 
@@ -1018,6 +1039,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "stale-minutes",
             "driver-only",
             "sprint",
+            "allowed-model",
         ],
         &["title"],
         false,
@@ -1031,6 +1053,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "with-claims",
             "tag",
             "lane",
+            "allowed-model",
             "fields",
             "no-body",
             "all",
@@ -1080,6 +1103,8 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "clear-dependencies",
             "sprint",
             "clear-sprint",
+            "allowed-model",
+            "clear-allowed-models",
         ],
         &["id"],
         false,
@@ -1109,6 +1134,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "candidates",
             "tag",
             "limit",
+            "model",
             "sprint",
             "any-sprint",
         ],
@@ -1187,6 +1213,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "caller-scope",
             "sprint",
             "any-sprint",
+            "model",
         ],
         &["id"],
         false,
@@ -4007,16 +4034,32 @@ fn object_of<T: Serialize>(value: &T) -> Result<Map<String, Value>> {
     }
 }
 
+/// What narrows one `task list`, as one value.
+///
+/// A struct rather than four more positionals: the filters travel together to
+/// exactly one reader, and a call site passing four bare `Option<&str>` in a
+/// row is one transposition away from filtering by lane on the tag column.
+struct TaskListQuery<'a> {
+    status: Option<&'a str>,
+    tag: Option<&'a str>,
+    lane: Option<&'a str>,
+    allowed_model: Option<&'a str>,
+    include_archived: bool,
+}
+
 fn list_json(
     store: &Store,
-    status: Option<&str>,
-    tag: Option<&str>,
-    lane: Option<&str>,
+    query: TaskListQuery<'_>,
     claims: bool,
     relations: bool,
-    include_archived: bool,
 ) -> Result<Value> {
-    let listed = store.list_tasks_with_claims(status, tag, lane, include_archived)?;
+    let listed = store.list_tasks_with_claims(
+        query.status,
+        query.tag,
+        query.lane,
+        query.allowed_model,
+        query.include_archived,
+    )?;
     // Every row's gate in one read, because the lapsed-lease projection it
     // applies is board-wide: asking row by row put that read on the listing
     // once per row.
@@ -4087,7 +4130,7 @@ fn task_list_row(
 /// came back, so an empty listing refuses a misspelt key the same way a full
 /// one does. The test module builds a row and compares, so the list cannot
 /// drift from what [`task_list_row`] emits.
-const TASK_FIELDS: [&str; 21] = [
+const TASK_FIELDS: [&str; 22] = [
     "id",
     "type",
     "parentID",
@@ -4108,6 +4151,7 @@ const TASK_FIELDS: [&str; 21] = [
     "archivedAt",
     "metadata",
     "tags",
+    "allowedModels",
     "claimed",
 ];
 
@@ -5915,7 +5959,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 }
             }
             let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
-            let tasks = store.list_tasks(None, None, None, false)?;
+            let tasks = store.list_tasks(None, None, None, None, false)?;
             // Counted, not fetched: a listing page passed off as a count told
             // an operator 100 pending handoffs on a board holding 101, with
             // nothing to say it had stopped. The ranking below needs only the
@@ -6488,6 +6532,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             cross_lane: !args.has("no-cross-lane"),
             allow_reassign: args.has("allow-reassign"),
             sprint_override: claim_sprint_override(&args)?,
+            model: option_string(&args, "model"),
         };
         return print(
             &args.bounded_page(100, "claim candidates", |limit| {
@@ -6690,6 +6735,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         let task = store.add_task_in_sprint(
             crate::model::AddTask {
                 tags: args.many("tag"),
+                allowed_models: args.many("allowed-model"),
                 id: option_string(&args, "id"),
                 task_type: args.one("type").unwrap_or("task").into(),
                 parent_id: option_string(&args, "parent"),
@@ -6726,12 +6772,15 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         let keep = projection(&args, &fields, &TASK_GATED_FIELDS)?;
         let mut rows = list_json(
             &store,
-            args.one("status"),
-            args.one("tag"),
-            args.one("lane"),
+            TaskListQuery {
+                status: args.one("status"),
+                tag: args.one("tag"),
+                lane: args.one("lane"),
+                allowed_model: args.one("allowed-model"),
+                include_archived: args.has("all"),
+            },
             claims,
             relations,
-            args.has("all"),
         )?;
         if let Some(keep) = &keep {
             project(&mut rows, keep);
@@ -6806,6 +6855,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             ("depends-on", "clear-dependencies"),
             ("tag", "clear-tags"),
             ("sprint", "clear-sprint"),
+            ("allowed-model", "clear-allowed-models"),
         ] {
             if args.has(a) && args.has(b) {
                 bail!("--{a} and --{b} are mutually exclusive");
@@ -6816,6 +6866,13 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 Some(Vec::new())
             } else if args.flags.contains_key("tag") {
                 Some(args.many("tag"))
+            } else {
+                None
+            },
+            allowed_models: if args.has("clear-allowed-models") {
+                Some(Vec::new())
+            } else if args.flags.contains_key("allowed-model") {
+                Some(args.many("allowed-model"))
             } else {
                 None
             },
@@ -6927,6 +6984,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 cross_lane: !args.has("no-cross-lane"),
                 allow_reassign: args.has("allow-reassign"),
                 sprint_override: claim_sprint_override(&args)?,
+                model: option_string(&args, "model"),
             },
         )?;
         value.rules =
@@ -7045,6 +7103,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 lease_ms: lease_ms(&args)?,
                 caller_scope: option_string(&args, "caller-scope"),
                 sprint_override: claim_sprint_override(&args)?,
+                model: option_string(&args, "model"),
                 git,
             },
         )?;
@@ -9535,6 +9594,7 @@ mod tests {
             "archived": false,
             "metadata": {},
             "tags": ["kanban"],
+            "allowedModels": ["Astra"],
         }))
         .unwrap()
     }
@@ -9615,6 +9675,7 @@ mod tests {
             claimed_at: 1,
             heartbeat_at: 1,
             expires_at: 2,
+            model: None,
         };
         let mut expected = TASK_FIELDS.to_vec();
         expected.extend(TASK_GATED_FIELDS.iter().map(|(key, _)| *key));

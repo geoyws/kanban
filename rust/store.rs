@@ -466,6 +466,87 @@ fn attach_tags<'a>(
     Ok(())
 }
 
+/// Attach each row's model allow-list, sorted.
+///
+/// One query for the whole set, for the reason [`attach_tags`] gives: a
+/// listing must not pay a round trip per row to answer a question almost
+/// every row answers with the empty list.
+fn attach_allowed_models<'a>(
+    connection: &Connection,
+    tasks: impl ExactSizeIterator<Item = &'a mut Task>,
+) -> Result<()> {
+    if tasks.len() == 0 {
+        return Ok(());
+    }
+    let mut statement =
+        connection.prepare("SELECT task_id,model FROM task_models ORDER BY task_id,model")?;
+    let mut by_task: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (task_id, model) = row?;
+        by_task.entry(task_id).or_default().push(model);
+    }
+    for task in tasks {
+        if let Some(models) = by_task.remove(&task.id) {
+            task.allowed_models = models;
+        }
+    }
+    Ok(())
+}
+
+/// One row's allow-list, for the single-row claim paths.
+fn allowed_models_of(connection: &Connection, id: &str) -> Result<Vec<String>> {
+    Ok(connection
+        .prepare("SELECT model FROM task_models WHERE task_id=? ORDER BY model")?
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Replace a row's allow-list, refusing any name the shape does not admit.
+///
+/// Validated before the first `INSERT`, so a list with one bad name leaves
+/// the row exactly as it was rather than half replaced.
+pub(crate) fn set_allowed_models(
+    connection: &Connection,
+    id: &str,
+    models: &[String],
+) -> Result<()> {
+    let canonical = crate::model::validate_model_names(models)?;
+    connection.execute("DELETE FROM task_models WHERE task_id=?", [id])?;
+    for model in &canonical {
+        connection.execute(
+            "INSERT INTO task_models(task_id,model) VALUES(?,?)",
+            params![id, model],
+        )?;
+    }
+    Ok(())
+}
+
+/// The refusal a restricted task answers a claim with.
+///
+/// One function so the claim path and the handoff-accept path cannot drift:
+/// both print the same two sentences, and both print the list, because a
+/// refusal that does not name the models it wants tells the caller nothing it
+/// can act on (ADR-008). A typo in an allow-list is visible here.
+fn require_allowed_model(id: &str, allowed: &[String], model: Option<&str>) -> Result<()> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let list = allowed.join(", ");
+    match model {
+        None => bail!(
+            "task {id} is restricted to models [{list}]; pass --model with one of them to claim it"
+        ),
+        Some(model) if !allowed.iter().any(|allowed| allowed == model) => {
+            bail!("task {id} is restricted to models [{list}]; model {model} may not claim it")
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 fn attach_attention_tags(connection: &Connection, items: &mut [Attention]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
@@ -931,6 +1012,7 @@ fn task_row(row: &Row<'_>) -> rusqlite::Result<Task> {
         // Attached after the row is read: a join per task would be a query per
         // task, and the readers below fill these in one pass.
         tags: Vec::new(),
+        allowed_models: Vec::new(),
     })
 }
 
@@ -1065,6 +1147,7 @@ fn claim_row(row: &Row<'_>) -> rusqlite::Result<Claim> {
         branch: row.get("branch")?,
         head_sha: row.get("head_sha")?,
         root_head: row.get("root_head")?,
+        model: row.get("model")?,
     })
 }
 
@@ -2348,6 +2431,9 @@ pub struct UpdateTask {
     pub dependencies: Option<Vec<String>>,
     /// `None` leaves tags alone; `Some(list)` replaces them wholesale.
     pub tags: Option<Vec<String>>,
+    /// `None` leaves the model allow-list alone; `Some(list)` replaces it
+    /// wholesale, and `Some(vec![])` makes the row unrestricted again.
+    pub allowed_models: Option<Vec<String>>,
     /// None leaves scope; Some(Some(id)) attaches; Some(None) audits detach.
     pub sprint: Option<Option<String>>,
 }
@@ -2357,6 +2443,9 @@ pub struct AcceptHandoffOptions {
     pub lease_ms: i64,
     pub caller_scope: Option<String>,
     pub sprint_override: Option<String>,
+    /// The model the acceptor runs as, checked against the task's allow-list
+    /// and recorded on the claim row.
+    pub model: Option<String>,
     pub git: Option<crate::gitctx::GitContext>,
 }
 
@@ -2378,6 +2467,10 @@ pub struct ClaimOptions {
     /// the board's current sprint when one exists, and changes nothing on a
     /// board without one.
     pub sprint_override: Option<String>,
+    /// The model the claimer runs as. A restricted task refuses a claim that
+    /// omits it or names one outside its list; an unrestricted task records
+    /// it and is otherwise unaffected.
+    pub model: Option<String>,
 }
 
 /// The outcome of settling a restore rescue source before copying it.
@@ -2602,11 +2695,22 @@ fn eligible_claim_candidates(
     // routing on the stored value refused the row to every other agent —
     // silently, and only on the path that had not swept.
     apply_lapsed_leases(connection, candidates.iter_mut())?;
+    // And before it reads `allowed_models`: the scheduler must not offer work
+    // the claim path would immediately refuse, so a restricted row is routable
+    // only to a caller whose `--model` is in its list. An unrestricted row
+    // carries the empty list and is unaffected either way.
+    attach_allowed_models(connection, candidates.iter_mut())?;
 
     let mut eligible = Vec::new();
     for candidate in candidates {
         let routable = (!candidate.driver_only
             || options.caller_scope.as_deref() == Some("driver"))
+            && require_allowed_model(
+                &candidate.id,
+                &candidate.allowed_models,
+                options.model.as_deref(),
+            )
+            .is_ok()
             && (candidate
                 .assignee
                 .as_ref()
@@ -4474,6 +4578,10 @@ impl Store {
         // carried no actor. An absent actor is still recorded as absent —
         // inventing one would be worse than the gap.
         set_tags(&transaction, &id, &input.tags)?;
+        // The list is validated inside, before its first INSERT, so a bad
+        // name refuses the whole `task add` rather than creating a row with
+        // half a restriction.
+        set_allowed_models(&transaction, &id, &input.allowed_models)?;
         event_with_status(
             &transaction,
             Some(&id),
@@ -4512,11 +4620,13 @@ impl Store {
         self.authz.check_read(&tags)?;
         let mut one = require_task(&self.connection, id)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
+        attach_allowed_models(&self.connection, std::iter::once(&mut one))?;
         apply_lapsed_leases(&self.connection, std::iter::once(&mut one))?;
         Ok(one)
     }
 
-    /// Rows, optionally narrowed by status, by tag and by lane.
+    /// Rows, optionally narrowed by status, by tag, by lane and by the model
+    /// allowed to claim them.
     ///
     /// A tag filter checks the master file first: asking for one that was never
     /// registered returns an empty list otherwise, which reads exactly like
@@ -4525,15 +4635,22 @@ impl Store {
     /// A lane is not registered anywhere, so the lane filter is an exact match
     /// on the row's own `lane`: a task with no lane matches no lane, and no
     /// lane is inferred for it.
+    ///
+    /// A model filter is neither: there is no master file of models, so the
+    /// name is checked for shape and then matched exactly against the rows'
+    /// lists. It selects restricted rows only — an unrestricted row is open to
+    /// every model and belongs to none of their listings.
     pub fn list_tasks(
         &self,
         status: Option<&str>,
         tag: Option<&str>,
         lane: Option<&str>,
+        allowed_model: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<Task>> {
         self.authz.check_read(&[])?;
-        let (where_clause, values) = self.task_filter(status, tag, lane, include_archived)?;
+        let (where_clause, values) =
+            self.task_filter(status, tag, lane, allowed_model, include_archived)?;
         let sql = format!("SELECT * FROM tasks{where_clause} ORDER BY priority,created_at,id");
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
@@ -4542,6 +4659,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
+        attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
@@ -4559,17 +4677,19 @@ impl Store {
         status: Option<&str>,
         tag: Option<&str>,
         lane: Option<&str>,
+        allowed_model: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<(Task, Option<ClaimSummary>)>> {
         self.authz.check_read(&[])?;
-        let (where_clause, filters) = self.task_filter(status, tag, lane, include_archived)?;
+        let (where_clause, filters) =
+            self.task_filter(status, tag, lane, allowed_model, include_archived)?;
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(filters.len() + 1);
         values.push(Box::new(now_ms()));
         values.extend(filters);
         let sql = format!(
             "SELECT t.*, c.agent_id AS claim_agent_id, c.session_id AS claim_session_id, \
              c.claimed_at AS claim_claimed_at, c.heartbeat_at AS claim_heartbeat_at, \
-             c.expires_at AS claim_expires_at \
+             c.expires_at AS claim_expires_at, c.model AS claim_model \
              FROM tasks t LEFT JOIN task_claims c ON c.task_id=t.id AND c.expires_at>?\
              {where_clause} ORDER BY t.priority,t.created_at,t.id"
         );
@@ -4588,6 +4708,7 @@ impl Store {
                             claimed_at: row.get("claim_claimed_at")?,
                             heartbeat_at: row.get("claim_heartbeat_at")?,
                             expires_at: row.get("claim_expires_at")?,
+                            model: row.get("claim_model")?,
                         })
                     })
                     .transpose()?;
@@ -4596,6 +4717,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
+        attach_allowed_models(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         apply_lapsed_leases(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         Ok(rows)
     }
@@ -4609,6 +4731,7 @@ impl Store {
         status: Option<&str>,
         tag: Option<&str>,
         lane: Option<&str>,
+        allowed_model: Option<&str>,
         include_archived: bool,
     ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
         if let Some(value) = status {
@@ -4653,6 +4776,14 @@ impl Store {
             });
             values.push(Box::new(tag));
         }
+        if let Some(model) = allowed_model {
+            // Shape-checked, not registry-checked: there is no master file of
+            // models to mistype against, and the refusal a bad name earns is
+            // the same one the write side gives.
+            let model = crate::model::validate_model_name(model)?;
+            clauses.push("id IN (SELECT task_id FROM task_models WHERE model=?)");
+            values.push(Box::new(model));
+        }
         let where_clause = if clauses.is_empty() {
             String::new()
         } else {
@@ -4666,6 +4797,7 @@ impl Store {
         self.authz.check_read(&[])?;
         let mut rows = dependencies(&self.connection, id)?;
         attach_tags(&self.connection, rows.iter_mut())?;
+        attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
@@ -4986,6 +5118,15 @@ impl Store {
         if let Some(tags) = &input.tags {
             set_tags(&transaction, id, tags)?;
         }
+        // Read before the replace, so `allowedModels` joins the changed list
+        // only when the SET actually moved: `--allowed-model Astra` on a row
+        // already restricted to Astra changed nothing and must not say it did.
+        let previous_models = allowed_models_of(&transaction, id)?;
+        if let Some(models) = &input.allowed_models {
+            set_allowed_models(&transaction, id, models)?;
+        }
+        let models_moved = input.allowed_models.is_some()
+            && allowed_models_of(&transaction, id)? != previous_models;
         // Name what moved, and keep the one value whose loss is unrecoverable.
         // Everything else can be read off the row; a replaced body cannot.
         let mut changed = Vec::new();
@@ -4999,6 +5140,7 @@ impl Store {
             ("driverOnly", driver != previous_driver),
             ("priority", priority != previous_priority),
             ("parentID", parent != previous_parent),
+            ("allowedModels", models_moved),
         ] {
             if moved {
                 changed.push(field);
@@ -5059,6 +5201,12 @@ impl Store {
         let agent = nonempty(&options.agent_id, "agent id")?.to_owned();
         if options.lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
+        }
+        // Before the write lock and before any row is chosen: a malformed
+        // `--model` is refused by name rather than silently matching nothing
+        // in an allow-list and reading as "this model may not claim it".
+        if let Some(model) = &options.model {
+            crate::model::validate_model_name(model)?;
         }
         let transaction = self.begin_write()?;
         // Claims carry no tags of their own: board scope, under the lock.
@@ -5130,12 +5278,21 @@ impl Store {
         if task.driver_only && options.caller_scope.as_deref() != Some("driver") {
             bail!("task {} is driver-only", task.id);
         }
+        // Right after driver-only, so the refusal order a caller learns stays
+        // type → draft → status → gates → held → driver-only → MODEL →
+        // assignee. Read from the table rather than from `task`, because the
+        // named-id path builds its row without the list attached.
+        require_allowed_model(
+            &task.id,
+            &allowed_models_of(&transaction, &task.id)?,
+            options.model.as_deref(),
+        )?;
         if task.assignee.as_ref().is_some_and(|value| value != &agent) && !options.allow_reassign {
             bail!("task {} is assigned to {}", task.id, task.assignee.unwrap());
         }
         let token = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 task.id,agent,options.session_id,token,now,now,now+options.lease_ms,
                 options.git.as_ref().map(|g| g.worktree.clone()),
@@ -5143,6 +5300,7 @@ impl Store {
                 options.git.as_ref().and_then(|g| g.branch.clone()),
                 options.git.as_ref().map(|g| g.head.clone()),
                 options.git.as_ref().and_then(|g| g.root_head.clone()),
+                options.model,
             ],
         )?;
         transaction.execute(
@@ -5156,11 +5314,16 @@ impl Store {
             Some(&agent),
             // `sprintOverride` rides along only when the caller crossed a
             // boundary on purpose; a default-scoped claim keeps the payload
-            // byte-identical to a board without sprints (ADR-045 §3).
+            // byte-identical to a board without sprints (ADR-045 §3). `model`
+            // is conditional for the same reason: a claim that declared none
+            // records the same payload it always did.
             {
                 let mut payload = json!({"expiresAt": now+options.lease_ms});
                 if let Some(recorded) = &sprint_recorded {
                     payload["sprintOverride"] = json!(recorded);
+                }
+                if let Some(model) = &options.model {
+                    payload["model"] = json!(model);
                 }
                 payload
             },
@@ -5188,6 +5351,9 @@ impl Store {
     ) -> Result<Vec<Task>> {
         let agent = nonempty(&options.agent_id, "agent id")?;
         self.authz.check_read(&[])?;
+        if let Some(model) = &options.model {
+            crate::model::validate_model_name(model)?;
+        }
         let tag = tag
             .map(|value| validate_registered_tags(&self.connection, &[value.to_owned()], "claim"))
             .transpose()?
@@ -5197,6 +5363,7 @@ impl Store {
         let mut candidates =
             eligible_claim_candidates(&self.connection, agent, options, sprint_filter.as_deref())?;
         attach_tags(&self.connection, candidates.iter_mut())?;
+        attach_allowed_models(&self.connection, candidates.iter_mut())?;
         candidates.retain(|candidate| self.authz.permits_read(&candidate.tags));
         if let Some(tag) = tag {
             candidates.retain(|candidate| candidate.tags.contains(&tag));
@@ -6488,11 +6655,15 @@ impl Store {
             lease_ms,
             caller_scope,
             sprint_override,
+            model,
             git,
         } = options;
         let agent = nonempty(&agent, "agent id")?.to_owned();
         if lease_ms < 1000 {
             bail!("lease must be at least 1000ms");
+        }
+        if let Some(model) = &model {
+            crate::model::validate_model_name(model)?;
         }
         let transaction = self.begin_write()?;
         // Board scope, under the lock.
@@ -6596,6 +6767,14 @@ impl Store {
         if task.driver_only && caller_scope.as_deref() != Some("driver") {
             bail!("task {} is driver-only", task.id);
         }
+        // Same place in the order as `claim`: after driver-only, and with the
+        // same two sentences, so a caller reads one rule whichever path they
+        // arrived on.
+        require_allowed_model(
+            &task.id,
+            &allowed_models_of(&transaction, &task.id)?,
+            model.as_deref(),
+        )?;
         require_no_blocking_gates(&transaction, &task.id, GateCaller::Unleased)?;
         if let Some(held) = active_claim(&transaction, &task.id, now)? {
             // Name the holder and the way out. `claim` has no --force, and
@@ -6612,13 +6791,14 @@ impl Store {
             );
         }
         let token = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![
+        transaction.execute("INSERT INTO task_claims(task_id,agent_id,session_id,lease_token,claimed_at,heartbeat_at,expires_at,worktree,worktree_kind,branch,head_sha,root_head,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![
             task.id,agent,session,token,now,now,now+lease_ms,
             git.as_ref().map(|g| g.worktree.clone()),
             git.as_ref().map(|g| g.worktree_kind.to_owned()),
             git.as_ref().and_then(|g| g.branch.clone()),
             git.as_ref().map(|g| g.head.clone()),
             git.as_ref().and_then(|g| g.root_head.clone()),
+            model,
         ])?;
         transaction.execute(
             "UPDATE tasks SET status='in_progress',assignee=?,updated_at=? WHERE id=?",
@@ -6634,6 +6814,9 @@ impl Store {
                 let mut payload = json!({"handoffID":id,"expiresAt":now+lease_ms});
                 if let Some(value) = sprint_recorded {
                     payload["sprintOverride"] = json!(value);
+                }
+                if let Some(value) = &model {
+                    payload["model"] = json!(value);
                 }
                 payload
             },
@@ -8116,6 +8299,7 @@ impl Store {
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
         rows.retain(|task| self.authz.permits_read(&task.tags));
+        attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
@@ -8840,6 +9024,7 @@ mod tests {
             dependencies,
             metadata: serde_json::json!({}),
             actor: Some("seed".to_owned()),
+            allowed_models: Vec::new(),
             tags,
         }
     }
@@ -8855,6 +9040,7 @@ mod tests {
             cross_lane: false,
             allow_reassign: false,
             sprint_override: None,
+            model: None,
             git: None,
         }
     }
@@ -8900,6 +9086,7 @@ mod tests {
             dependencies: Vec::new(),
             metadata: serde_json::json!({}),
             actor: Some("seed".to_owned()),
+            allowed_models: Vec::new(),
             tags: Vec::new(),
         }
     }
@@ -9053,9 +9240,9 @@ mod tests {
 
         // Reads: no row of B is reachable.
         assert_denied(store.require_task("t-b"), "task show");
-        assert_denied(store.list_tasks(None, None, None, false), "task list");
+        assert_denied(store.list_tasks(None, None, None, None, false), "task list");
         assert_denied(
-            store.list_tasks_with_claims(None, None, None, false),
+            store.list_tasks_with_claims(None, None, None, None, false),
             "task list --with-claims",
         );
         assert_denied(store.dependencies("t-b"), "relations dependencies");
@@ -9166,6 +9353,7 @@ mod tests {
                     lease_ms: 60_000,
                     caller_scope: None,
                     sprint_override: None,
+                    model: None,
                     git: None,
                 },
             ),
@@ -12158,6 +12346,7 @@ mod tests {
                 metadata: json!({}),
                 actor: Some("test".into()),
                 tags: vec!["zeta".into(), "alpha".into()],
+                allowed_models: Vec::new(),
             })
             .unwrap();
         let event = store
@@ -12196,6 +12385,7 @@ mod tests {
                 metadata: json!({}),
                 actor: Some("test".into()),
                 tags: Vec::new(),
+                allowed_models: Vec::new(),
             })
             .unwrap();
         store
@@ -12284,6 +12474,7 @@ mod tests {
                 metadata: json!({}),
                 actor: Some("test".into()),
                 tags: Vec::new(),
+                allowed_models: Vec::new(),
             })
             .unwrap();
         store.remove_task("t-removed", "test", false).unwrap();
@@ -12517,6 +12708,7 @@ mod tests {
                         cross_lane: false,
                         allow_reassign: false,
                         sprint_override: None,
+                        model: None,
                         git: None,
                     },
                 )
@@ -12572,6 +12764,7 @@ mod tests {
                 metadata: json!({}),
                 actor: Some("test".into()),
                 tags: Vec::new(),
+                allowed_models: Vec::new(),
             })
             .unwrap();
 
@@ -12592,6 +12785,7 @@ mod tests {
                     cross_lane: false,
                     allow_reassign: false,
                     sprint_override: None,
+                    model: None,
                     git: None,
                 },
             )
@@ -12732,6 +12926,7 @@ mod tests {
             archived_at: None,
             metadata: json!({}),
             tags: Vec::new(),
+            allowed_models: Vec::new(),
         };
 
         // An epic holds anything, including another epic: a plan is an epic, so
@@ -13090,7 +13285,7 @@ mod tests {
 
         let ids = |lane: Option<&str>| {
             store
-                .list_tasks(None, None, lane, false)
+                .list_tasks(None, None, lane, None, false)
                 .unwrap()
                 .into_iter()
                 .map(|task| task.id)
@@ -13102,7 +13297,7 @@ mod tests {
         assert_eq!(ids(Some("driver")), [] as [String; 0]);
         assert_eq!(ids(None).len(), 3, "no filter is the whole board");
         let error = store
-            .list_tasks(None, None, Some("  "), false)
+            .list_tasks(None, None, Some("  "), None, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("--lane must name a lane"), "{error}");
@@ -13133,7 +13328,7 @@ mod tests {
                 .expect("insert claim");
         }
         let listed = store
-            .list_tasks_with_claims(None, None, None, false)
+            .list_tasks_with_claims(None, None, None, None, false)
             .unwrap();
         let claim = |id: &str| {
             listed
@@ -14059,6 +14254,7 @@ mod tests {
                     lease_ms: 60_000,
                     caller_scope: None,
                     sprint_override: None,
+                    model: None,
                     git: None,
                 },
             ),

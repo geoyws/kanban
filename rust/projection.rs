@@ -239,7 +239,7 @@ pub fn needs_you() -> Projected<Listing<AttentionCard>> {
 pub fn board_summaries() -> Projected<Vec<BoardSummary>> {
     let mut rows = Vec::new();
     for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None, None, false)?;
+        let tasks = store.list_tasks(None, None, None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
         // Counted, not fetched: a page used as a count saturates silently.
         // Only the most urgent row of each ranks the board, and neither is
@@ -310,7 +310,7 @@ pub fn boards() -> Projected<Listing<BoardSummary>> {
 /// registry, rather than a second time in the web layer.
 pub fn board(name: &str) -> Projected<BoardDetail> {
     let (project, store) = project_named(name).map_err(|_| Refusal::DeniedOrNotFound)?;
-    let tasks = store.list_tasks(None, None, None, false)?;
+    let tasks = store.list_tasks(None, None, None, None, false)?;
     let rules =
         Registry::open()?.applicable_rule_summaries(Some(&project.name), None, None, false)?;
     Ok(BoardDetail {

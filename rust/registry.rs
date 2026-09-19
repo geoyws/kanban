@@ -4704,6 +4704,7 @@ mod tests {
                 metadata: json!({}),
                 actor: Some("codex".to_owned()),
                 tags: Vec::new(),
+                allowed_models: vec![],
             })
             .expect("add source task");
     }
