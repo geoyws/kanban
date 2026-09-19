@@ -2,7 +2,9 @@
 
 **Status:** Accepted
 **Date:** 2026-08-24
-**Amended:** 2026-09-11 (decisions room: recent decisions, web undo, previews, markdown)
+**Amended:** 2026-09-11 (decisions room: recent decisions, web undo, previews, markdown);
+2026-09-19 (ADR-048: the UI becomes a bundled SPA; §"Needs you is live" projection-swap wording
+and the inlined-asset arrangement superseded)
 **Deciders:** George
 
 ## Context
@@ -118,6 +120,8 @@ of which the re-rendered projection would come back empty — and the block is
 re-checked when the projection arrives, because an answer can be started
 while it is in flight. This preserves one read path and makes the socket a
 notification channel rather than replicated state.
+
+*Superseded 2026-09-19 by ADR-048 §1 and §5: the browser now fetches JSON from a thin projection over the same Store methods and re-renders it in the embedded SPA, rather than swapping in a server-rendered projection; the frame-content rule, the in-flight-answer hold and its releases below are kept.*
 
 Every hold is releasable, because one that is not is a frozen page: the card
 carries a `Clear verdict` control, shown exactly while a verdict is picked,
@@ -270,6 +274,8 @@ base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, green `#a6e3a1`, red
 is reserved for ids, keys and receipts. One register with the chat the
 decisions are made from, so the page and the harness do not read as two
 products.
+
+*Superseded 2026-09-19 by ADR-048 §7.2: the inlined-asset arrangement this clause realised — the `CSS` and `JS` constants in `rust/serve.rs` — becomes a build-time bundle embedded in the binary; the palette, the type register and ADR-046's design system are unchanged.*
 
 **Acceptance is compiled-process and real-Chrome, per this repo's rule.**
 `tests/e2e.rs` pins: the undo key round trip (receipt gone, card back with
