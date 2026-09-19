@@ -77,14 +77,18 @@ pub(crate) const DETAIL_ROWS: i64 = 50;
 /// The page exists so a decided item leaves Needs you without disappearing:
 /// the eye moves to the next open card while the last decisions stay within
 /// reach of one Undo. `kb ev` and the search view are the archive, not this.
-const DECIDED_ROWS: usize = 20;
+///
+/// Named `pub(crate)` because the JSON projection serves the same cut and
+/// reports it as the listing's `limit` (`docs/api/kanban-web.openapi.yaml`,
+/// `getDecided`): one bound, read from one place.
+pub(crate) const DECIDED_ROWS: i64 = 20;
 /// How many of each board's newest decisions one scan reads.
 ///
 /// The page shows the newest `DECIDED_ROWS` across every board, and each
 /// board is read decided-first (`recent_resolved_attention`) up to this bound
 /// before the merge. A board holding more recent decisions than this bound
 /// would need it raised; `kb ev` and search are the archive this page is not.
-const DECIDED_SCAN: i64 = 200;
+pub(crate) const DECIDED_SCAN: i64 = 200;
 const WEB_UNDO_NOTE: &str = "undone from the web view";
 /// How many characters of a body a hover preview renders.
 ///
@@ -503,6 +507,7 @@ fn api(method: &Method, path: &str) -> WebResponse {
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     let body = match parts.as_slice() {
         ["needs-you"] => encode(projection::needs_you()),
+        ["decided"] => encode(projection::decided()),
         ["boards"] => encode(projection::boards()),
         ["lanes"] => encode(projection::lanes()),
         ["board", project] => encode(projection::board(project)),
@@ -634,8 +639,8 @@ fn render(url: &str) -> Result<String> {
             query_value(query, "replied").as_deref(),
             query_value(query, "undone").as_deref(),
         ),
-        ["decided"] => decided_page(query_value(query, "undone").as_deref()),
-        ["boards"] => boards(),
+        ["decided"] => Ok(app_shell()),
+        ["boards"] => Ok(app_shell()),
         ["sprints"] => sprints(),
         ["sprints", project] => board_sprints(project),
         ["sprint", project, id] => sprint_detail(project, id),
@@ -645,7 +650,7 @@ fn render(url: &str) -> Result<String> {
             query_value(query, "show").as_deref(),
             query_value(query, "changed").as_deref(),
         ),
-        ["lanes"] => lanes(),
+        ["lanes"] => Ok(app_shell()),
         ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
         // `/preview` + the item path: `/preview/task/PREVIEW/t-1`. The kind
         // leads, exactly as it does in the path being previewed, so the page
@@ -657,7 +662,7 @@ fn render(url: &str) -> Result<String> {
             id,
         ] => preview_page(project, kind, id),
         ["preview", "board", project] => preview_page(project, "board", project),
-        ["board", project] => board(project),
+        ["board", _project] => Ok(app_shell()),
         ["task", project, id] => task_detail(project, id),
         ["deployment", project, id] => deployment_detail(project, id),
         _ => Ok(page(
@@ -1780,6 +1785,24 @@ fn open_attention() -> Result<OpenQueue> {
 /// this, rather than by each holding a comparator that has to be kept in
 /// step. Two orderings that agree today is a coincidence with a maintenance
 /// schedule.
+/// The decisions room's order: newest decided first, then id, then board so
+/// the list never flickers between two rows settled in the same
+/// millisecond.
+///
+/// Shared with the JSON projection (`rust/projection.rs`'s `decided`) rather
+/// than copied: which decision is newest is one question, and two surfaces
+/// that answered it differently would put the Undo on different rows.
+pub(crate) fn sort_decided_queue(items: &mut [(String, Attention)]) {
+    items.sort_by(|(project_a, item_a), (project_b, item_b)| {
+        let decided_a = item_a.resolved_at.unwrap_or(i64::MIN);
+        let decided_b = item_b.resolved_at.unwrap_or(i64::MIN);
+        decided_b
+            .cmp(&decided_a)
+            .then_with(|| item_a.id.cmp(&item_b.id))
+            .then_with(|| project_a.cmp(project_b))
+    });
+}
+
 pub(crate) fn sort_open_queue(items: &mut [(String, Attention)]) {
     items.sort_by(|(project_a, item_a), (project_b, item_b)| {
         (item_a.priority, item_a.created_at, &item_a.id, project_a).cmp(&(
@@ -1889,6 +1912,8 @@ fn all_open(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
 /// The previous decision is NOT re-shown from the row: a reopen clears it
 /// (ADR-042 §3), so what is rendered here is whatever the row settled with,
 /// read once while it was still resolved.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn decided_page(undone: Option<&str>) -> Result<String> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     let mut stores = std::collections::BTreeMap::new();
@@ -1899,16 +1924,8 @@ fn decided_page(undone: Option<&str>) -> Result<String> {
         }
         stores.insert(name, store);
     }
-    // Newest decided first, then board and id so the order never flickers.
-    items.sort_by(|(project_a, item_a), (project_b, item_b)| {
-        let decided_a = item_a.resolved_at.unwrap_or(i64::MIN);
-        let decided_b = item_b.resolved_at.unwrap_or(i64::MIN);
-        decided_b
-            .cmp(&decided_a)
-            .then_with(|| item_a.id.cmp(&item_b.id))
-            .then_with(|| project_a.cmp(project_b))
-    });
-    items.truncate(DECIDED_ROWS);
+    sort_decided_queue(&mut items);
+    items.truncate(usize::try_from(DECIDED_ROWS).unwrap_or(usize::MAX));
 
     let mut html = String::from("<div class=heading><h1>Recent decisions</h1></div>");
     if let Some(id) = undone {
@@ -2869,6 +2886,8 @@ fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
 /// [`projection::board_summaries`]: the JSON surface serves the same rows
 /// from the same computation, so the page and `/api/v1/boards` cannot drift
 /// into disagreeing about how many rows a board holds.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn boards() -> Result<String> {
     let mut html = String::from(
         "<h1>Boards</h1><table><thead><tr>\
@@ -3457,6 +3476,8 @@ pub(crate) fn lane_groups(limit: i64) -> Result<(Vec<((String, String), Vec<Sitr
 /// The counterpart to Needs you: that page is what waits on the operator, this
 /// is what the agents are doing. A lane that has been posting is legible here
 /// without anyone opening a terminal or waiting for a handoff.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn lanes() -> Result<String> {
     let (ordered, _truncated) = lane_groups(LANE_UPDATE_ROWS)?;
     let mut html = String::from("<h1>Lanes</h1>");
@@ -3510,6 +3531,8 @@ fn lanes() -> Result<String> {
 }
 
 /// One board's rows, grouped by status in workflow order.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn board(name: &str) -> Result<String> {
     let (project, store) = project_named(name)?;
     let tasks = store.list_tasks(None, None, None, None, false)?;
@@ -8016,12 +8039,13 @@ mod tests {
         let task_route = format!("/task/SERVE-RENDER/{}", fixture.epic_id);
         let deployment_route =
             format!("/deployment/SERVE-RENDER/{}", fixture.current_deployment_id);
+        // `/decided`, `/boards`, `/board/{project}` and `/lanes` are the
+        // mounted application's since `t-bf255880`, so their rows are swept
+        // in the browser by
+        // `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome`
+        // rather than out of bytes this module writes.
         let routes = [
             "/all",
-            "/decided",
-            "/boards",
-            "/board/SERVE-RENDER",
-            "/lanes",
             "/sprints",
             "/sprints/SERVE-RENDER",
             "/sprint/SERVE-RENDER/sp-render-current",
@@ -8037,34 +8061,14 @@ mod tests {
             let html = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
             measured += assert_rows_are_titles_and_sentences(&html, route);
         }
+        // Five is what the server still renders: the board's own row list,
+        // which used to be most of this sweep, is the mounted application's
+        // since `t-bf255880` and is swept in Chrome by
+        // `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome`.
         assert!(
-            measured >= 6,
+            measured >= 5,
             "the sweep measured only {measured} rows, so it proved almost nothing"
         );
-        // The rows that opened a page did so as anchors, and the row that
-        // opens nothing led with its own title element instead.
-        let board = render("/board/SERVE-RENDER").expect("render the board");
-        assert_html_contains(
-            &board,
-            "<li data-task=\"t-serve-render\"><a href=\"/task/SERVE-RENDER/t-serve-render\" \
-             data-task-link=\"t-serve-render\" data-ref target=_blank rel=noopener>\
-             Implement &lt;i&gt;escape&lt;/i&gt;</a><p class=meta>A task in \
-             <span class=\"pill status-in_progress\">In progress</span> at ",
-        );
-        // Open attention is a clause of the same sentence, with its own
-        // connector, so a row without tags never reads `at P0 3 open attention`.
-        assert_html_contains(
-            &board,
-            ", tagged ops, with <span class=attention-count>1 open attention</span>, \
-             filed as <code>",
-        );
-        for (at, _) in board.match_indices("<span class=attention-count>") {
-            assert!(
-                board[..at].ends_with(", with "),
-                "an attention count sits in a sentence without its connector:\n{}",
-                &board[at.saturating_sub(80)..at]
-            );
-        }
         let detail = render(&task_route).expect("render the task detail");
         assert_html_contains(&detail, "<span class=title>Please review ");
         // The sprint's attached tasks are a row list with a hook of its own,
@@ -8445,15 +8449,11 @@ mod tests {
         // is judged in the browser.
         for route in [
             "/all",
-            "/decided",
-            "/boards",
             "/sprints",
             "/plans",
             "/deployments",
             "/subscriptions",
-            "/lanes",
             "/search",
-            "/board/px",
             "/no/such/page",
         ] {
             let html = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
@@ -8711,11 +8711,18 @@ mod tests {
             "<code>e-serve-render</code> is decided and the board has it.",
         );
 
-        let boards = render("/boards").expect("render boards");
-        assert_page_title(&boards, "Boards");
-        assert_html_contains(&boards, "<h1>Boards</h1>");
-        assert_html_contains(&boards, "SERVE-RENDER");
-        assert_html_contains(&boards, "<td class=\"n waiting\">1</td>");
+        // `/boards`, `/lanes`, `/decided` and `/board/{project}` answer the
+        // application shell since `t-bf255880`: what they render is the
+        // bundle's, proved in the browser, and what the SERVER owes them is
+        // `/api/v1/boards`, `/api/v1/lanes`, `/api/v1/decided` and
+        // `/api/v1/board/{project}` (`tests/e2e.rs`).
+        for mounted in ["/boards", "/lanes", "/decided", "/board/SERVE-RENDER"] {
+            assert_eq!(
+                render(mounted).unwrap_or_else(|error| panic!("render {mounted}: {error}")),
+                app_shell(),
+                "{mounted} is not the application shell"
+            );
+        }
 
         let plans = render("/plans").expect("render plans");
         assert_page_title(&plans, "Plans");
@@ -8754,13 +8761,6 @@ mod tests {
         assert_html_contains(&deployment_detail, "artifact://kanban/&lt;render&gt;");
         assert_html_contains(&deployment_detail, "served &lt;release&gt; successfully");
 
-        let lanes = render("/lanes").expect("render lanes");
-        assert_page_title(&lanes, "Lanes");
-        assert_html_contains(&lanes, "driver-2");
-        assert_html_contains(&lanes, "driver-3");
-        assert_html_contains(&lanes, "Working quietly on the render page.");
-        assert_html_contains(&lanes, "A second lane with markup to sort.");
-
         let search_empty = render("/search").expect("render empty search");
         assert_page_title(&search_empty, "Search");
         assert_html_contains(
@@ -8774,29 +8774,6 @@ mod tests {
         assert_html_contains(&search, "kanban://SERVE-RENDER/task/e-serve-render");
         assert_html_contains(&search, "Plan &lt;b&gt;render&lt;/b&gt;");
         assert_html_contains(&search, "Ship &lt;script&gt;render&lt;/script&gt;");
-
-        let board = render("/board/SERVE-RENDER").expect("render board");
-        assert_page_title(&board, "SERVE-RENDER");
-        assert_html_contains(&board, "Rootless");
-        // The rendered rows, not the stylesheet: this board's tasks are P0
-        // and P1, so those are the two classes its markup can carry. `P2`
-        // used to pass here by matching a CSS rule, which proved nothing
-        // about what the page renders.
-        assert_html_contains(&board, "class=\"priority priority-p0\"");
-        assert_html_contains(&board, "class=\"priority priority-p1\"");
-        assert!(!board.contains("priority-p2"), "{board}");
-        // The type is no longer a badge beside the row: it is the first
-        // words of the row's own sentence (WEB-40, WEB-41).
-        assert_html_contains(&board, "<p class=meta>An epic in ");
-        assert_html_contains(&board, "<p class=meta>A story in ");
-        assert_html_contains(&board, "<p class=meta>A task in ");
-        // And the section heading reads as prose rather than as the slug the
-        // status is stored as, through the same `status_label` the pill uses.
-        assert_html_contains(&board, "<h2>In progress <span class=count>1</span>");
-        assert_html_contains(&board, "<h2>To do <span class=count>2</span>");
-        assert!(!board.contains("<h2>in_progress"), "{board}");
-        assert_html_contains(&board, "Implement &lt;i&gt;escape&lt;/i&gt;");
-        assert_html_contains(&board, "Ship &lt;script&gt;render&lt;/script&gt;");
 
         let task_detail =
             render(&format!("/task/SERVE-RENDER/{}", fixture.epic_id)).expect("render task detail");
@@ -8954,7 +8931,13 @@ mod tests {
         let not_found = render("/no/such/page").expect("render 404 page");
         assert_page_title(&not_found, "Not found");
         assert_html_contains(&not_found, "No page at that address");
-        assert!(render("/board/NO-SUCH-BOARD").is_err());
+        // `/board/{project}` answers the shell for every name now, so the
+        // refusal it used to render is the projection's: one non-enumerating
+        // denial, whatever the reason (SPA-08).
+        assert!(matches!(
+            crate::projection::board("NO-SUCH-BOARD"),
+            Err(crate::projection::Refusal::DeniedOrNotFound)
+        ));
         assert!(render("/task/SERVE-RENDER/no-such-task").is_err());
     }
 

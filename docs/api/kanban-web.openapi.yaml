@@ -259,9 +259,23 @@ paths:
         ADR-048 §5 binds the *board* data to `Store` and a document that
         pretended the rules came from there would be wrong about the one thing
         §5 cares about. The projection keeps the same call; it adds nothing.
+
+        **Two widenings, both because the page moved into the client
+        (`t-bf255880`).** The served page ended each row's sentence on the
+        board's open attention against that row
+        (`serve::attention_clause`) and folded each rule's whole body open
+        (`rust/serve.rs`'s `board`, the `<details class=rule><pre>` block).
+        A client that had `Task` and `RuleSummary` alone could render
+        neither, and the alternative — one request per row for the count —
+        is the fan-out a projection exists to avoid. So `tasks.items` is
+        `BoardTaskRow` (the task, and its open-attention count from
+        `Store::attention` filtered to it) and `rules` is `BoardRule` (the
+        registry's own summary, plus the body from `applicable_rules` under
+        the identical filter). The summary's derived fields are still
+        derived once, in the registry.
       x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
-      x-store-method: Store::list_tasks
-      x-registry-method: Registry::applicable_rule_summaries
+      x-store-method: Store::list_tasks, Store::attention
+      x-registry-method: Registry::applicable_rule_summaries, Registry::applicable_rules
       parameters:
         - $ref: "#/components/parameters/Project"
       responses:
@@ -1428,11 +1442,43 @@ components:
             - $ref: "#/components/schemas/ListEnvelope"
             - type: object
               properties:
-                items: { type: array, items: { $ref: "#/components/schemas/Task" } }
+                items: { type: array, items: { $ref: "#/components/schemas/BoardTaskRow" } }
           description: "`Store::list_tasks`, uncapped: `limit` is `null`."
         rules:
           type: array
-          items: { $ref: "#/components/schemas/RuleSummary" }
+          items: { $ref: "#/components/schemas/BoardRule" }
+
+    BoardTaskRow:
+      type: object
+      description: |
+        One row of a board's task list, with the count the row's own
+        sentence ends on (`projection::BoardTaskRow`). The count is
+        `Store::attention(Some("open"), …, task)` for that row — the same
+        call `serve::task_attention_count` makes — and it is on the wire
+        because a client that asked per row would make one request per task
+        on a board.
+      required: [task, openAttention]
+      additionalProperties: false
+      properties:
+        task: { $ref: "#/components/schemas/Task" }
+        openAttention: { type: integer, minimum: 0 }
+
+    BoardRule:
+      type: object
+      description: |
+        One applicable rule as the board page reads it
+        (`projection::BoardRule`): the registry's own `RuleSummary`, plus
+        the rule body the page folds open. The summary's `headline`,
+        `hasMore` and `bytes` stay the registry's derivation; only `body` is
+        added, read from `Registry::applicable_rules` under the same filter.
+      allOf:
+        - $ref: "#/components/schemas/RuleSummary"
+        - type: object
+          required: [body]
+          properties:
+            body:
+              type: string
+              description: The whole rule, as stored. Agent-authored text, rendered as text.
 
     Sprint:
       type: object
@@ -1755,8 +1801,30 @@ components:
         lane: { type: string }
         updates:
           type: array
-          items: { $ref: "#/components/schemas/Sitrep" }
+          items: { $ref: "#/components/schemas/LaneUpdate" }
           description: Newest first. Nothing deletes a sitrep, so a dead lane keeps its rows and sinks by recency rather than being destroyed.
+
+    LaneUpdate:
+      type: object
+      description: |
+        One sitrep as the lanes page renders it (`projection::LaneUpdate`):
+        the `Sitrep` verbatim, plus `bodyHtml`.
+
+        **Widened when the page moved into the client (`t-bf255880`).** The
+        served page typeset each update through `serve::markdown`, which is
+        the one bounded place in the crate with a parser in front of
+        agent-authored text; a client that rendered the raw `body` itself
+        would be a second renderer and so a second sanitiser (SPA-41). The
+        raw `body` is kept as well, because it is the row as the CLI reads
+        it.
+      allOf:
+        - $ref: "#/components/schemas/Sitrep"
+        - type: object
+          required: [bodyHtml]
+          properties:
+            bodyHtml:
+              type: string
+              description: The update's body as sanitised HTML, from `serve::markdown`. Raw HTML in the source is inert.
 
     SearchResult:
       type: object

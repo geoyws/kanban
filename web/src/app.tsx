@@ -11,7 +11,13 @@ import {
 } from "./card";
 import { connectLive, type Notice } from "./live";
 import { NOTICE_SHOWN, Notices } from "./notices";
+import BoardPage from "./pages/board";
+import BoardsPage from "./pages/boards";
+import DecidedPage from "./pages/decided";
+import LanesPage from "./pages/lanes";
 import { bindPreviews, dismissPreviews } from "./previews";
+import { type Route, setMountedRoutes, useRoute } from "./router";
+import { Chrome, RefreshProvider } from "./shell";
 
 /**
  * The Needs-you deck: one card on screen, the next one a keystroke away.
@@ -86,7 +92,7 @@ type Drafts = Record<string, Draft>;
 
 const EMPTY_DRAFT: Draft = { note: "", outcome: null };
 
-export function App(): ReactElement {
+function Deck(): ReactElement {
   const [cards, setCards] = useState<Card[] | null>(null);
   const [order, setOrder] = useState<string[]>([]);
   const [position, setPosition] = useState(0);
@@ -755,88 +761,25 @@ export function App(): ReactElement {
 
   return (
     <>
-      <nav aria-label="Primary" data-primary-nav>
-        <button
-          type="button"
-          className="menu"
-          data-menu
-          data-testid="nav-menu"
-          aria-label="Menu"
-          aria-expanded={drawerOpen}
-          aria-controls="nav-drawer"
-          onClick={() => setDrawerOpen((open) => !open)}
-        >
-          <span className="bars" aria-hidden="true" />
-        </button>
-        <a className="brand" href="/" aria-label="Kanban home">
-          kb
-        </a>
-        {/* The page's one status region: `<output>` IS `role=status`, so
-            the attribute the server-rendered span writes is left off here
-            rather than repeated. One status, one log, no third. */}
-        <output className="live" data-live data-testid="deck-live" aria-live="polite">
-          {inFlight
+      <Chrome
+        current="needs-you"
+        live={
+          inFlight
             ? "sending"
             : socketUp === null
               ? "connecting"
               : socketUp
                 ? "live"
-                : "reconnecting"}
-        </output>
-      </nav>
-      {/* The backdrop is the pointer's way out of the menu and the history;
-          the keyboard has `Escape` and each panel's own toggle. */}
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: pointer shortcut, keyboard has Escape */}
-      {/* biome-ignore lint/a11y/useKeyWithClickEvents: pointer shortcut, keyboard has Escape */}
-      <div
-        className="backdrop"
-        data-backdrop
-        hidden={!(drawerOpen || historyOpen)}
-        onClick={() => {
+                : "reconnecting"
+        }
+        drawerOpen={drawerOpen}
+        onDrawer={setDrawerOpen}
+        covered={drawerOpen || historyOpen}
+        onUncover={() => {
           setDrawerOpen(false);
           setHistoryOpen(false);
         }}
       />
-      <nav
-        className="drawer"
-        id="nav-drawer"
-        data-drawer
-        data-testid="nav-drawer"
-        aria-label="Destinations"
-        hidden={!drawerOpen}
-      >
-        <form action="/search" method="get" data-nav-search>
-          <input name="q" aria-label="Search Kanban" placeholder="Search" />
-        </form>
-        <div className="nav-links">
-          {[
-            ["/", "needs-you", "Needs you"],
-            ["/all", "all", "All open"],
-            ["/decided", "decided", "Recent decisions"],
-            ["/lanes", "lanes", "Lanes"],
-            ["/boards", "boards", "Boards"],
-            ["/sprints", "sprints", "Sprints"],
-            ["/plans", "plans", "Plans"],
-            ["/deployments", "deployments", "Deployments"],
-            ["/subscriptions", "subscriptions", "Subscriptions"],
-          ].map(([href, name, label]) => (
-            <a
-              key={name}
-              href={href}
-              data-nav={name}
-              // Which destination this is, marked by a rule rather than a
-              // fill, and read off the address bar rather than rendered: one
-              // shell serves every page.
-              {...((location.pathname.replace(/\/+$/, "") || "/") === href
-                ? { "aria-current": "page" as const }
-                : {})}
-              onClick={() => setDrawerOpen(false)}
-            >
-              {label}
-            </a>
-          ))}
-        </div>
-      </nav>
       <main
         id="main"
         data-deck
@@ -985,4 +928,114 @@ export function App(): ReactElement {
       </main>
     </>
   );
+}
+
+/**
+ * Every page that is not the deck, under one bar, one drawer and one
+ * socket.
+ *
+ * The deck keeps its own of each because it is the one page with a state
+ * worth protecting — an answer half written, a card mid-advance — and
+ * mounting it under a component that swaps pages would be one more thing
+ * able to throw that away. Everything else is a read page: it fetches its
+ * projection, it re-fetches when the boards move, and swapping one for
+ * another costs nothing.
+ *
+ * The socket is here rather than in each page so that walking the drawer
+ * does not open and drop a `/live` connection per destination.
+ */
+function ReadPages({ route }: { route: Route }): ReactElement {
+  const [socketUp, setSocketUp] = useState<boolean | null>(null);
+  const [refreshes, setRefreshes] = useState(0);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  useEffect(() => {
+    const stopLive = connectLive({
+      onStatus: (status) => setSocketUp(status === "live"),
+      // A read page renders no notice strip, exactly as the served read
+      // pages rendered none: the strip is the deck's, where a decision is
+      // being made. Nothing was shown, so nothing is claimed.
+      onNotice: () => false,
+      onRefresh: () => setRefreshes((count) => count + 1),
+    });
+    const stopPreviews = bindPreviews();
+    return () => {
+      stopLive();
+      stopPreviews();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      if (dismissPreviews()) {
+        event.preventDefault();
+        return;
+      }
+      if (drawerOpen) {
+        event.preventDefault();
+        setDrawerOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [drawerOpen]);
+
+  return (
+    <RefreshProvider value={refreshes}>
+      <Chrome
+        current={route.name}
+        live={socketUp === null ? "connecting" : socketUp ? "live" : "reconnecting"}
+        drawerOpen={drawerOpen}
+        onDrawer={setDrawerOpen}
+        covered={drawerOpen}
+        onUncover={() => setDrawerOpen(false)}
+      />
+      <Page route={route} />
+    </RefreshProvider>
+  );
+}
+
+/**
+ * Every read page this bundle renders, by the route name that reaches it.
+ *
+ * One table rather than a switch and a second list of names: this is also
+ * what `navigate` is told the application can draw, so a page cannot be
+ * added and left unroutable, and a route cannot be routed to before there
+ * is a page for it.
+ */
+const PAGES: Record<string, (route: Route) => ReactElement> = {
+  decided: (route) => <DecidedPage route={route} />,
+  boards: () => <BoardsPage />,
+  board: (route) => <BoardPage route={route} />,
+  lanes: () => <LanesPage />,
+};
+
+setMountedRoutes(["needs-you", ...Object.keys(PAGES)]);
+
+/** One route to one page. A name with no page is a page that says so. */
+function Page({ route }: { route: Route }): ReactElement {
+  const page = PAGES[route.name];
+  if (page !== undefined) {
+    return page(route);
+  }
+  return (
+    <main id="main" data-page data-route="not-found" data-testid="app-root">
+      <h1>Not found</h1>
+      <p>
+        No page at that address. <a href="/">Start over</a>.
+      </p>
+    </main>
+  );
+}
+
+/**
+ * The application: one document, and the address bar says which page it is
+ * showing (ADR-048 §1).
+ */
+export function App(): ReactElement {
+  const route = useRoute();
+  return route.name === "needs-you" ? <Deck /> : <ReadPages route={route} />;
 }

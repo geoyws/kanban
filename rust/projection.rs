@@ -26,8 +26,8 @@ use crate::model::{
 };
 use crate::registry::Registry;
 use crate::serve::{
-    DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS, lane_groups, markdown, project_named,
-    projects, sort_open_queue,
+    DECIDED_ROWS, DECIDED_SCAN, DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS, lane_groups,
+    markdown, project_named, projects, sort_decided_queue, sort_open_queue,
 };
 
 /// Why a projection could not answer.
@@ -191,8 +191,39 @@ pub struct BoardSummary {
 pub struct BoardDetail {
     board: String,
     roots: Vec<String>,
-    tasks: Listing<Task>,
-    rules: Vec<RuleSummary>,
+    tasks: Listing<BoardTaskRow>,
+    rules: Vec<BoardRule>,
+}
+
+/// One row of a board's task list, with the count the board page reads it
+/// with.
+///
+/// The count is not derivable from [`Task`]: it is the board's open attention
+/// against that row, which is what the served page's row sentence ends on
+/// (`attention_clause`, `rust/serve.rs`). A client that had the tasks and not
+/// the counts would have to ask once per row, which is the fan-out a
+/// projection exists to avoid.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardTaskRow {
+    task: Task,
+    open_attention: usize,
+}
+
+/// One applicable rule: the registry's own summary, plus the body the board
+/// page folds open.
+///
+/// The summary's three derived fields stay the registry's — they are not
+/// recomputed here — and `body` is the same rule read back through
+/// `applicable_rules` under the identical filter, because the served page
+/// shows the whole rule inside its fold and a page that only had the
+/// headline would be a different page.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardRule {
+    #[serde(flatten)]
+    summary: RuleSummary,
+    body: String,
 }
 
 /// One `(board, lane)` group and what that lane last said about itself.
@@ -201,7 +232,21 @@ pub struct BoardDetail {
 pub struct LaneSummary {
     board: String,
     lane: String,
-    updates: Vec<Sitrep>,
+    updates: Vec<LaneUpdate>,
+}
+
+/// One sitrep as the lanes page reads it: the row, and its body typeset by
+/// the server's one markdown renderer.
+///
+/// `bodyHtml` is here for the reason [`AttentionCard`]'s is: the page renders
+/// agent-authored markdown, and a second renderer in the client would be a
+/// second sanitiser (SPA-41).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneUpdate {
+    #[serde(flatten)]
+    update: Sitrep,
+    body_html: String,
 }
 
 /// One task, who holds it, and its trail.
@@ -254,7 +299,25 @@ pub fn needs_you() -> Projected<Listing<AttentionCard>> {
         stores.insert(project.name.clone(), store);
     }
     sort_open_queue(&mut items);
-    let cards = items
+    Ok(Listing::merged(
+        attention_cards(items, &stores),
+        OPEN_ATTENTION_ROWS,
+        truncated,
+    ))
+}
+
+/// One merged `(board, row)` list as the cards the deck and the decisions
+/// room both render.
+///
+/// Shared rather than copied because the two queues differ only in which
+/// rows they hold: the card is the same card, with the same one markdown
+/// renderer in front of the body and the same task reference resolved
+/// through the board's own store.
+fn attention_cards(
+    items: Vec<(String, Attention)>,
+    stores: &std::collections::BTreeMap<String, crate::store::Store>,
+) -> Vec<AttentionCard> {
+    items
         .into_iter()
         .map(|(board, attention)| {
             let task = attention.task_id.as_deref().and_then(|id| {
@@ -274,8 +337,7 @@ pub fn needs_you() -> Projected<Listing<AttentionCard>> {
                 task,
             }
         })
-        .collect();
-    Ok(Listing::merged(cards, OPEN_ATTENTION_ROWS, truncated))
+        .collect()
 }
 
 /// Every readable board at a glance, most urgent first.
@@ -349,23 +411,56 @@ pub fn boards() -> Projected<Listing<BoardSummary>> {
 /// One board's rows and its applicable rules.
 ///
 /// `Store::list_tasks(None, None, None, false)` takes no limit, so the tasks
-/// envelope reports none.
+/// envelope reports none. Each row carries the board's open attention
+/// against it — `Store::attention` filtered to that task, which is the count
+/// the served page's row sentence ends on.
 ///
 /// The rules are registry state, not board state — the one documented
 /// exception to `x-store-method`, recorded as `x-registry-method` on
 /// `getBoard`. `applicable_rule_summaries` is the registry's own
 /// [`RuleSummary`] projection of `applicable_rules`: the filter is identical
 /// and the headline, `hasMore` and byte count are derived once, in the
-/// registry, rather than a second time in the web layer.
+/// registry, rather than a second time in the web layer. The bodies come
+/// from `applicable_rules` under that same filter, because the page folds
+/// the whole rule open and the summary does not carry it.
 pub fn board(name: &str) -> Projected<BoardDetail> {
     let (project, store) = project_named(name).map_err(|_| Refusal::DeniedOrNotFound)?;
-    let tasks = store.list_tasks(None, None, None, None, false)?;
-    let rules =
-        Registry::open()?.applicable_rule_summaries(Some(&project.name), None, None, false)?;
+    let mut rows = Vec::new();
+    for task in store.list_tasks(None, None, None, None, false)? {
+        let open_attention = store
+            .attention(
+                Some("open"),
+                None,
+                Some(&task.id),
+                None,
+                None,
+                OPEN_ATTENTION_ROWS,
+                false,
+            )?
+            .len();
+        rows.push(BoardTaskRow {
+            task,
+            open_attention,
+        });
+    }
+    let registry = Registry::open()?;
+    let mut bodies = registry
+        .applicable_rules(Some(&project.name), None, None, false)?
+        .into_iter()
+        .map(|rule| (rule.id, rule.body))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let rules = registry
+        .applicable_rule_summaries(Some(&project.name), None, None, false)?
+        .into_iter()
+        .map(|summary| {
+            let body = bodies.remove(&summary.id).unwrap_or_default();
+            BoardRule { summary, body }
+        })
+        .collect();
     Ok(BoardDetail {
         board: project.name,
         roots: project.workspace_roots,
-        tasks: Listing::complete(tasks),
+        tasks: Listing::complete(rows),
         rules,
     })
 }
@@ -380,7 +475,13 @@ pub fn lanes() -> Projected<Listing<LaneSummary>> {
         .map(|((board, lane), updates)| LaneSummary {
             board,
             lane,
-            updates,
+            updates: updates
+                .into_iter()
+                .map(|update| LaneUpdate {
+                    body_html: markdown(&update.body),
+                    update,
+                })
+                .collect(),
         })
         .collect();
     Ok(Listing::merged(items, LANE_UPDATE_ROWS, truncated))
@@ -418,5 +519,49 @@ pub fn task(project_name: &str, id: &str) -> Projected<TaskDetail> {
         notes: Listing::capped(notes, DETAIL_ROWS),
         checkpoints: Listing::capped(checkpoints, DETAIL_ROWS),
         events: Listing::capped(events, DETAIL_ROWS),
+    })
+}
+
+// --- the decisions room ---------------------------------------------------
+
+/// The decisions room's answer: the merged rows, plus the per-board scan
+/// that fed the merge.
+///
+/// Two bounds shape this page and a reader has to be able to tell them
+/// apart, so both are on the wire: `limit` is the cut the merge is served
+/// at, and `scanLimit` is how far each board was read before merging.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecidedListing {
+    #[serde(flatten)]
+    listing: Listing<AttentionCard>,
+    scan_limit: i64,
+}
+
+/// What was decided, newest first, across every readable board.
+///
+/// `Store::recent_resolved_attention(DECIDED_SCAN)` per board, then the
+/// decisions room's own ordering — newest `resolved_at`, then id, then board
+/// — and the merge cut to `DECIDED_ROWS`. The ordering is
+/// [`sort_decided_queue`], shared with the page rather than copied, so the
+/// two surfaces cannot disagree about which decision is newest.
+pub fn decided() -> Projected<DecidedListing> {
+    let mut items: Vec<(String, Attention)> = Vec::new();
+    let mut stores = std::collections::BTreeMap::new();
+    for (project, store) in projects()? {
+        let name = project.name.clone();
+        for item in store.recent_resolved_attention(DECIDED_SCAN)? {
+            items.push((name.clone(), item));
+        }
+        stores.insert(name, store);
+    }
+    sort_decided_queue(&mut items);
+    // Cut here, on the merge, rather than by over-fetching: the bound is the
+    // merged list's, and `truncated` is the observation that the merge held
+    // more rows than the cut kept.
+    let cards = attention_cards(items, &stores);
+    Ok(DecidedListing {
+        listing: Listing::capped(cards, DECIDED_ROWS),
+        scan_limit: DECIDED_SCAN,
     })
 }

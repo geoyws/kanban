@@ -31,6 +31,24 @@ export interface Attention {
   priority: number;
   priorityLevel?: string | null;
   tags: string[];
+  resolvedAt?: number | null;
+  resolvedBy?: string | null;
+  /** The composed sentence a row settled with before decisions were kept. */
+  resolution?: string | null;
+  decision?: Decision | null;
+}
+
+/**
+ * What settling one item recorded (`rust/model.rs`'s `AttentionDecision`).
+ * `null` while the item is open: a reopen clears it from the row and keeps
+ * it in the ledger (ADR-042 §3).
+ */
+export interface Decision {
+  choice: string;
+  outcome: string;
+  note?: string | null;
+  by: string;
+  at: number;
 }
 
 /** The row a card is about, as the card's meta sentence reads it. */
@@ -49,21 +67,40 @@ export interface Card {
   task?: TaskReference;
 }
 
-interface Listing {
-  items: Card[];
+/**
+ * The capped-listing envelope every JSON listing arrives in (ADR-037 §4,
+ * option A): the rows, and whether there are rows this answer does not
+ * hold. A page that renders `items` and drops `truncated` is telling the
+ * operator a bounded list is the whole list.
+ */
+export interface Listing<T> {
+  items: T[];
+  returned: number;
+  limit: number | null;
+  truncated: boolean;
 }
 
-/** The projection this page is: every open item, in deck order. */
-export async function fetchNeedsYou(): Promise<Card[]> {
-  const response = await fetch("/api/v1/needs-you", {
+/**
+ * Read one projection.
+ *
+ * Every read in this application goes through here, so there is one place
+ * that says what a read is: same-origin, JSON, and a refusal that carries
+ * the route and the status rather than a parse error twenty frames later.
+ */
+export async function fetchJson<T>(path: string): Promise<T> {
+  const response = await fetch(path, {
     credentials: "same-origin",
     headers: { Accept: "application/json" },
   });
   if (!response.ok) {
-    throw new Error(`needs-you ${response.status}`);
+    throw new Error(`${path} ${response.status}`);
   }
-  const listing = (await response.json()) as Listing;
-  return listing.items;
+  return (await response.json()) as T;
+}
+
+/** The projection this page is: every open item, in deck order. */
+export async function fetchNeedsYou(): Promise<Card[]> {
+  return (await fetchJson<Listing<Card>>("/api/v1/needs-you")).items;
 }
 
 /**
@@ -78,7 +115,17 @@ export type WriteResult =
   | { recorded: true }
   | { recorded: false; refusal: string | null; status: number };
 
-async function post(path: string, body?: URLSearchParams): Promise<WriteResult> {
+/**
+ * Post one of the four allowed form writes and read what came back.
+ *
+ * Shared by every page that writes, because the refusal-reading is the
+ * delicate half: three copies of it would be three different ideas of what
+ * a refused write says.
+ */
+export async function postForm(
+  path: string,
+  body?: URLSearchParams,
+): Promise<WriteResult> {
   const response = await fetch(path, {
     method: "POST",
     credentials: "same-origin",
@@ -105,7 +152,7 @@ export function postDecision(
   id: string,
   body: URLSearchParams,
 ): Promise<WriteResult> {
-  return post(
+  return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reply`,
     body,
   );
@@ -116,7 +163,7 @@ export function postDecision(
  * undo that demanded words would be a dialog wearing a button.
  */
 export function postReopen(board: string, id: string): Promise<WriteResult> {
-  return post(
+  return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reopen`,
   );
 }

@@ -21639,18 +21639,23 @@ fn dashboard_and_boards_page_count_past_the_listing_page() {
     );
     assert_eq!(attention.as_array().unwrap().len(), 1001);
 
-    // The served Boards page is the same projection.
+    // The Boards page reads the same projection, and since `t-bf255880` it
+    // reads it over the wire: the counts are the route's, not a second
+    // count the page did for itself.
     let server = spawn_server(&fixture);
-    let (status, body) = http_get(server.port, "/boards");
-    assert_eq!(status, 200);
-    assert!(
-        body.contains("<td class=\"n waiting\">1001</td>"),
-        "open attention on the Boards page:\n{body}"
+    let (status, body) = http_get(server.port, "/api/v1/boards");
+    assert_eq!(status, 200, "{body}");
+    let index: Value = serde_json::from_str(&body).expect("/api/v1/boards is JSON");
+    let row = index["items"]
+        .as_array()
+        .expect("the board rows")
+        .first()
+        .unwrap_or_else(|| panic!("the board index is empty:\n{body}"));
+    assert_eq!(
+        row["openAttention"], 1001,
+        "open attention on Boards:\n{body}"
     );
-    assert!(
-        body.contains("<td class=n>101</td>"),
-        "pending handoffs on the Boards page:\n{body}"
-    );
+    assert_eq!(row["handoffs"], 101, "pending handoffs on Boards:\n{body}");
 }
 
 #[test]
@@ -25251,9 +25256,12 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "raw markup reached the page: {home}"
     );
 
-    let (status, boards) = http_get(port, "/boards");
-    assert_eq!(status, 200);
-    assert!(boards.contains("SERVED"), "{boards}");
+    // `/boards`, `/lanes` and `/board/{project}` are the mounted
+    // application since `t-bf255880`: the route answers the shell, so what
+    // is asserted here is the projection those pages read.
+    let (status, boards) = http_get(port, "/api/v1/boards");
+    assert_eq!(status, 200, "{boards}");
+    assert!(boards.contains("\"board\":\"SERVED\""), "{boards}");
 
     let (status, deployments) = http_get(port, "/deployments");
     assert_eq!(status, 200, "{deployments}");
@@ -25304,8 +25312,8 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
             "--json",
         ],
     );
-    let (status, lanes) = http_get(port, "/lanes");
-    assert_eq!(status, 200);
+    let (status, lanes) = http_get(port, "/api/v1/lanes");
+    assert_eq!(status, 200, "{lanes}");
     assert!(lanes.contains("driver-2"), "{lanes}");
     // Most recently active first. Nothing deletes a sitrep, so a lane
     // whose driver is long gone keeps its rows forever -- alphabetical order
@@ -25315,14 +25323,24 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "a quiet lane sorted above an active one: {lanes}"
     );
     assert!(lanes.contains("retry path is the culprit"), "{lanes}");
-    // Raw HTML in a body never reaches the page as markup: the words stay
-    // and the tags do not (markdown strips them server-side).
+    // The body a lane renders is typeset by the server's one markdown
+    // renderer and arrives as `bodyHtml`, so raw HTML an agent wrote is
+    // already inert before the client ever sees it: the words stay and the
+    // tags do not.
+    let lane_rows: Value = serde_json::from_str(&lanes).expect("/api/v1/lanes is JSON");
+    let typeset = lane_rows["items"]
+        .as_array()
+        .expect("the lane groups")
+        .iter()
+        .flat_map(|group| group["updates"].as_array().expect("the updates"))
+        .map(|update| update["bodyHtml"].as_str().expect("a typeset body"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        lanes.contains("underway"),
-        "a sitrep body lost its words: {lanes}"
+        typeset.contains("underway"),
+        "a sitrep body lost its words: {typeset}"
     );
-    assert!(!lanes.contains("<i>underway</i>"), "{lanes}");
-    assert!(!lanes.contains("&lt;i&gt;"), "{lanes}");
+    assert!(!typeset.contains("<i>underway</i>"), "{typeset}");
 
     let (status, plans) = http_get(port, "/plans");
     assert_eq!(status, 200);
@@ -25334,51 +25352,80 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     );
     assert!(plans.contains("infra"), "tags must render: {plans}");
 
-    // The hostile title survives as text on every page that renders it.
-    let (status, one) = http_get(port, "/board/SERVED");
-    assert_eq!(status, 200);
+    // The board's projection carries exactly the rules that apply to it
+    // and no others. An agent-authored title and an agent-authored rule
+    // body are carried as the text they are -- JSON has no markup to
+    // escape into, and the client builds the DOM with text nodes, which is
+    // where WEB-27 is now proved (SPA-41,
+    // `agent_markup_stays_inert_in_real_chrome`).
+    let (status, one) = http_get(port, "/api/v1/board/SERVED");
+    assert_eq!(status, 200, "{one}");
+    let projected: Value = serde_json::from_str(&one).expect("/api/v1/board is JSON");
+    let titles = projected["tasks"]["items"]
+        .as_array()
+        .expect("the board's rows")
+        .iter()
+        .map(|row| row["task"]["title"].as_str().expect("a title"))
+        .collect::<Vec<_>>();
     assert!(
-        one.contains("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"),
-        "a task title was not escaped: {one}"
+        titles.contains(&"<script>alert('xss')</script>"),
+        "the hostile title did not survive as text: {one}"
     );
+    let rules = projected["rules"].as_array().expect("the board's rules");
+    let rule_ids = rules
+        .iter()
+        .map(|rule| rule["id"].as_str().expect("a rule id"))
+        .collect::<Vec<_>>();
     assert!(
-        !one.contains("<script>alert"),
-        "a script tag reached the page: {one}"
-    );
-    assert!(one.contains("<h2>Rules"), "{one}");
-    assert!(!one.contains("Project rules"), "{one}");
-    assert!(!one.contains("Global rules"), "{one}");
-    assert!(one.contains(global_rule["id"].as_str().unwrap()), "{one}");
-    assert!(
-        one.contains("ALL"),
-        "global rule target tag did not render: {one}"
-    );
-    assert!(!one.contains(other_only["id"].as_str().unwrap()), "{one}");
-    assert!(
-        !one.contains(all_except_served["id"].as_str().unwrap()),
+        rule_ids.contains(&global_rule["id"].as_str().unwrap()),
         "{one}"
     );
     assert!(
-        one.contains("Global &lt;em&gt;rule&lt;/em&gt; inherited everywhere."),
-        "a global rule was not escaped: {one}"
+        rule_ids.contains(&live_rule["id"].as_str().unwrap()),
+        "{one}"
     );
-    assert!(one.contains(live_rule["id"].as_str().unwrap()), "{one}");
     assert!(
-        !one.contains(task_only_rule["id"].as_str().unwrap()),
+        !rule_ids.contains(&other_only["id"].as_str().unwrap()),
+        "another board's rule reached this board: {one}"
+    );
+    assert!(
+        !rule_ids.contains(&all_except_served["id"].as_str().unwrap()),
+        "an excluded rule reached this board: {one}"
+    );
+    assert!(
+        !rule_ids.contains(&task_only_rule["id"].as_str().unwrap()),
         "task-scoped rule leaked into a taskless board projection: {one}"
     );
     assert!(
-        one.contains("Never render &lt;b&gt;rules&lt;/b&gt; without escaping."),
-        "a rule headline was not escaped: {one}"
+        rules.iter().any(|rule| rule["tags"]
+            .as_array()
+            .expect("rule tags")
+            .iter()
+            .any(|tag| tag == "ALL")),
+        "global rule target tag did not reach the board: {one}"
     );
-    assert!(one.contains("The full body is visible."), "{one}");
+    let bodies = rules
+        .iter()
+        .map(|rule| rule["body"].as_str().expect("a rule body"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !one.contains("<b>rules</b>"),
-        "raw rule markup reached the page: {one}"
+        bodies.contains("Global <em>rule</em> inherited everywhere."),
+        "a global rule body did not reach the board: {bodies}"
+    );
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule["headline"] == "Never render <b>rules</b> without escaping."),
+        "a rule headline did not reach the board: {one}"
+    );
+    assert!(
+        bodies.contains("The full body is visible."),
+        "the board's fold has no rule body to open: {bodies}"
     );
     assert!(
         !one.contains("RETIRED RULE MUST NOT RENDER"),
-        "a retired rule remained in force on the board page: {one}"
+        "a retired rule remained in force on the board projection: {one}"
     );
 
     let (status, detail) = http_get(port, "/task/SERVED/t-hostile");
@@ -25433,6 +25480,13 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         &format!("/deployment/SERVED/{deployment_id}"),
         "/board/SERVED",
         "/task/SERVED/t-gated",
+        // The JSON projection is a read surface too, and it is the one the
+        // mounted pages actually read (SPA-13).
+        "/api/v1/needs-you",
+        "/api/v1/decided",
+        "/api/v1/boards",
+        "/api/v1/board/SERVED",
+        "/api/v1/lanes",
     ] {
         let (status, _) = http_get(port, path);
         assert_eq!(status, 200, "{path}");
@@ -25596,11 +25650,14 @@ fn priority_orders_cli_dashboard_and_web_queues_before_age() {
         "the web queue is not in priority order: {body}"
     );
 
-    let (status, board) = http_get(port, "/board/PRIORITY-MAIN");
+    // The board's own rows and the board index are the mounted
+    // application's since `t-bf255880`, so the order is asserted where it
+    // is decided: in the projection both the page and the CLI read.
+    let (status, board) = http_get(port, "/api/v1/board/PRIORITY-MAIN");
     assert_eq!(status, 200, "{board}");
     assert!(board.find("t-committed").unwrap() < board.find("t-routine").unwrap());
 
-    let (status, boards) = http_get(port, "/boards");
+    let (status, boards) = http_get(port, "/api/v1/boards");
     assert_eq!(status, 200, "{boards}");
     assert!(boards.find("PRIORITY-URGENT").unwrap() < boards.find("PRIORITY-MAIN").unwrap());
 }
@@ -25613,10 +25670,20 @@ fn served_board_pages_fail_closed_on_duplicate_names() {
 
     let server = spawn_server(&fixture);
     let port = server.port;
-    let (status, page) = http_get(port, "/board/Alpha");
-    assert_eq!(status, 500, "{page}");
-    assert!(page.contains("2 Kanban projects are named Alpha"), "{page}");
-    assert!(page.contains("Alpha (rootless)"), "{page}");
+    // The route answers the application shell for every name now, so the
+    // fail-closed is the projection's -- and it is the SAME body an unknown
+    // or unauthorized board gets, because a refusal that distinguishes an
+    // ambiguous name from an absent one is an existence oracle (SPA-08).
+    let (status, shell) = http_get(port, "/board/Alpha");
+    assert_eq!(status, 200, "{shell}");
+    assert!(shell.contains("id=root"), "{shell}");
+    assert!(
+        !shell.contains("Kanban projects are named"),
+        "the shell carried the ambiguity it must not name: {shell}"
+    );
+    let (status, refused) = http_get(port, "/api/v1/board/Alpha");
+    assert_eq!(status, 404, "{refused}");
+    assert_eq!(refused, JSON_DENIED_OR_NOT_FOUND, "{refused}");
 }
 
 struct ActorHeaderFixture {
@@ -26514,9 +26581,11 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
         task_page.contains("Choose the rollout window"),
         "{task_page}"
     );
-    let (status, board) = http_get(port, "/board/SERVEWRITE");
+    let (status, board) = http_get(port, "/api/v1/board/SERVEWRITE");
     assert_eq!(status, 200, "{board}");
-    assert!(board.contains("1 open attention"), "{board}");
+    // The count the board's row sentence ends on, carried per row rather
+    // than fetched by the client once per task.
+    assert!(board.contains("\"openAttention\":1"), "{board}");
     assert!(board.contains("Ship the rollout task"), "{board}");
     let (status, opened) = http_post(port, "/plan/SERVEWRITE/e-web-open/open", &origin, b"");
     assert_eq!(status, 303, "{opened}");
@@ -27440,6 +27509,116 @@ fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, l
     if selector.starts_with("[data-nav") {
         open_nav_drawer(tab);
     }
+    let replaced = || {
+        tab.evaluate("!document.documentElement.dataset.navigationProbe", false)
+            .ok()
+            .and_then(|result| result.value)
+            == Some(json!(true))
+    };
+    assert_eq!(
+        js_value(
+            tab,
+            "(() => { document.documentElement.dataset.navigationProbe = 'before'; return true; })()",
+        ),
+        true
+    );
+    // Measure, dispatch, and prove the document was replaced -- and if it was
+    // not, measure and dispatch again rather than declare the page broken.
+    //
+    // A projection swap can move the control between the measurement and the
+    // press, and a press that lands where the control no longer is does
+    // nothing at all. Re-dispatching is only safe because the probe is still
+    // on the document: had the earlier press been accepted, the reply from
+    // the local server -- which has never taken anything like eight seconds
+    // to answer -- would already have replaced it. The test still fails, with
+    // the same message, if no press ever navigates.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        tab.click_point(clickable_point(tab, selector, label))
+            .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
+        // Only a settling wait: the probe below, not this event, is what
+        // proves a new document arrived.
+        let _ = tab.wait_until_navigated();
+        let grace = Instant::now() + Duration::from_secs(8);
+        while !replaced() {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the clicked control never replaced the document"
+            );
+            if Instant::now() > grace {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if replaced() {
+            break;
+        }
+    }
+    tab.wait_for_element(arrived)
+        .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
+}
+
+/// The same press, for a control that ROUTES rather than navigates.
+///
+/// A client-side route change never replaces the document, so
+/// `click_navigating`'s probe -- a dataset flag that has to disappear --
+/// can never clear and every such leg would time out. What is observed
+/// instead is the two things a route change actually does: the address bar
+/// moves to `pathname`, and the page that address names is on screen.
+///
+/// The measurement, the hit test and the re-dispatch are the same as
+/// `click_navigating`'s, shared rather than copied, because the flake they
+/// close -- a projection swap moving the control between the measure and
+/// the press -- is the same flake on a routed link.
+fn click_routing(
+    tab: &headless_chrome::Tab,
+    selector: &str,
+    arrived: &str,
+    pathname: &str,
+    label: &str,
+) {
+    if selector.starts_with("[data-nav") {
+        open_nav_drawer(tab);
+    }
+    let probe = format!(
+        "(() => location.pathname === {} && Boolean(document.querySelector({})))()",
+        serde_json::to_string(pathname).expect("pathname as a JS string literal"),
+        serde_json::to_string(arrived).expect("selector as a JS string literal"),
+    );
+    let there = || {
+        tab.evaluate(&probe, false)
+            .ok()
+            .and_then(|result| result.value)
+            == Some(json!(true))
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        tab.click_point(clickable_point(tab, selector, label))
+            .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
+        let grace = Instant::now() + Duration::from_secs(8);
+        while !there() {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the clicked control never routed to {pathname} with {arrived} on screen"
+            );
+            if Instant::now() > grace {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if there() {
+            return;
+        }
+    }
+}
+
+/// One point on a control that a real pointer could hit, measured, scrolled
+/// and hit-tested in a single in-page expression.
+fn clickable_point(
+    tab: &headless_chrome::Tab,
+    selector: &str,
+    label: &str,
+) -> headless_chrome::browser::tab::point::Point {
     const MEASURE: &str = "(() => {
         const element = document.querySelector(__SELECTOR__);
         if (!element) return JSON.stringify({state: 'missing'});
@@ -27481,8 +27660,8 @@ fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, l
         "__SELECTOR__",
         &serde_json::to_string(selector).expect("selector as a JS string literal"),
     );
-    let measure_point = || {
-        let control_deadline = Instant::now() + Duration::from_secs(20);
+    let control_deadline = Instant::now() + Duration::from_secs(20);
+    {
         let mut last = "no measurement completed".to_owned();
         loop {
             // A tolerated Err is the page swapping execution contexts
@@ -27515,54 +27694,7 @@ fn click_navigating(tab: &headless_chrome::Tab, selector: &str, arrived: &str, l
             );
             std::thread::sleep(Duration::from_millis(25));
         }
-    };
-    let replaced = || {
-        tab.evaluate("!document.documentElement.dataset.navigationProbe", false)
-            .ok()
-            .and_then(|result| result.value)
-            == Some(json!(true))
-    };
-    assert_eq!(
-        js_value(
-            tab,
-            "(() => { document.documentElement.dataset.navigationProbe = 'before'; return true; })()",
-        ),
-        true
-    );
-    // Measure, dispatch, and prove the document was replaced -- and if it was
-    // not, measure and dispatch again rather than declare the page broken.
-    //
-    // A projection swap can move the control between the measurement and the
-    // press, and a press that lands where the control no longer is does
-    // nothing at all. Re-dispatching is only safe because the probe is still
-    // on the document: had the earlier press been accepted, the reply from
-    // the local server -- which has never taken anything like eight seconds
-    // to answer -- would already have replaced it. The test still fails, with
-    // the same message, if no press ever navigates.
-    let deadline = Instant::now() + Duration::from_secs(40);
-    loop {
-        tab.click_point(measure_point())
-            .unwrap_or_else(|error| panic!("{label}: click failed: {error}"));
-        // Only a settling wait: the probe below, not this event, is what
-        // proves a new document arrived.
-        let _ = tab.wait_until_navigated();
-        let grace = Instant::now() + Duration::from_secs(8);
-        while !replaced() {
-            assert!(
-                Instant::now() < deadline,
-                "{label}: the clicked control never replaced the document"
-            );
-            if Instant::now() > grace {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        if replaced() {
-            break;
-        }
     }
-    tab.wait_for_element(arrived)
-        .unwrap_or_else(|error| panic!("{label}: did not arrive at {arrived}: {error}"));
 }
 
 /// A reference link opens its item in a tab of its own (George, 2026-09-11:
@@ -28329,8 +28461,16 @@ fn recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome() {
         tab.wait_for_element(&ui::receipt(id)).expect("the receipt");
     }
 
+    // Recent decisions is the mounted application since `t-bf255880`: the
+    // route answers the shell, the bundle routes to the page, and the rows
+    // come from `/api/v1/decided`. So the readiness gate is the mounted
+    // root and then the page's own first row, not the first response's
+    // markup.
     tab.navigate_to(&format!("{origin}decided"))
         .expect("load Recent decisions");
+    wait_for_app_root(&tab, ui::APP_ROOT);
+    tab.wait_for_element(&format!("article.decided[data-item=\"{first_id}\"]"))
+        .expect("the older decision");
     // `evaluate` without return-by-value hands back objects by reference, so
     // the row order travels as JSON text.
     let rows = || {
@@ -28375,6 +28515,14 @@ fn recent_decisions_page_lists_newest_first_and_undoes_in_real_chrome() {
     click_control(
         &tab,
         &format!("article.decided[data-item=\"{second_id}\"] button[data-undo]"),
+    );
+    // The page is not replaced and the address does not move: the undo is
+    // the same form POST to the same route, and what follows it is a
+    // re-read of this page's own projection.
+    assert_eq!(
+        js_value(&tab, "location.pathname"),
+        "/decided",
+        "the undo navigated away from Recent decisions"
     );
     tab.wait_for_element(&format!("article.decided[data-item=\"{first_id}\"]"))
         .expect("the older decision stays");
@@ -31758,13 +31906,16 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         boards_link.get_attribute_value("href").unwrap().as_deref(),
         Some("/boards")
     );
-    click_navigating(
+    // Boards is the mounted application's since `t-bf255880`, so the leg
+    // routes rather than navigates: the document is not replaced, the
+    // address moves, and the page the address names is on screen.
+    click_routing(
         &tab,
         "[data-nav=boards]",
         "[data-board=\"MOBILE-JOURNEY\"]",
+        "/boards",
         "Boards nav",
     );
-    assert_eq!(js_value(&tab, "location.pathname"), "/boards");
     assert_no_horizontal_overflow(&tab, "Boards");
 
     let board_link = tab
@@ -31874,13 +32025,13 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     assert_element_text(&tab, "[data-task-title]", task_title);
     assert_no_horizontal_overflow(&tab, "searched task detail");
 
-    click_navigating(
+    click_routing(
         &tab,
         "[data-nav=lanes]",
         "[data-lane=\"mobile-lane\"]",
+        "/lanes",
         "Lanes nav",
     );
-    assert_eq!(js_value(&tab, "location.pathname"), "/lanes");
     assert_element_text(
         &tab,
         "[data-lane=\"mobile-lane\"] [data-lane-body]",
@@ -44717,7 +44868,7 @@ fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
     let server = spawn_server(&fixture);
     let port = server.port;
 
-    let (status, boards) = http_get(port, "/boards");
+    let (status, boards) = http_get(port, "/api/v1/boards");
     assert_eq!(status, 200, "{boards}");
     assert!(
         boards.contains("ACTIVE"),
@@ -44728,12 +44879,11 @@ fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
         "the retired board leaked into the board index: {boards}"
     );
 
-    let (status, retired_page) = http_get(port, "/board/RETIRED");
-    assert_eq!(status, 500, "{retired_page}");
-    assert!(
-        retired_page.contains("retire served board"),
-        "{retired_page}"
-    );
+    // Its own route is the same single refusal, and it says nothing about
+    // the retirement -- not the note, not the fact (SPA-08).
+    let (status, retired_route) = http_get(port, "/api/v1/board/RETIRED");
+    assert_eq!(status, 404, "{retired_route}");
+    assert_eq!(retired_route, JSON_DENIED_OR_NOT_FOUND, "{retired_route}");
 }
 
 /// The store's single generic refusal, as the JSON surface must write it.
@@ -44907,6 +45057,137 @@ fn the_json_needs_you_projection_answers_the_same_cards_as_the_cli_over_http() {
     assert_eq!(queue["returned"], 2, "{body}");
     assert_eq!(queue["limit"], 1000, "{body}");
     assert_eq!(queue["truncated"], Value::Bool(false), "{body}");
+}
+
+#[test]
+fn the_json_decided_projection_answers_the_same_rows_as_the_cli_over_http() {
+    // SPA-06, SPA-43. `/decided` is the mounted application now, so what
+    // the server owes the decisions room is this route. The load-bearing
+    // claim is the ORDER: the room exists so the last decisions stay within
+    // reach of one Undo, and "the last" is newest-resolved-first across
+    // every board. So the assertion is against `kb att list --status
+    // resolved`, whose own rows carry the resolution instants.
+    let fixture = Fixture::new("json-decided");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSOND", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Carrier", "--id", "t-decided", "--json"],
+    );
+    let mut settled = Vec::new();
+    for (body, choice) in [
+        ("Decided first", "approve"),
+        ("Decided second", "reject"),
+        ("Decided third", "approve"),
+    ] {
+        let raised = fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--as",
+                "claude@driver-1",
+                "--kind",
+                "decision",
+                "--task",
+                "t-decided",
+                "--json",
+            ],
+        );
+        let id = raised["id"].as_str().unwrap().to_owned();
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "resolve",
+                &id,
+                "--as",
+                "geoyws",
+                "--choice",
+                choice,
+                "--json",
+            ],
+        );
+        settled.push(id);
+    }
+    // One still open, which is the other page's row and must not be here.
+    let open = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Still waiting",
+            "--as",
+            "claude@driver-2",
+            "--kind",
+            "risk",
+            "--json",
+        ],
+    );
+    let open_id = open["id"].as_str().unwrap().to_owned();
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/decided");
+    assert_eq!(status, 200, "{body}");
+    let room: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/decided is not JSON: {error}\n{body}"));
+    let rows = room["items"].as_array().expect("the decided rows");
+    let served: Vec<&str> = rows
+        .iter()
+        .map(|card| card["attention"]["id"].as_str().expect("an id"))
+        .collect();
+    // Newest decided first: the reverse of the order they were settled in.
+    let newest_first: Vec<&str> = settled.iter().rev().map(String::as_str).collect();
+    assert_eq!(
+        served, newest_first,
+        "the decisions room is not newest first: {body}"
+    );
+
+    let cli = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    let listed = cli.as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        listed.len(),
+        "the JSON room and `kb att list --status resolved` disagree on how many rows are \
+         settled:\n{body}\n{cli}"
+    );
+    for card in rows {
+        let id = card["attention"]["id"].as_str().unwrap();
+        let row = listed
+            .iter()
+            .find(|listed| listed["id"] == id)
+            .unwrap_or_else(|| panic!("the CLI does not know {id}: {cli}"));
+        assert_eq!(card["board"], "JSOND", "{card}");
+        for field in ["status", "decision", "resolvedBy", "resolvedAt", "choices"] {
+            assert_eq!(
+                card["attention"][field], row[field],
+                "{field} differs between the JSON row and the CLI row:\n{card}\n{row}"
+            );
+        }
+        // The card carries what the room renders and the row does not hold:
+        // the body typeset by the server's one markdown renderer, and the
+        // task the decision was about.
+        assert!(
+            card["bodyHtml"]
+                .as_str()
+                .is_some_and(|html| html.contains("<p>")),
+            "a decided card carries no server-typeset body: {card}"
+        );
+        assert_eq!(card["task"]["id"], "t-decided", "{card}");
+    }
+    assert!(
+        !body.contains(&open_id),
+        "an open row is in the decisions room: {body}"
+    );
+    // Two bounds, and the envelope says which is which (ADR-037 §4): the
+    // cut the merge is served at, and the per-board scan behind it.
+    assert_eq!(room["returned"], 3, "{body}");
+    assert_eq!(room["limit"], 20, "{body}");
+    assert_eq!(room["truncated"], Value::Bool(false), "{body}");
+    assert_eq!(room["scanLimit"], 200, "{body}");
 }
 
 #[test]
@@ -49440,6 +49721,16 @@ fn go(tab: &headless_chrome::Tab, origin: &str, route: &str) {
     tab.wait_until_navigated()
         .unwrap_or_else(|error| panic!("navigate to {route}: {error}"));
     wait_for_js_true(tab, "document.readyState === 'complete'");
+    // Several of these routes are the mounted application now
+    // (`t-bf255880`), whose `<main>` arrives when the bundle runs rather
+    // than in the first response. `readyState` alone would hand a sweep an
+    // empty shell. A preview fragment has no `<main>` and never had one, so
+    // the wait is asked only of a document that IS the shell.
+    wait_for_js_true(
+        tab,
+        "!document.querySelector('[data-testid=app-root-shell]') \
+         || Boolean(document.querySelector('main'))",
+    );
 }
 
 /// Every animation the page starts, recorded at the document so the record
@@ -49691,6 +49982,22 @@ const BOX_SWEEP: &str = r#"(() => {
 #[test]
 fn nothing_is_boxed_in_real_chrome() {
     let desk = deck_desk("serve-deck-boxes", "DECKBOX");
+    // `/decided` draws decided ROWS, so the sweep is given one: an empty
+    // decisions room is a heading and a sentence, and a sweep over that
+    // proves nothing about what a row draws.
+    desk.fixture.ok_json(
+        &desk.fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &desk.ids[0],
+            "--as",
+            "geoyws",
+            "--choice",
+            "assign-and-login",
+            "--json",
+        ],
+    );
     let origin = desk.server.origin();
     let surface0 = token(&desk.tab, "--surface0");
     let surface1 = token(&desk.tab, "--surface1");

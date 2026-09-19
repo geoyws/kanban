@@ -64,8 +64,11 @@ export interface CardState {
 /**
  * The priority, which is the only thing in the card's orientation line that
  * is not prose (`rust/serve.rs`'s `priority_badge`).
+ *
+ * Exported because every read page ends a row's sentence on the same badge,
+ * and a second rendering of it would be a second idea of what P0 looks like.
  */
-function Priority({
+export function Priority({
   priority,
   level,
 }: {

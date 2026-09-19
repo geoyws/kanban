@@ -1470,7 +1470,14 @@ fn the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over
     // read the store's one filtered listing and both refuse it by name.
     let alpha = server.get_json("/api/v1/board/Alpha");
     let listed = estate.ok_json(&work_a, &["task", "list", "--json"]);
-    let api_rows = alpha["tasks"]["items"].as_array().unwrap();
+    // A board row is `{task, openAttention}` since `t-bf255880`, so the
+    // task the CLI lists is the row's `task` member.
+    let api_rows = alpha["tasks"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| &row["task"])
+        .collect::<Vec<_>>();
     let cli_rows = listed.as_array().unwrap();
     assert_eq!(
         api_rows.len(),
@@ -1501,7 +1508,7 @@ fn the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over
         "a granted board did not appear: {boards}"
     );
     let beta = server.get_json("/api/v1/board/Beta");
-    assert_eq!(beta["tasks"]["items"][0]["id"], "t-bhid", "{beta}");
+    assert_eq!(beta["tasks"]["items"][0]["task"]["id"], "t-bhid", "{beta}");
     estate.ok_json(&work_b, &["task", "list", "--json"]);
 }
 
@@ -2270,7 +2277,12 @@ fn the_json_routes_answer_the_same_rows_as_the_cli_over_http() {
     // 1. The board listing against `task list`.
     let board = server.get_json("/api/v1/board/Alpha");
     let listed = estate.ok_json(&work_a, &["task", "list", "--json"]);
-    let api_rows = board["tasks"]["items"].as_array().unwrap();
+    let api_rows = board["tasks"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| &row["task"])
+        .collect::<Vec<_>>();
     let cli_rows = listed.as_array().unwrap();
     assert_eq!(
         api_rows.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
@@ -2634,7 +2646,7 @@ fn a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .map(|row| row["task"]["id"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(
         api_ids,
@@ -2653,10 +2665,15 @@ fn a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http() {
         "the board index counts rows this caller may not read: {summary}"
     );
 
-    // 4. The rendered board page, searched for every string the hidden rows
-    //    carry: a page that named one would confirm its existence as surely
-    //    as the JSON would.
-    let page = server.get("/board/Alpha");
+    // 4. The bytes the board PAGE is built from, searched for every string
+    //    the hidden rows carry: bytes that named one would confirm its
+    //    existence as surely as a rendering of them would. Since
+    //    `t-bf255880` the page is the mounted application and `/board/Alpha`
+    //    answers the shell, so the bytes that carry rows are the
+    //    projection's — which is exactly what the client is handed.
+    let shell = server.get("/board/Alpha");
+    assert_eq!(shell.status, 200, "{}", shell.body);
+    let page = server.get("/api/v1/board/Alpha");
     assert_eq!(page.status, 200, "{}", page.body);
     for needle in [
         "t-asec",
@@ -2665,13 +2682,17 @@ fn a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http() {
         "alpha row with both tags",
     ] {
         assert!(
+            !shell.body.contains(needle),
+            "the board shell named {needle}, which this caller may not read"
+        );
+        assert!(
             !page.body.contains(needle),
-            "the board page named {needle}, which this caller may not read"
+            "the board projection named {needle}, which this caller may not read"
         );
     }
     assert!(
         page.body.contains("t-avis") && page.body.contains("alpha visible row"),
-        "the board page did not render the row this caller MAY read"
+        "the board projection did not carry the row this caller MAY read"
     );
 }
 

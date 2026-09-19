@@ -56,3 +56,44 @@ export function cardQuestion(
   }
   return `${glyphs.slice(0, QUESTION_BOUND - 1).join("")}…`;
 }
+
+/* read pages -------------------------------------------------------------
+ *
+ * The four sentence-shapes the read pages share, each ported from the
+ * `rust/serve.rs` function named on it. They are here rather than in a page
+ * because three pages read the same sentence and a reader compares them.
+ */
+
+/** `rust/serve.rs`'s `status_label`: one board status as a heading reads it. */
+export function statusLabel(status: string): string {
+  // `todo` is two words in English; every other status is one word or
+  // underscore-joined.
+  if (status === "todo") {
+    return "To do";
+  }
+  const words = status.replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/**
+ * `rust/serve.rs`'s `a_or_an`, capitalised as every call site is: the
+ * article opens a row's meta sentence, so "An epic" and "A task".
+ */
+export function aOrAn(word: string): string {
+  return "aeiou".includes((word[0] ?? "").toLowerCase()) ? "An" : "A";
+}
+
+/**
+ * `rust/serve.rs`'s `stamp`: an absolute UTC moment, to the second.
+ *
+ * `YYYY-MM-DD HH:MM:SSZ` — a space rather than the ISO `T`, because this is
+ * a moment a person reads in a row, not a value anything parses back.
+ */
+export function stamp(ms: number): string {
+  return `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")}Z`;
+}
+
+/** `rust/serve.rs`'s `tag_list`: what a row is about, as a trailing clause. */
+export function tagSentence(tags: readonly string[]): string {
+  return tags.length === 0 ? "" : `, tagged ${tags.join(", ")}`;
+}

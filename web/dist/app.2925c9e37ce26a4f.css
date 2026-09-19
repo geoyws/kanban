@@ -971,3 +971,122 @@ main[data-deck] > p.keys {
     transition: none;
   }
 }
+main[data-page] {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  padding: 0.6rem clamp(0.7rem, 3vw, 1.2rem) calc(1.5rem + env(safe-area-inset-bottom));
+}
+.scroller {
+  overflow-x: auto;
+}
+.scroller table {
+  min-width: 34rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+th,
+td {
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--surface0);
+}
+th {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--overlay);
+}
+td.n,
+th.n {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+td.waiting {
+  font-weight: 600;
+}
+ul.rows,
+ul.children {
+  list-style: none;
+  margin: 0.3rem 0;
+  padding: 0;
+}
+ul.rows li,
+ul.children li {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--surface0);
+}
+ul.rows li > a,
+ul.children li > a {
+  font-weight: 500;
+}
+.pill {
+  display: inline-block;
+  padding: 0.1em 0.4em;
+  color: var(--subtext);
+  background: var(--surface0);
+  font-size: 0.75rem;
+  border-radius: 999px;
+}
+.pill.status-done,
+.pill.status-approve,
+.pill.status-succeeded {
+  color: var(--green);
+}
+.pill.status-in_progress,
+.pill.status-other {
+  color: var(--blue);
+}
+.pill.status-blocked,
+.pill.status-reject,
+.pill.status-failed {
+  color: var(--red);
+}
+.pill.status-review,
+.pill.status-defer {
+  color: var(--yellow);
+}
+.count {
+  color: var(--subtext);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+.attention-count {
+  margin-left: 0.4rem;
+  color: var(--overlay);
+  font-size: 0.8125rem;
+}
+.cmd {
+  margin: 0.5rem 0 0;
+  font-size: 0.8125rem;
+}
+.decided {
+  margin: 0 0 1.4rem;
+}
+.decided h2 {
+  margin: 0 0 0.35rem;
+  color: var(--text);
+}
+.decided .decision {
+  margin: 0.2rem 0;
+  color: var(--text);
+}
+.decided .note {
+  margin: 0.3rem 0;
+  color: var(--subtext);
+  font-style: italic;
+}
+.rule {
+  margin: 0.3rem 0;
+}
+.rule > summary {
+  padding: 0.3rem 0;
+  color: var(--subtext);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
