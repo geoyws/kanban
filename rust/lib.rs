@@ -29,6 +29,7 @@ mod model;
 mod opencode_adapter;
 #[allow(dead_code)]
 mod policy;
+mod projection;
 mod registry;
 mod routing;
 mod search;

@@ -38,6 +38,7 @@ use crate::model::{
     DeploymentAttempt, IDENTITY_MODE_ARTIFACT, OPERATOR_ACTOR, ProjectRecord, SearchOptions,
     Sitrep, Sprint, Subscription, SubscriptionPosition, Task,
 };
+use crate::projection;
 use crate::registry::{Registry, now_ms, retired_board_message};
 use crate::search;
 use crate::store::Store;
@@ -70,7 +71,7 @@ const SOCKET_MODE: u32 = 0o660;
 /// The page is for reading, not archaeology: `kb ev --task <id>` has the whole
 /// trail and is one command away. A page that renders ten thousand events is
 /// slower to load and no more useful.
-const DETAIL_ROWS: i64 = 50;
+pub(crate) const DETAIL_ROWS: i64 = 50;
 /// How many decided rows the Recent decisions page shows.
 ///
 /// The page exists so a decided item leaves Needs you without disappearing:
@@ -91,6 +92,17 @@ const WEB_UNDO_NOTE: &str = "undone from the web view";
 /// is one click away in its own tab.
 const PREVIEW_BODY_CHARS: usize = 800;
 
+/// How many open attention rows one board hands the cross-board queue.
+///
+/// The bound the `/` and `/all` arms have always passed, named here because
+/// the JSON projection reports it as the listing's `limit`
+/// (`docs/api/kanban-web.openapi.yaml`, `getNeedsYou`) and a reported bound
+/// that drifted from the one actually passed would be a lie an operator plans
+/// around.
+pub(crate) const OPEN_ATTENTION_ROWS: i64 = 1_000;
+/// How many sitreps one board hands the Lanes grouping.
+pub(crate) const LANE_UPDATE_ROWS: i64 = 200;
+
 /// A browser reply is a decision note, not a document upload.
 const MAX_REPLY_BYTES: usize = 4_096;
 /// The configured actor header is an email-sized audit identity, not a blob.
@@ -98,6 +110,9 @@ const MAX_ACTOR_BYTES: usize = 254;
 
 enum WebResponse {
     Html(u16, String),
+    /// One JSON body, served as the contract's own content type on success
+    /// and on refusal (`docs/api/kanban-web.openapi.yaml`).
+    Json(u16, String),
     Redirect(String),
     /// One embedded bundle asset, served as itself.
     Asset(&'static crate::bundle::Asset),
@@ -341,6 +356,13 @@ fn handle(mut request: Request, config: &ServeConfig) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(&mut request, config)))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("the page renderer panicked")));
     let (status, body, content_type, location, immutable) = match response {
+        Ok(WebResponse::Json(status, json)) => (
+            status,
+            json.into_bytes(),
+            "application/json; charset=utf-8",
+            None,
+            false,
+        ),
         Ok(WebResponse::Html(status, html)) => (
             status,
             html.into_bytes(),
@@ -400,6 +422,15 @@ fn handle(mut request: Request, config: &ServeConfig) {
                 .expect("a generated relative location is valid"),
         );
     }
+    if status == 405 && content_type.starts_with("application/json") {
+        // The contract states the header on every refusal of a method, and a
+        // client that has to read prose to learn which method is allowed has
+        // been told by the wrong mechanism.
+        response = response.with_header(
+            Header::from_bytes(&b"Allow"[..], &b"GET"[..])
+                .expect("a static header is always valid"),
+        );
+    }
     // A client that hung up mid-write is not this server's problem, and
     // crashing on it would take down a page everyone else is still reading.
     let _ = request.respond(response);
@@ -407,6 +438,18 @@ fn handle(mut request: Request, config: &ServeConfig) {
 
 fn route(request: &mut Request, config: &ServeConfig) -> Result<WebResponse> {
     let url = request.url().to_owned();
+    // The JSON surface is dispatched ahead of everything else, including the
+    // POST arm: `/api/v1` answers `GET` and refuses every other method with
+    // `405`, and routing a POST to the form handler first would give one
+    // JSON path a write surface the contract does not give it (SPA-13).
+    if let Some(rest) = url
+        .split('?')
+        .next()
+        .unwrap_or(&url)
+        .strip_prefix(API_PREFIX)
+    {
+        return Ok(api(request.method(), rest));
+    }
     if request.method() == &Method::Post {
         return post(request, &url, config);
     }
@@ -425,6 +468,64 @@ fn route(request: &mut Request, config: &ServeConfig) -> Result<WebResponse> {
         return Ok(response);
     }
     Ok(WebResponse::Html(200, render(&url)?))
+}
+
+/// The one prefix the JSON projection answers on, and nothing else does
+/// (`docs/api/kanban-web.openapi.yaml`, the OQ-3 answer).
+const API_PREFIX: &str = "/api/v1";
+/// The store's own single generic denial, as a JSON body.
+///
+/// Byte-identical for a board that is unknown, retired, ambiguous or
+/// invisible, and for every `/api/v1` path outside the five implemented ones:
+/// the route table is not enumerable either.
+const DENIED_OR_NOT_FOUND_JSON: &str = "{\"error\":\"denied or not found\"}";
+/// A JSON route answers `GET`. Every other method gets this.
+const METHOD_NOT_ALLOWED_JSON: &str = "{\"error\":\"Method not allowed\"}";
+/// The generic failure. It never carries a board name, a path, a row title,
+/// or the store's own sentence.
+const SERVER_ERROR_JSON: &str = "{\"error\":\"The request could not be completed.\"}";
+
+/// Dispatch one `/api/v1` request.
+///
+/// The five reads of the first wave; every other path under the prefix gets
+/// the same non-enumerating refusal as an unknown board, because a route
+/// table that answered "no such route" differently from "no such board"
+/// would be an inventory of what exists.
+fn api(method: &Method, path: &str) -> WebResponse {
+    if method != &Method::Get {
+        return WebResponse::Json(405, METHOD_NOT_ALLOWED_JSON.to_owned());
+    }
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(decode)
+        .collect::<Vec<_>>();
+    let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+    let body = match parts.as_slice() {
+        ["needs-you"] => encode(projection::needs_you()),
+        ["boards"] => encode(projection::boards()),
+        ["lanes"] => encode(projection::lanes()),
+        ["board", project] => encode(projection::board(project)),
+        ["task", project, id] => encode(projection::task(project, id)),
+        _ => Err(projection::Refusal::DeniedOrNotFound),
+    };
+    match body {
+        Ok(json) => WebResponse::Json(200, json),
+        Err(projection::Refusal::DeniedOrNotFound) => {
+            WebResponse::Json(404, DENIED_OR_NOT_FOUND_JSON.to_owned())
+        }
+        Err(projection::Refusal::Failed(_)) => WebResponse::Json(500, SERVER_ERROR_JSON.to_owned()),
+    }
+}
+
+/// Serialise one projection, keeping a serialisation failure on the same
+/// footing as any other: a generic `500`, never the serde message.
+fn encode<T: serde::Serialize>(
+    projected: projection::Projected<T>,
+) -> projection::Projected<String> {
+    let value = projected?;
+    serde_json::to_string(&value)
+        .map_err(|error| projection::Refusal::Failed(anyhow::Error::new(error)))
 }
 
 /// The two addresses the embedded bundle answers, or `None` for a URL that
@@ -1034,7 +1135,7 @@ fn decode(segment: &str) -> String {
 /// A board that has gone missing is skipped rather than fatal: one broken
 /// registration must not take out the page that lists the other twelve.
 /// `kanban doctor` is where that gets reported, and it is linked from Boards.
-fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
+pub(crate) fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
     let registry = Registry::open()?;
     let mut out = Vec::new();
     for project in registry.projects_active()? {
@@ -1048,7 +1149,7 @@ fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
     Ok(out)
 }
 
-fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
+pub(crate) fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
     let matches = projects()?
         .into_iter()
         .filter(|(project, _)| project.name == name)
@@ -1524,7 +1625,15 @@ fn hash_file_state(path: &Path, hasher: &mut impl Hasher) {
 }
 
 fn task_open_attention(store: &Store, task_id: &str) -> Result<Vec<Attention>> {
-    store.attention(Some("open"), None, Some(task_id), None, None, 1000, false)
+    store.attention(
+        Some("open"),
+        None,
+        Some(task_id),
+        None,
+        None,
+        OPEN_ATTENTION_ROWS,
+        false,
+    )
 }
 
 fn task_attention_count(store: &Store, task_id: &str) -> Result<usize> {
@@ -1638,11 +1747,31 @@ fn open_attention() -> Result<OpenQueue> {
     let mut stores = std::collections::BTreeMap::new();
     for (project, store) in projects()? {
         let name = project.name.clone();
-        for item in store.attention(Some("open"), None, None, None, None, 1000, false)? {
+        for item in store.attention(
+            Some("open"),
+            None,
+            None,
+            None,
+            None,
+            OPEN_ATTENTION_ROWS,
+            false,
+        )? {
             items.push((name.clone(), item));
         }
         stores.insert(name, store);
     }
+    sort_open_queue(&mut items);
+    Ok((items, stores))
+}
+
+/// Deck order, in one place: priority first, then oldest, then id, then
+/// board.
+///
+/// The page and the JSON projection order the cross-board queue by calling
+/// this, rather than by each holding a comparator that has to be kept in
+/// step. Two orderings that agree today is a coincidence with a maintenance
+/// schedule.
+pub(crate) fn sort_open_queue(items: &mut [(String, Attention)]) {
     items.sort_by(|(project_a, item_a), (project_b, item_b)| {
         (item_a.priority, item_a.created_at, &item_a.id, project_a).cmp(&(
             item_b.priority,
@@ -1651,7 +1780,6 @@ fn open_attention() -> Result<OpenQueue> {
             project_b,
         ))
     });
-    Ok((items, stores))
 }
 
 /// The one card loop both open-item screens render: the deck at `/` and the
@@ -2775,6 +2903,11 @@ fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
 }
 
 /// Every board at a glance — the `dashboard` projection, rendered.
+///
+/// The counts, and the order they arrive in, are
+/// [`projection::board_summaries`]: the JSON surface serves the same rows
+/// from the same computation, so the page and `/api/v1/boards` cannot drift
+/// into disagreeing about how many rows a board holds.
 fn boards() -> Result<String> {
     let mut html = String::from(
         "<h1>Boards</h1><table><thead><tr>\
@@ -2782,63 +2915,26 @@ fn boards() -> Result<String> {
         <th class=n>In progress</th><th class=n>Stale</th>\
         <th class=n>Handoffs</th><th class=n>Tasks</th></tr></thead><tbody>",
     );
-    let mut rows = Vec::new();
-    for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None, None, false)?;
-        let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        // Counted, not fetched, for the same reason as `dashboard`: a page
-        // used as a count saturates silently. Only the most urgent row of
-        // each ranks the board, and both listings put it first.
-        let open_attention = store.count_open_attention()?;
-        let pending_handoffs = store.count_pending_handoffs()?;
-        let urgent_attention = store.attention(Some("open"), None, None, None, None, 1, false)?;
-        let urgent_handoff = store.handoffs(None, Some("pending"), None, 1, false)?;
-        let queued = tasks
-            .iter()
-            .filter(|task| task.status == "todo")
-            .map(|task| (task.priority, task.created_at))
-            .chain(
-                urgent_attention
-                    .iter()
-                    .map(|item| (item.priority, item.created_at)),
-            )
-            .chain(
-                urgent_handoff
-                    .iter()
-                    .map(|item| (item.priority, item.created_at)),
-            )
-            .collect::<Vec<_>>();
-        let highest = queued
-            .iter()
-            .map(|(priority, _)| *priority)
-            .min()
-            .unwrap_or(i64::MAX);
-        let oldest = queued
-            .iter()
-            .filter(|(priority, _)| *priority == highest)
-            .map(|(_, created_at)| *created_at)
-            .min()
-            .unwrap_or(i64::MAX);
-        let row = format!(
+    for summary in projection::board_summaries()? {
+        html.push_str(&format!(
             "<tr data-board=\"{name}\"><td><a href=\"/board/{url}\" data-board-link data-ref target=_blank rel=noopener>{name}</a></td>\
              <td class=\"n{flag}\">{attention}</td><td class=n>{todo}</td>\
              <td class=n>{doing}</td><td class=n>{stale}</td>\
              <td class=n>{handoffs}</td><td class=n>{total}</td></tr>",
-            url = escape(&project.name),
-            name = escape(&project.name),
-            flag = if open_attention == 0 { "" } else { " waiting" },
-            attention = open_attention,
-            todo = count("todo"),
-            doing = count("in_progress"),
-            stale = store.stale_tasks()?.len(),
-            handoffs = pending_handoffs,
-            total = tasks.len(),
-        );
-        rows.push((highest, oldest, project.name.clone(), row));
-    }
-    rows.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
-    for (_, _, _, row) in rows {
-        html.push_str(&row);
+            url = escape(&summary.board),
+            name = escape(&summary.board),
+            flag = if summary.open_attention == 0 {
+                ""
+            } else {
+                " waiting"
+            },
+            attention = summary.open_attention,
+            todo = summary.todo,
+            doing = summary.in_progress,
+            stale = summary.stale,
+            handoffs = summary.handoffs,
+            total = summary.tasks,
+        ));
     }
     html.push_str("</tbody></table>");
     html.push_str(
@@ -3341,24 +3437,54 @@ fn or_list(values: &[String]) -> String {
     }
 }
 
-/// Where every lane stands, newest first.
+/// Every board's sitreps, grouped by `(board, lane)` and ordered most
+/// recently active first, plus whether any one board's scan was cut at
+/// `limit`.
 ///
-/// The counterpart to Needs you: that page is what waits on the operator, this
-/// is what the agents are doing. A lane that has been posting is legible here
-/// without anyone opening a terminal or waiting for a handoff.
-fn lanes() -> Result<String> {
+/// Shared by the Lanes page and `/api/v1/lanes`, which is why the bound is a
+/// parameter and why the scan asks for one row past it: the JSON envelope has
+/// to report whether rows were cut, and a flag inferred from `returned ==
+/// limit` would be a guess (ADR-037 §1).
+///
+/// Most recently active first. Nothing deletes a sitrep, and nothing
+/// should — but that means a lane whose driver is long gone keeps its rows
+/// forever, and alphabetical order parks it at the top of the page. Sorting
+/// by recency lets a dead lane sink out of the way without destroying what
+/// it said, which is the same answer archiving gives within a lane.
+#[allow(clippy::type_complexity)]
+pub(crate) fn lane_groups(limit: i64) -> Result<(Vec<((String, String), Vec<Sitrep>)>, bool)> {
     let mut by_lane: std::collections::BTreeMap<(String, String), Vec<Sitrep>> =
         std::collections::BTreeMap::new();
+    let mut truncated = false;
     for (project, store) in projects()? {
-        for update in store.sitreps(None, false, None, 200)? {
+        let mut updates = store.sitreps(None, false, None, limit + 1)?;
+        if i64::try_from(updates.len()).unwrap_or(i64::MAX) > limit {
+            truncated = true;
+            updates.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        }
+        for update in updates {
             by_lane
                 .entry((project.name.clone(), update.lane.clone()))
                 .or_default()
                 .push(update);
         }
     }
+    let mut ordered = by_lane.into_iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, updates)| {
+        std::cmp::Reverse(updates.iter().map(|u| u.created_at).max().unwrap_or(0))
+    });
+    Ok((ordered, truncated))
+}
+
+/// Where every lane stands, newest first.
+///
+/// The counterpart to Needs you: that page is what waits on the operator, this
+/// is what the agents are doing. A lane that has been posting is legible here
+/// without anyone opening a terminal or waiting for a handoff.
+fn lanes() -> Result<String> {
+    let (ordered, _truncated) = lane_groups(LANE_UPDATE_ROWS)?;
     let mut html = String::from("<h1>Lanes</h1>");
-    if by_lane.is_empty() {
+    if ordered.is_empty() {
         html.push_str(
             "<p class=empty>No lane has posted a sitrep. \
              <code>kb sr new \"…\" --as AGENT --lane LANE</code> writes one — no task \
@@ -3366,15 +3492,6 @@ fn lanes() -> Result<String> {
         );
         return Ok(page("Lanes", &html));
     }
-    // Most recently active first. Nothing deletes a sitrep, and nothing
-    // should — but that means a lane whose driver is long gone keeps its rows
-    // forever, and alphabetical order parks it at the top of the page. Sorting
-    // by recency lets a dead lane sink out of the way without destroying what
-    // it said, which is the same answer archiving gives within a lane.
-    let mut ordered = by_lane.into_iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|(_, updates)| {
-        std::cmp::Reverse(updates.iter().map(|u| u.created_at).max().unwrap_or(0))
-    });
     for ((project, lane), updates) in &ordered {
         html.push_str(&format!(
             "<article class=item data-lane=\"{}\">",
@@ -8821,40 +8938,7 @@ mod tests {
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)
             .unwrap_or(SOURCE);
-        // Every `&mut self` method on Store, which is the complete set of ways
-        // this module could change a board.
-        const MUTATORS: [&str; 29] = [
-            "add_task",
-            "move_task",
-            "remove_task",
-            "patch_metadata",
-            "update_task",
-            "claim",
-            "heartbeat",
-            "release",
-            "add_note",
-            "checkpoint",
-            "add_tag",
-            "remove_tag",
-            "raise_attention",
-            "update_attention",
-            "resolve_attention",
-            "reopen_attention",
-            "create_handoff",
-            "accept_handoff",
-            "retire_handoff",
-            "signoff_story",
-            "advance_story",
-            "sweep_expired_claims",
-            "initialize",
-            "start_deployment",
-            "finish_deployment",
-            "abandon_deployment",
-            "add_subscription",
-            "pause_subscription",
-            "resume_subscription",
-        ];
-        for name in MUTATORS {
+        for name in STORE_MUTATORS {
             if ALLOWED.contains(&name) {
                 continue;
             }
@@ -8866,6 +8950,106 @@ mod tests {
                 "serve.rs calls {name}, which writes. A read surface that can \
                  write is one refactor away from doing so; add it to ALLOWED \
                  with a reason if that is deliberate."
+            );
+        }
+    }
+
+    /// Every `&mut self` method on `Store`, which is the complete set of ways
+    /// the web layer could change a board. Shared by the two capability
+    /// tests below it, so a new mutator is added once.
+    const STORE_MUTATORS: [&str; 29] = [
+        "add_task",
+        "move_task",
+        "remove_task",
+        "patch_metadata",
+        "update_task",
+        "claim",
+        "heartbeat",
+        "release",
+        "add_note",
+        "checkpoint",
+        "add_tag",
+        "remove_tag",
+        "raise_attention",
+        "update_attention",
+        "resolve_attention",
+        "reopen_attention",
+        "create_handoff",
+        "accept_handoff",
+        "retire_handoff",
+        "signoff_story",
+        "advance_story",
+        "sweep_expired_claims",
+        "initialize",
+        "start_deployment",
+        "finish_deployment",
+        "abandon_deployment",
+        "add_subscription",
+        "pause_subscription",
+        "resume_subscription",
+    ];
+
+    #[test]
+    fn the_projection_reaches_nothing_but_the_store_and_the_registry() {
+        // SPA-07: the projection's only data dependency is `Store` (plus the
+        // one named `Registry` read the board page already makes for its
+        // rules). An HTTP test can show that today's five routes answer
+        // correctly; it cannot show that the module has no way to reach past
+        // the store, because a query that happens to agree with the store on
+        // the day leaves every assertion green and the capability in place.
+        // So this reads the module back, the same way
+        // `no_page_can_reach_a_method_that_writes` does.
+        const SOURCE: &str = include_str!("projection.rs");
+        let shipped = SOURCE
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(SOURCE);
+        for name in STORE_MUTATORS {
+            // Assembled rather than written out, so this file's own source
+            // does not match itself.
+            let call = format!(".{name}(");
+            assert!(
+                !shipped.contains(call.as_str()),
+                "projection.rs calls {name}, which writes. The JSON surface is \
+                 read-only (SPA-13); there is no allowlist here because no \
+                 projection has a reason to hold one."
+            );
+        }
+        // No second query implementation: no driver, no connection, no SQL.
+        for forbidden in [
+            "rusqlite",
+            "Connection",
+            "SELECT",
+            "prepare(",
+            "query_row",
+            "query_map",
+            "execute(",
+        ] {
+            assert!(
+                !shipped.contains(forbidden),
+                "projection.rs names {forbidden}. ADR-048 §5 binds the JSON \
+                 API to the same Store methods the CLI calls; data no method \
+                 exposes is a request for a Store method, not a query in the \
+                 web layer."
+            );
+        }
+        // And it reaches for nothing else in this crate: the model's records,
+        // the store, the registry, and the page router's own board
+        // enumeration, which it shares rather than duplicates.
+        const REACHABLE: [&str; 4] = [
+            "use crate::model::{",
+            "use crate::registry::Registry;",
+            "use crate::serve::{",
+            "use crate::store::Store;",
+        ];
+        for line in shipped
+            .lines()
+            .filter(|line| line.starts_with("use crate::"))
+        {
+            assert!(
+                REACHABLE.iter().any(|allowed| line.starts_with(allowed)),
+                "projection.rs imports {line}, which is not the store, the \
+                 registry, the model or the shared board enumeration."
             );
         }
     }
@@ -9834,6 +10018,12 @@ mod tests {
                     asset.name
                 )
             }
+            // `post` never answers JSON either: the JSON surface is
+            // dispatched ahead of the POST arm and refuses every method but
+            // GET, so a body here would mean the two were crossed.
+            Ok(WebResponse::Json(status, body)) => {
+                panic!("posting {url} answered JSON {status}: {body}")
+            }
             Err(error) => panic!("posting {url} failed: {error}"),
         }
     }
@@ -9849,6 +10039,9 @@ mod tests {
                     "posting {url} answered with the bundle asset {}",
                     asset.name
                 )
+            }
+            Ok(WebResponse::Json(status, body)) => {
+                panic!("posting {url} answered JSON {status}: {body}")
             }
             Err(error) => panic!("posting {url} failed: {error}"),
         }

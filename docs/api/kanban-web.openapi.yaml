@@ -261,7 +261,7 @@ paths:
         §5 cares about. The projection keeps the same call; it adds nothing.
       x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
       x-store-method: Store::list_tasks
-      x-registry-method: Registry::applicable_rules
+      x-registry-method: Registry::applicable_rule_summaries
       parameters:
         - $ref: "#/components/parameters/Project"
       responses:

@@ -207,27 +207,42 @@ Recorded here because the specification's §8 evidence rows will be read against
 it, and because a contract that quietly diverges from the shipped surface is
 worse than one that names the gap.
 
-- **A named board that is unknown, retired or ambiguous is `500` today, with
-  detail.** `board(name)` calls `project_named` (`rust/serve.rs:962`), whose
-  error text names the board and, for a retired one, its retirement note
+- **A named board that is unknown, retired or ambiguous is `500` today on the
+  pages, with detail — closed on the JSON surface by `t-88814b7a`; the page
+  arms still answer `500`.** `board(name)` calls `project_named`, whose error
+  text names the board and, for a retired one, its retirement note
   (`rust/registry.rs:571`-`rust/registry.rs:581`); `handle` renders that text
-  into a `500` (`rust/serve.rs:351`-`rust/serve.rs:361`). The shipped test
-  asserts exactly this: `/board/RETIRED` returns `500` and the body contains
-  the retirement note `retire served board`
-  (`tests/e2e.rs:43920`-`tests/e2e.rs:43923`). **The JSON surface must not copy
-  it.** Those cases are `404` with `denied or not found`. This is a contract
-  improvement the projection has to implement, not an observation of current
-  behaviour, and `t-88814b7a` owns closing it.
-- **kanban sets no security response headers.** The only header the server adds
-  is `Content-Type: text/html; charset=utf-8`, plus `Location` on a redirect
-  (`rust/serve.rs:363`-`rust/serve.rs:372`); there is no
-  `Content-Security-Policy`, `X-Content-Type-Options`, `Cache-Control` or
-  `Referrer-Policy` anywhere in `rust/`. Whatever CSP `kb.geoy.ws` has is the
-  edge's. The appendix records this as an open item against V3 and V14 rather
-  than as a claim.
-- **No JSON route exists yet.** Every `/api/v1` path in the document is
-  unimplemented at `cd55cbc`. `SPA-06`'s matrix row is `none` until
-  `t-88814b7a` writes the HTTP test against this contract.
+  into a `500`. The shipped test asserts exactly this: `/board/RETIRED`
+  returns `500` and the body contains the retirement note `retire served
+  board` (`serve_hides_retired_boards_from_the_board_index_and_board_route`).
+  The JSON surface does not copy it: `/api/v1/board/{project}` and
+  `/api/v1/task/{project}/{id}` answer `404` with the byte-identical
+  `{"error":"denied or not found"}` for an unknown, retired or ambiguous
+  board and for an absent row, asserted by
+  `the_json_projection_refuses_unknown_retired_and_unauthorized_boards_with_one_body_over_http`.
+  The pages keep their behaviour until the cutover (`t-1f495a7f`) retires
+  them, so this line stays a divergence rather than a closed item.
+- **kanban sets no security response headers.** The headers the server adds
+  are `Content-Type` — `text/html; charset=utf-8` on a page,
+  `application/json; charset=utf-8` on a JSON route — plus `Location` on a
+  redirect, `Cache-Control: public, max-age=31536000, immutable` on a
+  content-hashed bundle asset, and `Allow: GET` on a JSON `405`. There is no
+  `Content-Security-Policy`, `X-Content-Type-Options` or `Referrer-Policy`
+  anywhere in `rust/`. Whatever CSP `kb.geoy.ws` has is the edge's. The
+  appendix records this as an open item against V3 and V14 rather than as a
+  claim.
+- **Five of the fifteen JSON routes exist.** `t-88814b7a` implemented the
+  first wave in `rust/projection.rs`: `/api/v1/needs-you`, `/api/v1/boards`,
+  `/api/v1/board/{project}`, `/api/v1/lanes` and
+  `/api/v1/task/{project}/{id}`. The other ten — `/api/v1/decided`,
+  `/api/v1/sprints`, `/api/v1/sprints/{project}`,
+  `/api/v1/sprint/{project}/{id}`, `/api/v1/plans`, `/api/v1/deployments`,
+  `/api/v1/deployment/{project}/{id}`, `/api/v1/subscriptions`,
+  `/api/v1/search` and `/api/v1/preview/{kind}/{project}/{id}` — are
+  unimplemented, and they answer the same non-enumerating `404` as an unknown
+  board rather than a "not implemented" that would inventory what is coming.
+  `SPA-06`, `SPA-07` and `SPA-09` carry their first evidence from this wave;
+  the remaining routes stay owed by the epic.
 
 ---
 

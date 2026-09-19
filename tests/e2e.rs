@@ -44145,6 +44145,408 @@ fn serve_hides_retired_boards_from_the_board_index_and_board_route() {
     );
 }
 
+/// The store's single generic refusal, as the JSON surface must write it.
+///
+/// Held as one byte string rather than as a parsed object on purpose: the
+/// contract's claim is that the refusal is *byte-identical* whichever of the
+/// four reasons produced it, and a comparison that went through a parser
+/// would pass on two bodies that differ in spacing, field order, or an extra
+/// key a client would then be able to read.
+const JSON_DENIED_OR_NOT_FOUND: &str = "{\"error\":\"denied or not found\"}";
+
+/// One request with a method of the caller's choosing.
+///
+/// `http_get` cannot ask for the methods a `GET`-only route has to refuse,
+/// and the refusal's `Allow` header only exists in the response head, so
+/// both are kept here.
+fn http_request(port: u16, method: &str, path: &str) -> (u16, String, String) {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    decode_http_response(&raw)
+}
+
+#[test]
+fn the_json_needs_you_projection_answers_the_same_cards_as_the_cli_over_http() {
+    // SPA-06: the page's data arrives as JSON. The load-bearing claim is not
+    // that a body arrives but that it is the *same* queue the CLI reads --
+    // same rows, same order, same authored card -- because a second read
+    // model that agreed on the day and drifted later is the failure ADR-048
+    // §5 forbids. So the assertion is against `kb att list`, row for row.
+    let fixture = Fixture::new("json-needs-you");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONQ", "--json"]);
+    fixture.ok_json(&fixture.main, &["tag", "add", "infra", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Carrier", "--id", "t-carrier", "--json"],
+    );
+    // One authored card, with a recommendation: the projection has to carry
+    // the choices and which one is recommended, not just the body.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Ship or hold the migration",
+            "--as",
+            "claude@driver-1",
+            "--kind",
+            "decision",
+            "--task",
+            "t-carrier",
+            "--question",
+            "Ship the migration tonight?",
+            "--context",
+            "The queue stays wrong until it lands.",
+            "--choice",
+            "ship=Ship it|approve",
+            "--choice",
+            "hold=Hold until morning|defer",
+            "--consequence",
+            "ship=The migration runs while nobody is watching it.",
+            "--consequence",
+            "hold=The queue stays wrong for one more day.",
+            "--recommend",
+            "ship",
+            "--json",
+        ],
+    );
+    // One already settled, which must not be in the open queue at all.
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Already decided",
+            "--as",
+            "claude@driver-1",
+            "--kind",
+            "approval",
+            "--json",
+        ],
+    );
+    let settled_id = settled["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &settled_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    // One tagged, because tags are what a row is *about* and the card has to
+    // carry them.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Tagged ask",
+            "--as",
+            "claude@driver-2",
+            "--kind",
+            "risk",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/needs-you");
+    assert_eq!(status, 200, "{body}");
+    let queue: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/needs-you is not JSON: {error}\n{body}"));
+    let cards = queue["items"].as_array().unwrap();
+    let cli = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    let rows = cli.as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the fixture seeded the wrong open queue: {cli}"
+    );
+    assert_eq!(
+        cards.len(),
+        rows.len(),
+        "the JSON queue and `kb att list` disagree on how many rows are open:\n{body}\n{cli}"
+    );
+    for (card, row) in cards.iter().zip(rows) {
+        assert_eq!(card["board"], "JSONQ", "{card}");
+        for field in ["id", "kind", "choices", "tags", "priority", "question"] {
+            assert_eq!(
+                card["attention"][field], row[field],
+                "{field} differs between the JSON card and the CLI row:\n{card}\n{row}"
+            );
+        }
+    }
+    assert!(
+        !body.contains(&settled_id),
+        "a settled row is in the open queue: {body}"
+    );
+    let recommended = cards
+        .iter()
+        .flat_map(|card| card["attention"]["choices"].as_array().unwrap())
+        .filter(|choice| choice["recommended"] == Value::Bool(true))
+        .map(|choice| choice["key"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recommended,
+        vec!["ship".to_owned()],
+        "the recommendation did not survive the projection: {body}"
+    );
+    // The envelope reports the bound the arm actually passes (ADR-037 §4).
+    assert_eq!(queue["returned"], 2, "{body}");
+    assert_eq!(queue["limit"], 1000, "{body}");
+    assert_eq!(queue["truncated"], Value::Bool(false), "{body}");
+}
+
+#[test]
+fn the_json_projection_never_serialises_a_lease_token_over_http() {
+    // SPA-09. A lease token is a capability: whoever holds it can heartbeat
+    // and release someone else's claim. The read surface serves the holder's
+    // identity and timings as `ClaimSummary`, which has no field to forget to
+    // strip -- so this asserts the token's own bytes are absent, not merely
+    // that a field name is.
+    let fixture = Fixture::new("json-no-lease");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONLEASE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Leased", "--id", "t-leased", "--json"],
+    );
+    let lease = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-leased", "--as", "driver-2", "--json"],
+    );
+    let token = lease["leaseToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the CLI claim carries no lease token to look for: {lease}"))
+        .to_owned();
+    assert!(!token.is_empty(), "{lease}");
+
+    let server = spawn_server(&fixture);
+    for path in ["/api/v1/task/JSONLEASE/t-leased", "/api/v1/boards"] {
+        let (status, body) = http_get(server.port, path);
+        assert_eq!(status, 200, "{path}: {body}");
+        assert!(
+            !body.contains(&token),
+            "{path} served the lease token itself: {body}"
+        );
+        assert!(
+            !body.contains("leaseToken"),
+            "{path} served a leaseToken field: {body}"
+        );
+    }
+    let (_, body) = http_get(server.port, "/api/v1/task/JSONLEASE/t-leased");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    let claim = detail["claim"].as_object().unwrap();
+    assert_eq!(claim["agentID"], "driver-2", "{body}");
+    let mut keys = claim.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "agentID".to_owned(),
+            "claimedAt".to_owned(),
+            "expiresAt".to_owned(),
+            "heartbeatAt".to_owned(),
+            "sessionID".to_owned(),
+            "taskID".to_owned(),
+        ],
+        "the served claim is not exactly ClaimSummary: {body}"
+    );
+}
+
+#[test]
+fn the_json_projection_refuses_unknown_retired_and_unauthorized_boards_with_one_body_over_http() {
+    // SPA-08. A refusal that distinguishes "not yours" from "not there" is an
+    // existence oracle, so all of them answer one body. The HTML arm answers
+    // 500 with the store's detailed text for these same three cases
+    // (`serve_hides_retired_boards_from_the_board_index_and_board_route`,
+    // `served_board_pages_fail_closed_on_duplicate_names`); the JSON surface
+    // must not copy it, which is the divergence recorded in
+    // `docs/api/README.md`.
+    let fixture = Fixture::new("json-denial");
+    let active = fixture.root.join("active");
+    let retired = fixture.root.join("retired");
+    fs::create_dir_all(&active).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+    fixture.ok_json(&active, &["init", "--name", "ACTIVE", "--json"]);
+    fixture.ok_json(&retired, &["init", "--name", "RETIRED", "--json"]);
+    fixture.ok_json(
+        &fixture.root,
+        &[
+            "workspace",
+            "retire",
+            "RETIRED",
+            "--as",
+            "geoyws",
+            "--note",
+            "retire served board",
+            "--json",
+        ],
+    );
+    let server = spawn_server(&fixture);
+    for path in [
+        "/api/v1/board/NO-SUCH-BOARD",
+        "/api/v1/board/RETIRED",
+        "/api/v1/task/RETIRED/t-anything",
+        "/api/v1/task/ACTIVE/t-no-such-row",
+    ] {
+        let (status, body) = http_get(server.port, path);
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(
+            body, JSON_DENIED_OR_NOT_FOUND,
+            "{path} answered a refusal of its own"
+        );
+        assert!(
+            !body.contains("RETIRED") && !body.contains("retire served board"),
+            "{path} named the board or its retirement note: {body}"
+        );
+    }
+    let (status, boards) = http_get(server.port, "/api/v1/boards");
+    assert_eq!(status, 200, "{boards}");
+    assert!(boards.contains("ACTIVE"), "{boards}");
+    assert!(
+        !boards.contains("RETIRED"),
+        "the retired board leaked into the JSON index: {boards}"
+    );
+    drop(server);
+
+    // The ambiguous case needs its own registry: two ACTIVE boards with one
+    // name is a state the CLI refuses to create, so it is seeded directly,
+    // exactly as `served_board_pages_fail_closed_on_duplicate_names` does.
+    let ambiguous = Fixture::new("json-denial-ambiguous");
+    ambiguous.ok_json(&ambiguous.main, &["init", "--name", "Alpha", "--json"]);
+    seed_legacy_rootless_duplicate(&ambiguous, "alpha-rootless", "Alpha");
+    let server = spawn_server(&ambiguous);
+    let (status, body) = http_get(server.port, "/api/v1/board/Alpha");
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(
+        body, JSON_DENIED_OR_NOT_FOUND,
+        "an ambiguous name answered something other than the one refusal"
+    );
+    assert!(
+        !body.contains("rootless") && !body.contains("Alpha"),
+        "the refusal enumerated the candidates: {body}"
+    );
+}
+
+#[test]
+fn the_json_routes_answer_get_only_over_http() {
+    // SPA-13: the read surface writes nothing, and a JSON route refuses even
+    // POST -- the one method the page router does accept -- because no JSON
+    // route is a write and the four writes keep their own paths (SPA-10).
+    let fixture = Fixture::new("json-get-only");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONGET", "--json"]);
+    let server = spawn_server(&fixture);
+    for method in ["POST", "PUT", "DELETE"] {
+        let (status, head, body) = http_request(server.port, method, "/api/v1/boards");
+        assert_eq!(status, 405, "{method}: {body}");
+        assert_eq!(
+            body, "{\"error\":\"Method not allowed\"}",
+            "{method} was refused in prose rather than as JSON"
+        );
+        assert!(
+            head.contains("application/json; charset=utf-8"),
+            "{method} was refused as {head}"
+        );
+        assert!(
+            head.contains("Allow: GET"),
+            "{method} was refused without saying which method is allowed: {head}"
+        );
+    }
+    let (status, body) = http_get(server.port, "/api/v1/boards");
+    assert_eq!(status, 200, "{body}");
+}
+
+#[test]
+fn a_capped_json_listing_says_it_was_capped_over_http() {
+    // ADR-037 §4: a listing that was cut says so, in the envelope, with the
+    // bound that cut it -- and a listing that has no bound reports none
+    // rather than a number an operator would plan around. `DETAIL_ROWS` is 50
+    // (`rust/serve.rs`), so one row past it is what the cut has to be
+    // observed on.
+    const DETAIL_ROWS: usize = 50;
+    let fixture = Fixture::new("json-capped");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONCAP", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "Noted", "--id", "t-noted", "--json"],
+    );
+    for index in 0..=DETAIL_ROWS {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "note",
+                "t-noted",
+                &format!("note {index}"),
+                "--as",
+                "driver-2",
+                "--json",
+            ],
+        );
+    }
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/task/JSONCAP/t-noted");
+    assert_eq!(status, 200, "{body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    for capped in ["notes", "events"] {
+        let envelope = &detail[capped];
+        assert_eq!(
+            envelope["limit"], DETAIL_ROWS,
+            "{capped} reported a bound the page does not pass: {envelope}"
+        );
+        assert_eq!(
+            envelope["returned"], DETAIL_ROWS,
+            "{capped} returned more or fewer rows than its bound: {envelope}"
+        );
+        assert_eq!(
+            envelope["items"].as_array().unwrap().len(),
+            DETAIL_ROWS,
+            "{capped} reported a count its rows do not support: {envelope}"
+        );
+        assert_eq!(
+            envelope["truncated"],
+            Value::Bool(true),
+            "{capped} was cut and did not say so: {envelope}"
+        );
+    }
+    // Nothing was written past the bound, so the checkpoint list is complete
+    // at its bound and says exactly that.
+    assert_eq!(
+        detail["checkpoints"]["truncated"],
+        Value::Bool(false),
+        "{body}"
+    );
+    assert_eq!(detail["checkpoints"]["limit"], DETAIL_ROWS, "{body}");
+    // And a listing whose store call takes no limit reports none.
+    let (status, board) = http_get(server.port, "/api/v1/board/JSONCAP");
+    assert_eq!(status, 200, "{board}");
+    let board: Value = serde_json::from_str(&board).unwrap();
+    assert_eq!(board["tasks"]["limit"], Value::Null, "{board}");
+    assert_eq!(board["tasks"]["truncated"], Value::Bool(false), "{board}");
+    assert_eq!(board["tasks"]["returned"], 1, "{board}");
+}
+
 #[test]
 fn a_listing_says_whether_each_task_is_held_and_by_whom() {
     // Measured 2026-09-04 across eight boards: `task list --status
