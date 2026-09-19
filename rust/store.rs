@@ -5917,6 +5917,13 @@ impl Store {
     /// Newest-first, unlike `attention`: the question this answers is "what is
     /// true now", and the newest update is the answer. Archived rows are
     /// excluded by default and readable on request — hidden, never gone.
+    ///
+    /// Board scope is the whole check: a sitrep carries no tags, so there is
+    /// no per-row filter to apply and `&[]` is the entire subject. The guard
+    /// lives here rather than at each caller because `serve::lane_groups`
+    /// reaches this method with a store it opened for a board the caller may
+    /// never have been granted (`t-c84850a1`); with the check at the source
+    /// both the CLI and `/api/v1/lanes` are refused by construction.
     pub fn sitreps(
         &self,
         lane: Option<&str>,
@@ -5924,6 +5931,7 @@ impl Store {
         task: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Sitrep>> {
+        self.authz.check_read(&[])?;
         if let Some(id) = task {
             require_task(&self.connection, id)?;
         }
@@ -9249,6 +9257,7 @@ mod tests {
         assert_denied(store.ancestors("t-b"), "relations ancestors");
         assert_denied(store.notes("t-b", 10), "note list");
         assert_denied(store.checkpoints("t-b", 10), "checkpoint list");
+        assert_denied(store.sitreps(None, false, None, 10), "sitrep list");
         assert_denied(store.handoffs(None, None, None, 10, false), "handoff list");
         assert_denied(store.count_pending_handoffs(), "handoff count");
         assert_denied(

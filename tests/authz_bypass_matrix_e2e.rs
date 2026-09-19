@@ -2379,22 +2379,17 @@ fn the_json_routes_answer_the_same_rows_as_the_cli_over_http() {
 
 // -- findings: what the contract promises and this server does not do -------
 
-/// FINDING (`t-4b9501b3`, 2026-09-19): `/api/v1/lanes` hands over the sitreps
-/// of a board the caller may not read.
+/// `t-c84850a1` (2026-09-19), was FINDING `t-4b9501b3`: `/api/v1/lanes` must
+/// not hand over the sitreps of a board the caller may not read.
 ///
 /// `lane_groups` (`rust/serve.rs`) iterates every ACTIVE board and calls
-/// `Store::sitreps` on each, and that method is not guarded — so a board the
-/// same principal is refused by `kanban sitrep list` is served in full over
-/// HTTP, with its lane name, its author, its body and its worktree path.
-/// This is a real divergence from SPA-08 ("a board the principal may not read
-/// is absent from every JSON body") and from the CLI, which refuses the same
-/// read for the same identity — asserted here as the positive control.
-///
-/// Ignored, not weakened: the assertion below is what the contract requires,
-/// and it fails against the shipped server. Fixing it is a change to
-/// `rust/serve.rs`/`rust/store.rs`, which this row does not own.
+/// `Store::sitreps` on each. That method now takes the same `check_read(&[])`
+/// guard its siblings take, so a board the same principal is refused by
+/// `kanban sitrep list` is refused here too — and `lane_groups` skips it, the
+/// way an enumeration must, rather than refusing the whole page. SPA-08 ("a
+/// board the principal may not read is absent from every JSON body") is what
+/// this asserts; the CLI refusal above is the positive control.
 #[test]
-#[ignore = "FINDING t-4b9501b3: /api/v1/lanes serves an unauthorized board's sitreps; the fix belongs to serve.rs/store.rs"]
 fn the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http() {
     let estate = ManagedEstate::new("json-lane-leak");
     let work_a = estate.work_a.clone();
@@ -2414,11 +2409,15 @@ fn the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over
 
     let server = WebServer::start(&estate, &work_a, None);
     let lanes = server.get_json("/api/v1/lanes");
+    let served = lanes.to_string();
+    // The positive control: the readable board's lane and sitrep are served,
+    // so a route that answered nothing at all could not pass this case.
     assert!(
-        !lanes.to_string().contains("beta-lane")
-            && !lanes
-                .to_string()
-                .contains("the pier survey nobody else may read"),
+        served.contains("alpha-lane") && served.contains("alpha update"),
+        "/api/v1/lanes withheld the board this caller may read: {lanes}"
+    );
+    assert!(
+        !served.contains("beta-lane") && !served.contains("the pier survey nobody else may read"),
         "/api/v1/lanes served a board this caller may not read: {lanes}"
     );
 }

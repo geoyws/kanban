@@ -191,6 +191,14 @@ single generic denial exists to avoid (`rust/authz.rs:180`-`rust/authz.rs:189`).
 A retired board is absent from `/api/v1/boards` and from its own route
 (`SPA-08`).
 
+`/api/v1/lanes` and the `/lanes` page obey that rule at the store since
+`t-c84850a1` (2026-09-19): `Store::sitreps` takes the same
+`self.authz.check_read(&[])` its sibling reads take — a sitrep carries no
+tags, so board scope is the whole subject — and `serve::lane_groups` skips a
+board whose sitreps read the store refuses instead of propagating it. A board
+this caller may not read is therefore absent from the listing rather than
+refused inside it, indistinguishable from a board with no sitreps.
+
 Two refusals are deliberately *not* generic, and both are the product's own
 words rather than the store's state:
 
@@ -233,9 +241,11 @@ field by field on shared keys, against `task list`, `task show`, `sitrep list`
 and `attention list --status open`, so a future divergence fails there instead
 of being discovered in the UI.
 
-Three cases in that section are `#[ignore]`d and carry a failing assertion on
+Two cases in that section are `#[ignore]`d and carry a failing assertion on
 purpose. Each is a divergence named below rather than a test written down to
-the shipped behaviour.
+the shipped behaviour. A third,
+`the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http`,
+runs: `t-c84850a1` closed the divergence it held.
 
 ## Where the served pages do not yet meet this contract
 
@@ -279,16 +289,6 @@ worse than one that names the gap.
   board rather than a "not implemented" that would inventory what is coming.
   `SPA-06`, `SPA-07` and `SPA-09` carry their first evidence from this wave;
   the remaining routes stay owed by the epic.
-- **`/api/v1/lanes` serves the sitreps of a board the caller may not read.**
-  Found 2026-09-19 by `t-4b9501b3`. `lane_groups` (`rust/serve.rs`) scans
-  every *active* board and calls `Store::sitreps`, which carries no guard, so
-  a board that `kanban sitrep list` refuses to the same principal is handed
-  over in full over HTTP — lane, author, body and worktree path. This
-  contradicts `SPA-08` and this document's own rule that a caller is never
-  handed rows they may not see. Held by the `#[ignore]`d
-  `the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http`,
-  whose positive control is the CLI refusing the same read. Closing it is a
-  change to the store or to the scan, not to the test.
 - **A whole-estate listing refuses entire rather than serving the readable
   subset.** Found 2026-09-19 by `t-4b9501b3`. `board_summaries` and
   `needs_you` iterate every active board and propagate the first refusal, so
