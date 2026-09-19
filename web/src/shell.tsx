@@ -193,14 +193,9 @@ export function Chrome(props: ChromeProps): ReactElement {
               {...(name === current ? { "aria-current": "page" as const } : {})}
               onClick={(event) => {
                 onDrawer(false);
-                // `/all` is still a served page, and a modified click is the
-                // reader asking the browser for a tab of their own.
-                if (
-                  name === "all" ||
-                  event.metaKey ||
-                  event.ctrlKey ||
-                  event.shiftKey
-                ) {
+                // A modified click is the reader asking the browser for a
+                // tab of their own.
+                if (event.metaKey || event.ctrlKey || event.shiftKey) {
                   return;
                 }
                 event.preventDefault();

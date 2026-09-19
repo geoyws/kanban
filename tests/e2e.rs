@@ -27466,6 +27466,10 @@ fn list_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
 /// recommendation and its consequence, the alternatives in the order they
 /// were declared, the note field, the folded own-words answer, and the
 /// priority pill in the orientation line rather than over the question.
+///
+/// The own-words submit's own words are asserted here too (WEB-25): the
+/// button says what pressing it does, and "Record my answer" is the
+/// sentence ADR-042 §5 settled on.
 #[test]
 fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
     browser_loopback_reservation_supported()
@@ -27514,6 +27518,20 @@ fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
             "data-testid=\"deck-outcome-other\"",
             "data-testid=\"deck-record\"",
         ],
+    );
+    // WEB-25 -- the custom answer's button says what happens, exactly. The
+    // idle label is the claim; `Sending…` is the pressed state of the same
+    // button and is not what an operator reads before deciding.
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('[data-item=\"{id}\"] \
+                 [data-testid=deck-record]').textContent.trim()"
+            ),
+        ),
+        "Record my answer",
+        "the own-words submit has to say what pressing it does"
     );
     drop(server);
 }
@@ -49807,6 +49825,17 @@ fn the_deck_shows_one_card_and_only_its_body_scrolls_in_real_chrome() {
         ),
         Value::Bool(true),
         "the menu closed without taking its backdrop with it"
+    );
+    // And `/all` is reached the way every other destination is, since
+    // `t-bf255880` wave 2 mounted it: the drawer link routes in place. The
+    // marker is on the window the deck was rendered in, so it survives a
+    // route change and cannot survive a new document.
+    assert_eq!(js_value(&tab, "window.__sameDocument = true"), true);
+    click_routing(&tab, "[data-nav=all]", ui::CARD, "/all", "All open nav");
+    assert_eq!(
+        js_value(&tab, "window.__sameDocument === true"),
+        Value::Bool(true),
+        "the drawer's `/all` link asked the server for a new document"
     );
 }
 

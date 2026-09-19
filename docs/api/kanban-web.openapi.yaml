@@ -564,22 +564,24 @@ paths:
       tags: [operations]
       summary: Hybrid search across every readable board, and the rules.
       description: |
-        Mirrors `/search` (`rust/serve.rs:450`, `search_page` at
-        `rust/serve.rs:2136`): `Store::search(&board_name, &options)` per board
-        (`rust/serve.rs:2174`), plus `search::search_rules` over
-        `Registry::rules(false)` (`rust/serve.rs:2177`), bounded by
-        `search::bound_receipt` (`rust/serve.rs:2178`).
+        The retrieval is `serve::search_receipt` (`rust/serve.rs:1743`), shared
+        with the `/search` page rather than reimplemented:
+        `Store::search(&board_name, &options)` per readable board
+        (`rust/serve.rs:1778`), plus `search::search_rules` over
+        `Registry::rules(false)` (`rust/serve.rs:1781`), bounded by
+        `search::bound_receipt` (`rust/serve.rs:1782`). This route reads that
+        receipt through `projection::search` (`rust/projection.rs:1135`).
 
-        The page fixes its own `SearchOptions` and exposes only `q`
-        (`rust/serve.rs:2152`-`rust/serve.rs:2163`): `limit` 30, `max_chars`
+        `search_receipt` fixes its own `SearchOptions`
+        (`rust/serve.rs:1745`-`rust/serve.rs:1756`): `limit` 30, `max_chars`
         30,000, no source, status, tag, lane or date filter, archived excluded.
-        This route exposes exactly that one parameter, for the same reason: a
+        This route exposes exactly one parameter, for the same reason: a
         filter the page cannot set is a filter with no caller, and SPA-06 pins
         that the route serves the page's data, not a superset of it.
 
         An empty or whitespace-only `q` returns an empty result set with
-        `truncated: false` and performs no search — the page's own behaviour
-        (`rust/serve.rs:2145`-`rust/serve.rs:2151`), and the honest answer to a
+        `truncated: false` and performs no search
+        (`rust/serve.rs:1757`-`rust/serve.rs:1767`) — the honest answer to a
         question that was not asked.
 
         `truncated` is `SearchReceipt.truncated` (`rust/model.rs:2036`) as
@@ -599,7 +601,10 @@ paths:
             as a finding.
           schema:
             type: string
-            maxLength: 1024
+            # `MAX_QUERY_BYTES` (`rust/serve.rs:491`) is the bound the server
+            # actually enforces, in bytes of the decoded query; a longer `q`
+            # is refused with `400` before any board is opened.
+            maxLength: 4096
           example: lease token
       responses:
         "200":
@@ -607,6 +612,7 @@ paths:
           content:
             application/json; charset=utf-8:
               schema: { $ref: "#/components/schemas/SearchPage" }
+        "400": { $ref: "#/components/responses/QueryTooLong" }
         "403": { $ref: "#/components/responses/Refused" }
         "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "500": { $ref: "#/components/responses/ServerError" }
@@ -1108,6 +1114,18 @@ components:
         application/json; charset=utf-8:
           schema: { $ref: "#/components/schemas/Error" }
           example: { error: "Method not allowed" }
+    QueryTooLong:
+      description: |
+        `q` is longer than `MAX_QUERY_BYTES` (4096 bytes of the decoded query,
+        `rust/serve.rs:491`), so it was refused before any board was opened
+        (`rust/serve.rs:537`-`rust/serve.rs:538`): the work is done per
+        readable board, so an unbounded input is an unbounded scan. The
+        sentence is one line and never echoes the query back
+        (`rust/serve.rs:494`).
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "The search query is too long. Shorten it and try again." }
     WriteRecorded:
       description: |
         Recorded. The response is a redirect to the page that shows the result,
