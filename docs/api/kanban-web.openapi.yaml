@@ -1,0 +1,1948 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/OAI/OpenAPI-Specification/main/schemas/v3.0/schema.json
+openapi: 3.0.3
+
+# Pinned to 3.0.3, deliberately, and not to 3.1.x.
+#
+# The audience for this document is a reviewer with whatever tooling is on
+# their machine, and 3.0.3 is the version every such tool reads: Swagger UI,
+# Redoc, the editor language servers, the linters, the code generators. 3.1's
+# only advantage here would be full JSON Schema 2020-12 — which this document
+# does not need, because every schema below is a flat record of scalars,
+# arrays and nullable strings. Choosing the newest version would trade a
+# capability nobody uses for a chance that the reviewer's renderer fails on
+# the file. Newest is not a requirement; readable by the reader is.
+#
+# 3.0's `nullable: true` is used where a Rust `Option<T>` serialises as JSON
+# null. 3.1 would write `type: [string, "null"]`; the meaning is identical.
+
+info:
+  title: Kanban operator web API
+  version: 1.0.0
+  description: |
+    The read-only JSON projection the embedded operator SPA reads, plus the
+    four writes it may make.
+
+    This document is the answer to `docs/specs/spa.md` §7 OQ-3 — *"What are the
+    JSON routes called, and how are they versioned?"* — which SPA-06
+    deliberately left open. It is a **contract**, not an implementation report:
+    at the baseline commit `cd55cbc` on branch `docs/t-19d4c16d-api-contract`
+    the server serves HTML from `render` (`rust/serve.rs:421`-`rust/serve.rs:470`)
+    and **no `/api/v1` route exists yet**. `t-88814b7a` builds the projection
+    against this document; `t-992e40aa` builds the bundle that consumes it.
+
+    ## What binds this document
+
+    - **ADR-048 §5** — the JSON API is a *thin projection over the same `Store`
+      methods the CLI and MCP call*, or it is not built. No new SQL, no second
+      query implementation, authorization parity with the CLI, never a lease
+      token. Every operation below therefore carries `x-store-method`, naming
+      the `Store` method(s) the page arm it mirrors already calls today. A
+      handler that needs data no named method exposes is a request for a
+      `Store` method, not a licence to write a query in the web layer (SPA-07).
+    - **ADR-016** — loopback only, no authentication of kanban's own, the
+      trusted edge sets the actor, the write surface is an allowlist, and the
+      same-origin gate is the CSRF defence.
+    - **ADR-037 §4** — a capped listing that was cut says so, in the `A`
+      envelope that ADR names as the migration path for exactly this case: a
+      consumer that needs the partial rows *and* the fact that they are
+      partial. See `ListEnvelope`.
+    - **`docs/specs/spa.md` SPA-06 .. SPA-13** — the eight requirements that
+      govern the projection. Every operation carries `x-requirement` naming the
+      ones it satisfies, so the trace runs spec → route → test in one hop.
+
+    ## Route naming and versioning — the OQ-3 answer
+
+    1. **One prefix, `/api/v1`.** JSON lives under it; nothing else does. The
+       HTML pages keep their bare paths for as long as they are served
+       (§7 OQ-2, `t-1f495a7f`), so the two surfaces never contend for a path.
+    2. **One route per page arm, named after the arm.** `/api/v1/needs-you`
+       for `/`, `/api/v1/boards` for `/boards`, and so on. A reader who knows
+       the page knows the route. The one deviation is documented where it
+       happens: `/` and `/all` are the *same* projection rendered two ways
+       (`rust/serve.rs:1636` and `rust/serve.rs:1680` both call
+       `open_attention`), so they share `/api/v1/needs-you`.
+    3. **`GET` only, and `GET` never mutates** (SPA-06, SPA-13). Any other
+       method on a JSON route is `405`.
+    4. **`application/json; charset=utf-8`**, always, on success and on
+       refusal.
+    5. **The version in the path is a compatibility boundary, not a release
+       number.** Additive fields do not bump it; a removed or renamed field
+       does, and lands under `/api/v2`. See `docs/api/README.md`.
+    6. **The four writes do not move.** They keep their current paths, their
+       form encoding and their field names (SPA-10), because moving them would
+       be a fifth change to the write surface disguised as a rename.
+    7. **The bundle's own bytes are not API.** The app shell is served at
+       `/app` and its assets at `/assets/…` with a content hash in the
+       filename. They are documented here only so a reader knows the whole
+       surface; they are `t-992e40aa`'s to implement and carry no JSON.
+
+    ## What this document does not restate
+
+    The CLI grammar and the MCP tool surface have their own contracts and are
+    untouched by this slice (`docs/specs/spa.md` §5). The edge's authentication
+    posture is the edge's (ADR-016); this document records only the one header
+    that crosses the boundary.
+  contact:
+    name: George (product scope) — `docs/specs/spa.md` §1
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+
+servers:
+  - url: https://kb.geoy.ws
+    description: |
+      The edge. nginx terminates TLS, authenticates through Google SSO via
+      oauth2-proxy, and proxies to the loopback listener. This is the only
+      address a browser ever uses, and the only one on which the
+      `trustedEdge` identity exists.
+  - url: http://127.0.0.1:14200
+    description: |
+      The listener itself, loopback only and with no `--bind` flag to change
+      that (ADR-016). Reaching it directly bypasses the edge, so no identity
+      is present and the interface fails closed on any write
+      (`rust/serve.rs:116`-`rust/serve.rs:118`). Reads behave exactly as they
+      do through the edge, because kanban authenticates nothing itself.
+
+tags:
+  - name: decisions
+    description: The Needs-you deck and the decisions room.
+  - name: boards
+    description: Board index, one board's rows, and hover previews.
+  - name: releases
+    description: Sprints and the deployment attempt ledger.
+  - name: operations
+    description: Plans, subscriptions, lanes and search.
+  - name: writes
+    description: The four form POSTs, unchanged in path, method and field names.
+  - name: bundle
+    description: The app shell and its hashed assets. Not JSON; listed for completeness.
+
+security:
+  - trustedEdge: []
+
+paths:
+  /api/v1/needs-you:
+    get:
+      operationId: getNeedsYou
+      tags: [decisions]
+      summary: Every open attention item across every board, in deck order.
+      description: |
+        Mirrors the `/` page arm (`rust/serve.rs:430`) and the `/all` arm
+        (`rust/serve.rs:434`), which render the **same** projection — both call
+        `open_attention` (`rust/serve.rs:1547`), which reads each active board
+        with `Store::attention(Some("open"), …, 1000, false)`
+        (`rust/serve.rs:1552`) and sorts priority-first, then oldest, then id,
+        then board (`rust/serve.rs:1557`-`rust/serve.rs:1564`). One projection,
+        one route; the deck and the flat list are presentation.
+
+        The `limit` reported is the per-board cap the arm passes today, `1000`.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
+      x-store-method: Store::attention
+      responses:
+        "200":
+          description: The open queue, in the order the deck shows it.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AttentionCard" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/decided:
+    get:
+      operationId: getDecided
+      tags: [decisions]
+      summary: Recently recorded decisions, newest first.
+      description: |
+        Mirrors `/decided` (`rust/serve.rs:438`, `decided_page` at
+        `rust/serve.rs:1718`). Each active board is scanned with
+        `Store::recent_resolved_attention(DECIDED_SCAN)` — `DECIDED_SCAN` is
+        `200` (`rust/serve.rs:86`) — the rows are merged newest-`resolvedAt`
+        first with id and board as the stable tie-breakers
+        (`rust/serve.rs:1729`-`rust/serve.rs:1736`), and the merge is cut to
+        `DECIDED_ROWS`, `20` (`rust/serve.rs:79`, `rust/serve.rs:1737`).
+
+        `limit` is the cut that shapes the answer, `20`. `truncated` is true
+        when the merge held more rows than the cut kept — an observation of the
+        merged list's length, not an inference from the row count (ADR-037 §1).
+        The per-board `200` scan is a second bound and is reported as
+        `scanLimit` so a reader can tell the two apart.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-43]
+      x-store-method: Store::recent_resolved_attention
+      responses:
+        "200":
+          description: The decisions room's rows.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items, scanLimit]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AttentionCard" }
+                      scanLimit:
+                        type: integer
+                        description: Rows read per board before the merge, `DECIDED_SCAN` (`rust/serve.rs:86`).
+                        example: 200
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/boards:
+    get:
+      operationId: getBoards
+      tags: [boards]
+      summary: Every readable board at a glance.
+      description: |
+        Mirrors `/boards` (`rust/serve.rs:439`, `boards` at
+        `rust/serve.rs:2689`). Per board: `Store::list_tasks(None, None, None,
+        false)` for the status counts and the total
+        (`rust/serve.rs:2698`-`rust/serve.rs:2699`),
+        `Store::count_open_attention` (`:2703`),
+        `Store::count_pending_handoffs` (`:2704`), `Store::stale_tasks` for the
+        stale count (`:2744`), and the single most urgent open attention row
+        and pending handoff — `Store::attention(…, 1, false)` (`:2705`) and
+        `Store::handoffs(None, Some("pending"), None, 1, false)` (`:2706`) —
+        which rank the boards and are **not** serialised, only their derived
+        order is.
+
+        A board the principal may not read is absent, and a retired board is
+        absent from this index and from its own route (SPA-08). Absence is the
+        whole denial: no count, no placeholder row, no name.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
+      x-store-method: Store::list_tasks, Store::count_open_attention, Store::count_pending_handoffs, Store::attention, Store::handoffs, Store::stale_tasks
+      responses:
+        "200":
+          description: One row per readable board, most-urgent board first.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/BoardSummary" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/board/{project}:
+    get:
+      operationId: getBoard
+      tags: [boards]
+      summary: One board's rows and the rules that frame it.
+      description: |
+        Mirrors `/board/{project}` (`rust/serve.rs:461`, `board` at
+        `rust/serve.rs:3331`): `Store::list_tasks(None, None, None, false)`
+        (`rust/serve.rs:3333`), grouped by status in workflow order by the
+        client.
+
+        **One honest exception to `x-store-method`.** The page also reads
+        `Registry::applicable_rules(Some(&project.name), None, None, false)`
+        (`rust/serve.rs:3334`) — the board's rules are registry state, not board
+        state, and no `Store` method exposes them. That read is recorded as
+        `x-registry-method` rather than hidden inside the store list, because
+        ADR-048 §5 binds the *board* data to `Store` and a document that
+        pretended the rules came from there would be wrong about the one thing
+        §5 cares about. The projection keeps the same call; it adds nothing.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
+      x-store-method: Store::list_tasks
+      x-registry-method: Registry::applicable_rules
+      parameters:
+        - $ref: "#/components/parameters/Project"
+      responses:
+        "200":
+          description: The board's rows and its applicable rules.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/BoardDetail" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/sprints:
+    get:
+      operationId: getSprints
+      tags: [releases]
+      summary: Every board's current release boundary and its sprint history.
+      description: |
+        Mirrors `/sprints` (`rust/serve.rs:440`, `sprints` at
+        `rust/serve.rs:2566`), which renders `board_sprints_content`
+        (`rust/serve.rs:2529`) per board: `Store::current_sprint` (`:2530`),
+        `Store::sprints(None, true, i64::MAX)` (`:2531`) for the complete
+        history, and `Store::sprint_task_counts(sprint_id)` (`:2492`) for each
+        card's open/done pair.
+
+        The history call passes `i64::MAX`, so this listing is **not capped**:
+        `truncated` is always `false` and `limit` is `null`. A listing that
+        reports a bound it does not have is a lie an operator would plan
+        around.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-47]
+      x-store-method: Store::current_sprint, Store::sprints, Store::sprint_task_counts
+      responses:
+        "200":
+          description: Sprint state grouped by board.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/BoardSprints" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/sprints/{project}:
+    get:
+      operationId: getBoardSprints
+      tags: [releases]
+      summary: One board's current release boundary and its sprint history.
+      description: |
+        Mirrors `/sprints/{project}` (`rust/serve.rs:441`, `board_sprints` at
+        `rust/serve.rs:2585`) — the same `board_sprints_content` projection as
+        `/api/v1/sprints`, for one named board. Uncapped for the same reason.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-47]
+      x-store-method: Store::current_sprint, Store::sprints, Store::sprint_task_counts
+      parameters:
+        - $ref: "#/components/parameters/Project"
+      responses:
+        "200":
+          description: One board's sprint state.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/BoardSprints" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/sprint/{project}/{id}:
+    get:
+      operationId: getSprint
+      tags: [releases]
+      summary: One sprint's goal, dates, visible scope and deployment proof.
+      description: |
+        Mirrors `/sprint/{project}/{id}` (`rust/serve.rs:442`, `sprint_detail`
+        at `rust/serve.rs:2597`): `Store::require_sprint(id)` (`:2599`),
+        `Store::sprint_tasks(id)` (`:2600`), `Store::sprint_task_counts(id)`
+        (`:2601`), and `Store::require_deployment` for the attempt named by
+        `closedByDeployment` when the sprint has one (`:2642`).
+
+        `Store::sprint_tasks` takes no limit, so `tasks` is uncapped and
+        `truncated` is `false`.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-47]
+      x-store-method: Store::require_sprint, Store::sprint_tasks, Store::sprint_task_counts, Store::require_deployment
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/SprintId"
+      responses:
+        "200":
+          description: The sprint, its scope and the deployment that closed it.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/SprintDetail" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/plans:
+    get:
+      operationId: getPlans
+      tags: [operations]
+      summary: Draft epics — the plans that have not been opened yet.
+      description: |
+        Mirrors `/plans` (`rust/serve.rs:443`, `plans` at
+        `rust/serve.rs:2768`): `Store::list_tasks(None, None, None, false)`
+        (`rust/serve.rs:2778`), filtered client-side to rows whose `type` is
+        `epic` and whose `status` is `draft` — the same pair the write verb
+        checks before it will open one (`rust/serve.rs:526`).
+
+        `Store::list_tasks` takes no limit, so this listing is uncapped:
+        `truncated` is `false` and `limit` is `null`.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
+      x-store-method: Store::list_tasks
+      responses:
+        "200":
+          description: Every draft epic on every readable board.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/BoardTask" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/deployments:
+    get:
+      operationId: getDeployments
+      tags: [releases]
+      summary: Current releases and the attempts that still need attention.
+      description: |
+        Mirrors `/deployments` (`rust/serve.rs:444`, `deployments` at
+        `rust/serve.rs:2274`). Three groups, three different caps, so three
+        envelopes rather than one that would have to pick a number and be wrong
+        about the other two:
+
+        - `current` — `Store::current_deployments` (`rust/serve.rs:2281`),
+          uncapped.
+        - `active` — `Store::deployments(Some("started"), None, false, 100)`
+          (`rust/serve.rs:2287`), capped at 100 **per board**.
+        - `failures` — `Store::deployments(Some(status), None, false, 30)` for
+          `failed` and then `abandoned` (`rust/serve.rs:2291`-`rust/serve.rs:2294`),
+          capped at 30 per board per status.
+
+        Each envelope's `truncated` is computed by over-fetching one row past
+        its own cap (ADR-037 §1), never inferred from a row count that happens
+        to equal the cap.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-47]
+      x-store-method: Store::current_deployments, Store::deployments
+      responses:
+        "200":
+          description: The cross-board deployment matrix.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/DeploymentIndex" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/deployment/{project}/{id}:
+    get:
+      operationId: getDeployment
+      tags: [releases]
+      summary: One deployment attempt and what it proved.
+      description: |
+        Mirrors `/deployment/{project}/{id}` (`rust/serve.rs:463`,
+        `deployment_detail` at `rust/serve.rs:2359`):
+        `Store::require_deployment(id)` (`rust/serve.rs:2361`).
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-47]
+      x-store-method: Store::require_deployment
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/DeploymentId"
+      responses:
+        "200":
+          description: The attempt, its identity mode and its verifications.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/DeploymentDetail" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/subscriptions:
+    get:
+      operationId: getSubscriptions
+      tags: [operations]
+      summary: What each consumer watches and how far it has actually got.
+      description: |
+        Mirrors `/subscriptions` (`rust/serve.rs:445`, `subscriptions` at
+        `rust/serve.rs:2894`): two statements per board, both outside the row
+        loop — `Store::subscription_positions` (`rust/serve.rs:2901`) and
+        `Store::subscriptions(None, None, true)` (`rust/serve.rs:2902`), which
+        reads paused rows whatever the client filter says so that a hidden row
+        is counted rather than reading as "nothing exists".
+
+        **The position is a presented cursor and never a token.** `leased` is a
+        count of leased deliveries; the `subscription_deliveries.lease_token`
+        that made them leased is never serialised, on any route, in any state
+        (SPA-09). `secretRef` is an opaque host-local lookup name and never a
+        credential value (`rust/model.rs:148`-`rust/model.rs:149`); it is
+        served because an operator needs to know *which* secret a consumer
+        uses, and it resolves to nothing in a browser.
+
+        Neither store call takes a limit, so this listing is uncapped.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-09, SPA-13, SPA-46]
+      x-store-method: Store::subscription_positions, Store::subscriptions
+      responses:
+        "200":
+          description: Every subscription on every readable board, with its position.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/SubscriptionView" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/lanes:
+    get:
+      operationId: getLanes
+      tags: [operations]
+      summary: What each lane last said about itself.
+      description: |
+        Mirrors `/lanes` (`rust/serve.rs:449`, `lanes` at
+        `rust/serve.rs:3260`): `Store::sitreps(None, false, None, 200)`
+        (`rust/serve.rs:3264`) per board, grouped by `(board, lane)` and
+        ordered most-recently-active first (`rust/serve.rs:3285`-`rust/serve.rs:3287`).
+
+        `limit` is the per-board scan, `200`; `truncated` is computed against
+        it per board and reported once as true if any board was cut.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
+      x-store-method: Store::sitreps
+      responses:
+        "200":
+          description: Lanes, newest activity first.
+          content:
+            application/json; charset=utf-8:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/LaneSummary" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/search:
+    get:
+      operationId: search
+      tags: [operations]
+      summary: Hybrid search across every readable board, and the rules.
+      description: |
+        Mirrors `/search` (`rust/serve.rs:450`, `search_page` at
+        `rust/serve.rs:2136`): `Store::search(&board_name, &options)` per board
+        (`rust/serve.rs:2174`), plus `search::search_rules` over
+        `Registry::rules(false)` (`rust/serve.rs:2177`), bounded by
+        `search::bound_receipt` (`rust/serve.rs:2178`).
+
+        The page fixes its own `SearchOptions` and exposes only `q`
+        (`rust/serve.rs:2152`-`rust/serve.rs:2163`): `limit` 30, `max_chars`
+        30,000, no source, status, tag, lane or date filter, archived excluded.
+        This route exposes exactly that one parameter, for the same reason: a
+        filter the page cannot set is a filter with no caller, and SPA-06 pins
+        that the route serves the page's data, not a superset of it.
+
+        An empty or whitespace-only `q` returns an empty result set with
+        `truncated: false` and performs no search — the page's own behaviour
+        (`rust/serve.rs:2145`-`rust/serve.rs:2151`), and the honest answer to a
+        question that was not asked.
+
+        `truncated` is `SearchReceipt.truncated` (`rust/model.rs:2036`) as
+        `bound_receipt` computed it, promoted into the envelope rather than
+        recomputed. `limit` is the fixed `30`.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-39]
+      x-store-method: Store::search
+      x-registry-method: Registry::rules
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: |
+            The query. Trimmed before use. Absent, empty or whitespace-only
+            returns the empty result set rather than every row: an unbounded
+            listing dressed as a search is how a read surface lets absence read
+            as a finding.
+          schema:
+            type: string
+            maxLength: 1024
+          example: lease token
+      responses:
+        "200":
+          description: The bounded result set and the receipt that bounds it.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/SearchPage" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/task/{project}/{id}:
+    get:
+      operationId: getTask
+      tags: [boards]
+      summary: One task, who holds it, and its trail.
+      description: |
+        Mirrors `/task/{project}/{id}` (`rust/serve.rs:462`, `task_detail` at
+        `rust/serve.rs:3421`): `Store::require_task(id)` (`:3423`),
+        `Store::get_claim(&task.id)` (`:3454`),
+        `Store::notes(&task.id, DETAIL_ROWS)` (`:3482`),
+        `Store::checkpoints(&task.id, DETAIL_ROWS)` (`:3498`) and
+        `Store::events(Some(&task.id), None, DETAIL_ROWS, true)` (`:3527`).
+        `DETAIL_ROWS` is `50` (`rust/serve.rs:73`). The open-attention count
+        beside the task comes from `Store::attention(Some("open"), None,
+        Some(task_id), None, None, 1000, false)` (`rust/serve.rs:1438`).
+
+        **The claim is served as `ClaimSummary`, never as `Claim`.**
+        `Claim` carries `lease_token` (`rust/model.rs:508`); `ClaimSummary`
+        (`rust/model.rs:557`-`rust/model.rs:569`) is the same identity and
+        timing without it, and it is the shape this route serves — for every
+        principal, in every state, including a task that is currently leased
+        (SPA-09). A field named `leaseToken` appearing in any body served by
+        any route in this document is a defect, not a configuration.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-09, SPA-13]
+      x-store-method: Store::require_task, Store::get_claim, Store::notes, Store::checkpoints, Store::events, Store::attention
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: The task, its holder, its notes, checkpoints and audit trail.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/TaskDetail" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/v1/preview/{kind}/{project}/{id}:
+    get:
+      operationId: getPreview
+      tags: [boards]
+      summary: The card a reference link opens on hover.
+      description: |
+        Mirrors the two preview arms — `/preview/{task|attention|deployment}/{project}/{id}`
+        (`rust/serve.rs:454`-`rust/serve.rs:459`) and
+        `/preview/board/{project}` (`rust/serve.rs:460`), which calls
+        `preview_page(project, "board", project)`: for `kind: board` the `{id}`
+        segment **is** the project name, exactly as the server passes it today.
+        The one route therefore covers both arms without inventing a second
+        path.
+
+        The store call depends on the kind (`rust/serve.rs:1997`-`rust/serve.rs:2005`):
+
+        | `kind` | source |
+        | --- | --- |
+        | `task` | `Store::require_task` (`rust/serve.rs:2013`) |
+        | `attention` | `Store::attention(None, None, None, None, None, 500, false)` then find by id (`rust/serve.rs:2055`) — no single-row getter exists and the projection does not add one for a hover |
+        | `deployment` | `Store::require_deployment` (`rust/serve.rs:2094`) |
+        | `board` | `Store::list_tasks` and `Store::count_open_attention` (`rust/serve.rs:2110`, `rust/serve.rs:2112`) |
+
+        A kind that is not one of the four, or `board` with an `{id}` that is
+        not the project name, is `404` with the generic refusal — the server's
+        own arm answers "Nothing to preview here." (`rust/serve.rs:2005`),
+        which says the same thing without naming anything.
+      x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-40]
+      x-store-method: Store::require_task, Store::attention, Store::require_deployment, Store::list_tasks, Store::count_open_attention
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          description: Which record is being previewed. For `board`, `{id}` repeats `{project}`.
+          schema:
+            type: string
+            enum: [task, attention, deployment, board]
+        - $ref: "#/components/parameters/Project"
+        - name: id
+          in: path
+          required: true
+          description: The record id; the project name when `kind` is `board`.
+          schema: { type: string, maxLength: 128 }
+      responses:
+        "200":
+          description: The preview card's data.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/Preview" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  # ------------------------------------------------------------------ writes
+  #
+  # Exactly four, exactly as `post`'s allowlist has them today
+  # (`rust/serve.rs:480`-`rust/serve.rs:486`). They are NOT under `/api/v1`:
+  # they do not move, because moving them would be a change to the write
+  # surface wearing a rename (SPA-10). They stay `application/x-www-form-urlencoded`
+  # and they stay redirect-answering, because the browser that posts them is
+  # the browser that follows the redirect.
+
+  /attention/{project}/{id}/reply:
+    post:
+      operationId: replyToAttention
+      tags: [writes]
+      summary: Record a decision on an open attention item.
+      description: |
+        `rust/serve.rs:482`, handled at `rust/serve.rs:632`-`rust/serve.rs:729`.
+
+        **Preconditions, in the order the handler checks them.**
+
+        1. The path is on the allowlist, or `404` (`rust/serve.rs:480`-`rust/serve.rs:490`).
+        2. `same_origin(request)` — the `Origin` header's authority equals the
+           `Host` header, compared ASCII-case-insensitively, with the scheme
+           required to be `http` or `https`; a **missing** `Origin` or a
+           missing `Host` is a refusal, not a pass (`rust/serve.rs:854`-`rust/serve.rs:869`).
+           Otherwise `403` (SPA-11).
+        3. The actor resolves (`rust/serve.rs:501`, `ServeConfig::actor_for_write`
+           at `rust/serve.rs:116`-`rust/serve.rs:121`), or `400`.
+        4. The body is present and at most `MAX_REPLY_BYTES` = 4096 bytes
+           (`rust/serve.rs:95`, `rust/serve.rs:633`), and is read to exactly
+           the declared `Content-Length` and never to end-of-stream
+           (`rust/serve.rs:636`-`rust/serve.rs:644`).
+        5. `decision` is present and non-blank, or `400` (`rust/serve.rs:670`).
+        6. When `decision` is the reserved `custom`, **both** `outcome` and
+           `reply` must be present and non-blank, or `400` — the form is wrong
+           rather than the row, which is why it is not the `409` a settled row
+           gets (`rust/serve.rs:677`-`rust/serve.rs:696`).
+        7. The board resolves, or `404` (`rust/serve.rs:708`).
+        8. `Store::resolve_attention_from_trusted_edge` accepts it, or `409`
+           with the store's own sentence (`rust/serve.rs:714`-`rust/serve.rs:724`).
+           That method is `pub(crate)` (`rust/store.rs:6064`), not `pub` like
+           every other method this document names: the trusted-edge resolve is
+           deliberately unreachable outside the binary, and the web edge is its
+           only caller. `Store::resolve_attention` (`rust/store.rs:6051`) is the
+           public sibling the CLI uses, and it is **not** what a browser write
+           reaches.
+
+        On success: `303` to `/?replied={id}`.
+      x-requirement: [SPA-10, SPA-11, SPA-12, SPA-14, SPA-19, SPA-20]
+      x-store-method: Store::resolve_attention_from_trusted_edge
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/AttentionId"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  description: |
+                    An authored choice `key` the row carries, or the reserved
+                    `custom`. A key the row no longer carries is refused **by
+                    name by the store** (ADR-042 §4 refusal 13) rather than
+                    mapped onto whatever now sits in that position, which is
+                    what makes a card left open in a tab safe
+                    (`rust/serve.rs:673`-`rust/serve.rs:676`).
+                  example: approve
+                outcome:
+                  type: string
+                  description: |
+                    The verdict, required when and only when `decision` is
+                    `custom`. An authored choice carries its own outcome and a
+                    picker the operator left set is deliberately not forwarded
+                    onto it (`rust/serve.rs:701`-`rust/serve.rs:704`).
+                reply:
+                  type: string
+                  description: |
+                    The note. Optional beside an authored choice; required
+                    beside `custom`.
+      responses:
+        "303": { $ref: "#/components/responses/WriteRecorded" }
+        "400": { $ref: "#/components/responses/WriteRejected" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "409": { $ref: "#/components/responses/WriteConflict" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /attention/{project}/{id}/reopen:
+    post:
+      operationId: reopenAttention
+      tags: [writes]
+      summary: Undo a recorded decision and put the item back on the deck.
+      description: |
+        `rust/serve.rs:483`, handled at `rust/serve.rs:595`-`rust/serve.rs:630`.
+        Same-origin and actor preconditions as `reply`.
+
+        **No request body.** The undo is one keypress or one click, so its
+        reopen note is fixed prose — `WEB_UNDO_NOTE`, "undone from the web
+        view" (`rust/serve.rs:87`, `rust/serve.rs:607`) — rather than a form
+        field: an undo that demanded words would be a dialog wearing a button.
+        The row's previous decision and resolution stay in the hash-chained
+        ledger (ADR-042 §3).
+
+        On success: `303` to `/?undone={id}`, or to `/decided?undone={id}` when
+        the query carries `back=/decided`. The value is **compared, not
+        trusted**, so a form cannot redirect elsewhere
+        (`rust/serve.rs:619`-`rust/serve.rs:626`).
+      x-requirement: [SPA-10, SPA-11, SPA-12, SPA-27, SPA-43]
+      x-store-method: Store::reopen_attention
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/AttentionId"
+        - name: back
+          in: query
+          required: false
+          description: |
+            Where to land. The only value with an effect is the literal
+            `/decided`; anything else, including anything an attacker could
+            write, lands on `/`.
+          schema:
+            type: string
+            enum: ["/decided"]
+      responses:
+        "303": { $ref: "#/components/responses/WriteRecorded" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "409": { $ref: "#/components/responses/WriteConflict" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /plan/{project}/{id}/open:
+    post:
+      operationId: openPlan
+      tags: [writes]
+      summary: Open a draft epic, moving the real task to `todo`.
+      description: |
+        `rust/serve.rs:484`, handled at `rust/serve.rs:516`-`rust/serve.rs:551`.
+        Same-origin and actor preconditions as `reply`. **No request body.**
+
+        The handler reads `Store::list_tasks(None, None, None, false)`
+        (`rust/serve.rs:523`) and refuses with `409` unless the named row is an
+        existing epic in `draft` (`rust/serve.rs:524`-`rust/serve.rs:534`): it
+        cannot move a task, a story, or a non-draft epic (ADR-016). The move
+        itself is the same audited `Store::move_task` the CLI uses
+        (`rust/serve.rs:536`).
+
+        On success: `303` to `/plans?opened={id}`.
+      x-requirement: [SPA-10, SPA-11, SPA-12, SPA-44]
+      x-store-method: Store::list_tasks, Store::move_task
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "303": { $ref: "#/components/responses/WriteRecorded" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "409":
+          description: |
+            Not opened. Either the row is not an existing draft epic — the
+            server's own sentence is `Only an existing draft epic can be opened
+            here.` (`rust/serve.rs:532`) — or `Store::move_task` refused.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /subscription/{project}/{id}/{verb}:
+    post:
+      operationId: setSubscriptionPaused
+      tags: [writes]
+      summary: Pause or resume one subscription.
+      description: |
+        `rust/serve.rs:485`, handled at `rust/serve.rs:553`-`rust/serve.rs:593`.
+        Same-origin and actor preconditions as `reply`. **No request body.**
+
+        **Idempotent, because the store makes it so.** `pause_subscription` /
+        `resume_subscription` return the row untouched when it already holds
+        the requested state — no second ledger event, and `pausedAt` does not
+        move — so a double submit lands on the page rather than erroring or
+        re-stamping who paused it, and the handler needs no read-then-write of
+        its own, which could not be atomic anyway
+        (`rust/serve.rs:561`-`rust/serve.rs:571`).
+
+        On success: `303` to `/subscriptions?changed={id}`, with `show=all`
+        prepended when pausing — a paused row is hidden by the default filter,
+        and an action whose result vanishes from the page reads as an action
+        that failed (`rust/serve.rs:584`-`rust/serve.rs:593`).
+      x-requirement: [SPA-10, SPA-11, SPA-12, SPA-45]
+      x-store-method: Store::pause_subscription, Store::resume_subscription
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - name: id
+          in: path
+          required: true
+          description: The subscription id.
+          schema: { type: string, maxLength: 128 }
+        - name: verb
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [pause, resume]
+        - name: show
+          in: query
+          required: false
+          description: The filter the form was submitted from; `all` is preserved across a resume.
+          schema:
+            type: string
+            enum: [all]
+      responses:
+        "303": { $ref: "#/components/responses/WriteRecorded" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "409":
+          description: Unchanged. The store refused; its sentence is the generic refusal here.
+          content:
+            application/json; charset=utf-8:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  # ------------------------------------------------------------------ bundle
+  /app:
+    get:
+      operationId: getAppShell
+      tags: [bundle]
+      summary: The application shell.
+      description: |
+        The HTML document that mounts the application root
+        (`data-testid="app-root"`, SPA-04). Served from the executable's own
+        bytes, never from the filesystem at request time (SPA-01). `/app` is
+        the first-wave mount; the cutover row (`t-bf255880`, §7 OQ-2/OQ-5)
+        moves it to `/`.
+
+        No JSON, no store call, and no `x-store-method`: this operation reads
+        nothing from the ledger. Implemented by `t-992e40aa`, not by this
+        contract.
+      x-requirement: [SPA-01, SPA-04]
+      responses:
+        "200":
+          description: The shell document.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+
+  /assets/{file}:
+    get:
+      operationId: getAsset
+      tags: [bundle]
+      summary: One built asset, addressed by content hash.
+      description: |
+        The bundle's JavaScript and CSS, each filename carrying a content hash
+        so a new build is a new URL and a cached old one is never the wrong
+        answer. Served from the executable's own bytes (SPA-01); nothing is
+        fetched from a third party (SPA-57). Implemented by `t-992e40aa`.
+      x-requirement: [SPA-01, SPA-02, SPA-57]
+      parameters:
+        - name: file
+          in: path
+          required: true
+          description: The hashed filename, e.g. `app.9f3c1b2a.js`.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_.-]+$"
+      responses:
+        "200":
+          description: The asset.
+          content:
+            application/javascript; charset=utf-8:
+              schema: { type: string }
+            text/css; charset=utf-8:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+
+components:
+  securitySchemes:
+    trustedEdge:
+      type: apiKey
+      in: header
+      name: X-Auth-Request-Email
+      description: |
+        **The only identity in this estate, and it is not a token.**
+
+        `X-Auth-Request-Email` is set by nginx from a verified oauth2-proxy
+        `auth_request` sub-request, and set with `proxy_set_header` — which
+        *overwrites* the field for the upstream request, so a client copy
+        arriving from the browser cannot be injected and cannot survive the
+        edge (ADR-016:98-:105). A request that reaches the loopback listener
+        without passing the edge simply has no identity.
+
+        **It is read only under an opt-in flag.** With no `--actor-header
+        NAME`, `ServeConfig::actor_for_write` returns `OPERATOR_ACTOR`
+        (`geoyws`) and never looks at any header
+        (`rust/serve.rs:116`-`rust/serve.rs:121`). With the flag, the named
+        header's value is validated, and a **missing, duplicated, empty,
+        oversized or malformed** value **fails the write closed** — it does not
+        fall back to the default (SPA-12, ADR-016:101-:103). A client-supplied
+        actor in a JSON body, a query parameter or any other field is ignored
+        and can never change the recorded actor. The trusted-edge resolve call
+        site stays single.
+
+        **There is no bearer token in this estate, and this scheme is not one.**
+        No OAuth credential, cookie or authorization header enters a response
+        body or a `/live` frame (ADR-016:66-:67). The browser holds no
+        credential it could replay against the CLI, and the API never serves a
+        lease token (ADR-048 §5, SPA-09). `type: apiKey` is OpenAPI 3.0's only
+        way to describe "a header carries the identity"; it is a description of
+        the edge's contract with the server, not an invitation to send one.
+
+        **Read routes are not gated by it.** kanban implements no
+        authentication (ADR-016) — authorization happens inside the store, per
+        board and per tag, identically to the CLI (ADR-048 §5, SPA-08). The
+        scheme is declared globally because every request crosses the edge in
+        production; it is *load-bearing* only on the four writes.
+
+  parameters:
+    Project:
+      name: project
+      in: path
+      required: true
+      description: |
+        The board's registered name, URL-encoded. A name that resolves to no
+        readable board, to a retired board, or to more than one board is
+        `404` with the generic refusal — see the `DeniedOrNotFound` response.
+      schema:
+        type: string
+        maxLength: 128
+      example: KANBAN
+    TaskId:
+      name: id
+      in: path
+      required: true
+      description: The task id, e.g. `t-19d4c16d`.
+      schema: { type: string, maxLength: 128 }
+      example: t-19d4c16d
+    AttentionId:
+      name: id
+      in: path
+      required: true
+      description: The attention id, e.g. `a-180f934d`.
+      schema: { type: string, maxLength: 128 }
+      example: a-180f934d
+    SprintId:
+      name: id
+      in: path
+      required: true
+      description: The sprint id, e.g. `sp-4f1c2d90`.
+      schema: { type: string, maxLength: 128 }
+    DeploymentId:
+      name: id
+      in: path
+      required: true
+      description: The deployment attempt id, e.g. `d-77ab1e05`.
+      schema: { type: string, maxLength: 128 }
+
+  responses:
+    DeniedOrNotFound:
+      description: |
+        **Refused, non-enumerating.** One body, byte-identical whether the row
+        is invisible to the caller, absent from the board, or on a board that
+        does not exist — because a refusal that distinguishes them is an
+        existence oracle. This is the store's own single generic denial,
+        `denied or not found` (`rust/authz.rs:28`-`rust/authz.rs:33`), and the
+        API reuses its exact wording rather than inventing a second string.
+
+        No board name, no row title, no tag, no retirement note, and no count
+        appears in this body, on any route, for any principal.
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "denied or not found" }
+    Refused:
+      description: |
+        **The action did not come from this site.** The same-origin gate
+        refused: `Origin`'s authority did not equal `Host`, or one of the two
+        headers was absent (`rust/serve.rs:854`-`rust/serve.rs:869`,
+        `rust/serve.rs:492`-`rust/serve.rs:500`). The board is unchanged — no
+        event, no decision, no status transition — and a JSON-shaped request
+        body does not exempt a write from the gate (SPA-11).
+
+        The sentence is the product's own, copied verbatim from
+        `rust/serve.rs:497`.
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "The action did not come from this site." }
+    MethodNotAllowed:
+      description: |
+        The route answers `GET` and nothing else (SPA-06). The server's current
+        arm returns `405` for any method that is neither `GET` nor `POST`
+        (`rust/serve.rs:384`-`rust/serve.rs:389`); a JSON route additionally
+        refuses `POST`, because no `GET` route mutates and no JSON route is a
+        write (SPA-10, SPA-13).
+      headers:
+        Allow:
+          description: Always `GET`.
+          schema: { type: string, enum: ["GET"] }
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "Method not allowed" }
+    WriteRecorded:
+      description: |
+        Recorded. The response is a redirect to the page that shows the result,
+        exactly as the form POST answers today
+        (`rust/serve.rs:343`-`rust/serve.rs:350`). The client follows it; the
+        board is the record.
+      headers:
+        Location:
+          description: A relative path on this origin. Never client-supplied.
+          schema: { type: string }
+    WriteRejected:
+      description: |
+        The request was wrong — no choice named, a body that was empty or over
+        `MAX_REPLY_BYTES` (4096), a body that was not UTF-8, a malformed form
+        encoding, a free-text answer missing its verdict or its words, or an
+        actor header that failed validation. The row is untouched, and the
+        refusal names what is missing so supplying it and submitting again
+        works without a reload (SPA-19).
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+    WriteConflict:
+      description: |
+        The board refused. The row was already resolved, the choice key is one
+        the row no longer carries, or the store declined for its own reason.
+        The store's sentence is returned as written — these refusals name the
+        row's own state to the one operator who raised it and is authorised to
+        see it, which is not an enumeration of anything they could not already
+        read.
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+    ServerError:
+      description: |
+        The renderer failed. The sentence is generic; it never carries a board
+        name, a path, or a row title.
+
+        **Known divergence at the baseline.** The HTML surface today answers
+        `500` with the store's *detailed* error text for an unknown, retired or
+        ambiguous board — `/board/RETIRED` returns `500` carrying the board's
+        name and its retirement note, asserted as such by
+        `serve_hides_retired_boards_from_the_board_index_and_board_route`
+        (`tests/e2e.rs:43920`-`tests/e2e.rs:43923`). The JSON surface **must
+        not** copy that: those cases are `404` with `denied or not found` here.
+        See `docs/api/README.md`, "Where the served pages do not yet meet this
+        contract".
+      content:
+        application/json; charset=utf-8:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "The request could not be completed." }
+
+  schemas:
+    Error:
+      type: object
+      description: |
+        The only error shape. One field, one sentence, and nothing else — no
+        code, no field path, no row id, no board name. A machine-readable code
+        would have to distinguish "not yours" from "not there" to be useful,
+        and that distinction is exactly what must not cross this boundary.
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          description: A generic sentence, safe to render verbatim.
+          example: denied or not found
+
+    ListEnvelope:
+      type: object
+      description: |
+        **The capped-listing shape (ADR-037 §4, option A).** ADR-037 decided
+        that a CLI listing which exceeds a default the caller never set
+        *refuses*, and named option A — `{items, returned, limit, truncated}` —
+        as the migration path for the one case a refusal cannot serve: a
+        consumer that needs the partial rows **and** the fact that they are
+        partial, in one response. The browser is exactly that consumer. SPA-06
+        requires the page's data to arrive; a page that got a refusal instead
+        of rows would be a blank screen where a bounded list belongs.
+
+        This envelope is adopted for the JSON surface only. It does **not**
+        migrate the CLI listings, which keep ADR-037 §3's silence and §2's
+        refusal; if they ever adopt A, this is the same shape and the two agree
+        by construction.
+
+        `truncated` is **computed, never inferred**: the listing asks the store
+        for one row past the bound it will return and sets the flag from
+        whether that row came back (ADR-037 §1, the `context_packet`
+        discipline). A result with exactly `limit` rows and no extra is
+        complete and says so.
+      required: [items, returned, limit, truncated]
+      properties:
+        items:
+          type: array
+          description: The rows, in the order the page shows them.
+          items: {}
+        returned:
+          type: integer
+          minimum: 0
+          description: How many rows are in `items`.
+        limit:
+          type: integer
+          nullable: true
+          description: |
+            The bound that shaped this answer, or `null` when the underlying
+            store call takes no limit. `null` and `truncated: false` together
+            mean the listing is complete by construction, not by luck.
+        truncated:
+          type: boolean
+          description: Whether rows were cut. Observed by over-fetching one row, not inferred from `returned == limit`.
+
+    # ---------------------------------------------------------------- records
+    # Every field name below is the serialised name of a field on an existing
+    # Rust struct in `rust/model.rs`, under that struct's own serde attributes:
+    # `rename_all = "camelCase"` where the struct declares it, and the explicit
+    # `rename` where one is given (`taskID`, `agentID`, `sessionID`,
+    # `consumerID`, `actionID`, `sprintID`, `parentID`, `type`). Nothing here
+    # is invented; where a struct has no `Serialize` derive today, the schema
+    # says so in its description and the wire name is this document's choice,
+    # fixed here so the projection has one to implement.
+
+    Task:
+      type: object
+      description: "`rust/model.rs:454`. `rename_all = \"camelCase\"`, with `type` and `parentID` renamed explicitly."
+      required: [id, type, title, status, priority, createdAt, updatedAt, archived, metadata, tags]
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [epic, story, task]
+          description: "`task_type`, renamed to `type` (`rust/model.rs:456`). `TASK_TYPES`, `rust/model.rs:411`."
+        parentID: { type: string, nullable: true }
+        title: { type: string }
+        body: { type: string, nullable: true }
+        assignee: { type: string, nullable: true }
+        lane: { type: string, nullable: true }
+        deliverable: { type: string, nullable: true }
+        staleMinutes: { type: integer, nullable: true }
+        driverOnly: { type: boolean }
+        status: { type: string }
+        priority:
+          type: integer
+          description: The durable 0-9 queue key.
+        priorityLevel:
+          type: string
+          nullable: true
+          enum: [P0, P1, P2, null]
+          description: "Derived on read from `priority` by `model::priority_level` (`rust/model.rs:443`); never stored, never typed."
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        updatedAt: { $ref: "#/components/schemas/EpochMillis" }
+        completedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        archived: { type: boolean }
+        archivedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        metadata:
+          description: "Free-form JSON the row carries (`rust/model.rs:477`)."
+        tags:
+          type: array
+          items: { type: string }
+          description: Registered tags, sorted. What the row is *about*, as opposed to `lane`.
+
+    AttentionChoice:
+      type: object
+      description: |
+        `rust/model.rs:900`. **No `rename_all`** on this struct, so the wire
+        names are the Rust field names as written.
+      required: [key, label, consequence, outcome, recommended]
+      properties:
+        key:
+          type: string
+          description: The slug the CLI, the MCP tool, the form POST and the ledger all name. Never the reserved `custom`.
+        label: { type: string, description: The button text. }
+        consequence: { type: string, description: "What happens if it is picked, including its cost." }
+        outcome: { type: string }
+        recommended: { type: boolean }
+
+    AttentionDecision:
+      type: object
+      description: "`rust/model.rs:912`. No `rename_all`; wire names are the Rust field names."
+      required: [choice, outcome, by, at]
+      properties:
+        choice: { type: string, description: "An authored key, or the literal `custom`." }
+        outcome: { type: string }
+        note: { type: string, nullable: true }
+        by: { type: string }
+        at: { $ref: "#/components/schemas/EpochMillis" }
+
+    Attention:
+      type: object
+      description: "`rust/model.rs:1322`, `rename_all = \"camelCase\"` with `taskID` renamed explicitly."
+      required: [id, kind, body, choices, raisedBy, createdAt, status, priority, archived, tags]
+      properties:
+        id: { type: string }
+        taskID: { type: string, nullable: true }
+        kind: { type: string }
+        body: { type: string }
+        question:
+          type: string
+          nullable: true
+          description: What the operator is deciding, in his terms; `null` on a row with no authored card, where the body serves as both question and context.
+        context: { type: string, nullable: true }
+        choices:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/AttentionChoice" }
+          description: |
+            What the raiser authored, or `default_choice_pair`
+            (`rust/model.rs:926`) materialized on read for a row that authored
+            none. Never empty, and never carries the reserved `custom` key.
+        raisedBy: { type: string }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        status: { type: string }
+        priority: { type: integer }
+        priorityLevel: { type: string, nullable: true, enum: [P0, P1, P2, null] }
+        resolvedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        resolvedBy: { type: string, nullable: true }
+        resolution: { type: string, nullable: true }
+        decision:
+          type: object
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/AttentionDecision" }]
+          description: What settling it recorded, or `null` while it is open — a reopen clears it from the row and keeps it in the ledger (ADR-042 §3).
+        reopenedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        reopenedBy: { type: string, nullable: true }
+        reopenNote: { type: string, nullable: true }
+        archived: { type: boolean }
+        tags: { type: array, items: { type: string } }
+
+    AttentionCard:
+      type: object
+      description: |
+        One open or decided item paired with the board that raised it. The pair
+        is the `OpenQueue` element `open_attention` builds
+        (`rust/serve.rs:1539`-`rust/serve.rs:1541`): the board name is not a
+        field of `Attention`, because a board holds its own rows and the name
+        only exists once they are merged across boards.
+
+        `board` is this document's wire name for that pairing; `attention` is
+        the row verbatim.
+      required: [board, attention]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        attention: { $ref: "#/components/schemas/Attention" }
+
+    BoardTask:
+      type: object
+      description: One task paired with the board it is on, for the cross-board listings.
+      required: [board, task]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        task: { $ref: "#/components/schemas/Task" }
+
+    BoardSummary:
+      type: object
+      description: |
+        One row of the board index. **No Rust struct backs this**: `boards`
+        (`rust/serve.rs:2689`) computes the row inline and writes it straight
+        into HTML (`rust/serve.rs:2733`-`rust/serve.rs:2747`). The field names
+        here are this document's, one per rendered cell, each naming its
+        source. The projection implements them; it does not get to pick others.
+      required: [board, openAttention, todo, inProgress, stale, handoffs, tasks]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        openAttention:
+          type: integer
+          description: "`Store::count_open_attention` (`rust/serve.rs:2703`). Counted, not fetched — a page used as a count saturates silently."
+        todo:
+          type: integer
+          description: Rows in `todo`, counted over `Store::list_tasks` (`rust/serve.rs:2742`).
+        inProgress:
+          type: integer
+          description: Rows in `in_progress` (`rust/serve.rs:2743`).
+        stale:
+          type: integer
+          description: "`Store::stale_tasks().len()` (`rust/serve.rs:2744`)."
+        handoffs:
+          type: integer
+          description: "`Store::count_pending_handoffs` (`rust/serve.rs:2704`)."
+        tasks:
+          type: integer
+          description: Every non-archived row on the board (`rust/serve.rs:2746`).
+
+    RuleSummary:
+      type: object
+      description: |
+        `rust/model.rs:294`, `rename_all = "camelCase"`. The always-carried
+        table-of-contents entry for a rule. Registry state, not board state —
+        see `x-registry-method` on `getBoard`.
+      required: [id, headline, hasMore, bytes, tags]
+      properties:
+        id: { type: string }
+        headline: { type: string }
+        hasMore:
+          type: boolean
+          description: Whether the rule's body carries more than the headline.
+        bytes: { type: integer, minimum: 0 }
+        tags: { type: array, items: { type: string } }
+
+    BoardDetail:
+      type: object
+      required: [board, roots, tasks, rules]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        roots:
+          type: array
+          items: { type: string }
+          description: The workspace roots, empty for a rootless board (`rust/serve.rs:3340`). Roots are hints, not board identity (ADR-028).
+        tasks:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/Task" } }
+          description: "`Store::list_tasks`, uncapped: `limit` is `null`."
+        rules:
+          type: array
+          items: { $ref: "#/components/schemas/RuleSummary" }
+
+    Sprint:
+      type: object
+      description: "`rust/model.rs:1895`, `rename_all = \"camelCase\"`."
+      required: [id, title, status, targetVersion, scheduledStart, scheduledEnd, startsAt, createdAt, updatedAt, archived]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        body: { type: string, nullable: true, description: The goal and success criteria. }
+        status: { type: string }
+        targetVersion: { type: string }
+        scheduledStart: { $ref: "#/components/schemas/EpochMillis" }
+        scheduledEnd: { $ref: "#/components/schemas/EpochMillis" }
+        startsAt:
+          type: integer
+          format: int64
+          description: Stamped by `sprint start`; `0` until then — epoch zero is not a moment anyone can have started at, so it can never read as a stamp (`rust/model.rs:1908`).
+        endsAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        closedByDeployment:
+          type: string
+          nullable: true
+          description: The `d-` attempt that proved the version served, set by close.
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        updatedAt: { $ref: "#/components/schemas/EpochMillis" }
+        archived: { type: boolean }
+
+    SprintCard:
+      type: object
+      description: |
+        One sprint with the two counts the card shows.
+        `sprint_summary` (`rust/serve.rs:2491`) renders exactly this from
+        `Store::sprint_task_counts` (`rust/serve.rs:2492`), which returns
+        `(open, done)`.
+      required: [sprint, openTasks, doneTasks]
+      additionalProperties: false
+      properties:
+        sprint: { $ref: "#/components/schemas/Sprint" }
+        openTasks: { type: integer }
+        doneTasks: { type: integer }
+
+    BoardSprints:
+      type: object
+      description: "One board's sprint state, as `board_sprints_content` assembles it (`rust/serve.rs:2529`)."
+      required: [board, current, history]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        current:
+          type: object
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/SprintCard" }]
+          description: "`Store::current_sprint`; `null` when the board has none, which is a state the page names rather than hides (`rust/serve.rs:2537`)."
+        history:
+          type: array
+          items: { $ref: "#/components/schemas/SprintCard" }
+          description: Every sprint whose status is not `current`, from `Store::sprints(None, true, i64::MAX)` — planned, closed and abandoned alike.
+
+    SprintDetail:
+      type: object
+      required: [board, sprint, openTasks, doneTasks, tasks]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        sprint: { $ref: "#/components/schemas/Sprint" }
+        openTasks: { type: integer }
+        doneTasks: { type: integer }
+        tasks:
+          type: array
+          items: { $ref: "#/components/schemas/Task" }
+          description: "`Store::sprint_tasks` — the visible scope. Uncapped."
+        closingDeployment:
+          type: object
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/DeploymentAttempt" }]
+          description: "`Store::require_deployment(closedByDeployment)` when the sprint names one (`rust/serve.rs:2642`); the authoritative proof the target version was served (ADR-045)."
+
+    ArtifactVerification:
+      type: object
+      description: |
+        `rust/model.rs:1606`, `rename_all = "camelCase"`. One expected
+        artifact identity and what the attempt's finish observed for it — the
+        shape every surface renders (ADR-043 §4).
+      required: [role, kind, expected]
+      properties:
+        role: { type: string }
+        kind: { type: string }
+        expected: { type: string }
+        observed:
+          type: string
+          nullable: true
+          description: "`null` until a terminal finish records what was measured."
+
+    DeploymentAttempt:
+      type: object
+      description: |
+        `rust/model.rs:1791`, `rename_all = "camelCase"` with `taskID` and
+        `sprintID` renamed explicitly. `sprintID`, `targetVersion` and
+        `servedVersion` carry `skip_serializing_if = "Option::is_none"`
+        (`rust/model.rs:1823`-`rust/model.rs:1828`), so they are **absent**
+        rather than `null` when unset — a difference a strict client must
+        tolerate.
+      required: [id, repo, identityMode, buildCommit, buildCommitLabel, tier, environment, host, url, status, actor, artifacts, createdAt, updatedAt, archived]
+      properties:
+        id: { type: string }
+        taskID: { type: string, nullable: true }
+        repo: { type: string }
+        identityMode:
+          type: string
+          enum: [git, artifact]
+          description: Which identity this attempt proves itself with.
+        buildCommit:
+          type: string
+          description: The build commit, or the literal unknown-build-commit sentinel in artifact mode. Never a blank and never a borrowed SHA (ADR-043).
+        buildCommitLabel:
+          type: string
+          description: Derived on read, never stored — what a surface prints where a build SHA would be (`rust/model.rs:1801`-`rust/model.rs:1804`).
+        deployerCheckout:
+          type: string
+          nullable: true
+          description: The checkout the deployer ran from. Recorded separately and never presented as the build commit.
+        branch: { type: string, nullable: true }
+        tier: { type: string }
+        environment: { type: string }
+        host: { type: string }
+        url: { type: string }
+        mechanism: { type: string, nullable: true }
+        operationId: { type: string, nullable: true }
+        retryOf: { type: string, nullable: true }
+        status: { type: string }
+        phase: { type: string, nullable: true }
+        actor: { type: string }
+        lane: { type: string, nullable: true }
+        receipt: { type: string, nullable: true }
+        artifactUri: { type: string, nullable: true }
+        servedCommit: { type: string, nullable: true }
+        sprintID: { type: string, description: Absent when the attempt is not sprint-bound. }
+        targetVersion: { type: string, description: Absent when the attempt is not sprint-bound. }
+        servedVersion: { type: string, description: Absent until a successful sprint-bound finish observes one. }
+        artifacts:
+          type: array
+          items: { $ref: "#/components/schemas/ArtifactVerification" }
+          description: The expected identities and what the finish observed for each, in the attempt's own expected order. Empty in Git mode.
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        updatedAt: { $ref: "#/components/schemas/EpochMillis" }
+        completedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        archived: { type: boolean }
+        archivedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+
+    BoardDeployment:
+      type: object
+      description: One attempt paired with the board it was recorded on.
+      required: [board, deployment]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        deployment: { $ref: "#/components/schemas/DeploymentAttempt" }
+
+    DeploymentIndex:
+      type: object
+      description: Three groups with three different caps, each carrying its own envelope.
+      required: [current, active, failures]
+      additionalProperties: false
+      properties:
+        current:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/BoardDeployment" } }
+          description: "`Store::current_deployments`. Uncapped: `limit` is `null`."
+        active:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/BoardDeployment" } }
+          description: "`Store::deployments(Some(\"started\"), None, false, 100)`; `limit` is 100 per board."
+        failures:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/BoardDeployment" } }
+          description: "`failed` then `abandoned`, `Store::deployments(…, 30)`; `limit` is 30 per board per status."
+
+    DeploymentDetail:
+      type: object
+      required: [board, deployment]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        deployment: { $ref: "#/components/schemas/DeploymentAttempt" }
+
+    Subscription:
+      type: object
+      description: "`rust/model.rs:129`, `rename_all = \"camelCase\"` with `subjectTaskID`, `consumerID` and `actionID` renamed explicitly."
+      required: [id, protocolVersion, relations, kinds, priorStatuses, currentStatuses, tags, consumerID, actionID, timeoutMs, maxRetries, ratePerMinute, maxConcurrency, startEventSeq, status, createdAt, createdBy, updatedAt, updatedBy]
+      properties:
+        id: { type: string }
+        protocolVersion: { type: integer }
+        subjectTaskID: { type: string, nullable: true }
+        relations:
+          type: array
+          items: { type: string, enum: [parent, ancestor, depends-on] }
+        kinds: { type: array, items: { type: string } }
+        priorStatuses: { type: array, items: { type: string } }
+        currentStatuses: { type: array, items: { type: string } }
+        tags: { type: array, items: { type: string } }
+        consumerID: { type: string }
+        actionID: { type: string }
+        timeoutMs: { type: integer }
+        maxRetries: { type: integer }
+        ratePerMinute: { type: integer }
+        maxConcurrency: { type: integer }
+        startEventSeq: { type: integer, format: int64 }
+        secretRef:
+          type: string
+          nullable: true
+          description: |
+            An **opaque host-local lookup name, never a credential value**
+            (`rust/model.rs:148`-`rust/model.rs:149`). It names which secret
+            the consumer resolves on the host; it resolves to nothing in a
+            browser and grants nothing.
+        status: { type: string }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        createdBy: { type: string }
+        updatedAt: { $ref: "#/components/schemas/EpochMillis" }
+        updatedBy: { type: string }
+        pausedAt: { $ref: "#/components/schemas/EpochMillisNullable" }
+        pausedBy: { type: string, nullable: true }
+
+    SubscriptionPosition:
+      type: object
+      description: |
+        Where one subscription has actually got to — derived, never stored
+        (`rust/model.rs:171`). **This struct has no `Serialize` derive today**
+        (`rust/model.rs:170`), so these wire names are fixed by this document
+        rather than read off the Rust: the camelCase of each field, which is
+        what every serialising struct beside it uses.
+
+        **A presented cursor and nothing else.** `leased` counts deliveries
+        currently held; the `subscription_deliveries.lease_token` that holds
+        them is never serialised (SPA-09).
+      required: [ackedThroughSeq, pending, leased, retryWait, deadLetter]
+      additionalProperties: false
+      properties:
+        ackedThroughSeq:
+          type: integer
+          format: int64
+          nullable: true
+          description: The highest acked delivery seq, or `null` when nothing has been acked yet — which is not the same fact as "acked through seq 0" (`rust/model.rs:172`-`rust/model.rs:174`).
+        pending: { type: integer, format: int64 }
+        leased: { type: integer, format: int64 }
+        retryWait: { type: integer, format: int64 }
+        deadLetter: { type: integer, format: int64 }
+
+    DeadLetterCode:
+      type: object
+      description: |
+        `rust/model.rs:191`. No `Serialize` derive either; wire names fixed
+        here. The code is the adapter's own classification, stored on the
+        delivery row as `last_error_code`, and it is served **verbatim**:
+        `opencode_endpoint_unreachable` tells an operator to check a port and a
+        generic failure sentence tells them to guess (SPA-46).
+      required: [code, deliveries]
+      additionalProperties: false
+      properties:
+        code: { type: string }
+        deliveries: { type: integer, format: int64 }
+
+    SubscriptionView:
+      type: object
+      description: |
+        One row of `/subscriptions`, matching `SubscriptionView`
+        (`rust/serve.rs:2864`-`rust/serve.rs:2873`) field for field. The head
+        travels with the position because the two are only meaningful together:
+        "acked through seq 8" says nothing until you know whether the board is
+        at seq 8 or seq 800 (`rust/model.rs:196`-`rust/model.rs:201`).
+      required: [board, subscription, position, deadLetterCodes, headEventSeq]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        subscription: { $ref: "#/components/schemas/Subscription" }
+        position: { $ref: "#/components/schemas/SubscriptionPosition" }
+        deadLetterCodes:
+          type: array
+          items: { $ref: "#/components/schemas/DeadLetterCode" }
+          description: Empty unless this subscription has dead letters. Ordered by how many deliveries carry each code, then by code, so equal counts keep one order across reads.
+        headEventSeq: { type: integer, format: int64, description: "The board's head, which the position is measured against." }
+
+    Sitrep:
+      type: object
+      description: "`rust/model.rs:390`, `rename_all = \"camelCase\"` with `taskID` renamed explicitly."
+      required: [id, lane, author, body, archived, createdAt]
+      properties:
+        id: { type: string }
+        lane: { type: string, description: "The lane this describes — `driver-2`, `solo`. Lane-keyed, not task-keyed." }
+        taskID: { type: string, nullable: true }
+        author: { type: string }
+        body: { type: string }
+        worktree: { type: string, nullable: true }
+        branch: { type: string, nullable: true }
+        headSha: { type: string, nullable: true }
+        rootHead: { type: string, nullable: true }
+        dirtySummary: { type: string, nullable: true }
+        archived: { type: boolean, description: Superseded by newer updates in the same lane. Hidden from the default read; never deleted by archiving. }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+
+    LaneSummary:
+      type: object
+      description: |
+        One `(board, lane)` group as `lanes` builds it
+        (`rust/serve.rs:3260`-`rust/serve.rs:3288`). The grouping key is not a
+        struct in `rust/model.rs`; these two names are this document's, the
+        updates are `Sitrep` verbatim.
+      required: [board, lane, updates]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        lane: { type: string }
+        updates:
+          type: array
+          items: { $ref: "#/components/schemas/Sitrep" }
+          description: Newest first. Nothing deletes a sitrep, so a dead lane keeps its rows and sinks by recency rather than being destroyed.
+
+    SearchResult:
+      type: object
+      description: "`rust/model.rs:1983`, `rename_all = \"camelCase\"`; `taskID` is renamed and carries `skip_serializing_if = \"Option::is_none\"` (`rust/model.rs:1987`), so it is absent rather than null on a non-task result."
+      required: [board, sourceKind, sourceId, title, snippet, tags, createdAt, updatedAt, archived, exactScore, lexicalScore, semanticScore, score, citation]
+      properties:
+        board: { type: string }
+        sourceKind: { type: string }
+        sourceId: { type: string }
+        taskID: { type: string }
+        title: { type: string }
+        snippet: { type: string, description: Deliberately bounded. }
+        status: { type: string, nullable: true }
+        lane: { type: string, nullable: true }
+        tags: { type: array, items: { type: string } }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        updatedAt: { $ref: "#/components/schemas/EpochMillis" }
+        archived: { type: boolean }
+        exactScore: { type: number, format: double }
+        lexicalScore: { type: number, format: double }
+        semanticScore: { type: number, format: double }
+        score: { type: number, format: double }
+        citation: { type: string, description: Stable and sufficient to retrieve the authoritative row. }
+
+    UnreadableBoard:
+      type: object
+      description: |
+        `rust/model.rs:2016`. **Reported separately from `missingBoards`,
+        never folded into it**, because the two call for opposite responses: a
+        missing board is recovered by restoring a snapshot over its path, and
+        doing that to an unreadable one overwrites intact data with older data
+        (`rust/model.rs:2004`-`rust/model.rs:2013`).
+
+        `reason` is the OS-level failure verbatim. It names a **path on the
+        serving host**, not a board's contents, and it is reachable only by the
+        one operator who administers that host.
+      required: [name, boardPath, reason]
+      properties:
+        name: { type: string }
+        boardPath: { type: string }
+        reason: { type: string }
+
+    SearchPage:
+      description: |
+        `SearchReceipt` (`rust/model.rs:2026`) with its `results` promoted into
+        the `ListEnvelope`'s `items`. Every other receipt field is carried
+        verbatim under its serialised name.
+
+        The page's own classifier never produces the `unreadableBoards` bucket
+        — it checks `is_file` itself and passes an empty vector to
+        `bound_receipt` (`rust/serve.rs:2182`-`rust/serve.rs:2184`) — so the
+        field is always `[]` on this route today. It is documented rather than
+        dropped, because the receipt shape is the store's and a reader
+        comparing the two surfaces should not have to wonder where it went.
+      allOf:
+        - $ref: "#/components/schemas/ListEnvelope"
+        - type: object
+          required: [query, embeddingModel, boards, missingBoards, unreadableBoards, resultChars, generatedAt]
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/SearchResult" } }
+            query: { type: string }
+            embeddingModel: { type: string }
+            boards: { type: array, items: { type: string }, description: The boards actually searched. }
+            missingBoards: { type: array, items: { type: string }, description: Registered boards whose file was not there. }
+            unreadableBoards: { type: array, items: { $ref: "#/components/schemas/UnreadableBoard" } }
+            resultChars: { type: integer }
+            generatedAt: { $ref: "#/components/schemas/EpochMillis" }
+
+    ClaimSummary:
+      type: object
+      description: |
+        `rust/model.rs:559`, `rename_all = "camelCase"` with `taskID`,
+        `agentID` and `sessionID` renamed explicitly.
+
+        **This — never `Claim`.** `Claim` (`rust/model.rs:501`) carries
+        `lease_token` at `rust/model.rs:508`. `ClaimSummary` is the same
+        identity and the same timings with the token structurally absent, and a
+        `From<&Claim>` conversion already exists (`rust/model.rs:571`). The
+        projection converts; it does not filter, because a filter can be
+        forgotten and a type cannot (SPA-09).
+      required: [taskID, agentID, claimedAt, heartbeatAt, expiresAt]
+      additionalProperties: false
+      properties:
+        taskID: { type: string }
+        agentID: { type: string }
+        sessionID: { type: string, nullable: true }
+        claimedAt: { $ref: "#/components/schemas/EpochMillis" }
+        heartbeatAt: { $ref: "#/components/schemas/EpochMillis" }
+        expiresAt: { $ref: "#/components/schemas/EpochMillis" }
+
+    TaskNote:
+      type: object
+      description: "`rust/model.rs:586`, `rename_all = \"camelCase\"` with `taskID` renamed."
+      required: [seq, taskID, author, kind, body, createdAt]
+      properties:
+        seq: { type: integer, format: int64 }
+        taskID: { type: string }
+        author: { type: string }
+        kind: { type: string, enum: [plan, progress, blocker, decision, evidence, done] }
+        body: { type: string }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+
+    Checkpoint:
+      type: object
+      description: "`rust/model.rs:598`, `rename_all = \"camelCase\"` with `taskID` and `sessionID` renamed."
+      required: [seq, taskID, author, state, summary, intent, nextAction, blockers, validations, createdAt]
+      properties:
+        seq: { type: integer, format: int64 }
+        taskID: { type: string }
+        author: { type: string }
+        sessionID: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        state: { type: string, enum: [continue, blocked, done] }
+        summary: { type: string }
+        intent: { type: string }
+        nextAction: { type: string }
+        blockers: { type: array, items: { type: string } }
+        validations: { type: array, items: { type: string } }
+        repoPath: { type: string, nullable: true }
+        branch: { type: string, nullable: true }
+        headSha: { type: string, nullable: true }
+        dirtySummary: { type: string, nullable: true }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        rootHead: { type: string, nullable: true, description: "The outermost superproject's commit, for a nested checkout." }
+
+    Event:
+      type: object
+      description: |
+        `rust/model.rs:668`, `rename_all = "camelCase"` with `taskID` renamed.
+        One row of the durable, hash-chained audit trail (ADR-029).
+
+        `payload` is free-form JSON written by whichever operation produced the
+        event. It is ledger content, authored by agents, and the client renders
+        it as **text** — no element authored by an agent enters the document
+        (SPA-41). That obligation is the client's; this document records that
+        the field is untrusted text, not markup.
+      required: [seq, kind, payload, createdAt, archived]
+      properties:
+        seq: { type: integer, format: int64 }
+        taskID: { type: string, nullable: true }
+        kind: { type: string }
+        actor: { type: string, nullable: true }
+        payload: { description: "Free-form JSON. Untrusted, agent-authored content." }
+        createdAt: { $ref: "#/components/schemas/EpochMillis" }
+        archived: { type: boolean }
+        prevHash: { type: string, nullable: true }
+        eventHash: { type: string, nullable: true }
+
+    TaskDetail:
+      type: object
+      required: [board, task, claim, openAttention, notes, checkpoints, events]
+      additionalProperties: false
+      properties:
+        board: { type: string }
+        task: { $ref: "#/components/schemas/Task" }
+        claim:
+          type: object
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/ClaimSummary" }]
+          description: "`Store::get_claim`, converted to `ClaimSummary`. `null` when nothing holds the task."
+        openAttention:
+          type: array
+          items: { $ref: "#/components/schemas/Attention" }
+          description: "Open items raised against this task (`rust/serve.rs:1437`-`rust/serve.rs:1439`)."
+        notes:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/TaskNote" } }
+          description: "`Store::notes(id, DETAIL_ROWS)`; `limit` is 50."
+        checkpoints:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/Checkpoint" } }
+          description: "`Store::checkpoints(id, DETAIL_ROWS)`; `limit` is 50."
+        events:
+          allOf:
+            - $ref: "#/components/schemas/ListEnvelope"
+            - type: object
+              properties:
+                items: { type: array, items: { $ref: "#/components/schemas/Event" } }
+          description: "`Store::events(Some(id), None, DETAIL_ROWS, true)`; `limit` is 50, archived included, exactly as the page reads it."
+
+    Preview:
+      type: object
+      description: |
+        The hover card's data, discriminated by `kind`. Exactly one of the four
+        payload fields is present, matching `kind`.
+      required: [kind, board]
+      properties:
+        kind: { type: string, enum: [task, attention, deployment, board] }
+        board: { type: string }
+        task: { $ref: "#/components/schemas/Task" }
+        attention: { $ref: "#/components/schemas/Attention" }
+        deployment: { $ref: "#/components/schemas/DeploymentAttempt" }
+        boardCounts:
+          type: object
+          description: "For `kind: board` — the four numbers `board_preview` prints (`rust/serve.rs:2109`-`rust/serve.rs:2120`)."
+          required: [openAttention, todo, inProgress, tasks]
+          additionalProperties: false
+          properties:
+            openAttention: { type: integer }
+            todo: { type: integer }
+            inProgress: { type: integer }
+            tasks: { type: integer }
+
+    EpochMillis:
+      type: integer
+      format: int64
+      description: Epoch milliseconds, as the ledger stores them. Never a formatted string — formatting is the client's, and a server that formats has picked the reader's timezone for them.
+
+    EpochMillisNullable:
+      type: integer
+      format: int64
+      nullable: true
+      description: Epoch milliseconds, or `null`.

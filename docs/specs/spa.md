@@ -815,11 +815,14 @@ WEB-56 and WEB-58 this specification records rather than a defect.
 
 - **Interface version or schema:** three interfaces. (1) The HTML document and the embedded
   bundle it loads — one document, one application root (SPA-04). (2) The read-only JSON
-  projection — one `GET` route per page arm of `render` (SPA-06); its **naming and versioning are
-  an open question** owned by `t-19d4c16d` (§7 OQ-3), and this specification deliberately does
-  not invent them. (3) The four form POSTs, unchanged in path, method and field names, and the
-  `/live` WebSocket, unchanged in frame kinds (SPA-48). There is no OpenAPI document for this
-  server and this slice does not introduce one.
+  projection — one `GET` route per page arm of `render` (SPA-06); its **naming and versioning
+  are decided** by `t-19d4c16d` (§7 OQ-3, resolved 2026-09-19) in
+  `docs/api/kanban-web.openapi.yaml`, which this specification points at rather than restates.
+  (3) The four form POSTs, unchanged in path, method and field names, and the `/live`
+  WebSocket, unchanged in frame kinds (SPA-48). The OpenAPI document that describes (2) and
+  (3) is `docs/api/kanban-web.openapi.yaml`, introduced by `t-19d4c16d` and read alongside
+  `docs/api/README.md`; it is a contract for the projection `t-88814b7a` builds, not a record
+  of a shipped surface.
 - **Data invariants:** the ledger is the only state. The browser holds no durable state of its
   own beyond the current session's view; a reload reconstructs everything from the projection.
   No JSON body and no frame ever carries a lease token, a credential or a write capability
@@ -880,7 +883,7 @@ WEB-56 and WEB-58 this specification records rather than a defect.
 | --- | --- | --- | --- | --- |
 | OQ-1 | Which bundler and which React version? ADR-048's Consequences leave both open and name this specification as the place they are decided; the constraint they must satisfy is SPA-01 and SPA-02 — build-time only, output embedded, nothing of that shape on `hax` or `hig`. | `t-992e40aa` | open | the embedded bundle and its build step |
 | OQ-2 | Do the server-rendered pages stay reachable while the SPA is cut over, or does the cutover replace them route by route? This decides whether `WEB-38`'s scriptless destination GET survives the first wave and whether two renderers are live at once. | `t-1f495a7f` | open | the Needs-you cutover |
-| OQ-3 | What are the JSON routes called, and how are they versioned? Deliberately not invented here: SPA-06 pins that one read-only `GET` route exists per page arm and what it may do, not its name. | `t-19d4c16d` | open | the API contract |
+| OQ-3 | What are the JSON routes called, and how are they versioned? Deliberately not invented here: SPA-06 pins that one read-only `GET` route exists per page arm and what it may do, not its name. | `t-19d4c16d` | **resolved 2026-09-19** — `docs/api/kanban-web.openapi.yaml` (OpenAPI 3.0.3) with `docs/api/README.md`. JSON under `/api/v1/…`, one `GET`-only route per page arm named after the arm, `application/json; charset=utf-8`; the path version is a compatibility boundary (additive fields stay `v1`, a removed or renamed field is `/api/v2`); the four POSTs keep their current paths unchanged (SPA-10). | the API contract |
 | OQ-4 | How does the bundle fingerprint enter the deploy receipt — which ADR-044 §2 provenance field carries it, and is it verified against the running process or only against the package? | `t-992e40aa` | open | the release receipt (ADR-044 §2), and SPA-03's process evidence |
 | OQ-5 | Do `/search` and `/preview` move in the first wave, and what is the actual landing-payload target the 1.32 MB baseline is being reduced *to*? Both are scope calls on the last row of the epic. | `t-bf255880` / George | open | the remaining pages and the payload fix |
 
@@ -906,14 +909,14 @@ row that must write one.
 | `SPA-03` | MUST | process | `none` | no e2e coverage — to be written by `t-992e40aa`; blocked on OQ-4 |
 | `SPA-04` | MUST | chrome | `none` | no e2e coverage — harness proven by `an_async_mounted_root_is_found_by_test_id_in_real_chrome` (a fixture page the test wrote, not the product); product observation owed by `t-1f495a7f` |
 | `SPA-05` | MUST | chrome | `none` | no e2e coverage — harness proven by `an_async_mounted_root_is_found_by_test_id_in_real_chrome` (fixture); product observation owed by `t-1f495a7f`. That case is also where `wait_for_shell_ready` (`tests/e2e.rs:26362`) becomes `wait_for_app_root(tab, ui::APP_ROOT)` and nothing else in the file has to know |
-| `SPA-06` | MUST | http | `none` | no e2e coverage — to be written by `t-19d4c16d`; blocked on OQ-3 |
-| `SPA-07` | MUST | unit | `none` | no e2e coverage — to be written by `t-88814b7a`, as a source-reading unit test of the same shape as `no_page_can_reach_a_method_that_writes` (`rust/serve.rs:8442`), asserting the absence of a capability over the projection module rather than the absence of a write |
-| `SPA-08` | MUST | http | `serve_hides_retired_boards_from_the_board_index_and_board_route` | authorization parity on the served surface today; extended to the JSON routes by `t-88814b7a` |
-| `SPA-09` | MUST | http | `none` | no e2e coverage — to be written by `t-88814b7a`; `compiled_binary_persists_across_processes_and_rotates_handoff_lease` is the same assertion on the CLI read model |
-| `SPA-10` | MUST | unit | `the_route_table_and_the_write_allowlist_are_unchanged_unit` | |
-| `SPA-11` | MUST | unit | `same_origin_post_is_csrf_defence_and_grants_no_capability` | the in-process proof over the handler; `serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests` keeps same-origin required across a compiled HTTP exchange |
-| `SPA-12` | MUST | http | `serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests` | `trusted_edge_resolution_stays_on_the_single_web_call_site` and `the_trusted_edge_actor_header_records_the_same_actor_over_a_socket` hold the other halves |
-| `SPA-13` | MUST | http | `the_served_pages_read_the_real_boards_and_write_to_none_of_them` | `no_page_can_reach_a_method_that_writes` holds the same boundary as a source-reading unit test |
+| `SPA-06` | MUST | http | `none` | no e2e coverage — to be written by `t-88814b7a`; OQ-3 resolved 2026-09-19, so this row is no longer blocked. contract: `docs/api/kanban-web.openapi.yaml#/paths` — fifteen `GET` operations, one per page arm, each carrying `x-requirement: [SPA-06, …]` |
+| `SPA-07` | MUST | unit | `none` | no e2e coverage — to be written by `t-88814b7a`, as a source-reading unit test of the same shape as `no_page_can_reach_a_method_that_writes` (`rust/serve.rs:8442`), asserting the absence of a capability over the projection module rather than the absence of a write. contract: `docs/api/kanban-web.openapi.yaml` — every operation's `x-store-method` names the `Store` methods the arm it mirrors already calls, and the two `x-registry-method` exceptions are named rather than hidden |
+| `SPA-08` | MUST | http | `serve_hides_retired_boards_from_the_board_index_and_board_route` | authorization parity on the served surface today; extended to the JSON routes by `t-88814b7a`. contract: `docs/api/kanban-web.openapi.yaml#/components/responses/DeniedOrNotFound` — the store's own `denied or not found`, non-enumerating. The shipped test asserts `500` with the retirement note in the body (`tests/e2e.rs:43920`-`:43923`); the JSON surface must answer `404` with the generic sentence instead, recorded as a named divergence in `docs/api/README.md` |
+| `SPA-09` | MUST | http | `none` | no e2e coverage — to be written by `t-88814b7a`; `compiled_binary_persists_across_processes_and_rotates_handoff_lease` is the same assertion on the CLI read model. contract: `docs/api/kanban-web.openapi.yaml#/components/schemas/ClaimSummary` — a task's holder is served as `ClaimSummary` (`rust/model.rs:559`), never as `Claim` (`rust/model.rs:501`, `lease_token` at `:508`), and `#/components/schemas/SubscriptionPosition` serves `leased` as a count with no delivery token |
+| `SPA-10` | MUST | unit | `the_route_table_and_the_write_allowlist_are_unchanged_unit` | contract: `docs/api/kanban-web.openapi.yaml` — exactly four `POST` operations, at their current paths and outside `/api/v1`, and every JSON route `GET`-only |
+| `SPA-11` | MUST | unit | `same_origin_post_is_csrf_defence_and_grants_no_capability` | the in-process proof over the handler; `serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests` keeps same-origin required across a compiled HTTP exchange. contract: `docs/api/kanban-web.openapi.yaml#/components/responses/Refused` — the product's own sentence, verbatim from `rust/serve.rs:497` |
+| `SPA-12` | MUST | http | `serve_actor_header_uses_trusted_edge_value_and_refuses_bad_requests` | `trusted_edge_resolution_stays_on_the_single_web_call_site` and `the_trusted_edge_actor_header_records_the_same_actor_over_a_socket` hold the other halves. contract: `docs/api/kanban-web.openapi.yaml#/components/securitySchemes/trustedEdge` — one scheme, `X-Auth-Request-Email`, overwritten by `proxy_set_header` so a client copy cannot be injected; fails closed with no identity; no bearer token exists in this estate |
+| `SPA-13` | MUST | http | `the_served_pages_read_the_real_boards_and_write_to_none_of_them` | `no_page_can_reach_a_method_that_writes` holds the same boundary as a source-reading unit test. contract: `docs/api/kanban-web.openapi.yaml#/components/responses/MethodNotAllowed` — a JSON route answers `GET` and refuses every other method with `405` |
 | `SPA-14` | MUST | chrome | `a_recommended_choice_resolves_in_one_click_in_real_chrome_and_records_its_outcome` | `the_pressed_answer_says_sending_on_its_own_fill_in_real_chrome` and `pressing_1_sends_and_advances_to_the_next_card_in_real_chrome` hold the in-flight label and the digit |
 | `SPA-15` | MUST | chrome | `last_attention_card_task_drilldown_and_receipt_survive_websocket_refresh_in_real_chrome` | |
 | `SPA-16` | MUST | chrome | `a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded` | `a_choice_clicked_with_a_reply_records_the_note_in_real_chrome` proves the surviving text still records |
