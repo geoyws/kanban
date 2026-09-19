@@ -404,9 +404,12 @@ and a `background-color` equal to the drawer's own; no other drawer link compute
 
 **WEB-38** — navigation works with no script at all.
 Strength: MUST · Layer: http · Source: ADR-016; plan §Layout.
-The served HTML of `/` contains an anchor for every destination (`data-nav` values `needs-you`,
-`all`, `decided`, `lanes`, `boards`, `sprints`, `plans`, `deployments`, `subscriptions`), and a
-`GET` of each `href` over HTTP with no browser returns `200` with that page's heading.
+The served HTML of a page contains an anchor for every destination (`data-nav` values
+`needs-you`, `all`, `decided`, `lanes`, `boards`, `sprints`, `plans`, `deployments`,
+`subscriptions`), and a `GET` of each `href` over HTTP with no browser returns `200` with that
+page's heading. Since `t-1f495a7f` the drawer is read from `/all`: `/` is the mounted deck's
+shell and carries no navigation of its own, and the one thing `/` must answer without a script
+is that shell's mount point (spec SPA-51).
 
 **WEB-39** — search is the first thing in the drawer.
 Strength: MUST · Layer: unit · Source: plan §Layout (Navigation).

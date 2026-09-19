@@ -252,6 +252,24 @@ the server-rendered pages. `the_app_shell_closes_its_head_exactly_once_unit` hol
 packaged executable, and verified at install by running the INSTALLED executable's `--version`
 and comparing its `bundle <sha256>` line.
 
+### Addendum, 2026-09-19 — what `t-1f495a7f` decided cutting Needs-you over
+
+**`/` is the shell; every other route is still served** (OQ-2, answered for this wave). The
+deck is mounted from `/api/v1/needs-you` and posts the four existing form POSTs unchanged;
+`/all` keeps the same queue as a server-rendered list, so a scriptless client still has the
+queue, one route away. The SSR deck — `needs_you`, `deck_page` and their keys line — is deleted
+rather than left beside the mount: two renderers of one page is the drift §5 forbids, stated
+about markup instead of reads.
+
+**One card renderer's names, two surfaces.** `decision_card` and the mounted card write the
+same `data-testid` vocabulary, so `mod ui` names a card, an answer, a receipt or the note once
+and both surfaces answer to it. The body arrives as `bodyHtml` from `serve::markdown`, so the
+sanitiser is the server's on both surfaces rather than a second one in TypeScript.
+
+**What the HTTP-layer cases observe moved with the surface.** The cases that read the served
+deck at `/` now read `/all` or the projection; none was weakened, and `/`'s scriptless answer is
+asserted to be the shell and nothing data-bearing (SPA-51).
+
 ## References
 
 - Epic `e-9306a1d9` (the `SPA` rebuild, and the source of §3's measurements); task `t-aed0352a`

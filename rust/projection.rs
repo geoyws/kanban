@@ -26,8 +26,8 @@ use crate::model::{
 };
 use crate::registry::Registry;
 use crate::serve::{
-    DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS, lane_groups, project_named, projects,
-    sort_open_queue,
+    DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS, lane_groups, markdown, project_named,
+    projects, sort_open_queue,
 };
 
 /// Why a projection could not answer.
@@ -137,11 +137,36 @@ impl<T> Listing<T> {
 ///
 /// The board name is not a field of [`Attention`] — a board holds its own
 /// rows, and the name only exists once they are merged across boards.
+///
+/// Two fields beyond the row itself, both of them things the mounted card
+/// cannot derive and must not invent:
+///
+/// - `body_html` is the row's body typeset by [`markdown`], the one bounded
+///   place in this crate with a parser in front of agent-authored text. The
+///   deck renders those bytes; a second renderer in the client would be a
+///   second sanitiser, and the second one is always the one that is wrong.
+/// - `task` is the row's task as the card's meta sentence reads it — the
+///   kind and the title, resolved through `Store::require_task` exactly as
+///   `serve`'s own `task_reference` resolves it, and absent when the row
+///   names no task or the task is gone.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttentionCard {
     board: String,
     attention: Attention,
+    body_html: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<TaskReference>,
+}
+
+/// What a card says about the row it is about: enough for the sentence, and
+/// nothing that is not in it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskReference {
+    id: String,
+    task_type: String,
+    title: String,
 }
 
 /// One row of the board index, as `/boards` computes it.
@@ -200,8 +225,14 @@ pub struct TaskDetail {
 /// `Store::attention(Some("open"), …)` per active board, at the arm's own
 /// per-board bound, then the arm's own ordering — priority first, then oldest,
 /// then id, then board.
+///
+/// The boards' stores are kept across the merge because a card resolves its
+/// own task reference, exactly as the page's own `open_attention` keeps them
+/// for the same reason: the row carries a task id, and the sentence the card
+/// reads carries the task's kind and title.
 pub fn needs_you() -> Projected<Listing<AttentionCard>> {
     let mut items: Vec<(String, Attention)> = Vec::new();
+    let mut stores = std::collections::BTreeMap::new();
     let mut truncated = false;
     for (project, store) in projects()? {
         let mut rows = store.attention(
@@ -220,11 +251,29 @@ pub fn needs_you() -> Projected<Listing<AttentionCard>> {
         for item in rows {
             items.push((project.name.clone(), item));
         }
+        stores.insert(project.name.clone(), store);
     }
     sort_open_queue(&mut items);
     let cards = items
         .into_iter()
-        .map(|(board, attention)| AttentionCard { board, attention })
+        .map(|(board, attention)| {
+            let task = attention.task_id.as_deref().and_then(|id| {
+                stores
+                    .get(&board)
+                    .and_then(|store| store.require_task(id).ok())
+                    .map(|task| TaskReference {
+                        id: task.id,
+                        task_type: task.task_type,
+                        title: task.title,
+                    })
+            });
+            AttentionCard {
+                board,
+                body_html: markdown(&attention.body),
+                attention,
+                task,
+            }
+        })
         .collect();
     Ok(Listing::merged(cards, OPEN_ATTENTION_ROWS, truncated))
 }

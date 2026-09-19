@@ -1,32 +1,7 @@
-/* The bundle's stylesheet: ADR-046's one designed system, as the mounted
- * application wears it (spec WEB, spec SPA-52..SPA-57).
- *
- * The token block is the same thirteen colours `rust/serve.rs`'s `CSS`
- * declares, byte for byte and in the same order, because ADR-046's contrast
- * proofs are run over BOTH stylesheets (SPA-56) and two token blocks that
- * drifted would be two different products wearing one name. Every colour
- * below is a `var(--token)`: no hex is written outside `:root`.
- *
- * The rules are the served stylesheet's, moved rather than redesigned — this
- * is the page the operator already uses. Two differences, both because the
- * deck is now mounted rather than served:
- *
- *   - nothing is scoped to `html.js`. The served rules are, because the same
- *     markup had to stay a plain list when no script ran; with the SPA there
- *     is no page at all without a script (SPA-51), so the scope would be a
- *     condition that is always true.
- *   - the page column is `#root`, which is what the shell gives the bundle
- *     to mount into, where the document's own `<body>` was the column
- *     before.
- *
- * `t-bf255880` moves the remaining pages, and the served copy goes with the
- * last of them.
- */
-
+/* src/app.css */
 * {
   box-sizing: border-box;
 }
-
 :root {
   color-scheme: dark;
   --base: #1e1e2e;
@@ -42,26 +17,33 @@
   --blue: #89b4fa;
   --link: #89b4fa;
   --focus: #b4befe;
-  --serif: ui-serif, "New York", "Iowan Old Style", Charter, Georgia, serif;
+  --serif:
+    ui-serif,
+    "New York",
+    "Iowan Old Style",
+    Charter,
+    Georgia,
+    serif;
   --sans:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
     sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mono:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    monospace;
 }
-/* The deck is the height of the screen and the card is the only thing in it
-   that scrolls, so the document itself must not: `html`, `body` and the
-   mount point are one column.
-
-   The mount point is matched by attribute rather than by `#root`: ADR-046's
-   proof that no colour is written outside the token block (SPA-56) scans
-   this stylesheet for `#`, and an id selector would read as a hex literal
-   to it. */
 html,
 body,
-[id="root"] {
+[id=root] {
   height: 100%;
 }
-
 body {
   margin: 0;
   overflow: hidden;
@@ -72,12 +54,10 @@ body {
   line-height: 1.55;
   scrollbar-color: var(--surface1) var(--base);
 }
-
-[id="root"] {
+[id=root] {
   display: flex;
   flex-direction: column;
 }
-
 h1 {
   margin: 0.2rem 0 1rem;
   font-family: var(--serif);
@@ -86,7 +66,6 @@ h1 {
   font-weight: 600;
   color: var(--text);
 }
-
 h2 {
   margin: 1.6rem 0 0.5rem;
   font-size: 1.0625rem;
@@ -94,16 +73,13 @@ h2 {
   font-weight: 600;
   color: var(--subtext);
 }
-
 a {
   color: var(--link);
   text-decoration: none;
 }
-
 a:hover {
   text-decoration: underline;
 }
-
 code {
   padding: 0.12em 0.3em;
   color: var(--text);
@@ -112,7 +88,6 @@ code {
   font-family: var(--mono);
   font-size: 0.92em;
 }
-
 pre {
   margin: 0.6rem 0;
   padding: 0.8rem;
@@ -123,7 +98,6 @@ pre {
   word-break: break-word;
   font-size: 0.85rem;
 }
-
 input,
 textarea {
   min-height: 2.75rem;
@@ -136,12 +110,10 @@ textarea {
   border: 0;
   border-radius: 8px;
 }
-
 input::placeholder,
 textarea::placeholder {
   color: var(--subtext);
 }
-
 button {
   min-height: 2.75rem;
   padding: 0.6rem 0.8rem;
@@ -155,34 +127,22 @@ button {
   border-radius: 8px;
   cursor: pointer;
 }
-
 *:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
-
-/* ...except the card the deck is showing. The deck moves focus to it so `1`
-   decides without a click first, which means the ring would be drawn around
-   the whole card permanently — a box around everything, saying nothing
-   (WEB-13). Focus is still visible on every control inside it. */
 .deck article.item[data-current]:focus-visible {
   outline: 0;
 }
-
-/* --- the shell ----------------------------------------------------------- */
 nav {
   z-index: 10;
   display: flex;
   align-items: center;
   gap: 0.8rem;
-  padding: 0.45rem max(1rem, env(safe-area-inset-right)) 0.45rem
-    max(1rem, env(safe-area-inset-left));
+  padding: 0.45rem max(1rem, env(safe-area-inset-right)) 0.45rem max(1rem, env(safe-area-inset-left));
   background: var(--mantle);
   flex: none;
 }
-
-/* Two letters, and a 44px hit box around them: the home link is a control in
-   the bar, and WEB-45's floor is every control in it. */
 .brand {
   display: flex;
   align-items: center;
@@ -194,13 +154,11 @@ nav {
   color: var(--link);
   font-weight: 600;
 }
-
 .nav-links {
   display: flex;
   align-items: center;
   gap: 0.15rem;
 }
-
 nav a {
   display: flex;
   align-items: center;
@@ -209,16 +167,13 @@ nav a {
   color: var(--subtext);
   white-space: nowrap;
 }
-
 nav form {
   margin-left: auto;
   min-width: 8rem;
 }
-
 nav form input {
   width: 100%;
 }
-
 .menu {
   display: flex;
   align-items: center;
@@ -228,14 +183,12 @@ nav form input {
   padding: 0;
   background: none;
 }
-
 .menu .bars {
   display: block;
   width: 1.1rem;
   height: 10px;
   background: repeating-linear-gradient(var(--text) 0 2px, transparent 2px 4px);
 }
-
 .backdrop {
   position: fixed;
   inset: 0;
@@ -243,7 +196,6 @@ nav form input {
   background: var(--base);
   opacity: 0.72;
 }
-
 .drawer {
   position: fixed;
   left: 0;
@@ -258,89 +210,72 @@ nav form input {
   overflow-y: auto;
   background: var(--mantle);
 }
-
 .drawer[hidden],
 .backdrop[hidden] {
   display: none;
 }
-
 .drawer form {
   margin: 0;
 }
-
 .drawer form input {
   width: 100%;
 }
-
 .drawer .nav-links {
   display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 0;
 }
-
 .drawer .nav-links a {
   min-height: 2.75rem;
   padding: 0 0.7rem;
   color: var(--text);
   border-bottom: 1px solid var(--surface0);
 }
-
-.drawer .nav-links a[aria-current="page"] {
+.drawer .nav-links a[aria-current=page] {
   background: var(--mantle);
   border-left: 2px solid var(--text);
 }
-
-/* --- the card (ADR-042 §5) ----------------------------------------------- */
 .priority {
   font-family: var(--mono);
   color: var(--overlay);
 }
-
 .priority-p0 {
   color: var(--red);
 }
-
 .meta {
   margin: 0.2rem 0;
   color: var(--overlay);
   font-size: 0.8125rem;
   line-height: 1.4;
 }
-
 .empty {
   color: var(--subtext);
   font-size: 0.8125rem;
   font-weight: 400;
 }
-
 .success {
   margin: 0 0 1rem;
   color: var(--subtext);
 }
-
 .error {
   color: var(--red);
 }
-
 .live {
   color: var(--overlay);
   font-size: 0.75rem;
   margin-left: auto;
 }
-
 .heading {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 0.6rem;
 }
-
 .item {
   margin: 1.4rem 0;
   padding: 0;
 }
-
 .eyebrow {
   max-width: 70ch;
   margin: 0 0 0.5rem;
@@ -348,7 +283,6 @@ nav form input {
   font-size: 0.8125rem;
   line-height: 1.4;
 }
-
 .item > h2 {
   max-width: 70ch;
   margin: 0 0 0.7rem;
@@ -358,42 +292,35 @@ nav form input {
   font-weight: 600;
   color: var(--text);
 }
-
 .context {
   max-width: 70ch;
   margin: 0 0 1rem;
   color: var(--subtext);
 }
-
 .consequence {
   max-width: 70ch;
   margin: 0.35rem 0 0;
   color: var(--subtext);
   font-size: 0.9375rem;
 }
-
 .body {
   max-width: 70ch;
   margin: 0.5rem 0;
 }
-
 .decide {
   margin: 0;
 }
-
 fieldset {
   min-width: 0;
   margin: 0;
   padding: 0;
   border: 0;
 }
-
 legend {
   padding: 0;
   color: var(--overlay);
   font-size: 0.8125rem;
 }
-
 .choice {
   display: block;
   width: 100%;
@@ -403,7 +330,6 @@ legend {
   white-space: normal;
   background: var(--surface0);
 }
-
 .choice .key {
   display: inline-block;
   min-width: 1.4em;
@@ -412,69 +338,52 @@ legend {
   font-size: 0.75rem;
   font-weight: 400;
 }
-
 .choice.outcome-approve {
   --hue: var(--green);
   color: var(--hue);
 }
-
 .choice.outcome-reject {
   --hue: var(--red);
   color: var(--hue);
 }
-
 .choice.outcome-defer {
   --hue: var(--yellow);
   color: var(--hue);
 }
-
 .choice.outcome-other {
   --hue: var(--blue);
   color: var(--hue);
 }
-
-/* The one rule that fills an answer, and it is the recommendation: the hue
-   rides in on `--hue` from the class that knows the outcome, so adding a
-   fifth outcome is a token line rather than a fifth fill. */
 .recommended .choice {
   color: var(--base);
   background: var(--hue, var(--surface1));
 }
-
-/* One answer per row, at every width: a choice is a sentence, so it gets the
-   card's whole width and its consequence sits under it. */
 .alternatives {
   display: grid;
   grid-template-columns: 1fr;
   gap: 0.6rem 0.8rem;
   margin: 1rem 0 0;
 }
-
 .alternative .consequence {
   margin-top: 0.3rem;
 }
-
 .reply {
   margin-top: 1rem;
 }
-
 .reply > label {
   display: block;
   margin: 0 0 0.35rem;
   color: var(--subtext);
   font-size: 0.8125rem;
 }
-
 .reply textarea {
   display: block;
   width: 100%;
   resize: vertical;
 }
-
 .custom {
   margin-top: 1rem;
 }
-
 .custom > summary {
   display: flex;
   align-items: center;
@@ -484,27 +393,22 @@ legend {
   cursor: pointer;
   list-style: none;
 }
-
 .custom > summary::-webkit-details-marker {
   display: none;
 }
-
 .custom > summary::after {
   content: "\25be";
   margin-left: 0.4em;
 }
-
 .custom[open] > summary::after {
   content: "\25b4";
 }
-
 .picks {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
   margin: 0.4rem 0 0.7rem;
 }
-
 .picks label {
   display: inline-flex;
   align-items: center;
@@ -516,12 +420,10 @@ legend {
   border-radius: 999px;
   cursor: pointer;
 }
-
 .picks label:has(input:checked) {
   color: var(--text);
   background: var(--surface1);
 }
-
 .picks input {
   width: 0.9rem;
   height: 0.9rem;
@@ -531,7 +433,6 @@ legend {
   background: none;
   accent-color: var(--focus);
 }
-
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -539,43 +440,33 @@ legend {
   gap: 0.6rem;
   margin-top: 0.7rem;
 }
-
 .hint[hidden],
 .clear[hidden] {
   display: none;
 }
-
 .full {
   margin: 1.2rem 0 0;
 }
-
 .full summary {
   color: var(--subtext);
   cursor: pointer;
 }
-
 .full .body {
   max-height: 24rem;
   margin: 0.6rem 0 0;
   overflow-y: auto;
   color: var(--subtext);
 }
-
 p.keys {
   margin: 0.9rem 0 0;
   color: var(--overlay);
   font-family: var(--mono);
   font-size: 0.75rem;
 }
-
-/* What a click is doing, said on the pressed answer's own fill: nothing is
-   disabled — a disabled button is the one control that cannot report its own
-   refusal — so the OTHER answers step back instead. */
-.item[data-state="sending"] .choice:not([data-pressed]),
-.item[data-state="sending"] .record:not([data-pressed]) {
+.item[data-state=sending] .choice:not([data-pressed]),
+.item[data-state=sending] .record:not([data-pressed]) {
   opacity: 0.5;
 }
-
 .undo-button {
   min-height: 2.25rem;
   margin-top: 0.4rem;
@@ -585,14 +476,11 @@ p.keys {
   font-size: 0.8125rem;
   font-weight: 400;
 }
-
-/* --- what arrives: notices, toasts, receipts ----------------------------- */
 .notices {
   display: grid;
   gap: 0.35rem;
   margin: 0 0 1.1rem;
 }
-
 .notice {
   display: flex;
   align-items: center;
@@ -604,15 +492,12 @@ p.keys {
   border-radius: 8px;
   font-size: 0.8125rem;
 }
-
 .notice-board {
   color: var(--subtext);
 }
-
 .notice.summary .notice-what {
   font-weight: 600;
 }
-
 .notice .dismiss {
   min-height: auto;
   margin-left: auto;
@@ -622,7 +507,6 @@ p.keys {
   font-size: 0.75rem;
   font-weight: 400;
 }
-
 .preview-pop {
   position: fixed;
   z-index: 300;
@@ -634,42 +518,32 @@ p.keys {
   background: var(--surface0);
   border-radius: 8px;
 }
-
 .preview-card h3 {
   margin: 0.1rem 0 0.4rem;
   color: var(--text);
   font-size: 0.95rem;
   font-weight: 600;
 }
-
 .preview-card h3 a {
   color: inherit;
 }
-
 .preview-card .body {
   margin: 0.4rem 0 0;
   color: var(--subtext);
   font-size: 0.88rem;
 }
-
-/* The typeset body is the server's own markup inside the card's body region,
-   so the first/last-child collapse is declared through the wrapper it
-   arrives in rather than on the region's children. */
 .body.md > *:first-child,
 .body.md > .typeset > *:first-child {
   margin-top: 0;
 }
-
 .body.md > *:last-child,
 .body.md > .typeset > *:last-child {
   margin-bottom: 0;
 }
-
 .body.md p {
   margin: 0.5rem 0;
   max-width: 70ch;
 }
-
 .body.md h1,
 .body.md h2,
 .body.md h3,
@@ -678,55 +552,44 @@ p.keys {
   color: var(--text);
   font-weight: 600;
 }
-
 .body.md h1 {
   font-size: 1.1rem;
 }
-
 .body.md h2 {
   font-size: 1.05rem;
 }
-
 .body.md h3 {
   font-size: 1rem;
 }
-
 .body.md h4 {
   font-size: 0.95rem;
 }
-
 .body.md ul,
 .body.md ol {
   margin: 0.5rem 0;
   padding-left: 1.4rem;
   max-width: 70ch;
 }
-
 .body.md li {
   margin: 0.2rem 0;
 }
-
 .body.md ul {
   list-style: disc;
 }
-
 .body.md ol {
   list-style: decimal;
 }
-
 .body.md blockquote {
   margin: 0.6rem 0;
   padding: 0.2rem 0.9rem;
   color: var(--subtext);
 }
-
 .body.md table {
   margin: 0.6rem 0;
   width: 100%;
   border-collapse: collapse;
   font-size: 0.88rem;
 }
-
 .body.md th,
 .body.md td {
   padding: 0.45rem 0.6rem;
@@ -734,19 +597,12 @@ p.keys {
   vertical-align: top;
   border-bottom: 1px solid var(--surface0);
 }
-
 .body.md hr {
   height: 1px;
   margin: 1rem 0;
   background: var(--surface0);
   border: 0;
 }
-
-/* --- the deck: one card, and its own column the one thing that scrolls --- */
-/* The answers have to be where the thumb is, so the card is a column: what
-   the item is at the top, the long form in the middle taking whatever is
-   left, and the answers at the bottom of the screen. The card renders in the
-   ADR-042 §5 order and the deck orders the column visually. */
 main[data-deck] {
   position: relative;
   flex: 1;
@@ -758,45 +614,34 @@ main[data-deck] {
   overflow: hidden;
   padding: 0.6rem clamp(0.7rem, 3vw, 1.2rem) 0;
 }
-
 main[data-deck] > .heading,
 main[data-deck] > .success {
   flex: none;
 }
-
-/* Everything that is not the card gives up its room to the card: on a phone
-   every line of page furniture is a line the long form or an answer does not
-   get. */
 main[data-deck] > .heading h1 {
   margin: 0;
   font-size: 1rem;
 }
-
 main[data-deck] > p.keys {
   flex: none;
   margin: 0;
   padding: 0.3rem 0 calc(0.3rem + env(safe-area-inset-bottom));
 }
-
 .progress {
   margin: 0;
   color: var(--overlay);
   font-size: 0.8125rem;
   font-variant-numeric: tabular-nums;
 }
-
-/* Nothing left to count, and `0 left` over an empty state says it twice. */
 .progress[hidden] {
   display: none;
 }
-
 .deck {
   position: relative;
   flex: 1;
   min-height: 0;
   display: flex;
 }
-
 .deck .item {
   flex: 1;
   min-height: 0;
@@ -806,33 +651,21 @@ main[data-deck] > p.keys {
   overflow: hidden auto;
   overscroll-behavior: contain;
 }
-
-/* `hidden` is a display rule and the rule above is one too, so the card the
-   deck is not showing needs saying twice to stay off the screen. */
 .deck .item[hidden] {
   display: none;
 }
-
 .deck .item > .eyebrow {
   order: 1;
   flex: none;
   margin-bottom: 0.25rem;
 }
-
 .deck .item > h2 {
   order: 2;
   flex: none;
 }
-
 .deck .item .body > .context {
   margin: 0 0 0.8rem;
 }
-
-/* The long form is the card's body and clips: a region that overflowed
-   instead would paint the body straight over the answers. It keeps a floor
-   so that a card with a long context and four answers still shows some of
-   what it is about, and a 40vh cap so it scrolls inside itself rather than
-   pushing the answers down the card. */
 .deck .item > .full {
   order: 4;
   flex: 1 1 0;
@@ -842,18 +675,9 @@ main[data-deck] > p.keys {
   flex-direction: column;
   margin: 0;
 }
-
-/* The disclosure control goes: on the deck the long form is not folded, so a
-   control that says `show the full item` above an item already shown is one
-   line of a phone spent saying nothing. */
 .deck .item > .full > summary {
   display: none;
 }
-
-/* Chrome wraps what a `<details>` reveals in `::details-content`, so the long
-   form is a grandchild of the card's column and not a child: the wrapper has
-   to carry the column through, or the body sizes itself to its content and
-   paints over the answers. */
 .deck .item > .full::details-content {
   flex: 1 1 0;
   min-height: 0;
@@ -861,74 +685,65 @@ main[data-deck] > p.keys {
   display: flex;
   flex-direction: column;
 }
-
-/* The foot of the long form fades, because a hard cut at the panel's edge
-   says the item ended there. Two rem of it, and it is the only fade on the
-   page. */
 .deck .item > .full .body {
   flex: 1;
   min-height: 0;
   max-height: 40vh;
   overflow-y: auto;
   padding-right: 0.3rem;
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    var(--text) calc(100% - 2rem),
-    transparent
-  );
-  mask-image: linear-gradient(to bottom, var(--text) calc(100% - 2rem), transparent);
+  -webkit-mask-image:
+    linear-gradient(
+      to bottom,
+      var(--text) calc(100% - 2rem),
+      transparent);
+  mask-image:
+    linear-gradient(
+      to bottom,
+      var(--text) calc(100% - 2rem),
+      transparent);
 }
-
-/* The panel: the answers and the note, on the desk surface at the foot of the
-   card. It is sized to its content and scrolls nothing of its own — the
-   card's column above is the ONE scroller, and the note is reached by
-   scrolling the card the reader is already scrolling. */
 .deck .item > .decide {
   order: 6;
   flex: none;
   margin: 0.45rem calc(-1 * clamp(0.7rem, 3vw, 1.2rem)) 0;
   padding: 0 clamp(0.7rem, 3vw, 1.2rem) calc(0.5rem + env(safe-area-inset-bottom));
-  background: linear-gradient(to bottom, transparent, var(--mantle) 2rem);
+  background:
+    linear-gradient(
+      to bottom,
+      transparent,
+      var(--mantle) 2rem);
 }
-
-/* The one hairline the design keeps, between the card's body and its answers
-   — at the foot of the band and not its head, because a rule drawn across
-   text that is still dissolving reads as a strikethrough. */
 .deck .item > .decide::before {
   content: "";
   display: block;
   height: 2rem;
   box-sizing: border-box;
   pointer-events: none;
-  background: linear-gradient(to bottom, transparent, var(--mantle) 2rem);
+  background:
+    linear-gradient(
+      to bottom,
+      transparent,
+      var(--mantle) 2rem);
   border-bottom: 1px solid var(--surface1);
 }
-
 .deck .item > .decide .consequence {
   font-size: 0.875rem;
 }
-
 .deck .item > .decide .reply {
   margin-top: 0.7rem;
 }
-
 .deck .item > .decide .custom {
   margin-top: 0.5rem;
 }
-
 .deck .item > .decide textarea {
   min-height: 2.75rem;
   max-height: 7.5rem;
   overflow-y: auto;
   resize: none;
 }
-
-/* The one motion: the card that was answered leaves to the left, the next one
-   arrives from the right, 140ms each way. */
 .deck .item.entering {
   animation: deck-in 0.14s ease-out;
 }
-
 .deck .item.leaving,
 .deck .item.leaving-back {
   position: absolute;
@@ -939,11 +754,9 @@ main[data-deck] > p.keys {
   pointer-events: none;
   animation: deck-out 0.14s ease-out forwards;
 }
-
 .deck .item.leaving-back {
   animation-name: deck-out-back;
 }
-
 @keyframes deck-in {
   from {
     opacity: 0;
@@ -954,38 +767,29 @@ main[data-deck] > p.keys {
     transform: none;
   }
 }
-
 @keyframes deck-out {
   to {
     opacity: 0;
     transform: translateX(-16px);
   }
 }
-
 @keyframes deck-out-back {
   to {
     opacity: 0;
     transform: translateX(16px);
   }
 }
-
-/* --- the side: toasts above, this sitting's decisions below -------------- */
-/* A list, not a stack of tiles: one heading, then one row per decision on the
-   desk surface. A receipt's own left rule is its outcome, which is the one
-   thing a reader needs from a decision already made. */
 .side {
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
   min-height: 0;
 }
-
 .toasts {
   display: grid;
   gap: 0.35rem;
   margin: 0;
 }
-
 .history {
   display: flex;
   flex-direction: column;
@@ -993,7 +797,6 @@ main[data-deck] > p.keys {
   min-height: 0;
   overflow-y: auto;
 }
-
 .history h2 {
   margin: 0;
   padding: 0;
@@ -1001,7 +804,6 @@ main[data-deck] > p.keys {
   font-weight: 600;
   color: var(--overlay);
 }
-
 .history .receipt,
 .history .pending {
   margin: 0;
@@ -1010,27 +812,21 @@ main[data-deck] > p.keys {
   background: var(--surface0);
   font-size: 0.8125rem;
 }
-
 .history .receipt {
   border-left: 3px solid var(--hue, var(--surface1));
 }
-
 .receipt.outcome-approve {
   --hue: var(--green);
 }
-
 .receipt.outcome-reject {
   --hue: var(--red);
 }
-
 .receipt.outcome-defer {
   --hue: var(--yellow);
 }
-
 .receipt.outcome-other {
   --hue: var(--blue);
 }
-
 .history-toggle {
   min-height: 2.75rem;
   padding: 0.2rem 0.7rem;
@@ -1038,27 +834,20 @@ main[data-deck] > p.keys {
   font-size: 0.8125rem;
   font-weight: 400;
 }
-
 .history-toggle [data-history-count] {
   margin-left: 0.4rem;
   color: var(--text);
 }
-
-/* The desk on a Mac: the deck column left, the side column right on its own
-   surface, holding the toasts above this sitting's decisions. */
 @media (min-width: 900px) {
   main[data-deck] {
     padding-right: calc(22rem + 1.2rem);
   }
-
   .deck {
     max-width: 44rem;
   }
-
   main[data-deck] > .heading h1 {
     font-size: 1.5rem;
   }
-
   main[data-deck] > .side {
     position: absolute;
     top: 0;
@@ -1068,61 +857,43 @@ main[data-deck] > p.keys {
     padding: 0.8rem 1rem calc(0.8rem + env(safe-area-inset-bottom));
     background: var(--mantle);
   }
-
   .history-toggle {
     display: none;
   }
 }
-
-/* Below the desktop column the side is a drawer, and the toasts come out of
-   it: news has to arrive whether or not the history is open. */
 @media (max-width: 899px) {
   main[data-deck] > .side {
     display: contents;
   }
-
-  /* A toast is IN the column on a phone, between the heading and the card:
-     one line that pushes the card down while it is there. Floated over the
-     card it covered the eyebrow and the question — the two lines that say
-     what is being decided. */
   main[data-deck] > .heading,
   main[data-deck] > .success {
     order: 0;
   }
-
   main[data-deck] .toasts {
     order: 1;
     position: static;
     margin: 0;
     pointer-events: auto;
   }
-
   main[data-deck] > .deck {
     order: 3;
   }
-
   main[data-deck] > p.keys {
     order: 4;
   }
-
   main[data-deck] .toasts .notice {
     flex-wrap: nowrap;
     overflow: hidden;
   }
-
   main[data-deck] .toasts .notice .notice-what,
   main[data-deck] .toasts .notice a {
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
-
-  /* One at a time: the strip is a line of the screen, and the newest notice
-     is the one worth that line. */
   main[data-deck] .toasts .notice ~ .notice {
     display: none;
   }
-
   main[data-deck] .history {
     position: fixed;
     top: 0;
@@ -1130,95 +901,72 @@ main[data-deck] > p.keys {
     bottom: 0;
     z-index: 50;
     width: min(19rem, 86vw);
-    padding: 0.8rem max(0.7rem, env(safe-area-inset-right))
-      calc(0.8rem + env(safe-area-inset-bottom));
+    padding: 0.8rem max(0.7rem, env(safe-area-inset-right)) calc(0.8rem + env(safe-area-inset-bottom));
     background: var(--mantle);
     transform: translateX(100%);
     transition: transform 0.14s ease-out;
   }
-
   body[data-history-open] main[data-deck] .history {
     transform: none;
   }
 }
-
 @media (max-width: 700px) {
   nav {
     align-items: stretch;
     flex-wrap: wrap;
   }
-
   .brand {
     flex: 0 0 2.5rem;
   }
-
   .nav-links {
     flex: 1;
     overflow-x: auto;
     scrollbar-width: none;
   }
-
   .nav-links::-webkit-scrollbar {
     display: none;
   }
-
   nav form {
     order: 3;
     flex: 1 0 100%;
     margin: 0;
   }
-
   .actions button {
     flex: 1;
   }
-
   .picks {
     display: grid;
     grid-template-columns: 1fr 1fr;
   }
-
   .drawer {
     flex-wrap: nowrap;
   }
-
   .drawer .nav-links {
     flex: none;
     overflow: visible;
   }
-
   .drawer form {
     order: 0;
     flex: none;
   }
 }
-
-/* A short screen — a laptop window, a phone in landscape — lets the long form
-   give up its floor, so the answers keep their room and what does not fit
-   scrolls with the card rather than being cut off. */
 @media (max-height: 620px) {
   .deck .item > .full {
     min-height: 0;
   }
 }
-
-/* The operator who asked for the page not to move gets the same page with the
-   one motion left out: the queue still advances, in no time at all. */
 @media (prefers-reduced-motion: reduce) {
   * {
-    /* biome-ignore lint/complexity/noImportantStyles: it overrides rules this page does not own */
     scroll-behavior: auto !important;
   }
-
   .deck .item.entering {
     animation: none;
   }
-
   .deck .item.leaving,
   .deck .item.leaving-back {
     animation: none;
     opacity: 0;
   }
-
   main[data-deck] .history {
     transition: none;
   }
