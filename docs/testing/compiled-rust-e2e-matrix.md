@@ -112,6 +112,20 @@ not E2E evidence. The gate is incomplete until the compiled executable passes
 this matrix on a clean test data directory, including the real-browser path
 above.
 
+## Requirements trace convention
+
+One `## Requirements trace — docs/specs/<slice>.md <SLICE>-01..<SLICE>-nn` section per specified
+slice (ADR-047 §5; conventions in `docs/specs/README.md`), with these five columns.
+`Requirement` is the ID alone. `Strength` is the specification's BCP 14 keyword — `MUST`,
+`SHOULD` or `MAY` — never a board priority. `Layer` is one of `unit`, `chrome`, `http` or
+`process`, or `none`; it is never `e2e` for an in-process test, and a `none` row says
+`no e2e coverage` plainly in its Note. `Existing test` is the exact `#[test]` function name,
+verified against the build with `cargo test -- --list` before the row lands. `Note` carries the
+substitute wording where browser evidence is infeasible — exactly `API-level integration
+asserting real database state plus tenancy isolation` — or the superseding date, or nothing.
+One row per mandatory requirement; a `MAY` gets a row only if it is actually tested. The section
+is updated in the same change as the specification delta it traces.
+
 ## Requirements trace — `docs/specs/web-ui.md` WEB-01..WEB-59
 
 One row per requirement, on branch `docs/t-5e88b314-release` at 2026-09-17:
