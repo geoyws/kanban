@@ -25263,13 +25263,16 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     assert_eq!(status, 200, "{boards}");
     assert!(boards.contains("\"board\":\"SERVED\""), "{boards}");
 
-    let (status, deployments) = http_get(port, "/deployments");
+    // `/deployments` and the attempt detail are mounted since `t-bf255880`
+    // wave 1, so what this case reads is the projection they render from.
+    // The claim is unchanged: the board's own rows are served, and serving
+    // them leaves the board byte-identical.
+    let (status, deployments) = http_get(port, "/api/v1/deployments");
     assert_eq!(status, 200, "{deployments}");
-    assert!(deployments.contains("Current releases"), "{deployments}");
     assert!(deployments.contains("geoyws/kanban"), "{deployments}");
     assert!(deployments.contains("aaaaaaaaaaaa"), "{deployments}");
     let (status, deployment_detail) =
-        http_get(port, &format!("/deployment/SERVED/{deployment_id}"));
+        http_get(port, &format!("/api/v1/deployment/SERVED/{deployment_id}"));
     assert_eq!(status, 200, "{deployment_detail}");
     assert!(deployment_detail.contains("served bundle carried exact release"));
 
@@ -26828,6 +26831,18 @@ mod ui {
     /// The priority pill, wherever the deck has put it.
     pub const DECK_PRIORITY: &str = "[data-testid=deck-priority]";
 
+    // --- the mounted subscriptions page (t-bf255880) ---------------------
+    /// One subscription's row. The id is the ledger's, so the selector is
+    /// the row's identity rather than its position in the table.
+    pub const SUBSCRIPTION_ROW: &str = "[data-testid=subscription-row]";
+    /// The state pill, which is the thing pause and resume move.
+    pub const SUBSCRIPTION_STATE: &str = "[data-testid=subscription-state]";
+    /// What is actually waiting for a subscription, written only when
+    /// something is: at rest the row says nothing here.
+    pub const SUBSCRIPTION_QUEUED: &str = "[data-testid=subscription-queued]";
+    /// The page's one loud element, and the codes it names.
+    pub const SUBSCRIPTION_DEAD_LETTERS: &str = "[data-testid=subscription-dead-letters]";
+
     /// `[data-testid="<id>"]` -- the readiness hook a client mount can offer
     /// that is neither a sleep nor a text match.
     pub fn test_id(id: &str) -> String {
@@ -26961,6 +26976,17 @@ fn wait_for_app_root<'tab>(
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// A mounted read page is ready when its root is up AND its own content has
+/// arrived: the server sends the shell, and the rows come one fetch later,
+/// so a measurement taken at the root is a measurement of an empty page.
+/// The marker is the page's own — `t-bf255880` gives each moved page a
+/// `data-testid` on the thing it exists to show.
+fn wait_for_mounted_page(tab: &headless_chrome::Tab, marker: &str) {
+    wait_for_app_root(tab, ui::APP_ROOT);
+    tab.wait_for_element(marker)
+        .unwrap_or_else(|error| panic!("the mounted page never rendered {marker}: {error}"));
 }
 
 /// Block until the page's shell has arrived -- the one readiness signal
@@ -30760,6 +30786,10 @@ fn dead_letter_delivery(board_path: &Path, subscription_id: &str, event_seq: i64
         .unwrap();
 }
 
+/// The host-local lookup name one fixture subscription resolves its secret
+/// by. It is never a page value, which is what the journey below asserts.
+const BROWSER_SECRET_REF: &str = "opencode_browser_token";
+
 /// A dead letter has to say what refused it, in the browser an operator
 /// actually reads it in.
 ///
@@ -30769,6 +30799,11 @@ fn dead_letter_delivery(board_path: &Path, subscription_id: &str, event_seq: i64
 /// codes on one subscription must stay two codes: collapsing them, or letting
 /// the first stand for the set, sends a person to fix one thing and leaves the
 /// other broken.
+///
+/// It also carries the three sentences the retired server-rendered page
+/// proved and nothing else does: where a subscription has got to, where it
+/// started, and whether a secret is configured without naming which.
+
 #[test]
 fn subscription_dead_letters_name_their_codes_in_real_chrome() {
     browser_loopback_reservation_supported()
@@ -30778,8 +30813,12 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
         &fixture.main,
         &["init", "--name", "SERVE-DEADLETTER", "--json"],
     );
-    let subscription_args = |id: &'static str| -> Vec<&'static str> {
-        vec![
+    // One of the two carries a secret. Which secret it is stays a host-local
+    // lookup name the page has no business repeating, and the page says only
+    // the operational half — that one is configured — so this fixture can
+    // hold both halves of that rule on one screen.
+    let subscription_args = |id: &'static str, secret: Option<&'static str>| -> Vec<&'static str> {
+        let mut argv = vec![
             "subscription",
             "add",
             "--id",
@@ -30801,10 +30840,20 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
             "--as",
             "geoyws",
             "--json",
-        ]
+        ];
+        if let Some(secret) = secret {
+            argv.extend_from_slice(&["--secret-ref", secret]);
+        }
+        argv
     };
-    let refusing = fixture.ok_json(&fixture.main, &subscription_args("sub-browser-refused"));
-    let quiet = fixture.ok_json(&fixture.main, &subscription_args("sub-browser-quiet"));
+    let refusing = fixture.ok_json(
+        &fixture.main,
+        &subscription_args("sub-browser-refused", None),
+    );
+    let quiet = fixture.ok_json(
+        &fixture.main,
+        &subscription_args("sub-browser-quiet", Some(BROWSER_SECRET_REF)),
+    );
     assert_eq!(refusing["id"], "sub-browser-refused");
     assert_eq!(quiet["id"], "sub-browser-quiet");
     // Three events after both anchors, so three deliveries can exist at all:
@@ -30860,9 +30909,13 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
     tab.navigate_to(&format!("{origin}/subscriptions"))
         .expect("load Subscriptions");
     tab.wait_until_navigated().expect("initial navigation");
+    // The page is mounted now (t-bf255880): the server sends the shell and
+    // the rows arrive from `/api/v1/subscriptions`, so the readiness gate is
+    // the application root and the assertions read the client's own DOM.
+    wait_for_app_root(&tab, ui::APP_ROOT);
 
     let dead = tab
-        .wait_for_element("span.dead")
+        .wait_for_element(ui::SUBSCRIPTION_DEAD_LETTERS)
         .expect("the dead-letter line");
     assert_eq!(
         dead.get_inner_text().expect("dead-letter text"),
@@ -30873,12 +30926,12 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
     // row carries no queued line at all — silent at rest is the reason these
     // counts are a sentence instead of three columns.
     let loud = tab
-        .find_elements("span.dead")
+        .find_elements(ui::SUBSCRIPTION_DEAD_LETTERS)
         .map(|rows| rows.len())
         .unwrap_or_default();
     assert_eq!(loud, 1, "only the refused subscription may be loud");
     let queued = tab
-        .find_elements(".queued")
+        .find_elements(ui::SUBSCRIPTION_QUEUED)
         .map(|rows| rows.len())
         .unwrap_or_default();
     assert_eq!(
@@ -30889,6 +30942,50 @@ fn subscription_dead_letters_name_their_codes_in_real_chrome() {
     assert!(
         content.contains("sub-browser-quiet") && content.contains("sub-browser-refused"),
         "both subscriptions should be listed: {content}"
+    );
+
+    // The sentences the retired server-rendered page proved, now read off the
+    // client that writes them (`t-bf255880` wave 1). The position sentence is
+    // checked against the numbers the projection served, so the page is held
+    // to its own data rather than to a figure this case invented.
+    let (status, projected) = http_get(server.port, "/api/v1/subscriptions");
+    assert_eq!(status, 200, "{projected}");
+    let listing: Value = serde_json::from_str(&projected).expect("the subscriptions projection");
+    let refused = listing["items"]
+        .as_array()
+        .expect("the rows")
+        .iter()
+        .find(|item| item["subscription"]["id"] == "sub-browser-refused")
+        .expect("the refused row");
+    let head = refused["headEventSeq"].as_i64().expect("the board head");
+    let anchor = refused["subscription"]["startEventSeq"]
+        .as_i64()
+        .expect("the start anchor");
+    assert_eq!(
+        refused["position"]["ackedThroughSeq"],
+        Value::Null,
+        "the fixture acks nothing, so the row must still sit on its anchor"
+    );
+    let refused_row = "[data-subscription=\"sub-browser-refused\"]";
+    assert_element_text(
+        &tab,
+        &format!("{refused_row} [data-testid=subscription-position]"),
+        &format!("{} board events behind head seq {head}.", head - anchor),
+    );
+    assert_element_text(
+        &tab,
+        &format!("{refused_row} [data-testid=subscription-anchor]"),
+        &format!("started at seq {anchor}, nothing acked yet"),
+    );
+    // Whether a secret is configured is operational; which secret it is is
+    // not the page's to repeat.
+    assert!(
+        content.contains("a secret is configured") && content.contains("no secret configured"),
+        "the page must say which rows have a secret configured: {content}"
+    );
+    assert!(
+        !content.contains(BROWSER_SECRET_REF),
+        "the secret's lookup name reached the page: {content}"
     );
 }
 
@@ -32050,10 +32147,14 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     assert_element_text(&tab, "[data-task-title]", task_title);
     assert_no_horizontal_overflow(&tab, "lane task detail");
 
-    click_navigating(
+    // `/deployments` is a mounted page since `t-bf255880` wave 1, so the
+    // drawer link routes rather than navigates: the document is not
+    // replaced, the address bar moves and the page arrives in place.
+    click_routing(
         &tab,
         "[data-nav=deployments]",
         &format!("[data-deployment-link=\"{deployment_id}\"]"),
+        "/deployments",
         "Deployments nav",
     );
     assert_eq!(js_value(&tab, "location.pathname"), "/deployments");
@@ -32103,10 +32204,11 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         "Mobile fixture served exact commit bbbbbbbbbbbb.",
     );
     assert_no_horizontal_overflow(&tab, "deployment detail");
-    click_navigating(
+    click_routing(
         &tab,
         "[data-nav=deployments]",
         &format!("[data-deployment-link=\"{recovery_id}\"]"),
+        "/deployments",
         "return to Deployments",
     );
     assert_no_horizontal_overflow(&tab, "Deployments with artifact release");
@@ -32319,14 +32421,18 @@ fn subscription_pause_and_resume_in_real_chrome_persist_each_state() {
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
     let tab = trusted_web_tab(&chrome, &origin);
-    click_navigating(
+    // The destinations are routes now (t-bf255880): the drawer link changes
+    // the address and the page mounts, rather than the server sending a new
+    // document, so arrival is the address plus the row being on screen.
+    click_routing(
         &tab,
         "[data-nav=subscriptions]",
         &format!("[data-subscription=\"{subscription_id}\"]"),
+        "/subscriptions",
         "Subscriptions nav",
     );
     let row = format!("[data-subscription=\"{subscription_id}\"]");
-    assert_element_text(&tab, &format!("{row} [data-subscription-state]"), "active");
+    assert_element_text(&tab, &format!("{row} {}", ui::SUBSCRIPTION_STATE), "active");
     assert_eq!(
         js_value(
             &tab,
@@ -32334,22 +32440,56 @@ fn subscription_pause_and_resume_in_real_chrome_persist_each_state() {
         ),
         "browser.fixture"
     );
+    // The default filter lists the active rows and says what it is not
+    // showing, with the link that shows it: an operator must be able to tell
+    // "nothing is paused" from "the paused ones are hidden".
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelectorAll('{}').length",
+                ui::SUBSCRIPTION_ROW
+            ),
+        ),
+        2,
+        "the unfiltered list must hide the paused peer"
+    );
+    assert_element_text(
+        &tab,
+        "[data-testid=subscriptions-hidden]",
+        "1 paused subscription is hidden. Show paused subscriptions.",
+    );
     let pause_form = tab.wait_for_element(&format!("{row} form")).unwrap();
     assert_eq!(
         pause_form.get_attribute_value("action").unwrap().as_deref(),
         Some("/subscription/WEB-SUBSCRIPTION/sub-browser-lifecycle/pause")
     );
-    click_navigating(
+    // The write is the same form POST it always was; what changed is that
+    // the answer is applied in place and the address the route's redirect
+    // used to hand back is pushed by the page. So the arrival is the state
+    // this click exists to produce, read off the pill itself.
+    click_routing(
         &tab,
         &format!("{row} [data-subscription-action=pause]"),
-        &row,
+        &format!("{row} .status-paused"),
+        "/subscriptions",
         "Pause subscription",
     );
     assert_eq!(
         js_value(&tab, "location.pathname + location.search"),
         "/subscriptions?show=all&changed=sub-browser-lifecycle"
     );
-    assert_element_text(&tab, &format!("{row} [data-subscription-state]"), "paused");
+    assert_element_text(&tab, &format!("{row} {}", ui::SUBSCRIPTION_STATE), "paused");
+    // The page says what it recorded, naming the row, so a write that landed
+    // somewhere off screen is still legible.
+    assert_element_text(
+        &tab,
+        "[data-testid=subscription-changed]",
+        &format!(
+            "Recorded the change to {subscription_id} and the dispatcher reads its state on the \
+             next pass."
+        ),
+    );
     let assert_subscription_row = |id: &str, state: &str| {
         let selector = format!("[data-subscription=\"{id}\"]");
         assert_eq!(
@@ -32362,14 +32502,17 @@ fn subscription_pause_and_resume_in_real_chrome_persist_each_state() {
         );
         assert_element_text(
             &tab,
-            &format!("{selector} [data-subscription-state]"),
+            &format!("{selector} {}", ui::SUBSCRIPTION_STATE),
             state,
         );
     };
     assert_eq!(
         js_value(
             &tab,
-            "document.querySelectorAll('[data-subscription]').length"
+            &format!(
+                "document.querySelectorAll('{}').length",
+                ui::SUBSCRIPTION_ROW
+            )
         ),
         3
     );
@@ -32391,21 +32534,25 @@ fn subscription_pause_and_resume_in_real_chrome_persist_each_state() {
             .as_deref(),
         Some("/subscription/WEB-SUBSCRIPTION/sub-browser-lifecycle/resume?show=all")
     );
-    click_navigating(
+    click_routing(
         &tab,
         &format!("{row} [data-subscription-action=resume]"),
-        &row,
+        &format!("{row} .status-active"),
+        "/subscriptions",
         "Resume subscription",
     );
     assert_eq!(
         js_value(&tab, "location.pathname + location.search"),
         "/subscriptions?show=all&changed=sub-browser-lifecycle"
     );
-    assert_element_text(&tab, &format!("{row} [data-subscription-state]"), "active");
+    assert_element_text(&tab, &format!("{row} {}", ui::SUBSCRIPTION_STATE), "active");
     assert_eq!(
         js_value(
             &tab,
-            "document.querySelectorAll('[data-subscription]').length"
+            &format!(
+                "document.querySelectorAll('{}').length",
+                ui::SUBSCRIPTION_ROW
+            )
         ),
         3
     );
@@ -43618,9 +43765,13 @@ fn the_git_deploy_path_is_unchanged_by_artifact_mode() {
     assert_eq!(replay["identityMode"], "git");
 }
 
-/// The served page says it in words. A blank where a SHA would be, or the
-/// bare literal `unknown`, both read as "nobody looked"; the page has to say
-/// that the release was recovered by artifact identity.
+/// The page says it in words. A blank where a SHA would be, or the bare
+/// literal `unknown`, both read as "nobody looked"; the page has to say that
+/// the release was recovered by artifact identity.
+///
+/// Read in the browser since `t-bf255880` wave 1: `/deployments` and the
+/// attempt detail are mounted now, so the rendered text is the client's and
+/// an assertion against the served bytes would be asserting the shell.
 #[test]
 fn the_deployments_page_says_build_commit_unknown_in_words() {
     browser_loopback_reservation_supported()
@@ -43645,23 +43796,48 @@ fn the_deployments_page_says_build_commit_unknown_in_words() {
     );
 
     let server = spawn_server(&fixture);
-    let (status, page) = http_get(server.port, "/deployments");
-    assert_eq!(status, 200, "{page}");
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "recovery tab");
+    tab.navigate_to(&format!("{origin}/deployments"))
+        .expect("load Deployments");
+    tab.wait_until_navigated().expect("initial navigation");
+    wait_for_app_root(&tab, ui::APP_ROOT);
+    tab.wait_for_element("[data-testid=deployments-current]")
+        .expect("the current-releases table");
+    let page = js_value(&tab, "document.body.innerText");
+    let page = page.as_str().expect("the page's text");
     assert!(
         page.contains("build commit unknown - recovered by artifact identity"),
         "the current-releases table must say it in words: {page}"
     );
-    assert!(
-        !page.contains(">unknown<"),
+    assert_eq!(
+        js_value(
+            &tab,
+            "[...document.querySelectorAll('td, dd')].filter((cell) => \
+             cell.textContent.trim() === 'unknown').length"
+        ),
+        0,
         "the bare literal must never be the whole cell: {page}"
     );
-    assert!(
-        !page.contains("<td><code></code></td>"),
-        "no cell may be blank where a commit would be: {page}"
+    assert_eq!(
+        js_value(
+            &tab,
+            "[...document.querySelectorAll('td code')].filter((cell) => \
+             cell.textContent.trim() === '').length"
+        ),
+        0,
+        "no cell may be blank where a commit would be"
     );
 
-    let (status, detail) = http_get(server.port, &format!("/deployment/PAGE/{id}"));
-    assert_eq!(status, 200, "{detail}");
+    tab.navigate_to(&format!("{origin}/deployment/PAGE/{id}"))
+        .expect("load the attempt");
+    tab.wait_until_navigated().expect("attempt navigation");
+    wait_for_app_root(&tab, ui::APP_ROOT);
+    tab.wait_for_element("[data-testid=deployment-detail]")
+        .expect("the attempt's heading");
+    let detail = js_value(&tab, "document.body.innerText");
+    let detail = detail.as_str().expect("the attempt's text");
     assert!(
         detail.contains("build commit unknown - recovered by artifact identity"),
         "{detail}"
@@ -45057,6 +45233,433 @@ fn the_json_needs_you_projection_answers_the_same_cards_as_the_cli_over_http() {
     assert_eq!(queue["returned"], 2, "{body}");
     assert_eq!(queue["limit"], 1000, "{body}");
     assert_eq!(queue["truncated"], Value::Bool(false), "{body}");
+}
+
+/// One attempt seeded and finished, so a case has a current release to read.
+///
+/// Returns the attempt's id. The finish is the only way a release becomes
+/// current: `current_deployments` is derived from succeeded attempts, never
+/// written, which is the property the JSON surface has to carry across.
+fn seeded_release(fixture: &Fixture, repo: &str, environment: &str, commit: &str) -> String {
+    let started = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            repo,
+            "--commit",
+            commit,
+            "--tier",
+            "@_bs",
+            "--environment",
+            environment,
+            "--host",
+            "hax",
+            "--url",
+            "https://kb.geoy.ws",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let id = started["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            &id,
+            "--token",
+            started["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "succeeded",
+            "--phase",
+            "verification",
+            "--receipt",
+            "served the release",
+            "--served-commit",
+            commit,
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    id
+}
+
+/// One attempt left open, so a case has something in flight to read.
+///
+/// The start's own answer is returned whole: an attempt is finished with the
+/// capability token that start handed out, and a case that wants a failure
+/// needs both halves.
+fn started_attempt(fixture: &Fixture, repo: &str, environment: &str, commit: &str) -> Value {
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            repo,
+            "--commit",
+            commit,
+            "--tier",
+            "@_uat",
+            "--environment",
+            environment,
+            "--host",
+            "hig",
+            "--url",
+            "https://uat.geoy.ws",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    )
+}
+
+#[test]
+fn the_json_deployments_projection_answers_the_same_attempts_as_the_cli_over_http() {
+    // SPA-06/SPA-47 at the HTTP layer. The claim is not that a body arrives
+    // but that each of the three groups is the SAME set the CLI reads, and
+    // that each envelope reports its own bound: three groups with three
+    // caps, so one envelope would have to pick a number and be wrong about
+    // the other two (ADR-037 §4).
+    let fixture = Fixture::new("json-deployments");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONDEPLOY", "--json"]);
+    let released = seeded_release(
+        &fixture,
+        "geoyws/kanban",
+        "driver-feedback",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let in_flight = started_attempt(
+        &fixture,
+        "geoyws/property",
+        "uat",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    let in_flight = in_flight["id"].as_str().unwrap().to_owned();
+    let doomed = started_attempt(
+        &fixture,
+        "geoyws/hom",
+        "staging",
+        "cccccccccccccccccccccccccccccccccccccccc",
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "finish",
+            doomed["id"].as_str().unwrap(),
+            "--token",
+            doomed["capabilityToken"].as_str().unwrap(),
+            "--result",
+            "failed",
+            "--phase",
+            "verification",
+            "--receipt",
+            "the host never answered",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    let doomed = doomed["id"].as_str().unwrap().to_owned();
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/deployments");
+    assert_eq!(status, 200, "{body}");
+    let index: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/deployments is not JSON: {error}\n{body}"));
+
+    let ids = |group: &str| -> Vec<String> {
+        index[group]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{group} is not a listing: {body}"))
+            .iter()
+            .map(|row| row["deployment"]["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let cli_ids = |argv: &[&str]| -> Vec<String> {
+        let rows = fixture.ok_json(&fixture.main, argv);
+        rows.as_array()
+            .unwrap_or_else(|| panic!("{argv:?} is not a list: {rows}"))
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        ids("current"),
+        cli_ids(&["deploy", "current", "--json"]),
+        "the JSON matrix and `kb deploy current` disagree: {body}"
+    );
+    assert_eq!(ids("current"), vec![released.clone()], "{body}");
+    assert_eq!(
+        ids("active"),
+        cli_ids(&["deploy", "list", "--status", "started", "--json"]),
+        "the JSON matrix and `kb deploy list --status started` disagree: {body}"
+    );
+    assert_eq!(ids("active"), vec![in_flight], "{body}");
+    assert_eq!(
+        ids("failures"),
+        cli_ids(&["deploy", "list", "--status", "failed", "--json"]),
+        "the JSON matrix and `kb deploy list --status failed` disagree: {body}"
+    );
+    assert_eq!(ids("failures"), vec![doomed], "{body}");
+
+    // Each group carries the board that recorded it, which is not a column
+    // of the attempt and only exists once boards are merged.
+    assert_eq!(
+        index["current"]["items"][0]["board"], "JSONDEPLOY",
+        "{body}"
+    );
+    // And each envelope says what it was bounded by, observed rather than
+    // inferred from a row count that happens to equal the bound.
+    assert_eq!(index["current"]["limit"], Value::Null, "{body}");
+    assert_eq!(index["current"]["returned"], 1, "{body}");
+    assert_eq!(index["current"]["truncated"], Value::Bool(false), "{body}");
+    assert_eq!(index["active"]["limit"], 100, "{body}");
+    assert_eq!(index["active"]["truncated"], Value::Bool(false), "{body}");
+    assert_eq!(index["failures"]["limit"], 30, "{body}");
+    assert_eq!(index["failures"]["truncated"], Value::Bool(false), "{body}");
+}
+
+#[test]
+fn the_json_deployment_projection_answers_the_same_attempt_as_the_cli_over_http() {
+    // SPA-06/SPA-08/SPA-47. One attempt, read as `kb deploy show` reads it,
+    // and one refusal that names nothing: an attempt that is absent and one
+    // this reader may not see answer byte-identically, because a refusal
+    // that distinguishes them is an existence oracle.
+    let fixture = Fixture::new("json-deployment");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONATTEMPT", "--json"]);
+    let id = seeded_release(
+        &fixture,
+        "geoyws/kanban",
+        "driver-feedback",
+        "dddddddddddddddddddddddddddddddddddddddd",
+    );
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, &format!("/api/v1/deployment/JSONATTEMPT/{id}"));
+    assert_eq!(status, 200, "{body}");
+    let detail: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("the attempt is not JSON: {error}\n{body}"));
+    let cli = fixture.ok_json(&fixture.main, &["deploy", "show", &id, "--json"]);
+    assert_eq!(detail["board"], "JSONATTEMPT", "{body}");
+    for field in [
+        "id",
+        "repo",
+        "identityMode",
+        "buildCommit",
+        "buildCommitLabel",
+        "tier",
+        "environment",
+        "host",
+        "url",
+        "status",
+        "actor",
+        "receipt",
+        "servedCommit",
+        "artifacts",
+        "archived",
+    ] {
+        assert_eq!(
+            detail["deployment"][field], cli[field],
+            "{field} differs between the JSON attempt and the CLI row:\n{body}\n{cli}"
+        );
+    }
+    // The capability token the start handed out is a write capability and
+    // belongs to nobody who can only read (SPA-09).
+    assert!(
+        !body.contains("capabilityToken") && !body.contains("capability_token"),
+        "the read surface served a deploy capability: {body}"
+    );
+
+    for missing in [
+        "/api/v1/deployment/JSONATTEMPT/d-nothing-here",
+        "/api/v1/deployment/NOSUCHBOARD/d-nothing-here",
+    ] {
+        let (status, refusal) = http_get(server.port, missing);
+        assert_eq!(status, 404, "{missing}: {refusal}");
+        assert_eq!(refusal, JSON_DENIED_OR_NOT_FOUND, "{missing}");
+    }
+}
+
+#[test]
+fn the_json_subscriptions_projection_answers_the_same_rows_as_the_cli_over_http() {
+    // SPA-06/SPA-09/SPA-46. The rows are `kb subscription list --all`'s, the
+    // position is derived per request against the board's own head, and the
+    // dead-letter codes ride with the count because a count alone is a
+    // number nobody can act on. A paused row is served whatever a client
+    // would filter for: the filter is a display choice, not a read bound.
+    let fixture = Fixture::new("json-subscriptions");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONSUB", "--json"]);
+    let add = |id: &str, consumer: &str| {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "subscription",
+                "add",
+                "--id",
+                id,
+                "--kind",
+                "task_added",
+                "--consumer",
+                consumer,
+                "--action",
+                "deliver-turn",
+                "--timeout-ms",
+                "30000",
+                "--max-retries",
+                "0",
+                "--rate-per-minute",
+                "60",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "geoyws",
+                "--json",
+            ],
+        );
+    };
+    add("sub-json-refused", "opencode");
+    add("sub-json-quiet", "kimi");
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "pause",
+            "sub-json-quiet",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    for suffix in ["one", "two"] {
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "task",
+                "add",
+                &format!("Watched task {suffix}"),
+                "--as",
+                "geoyws",
+                "--json",
+            ],
+        );
+    }
+    let board_path = board_path_for_project(&fixture, &fixture.main, "JSONSUB");
+    let watched: Vec<i64> = {
+        let connection = Connection::open(&board_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT seq FROM events WHERE kind='task_added' \
+                 AND seq > (SELECT start_event_seq FROM subscriptions WHERE id='sub-json-refused') \
+                 ORDER BY seq",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(watched.len(), 2, "two watched events: {watched:?}");
+    for (event_seq, code) in watched
+        .iter()
+        .zip(["opencode_endpoint_unreachable", "opencode_request_rejected"])
+    {
+        dead_letter_delivery(&board_path, "sub-json-refused", *event_seq, code);
+    }
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/subscriptions");
+    assert_eq!(status, 200, "{body}");
+    let listing: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/subscriptions is not JSON: {error}\n{body}"));
+    let items = listing["items"].as_array().unwrap();
+    let cli = fixture.ok_json(&fixture.main, &["subscription", "list", "--all", "--json"]);
+    let rows = cli.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "the fixture seeded the wrong estate: {cli}");
+    assert_eq!(
+        items.len(),
+        rows.len(),
+        "the JSON listing and `kb subscription list --all` disagree:\n{body}\n{cli}"
+    );
+    let served: Vec<&str> = items
+        .iter()
+        .map(|item| item["subscription"]["id"].as_str().unwrap())
+        .collect();
+    let listed: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+    assert_eq!(served, listed, "{body}\n{cli}");
+    for (item, row) in items.iter().zip(rows) {
+        assert_eq!(item["board"], "JSONSUB", "{item}");
+        for field in ["status", "consumerID", "actionID", "startEventSeq", "kinds"] {
+            assert_eq!(
+                item["subscription"][field], row[field],
+                "{field} differs between the JSON row and the CLI row:\n{item}\n{row}"
+            );
+        }
+    }
+    // The paused row is served, so a client can count it and offer it rather
+    // than reading its absence as "nothing exists".
+    let paused = items
+        .iter()
+        .find(|item| item["subscription"]["id"] == "sub-json-quiet")
+        .unwrap_or_else(|| panic!("the paused row is missing: {body}"));
+    assert_eq!(paused["subscription"]["status"], "paused", "{body}");
+    assert_eq!(paused["subscription"]["pausedBy"], "geoyws", "{body}");
+    assert_eq!(paused["position"]["deadLetter"], 0, "{body}");
+    assert_eq!(
+        paused["deadLetterCodes"].as_array().unwrap().len(),
+        0,
+        "{body}"
+    );
+
+    let refused = items
+        .iter()
+        .find(|item| item["subscription"]["id"] == "sub-json-refused")
+        .unwrap_or_else(|| panic!("the refused row is missing: {body}"));
+    assert_eq!(refused["position"]["deadLetter"], 2, "{body}");
+    assert_eq!(
+        refused["position"]["ackedThroughSeq"],
+        Value::Null,
+        "{body}"
+    );
+    // Two adapters refusing for two reasons stay two codes, served verbatim.
+    let codes: Vec<(&str, i64)> = refused["deadLetterCodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|code| {
+            (
+                code["code"].as_str().unwrap(),
+                code["deliveries"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("opencode_endpoint_unreachable", 1),
+            ("opencode_request_rejected", 1)
+        ],
+        "{body}"
+    );
+    assert!(
+        refused["headEventSeq"].as_i64().unwrap() > 0,
+        "the position is measured against the board's head: {body}"
+    );
+    // Neither store call takes a bound, so the listing cannot be cut.
+    assert_eq!(listing["limit"], Value::Null, "{body}");
+    assert_eq!(listing["truncated"], Value::Bool(false), "{body}");
+    // A delivery lease is a capability: whoever holds the token can claim
+    // someone else's delivery. It is not a field of anything served here.
+    assert!(
+        !body.contains("lease_token") && !body.contains("leaseToken"),
+        "the read surface served a delivery lease: {body}"
+    );
 }
 
 #[test]
@@ -49271,9 +49874,16 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
 /// deck's shell and carries no navigation of its own, and `/all` is the
 /// same queue as a served list with the same drawer in it. `/` is still
 /// swept as a destination, and what it has to answer without a script is
-/// the shell the bundle mounts into - the one destination whose scriptless
-/// answer is a mount point rather than a heading, which is the cutover's
-/// recorded consequence (spec SPA-51, ADR-048).
+/// the shell the bundle mounts into - a mount point rather than a heading,
+/// which is the cutover's recorded consequence (spec SPA-51, ADR-048).
+///
+/// `t-bf255880` wave 1 moved five more destinations onto the bundle -
+/// `/decided`, `/lanes`, `/boards`, `/deployments` and `/subscriptions` -
+/// so their scriptless answer is the same mount point. What this case
+/// still holds for all nine is the part that is about the drawer rather
+/// than the renderer: every anchor the spec names is there, every href is
+/// site-local, every one answers `200`, and the drawer holds no tenth
+/// destination.
 #[test]
 fn every_destination_answers_without_a_script_over_http() {
     let (fixture, _ids) = deck_fixture("serve-nav-http", "NAVHTTP");
@@ -49289,13 +49899,13 @@ fn every_destination_answers_without_a_script_over_http() {
         // and a heading would mean the deck went back to being served.
         ("needs-you", "data-testid=app-root-shell"),
         ("all", "<h1>Needs you"),
-        ("decided", "<h1>Recent decisions"),
-        ("lanes", "<h1>Lanes"),
-        ("boards", "<h1>Boards"),
+        ("decided", "data-testid=app-root-shell"),
+        ("lanes", "data-testid=app-root-shell"),
+        ("boards", "data-testid=app-root-shell"),
         ("sprints", "<h1 data-sprints-overview>Sprints"),
         ("plans", "<h1>Plans"),
-        ("deployments", "<h1>Deployments"),
-        ("subscriptions", "<h1>Subscriptions"),
+        ("deployments", "data-testid=app-root-shell"),
+        ("subscriptions", "data-testid=app-root-shell"),
     ];
     for (destination, heading) in expected {
         let marker = format!(" data-nav={destination}>");
@@ -50928,9 +51538,29 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
         // A preview is a fragment rather than a page: no shell, no heading,
         // and its own card is the thing that has to have rendered.
         let fragment = shape.starts_with("/preview");
+        // A route the client mounts has nothing to measure until it has
+        // read its projection: the server sends the shell, and the seeded
+        // record arrives one fetch later. Waiting for the record rather
+        // than for the root is what makes the marker assertion below an
+        // assertion instead of a race. (t-bf255880 wave 1 moved these three;
+        // the rest of the list is still server-rendered.)
+        let mounted = matches!(
+            shape,
+            "/deployments" | "/subscriptions" | "/deployment/{project}/{id}"
+        );
         for (width, height) in [(390_u32, 844_u32), (820, 1180), (1280, 800)] {
             set_viewport_with(&tab, width, height, !fragment && width < 700);
             go(&tab, &origin, route);
+            if mounted {
+                wait_for_app_root(&tab, ui::APP_ROOT);
+                if let Some(marker) = marker {
+                    let literal = serde_json::to_string(marker).expect("the marker as a JS string");
+                    wait_for_js_true(
+                        &tab,
+                        &format!("document.body.innerText.includes({literal})"),
+                    );
+                }
+            }
             wait_for_js_true(&tab, &format!("innerWidth === {width}"));
             let measured = measure(&tab, WIDTH_SWEEP, "the width sweep");
             let scroll = measured["scrollWidth"].as_i64().expect("scrollWidth");
@@ -52190,6 +52820,11 @@ fn read_tables_are_borderless_but_for_the_hairline_in_real_chrome() {
     );
     for route in ["/boards", "/deployments"] {
         go(&tab, &origin, route);
+        // `/deployments` is mounted since `t-bf255880` wave 1: measuring at
+        // the shell would measure a page with no cells in it.
+        if route == "/deployments" {
+            wait_for_mounted_page(&tab, "[data-testid=deployments-current]");
+        }
         let measured = measure(&tab, TABLE_SWEEP, "the table sweep");
         let cells = measured["cells"].as_array().expect("the cells");
         assert!(
@@ -52302,6 +52937,10 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     let mut measured_pills = 0;
     for route in ["/board/ROWSA11", "/boards", "/deployments"] {
         go(&tab, &origin, route);
+        // `/deployments` is mounted since `t-bf255880` wave 1.
+        if route == "/deployments" {
+            wait_for_mounted_page(&tab, "[data-testid=deployments-current]");
+        }
         let measured = measure(&tab, ROW_SWEEP, "the row sweep");
         eprintln!("{route}: {measured}");
         for row in measured["rows"].as_array().expect("the rows") {

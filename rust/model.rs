@@ -193,7 +193,8 @@ pub struct Subscription {
 /// `Copy` on purpose: the operator page looks one of these up per rendered
 /// row, and a lookup that allocates is a lookup that shows up in a page
 /// serving thirteen boards.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SubscriptionPosition {
     /// The highest `acked` delivery seq, or `None` when nothing has been
     /// acked yet — which is not the same fact as "acked through seq 0".
@@ -213,7 +214,8 @@ pub struct SubscriptionPosition {
 /// count alone tells them to guess. Not `Copy` and deliberately owned — a
 /// code is text out of the ledger, and the alternative is a reader holding a
 /// borrow of the whole projection while it renders.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeadLetterCode {
     pub code: String,
     pub deliveries: i64,

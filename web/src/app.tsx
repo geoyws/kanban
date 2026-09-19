@@ -14,7 +14,10 @@ import { NOTICE_SHOWN, Notices } from "./notices";
 import BoardPage from "./pages/board";
 import BoardsPage from "./pages/boards";
 import DecidedPage from "./pages/decided";
+import DeploymentPage from "./pages/deployment";
+import DeploymentsPage from "./pages/deployments";
 import LanesPage from "./pages/lanes";
+import SubscriptionsPage from "./pages/subscriptions";
 import { bindPreviews, dismissPreviews } from "./previews";
 import { type Route, setMountedRoutes, useRoute } from "./router";
 import { Chrome, RefreshProvider } from "./shell";
@@ -1011,6 +1014,9 @@ const PAGES: Record<string, (route: Route) => ReactElement> = {
   boards: () => <BoardsPage />,
   board: (route) => <BoardPage route={route} />,
   lanes: () => <LanesPage />,
+  subscriptions: (route) => <SubscriptionsPage route={route} />,
+  deployments: () => <DeploymentsPage />,
+  deployment: (route) => <DeploymentPage route={route} />,
 };
 
 setMountedRoutes(["needs-you", ...Object.keys(PAGES)]);

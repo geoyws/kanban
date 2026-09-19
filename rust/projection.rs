@@ -22,7 +22,8 @@
 use serde::Serialize;
 
 use crate::model::{
-    Attention, Checkpoint, ClaimSummary, Event, RuleSummary, Sitrep, Task, TaskNote,
+    Attention, Checkpoint, ClaimSummary, DeadLetterCode, DeploymentAttempt, Event, RuleSummary,
+    Sitrep, Subscription, SubscriptionPosition, Task, TaskNote,
 };
 use crate::registry::Registry;
 use crate::serve::{
@@ -564,4 +565,178 @@ pub fn decided() -> Projected<DecidedListing> {
         listing: Listing::capped(cards, DECIDED_ROWS),
         scan_limit: DECIDED_SCAN,
     })
+}
+
+// --- releases and subscriptions ---
+
+/// How many started attempts one board contributes to the index, as
+/// `/deployments` has always asked for them.
+const ACTIVE_DEPLOYMENT_ROWS: i64 = 100;
+
+/// How many failed, and separately how many abandoned, attempts one board
+/// contributes. The two statuses are two calls, so this bound is per board
+/// per status and the envelope says so.
+const FAILED_DEPLOYMENT_ROWS: i64 = 30;
+
+/// One attempt paired with the board it was recorded on.
+///
+/// The board is not a column of the attempt — a board holds its own rows,
+/// and the name only exists once they are merged across boards.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardDeployment {
+    board: String,
+    deployment: DeploymentAttempt,
+}
+
+/// The deployment matrix: three groups with three different caps.
+///
+/// Three envelopes rather than one, because one envelope would have to pick
+/// a number and be wrong about the other two: `current` cannot be cut at
+/// all, `active` is cut at a hundred per board and `failures` at thirty per
+/// board per status.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentIndex {
+    current: Listing<BoardDeployment>,
+    active: Listing<BoardDeployment>,
+    failures: Listing<BoardDeployment>,
+}
+
+/// One attempt and the board it belongs to.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentDetail {
+    board: String,
+    deployment: DeploymentAttempt,
+}
+
+/// One subscription, where it has actually got to, and what refused it.
+///
+/// The head travels with the position because the two are only meaningful
+/// together: "acked through seq 8" says nothing until you know whether the
+/// board is at seq 8 or seq 800. The codes travel with the dead-letter count
+/// for the same reason — a count without them is a number nobody can act on.
+///
+/// **No lease token, structurally** (SPA-09): `position.leased` is how many
+/// deliveries are held, and the token that holds them is not a field of
+/// anything serialised here.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionView {
+    board: String,
+    subscription: Subscription,
+    position: SubscriptionPosition,
+    dead_letter_codes: Vec<DeadLetterCode>,
+    head_event_seq: i64,
+}
+
+/// Cut an over-fetched page back to its bound, recording that it was cut.
+///
+/// Every bounded call below asks for one row past the bound it will return,
+/// so `truncated` is observed rather than inferred from a row count that
+/// happens to equal the bound (ADR-037 §1).
+fn cut_to(rows: &mut Vec<DeploymentAttempt>, limit: i64, truncated: &mut bool) {
+    if i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit {
+        *truncated = true;
+        rows.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+    }
+}
+
+/// Verified current releases, what is in flight, and what went wrong.
+///
+/// The three groups and their orders are the `/deployments` page's own:
+/// current releases by repository, tier, environment and board, and both
+/// attempt lists newest first.
+pub fn deployments() -> Projected<DeploymentIndex> {
+    let mut current = Vec::new();
+    let mut active = Vec::new();
+    let mut failures = Vec::new();
+    let mut active_truncated = false;
+    let mut failures_truncated = false;
+    for (project, store) in projects()? {
+        let pair = |deployment| BoardDeployment {
+            board: project.name.clone(),
+            deployment,
+        };
+        current.extend(store.current_deployments()?.into_iter().map(pair));
+        let mut started =
+            store.deployments(Some("started"), None, false, ACTIVE_DEPLOYMENT_ROWS + 1)?;
+        cut_to(&mut started, ACTIVE_DEPLOYMENT_ROWS, &mut active_truncated);
+        active.extend(started.into_iter().map(pair));
+        for status in ["failed", "abandoned"] {
+            let mut rows =
+                store.deployments(Some(status), None, false, FAILED_DEPLOYMENT_ROWS + 1)?;
+            cut_to(&mut rows, FAILED_DEPLOYMENT_ROWS, &mut failures_truncated);
+            failures.extend(rows.into_iter().map(pair));
+        }
+    }
+    current.sort_by(|a, b| {
+        (
+            &a.deployment.repo,
+            &a.deployment.tier,
+            &a.deployment.environment,
+            &a.board,
+        )
+            .cmp(&(
+                &b.deployment.repo,
+                &b.deployment.tier,
+                &b.deployment.environment,
+                &b.board,
+            ))
+    });
+    active.sort_by_key(|row| std::cmp::Reverse(row.deployment.created_at));
+    failures.sort_by_key(|row| std::cmp::Reverse(row.deployment.created_at));
+    Ok(DeploymentIndex {
+        current: Listing::complete(current),
+        active: Listing::merged(active, ACTIVE_DEPLOYMENT_ROWS, active_truncated),
+        failures: Listing::merged(failures, FAILED_DEPLOYMENT_ROWS, failures_truncated),
+    })
+}
+
+/// One attempt, its identity mode and what its finish observed.
+pub fn deployment(project_name: &str, id: &str) -> Projected<DeploymentDetail> {
+    let (project, store) = project_named(project_name).map_err(|_| Refusal::DeniedOrNotFound)?;
+    // An attempt that is invisible and one that is absent answer the same
+    // way, which is the answer `require_deployment` already gives.
+    let deployment = store
+        .require_deployment(id)
+        .map_err(|_| Refusal::DeniedOrNotFound)?;
+    Ok(DeploymentDetail {
+        board: project.name,
+        deployment,
+    })
+}
+
+/// Every subscription on every readable board, with its position.
+///
+/// Two store calls per board, both outside the row loop, exactly as the page
+/// makes them: the grouped delivery projection plus the head it is measured
+/// against. Paused rows are read whatever the client's filter says, so a
+/// hidden row can be counted and offered rather than reading as "nothing
+/// exists" — the filter is the client's display choice, not a read bound.
+///
+/// Neither call takes a limit, so the listing cannot be cut.
+pub fn subscriptions() -> Projected<Listing<SubscriptionView>> {
+    let mut items = Vec::new();
+    for (project, store) in projects()? {
+        let positions = store.subscription_positions()?;
+        for subscription in store.subscriptions(None, None, true)? {
+            items.push(SubscriptionView {
+                board: project.name.clone(),
+                position: positions.position(&subscription.id),
+                dead_letter_codes: positions.dead_letter_codes(&subscription.id).to_vec(),
+                head_event_seq: positions.head_event_seq,
+                subscription,
+            });
+        }
+    }
+    items.sort_by(|a, b| {
+        (&a.board, a.subscription.created_at, &a.subscription.id).cmp(&(
+            &b.board,
+            b.subscription.created_at,
+            &b.subscription.id,
+        ))
+    });
+    Ok(Listing::complete(items))
 }

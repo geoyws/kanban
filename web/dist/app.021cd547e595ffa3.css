@@ -1090,3 +1090,35 @@ ul.children li > a {
   font-size: 0.8125rem;
   cursor: pointer;
 }
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.8rem;
+  margin: 0.4rem 0;
+}
+dt {
+  color: var(--overlay);
+  font-size: 0.8125rem;
+}
+dd {
+  margin: 0;
+  font-size: 0.9375rem;
+  word-break: break-word;
+}
+td.when {
+  white-space: nowrap;
+  color: var(--subtext);
+}
+td > form {
+  margin: 0.4rem 0 0;
+}
+.queued {
+  margin-top: 0.25rem;
+  color: var(--subtext);
+  font-size: 0.8125rem;
+}
+.queued .retrying,
+.queued .dead {
+  color: var(--text);
+  font-weight: 700;
+}

@@ -510,8 +510,11 @@ fn api(method: &Method, path: &str) -> WebResponse {
         ["decided"] => encode(projection::decided()),
         ["boards"] => encode(projection::boards()),
         ["lanes"] => encode(projection::lanes()),
+        ["deployments"] => encode(projection::deployments()),
+        ["subscriptions"] => encode(projection::subscriptions()),
         ["board", project] => encode(projection::board(project)),
         ["task", project, id] => encode(projection::task(project, id)),
+        ["deployment", project, id] => encode(projection::deployment(project, id)),
         _ => Err(projection::Refusal::DeniedOrNotFound),
     };
     match body {
@@ -645,11 +648,8 @@ fn render(url: &str) -> Result<String> {
         ["sprints", project] => board_sprints(project),
         ["sprint", project, id] => sprint_detail(project, id),
         ["plans"] => plans(query_value(query, "opened").as_deref()),
-        ["deployments"] => deployments(),
-        ["subscriptions"] => subscriptions(
-            query_value(query, "show").as_deref(),
-            query_value(query, "changed").as_deref(),
-        ),
+        ["deployments"] => Ok(app_shell()),
+        ["subscriptions"] => Ok(app_shell()),
         ["lanes"] => Ok(app_shell()),
         ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
         // `/preview` + the item path: `/preview/task/PREVIEW/t-1`. The kind
@@ -664,7 +664,7 @@ fn render(url: &str) -> Result<String> {
         ["preview", "board", project] => preview_page(project, "board", project),
         ["board", _project] => Ok(app_shell()),
         ["task", project, id] => task_detail(project, id),
-        ["deployment", project, id] => deployment_detail(project, id),
+        ["deployment", _project, _id] => Ok(app_shell()),
         _ => Ok(page(
             "Not found",
             "<h1>Not found</h1><p>No page at that address. \
@@ -2466,6 +2466,8 @@ fn build_commit_cell(deployment: &DeploymentAttempt) -> String {
 }
 
 /// Current releases and the attempts that still need operational attention.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn deployments() -> Result<String> {
     let mut current = Vec::new();
     let mut active = Vec::new();
@@ -2551,6 +2553,8 @@ fn deployments() -> Result<String> {
     Ok(page("Deployments", &html))
 }
 
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn deployment_detail(project: &str, id: &str) -> Result<String> {
     let (_, store) = project_named(project)?;
     let row = store.require_deployment(id)?;
@@ -3056,6 +3060,8 @@ struct SubscriptionView {
 /// shareable URL already says, and two operators would then disagree about
 /// what "the page" lists. If another display choice arrives, it is another
 /// query parameter.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn subscriptions(show: Option<&str>, changed: Option<&str>) -> Result<String> {
     let mut views = Vec::new();
     for (project, store) in projects()? {
@@ -8446,16 +8452,11 @@ mod tests {
         // them: it answers the application shell, whose own shape is held
         // by `the_app_shell_closes_its_head_exactly_once_unit` (it links
         // the two embedded assets and nothing else) and whose rendered page
-        // is judged in the browser.
-        for route in [
-            "/all",
-            "/sprints",
-            "/plans",
-            "/deployments",
-            "/subscriptions",
-            "/search",
-            "/no/such/page",
-        ] {
+        // is judged in the browser. `/decided`, `/boards`, `/board/{project}`,
+        // `/lanes`, `/deployments`, `/deployment/{project}/{id}` and
+        // `/subscriptions` left the list the same way with `t-bf255880`
+        // wave 1.
+        for route in ["/all", "/sprints", "/plans", "/search", "/no/such/page"] {
             let html = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
             assert_announcement_channels(&html, route);
             assert_every_field_is_named(&html, route);
@@ -8740,26 +8741,34 @@ mod tests {
             "Opened plan <code>e-serve-render</code> and its child work",
         );
 
-        let deployments = render("/deployments").expect("render deployments");
-        assert_page_title(&deployments, "Deployments");
-        assert_html_contains(&deployments, "Current releases");
-        assert_html_contains(&deployments, "In progress");
-        assert_html_contains(&deployments, "Recent failures");
-        assert_html_contains(&deployments, "geoyws/kanban");
-        assert_html_contains(&deployments, "build &lt;failed&gt;");
-
-        let deployment_detail = render(&format!(
-            "/deployment/SERVE-RENDER/{}",
-            fixture.current_deployment_id
-        ))
-        .expect("render deployment detail");
-        assert_page_title(
-            &deployment_detail,
-            &format!("Deployment {}", fixture.current_deployment_id),
+        // `/deployments` and the attempt detail are mounted since
+        // `t-bf255880` wave 1, so this reads the projection they render
+        // from. Escaping is no longer a property of these bytes: the client
+        // builds the DOM, and `markdown_renders_in_real_chrome_and_raw_html_stays_inert`
+        // is where agent-authored text is held inert.
+        let deployments = serde_json::to_string(
+            &crate::projection::deployments().unwrap_or_else(|_| panic!("project deployments")),
+        )
+        .expect("the deployment index serialises");
+        assert!(deployments.contains("geoyws/kanban"), "{deployments}");
+        assert!(deployments.contains("build <failed>"), "{deployments}");
+        let deployment_detail = serde_json::to_string(
+            &crate::projection::deployment("SERVE-RENDER", &fixture.current_deployment_id)
+                .unwrap_or_else(|_| panic!("project the attempt")),
+        )
+        .expect("the attempt serialises");
+        assert!(
+            deployment_detail.contains(&fixture.current_deployment_id),
+            "{deployment_detail}"
         );
-        assert_html_contains(&deployment_detail, "Deployment");
-        assert_html_contains(&deployment_detail, "artifact://kanban/&lt;render&gt;");
-        assert_html_contains(&deployment_detail, "served &lt;release&gt; successfully");
+        assert!(
+            deployment_detail.contains("artifact://kanban/<render>"),
+            "{deployment_detail}"
+        );
+        assert!(
+            deployment_detail.contains("served <release> successfully"),
+            "{deployment_detail}"
+        );
 
         let search_empty = render("/search").expect("render empty search");
         assert_page_title(&search_empty, "Search");
@@ -8796,17 +8805,17 @@ mod tests {
         assert_html_contains(&task_page, "Task body with &amp; &lt; &gt;");
         assert_html_contains(&task_page, "driver-2");
 
-        let failed_detail = render(&format!(
-            "/deployment/SERVE-RENDER/{}",
-            fixture.failed_deployment_id
-        ))
-        .expect("render failed deployment detail");
-        assert_page_title(
-            &failed_detail,
-            &format!("Deployment {}", fixture.failed_deployment_id),
+        let failed_detail = serde_json::to_string(
+            &crate::projection::deployment("SERVE-RENDER", &fixture.failed_deployment_id)
+                .unwrap_or_else(|_| panic!("project the failed attempt")),
+        )
+        .expect("the failed attempt serialises");
+        assert!(
+            failed_detail.contains(&fixture.failed_deployment_id),
+            "{failed_detail}"
         );
-        assert_html_contains(&failed_detail, "failed");
-        assert_html_contains(&failed_detail, "build &lt;failed&gt;");
+        assert!(failed_detail.contains("failed"), "{failed_detail}");
+        assert!(failed_detail.contains("build <failed>"), "{failed_detail}");
 
         let sprint_overview = render("/sprints").expect("render sprint overview");
         assert_page_title(&sprint_overview, "Sprints");
@@ -10129,51 +10138,88 @@ mod tests {
             "the fixture should leave the active subscription measurably behind the head"
         );
 
-        let listed = render("/subscriptions").expect("render subscriptions");
-        assert_page_title(&listed, "Subscriptions");
-        assert_html_contains(&listed, &fixture.active);
-        assert_html_contains(&listed, &fixture.dead);
-        assert!(!listed.contains(&fixture.paused), "{listed}");
-        // The lookup name of a configured secret is never a page value.
-        assert!(!listed.contains(&fixture.secret_ref), "{listed}");
-        assert_html_contains(&listed, "a secret is configured");
-        assert_html_contains(&listed, "no secret configured");
-        assert_html_contains(
-            &listed,
-            &format!(
-                "{behind} board events behind head seq {}.",
-                fixture.head_event_seq
-            ),
+        // `/subscriptions` is mounted since `t-bf255880` wave 1, so what
+        // this fixture reads is the projection the page renders from. The
+        // rendering rules that used to be asserted on these bytes — the
+        // paused filter, the two secret sentences, the position sentence and
+        // the dead-letter attribution — are asserted in the browser, by
+        // `subscription_pause_and_resume_in_real_chrome_persist_each_state`
+        // and `subscription_dead_letters_name_their_codes_in_real_chrome`.
+        let listed = serde_json::to_string(
+            &crate::projection::subscriptions().unwrap_or_else(|_| panic!("project subscriptions")),
+        )
+        .expect("the projection serialises");
+        let projected: serde_json::Value =
+            serde_json::from_str(&listed).expect("the projection is JSON");
+        let rows = projected["items"].as_array().expect("the rows");
+        let row = |id: &str| -> &serde_json::Value {
+            rows.iter()
+                .find(|row| row["subscription"]["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is missing from the projection: {listed}"))
+        };
+        // A paused row is served whatever a client would filter for: the
+        // filter is a display choice, and a hidden row still has to be
+        // countable and offerable.
+        for id in [&fixture.active, &fixture.dead, &fixture.paused] {
+            row(id);
+        }
+        // The lookup name of a configured secret IS served — an operator
+        // needs to know which secret a consumer resolves, and it resolves to
+        // nothing in a browser — and the page is the surface that must not
+        // repeat it.
+        assert_eq!(
+            row(&fixture.active)["subscription"]["secretRef"],
+            serde_json::Value::String(fixture.secret_ref.clone()),
+            "{listed}"
         );
-        assert_html_contains(&listed, &format!("acked through seq {}", fixture.acked_seq));
-        assert_html_contains(&listed, "nothing acked yet");
+        let active = row(&fixture.active);
+        assert_eq!(active["headEventSeq"], fixture.head_event_seq, "{listed}");
+        assert_eq!(
+            active["position"]["ackedThroughSeq"], fixture.acked_seq,
+            "{listed}"
+        );
+        assert_eq!(
+            fixture.head_event_seq - fixture.acked_seq,
+            behind,
+            "the fixture's own arithmetic moved"
+        );
+        assert_eq!(
+            row(&fixture.dead)["position"]["ackedThroughSeq"],
+            serde_json::Value::Null,
+            "{listed}"
+        );
         // Two terminal failures on the zero-retry subscription, refused two
         // different ways. The count is what the operator notices; the codes
         // are what they act on, and they come out of the delivery rows in the
         // same projection as the count rather than from a second read that
         // could disagree with it.
-        assert_html_contains(
-            &listed,
-            "<span class=dead>2 dead-lettered: 1 adapter_spawn, 1 adapter_timeout</span>",
+        let dead = row(&fixture.dead);
+        assert_eq!(dead["position"]["deadLetter"], 2, "{listed}");
+        assert_eq!(
+            dead["deadLetterCodes"]
+                .as_array()
+                .expect("the codes")
+                .iter()
+                .map(|code| (
+                    code["code"].as_str().expect("a code").to_owned(),
+                    code["deliveries"].as_i64().expect("a count")
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("adapter_spawn".to_owned(), 1),
+                ("adapter_timeout".to_owned(), 1)
+            ],
+            "{listed}"
         );
-        assert_html_contains(&listed, "1 paused subscription is hidden.");
         assert!(
             listed.find(&fixture.active) < listed.find(&fixture.dead),
             "rows should follow creation order: {listed}"
         );
-
-        let everything = render("/subscriptions?show=all").expect("render every subscription");
-        assert_html_contains(&everything, &fixture.paused);
-        assert_html_contains(&everything, "Resume delivery");
-        assert_html_contains(
-            &everything,
-            &format!(
-                "action=\"/subscription/{}/{}/resume?show=all\"",
-                fixture.board, fixture.paused
-            ),
+        assert_eq!(
+            row(&fixture.paused)["subscription"]["pausedBy"],
+            serde_json::Value::String(OPERATOR_ACTOR.to_owned()),
+            "{listed}"
         );
-        assert_html_contains(&everything, &format!("paused by {OPERATOR_ACTOR}"));
-        assert!(!everything.contains(&fixture.secret_ref), "{everything}");
 
         let config = ServeConfig::new(None).expect("the default write actor");
         let pause_url = format!("/subscription/{}/{}/pause", fixture.board, fixture.active);
@@ -10246,12 +10292,9 @@ mod tests {
         let mut request = same_origin_post(&missing_row);
         assert_eq!(post_status(&missing_row, &mut request, &config), 409);
 
-        let banner =
-            render(&format!("/subscriptions?changed={}", fixture.active)).expect("render banner");
-        assert_html_contains(
-            &banner,
-            &format!("Recorded the change to <code>{}</code>", fixture.active),
-        );
+        // The `?changed=` receipt is the mounted page's now, and
+        // `subscription_pause_and_resume_in_real_chrome_persist_each_state`
+        // reads it in the browser after a real write.
     }
 
     #[test]
