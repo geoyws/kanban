@@ -56,3 +56,49 @@ export function cardQuestion(
   }
   return `${glyphs.slice(0, QUESTION_BOUND - 1).join("")}…`;
 }
+
+/* read pages */
+
+/**
+ * `rust/serve.rs`'s `status_label`: one board status as a heading and a
+ * pill read it. `todo` is two words in English; every other status is one
+ * word or underscore-joined.
+ */
+export function statusLabel(status: string): string {
+  if (status === "todo") {
+    return "To do";
+  }
+  const words = status.replace(/_/g, " ");
+  return words.length === 0 ? words : words[0]?.toUpperCase() + words.slice(1);
+}
+
+/**
+ * `rust/serve.rs`'s `a_or_an`: capitalised, because every sentence it opens
+ * is a meta sentence and it is the first word of it.
+ */
+export function aOrAn(word: string): "A" | "An" {
+  return /^[aeiou]/i.test(word) ? "An" : "A";
+}
+
+/**
+ * `rust/serve.rs`'s `stamp`: a millisecond stamp as a readable UTC instant,
+ * deliberately not localised — the ledger stores UTC and a page that
+ * quietly shifted stamps would disagree with every `--json` read.
+ */
+export function stamp(ms: number): string {
+  const at = new Date(ms);
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  return (
+    `${pad(at.getUTCFullYear(), 4)}-${pad(at.getUTCMonth() + 1)}-${pad(at.getUTCDate())} ` +
+    `${pad(at.getUTCHours())}:${pad(at.getUTCMinutes())}:${pad(at.getUTCSeconds())}Z`
+  );
+}
+
+/**
+ * `rust/serve.rs`'s `tag_list`: the words a row was filed under, as a
+ * fragment of the row's own sentence. A tag is neither a state nor an
+ * outcome, so it gets no pill (WEB-41).
+ */
+export function tagSentence(tags: readonly string[]): string {
+  return tags.length === 0 ? "" : `, tagged ${tags.join(", ")}`;
+}

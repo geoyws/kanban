@@ -1914,11 +1914,24 @@ components:
 
     TaskDetail:
       type: object
-      required: [board, task, claim, openAttention, notes, checkpoints, events]
+      description: |
+        Extended 2026-09-19 by `t-bf255880`, when `/task/{project}/{id}`
+        became the mounted application. The server-rendered page typeset
+        three agent-authored bodies with `serve::markdown` — the task's, each
+        note's and each open ask's — so the projection that replaces it
+        carries the same three as `bodyHtml`. A client that re-parsed them
+        would be a second sanitiser, and the second one is always the one
+        that is wrong (SPA-41). `notes` and `openAttention` therefore carry a
+        record plus its typeset body rather than the bare record.
+      required: [board, task, bodyHtml, claim, openAttention, notes, checkpoints, events]
       additionalProperties: false
       properties:
         board: { type: string }
         task: { $ref: "#/components/schemas/Task" }
+        bodyHtml:
+          type: string
+          nullable: true
+          description: "The task's body typeset by `serve::markdown`; `null` when the row has no body."
         claim:
           type: object
           nullable: true
@@ -1926,14 +1939,14 @@ components:
           description: "`Store::get_claim`, converted to `ClaimSummary`. `null` when nothing holds the task."
         openAttention:
           type: array
-          items: { $ref: "#/components/schemas/Attention" }
-          description: "Open items raised against this task (`rust/serve.rs:1437`-`rust/serve.rs:1439`)."
+          items: { $ref: "#/components/schemas/RenderedAttention" }
+          description: "Open items raised against this task (`rust/serve.rs:1437`-`rust/serve.rs:1439`), each with its body typeset."
         notes:
           allOf:
             - $ref: "#/components/schemas/ListEnvelope"
             - type: object
               properties:
-                items: { type: array, items: { $ref: "#/components/schemas/TaskNote" } }
+                items: { type: array, items: { $ref: "#/components/schemas/RenderedNote" } }
           description: "`Store::notes(id, DETAIL_ROWS)`; `limit` is 50."
         checkpoints:
           allOf:
@@ -1950,17 +1963,55 @@ components:
                 items: { type: array, items: { $ref: "#/components/schemas/Event" } }
           description: "`Store::events(Some(id), None, DETAIL_ROWS, true)`; `limit` is 50, archived included, exactly as the page reads it."
 
+    RenderedNote:
+      type: object
+      description: One note and its body as the page shows it.
+      required: [note, bodyHtml]
+      additionalProperties: false
+      properties:
+        note: { $ref: "#/components/schemas/TaskNote" }
+        bodyHtml: { type: string, description: "`note.body` typeset by `serve::markdown`." }
+
+    RenderedAttention:
+      type: object
+      description: One attention row and its body as the page shows it.
+      required: [attention, bodyHtml]
+      additionalProperties: false
+      properties:
+        attention: { $ref: "#/components/schemas/Attention" }
+        bodyHtml: { type: string, description: "`attention.body` typeset by `serve::markdown`." }
+
     Preview:
       type: object
       description: |
         The hover card's data, discriminated by `kind`. Exactly one of the four
         payload fields is present, matching `kind`.
+
+        Extended 2026-09-19 by `t-bf255880`, when the client stopped fetching
+        the served fragment and started building the card. Four fields beyond
+        the records, each of them something the fragment rendered and the
+        client cannot derive: the typeset body excerpt, the open-attention
+        count the card ends on, and the two references — a task's parent and
+        the row an ask was raised against — that make previews nest. Absent
+        rather than null when the kind does not carry them.
       required: [kind, board]
       properties:
         kind: { type: string, enum: [task, attention, deployment, board] }
         board: { type: string }
         task: { $ref: "#/components/schemas/Task" }
+        bodyHtml:
+          type: string
+          description: "For `kind: task` — the body's first `PREVIEW_BODY_CHARS` (800) characters typeset by `serve::markdown` (`rust/serve.rs:2215`-`rust/serve.rs:2218`)."
+        openAttention:
+          type: integer
+          description: "For `kind: task` — how many open items name the row (`rust/serve.rs:2221`); the card says so when it is not zero."
+        parent:
+          allOf: [{ $ref: "#/components/schemas/TaskReference" }]
+          description: "For `kind: task` — the parent as `task_reference` resolves it, absent when the row has no parent or the parent is gone."
         attention: { $ref: "#/components/schemas/Attention" }
+        about:
+          allOf: [{ $ref: "#/components/schemas/TaskReference" }]
+          description: "For `kind: attention` — the task the ask is about, absent when it names none or the row is gone."
         deployment: { $ref: "#/components/schemas/DeploymentAttempt" }
         boardCounts:
           type: object

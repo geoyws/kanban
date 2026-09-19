@@ -25265,9 +25265,11 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     assert_eq!(status, 200, "{deployment_detail}");
     assert!(deployment_detail.contains("served bundle carried exact release"));
 
-    let (status, search) = http_get(port, "/search?q=migration");
+    // Search is the mounted application now (`t-bf255880`): `/search`
+    // answers the shell and its rows arrive on the projection, so that is
+    // where this read moved.
+    let (status, search) = http_get(port, "/api/v1/search?q=migration");
     assert_eq!(status, 200, "{search}");
-    assert!(search.contains("Search"), "{search}");
     assert!(search.contains("Plan the migration"), "{search}");
     assert!(
         search.contains("kanban://SERVED/task/e-plan"),
@@ -25381,35 +25383,48 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         "a retired rule remained in force on the board page: {one}"
     );
 
-    let (status, detail) = http_get(port, "/task/SERVED/t-hostile");
-    assert_eq!(status, 200);
-    assert!(!detail.contains("<script>alert"), "{detail}");
+    // The task detail is mounted too, so what the server answers for it is
+    // the projection: the row's own text, the typeset body with the
+    // raiser's markup neutralised, and the trail.
+    let (status, detail) = http_get(port, "/api/v1/task/SERVED/t-hostile");
+    assert_eq!(status, 200, "{detail}");
+    let row: Value = serde_json::from_str(&detail).expect("the task detail as JSON");
+    assert!(
+        !row["bodyHtml"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("<script>alert"),
+        "a script survived the server's typesetting: {detail}"
+    );
     assert!(
         detail.contains("task_added"),
-        "the trail must render: {detail}"
+        "the trail must be served: {detail}"
     );
 
-    // A lease token is a capability. A read surface that renders one hands
+    // A lease token is a capability. A read surface that serves one hands
     // whoever loads the page the ability to write.
     let claim = fixture.ok_json(
         &fixture.main,
         &["claim", "t-hostile", "--as", "driver-1", "--json"],
     );
     let token = claim["leaseToken"].as_str().unwrap().to_owned();
-    let (_, held) = http_get(port, "/task/SERVED/t-hostile");
+    let (_, held) = http_get(port, "/api/v1/task/SERVED/t-hostile");
     assert!(
         held.contains("driver-1"),
         "the holder must be named: {held}"
     );
     assert!(
         !held.contains(&token),
-        "the lease token was rendered into a page"
+        "the lease token was served to a reader"
     );
 
-    // An address that names nothing is a page, not a dropped connection.
-    let (status, missing) = http_get(port, "/task/SERVED/t-nope");
-    assert_eq!(status, 500, "{missing}");
-    assert!(missing.contains("t-nope"), "{missing}");
+    // An address that names nothing is the one non-enumerating refusal.
+    let (status, missing) = http_get(port, "/api/v1/task/SERVED/t-nope");
+    assert_eq!(status, 404, "{missing}");
+    assert!(
+        !missing.contains("t-nope"),
+        "the refusal named the row it could not find: {missing}"
+    );
     let (status, nowhere) = http_get(port, "/no/such/page");
     assert_eq!(status, 200, "{nowhere}");
     assert!(nowhere.contains("Not found"), "{nowhere}");
@@ -26507,12 +26522,13 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(status, 404, "an unknown board write was accepted");
     let unresolved = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
     assert_eq!(unresolved.as_array().unwrap().len(), 4);
-    let (status, task_page) = http_get(port, "/task/SERVEWRITE/e-web-open");
+    // `/task/{project}/{id}` is the mounted application, so the open ask it
+    // still carries is read off the projection it renders from.
+    let (status, task_page) = http_get(port, "/api/v1/task/SERVEWRITE/e-web-open");
     assert_eq!(status, 200, "{task_page}");
-    assert!(task_page.contains("Open attention"), "{task_page}");
     assert!(
         task_page.contains("Choose the rollout window"),
-        "{task_page}"
+        "the open ask is not on the task's projection: {task_page}"
     );
     let (status, board) = http_get(port, "/board/SERVEWRITE");
     assert_eq!(status, 200, "{board}");
@@ -45143,6 +45159,294 @@ fn a_capped_json_listing_says_it_was_capped_over_http() {
 }
 
 #[test]
+fn the_json_search_projection_answers_the_same_rows_as_the_cli_over_http() {
+    // SPA-06, SPA-39. The search page's data arrives as JSON, and the
+    // load-bearing claim is the same one the Needs-you case makes: this is
+    // the retrieval the CLI already runs, not a second one written for the
+    // browser. So the rows are asserted against `kb search` at the page's
+    // own bound, citation for citation and in the same ranked order.
+    let fixture = Fixture::new("json-search");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONSEARCH", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Seleniumquartz retrieval audit",
+            "--id",
+            "t-search",
+            "--body",
+            "seleniumquartz is the token only this fixture's rows carry.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "note",
+            "t-search",
+            "The seleniumquartz receipt, written as a note.",
+            "--as",
+            "fixture-agent",
+            "--kind",
+            "evidence",
+            "--json",
+        ],
+    );
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/search?q=seleniumquartz");
+    assert_eq!(status, 200, "{body}");
+    let page: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/search is not JSON: {error}\n{body}"));
+    let cli = fixture.ok_json(
+        &fixture.main,
+        &["search", "seleniumquartz", "--limit", "30", "--json"],
+    );
+    let served = page["items"].as_array().expect("the served rows");
+    let rows = cli["results"].as_array().expect("the CLI rows");
+    assert!(
+        !rows.is_empty(),
+        "the fixture seeded nothing to find: {cli}"
+    );
+    assert_eq!(
+        served.len(),
+        rows.len(),
+        "the JSON search and `kb search` disagree on how many rows match:\n{body}\n{cli}"
+    );
+    for (served, row) in served.iter().zip(rows) {
+        for field in ["board", "sourceKind", "sourceId", "title", "citation"] {
+            assert_eq!(
+                served[field], row[field],
+                "{field} differs between the JSON row and the CLI row:\n{served}\n{row}"
+            );
+        }
+    }
+    assert!(
+        served
+            .iter()
+            .any(|row| row["citation"] == "kanban://JSONSEARCH/task/t-search"),
+        "the seeded task is not among the served rows: {body}"
+    );
+    // The envelope is the page's own bound, and the receipt beside it says
+    // which boards were searched with what.
+    assert_eq!(page["limit"], 30, "{body}");
+    assert_eq!(page["returned"], served.len(), "{body}");
+    assert_eq!(page["truncated"], cli["truncated"], "{body}\n{cli}");
+    assert_eq!(page["query"], "seleniumquartz", "{body}");
+    assert_eq!(page["embeddingModel"], cli["embeddingModel"], "{body}");
+    assert_eq!(page["boards"], serde_json::json!(["JSONSEARCH"]), "{body}");
+    assert_eq!(page["missingBoards"], serde_json::json!([]), "{body}");
+    assert_eq!(page["unreadableBoards"], serde_json::json!([]), "{body}");
+
+    // A question that was not asked is answered with nothing, not with
+    // every row on every board.
+    for path in [
+        "/api/v1/search",
+        "/api/v1/search?q=",
+        "/api/v1/search?q=%20%20",
+    ] {
+        let (status, empty) = http_get(server.port, path);
+        assert_eq!(status, 200, "{path}: {empty}");
+        let empty: Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty["items"], serde_json::json!([]), "{path} searched");
+        assert_eq!(empty["returned"], 0, "{path}");
+        assert_eq!(empty["truncated"], Value::Bool(false), "{path}");
+        assert_eq!(empty["boards"], serde_json::json!([]), "{path}");
+    }
+}
+
+#[test]
+fn the_json_preview_projection_answers_every_kind_and_refuses_the_rest_over_http() {
+    // SPA-40. The hover card is data now, not a served fragment, so each of
+    // the four kinds has to answer with the record the fragment rendered --
+    // including the two references that make previews nest, which are what
+    // the client cannot derive from the record alone. A kind that is not one
+    // of the four gets the same non-enumerating refusal as an unknown board
+    // (SPA-08), which is what the fragment's "Nothing to preview here." said
+    // without naming anything.
+    let fixture = Fixture::new("json-preview");
+    fixture.ok_json(&fixture.main, &["init", "--name", "JSONPREVIEW", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Ship the decision room",
+            "--id",
+            "e-room",
+            "--type",
+            "epic",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Pin the hover preview",
+            "--id",
+            "t-hover",
+            "--parent",
+            "e-room",
+            "--body",
+            "## The body\n\nThe preview shows the first part of it.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let item = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "The body about the task, unchanged.",
+            "--as",
+            "fixture-agent",
+            "--kind",
+            "blocking",
+            "--task",
+            "t-hover",
+            "--question",
+            "Hold or ship the hover?",
+            "--context",
+            "The hover is the last thing between the deck and a reader.",
+            "--choice",
+            "ship=Ship it|approve",
+            "--choice",
+            "hold=Hold it|defer",
+            "--consequence",
+            "ship=The hover ships tonight.",
+            "--consequence",
+            "hold=The hover waits for the next pass.",
+            "--recommend",
+            "ship",
+            "--json",
+        ],
+    );
+    let attention_id = item["id"].as_str().expect("the raised item").to_owned();
+    let deployment = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "geoyws/kanban-preview",
+            "--commit",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "--tier",
+            "@_bd",
+            "--environment",
+            "preview-fixture",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://127.0.0.1:14301",
+            "--task",
+            "t-hover",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    let deployment_id = deployment["id"].as_str().expect("the attempt").to_owned();
+
+    let server = spawn_server(&fixture);
+    let json = |path: &str| -> Value {
+        let (status, body) = http_get(server.port, path);
+        assert_eq!(status, 200, "{path}: {body}");
+        serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("{path} is not JSON: {error}\n{body}"))
+    };
+
+    let task = json("/api/v1/preview/task/JSONPREVIEW/t-hover");
+    assert_eq!(task["kind"], "task", "{task}");
+    assert_eq!(task["board"], "JSONPREVIEW", "{task}");
+    assert_eq!(task["task"]["title"], "Pin the hover preview", "{task}");
+    assert_eq!(task["openAttention"], 1, "{task}");
+    // The parent is resolved here, because it is the anchor a nested
+    // preview hangs off and the client has no second call to make.
+    assert_eq!(task["parent"]["id"], "e-room", "{task}");
+    assert_eq!(task["parent"]["title"], "Ship the decision room", "{task}");
+    assert_eq!(task["parent"]["taskType"], "epic", "{task}");
+    // The body is typeset by the server's one markdown renderer, bounded.
+    let typeset = task["bodyHtml"].as_str().expect("the typeset body");
+    assert!(typeset.contains("<h2>"), "the body was not typeset: {task}");
+    assert!(
+        !typeset.contains("## The body"),
+        "the body reached the client as markdown source: {task}"
+    );
+
+    let ask = json(&format!(
+        "/api/v1/preview/attention/JSONPREVIEW/{attention_id}"
+    ));
+    assert_eq!(ask["kind"], "attention", "{ask}");
+    assert_eq!(ask["attention"]["id"], attention_id.as_str(), "{ask}");
+    assert_eq!(
+        ask["attention"]["question"], "Hold or ship the hover?",
+        "{ask}"
+    );
+    assert_eq!(ask["about"]["id"], "t-hover", "{ask}");
+    assert_eq!(ask["about"]["title"], "Pin the hover preview", "{ask}");
+
+    let attempt = json(&format!(
+        "/api/v1/preview/deployment/JSONPREVIEW/{deployment_id}"
+    ));
+    assert_eq!(attempt["kind"], "deployment", "{attempt}");
+    assert_eq!(
+        attempt["deployment"]["repo"], "geoyws/kanban-preview",
+        "{attempt}"
+    );
+    assert_eq!(
+        attempt["deployment"]["environment"], "preview-fixture",
+        "{attempt}"
+    );
+
+    let board = json("/api/v1/preview/board/JSONPREVIEW/JSONPREVIEW");
+    assert_eq!(board["kind"], "board", "{board}");
+    assert_eq!(board["boardCounts"]["tasks"], 2, "{board}");
+    assert_eq!(board["boardCounts"]["openAttention"], 1, "{board}");
+    assert_eq!(board["boardCounts"]["todo"], 2, "{board}");
+    assert_eq!(board["boardCounts"]["inProgress"], 0, "{board}");
+
+    // No lease token, and no payload from a kind this card is not about.
+    for card in [&task, &ask, &attempt, &board] {
+        assert!(
+            card.get("leaseToken").is_none(),
+            "a preview carried a lease token: {card}"
+        );
+    }
+    assert!(
+        task.get("attention").is_none() && task.get("deployment").is_none(),
+        "the task card carried another kind's payload: {task}"
+    );
+    assert!(
+        board.get("task").is_none(),
+        "the board card carried a task: {board}"
+    );
+
+    for path in [
+        "/api/v1/preview/rule/JSONPREVIEW/r-anything",
+        "/api/v1/preview/board/JSONPREVIEW/NOT-THE-BOARD",
+        "/api/v1/preview/task/JSONPREVIEW/t-no-such-row",
+        "/api/v1/preview/task/NO-SUCH-BOARD/t-hover",
+    ] {
+        let (status, body) = http_get(server.port, path);
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(
+            body, JSON_DENIED_OR_NOT_FOUND,
+            "{path} answered a refusal of its own"
+        );
+    }
+}
+
+#[test]
 fn a_listing_says_whether_each_task_is_held_and_by_whom() {
     // Measured 2026-09-04 across eight boards: `task list --status
     // in_progress` carried no claim key at all, so 32 leased tasks read as
@@ -49440,6 +49744,18 @@ fn go(tab: &headless_chrome::Tab, origin: &str, route: &str) {
     tab.wait_until_navigated()
         .unwrap_or_else(|error| panic!("navigate to {route}: {error}"));
     wait_for_js_true(tab, "document.readyState === 'complete'");
+    // A route that answers the application shell has nothing in it until
+    // the bundle mounts, and `readyState` is complete long before that. The
+    // shell is recognised by the node it exists to hold, so this branch
+    // needs no list of which routes are mounted -- one more route moving
+    // onto the application changes nothing here.
+    if js_value(
+        tab,
+        "document.querySelector('[data-testid=app-root-shell]') !== null",
+    ) == Value::Bool(true)
+    {
+        wait_for_app_root(tab, ui::APP_ROOT);
+    }
 }
 
 /// Every animation the page starts, recorded at the document so the record

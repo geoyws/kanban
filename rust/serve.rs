@@ -90,7 +90,7 @@ const WEB_UNDO_NOTE: &str = "undone from the web view";
 ///
 /// The preview answers "what is this?", and a body that needs reading whole
 /// is one click away in its own tab.
-const PREVIEW_BODY_CHARS: usize = 800;
+pub(crate) const PREVIEW_BODY_CHARS: usize = 800;
 
 /// How many open attention rows one board hands the cross-board queue.
 ///
@@ -442,13 +442,9 @@ fn route(request: &mut Request, config: &ServeConfig) -> Result<WebResponse> {
     // POST arm: `/api/v1` answers `GET` and refuses every other method with
     // `405`, and routing a POST to the form handler first would give one
     // JSON path a write surface the contract does not give it (SPA-13).
-    if let Some(rest) = url
-        .split('?')
-        .next()
-        .unwrap_or(&url)
-        .strip_prefix(API_PREFIX)
-    {
-        return Ok(api(request.method(), rest));
+    let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+    if let Some(rest) = path.strip_prefix(API_PREFIX) {
+        return Ok(api(request.method(), rest, query));
     }
     if request.method() == &Method::Post {
         return post(request, &url, config);
@@ -491,7 +487,7 @@ const SERVER_ERROR_JSON: &str = "{\"error\":\"The request could not be completed
 /// the same non-enumerating refusal as an unknown board, because a route
 /// table that answered "no such route" differently from "no such board"
 /// would be an inventory of what exists.
-fn api(method: &Method, path: &str) -> WebResponse {
+fn api(method: &Method, path: &str, query: &str) -> WebResponse {
     if method != &Method::Get {
         return WebResponse::Json(405, METHOD_NOT_ALLOWED_JSON.to_owned());
     }
@@ -507,6 +503,14 @@ fn api(method: &Method, path: &str) -> WebResponse {
         ["lanes"] => encode(projection::lanes()),
         ["board", project] => encode(projection::board(project)),
         ["task", project, id] => encode(projection::task(project, id)),
+        // The page exposes one parameter and so does this route: a filter
+        // the page cannot set is a filter with no caller (SPA-06).
+        ["search"] => encode(projection::search(
+            query_value(query, "q").as_deref().unwrap_or(""),
+        )),
+        // One arm for both preview shapes: `/preview/board/{project}`
+        // repeats the project as the id, exactly as `render` passes it.
+        ["preview", kind, project, id] => encode(projection::preview(kind, project, id)),
         _ => Err(projection::Refusal::DeniedOrNotFound),
     };
     match body {
@@ -646,7 +650,7 @@ fn render(url: &str) -> Result<String> {
             query_value(query, "changed").as_deref(),
         ),
         ["lanes"] => lanes(),
-        ["search"] => search_page(query_value(query, "q").as_deref().unwrap_or("")),
+        ["search"] => Ok(app_shell()),
         // `/preview` + the item path: `/preview/task/PREVIEW/t-1`. The kind
         // leads, exactly as it does in the path being previewed, so the page
         // script derives the URL with one prefix and nothing else.
@@ -658,7 +662,7 @@ fn render(url: &str) -> Result<String> {
         ] => preview_page(project, kind, id),
         ["preview", "board", project] => preview_page(project, "board", project),
         ["board", project] => board(project),
-        ["task", project, id] => task_detail(project, id),
+        ["task", _project, _id] => Ok(app_shell()),
         ["deployment", project, id] => deployment_detail(project, id),
         _ => Ok(page(
             "Not found",
@@ -2301,16 +2305,87 @@ fn board_preview(project: &str, store: &Store) -> Result<String> {
 
 /// The first `bound` characters of a body, cut on a character boundary so the
 /// markdown renderer never sees half a grapheme, with an ellipsis when it cut.
-fn excerpt(text: &str, bound: usize) -> String {
+pub(crate) fn excerpt(text: &str, bound: usize) -> String {
     if text.chars().count() <= bound {
         return text.to_owned();
     }
     format!("{}…", text.chars().take(bound).collect::<String>())
 }
 
+/// What the search surface asks for, fixed here rather than exposed: the
+/// page has never had a filter control, so neither has the route that
+/// serves it (SPA-06).
+pub(crate) const SEARCH_LIMIT: usize = 30;
+pub(crate) const SEARCH_MAX_CHARS: usize = 30_000;
+
+/// One cross-board retrieval, bounded, as both served surfaces read it.
+///
+/// Shared rather than copied: `projection::search` answers the JSON route
+/// from this function, so the two surfaces cannot disagree about which
+/// boards were searched, how the results were ranked, or where the bound
+/// fell.
+///
+/// An empty query performs no search at all and returns the empty receipt —
+/// an unbounded listing dressed as a search is how a read surface lets
+/// absence read as a finding.
+pub(crate) fn search_receipt(query: &str) -> Result<crate::model::SearchReceipt> {
+    let query = query.trim();
+    let options = SearchOptions {
+        query: query.to_owned(),
+        source: None,
+        status: None,
+        tags: Vec::new(),
+        lane: None,
+        after: None,
+        before: None,
+        include_archived: false,
+        limit: SEARCH_LIMIT,
+        max_chars: SEARCH_MAX_CHARS,
+    };
+    if query.is_empty() {
+        return Ok(search::bound_receipt(
+            query,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            options.limit,
+            options.max_chars,
+        ));
+    }
+    let registry = Registry::open()?;
+    let mut results = Vec::new();
+    let mut boards = Vec::new();
+    let mut missing = Vec::new();
+    for project in registry.projects_active()? {
+        if !Path::new(&project.board_path).is_file() {
+            missing.push(project.name);
+            continue;
+        }
+        let store = Store::open_as_caller(Path::new(&project.board_path))?;
+        results.extend(store.search(&project.name, &options)?);
+        boards.push(project.name);
+    }
+    results.extend(search::search_rules(&registry.rules(false)?, &options));
+    Ok(search::bound_receipt(
+        query,
+        boards,
+        missing,
+        // This surface classifies board paths with its own `is_file` check
+        // rather than the shared classifier, so it never produces this
+        // bucket.
+        Vec::new(),
+        results,
+        options.limit,
+        options.max_chars,
+    ))
+}
+
 /// Cross-board retrieval for people who should not need to know which board
 /// owns a fact before they can find it. Ranking and bounds are the same shared
 /// implementation used by the CLI and MCP tool.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn search_page(query: &str) -> Result<String> {
     let query = query.trim();
     let mut html = format!(
@@ -2327,43 +2402,7 @@ fn search_page(query: &str) -> Result<String> {
         );
         return Ok(page("Search", &html));
     }
-    let options = SearchOptions {
-        query: query.to_owned(),
-        source: None,
-        status: None,
-        tags: Vec::new(),
-        lane: None,
-        after: None,
-        before: None,
-        include_archived: false,
-        limit: 30,
-        max_chars: 30_000,
-    };
-    let registry = Registry::open()?;
-    let mut results = Vec::new();
-    let mut boards = Vec::new();
-    let mut missing = Vec::new();
-    for project in registry.projects_active()? {
-        if !Path::new(&project.board_path).is_file() {
-            missing.push(project.name);
-            continue;
-        }
-        let store = Store::open_as_caller(Path::new(&project.board_path))?;
-        results.extend(store.search(&project.name, &options)?);
-        boards.push(project.name);
-    }
-    results.extend(search::search_rules(&registry.rules(false)?, &options));
-    let receipt = search::bound_receipt(
-        query,
-        boards,
-        missing,
-        // This page classifies board paths with its own `is_file` check rather
-        // than the shared classifier, so it never produces this bucket.
-        Vec::new(),
-        results,
-        options.limit,
-        options.max_chars,
-    );
+    let receipt = search_receipt(query)?;
     html.push_str(&format!(
         "<p class=count>{} result{} across {} board{}, model <code>{}</code>{}</p>",
         receipt.results.len(),
@@ -3600,6 +3639,8 @@ fn board(name: &str) -> Result<String> {
 }
 
 /// One task in full: what it is, where its work happened, and the trail.
+// retired by t-bf255880 wave 1; deleted in wave 2
+#[allow(dead_code)]
 fn task_detail(project_name: &str, id: &str) -> Result<String> {
     let (project, store) = project_named(project_name)?;
     let task = store.require_task(id)?;
@@ -8013,7 +8054,6 @@ mod tests {
             .map(PathBuf::from)
             .expect("child data dir");
         let fixture = seed_render_fixture(&data_dir);
-        let task_route = format!("/task/SERVE-RENDER/{}", fixture.epic_id);
         let deployment_route =
             format!("/deployment/SERVE-RENDER/{}", fixture.current_deployment_id);
         let routes = [
@@ -8028,8 +8068,11 @@ mod tests {
             "/plans",
             "/deployments",
             "/subscriptions",
-            "/search?q=render",
-            task_route.as_str(),
+            // `/search` and `/task/{project}/{id}` are the mounted
+            // application now (`t-bf255880`): they answer the shell, and
+            // their rows are judged in the browser by
+            // `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome`
+            // and the mobile read journey.
             deployment_route.as_str(),
         ];
         let mut measured = 0;
@@ -8065,8 +8108,6 @@ mod tests {
                 &board[at.saturating_sub(80)..at]
             );
         }
-        let detail = render(&task_route).expect("render the task detail");
-        assert_html_contains(&detail, "<span class=title>Please review ");
         // The sprint's attached tasks are a row list with a hook of its own,
         // so it is pinned by name rather than left to the sweep's matcher.
         let sprint = render("/sprint/SERVE-RENDER/sp-render-current").expect("render the sprint");
@@ -8438,11 +8479,12 @@ mod tests {
         // Every in-scope SERVER-RENDERED route keeps both announcement
         // channels and reaches no third party (WEB-52, WEB-54), which is a
         // claim about the routes and so is made where the routes can be
-        // rendered. `/` is not in the list because it is no longer one of
-        // them: it answers the application shell, whose own shape is held
-        // by `the_app_shell_closes_its_head_exactly_once_unit` (it links
-        // the two embedded assets and nothing else) and whose rendered page
-        // is judged in the browser.
+        // rendered. `/`, `/search` and `/task/{project}/{id}` are not in
+        // the list because they are no longer server-rendered: they answer
+        // the application shell, whose own shape is held by
+        // `the_app_shell_closes_its_head_exactly_once_unit` (it links the
+        // two embedded assets and nothing else) and whose rendered page is
+        // judged in the browser.
         for route in [
             "/all",
             "/decided",
@@ -8452,7 +8494,6 @@ mod tests {
             "/deployments",
             "/subscriptions",
             "/lanes",
-            "/search",
             "/board/px",
             "/no/such/page",
         ] {
@@ -8761,20 +8802,25 @@ mod tests {
         assert_html_contains(&lanes, "Working quietly on the render page.");
         assert_html_contains(&lanes, "A second lane with markup to sort.");
 
-        let search_empty = render("/search").expect("render empty search");
-        assert_page_title(&search_empty, "Search");
-        assert_html_contains(
-            &search_empty,
-            "Search every board, including tasks, notes, checkpoints, handoffs, attention, sitreps, rules, and their audit trail.",
-        );
+        // Search is the mounted application now (`t-bf255880`), so what the
+        // server owes it is the projection rather than markup: the same
+        // rows, carrying the operator's own text unescaped, because
+        // escaping is the client's once the client builds the DOM.
+        let Ok(search_empty) = crate::projection::search("") else {
+            panic!("the empty search was refused")
+        };
+        let search_empty = serde_json::to_string(&search_empty).expect("serialise");
+        assert_html_contains(&search_empty, "\"items\":[]");
+        assert_html_contains(&search_empty, "\"boards\":[]");
 
-        let search = render("/search?q=render").expect("render search");
-        assert_page_title(&search, "Search: render");
-        assert_html_contains(&search, "Search: render");
+        let Ok(search) = crate::projection::search("render") else {
+            panic!("searching the boards was refused")
+        };
+        let search = serde_json::to_string(&search).expect("serialise");
+        assert_html_contains(&search, "\"query\":\"render\"");
         assert_html_contains(&search, "kanban://SERVE-RENDER/task/e-serve-render");
-        assert_html_contains(&search, "Plan &lt;b&gt;render&lt;/b&gt;");
-        assert_html_contains(&search, "Ship &lt;script&gt;render&lt;/script&gt;");
-
+        assert_html_contains(&search, "Plan <b>render</b>");
+        assert_html_contains(&search, "Ship <script>render</script>");
         let board = render("/board/SERVE-RENDER").expect("render board");
         assert_page_title(&board, "SERVE-RENDER");
         assert_html_contains(&board, "Rootless");
@@ -8798,26 +8844,79 @@ mod tests {
         assert_html_contains(&board, "Implement &lt;i&gt;escape&lt;/i&gt;");
         assert_html_contains(&board, "Ship &lt;script&gt;render&lt;/script&gt;");
 
-        let task_detail =
-            render(&format!("/task/SERVE-RENDER/{}", fixture.epic_id)).expect("render task detail");
-        assert_page_title(&task_detail, "Plan &lt;b&gt;render&lt;/b&gt;");
-        assert_html_contains(&task_detail, "Open attention");
-        assert_html_contains(&task_detail, "tag escaped &amp; readable");
-        assert_html_contains(&task_detail, "Trail");
-        assert_html_contains(&task_detail, "decision");
-        assert_html_contains(&task_detail, "Please review before release");
+        // The task detail is mounted too, and its three rows are read off
+        // the projection for the same reason: what the server owes the page
+        // is the row's own text and the one typeset body, not markup.
+        let detail = |id: &str| {
+            let Ok(row) = crate::projection::task("SERVE-RENDER", id) else {
+                panic!("the task detail for {id} was refused")
+            };
+            serde_json::to_value(row).expect("the detail as JSON")
+        };
+        let task_detail = detail(&fixture.epic_id);
+        assert_eq!(task_detail["task"]["title"], "Plan <b>render</b>");
+        assert_eq!(task_detail["task"]["tags"], serde_json::json!(["ops"]));
+        // The ask this epic is carrying, and its body as the page reads it.
+        // The row's own text arrives unescaped — escaping is the client's
+        // now — and the typeset copy beside it is the server's `markdown`,
+        // which is where the raiser's markup is neutralised.
+        assert_eq!(
+            task_detail["openAttention"][0]["attention"]["kind"],
+            "decision"
+        );
+        assert_eq!(
+            task_detail["openAttention"][0]["attention"]["body"],
+            "Please review <strong>before release</strong>."
+        );
+        let typeset_ask = task_detail["openAttention"][0]["bodyHtml"]
+            .as_str()
+            .expect("the typeset ask");
+        assert!(
+            typeset_ask.contains("Please review") && !typeset_ask.contains("<strong>"),
+            "the raiser's markup was not neutralised: {typeset_ask}"
+        );
+        // The note the CLI wrote, carried as text and typeset beside it.
+        assert_eq!(
+            task_detail["notes"]["items"][0]["note"]["body"],
+            "Keep the <script> tag escaped & readable."
+        );
+        let typeset_note = task_detail["notes"]["items"][0]["bodyHtml"]
+            .as_str()
+            .expect("the typeset note");
+        assert!(
+            typeset_note.contains("tag escaped &amp; readable")
+                && !typeset_note.contains("<script"),
+            "the note's markup reached the page as markup: {typeset_note}"
+        );
+        assert!(
+            task_detail["events"]["returned"].as_u64().unwrap_or(0) > 0,
+            "the task detail served no trail: {task_detail}"
+        );
 
-        let story_detail = render(&format!("/task/SERVE-RENDER/{}", fixture.story_id))
-            .expect("render story detail");
-        assert_page_title(&story_detail, "Ship &lt;script&gt;render&lt;/script&gt;");
-        assert_html_contains(&story_detail, "Story body with markup");
-        assert_html_contains(&story_detail, "<p class=meta>A story on ");
+        let story_detail = detail(&fixture.story_id);
+        assert_eq!(
+            story_detail["task"]["title"],
+            "Ship <script>render</script>"
+        );
+        assert_eq!(story_detail["task"]["type"], "story");
+        assert!(
+            story_detail["bodyHtml"]
+                .as_str()
+                .expect("the typeset story body")
+                .contains("Story body with markup"),
+            "{story_detail}"
+        );
 
-        let task_page =
-            render(&format!("/task/SERVE-RENDER/{}", fixture.task_id)).expect("render task detail");
-        assert_page_title(&task_page, "Implement &lt;i&gt;escape&lt;/i&gt;");
-        assert_html_contains(&task_page, "Task body with &amp; &lt; &gt;");
-        assert_html_contains(&task_page, "driver-2");
+        let task_page = detail(&fixture.task_id);
+        assert_eq!(task_page["task"]["title"], "Implement <i>escape</i>");
+        assert_eq!(task_page["task"]["lane"], "driver-2");
+        assert!(
+            task_page["bodyHtml"]
+                .as_str()
+                .expect("the typeset task body")
+                .contains("Task body with &amp; &lt; &gt;"),
+            "the body was not typeset by the server's markdown: {task_page}"
+        );
 
         let failed_detail = render(&format!(
             "/deployment/SERVE-RENDER/{}",
@@ -8955,7 +9054,16 @@ mod tests {
         assert_page_title(&not_found, "Not found");
         assert_html_contains(&not_found, "No page at that address");
         assert!(render("/board/NO-SUCH-BOARD").is_err());
-        assert!(render("/task/SERVE-RENDER/no-such-task").is_err());
+        // `/task/{project}/{id}` answers the shell whatever the id is, so
+        // the refusal moved with the surface: a row that is not there is
+        // the projection's non-enumerating denial (SPA-08).
+        assert!(
+            matches!(
+                crate::projection::task("SERVE-RENDER", "no-such-task"),
+                Err(crate::projection::Refusal::DeniedOrNotFound)
+            ),
+            "a missing row was not refused"
+        );
     }
 
     #[test]

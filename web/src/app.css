@@ -1223,3 +1223,171 @@ main[data-deck] > p.keys {
     transition: none;
   }
 }
+
+/* search and task -- the two pages' own rules, and nothing the read-page
+   primitives above already declare. */
+
+/* The field is the page: it takes the width the page has, and the button
+   keeps only the room its word needs. */
+.search-page {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.search-page input {
+  flex: 1;
+}
+
+/* A result is a title, a sentence, the snippet and the citation. It is not a
+   card and gets no box (SPA-53): the separation is the space between them. */
+.search-result {
+  margin: 1.4rem 0;
+  padding: 0;
+}
+
+.search-result h2 {
+  margin: 0.1rem 0;
+}
+
+/* The citation is how the row is retrieved, so it reads as a reference
+   rather than as prose: quiet, and in the mono the ids are already in. */
+.citation {
+  margin: 0.4rem 0 0;
+  color: var(--overlay);
+}
+
+/* PROVISIONAL -- writer A's shared read-page primitives, ported verbatim
+   from rust/serve.rs's CSS const so the search and task pages can be proved
+   before A's own read-pages banner lands. DELETE THIS WHOLE BLOCK
+   when it does: these declarations are A's, not this page's. */
+
+main[data-page] {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  padding: 0.6rem clamp(0.7rem, 3vw, 1.2rem) calc(1.5rem + env(safe-area-inset-bottom));
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+th,
+td {
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--surface0);
+}
+
+th {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--overlay);
+}
+
+td.n,
+th.n {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+td.when {
+  white-space: nowrap;
+  color: var(--subtext);
+}
+
+td.payload {
+  color: var(--subtext);
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+
+ul.rows,
+ul.children {
+  list-style: none;
+  margin: 0.3rem 0;
+  padding: 0;
+}
+
+ul.rows li,
+ul.children li {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--surface0);
+}
+
+ul.rows li > a,
+ul.children li > a,
+.title {
+  font-weight: 500;
+}
+
+.title {
+  display: inline-block;
+  color: var(--text);
+}
+
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.8rem;
+  margin: 0.4rem 0;
+}
+
+dt {
+  color: var(--overlay);
+  font-size: 0.8125rem;
+}
+
+dd {
+  margin: 0;
+  font-size: 0.9375rem;
+  word-break: break-word;
+}
+
+.pill {
+  display: inline-block;
+  padding: 0.1em 0.4em;
+  color: var(--subtext);
+  background: var(--surface0);
+  font-size: 0.75rem;
+  border-radius: 999px;
+}
+
+.pill.status-done,
+.pill.status-approve,
+.pill.status-succeeded {
+  color: var(--green);
+}
+
+.pill.status-in_progress,
+.pill.status-other {
+  color: var(--blue);
+}
+
+.pill.status-blocked,
+.pill.status-reject,
+.pill.status-failed {
+  color: var(--red);
+}
+
+.pill.status-review,
+.pill.status-defer {
+  color: var(--yellow);
+}
+
+.count {
+  color: var(--subtext);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
+.attention-count {
+  margin-left: 0.4rem;
+  color: var(--overlay);
+  font-size: 0.8125rem;
+}
