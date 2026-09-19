@@ -201,6 +201,42 @@ words rather than the store's state:
   row the operator just acted on and is authorised to see; they enumerate
   nothing they could not already read.
 
+## JSON API integration
+
+The boundary this document describes is exercised against the **compiled
+binary over real HTTP**, on a real SQLite estate, in
+`tests/authz_bypass_matrix_e2e.rs` — section 9, "The JSON projection over real
+HTTP" — alongside `tests/access_refusals_e2e.rs`, which holds the compiled
+refusal matrix the estate's enforcement states rest on. The layer is `http`:
+the process boundary is real and no browser is involved, so these are
+INTEGRATION cases and are never labelled otherwise (rule `g-ffbd95f5`).
+
+They live in that file rather than in one of their own because the fixture
+does: `ManagedEstate` is the only fixture in the suite that can put the
+*serving* process under managed enforcement with a named set of grants, which
+is what the authorization cases need and what the first wave's cases in
+`tests/e2e.rs` could not seed. Every case names the `SPA-nn` it answers in its
+doc comment, and `docs/specs/spa.md` §8 and the SPA section of
+`docs/testing/compiled-rust-e2e-matrix.md` name the case back.
+
+What they hold, in the order this document states it: board and tag
+authorization equal to the CLI's on all five routes, with the CLI read run as
+the same identity against the same estate; the one non-enumerating body, and
+every `4xx` searched for the invisible board's name, row titles, ids, tag and
+lane; no lease token in any of the five responses after a real `kanban claim`;
+every listing's `ListEnvelope` with all three bounds actually crossed; the
+four writes refused with no trusted-edge identity and refused cross-origin;
+a second, client-supplied copy of `X-Auth-Request-Email` refused rather than
+preferred; a reply naming a choice the row no longer carries refused by name;
+and the **projection invariant** — the four read routes compared row for row,
+field by field on shared keys, against `task list`, `task show`, `sitrep list`
+and `attention list --status open`, so a future divergence fails there instead
+of being discovered in the UI.
+
+Three cases in that section are `#[ignore]`d and carry a failing assertion on
+purpose. Each is a divergence named below rather than a test written down to
+the shipped behaviour.
+
 ## Where the served pages do not yet meet this contract
 
 Recorded here because the specification's §8 evidence rows will be read against
@@ -243,6 +279,35 @@ worse than one that names the gap.
   board rather than a "not implemented" that would inventory what is coming.
   `SPA-06`, `SPA-07` and `SPA-09` carry their first evidence from this wave;
   the remaining routes stay owed by the epic.
+- **`/api/v1/lanes` serves the sitreps of a board the caller may not read.**
+  Found 2026-09-19 by `t-4b9501b3`. `lane_groups` (`rust/serve.rs`) scans
+  every *active* board and calls `Store::sitreps`, which carries no guard, so
+  a board that `kanban sitrep list` refuses to the same principal is handed
+  over in full over HTTP — lane, author, body and worktree path. This
+  contradicts `SPA-08` and this document's own rule that a caller is never
+  handed rows they may not see. Held by the `#[ignore]`d
+  `the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http`,
+  whose positive control is the CLI refusing the same read. Closing it is a
+  change to the store or to the scan, not to the test.
+- **A whole-estate listing refuses entire rather than serving the readable
+  subset.** Found 2026-09-19 by `t-4b9501b3`. `board_summaries` and
+  `needs_you` iterate every active board and propagate the first refusal, so
+  `/api/v1/boards` and `/api/v1/needs-you` answer `404 denied or not found` to
+  a caller who fully owns one board out of two. The CLI's `dashboard` answers
+  identically, so the two surfaces agree and `SPA-08`'s equivalence holds —
+  but "The denial does not enumerate" above says a caller who asks for a list
+  is *simply not handed* the rows they may not see, and `SPA-06` requires the
+  page's data to arrive. Held by the `#[ignore]`d
+  `a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`.
+- **The four writes refuse in HTML; this contract says they refuse in JSON.**
+  Found 2026-09-19 by `t-4b9501b3`. `Refused`, `WriteRejected` and
+  `WriteConflict` each declare `application/json; charset=utf-8` with the
+  `Error` schema, and all four `POST` operations reference them; the server
+  renders a `text/html` page for every one, carrying the same sentence inside
+  the markup. The browser deck depends on that page — it parses the response
+  and reads `.error` — so this one may well be the document's to fix rather
+  than the server's, but it is a divergence either way. Held by the
+  `#[ignore]`d `the_write_refusals_answer_the_contracts_json_error_body_over_http`.
 
 ---
 

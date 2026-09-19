@@ -1168,17 +1168,22 @@ fn a_trusted_edge_header_and_a_same_origin_post_are_not_authority() {
     estate.bind_self("p-elsewhere", &owner_of(&estate.id_b));
     estate.enforce("managed");
 
-    let server = WebServer::start(&estate, &work_a, "X-Kanban-Actor");
+    let server = WebServer::start(&estate, &work_a, Some("X-Kanban-Actor"));
     let reply = format!("/attention/Alpha/{attention}/reply");
-    let (status, body) = server.post(
+    let refused = server.post(
         &reply,
         &[("X-Kanban-Actor", "kanban-board-owner")],
         "decision=approve&reply=forged",
     );
-    assert_eq!(status, 409, "the guard must refuse this write: {body}");
+    assert_eq!(
+        refused.status, 409,
+        "the guard must refuse this write: {}",
+        refused.body
+    );
     assert!(
-        body.contains(DENIED),
-        "the refusal must be the generic denial: {body}"
+        refused.body.contains(DENIED),
+        "the refusal must be the generic denial: {}",
+        refused.body
     );
 
     // Read the row back with enforcement lifted, so the read is not itself
@@ -1198,14 +1203,15 @@ fn a_trusted_edge_header_and_a_same_origin_post_are_not_authority() {
     // Now grant the SERVING process's own principal the board. Nothing about
     // the request changes — not the header, not the origin, not the body.
     estate.grant("p-elsewhere", &owner_of(&estate.id_a));
-    let (status, body) = server.post(
+    let recorded = server.post(
         &reply,
         &[("X-Kanban-Actor", "kanban-board-owner")],
         "decision=approve&reply=recorded",
     );
     assert_eq!(
-        status, 303,
-        "the principal's own authority must permit this write: {body}"
+        recorded.status, 303,
+        "the principal's own authority must permit this write: {}",
+        recorded.body
     );
 
     estate.enforce("direct");
@@ -1219,6 +1225,1316 @@ fn a_trusted_edge_header_and_a_same_origin_post_are_not_authority() {
         rows[0]["resolvedBy"].as_str(),
         Some("kanban-board-owner"),
         "the edge identity is the AUDIT actor, recorded verbatim"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. The JSON projection over real HTTP (SPA-06, SPA-08..SPA-13).
+// ---------------------------------------------------------------------------
+//
+// INTEGRATION coverage, at the layer `http` (rule g-ffbd95f5): every case
+// below spawns the compiled binary, speaks HTTP to it over a real socket and
+// reads a real SQLite estate, and no browser is involved in any of it.
+//
+// It lives in this file rather than in one of its own because the estate is
+// this file's: `ManagedEstate` is the only fixture in the suite that can put
+// the serving process under managed enforcement with a named set of grants,
+// which is what several of these cases are about and what the first wave's
+// cases in `tests/e2e.rs` could not seed. `tests/access_refusals_e2e.rs` has
+// no server and no board authority in it at all.
+//
+// Where a case asserts the API and the CLI agree, the CLI read is run as the
+// SAME process identity against the SAME estate, so the only difference
+// between the two answers is the surface.
+
+/// The store's one generic denial as the JSON surface writes it, byte for
+/// byte (`DENIED_OR_NOT_FOUND_JSON`, `rust/serve.rs`).
+///
+/// Held as a byte string rather than as a parsed object for the reason the
+/// contract gives: the claim is that the refusal is byte-identical whichever
+/// of the four reasons produced it, and a comparison through a parser would
+/// pass on two bodies differing in spacing, field order, or an extra key.
+const DENIED_JSON: &str = "{\"error\":\"denied or not found\"}";
+
+/// The product's own sentence for a write that did not come from this site
+/// (`rust/serve.rs`, and `#/components/responses/Refused`).
+const NOT_FROM_THIS_SITE: &str = "The action did not come from this site.";
+
+/// The three page bounds the projection reports, mirrored from
+/// `rust/serve.rs` so a change there fails here rather than drifting.
+const OPEN_ATTENTION_ROWS: usize = 1_000;
+const LANE_UPDATE_ROWS: usize = 200;
+const DETAIL_ROWS: usize = 50;
+/// How many unarchived sitreps one lane keeps: posting archives all but the
+/// last ten of that lane (`Store::post_sitrep`), so a fixture that needs
+/// more live rows than this needs more lanes, not more rows.
+const LIVE_SITREPS_PER_LANE: usize = 10;
+
+/// A commit-shaped SHA for a sitrep's provenance.
+const SEED_HEAD: &str = "0000000000000000000000000000000000000000";
+
+/// `kanban sitrep post` outside a git checkout.
+///
+/// The write refuses blank provenance rather than storing it, so the fixture
+/// supplies the four fields a checkout would have supplied.
+fn sitrep_on<'a>(body: &'a str, lane: &'a str, repo: &'a str) -> Vec<&'a str> {
+    vec![
+        "sitrep", "post", body, "--as", "seed", "--lane", lane, "--repo", repo, "--branch", "main",
+        "--head", SEED_HEAD, "--dirty", "clean", "--json",
+    ]
+}
+
+/// The five routes the first wave answers, for one board and one row of it.
+fn five_routes(board: &str, task: &str) -> Vec<String> {
+    vec![
+        "/api/v1/needs-you".to_owned(),
+        "/api/v1/boards".to_owned(),
+        "/api/v1/lanes".to_owned(),
+        format!("/api/v1/board/{board}"),
+        format!("/api/v1/task/{board}/{task}"),
+    ]
+}
+
+/// Compare one API object with one CLI object on the keys they share.
+///
+/// The shared set is asserted to contain `anchors` first: a comparison that
+/// silently emptied because a field was renamed on one side would otherwise
+/// pass forever. Nothing is sorted and nothing is normalised — each side is
+/// read in the order its own surface returned it, because the order is the
+/// page arm's own and the CLI read named beside it is the one that arm
+/// shares, not a property of the data.
+fn agrees_on_shared_keys(api: &Value, cli: &Value, anchors: &[&str], what: &str) {
+    let api = api
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: the API row is not an object: {api}"));
+    let cli = cli
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: the CLI row is not an object: {cli}"));
+    for anchor in anchors {
+        assert!(
+            api.contains_key(*anchor) && cli.contains_key(*anchor),
+            "{what}: both surfaces must carry {anchor}, or this comparison measures nothing"
+        );
+    }
+    for (key, value) in api {
+        if let Some(other) = cli.get(key) {
+            assert_eq!(
+                value, other,
+                "{what}: {key} differs between the JSON route and the CLI"
+            );
+        }
+    }
+}
+
+/// Every field a task carries on both surfaces and that a divergence would
+/// show up in first.
+const TASK_ANCHORS: &[&str] = &[
+    "id",
+    "title",
+    "status",
+    "priority",
+    "tags",
+    "type",
+    "assignee",
+    "lane",
+    "createdAt",
+    "updatedAt",
+];
+
+/// SPA-08: the same board and tag authority as the CLI, on all five routes.
+///
+/// The serving process owns board A and holds nothing at all on board B, and
+/// the estate is `managed`, so the guard is live. Every named access to B is
+/// refused with the one body; the whole-estate listings refuse exactly as the
+/// CLI's own whole-estate listing refuses; and granting B afterwards makes
+/// both surfaces answer, from the same unchanged request.
+///
+/// The tag half is asserted as an EQUIVALENCE rather than as a hiding rule,
+/// because that is what the store does: a named read of a row whose tag the
+/// caller lacks is refused on both surfaces, and a listing is filtered on
+/// neither. SPA-08's claim is that the JSON route returns what the CLI would
+/// return with the enforcement in the store, and a test that asserted the
+/// route filtered what the CLI does not would be asserting a second rule in
+/// the route — the one thing SPA-08 forbids.
+#[test]
+fn the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over_http() {
+    let estate = ManagedEstate::new("json-authz");
+    let work_a = estate.work_a.clone();
+    let work_b = estate.work_b.clone();
+    let repo_a = work_a.to_string_lossy().into_owned();
+    let repo_b = work_b.to_string_lossy().into_owned();
+
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "alpha visible row",
+            "--id",
+            "t-avis",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "alpha tagged row",
+            "--id",
+            "t-asec",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &sitrep_on("alpha lane update", "alpha-lane", &repo_a),
+    );
+    estate.ok_json(
+        &work_b,
+        &[
+            "task",
+            "add",
+            "beta hidden row",
+            "--id",
+            "t-bhid",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_b,
+        &sitrep_on("beta lane update", "beta-lane", &repo_b),
+    );
+
+    // Board scope at both capabilities on A, and the `secret` tag on
+    // neither. Nothing at all on B.
+    estate.bind_self(
+        "p-alpha-only",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // A named read the CLI refuses is a named read the route refuses, with
+    // the one non-enumerating body and the contract's content type.
+    estate.denied(&work_b, &["task", "list", "--json"]);
+    estate.denied(&work_a, &["task", "show", "t-asec", "--json"]);
+    for path in [
+        "/api/v1/board/Beta",
+        "/api/v1/task/Beta/t-bhid",
+        "/api/v1/task/Alpha/t-asec",
+    ] {
+        let answer = server.get(path);
+        assert_eq!(answer.status, 404, "{path}: {}", answer.body);
+        assert_eq!(
+            answer.body, DENIED_JSON,
+            "{path} answered a refusal of its own"
+        );
+        assert!(
+            answer
+                .head
+                .contains("Content-Type: application/json; charset=utf-8"),
+            "{path} refused as {}",
+            answer.head
+        );
+    }
+
+    // The whole-estate listings answer the same way the CLI's own
+    // whole-estate listing answers: an estate holding a board this caller
+    // cannot read is refused entire, on both surfaces, with one body. It is
+    // the equivalence that is asserted here; that the contract asks instead
+    // for the readable subset is a separate, named finding
+    // (`a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`).
+    estate.denied(&work_a, &["dashboard", "--json"]);
+    for path in ["/api/v1/boards", "/api/v1/needs-you"] {
+        let answer = server.get(path);
+        assert_eq!(answer.status, 404, "{path}: {}", answer.body);
+        assert_eq!(answer.body, DENIED_JSON, "{path}");
+    }
+
+    // The caller's own board answers, and it answers exactly the rows the
+    // CLI hands the same identity — including the tagged row, which neither
+    // surface filters out of a listing and both refuse by name.
+    let alpha = server.get_json("/api/v1/board/Alpha");
+    let listed = estate.ok_json(&work_a, &["task", "list", "--json"]);
+    let api_rows = alpha["tasks"]["items"].as_array().unwrap();
+    let cli_rows = listed.as_array().unwrap();
+    assert_eq!(
+        api_rows.len(),
+        cli_rows.len(),
+        "the route and the CLI disagree on how many rows this caller may list:\n{alpha}\n{listed}"
+    );
+    for (api, cli) in api_rows.iter().zip(cli_rows) {
+        agrees_on_shared_keys(
+            api,
+            cli,
+            TASK_ANCHORS,
+            "board listing under managed authority",
+        );
+    }
+
+    // Now the same request against a granted board. Nothing about the
+    // request changes; only the grant does.
+    estate.grant("p-alpha-only", &owner_of(&estate.id_b));
+    let boards = server.get_json("/api/v1/boards");
+    let names = boards["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["board"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"Alpha".to_owned()) && names.contains(&"Beta".to_owned()),
+        "a granted board did not appear: {boards}"
+    );
+    let beta = server.get_json("/api/v1/board/Beta");
+    assert_eq!(beta["tasks"]["items"][0]["id"], "t-bhid", "{beta}");
+    estate.ok_json(&work_b, &["task", "list", "--json"]);
+}
+
+/// SPA-08: a refusal names nothing that was seeded.
+///
+/// Every 4xx body an unauthorized caller can obtain is searched for every
+/// distinctive string the invisible board carries — its name, its rows'
+/// titles and ids, its tag, its lane, and the text of its open item. A
+/// refusal that named any of them would confirm existence, which is exactly
+/// what the single generic denial exists to prevent.
+#[test]
+fn no_json_refusal_names_a_board_row_or_tag_the_caller_may_not_see_over_http() {
+    let estate = ManagedEstate::new("json-leak");
+    let work_a = estate.work_a.clone();
+    let work_b = estate.work_b.clone();
+    let repo_b = work_b.to_string_lossy().into_owned();
+
+    let secrets = [
+        "Beta",
+        "harbour-wall-survey",
+        "t-bsecret",
+        "beta-only-tag",
+        "beta-only-lane",
+        "the pier decision nobody else may read",
+    ];
+    estate.ok_json(
+        &work_b,
+        &["tag", "add", "beta-only-tag", "--as", "seed", "--json"],
+    );
+    estate.ok_json(
+        &work_b,
+        &[
+            "task",
+            "add",
+            "harbour-wall-survey",
+            "--id",
+            "t-bsecret",
+            "--tag",
+            "beta-only-tag",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_b,
+        &[
+            "attention",
+            "raise",
+            "the pier decision nobody else may read",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_b,
+        &sitrep_on("beta lane update", "beta-only-lane", &repo_b),
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "alpha row",
+            "--id",
+            "t-avis",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+
+    estate.bind_self("p-alpha-only", &[board_scope("read", &estate.id_a)]);
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    let mut refusals = Vec::new();
+    for path in five_routes("Beta", "t-bsecret")
+        .into_iter()
+        .chain(five_routes("Alpha", "t-no-such-row"))
+        .chain([
+            "/api/v1/board/harbour-wall-survey".to_owned(),
+            "/api/v1/task/Beta/t-bsecret".to_owned(),
+            "/api/v1/deployments".to_owned(),
+        ])
+    {
+        let answer = server.get(&path);
+        if (400..500).contains(&answer.status) {
+            refusals.push((path, answer));
+        }
+    }
+    assert!(
+        refusals.len() >= 5,
+        "the fixture produced too few refusals to measure: {:?}",
+        refusals.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    for (path, answer) in &refusals {
+        assert_eq!(
+            answer.body, DENIED_JSON,
+            "{path} answered a refusal of its own"
+        );
+        for secret in secrets {
+            assert!(
+                !answer.body.contains(secret),
+                "{path} named {secret} in a refusal: {}",
+                answer.body
+            );
+        }
+    }
+}
+
+/// SPA-09: no route serialises a lease token, on any of the five.
+///
+/// The token is taken from a real `kanban claim`, so what the bodies are
+/// searched for is the capability's own bytes and not merely a field name —
+/// a filter can be forgotten, and a test that only looked for `leaseToken`
+/// would pass on a body that spelled the same secret differently.
+#[test]
+fn no_json_route_serialises_a_lease_token_over_http() {
+    let estate = ManagedEstate::new("json-lease");
+    let work_a = estate.work_a.clone();
+    let repo_a = work_a.to_string_lossy().into_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "leased row",
+            "--id",
+            "t-leased",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "a decision on a leased row",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--task",
+            "t-leased",
+            "--json",
+        ],
+    );
+    estate.ok_json(&work_a, &sitrep_on("lane update", "leased-lane", &repo_a));
+    let lease = estate.ok_json(
+        &work_a,
+        &["claim", "t-leased", "--as", "driver-2", "--json"],
+    );
+    let token = lease["leaseToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the CLI claim carries no lease token to look for: {lease}"))
+        .to_owned();
+    assert!(!token.is_empty(), "{lease}");
+
+    let server = WebServer::start(&estate, &work_a, None);
+    for path in five_routes("Alpha", "t-leased") {
+        let answer = server.get(&path);
+        assert_eq!(answer.status, 200, "{path}: {}", answer.body);
+        assert!(
+            !answer.body.contains(&token),
+            "{path} served the lease token itself: {}",
+            answer.body
+        );
+        assert!(
+            !answer.body.contains("leaseToken"),
+            "{path} served a leaseToken field: {}",
+            answer.body
+        );
+    }
+    // The holder is still served — the token's absence is not the claim's.
+    let detail = server.get_json("/api/v1/task/Alpha/t-leased");
+    assert_eq!(detail["claim"]["agentID"], "driver-2", "{detail}");
+}
+
+/// SPA-06 / ADR-037 §4: every listing route says whether it was cut.
+///
+/// Each of the three bounds is crossed for real — one row past
+/// `OPEN_ATTENTION_ROWS`, past `LANE_UPDATE_ROWS` and past `DETAIL_ROWS` —
+/// because `truncated` is meant to be observed from an over-fetch rather
+/// than inferred from `returned == limit`, and a fixture that stopped at the
+/// bound could not tell the two apart. The two routes whose store call takes
+/// no bound report `limit: null` rather than inventing one.
+///
+/// On `/api/v1/lanes` the envelope's `returned` counts LANE GROUPS while
+/// `limit` is the per-board sitrep scan, which is what the contract says it
+/// is (`getLanes`: "`limit` is the per-board scan, `200`"), so the cut is
+/// asserted on the updates the groups carry. The rows are spread across
+/// [`LIVE_SITREPS_PER_LANE`]-sized lanes rather than piled into one, because
+/// posting a sitrep archives all but the last ten of its own lane: a single
+/// lane can never reach the scan's bound however many rows are written to
+/// it.
+#[test]
+fn every_json_listing_says_whether_it_was_capped_over_http() {
+    let estate = ManagedEstate::new("json-capped");
+    let work_a = estate.work_a.clone();
+    let repo_a = work_a.to_string_lossy().into_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "noted row",
+            "--id",
+            "t-noted",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    for index in 0..=DETAIL_ROWS {
+        let body = format!("note {index}");
+        estate.ok_json(&work_a, &note_on("t-noted", &body));
+    }
+    let lane_count = LANE_UPDATE_ROWS / LIVE_SITREPS_PER_LANE + 1;
+    for lane in 0..lane_count {
+        let lane_name = format!("capped-lane-{lane}");
+        for index in 0..LIVE_SITREPS_PER_LANE {
+            let body = format!("lane {lane} update {index}");
+            estate.ok_json(&work_a, &sitrep_on(&body, &lane_name, &repo_a));
+        }
+    }
+    for index in 0..=OPEN_ATTENTION_ROWS {
+        let body = format!("bulk ask {index}");
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                &body,
+                "--as",
+                "seed",
+                "--kind",
+                "risk",
+                "--json",
+            ],
+        );
+    }
+
+    let server = WebServer::start(&estate, &work_a, None);
+
+    let queue = server.get_json("/api/v1/needs-you");
+    assert_eq!(queue["limit"], OPEN_ATTENTION_ROWS, "{}", queue["limit"]);
+    assert_eq!(
+        queue["truncated"],
+        Value::Bool(true),
+        "the open queue was cut and did not say so"
+    );
+    assert_eq!(queue["returned"], OPEN_ATTENTION_ROWS);
+    assert_eq!(
+        queue["items"].as_array().unwrap().len(),
+        OPEN_ATTENTION_ROWS,
+        "the queue reported a count its rows do not support"
+    );
+
+    let lanes = server.get_json("/api/v1/lanes");
+    assert_eq!(lanes["limit"], LANE_UPDATE_ROWS, "{lanes}");
+    assert_eq!(
+        lanes["truncated"],
+        Value::Bool(true),
+        "the lane scan was cut and did not say so"
+    );
+    let groups = lanes["items"].as_array().unwrap();
+    assert_eq!(lanes["returned"], groups.len());
+    let updates: usize = groups
+        .iter()
+        .map(|group| group["updates"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(
+        updates, LANE_UPDATE_ROWS,
+        "the per-board scan handed over more or fewer rows than its bound"
+    );
+
+    let detail = server.get_json("/api/v1/task/Alpha/t-noted");
+    for capped in ["notes", "events"] {
+        let envelope = &detail[capped];
+        assert_eq!(envelope["limit"], DETAIL_ROWS, "{capped}: {envelope}");
+        assert_eq!(envelope["returned"], DETAIL_ROWS, "{capped}: {envelope}");
+        assert_eq!(
+            envelope["items"].as_array().unwrap().len(),
+            DETAIL_ROWS,
+            "{capped} reported a count its rows do not support: {envelope}"
+        );
+        assert_eq!(
+            envelope["truncated"],
+            Value::Bool(true),
+            "{capped} was cut and did not say so: {envelope}"
+        );
+    }
+    assert_eq!(detail["checkpoints"]["truncated"], Value::Bool(false));
+    assert_eq!(detail["checkpoints"]["limit"], DETAIL_ROWS);
+
+    // The two whose store call takes no bound report none rather than a
+    // number an operator would plan around.
+    for (path, pointer) in [
+        ("/api/v1/boards", Vec::new()),
+        ("/api/v1/board/Alpha", vec!["tasks"]),
+    ] {
+        let body = server.get_json(path);
+        let envelope = pointer.iter().fold(&body, |value, key| &value[*key]);
+        assert_eq!(envelope["limit"], Value::Null, "{path}: {envelope}");
+        assert_eq!(
+            envelope["truncated"],
+            Value::Bool(false),
+            "{path}: {envelope}"
+        );
+        assert_eq!(
+            envelope["returned"],
+            envelope["items"].as_array().unwrap().len(),
+            "{path} reported a count its rows do not support: {envelope}"
+        );
+    }
+}
+
+/// SPA-11 and SPA-12: each of the four writes is refused without a
+/// trusted-edge identity and refused across origins, and the board is
+/// unchanged afterwards.
+///
+/// The order the handler checks in is load-bearing and is what the two
+/// statuses distinguish: same-origin is decided BEFORE the actor and before
+/// the board is opened, so a cross-origin write is `403` even when it names
+/// a row that does not exist, and a same-origin write with no identity is
+/// `400` rather than being recorded as the default operator.
+///
+/// The bodies are the shipped ones: a rendered page carrying the product's
+/// own sentence. The contract declares these three refusals as
+/// `application/json`, which the server does not do; that divergence is its
+/// own named case below rather than a weakened assertion here.
+#[test]
+fn the_four_web_writes_are_refused_without_identity_and_across_origins_over_http() {
+    let estate = ManagedEstate::new("json-writes");
+    let work_a = estate.work_a.clone();
+    let raised = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "needs a call",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    let attention = raised["id"].as_str().unwrap().to_owned();
+    let settled = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "already decided",
+            "--as",
+            "seed",
+            "--kind",
+            "approval",
+            "--json",
+        ],
+    );
+    let settled = settled["id"].as_str().unwrap().to_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &settled,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task", "add", "a plan", "--type", "epic", "--status", "draft", "--id", "e-plan",
+            "--as", "seed", "--json",
+        ],
+    );
+
+    let server = WebServer::start(&estate, &work_a, Some("X-Auth-Request-Email"));
+    let writes = [
+        (
+            format!("/attention/Alpha/{attention}/reply"),
+            "decision=approve&reply=done",
+        ),
+        (format!("/attention/Alpha/{settled}/reopen"), ""),
+        ("/plan/Alpha/e-plan/open".to_owned(), ""),
+        ("/subscription/Alpha/sub-none/pause".to_owned(), ""),
+    ];
+    for (path, body) in &writes {
+        // No `Origin` at all: the gate requires one, it does not default.
+        let absent = server.request(
+            "POST",
+            path,
+            None,
+            &[("X-Auth-Request-Email", "sso@edge.test")],
+            Some(body),
+        );
+        assert_eq!(absent.status, 403, "{path} with no Origin: {}", absent.body);
+        assert!(
+            absent.body.contains(NOT_FROM_THIS_SITE),
+            "{path} refused in words of its own: {}",
+            absent.body
+        );
+        // Another origin, with a perfectly good identity behind it.
+        let cross = server.request(
+            "POST",
+            path,
+            Some("https://hostile.example"),
+            &[("X-Auth-Request-Email", "sso@edge.test")],
+            Some(body),
+        );
+        assert_eq!(cross.status, 403, "{path} cross-origin: {}", cross.body);
+        assert!(
+            cross.body.contains(NOT_FROM_THIS_SITE),
+            "{path} refused in words of its own: {}",
+            cross.body
+        );
+        // Same origin, no identity: fails closed rather than falling back to
+        // the default operator.
+        let anonymous = server.post(path, &[], body);
+        assert_eq!(
+            anonymous.status, 400,
+            "{path} with no identity: {}",
+            anonymous.body
+        );
+        assert!(
+            anonymous
+                .body
+                .contains("actor header X-Auth-Request-Email is required"),
+            "{path} did not say which identity was missing: {}",
+            anonymous.body
+        );
+    }
+
+    // Nothing was recorded by any of the twelve refusals.
+    let open = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    let open_ids = open
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        open_ids,
+        vec![attention],
+        "a refused write moved an attention row"
+    );
+    let plan = estate.ok_json(&work_a, &["task", "show", "e-plan", "--json"]);
+    assert_eq!(plan["status"], "draft", "a refused write opened the plan");
+}
+
+/// SPA-12: a client copy of the trusted-edge header cannot override the
+/// proxy-set one, and neither can a form field.
+///
+/// nginx sets `X-Auth-Request-Email` with `proxy_set_header`, which
+/// overwrites a client copy — so the case a client can actually create is a
+/// SECOND copy of the header arriving beside the edge's. The server refuses
+/// that outright rather than picking one, which is the only safe reading: on
+/// a duplicated header there is no way to tell which copy the edge wrote.
+/// The recorded actor on the write that IS accepted is asserted in the board
+/// itself, not in the response.
+#[test]
+fn a_client_copy_of_the_actor_header_cannot_override_the_trusted_edge_value_over_http() {
+    let estate = ManagedEstate::new("json-actor");
+    let work_a = estate.work_a.clone();
+    let first = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "first decision",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    let first = first["id"].as_str().unwrap().to_owned();
+    let second = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "second decision",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    let second = second["id"].as_str().unwrap().to_owned();
+
+    let server = WebServer::start(&estate, &work_a, Some("X-Auth-Request-Email"));
+
+    // Two copies: the edge's, then the client's. Refused, and nothing is
+    // recorded — not the first value, not the second.
+    let doubled = server.post(
+        &format!("/attention/Alpha/{first}/reply"),
+        &[
+            ("X-Auth-Request-Email", "sso@edge.test"),
+            ("X-Auth-Request-Email", "client@spoofed.example"),
+        ],
+        "decision=approve&reply=two+identities",
+    );
+    assert_eq!(doubled.status, 400, "{}", doubled.body);
+    assert!(
+        doubled
+            .body
+            .contains("actor header X-Auth-Request-Email must appear exactly once"),
+        "{}",
+        doubled.body
+    );
+
+    // One copy, with a client-supplied actor in the form beside it. The
+    // field is not an input to the identity at all.
+    let recorded = server.post(
+        &format!("/attention/Alpha/{second}/reply"),
+        &[("X-Auth-Request-Email", "sso@edge.test")],
+        "decision=approve&reply=done&actor=client%40spoofed.example",
+    );
+    assert_eq!(recorded.status, 303, "{}", recorded.body);
+
+    let open = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec![first],
+        "the refused write was recorded anyway"
+    );
+    let resolved = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "resolved", "--json"],
+    );
+    let rows = resolved.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{resolved}");
+    assert_eq!(rows[0]["id"].as_str(), Some(second.as_str()));
+    assert_eq!(
+        rows[0]["resolvedBy"].as_str(),
+        Some("sso@edge.test"),
+        "the recorded actor is not the header the server trusts: {resolved}"
+    );
+}
+
+/// SPA-10 / ADR-042 §4 refusal 13: a card left open in a tab cannot answer a
+/// key the row no longer carries.
+///
+/// The row's choices are rewritten between the render and the post, which is
+/// exactly what happens to a card left open while someone else edits the
+/// item. The old key is refused BY NAME rather than mapped onto whatever now
+/// sits in that position — the mapping is the dangerous behaviour, because
+/// the operator would be recording a decision they never read.
+#[test]
+fn a_reply_naming_a_choice_the_row_no_longer_carries_is_refused_by_name_over_http() {
+    let estate = ManagedEstate::new("json-stale-choice");
+    let work_a = estate.work_a.clone();
+    let raised = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "ship or hold",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--question",
+            "Ship tonight?",
+            "--context",
+            "The queue stays wrong until it lands.",
+            "--choice",
+            "ship=Ship it|approve",
+            "--choice",
+            "hold=Hold until morning|defer",
+            "--consequence",
+            "ship=It runs unwatched.",
+            "--consequence",
+            "hold=One more wrong day.",
+            "--recommend",
+            "ship",
+            "--json",
+        ],
+    );
+    let attention = raised["id"].as_str().unwrap().to_owned();
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "update",
+            &attention,
+            "--as",
+            "seed",
+            "--question",
+            "Ship tonight?",
+            "--context",
+            "Rewritten while the card was open.",
+            "--choice",
+            "go=Go now|approve",
+            "--choice",
+            "wait=Wait for the morning|defer",
+            "--consequence",
+            "go=It runs unwatched.",
+            "--consequence",
+            "wait=One more wrong day.",
+            "--recommend",
+            "go",
+            "--json",
+        ],
+    );
+
+    let server = WebServer::start(&estate, &work_a, Some("X-Auth-Request-Email"));
+    let path = format!("/attention/Alpha/{attention}/reply");
+    let stale = server.post(
+        &path,
+        &[("X-Auth-Request-Email", "sso@edge.test")],
+        "decision=ship&reply=from+a+card+left+open",
+    );
+    assert_eq!(stale.status, 409, "{}", stale.body);
+    assert!(
+        stale
+            .body
+            .contains(&format!("attention {attention} has no choice ship")),
+        "the stale key was not refused by name: {}",
+        stale.body
+    );
+    let open = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        open.as_array().unwrap().len(),
+        1,
+        "the refused answer settled the row anyway"
+    );
+
+    // The rewritten key is accepted, so what was measured is the key and not
+    // a broken write path.
+    let fresh = server.post(
+        &path,
+        &[("X-Auth-Request-Email", "sso@edge.test")],
+        "decision=go&reply=from+the+card+as+it+now+reads",
+    );
+    assert_eq!(fresh.status, 303, "{}", fresh.body);
+}
+
+/// SPA-06: THE PROJECTION INVARIANT — the JSON surface and the CLI answer the
+/// same rows for the same board and the same caller.
+///
+/// This is the one case that keeps the second surface from becoming a second
+/// implementation. Four routes are compared against the four CLI reads whose
+/// store calls they share, field by field on the keys the two shapes have in
+/// common, positionally, in the order each surface returned — nothing is
+/// sorted first, because the order is part of what is being compared and a
+/// sort would hide exactly the drift this exists to catch.
+///
+/// The open queue is seeded on ONE board on purpose: `needs_you` merges every
+/// board and re-sorts, so a two-board fixture would be comparing the merge
+/// rule against a single board's listing. The cross-board key is the card's
+/// `board` field, asserted separately.
+#[test]
+fn the_json_routes_answer_the_same_rows_as_the_cli_over_http() {
+    let estate = ManagedEstate::new("json-invariant");
+    let work_a = estate.work_a.clone();
+    let work_b = estate.work_b.clone();
+    let repo_a = work_a.to_string_lossy().into_owned();
+    let repo_b = work_b.to_string_lossy().into_owned();
+
+    for (index, title) in ["first row", "second row", "third row"].iter().enumerate() {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task",
+                "add",
+                title,
+                "--id",
+                &format!("t-row{index}"),
+                "--as",
+                "seed",
+                "--json",
+            ],
+        );
+    }
+    estate.ok_json(&work_a, &note_on("t-row0", "a note on the first row"));
+    estate.ok_json(&work_a, &["claim", "t-row0", "--as", "driver-2", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "a decision",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--task",
+            "t-row0",
+            "--priority",
+            "P0",
+            "--question",
+            "Ship it?",
+            "--context",
+            "Context.",
+            "--choice",
+            "ship=Ship it|approve",
+            "--choice",
+            "hold=Hold|defer",
+            "--consequence",
+            "ship=x",
+            "--consequence",
+            "hold=y",
+            "--recommend",
+            "ship",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "a risk",
+            "--as",
+            "seed",
+            "--kind",
+            "risk",
+            "--json",
+        ],
+    );
+    for index in 0..3 {
+        let body = format!("alpha update {index}");
+        estate.ok_json(&work_a, &sitrep_on(&body, "alpha-lane", &repo_a));
+    }
+    let beta_update = "beta update";
+    estate.ok_json(&work_b, &sitrep_on(beta_update, "beta-lane", &repo_b));
+    estate.ok_json(
+        &work_b,
+        &[
+            "task", "add", "beta row", "--id", "t-beta", "--as", "seed", "--json",
+        ],
+    );
+
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // 1. The board listing against `task list`.
+    let board = server.get_json("/api/v1/board/Alpha");
+    let listed = estate.ok_json(&work_a, &["task", "list", "--json"]);
+    let api_rows = board["tasks"]["items"].as_array().unwrap();
+    let cli_rows = listed.as_array().unwrap();
+    assert_eq!(
+        api_rows.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
+        cli_rows.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
+        "the board route and `task list` disagree on the rows or their order"
+    );
+    for (api, cli) in api_rows.iter().zip(cli_rows) {
+        agrees_on_shared_keys(api, cli, TASK_ANCHORS, "/api/v1/board/{project}");
+    }
+
+    // 2. The task detail against `task show`, including the claim summary
+    //    and the trail the CLI serves beside it.
+    let detail = server.get_json("/api/v1/task/Alpha/t-row0");
+    let shown = estate.ok_json(&work_a, &["task", "show", "t-row0", "--json"]);
+    agrees_on_shared_keys(
+        &detail["task"],
+        &shown,
+        TASK_ANCHORS,
+        "/api/v1/task/{project}/{id}",
+    );
+    agrees_on_shared_keys(
+        &detail["claim"],
+        &shown["claim"],
+        &["taskID", "agentID", "claimedAt", "expiresAt", "heartbeatAt"],
+        "the claim summary",
+    );
+    let api_notes = detail["notes"]["items"].as_array().unwrap();
+    let cli_notes = shown["notes"].as_array().unwrap();
+    assert_eq!(api_notes.len(), cli_notes.len(), "{detail}\n{shown}");
+    for (api, cli) in api_notes.iter().zip(cli_notes) {
+        agrees_on_shared_keys(api, cli, &["seq", "author", "body", "createdAt"], "a note");
+    }
+
+    // 3. The lanes grouping against `sitrep list --lane`, per group, in the
+    //    order each lane's own listing returns.
+    let lanes = server.get_json("/api/v1/lanes");
+    let groups = lanes["items"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{lanes}");
+    for group in groups {
+        let lane = group["lane"].as_str().unwrap();
+        let cwd = if group["board"] == "Alpha" {
+            &work_a
+        } else {
+            &work_b
+        };
+        let listed = estate.ok_json(
+            cwd,
+            &[
+                "sitrep",
+                "list",
+                "--lane",
+                lane,
+                "--limit",
+                &LANE_UPDATE_ROWS.to_string(),
+                "--json",
+            ],
+        );
+        let api_updates = group["updates"].as_array().unwrap();
+        let cli_updates = listed.as_array().unwrap();
+        assert_eq!(
+            api_updates.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
+            cli_updates.iter().map(|row| &row["id"]).collect::<Vec<_>>(),
+            "lane {lane}: the route and `sitrep list` disagree on the rows or their order"
+        );
+        for (api, cli) in api_updates.iter().zip(cli_updates) {
+            agrees_on_shared_keys(
+                api,
+                cli,
+                &["id", "lane", "author", "body", "createdAt"],
+                "a lane update",
+            );
+        }
+    }
+
+    // 4. The open queue against `attention list --status open`.
+    let queue = server.get_json("/api/v1/needs-you");
+    let cards = queue["items"].as_array().unwrap();
+    let open = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "open",
+            "--limit",
+            &OPEN_ATTENTION_ROWS.to_string(),
+            "--json",
+        ],
+    );
+    let rows = open.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "the fixture seeded the wrong queue: {open}");
+    assert_eq!(
+        cards.len(),
+        rows.len(),
+        "the queue and `attention list` disagree on how many rows are open"
+    );
+    for (card, row) in cards.iter().zip(rows) {
+        assert_eq!(card["board"], "Alpha", "{card}");
+        agrees_on_shared_keys(
+            &card["attention"],
+            row,
+            &["id", "kind", "status", "priority", "choices", "tags"],
+            "a needs-you card",
+        );
+    }
+}
+
+// -- findings: what the contract promises and this server does not do -------
+
+/// FINDING (`t-4b9501b3`, 2026-09-19): `/api/v1/lanes` hands over the sitreps
+/// of a board the caller may not read.
+///
+/// `lane_groups` (`rust/serve.rs`) iterates every ACTIVE board and calls
+/// `Store::sitreps` on each, and that method is not guarded — so a board the
+/// same principal is refused by `kanban sitrep list` is served in full over
+/// HTTP, with its lane name, its author, its body and its worktree path.
+/// This is a real divergence from SPA-08 ("a board the principal may not read
+/// is absent from every JSON body") and from the CLI, which refuses the same
+/// read for the same identity — asserted here as the positive control.
+///
+/// Ignored, not weakened: the assertion below is what the contract requires,
+/// and it fails against the shipped server. Fixing it is a change to
+/// `rust/serve.rs`/`rust/store.rs`, which this row does not own.
+#[test]
+#[ignore = "FINDING t-4b9501b3: /api/v1/lanes serves an unauthorized board's sitreps; the fix belongs to serve.rs/store.rs"]
+fn the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http() {
+    let estate = ManagedEstate::new("json-lane-leak");
+    let work_a = estate.work_a.clone();
+    let work_b = estate.work_b.clone();
+    let repo_a = work_a.to_string_lossy().into_owned();
+    let repo_b = work_b.to_string_lossy().into_owned();
+    estate.ok_json(&work_a, &sitrep_on("alpha update", "alpha-lane", &repo_a));
+    estate.ok_json(
+        &work_b,
+        &sitrep_on("the pier survey nobody else may read", "beta-lane", &repo_b),
+    );
+    estate.bind_self("p-alpha-only", &[board_scope("read", &estate.id_a)]);
+    estate.enforce("managed");
+
+    // The control: the CLI refuses this caller board B's sitreps.
+    estate.denied(&work_b, &["sitrep", "list", "--json"]);
+
+    let server = WebServer::start(&estate, &work_a, None);
+    let lanes = server.get_json("/api/v1/lanes");
+    assert!(
+        !lanes.to_string().contains("beta-lane")
+            && !lanes
+                .to_string()
+                .contains("the pier survey nobody else may read"),
+        "/api/v1/lanes served a board this caller may not read: {lanes}"
+    );
+}
+
+/// FINDING (`t-4b9501b3`, 2026-09-19): a whole-estate listing refuses
+/// entirely when ANY board is unreadable, rather than serving the readable
+/// ones.
+///
+/// `board_summaries` and `needs_you` iterate every active board and propagate
+/// the first refusal, so `/api/v1/boards` and `/api/v1/needs-you` answer `404
+/// denied or not found` to a caller who fully owns one board out of two. The
+/// CLI's `dashboard` does the same, so the two surfaces agree — but
+/// `docs/api/README.md` ("The denial does not enumerate") says a caller who
+/// asks for a list "is simply not handed the rows they may not see", and
+/// SPA-06 requires the page's data to arrive rather than a refusal.
+///
+/// Ignored, not weakened: the equivalence that DOES hold is asserted in
+/// `the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over_http`.
+#[test]
+#[ignore = "FINDING t-4b9501b3: a whole-estate listing refuses entire instead of serving the readable subset; the fix belongs to projection.rs/serve.rs"]
+fn a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http() {
+    let estate = ManagedEstate::new("json-listing-subset");
+    let work_a = estate.work_a.clone();
+    let work_b = estate.work_b.clone();
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "alpha row",
+            "--id",
+            "t-avis",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_b,
+        &[
+            "task", "add", "beta row", "--id", "t-bhid", "--as", "seed", "--json",
+        ],
+    );
+    estate.bind_self("p-alpha-only", &owner_of(&estate.id_a));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    let boards = server.get_json("/api/v1/boards");
+    let names = boards["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["board"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["Alpha".to_owned()],
+        "the index did not serve the readable board on its own: {boards}"
+    );
+    server.get_json("/api/v1/needs-you");
+}
+
+/// FINDING (`t-4b9501b3`, 2026-09-19): the four writes refuse in HTML, and
+/// the contract says they refuse in JSON.
+///
+/// `#/components/responses/Refused`, `WriteRejected` and `WriteConflict` each
+/// declare `application/json; charset=utf-8` with the `Error` schema, and
+/// every one of the four POST operations references them. The server answers
+/// a rendered `text/html` page for all three, which is the shipped behaviour
+/// the browser deck depends on (it parses the page and reads `.error`), so
+/// the divergence may well be the document's to fix rather than the server's
+/// — but it is a divergence either way, and it is not among the ones
+/// `docs/api/README.md` records.
+///
+/// Ignored, not weakened: the shipped shape is asserted in
+/// `the_four_web_writes_are_refused_without_identity_and_across_origins_over_http`.
+#[test]
+#[ignore = "FINDING t-4b9501b3: the write refusals answer text/html; the contract declares application/json"]
+fn the_write_refusals_answer_the_contracts_json_error_body_over_http() {
+    let estate = ManagedEstate::new("json-write-shape");
+    let work_a = estate.work_a.clone();
+    let raised = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "needs a call",
+            "--as",
+            "seed",
+            "--kind",
+            "decision",
+            "--json",
+        ],
+    );
+    let attention = raised["id"].as_str().unwrap().to_owned();
+    let server = WebServer::start(&estate, &work_a, Some("X-Auth-Request-Email"));
+    let path = format!("/attention/Alpha/{attention}/reply");
+    let cross = server.request(
+        "POST",
+        &path,
+        Some("https://hostile.example"),
+        &[("X-Auth-Request-Email", "sso@edge.test")],
+        Some("decision=approve&reply=done"),
+    );
+    assert_eq!(cross.status, 403);
+    assert!(
+        cross
+            .head
+            .contains("Content-Type: application/json; charset=utf-8"),
+        "the same-origin refusal answered as {}",
+        cross.head
+    );
+    assert_eq!(
+        cross.body,
+        format!("{{\"error\":\"{NOT_FROM_THIS_SITE}\"}}"),
+        "the same-origin refusal is not the contract's Error body"
     );
 }
 
@@ -1319,24 +2635,22 @@ struct WebServer {
 }
 
 impl WebServer {
-    fn start(estate: &ManagedEstate, cwd: &Path, header: &str) -> Self {
+    fn start(estate: &ManagedEstate, cwd: &Path, header: Option<&str>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a loopback port");
         let port = listener
             .local_addr()
             .expect("read the reserved port")
             .port();
         drop(listener);
-        let mut child = estate
-            .command(cwd)
-            .args([
-                "serve",
-                "--port",
-                &port.to_string(),
-                "--actor-header",
-                header,
-            ])
-            .spawn()
-            .expect("spawn kanban serve");
+        let mut command = estate.command(cwd);
+        command.args(["serve", "--port", &port.to_string()]);
+        // Without `--actor-header` the write surface records the default
+        // operator, which is the configuration the read routes are served
+        // under and the one a reader should be measured against.
+        if let Some(header) = header {
+            command.args(["--actor-header", header]);
+        }
+        let mut child = command.spawn().expect("spawn kanban serve");
         let stderr = child.stderr.take().expect("serve stderr is piped");
         let (sender, lines) = channel();
         thread::spawn(move || {
@@ -1372,34 +2686,155 @@ impl WebServer {
 
     /// One same-origin POST: `Host` and `Origin` name the same authority, so
     /// the CSRF gate passes and whatever happens next is the guard's answer.
-    fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> Answer {
+        let origin = format!("http://127.0.0.1:{}", self.port);
+        self.request("POST", path, Some(&origin), headers, Some(body))
+    }
+
+    /// One `GET`, with no `Origin`: a read carries no CSRF gate.
+    fn get(&self, path: &str) -> Answer {
+        self.request("GET", path, None, &[], None)
+    }
+
+    /// One `GET` that must have answered `200` with the contract's content
+    /// type, parsed.
+    fn get_json(&self, path: &str) -> Value {
+        let answer = self.get(path);
+        assert_eq!(answer.status, 200, "{path}: {}", answer.body);
+        assert!(
+            answer
+                .head
+                .contains("Content-Type: application/json; charset=utf-8"),
+            "{path} answered as {}",
+            answer.head
+        );
+        serde_json::from_str(&answer.body)
+            .unwrap_or_else(|error| panic!("{path} is not JSON: {error}\n{}", answer.body))
+    }
+
+    /// One request, exactly as written: the method, the path, an `Origin` or
+    /// deliberately none, headers in the order given — a repeated name is
+    /// sent twice, which is the only way to offer a second copy of one
+    /// header — and a body or none.
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Answer {
         let port = self.port;
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to kanban serve");
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         write!(
             stream,
-            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-             Connection: close\r\n",
-            body.len()
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        )
+        .unwrap();
+        if let Some(origin) = origin {
+            write!(stream, "Origin: {origin}\r\n").unwrap();
+        }
+        if body.is_some() {
+            write!(
+                stream,
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+            )
+            .unwrap();
+        }
+        write!(
+            stream,
+            "Content-Length: {}\r\nConnection: close\r\n",
+            body.unwrap_or("").len()
         )
         .unwrap();
         for (name, value) in headers {
             write!(stream, "{name}: {value}\r\n").unwrap();
         }
         write!(stream, "\r\n").unwrap();
-        stream.write_all(body.as_bytes()).unwrap();
+        stream.write_all(body.unwrap_or("").as_bytes()).unwrap();
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).unwrap();
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        let status = text
+        Answer::decode(&raw)
+    }
+}
+
+/// One response, cut into its head and the body the server meant to send.
+///
+/// The cut is on bytes, so the boundary cannot move, and the chunked framing
+/// is removed rather than left in the body: tiny_http picks chunked for
+/// anything at or above 32768 bytes, every page here carries an inline
+/// stylesheet, and a bounded listing of rows clears that easily — so an
+/// assertion about a needle would otherwise pass or fail on where a chunk
+/// boundary happened to fall.
+struct Answer {
+    status: u16,
+    head: String,
+    body: String,
+}
+
+impl Answer {
+    fn decode(raw: &[u8]) -> Self {
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4)
+            .unwrap_or(raw.len());
+        let (head, body) = raw.split_at(split);
+        let head = String::from_utf8_lossy(head).into_owned();
+        let status = head
             .split_whitespace()
             .nth(1)
             .and_then(|code| code.parse().ok())
             .unwrap_or(0);
-        (status, text)
+        let body = if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            dechunk(body)
+        } else {
+            body.to_vec()
+        };
+        Self {
+            status,
+            head,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    }
+}
+
+/// A chunked body put back together, byte for byte. Strict on purpose: a
+/// short read or a malformed frame panics here rather than returning the
+/// prefix it managed to decode, which is the one failure mode that would
+/// leave assertions passing against bytes that never arrived.
+fn dechunk(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    loop {
+        let eol = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a chunked body ended after {} bytes with no size line",
+                    body.len()
+                )
+            });
+        let line = String::from_utf8_lossy(&body[..eol]).into_owned();
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or(&line).trim(), 16)
+            .unwrap_or_else(|error| panic!("chunk size {line:?} is not hexadecimal: {error}"));
+        let rest = &body[eol + 2..];
+        if size == 0 {
+            return out;
+        }
+        assert!(
+            rest.len() >= size + 2,
+            "a chunk of {size} bytes arrived with {} bytes behind its size line",
+            rest.len()
+        );
+        out.extend_from_slice(&rest[..size]);
+        body = &rest[size + 2..];
     }
 }
 
