@@ -184,6 +184,7 @@ Usage:
              [--dry-run] [--verify] [--json]
   kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]
   kanban tag list [--json]
+  kanban tag rename OLD NEW --as ACTOR [--json]
   kanban tag remove NAME [--force] [--as ACTOR] [--json]
   kanban rule add [BODY | --body TEXT | --body-file PATH] --as ACTOR
              [--board NAME ... | --except-board NAME ...] [--sprint sp-ID]
@@ -1214,6 +1215,11 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     ("mcp", None, &[], &[], false),
     ("tag", Some("add"), &["as", "description"], &["name"], false),
     ("tag", Some("list"), &[], &[], true),
+    // Two positionals, in the order the sentence has: the name that exists,
+    // then the name it becomes. `--as` is required rather than defaulted
+    // because a rename rewrites rows nobody asked about, and the ledger entry
+    // is the only record of who decided that.
+    ("tag", Some("rename"), &["as"], &["old", "new"], false),
     ("tag", Some("remove"), &["as", "force"], &["name"], false),
     (
         "rule",
@@ -5089,6 +5095,76 @@ fn read_transfer_bundle(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A registry rule rewrite owed to a board rename that has not committed yet.
+///
+/// `tag rename` is one operation over two SQLite databases, and two
+/// connections cannot share a transaction, so the rule rewrite is a second
+/// transaction ordered *after* the board's. Alone, the board write has
+/// committed by the time the dispatch arm returns and the rewrite runs
+/// immediately. Inside a `transact`, the board write is part of a batch that
+/// commits only after the last item, so the rewrite is queued here and run
+/// once — after `commit_batch` — and dropped unrun on a rollback. Without the
+/// queue, a rolled-back batch would leave the rules renamed and the board not:
+/// rules pointing at a tag no board has.
+struct PendingRuleTagRename {
+    old: String,
+    new: String,
+    board: Option<String>,
+    actor: String,
+}
+
+impl PendingRuleTagRename {
+    fn apply(&self) -> Result<i64> {
+        Registry::open()?.rename_rule_tag(&self.old, &self.new, self.board.as_deref(), &self.actor)
+    }
+}
+
+thread_local! {
+    static PENDING_RULE_TAG_RENAMES: std::cell::RefCell<Vec<PendingRuleTagRename>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The rewrites one batch owes, taken off the queue and owned by the stack.
+///
+/// Taken *before* the board's commit or rollback is attempted, which is the
+/// whole point of the type. The queue is a thread-local and an MCP thread is
+/// long-lived, so anything still on it when a batch leaves by an early `?` —
+/// a commit that failed, a rollback that failed, a board that was never handed
+/// back — would be applied by the *next* batch on that thread: registry rule
+/// rewrites, with their own chained events, for a board rename that never
+/// landed. Owning them on the stack instead means every exit takes them with
+/// it, including a panic, and only the one path that saw `commit_batch`
+/// succeed can run them.
+struct OwedRuleTagRenames(Vec<PendingRuleTagRename>);
+
+impl OwedRuleTagRenames {
+    fn take() -> Self {
+        Self(PENDING_RULE_TAG_RENAMES.with_borrow_mut(std::mem::take))
+    }
+
+    /// Run them once the board's write has landed, or drop them unrun.
+    ///
+    /// A failure here is reported rather than swallowed, and it is survivable
+    /// in one direction only: the board carries the new spelling and those
+    /// rules still carry the old one, so they match fewer rows than intended
+    /// until `kanban rule update ID --tag NEW` catches them up.
+    fn settle(self, committed: bool) -> Result<()> {
+        if !committed {
+            return Ok(());
+        }
+        for rename in &self.0 {
+            rename.apply().with_context(|| {
+                format!(
+                    "the board renamed tag {} to {}, but the registry rules still carry {}: \
+                     run `kanban rule update ID --tag {}` on each rule that scopes it",
+                    rename.old, rename.new, rename.old, rename.new
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// The items of a `transact`, from `--items` or from a file.
 ///
 /// The pair is modelled on `--body`/`--body-file`, refusing both at once
@@ -5468,6 +5544,11 @@ fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
     let store = Store::open_as_caller(&store_path(args, creation)?)?;
     store.begin_batch()?;
     LENT_BOARD.with_borrow_mut(|slot| *slot = Some(store));
+    // A batch that unwound inside the item loop (a panic caught by a
+    // long-lived MCP thread) never reached the take below, so this batch
+    // starts by dropping whatever it left, unrun: nothing on the queue can
+    // belong to a board write this batch will commit.
+    drop(OwedRuleTagRenames::take());
 
     let mut results: Vec<Value> = Vec::new();
     let mut reported: Vec<Value> = Vec::new();
@@ -5492,6 +5573,10 @@ fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
         reported.push(json!({ "index": index, "ok": false, "skipped": true }));
     }
 
+    // Off the thread-local first, so every way out of here from this point on
+    // — including a commit that fails and a board that was never handed back
+    // — takes them with it instead of leaving them for the next batch.
+    let owed = OwedRuleTagRenames::take();
     let store = LENT_BOARD
         .with_borrow_mut(Option::take)
         .context("the batch's board was not handed back")?;
@@ -5499,6 +5584,8 @@ fn run_transact(args: &Args, creation: BoardCreation) -> Result<()> {
         Some(_) => store.rollback_batch()?,
         None => store.commit_batch()?,
     }
+    // Strictly after the board's commit, and only if there was one.
+    owed.settle(failed.is_none())?;
     print(
         &json!({
             "ok": failed.is_none(),
@@ -7035,6 +7122,30 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "tag" && sub == Some("list") {
         return print(&store.tags()?, args.has("json"));
+    }
+    if command == "tag" && sub == Some("rename") {
+        let old = rest.first().context("the tag to rename is required")?;
+        let new = rest.get(1).context("the new tag name is required")?;
+        let actor = args.require("as")?.to_owned();
+        let board = selected_board_name(&args)?;
+        // The board first, always: `rename_tag` documents why, and the queue
+        // below is what keeps that order true inside a `transact` batch, whose
+        // board write does not land until every item has run.
+        let mut renamed = store.rename_tag(old, new, Some(&actor))?;
+        let pending = PendingRuleTagRename {
+            old: old.clone(),
+            new: new.clone(),
+            board,
+            actor,
+        };
+        renamed.rules = if store.in_batch() {
+            let uses = Registry::open()?.rule_tag_uses(&pending.old, pending.board.as_deref())?;
+            PENDING_RULE_TAG_RENAMES.with_borrow_mut(|queue| queue.push(pending));
+            uses
+        } else {
+            pending.apply()?
+        };
+        return print(&renamed, args.has("json"));
     }
     if command == "tag" && sub == Some("remove") {
         let name = rest.first().context("tag name is required")?;
@@ -8772,6 +8883,44 @@ mod tests {
                 "--{flag} is not documented under Global options"
             );
         }
+    }
+
+    #[test]
+    fn a_batch_that_never_committed_owes_the_next_batch_nothing() {
+        // The queue is a thread-local and an MCP thread serves batch after
+        // batch. Taking it only after `commit_batch` succeeded would leave a
+        // rename owed on the thread whenever the commit or the rollback
+        // returned Err, and the NEXT batch would then rewrite registry rules,
+        // with chained events, for a board rename that never landed.
+        PENDING_RULE_TAG_RENAMES.with_borrow_mut(|queue| {
+            queue.push(PendingRuleTagRename {
+                old: "infra".to_owned(),
+                new: "ifca/infra".to_owned(),
+                board: Some("BOARD".to_owned()),
+                actor: "geoyws".to_owned(),
+            });
+        });
+
+        // Taken before the commit is attempted, so the thread-local is already
+        // empty while the outcome is still unknown.
+        let owed = OwedRuleTagRenames::take();
+        assert_eq!(owed.0.len(), 1, "the queued rename must move to the stack");
+        assert!(
+            PENDING_RULE_TAG_RENAMES.with_borrow(Vec::is_empty),
+            "the queue must be empty from the moment the batch owns it"
+        );
+
+        // A commit that failed leaves by `?`, which drops the owner unrun.
+        drop(owed);
+
+        // So the next batch on this thread owes nothing, and settling a
+        // committed batch touches no registry at all -- if anything had
+        // survived, this would open one and rewrite rules for a rename that
+        // never happened.
+        let next = OwedRuleTagRenames::take();
+        assert!(next.0.is_empty(), "a rename survived a batch that failed");
+        next.settle(true)
+            .expect("an empty batch settles without reaching the registry");
     }
 
     #[test]

@@ -1972,6 +1972,24 @@ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lan
 SELECT * FROM search_source_rows WHERE source_kind='sprint';
 INSERT INTO search_fts(search_fts) VALUES('rebuild');
 "#;
+
+/// Where a renamed tag records the spelling it arrived under.
+///
+/// Two nullable columns rather than a JSON `metadata` blob: the `tags` table
+/// has no metadata column at all, so the JSON route would have to add one
+/// column *and* teach every reader to parse it, where the provenance is two
+/// scalars every reader wants rendered. Two `ALTER TABLE ... ADD COLUMN`
+/// statements are also the smallest migration SQLite can run — no table
+/// rebuild, no trigger drop, no index churn — and `renamed_at` stays a
+/// first-class integer a query can order by.
+///
+/// Both are NULL for a tag still carrying the name it was registered under,
+/// which is what makes `renamedFrom` on a `tag list` row mean "this used to be
+/// called something else" rather than "this row predates the column".
+const BOARD_V29: &str = r#"
+ALTER TABLE tags ADD COLUMN renamed_from TEXT;
+ALTER TABLE tags ADD COLUMN renamed_at INTEGER;
+"#;
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -2273,7 +2291,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 28;
+pub const BOARD_SCHEMA_VERSION: usize = 29;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2733,7 +2751,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
-    BOARD_V26, BOARD_V27, BOARD_V28,
+    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4675,7 +4693,7 @@ mod tests {
         );
 
         migrate(&mut connection, BOARD_MIGRATIONS).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 28);
+        assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
         let preserved: (i64, String, String, Vec<u8>) = connection
             .query_row(
                 "SELECT seq,source_hash,embedding_model,embedding FROM search_documents \
