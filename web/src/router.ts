@@ -134,9 +134,10 @@ export function matchRoute(pathname: string, search: string): Route {
 /**
  * Go to `href` without a round trip.
  *
- * An address this application does not render is left to the browser: `/all`
- * is still a served page, and a link out of the estate is a link out of the
- * estate. Everything else is a history entry and one event.
+ * An address this application does not render is left to the browser: a
+ * link out of the estate is a link out of the estate, and so is a shape
+ * this bundle has no page for. Everything else is a history entry and one
+ * event.
  */
 export function navigate(href: string): void {
   const target = new URL(href, location.href);
@@ -146,8 +147,8 @@ export function navigate(href: string): void {
   }
   const route = matchRoute(target.pathname, target.search);
   if (!mounted.has(route.name)) {
-    // `/all`, a shape no page renders yet, and an address that names
-    // nothing: all three belong to the server, which has a page for each.
+    // A shape no page renders and an address that names nothing both
+    // belong to the server, which answers each with its refusal document.
     location.assign(target.href);
     return;
   }

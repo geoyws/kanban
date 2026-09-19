@@ -774,8 +774,19 @@ fn browser_sandbox_disables_only_for_root_uid() {
 /// machine Chrome has been seen dying immediately afterwards: the journey's
 /// very first call then fails with `Unable to make method calls because
 /// underlying connection is closed`, before a page has been loaded, let
-/// alone asserted on. A version call proves the connection, and a browser
-/// that will not start is replaced rather than half-used.
+/// alone asserted on. So a browser that will not start is replaced rather
+/// than half-used.
+///
+/// The proof is a real tab rather than a version string, because those two
+/// ask Chrome for different things. `Browser.getVersion` is answered by the
+/// browser process out of what it already knows; `Target.createTarget` has
+/// to spawn a renderer, and spawning a renderer is what fails when the host
+/// is out of memory. Probing with the weaker call let a browser that could
+/// not make a tab past this point, where the only caller left -- `opened_tab`
+/// -- can retry `new_tab` but cannot replace a browser it does not own, so
+/// it spent ninety seconds asking a dead connection. The probe tab is closed
+/// again: it has proved what it was for, and a renderer left running is the
+/// very resource that was scarce.
 fn launched_browser<F>(build: F, label: &str) -> Browser
 where
     F: Fn() -> headless_chrome::LaunchOptions<'static>,
@@ -783,9 +794,12 @@ where
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let failure = match Browser::new(build()) {
-            Ok(browser) => match browser.get_version() {
-                Ok(_) => return browser,
-                Err(error) => format!("the freshly launched browser did not answer: {error}"),
+            Ok(browser) => match browser.new_tab() {
+                Ok(probe) => {
+                    let _ = probe.close_target();
+                    return browser;
+                }
+                Err(error) => format!("the freshly launched browser made no tab: {error}"),
             },
             Err(error) => format!("launch failed: {error}"),
         };
@@ -24782,8 +24796,9 @@ fn dechunk(mut body: &[u8]) -> Vec<u8> {
 /// them back together byte for byte.
 ///
 /// This is the measurement [`decode_http_response`] rests on, rather than a
-/// belief about tiny_http: `/all` comes back `Transfer-Encoding: chunked`, the
-/// same page asked for with `TE: identity` comes back with a `Content-Length`,
+/// belief about tiny_http: `/api/v1/needs-you` comes back
+/// `Transfer-Encoding: chunked`, the same read asked for with
+/// `TE: identity` comes back with a `Content-Length`,
 /// and the decoded chunked body has to equal that unchunked one exactly --
 /// over a port and over a unix socket, because the two helpers must not
 /// disagree about what a page says.
@@ -24796,27 +24811,26 @@ fn dechunk(mut body: &[u8]) -> Vec<u8> {
 fn the_socket_helpers_decode_the_chunked_pages_this_server_really_sends() {
     let fixture = Fixture::new("serve-chunked");
     fixture.ok_json(&fixture.main, &["init", "--name", "CHUNKED", "--json"]);
-    // `/all` rather than `/`: the deck at `/` is the mounted shell since
-    // `t-1f495a7f` and is a few hundred bytes, far under tiny_http's
-    // threshold, while `/all` is still server-rendered and still crosses it
-    // -- measured on this build, and the assertion below is what keeps that
-    // measurement honest. Enough cards to clear the threshold with room to
-    // spare: the page with its inline stylesheet and script is a few
-    // kilobytes short of it on its own.
-    for lane in ["driver", "driver-2", "driver-3", "driver-4"] {
+    // The projection rather than a page: every document this server
+    // writes is the shell or a refusal since `t-bf255880` wave 2, and both
+    // are a few hundred bytes, far under tiny_http's threshold. The queue
+    // is what crosses it -- measured on this build, and the assertion
+    // below is what keeps that measurement honest. Enough cards to clear
+    // it with room to spare.
+    for lane in 0..40 {
         raise_carded(
             &fixture,
-            &format!("BLOCKED - {lane} is waiting on a decision as of 2026-09-10."),
-            &format!("codex@{lane}"),
+            &format!("BLOCKED - driver-{lane} is waiting on a decision as of 2026-09-10."),
+            &format!("codex@driver-{lane}"),
             &card_args(&["--kind", "decision", "--priority", "2"], &CARD),
         );
     }
 
     let server = spawn_server(&fixture);
-    let (_, _, before) = http_get_with_head(server.port, "/all", "TE: identity\r\n");
-    let (status, head, chunked) = http_get_with_head(server.port, "/all", "");
+    let (_, _, before) = http_get_with_head(server.port, "/api/v1/needs-you", "TE: identity\r\n");
+    let (status, head, chunked) = http_get_with_head(server.port, "/api/v1/needs-you", "");
     let (identity_status, identity_head, after) =
-        http_get_with_head(server.port, "/all", "TE: identity\r\n");
+        http_get_with_head(server.port, "/api/v1/needs-you", "TE: identity\r\n");
     assert_eq!(status, 200, "{head}");
     assert!(
         head.contains("Transfer-Encoding: chunked"),
@@ -24834,22 +24848,33 @@ fn the_socket_helpers_decode_the_chunked_pages_this_server_really_sends() {
         chunked == before || chunked == after,
         "the decoded page is not the page the server sent"
     );
-    // And it is a whole page rather than a prefix of one, which an assertion
-    // about an early needle would not have noticed.
-    assert!(chunked.starts_with("<!doctype html>"), "{chunked}");
-    assert!(chunked.trim_end().ends_with("</html>"), "{chunked}");
+    // And it is a whole projection rather than a prefix of one, which an
+    // assertion about an early needle would not have noticed.
+    assert!(chunked.starts_with("{\"items\":"), "{chunked}");
+    assert!(chunked.trim_end().ends_with('}'), "{chunked}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&chunked)
+            .expect("the decoded projection is JSON")["items"]
+            .as_array()
+            .expect("the items array")
+            .len(),
+        40,
+        "the decoded projection lost cards: {chunked}"
+    );
     assert!(
         !chunked.contains('\r'),
-        "chunk framing survived into the page: the markup carries no CR of its own"
+        "chunk framing survived into the projection: the JSON carries no CR of its own"
     );
 
     let sockets = SocketDir::new("serve-chunked");
     let socket = sockets.join("kanban.sock");
     let unix = spawn_unix_server(&fixture, &socket, None);
-    let (_, _, socket_before) = unix_http_get_with_head(&socket, "/all", "TE: identity\r\n");
-    let (socket_status, socket_head, over_socket) = unix_http_get_with_head(&socket, "/all", "");
+    let (_, _, socket_before) =
+        unix_http_get_with_head(&socket, "/api/v1/needs-you", "TE: identity\r\n");
+    let (socket_status, socket_head, over_socket) =
+        unix_http_get_with_head(&socket, "/api/v1/needs-you", "");
     let (_, socket_identity_head, socket_after) =
-        unix_http_get_with_head(&socket, "/all", "TE: identity\r\n");
+        unix_http_get_with_head(&socket, "/api/v1/needs-you", "TE: identity\r\n");
     assert_eq!(socket_status, 200, "{socket_head}");
     assert!(
         socket_head.contains("Transfer-Encoding: chunked"),
@@ -24863,8 +24888,8 @@ fn the_socket_helpers_decode_the_chunked_pages_this_server_really_sends() {
         over_socket == socket_before || over_socket == socket_after,
         "the decoded page over the socket is not the page the server sent"
     );
-    assert!(over_socket.starts_with("<!doctype html>"), "{over_socket}");
-    assert!(over_socket.trim_end().ends_with("</html>"), "{over_socket}");
+    assert!(over_socket.starts_with("{\"items\":"), "{over_socket}");
+    assert!(over_socket.trim_end().ends_with('}'), "{over_socket}");
     drop(unix);
     drop(server);
 }
@@ -24953,24 +24978,6 @@ fn a_decision_posted_with_nginx_upgrade_headers_answers_at_once() {
     );
     assert_eq!(resolved[0]["id"], id);
     assert_eq!(resolved[0]["decision"]["outcome"], "approve");
-}
-
-/// One card's markup, from its `<article>` to its close.
-///
-/// Slicing the page rather than searching all of it is the point: an
-/// assertion about the order of a card's parts must not be satisfied by a
-/// neighbouring card that happens to carry the same text.
-fn card_markup<'a>(html: &'a str, id: &str) -> &'a str {
-    let opening =
-        format!("<article class=item tabindex=0 data-testid=deck-card data-item=\"{id}\"");
-    let start = html
-        .find(&opening)
-        .unwrap_or_else(|| panic!("no card for {id} in {html}"));
-    let card = &html[start..];
-    let end = card
-        .find("</article>")
-        .unwrap_or_else(|| panic!("the card for {id} never closed"));
-    &card[..end]
 }
 
 /// Every needle appears in `html`, each one after the last.
@@ -25230,30 +25237,32 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
         .to_owned();
     let before = fs::read(&board).unwrap();
 
-    // The queue is the reason this exists. It is read at `/all` since
-    // `t-1f495a7f`: `/` is the mounted deck's shell and carries no rows, and
-    // `/all` is the same queue served as a list -- which is the surface this
-    // case is about, a page the server renders out of the real boards. The
-    // eyebrow is a sentence naming the raiser, the board and the age
-    // (WEB-23); the kind is not on the card at all, so the item is
-    // recognised by its raiser and question.
-    let (status, home) = http_get(port, "/all");
+    // The queue is the reason this exists, and since `t-bf255880` wave 2
+    // both surfaces that show it -- the deck at `/` and the list at `/all`
+    // -- are mounted, so the queue is read where they read it. The raiser,
+    // the board and the row's own text are the projection's; the sentence
+    // they are rendered into is the card's and is read in Chrome.
+    for mounted in ["/", "/all"] {
+        let (status, shell) = http_get(port, mounted);
+        assert_eq!(status, 200, "{shell}");
+        assert!(shell.contains("data-testid=app-root-shell"), "{shell}");
+    }
+    let (status, home) = http_get(port, "/api/v1/needs-you");
     assert_eq!(status, 200, "{home}");
-    assert!(home.contains("Needs you"), "{home}");
-    assert!(home.contains("claude@driver-1 asked on"), "{home}");
+    assert!(home.contains("\"raisedBy\":\"claude@driver-1\""), "{home}");
     assert!(home.contains("Staging push needs your call"), "{home}");
-    assert!(home.contains("SERVED"), "{home}");
-    assert!(!home.contains("class=\"kind"), "{home}");
+    assert!(home.contains("\"board\":\"SERVED\""), "{home}");
 
-    // Agent-authored text is escaped everywhere it lands, and the item's own
-    // body is agent-authored too.
+    // Agent-authored text reaches the client as text and typeset once, by
+    // the server's own `markdown`: the row carries the raiser's markup
+    // verbatim and the typeset copy carries none of it.
     assert!(
-        home.contains("&lt;b&gt;now&lt;/b&gt;"),
-        "attention body was not escaped: {home}"
+        home.contains("<b>now</b>"),
+        "the row lost its own text: {home}"
     );
     assert!(
-        !home.contains("<b>now</b>"),
-        "raw markup reached the page: {home}"
+        !home.contains("bodyHtml\":\"<p>Ship <b>now</b>"),
+        "raw markup was typeset rather than neutralised: {home}"
     );
 
     // `/boards`, `/lanes` and `/board/{project}` are the mounted
@@ -26453,102 +26462,113 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     let server = spawn_server(&fixture);
     let port = server.port;
 
-    // `/all`, not `/`: the cards are the same `decision_card` markup, and
-    // `/all` is where the server still renders them -- `/` is the mounted
-    // deck's shell since `t-1f495a7f`.
-    let (status, home) = http_get(port, "/all");
+    // The card's markup is the bundle's since `t-bf255880` wave 2, and
+    // the ORDER it renders in is read in Chrome on `/all` by
+    // `the_card_reads_in_the_adr_042_order_in_real_chrome`. What the server
+    // owes that order is the queue and the authored choices in the order
+    // they were declared, which is what this reads.
+    let (status, home) = http_get(port, "/api/v1/needs-you");
     assert_eq!(status, 200, "{home}");
-    // The card's order is the contract (ADR-042 §5), and it is the order the
-    // server renders rather than anything the script arranges: the eyebrow
-    // that says who is waiting and for how long, the question, the context,
-    // the recommendation and its consequence, the alternatives in the order
-    // they were declared, the note field, the folded free-text answer, the
-    // folded body, and only then the meta line a priority pill used to lead
-    // with.
-    let card = card_markup(&home, carded_id);
-    assert_in_order(
-        card,
-        &[
-            "<p class=eyebrow>",
-            " asked on ",
-            &format!("<h2 id=\"q-{carded_id}\">"),
-            "hax has no logged-in Claude account",
-            "<p class=context>",
-            "Claude Code 2.1.236 is installed on hax",
-            "<fieldset class=recommended data-testid=deck-recommended><legend>Recommended</legend>",
-            "value=\"assign-and-login\" data-label=\"Assign a Claude seat to hax and log in\"",
-            "<span class=key>1</span>",
-            "<p class=consequence>You buy or free one Claude seat",
-            "<div class=alternatives data-testid=deck-answers>",
-            "value=\"keep-parked\"",
-            "<span class=key>2</span>",
-            "value=\"drop-receipt\"",
-            "<span class=key>3</span>",
-            "<div class=reply><label for=\"answer-",
-            ">Add a note</label>",
-            "<textarea id=\"answer-",
-            "<details class=custom data-custom data-testid=deck-custom><summary>Answer in my own words</summary>",
-            "<legend>recorded as</legend>",
-            "data-testid=\"deck-outcome-approve\" value=approve>",
-            "data-testid=\"deck-outcome-other\" value=other>",
-            "name=decision value=custom data-testid=deck-record>Record my answer",
-            "<details class=full data-testid=deck-full><summary>show the full item</summary>",
-            "<div class=\"body md\" data-testid=deck-body><p>PARKED - until an account is assigned",
-            "<p class=meta>",
-            "class=\"priority priority-p0\"",
-        ],
+    // The card's ORDER is the contract (ADR-042 §5) and it is the bundle
+    // that renders it, so the order is read in Chrome — by
+    // `the_card_reads_in_the_adr_042_order_in_real_chrome`, on this same
+    // `/all`. What the SERVER owes that card is read here: the question,
+    // the context, the authored choices in the order they were declared
+    // with exactly one recommendation, and — for a row that authored none
+    // — the synthesized pair with no recommendation and no context.
+    let projected: Value = serde_json::from_str(&home).expect("the queue is JSON");
+    let rows = projected["items"].as_array().expect("the queue's rows");
+    let row = |id: &str| -> &Value {
+        rows.iter()
+            .find(|card| card["attention"]["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is not in the queue: {home}"))
+    };
+    let carded_row = row(carded_id);
+    assert!(
+        carded_row["attention"]["question"]
+            .as_str()
+            .expect("the authored question")
+            .contains("hax has no logged-in Claude account"),
+        "{carded_row}"
+    );
+    assert!(
+        carded_row["attention"]["context"]
+            .as_str()
+            .expect("the authored context")
+            .contains("Claude Code 2.1.236 is installed on hax"),
+        "{carded_row}"
+    );
+    let choices = carded_row["attention"]["choices"]
+        .as_array()
+        .expect("the authored choices");
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice["key"].as_str().expect("a choice key"))
+            .collect::<Vec<_>>(),
+        ["assign-and-login", "keep-parked", "drop-receipt"],
+        "the authored choices are not in the order they were declared: {carded_row}"
+    );
+    assert_eq!(
+        choices
+            .iter()
+            .filter(|choice| choice["recommended"] == Value::Bool(true))
+            .count(),
+        1,
+        "{carded_row}"
+    );
+    assert!(
+        choices[0]["consequence"]
+            .as_str()
+            .expect("the recommendation's consequence")
+            .contains("You buy or free one Claude seat"),
+        "{carded_row}"
+    );
+    assert!(
+        carded_row["bodyHtml"]
+            .as_str()
+            .expect("the typeset body")
+            .contains("PARKED - until an account is assigned"),
+        "{carded_row}"
     );
     // A row that authored no card is the same card with the default pair:
     // its first body line as the question, two choices, and nothing marked
     // recommended, because nobody authored the pair.
-    let default_card = card_markup(&home, approve_id);
-    assert_in_order(
-        default_card,
-        &[
-            &format!("<h2 id=\"q-{approve_id}\">Choose the rollout window</h2>"),
-            "value=\"approve\" data-label=\"Approve - proceed\"",
-            "<p class=consequence>The work the body describes goes ahead as written.</p>",
-            "value=\"reject\" data-label=\"Reject - do not proceed\"",
-            "<div class=reply>",
-            "<details class=custom data-custom data-testid=deck-custom>",
-        ],
+    let default_row = row(approve_id);
+    // The projection reports what was AUTHORED: a row with no card carries
+    // no question of its own, and the first line of its body is what the
+    // deck heads the card with (`web/src/card.tsx`). Asserting a composed
+    // question here would be asserting the client's fallback twice.
+    assert_eq!(
+        default_row["attention"]["question"],
+        serde_json::Value::Null,
+        "{default_row}"
+    );
+    assert_eq!(
+        default_row["attention"]["body"], "Choose the rollout window",
+        "{default_row}"
+    );
+    assert_eq!(
+        default_row["attention"]["choices"]
+            .as_array()
+            .expect("the default pair")
+            .iter()
+            .map(|choice| choice["label"].as_str().expect("a label"))
+            .collect::<Vec<_>>(),
+        ["Approve - proceed", "Reject - do not proceed"],
+        "{default_row}"
     );
     assert!(
-        !default_card.contains("class=recommended"),
-        "a synthesized pair marked a recommendation: {default_card}"
+        default_row["attention"]["choices"]
+            .as_array()
+            .expect("the default pair")
+            .iter()
+            .all(|choice| choice["recommended"] != Value::Bool(true)),
+        "a synthesized pair marked a recommendation: {default_row}"
     );
     assert!(
-        !default_card.contains("<p class=context>"),
-        "{default_card}"
-    );
-    assert!(home.contains("new WebSocket"), "{home}");
-    assert!(
-        home.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
-        "{home}"
-    );
-    // The deck's own keys line (the one with `s skip`) is rendered by the
-    // bundle now, so it is proved where it exists: the deck journeys in
-    // real Chrome. The served list's line is asserted just below.
-    // The plain list keeps its own quiet map (no skip: every card is on
-    // screen), and it is where the page explains itself at length: the deck
-    // spends its screen on the card.
-    let (status, list) = http_get(port, "/all");
-    assert_eq!(status, 200, "{list}");
-    assert!(
-        list.contains("<p class=keys>1–4 answer · u undo · c own</p>"),
-        "{list}"
-    );
-    assert!(
-        list.contains(
-            "<p class=explain>Each card is one question an agent is waiting on. Pick an \
-             answer and it is recorded on the board at once; the agent continues from \
-             there. Undo any decision from Recent decisions.</p>"
-        ),
-        "{list}"
-    );
-    assert!(
-        list.contains(&format!("/attention/SERVEWRITE/{approve_id}/reply")),
-        "{list}"
+        default_row["attention"]["context"].is_null(),
+        "a synthesized card grew a context: {default_row}"
     );
 
     let path = format!("/attention/SERVEWRITE/{approve_id}/reply");
@@ -27434,6 +27454,68 @@ fn list_tab(chrome: &Browser, origin: &str) -> Arc<headless_chrome::Tab> {
     wait_for_shell_ready(&tab);
     tab.wait_for_element(ui::CARD).expect("a decision card");
     tab
+}
+
+/// ADR-042 §5 — the card reads in one order, and it is the order the reader
+/// gets.
+///
+/// The order was asserted against `decision_card`'s served bytes until
+/// `t-bf255880` wave 2 deleted that renderer. It is the same claim, read
+/// off the DOM the bundle builds on `/all`, where every card is on screen:
+/// the eyebrow that says who is waiting, the question, the context, the
+/// recommendation and its consequence, the alternatives in the order they
+/// were declared, the note field, the folded own-words answer, and the
+/// priority pill in the orientation line rather than over the question.
+#[test]
+fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-card-order");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CARDORDER", "--json"]);
+    let carded = raise_carded(
+        &fixture,
+        "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
+        "codex@driver",
+        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+    );
+    let id = carded["id"].as_str().expect("the raised id").to_owned();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = list_tab(&chrome, &origin);
+    let rendered = js_value(
+        &tab,
+        &format!("document.querySelector('[data-testid=deck-card][data-item=\"{id}\"]').outerHTML"),
+    );
+    let markup = rendered.as_str().expect("the card's markup").to_owned();
+    assert_in_order(
+        &markup,
+        &[
+            "class=\"eyebrow\"",
+            " asked on ",
+            "data-testid=\"deck-priority\"",
+            &format!("id=\"q-{id}\""),
+            "hax has no logged-in Claude account",
+            "class=\"context\"",
+            "Claude Code 2.1.236 is installed on hax",
+            "data-testid=\"deck-recommended\"",
+            "Recommended",
+            "data-testid=\"deck-choice-assign-and-login\"",
+            "You buy or free one Claude seat",
+            "data-testid=\"deck-answers\"",
+            "data-testid=\"deck-choice-keep-parked\"",
+            "data-testid=\"deck-choice-drop-receipt\"",
+            ">Add a note</label>",
+            "data-testid=\"deck-note\"",
+            "data-testid=\"deck-custom\"",
+            "Answer in my own words",
+            "recorded as",
+            "data-testid=\"deck-outcome-approve\"",
+            "data-testid=\"deck-outcome-other\"",
+            "data-testid=\"deck-record\"",
+        ],
+    );
+    drop(server);
 }
 
 /// Open the hamburger menu, which is where every destination lives now.
@@ -30046,6 +30128,38 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
             recommended(held_id)
         ),
     );
+    // `Sending…` is a transient: the deck escalates the pressed button to
+    // `Still sending…` eight seconds into an unanswered POST, on purpose.
+    // Reading the label afterwards over four sequential CDP round-trips is
+    // therefore a race the suite loses when the host is loaded, and the
+    // claim is about the first frame anyway. So record the label inside the
+    // page the moment the button becomes the pressed one, and assert what
+    // the operator actually saw rather than whatever the harness got round
+    // to asking for.
+    let recommended_literal = serde_json::to_string(&recommended(held_id))
+        .expect("the recommendation selector as a JS string literal");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                r#"(() => {{
+  window.__pressedLabel = null;
+  const watch = () => {{
+    const button = document.querySelector({recommended_literal});
+    if (window.__pressedLabel === null && button !== null && button.hasAttribute('data-pressed')) {{
+      window.__pressedLabel = button.textContent;
+    }}
+  }};
+  new MutationObserver(watch).observe(document.body, {{
+    subtree: true, childList: true, characterData: true, attributes: true
+  }});
+  return true;
+}})()"#
+            )
+        ),
+        true,
+        "the pressed-label recorder did not install"
+    );
     tab.wait_for_element(&recommended(held_id))
         .expect("the recommended button")
         .click()
@@ -30072,14 +30186,9 @@ fn a_click_shows_sending_until_the_board_answers_in_real_chrome() {
         "true",
         "a card with a decision in flight is not marked busy"
     );
+    wait_for_js_true(&tab, "window.__pressedLabel !== null");
     assert_eq!(
-        js_value(
-            &tab,
-            &format!(
-                "document.querySelector('{}').textContent",
-                recommended(held_id)
-            )
-        ),
+        js_value(&tab, "window.__pressedLabel"),
         "Sending…",
         "the pressed button says nothing about what it is doing"
     );
@@ -31367,117 +31476,6 @@ fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
         .get_attribute_value("class")
         .expect("read class");
     assert_eq!(classes.as_deref(), Some("notice summary"), "{classes:?}");
-    drop(server);
-}
-
-#[test]
-fn a_redelivered_notice_does_not_act_or_render_twice_in_real_chrome() {
-    browser_loopback_reservation_supported()
-        .expect("reserve loopback port for browser-backed server tests");
-    // The server never sends one key twice — a new connection starts at the
-    // head — so the redelivery here is handed to the page's OWN handler with
-    // the frame the server actually sent, key and all. That the server cannot
-    // produce a duplicate is exactly why the guard has to be in the browser:
-    // nothing upstream is left to prove it.
-    let fixture = Fixture::new("serve-notice-twice");
-    fixture.ok_json(&fixture.main, &["init", "--name", "TWICE", "--json"]);
-    for id in ["t-once", "t-later"] {
-        fixture.ok_json(
-            &fixture.main,
-            &["task", "add", "Approve the release", "--id", id, "--json"],
-        );
-    }
-    let server = spawn_server(&fixture);
-    let origin = server.origin();
-
-    let chrome = launch_browser(chrome_binary());
-    let tab = opened_tab(&chrome, "initial tab");
-    // The notices strip is the same on every page, and these cases are
-    // about the socket rather than the deck: the plain list keeps the strip
-    // on screen, while the deck turns each notice into a toast that takes
-    // itself away after six seconds.
-    tab.navigate_to(&format!("{origin}all"))
-        .expect("load the open list");
-    tab.wait_until_navigated().expect("initial navigation");
-    wait_for_live_status(&tab, "live", "first connect");
-
-    fixture.ok_json(
-        &fixture.main,
-        &[
-            "attention",
-            "raise",
-            "Approve the release",
-            "--as",
-            "codex@driver",
-            "--kind",
-            "decision",
-            "--task",
-            "t-once",
-            "--json",
-        ],
-    );
-    wait_for_notice_rows(&tab, 1, "first delivery");
-    let key = tab
-        .find_element(ui::NOTICE)
-        .expect("notice row")
-        .get_attribute_value("data-key")
-        .expect("read data-key")
-        .expect("the notice carries a key");
-    let redeliver = format!(
-        "applyNotice({{type:'notice',key:{key:?},what:'Attention raised',\
-         task:'t-once',title:'Approve the release',board:'TWICE'}}) === false"
-    );
-
-    assert_eq!(
-        tab.evaluate(&redeliver, false)
-            .expect("redeliver the notice")
-            .value,
-        Some(json!(true)),
-        "the page accepted a key it had already rendered"
-    );
-    assert_eq!(
-        notice_rows_on_page(&tab).len(),
-        1,
-        "a redelivered notice rendered twice"
-    );
-
-    // Dismissing is the action a notice offers. A redelivery must not undo it:
-    // the key is remembered, so the answer stays "already seen".
-    tab.find_element(&format!("{} > .dismiss", ui::NOTICE))
-        .expect("dismiss button")
-        .click()
-        .expect("dismiss the notice");
-    wait_for_notice_rows(&tab, 0, "after dismissing");
-    assert_eq!(
-        tab.evaluate(&redeliver, false)
-            .expect("redeliver the dismissed notice")
-            .value,
-        Some(json!(true)),
-        "a dismissed notice came back on redelivery"
-    );
-    assert!(
-        notice_rows_on_page(&tab).is_empty(),
-        "a dismissed notice came back on redelivery"
-    );
-
-    // And the guard is memory, not deafness: a different change still lands.
-    fixture.ok_json(
-        &fixture.main,
-        &[
-            "attention",
-            "raise",
-            "A second decision",
-            "--as",
-            "codex@driver",
-            "--kind",
-            "decision",
-            "--task",
-            "t-later",
-            "--json",
-        ],
-    );
-    let rows = wait_for_notice_rows(&tab, 1, "a different change");
-    assert!(rows[0].contains("t-later"), "{rows:?}");
     drop(server);
 }
 
@@ -32803,13 +32801,16 @@ fn a_socket_listener_serves_pages_and_the_kernel_holds_the_mode_it_was_given() {
     fixture.ok_json(&fixture.main, &["init", "--name", "UNIXSOCK", "--json"]);
     let server = spawn_unix_server(&fixture, &socket, None);
 
-    // `/all`, not `/`: `/` is the mounted deck's shell since `t-1f495a7f`
-    // and proves nothing about a page having been rendered, while `/all` is
-    // the same queue served as a list. What is being proved here is that a
-    // listener on a unix socket answers a real page at all.
+    // What is being proved here is that a listener on a unix socket
+    // answers at all. Every address answers the application shell since
+    // `t-bf255880` wave 2, so the page is the shell and the rows are the
+    // projection -- both are asked for over the socket.
     let (status, home) = unix_http_get(&socket, "/all");
     assert_eq!(status, 200, "{home}");
-    assert!(home.contains("<h1>Needs you"), "{home}");
+    assert!(home.contains("data-testid=app-root-shell"), "{home}");
+    let (status, queue) = unix_http_get(&socket, "/api/v1/needs-you");
+    assert_eq!(status, 200, "{queue}");
+    assert!(queue.contains("\"items\""), "{queue}");
 
     let pinned = fs::symlink_metadata(&socket).unwrap();
     assert!(
@@ -46379,6 +46380,42 @@ fn the_json_routes_answer_get_only_over_http() {
     assert_eq!(status, 200, "{body}");
 }
 
+/// The search route bounds its query before the store sees it.
+///
+/// `SEARCH_MAX_CHARS` bounds what comes BACK; nothing bounded what went in,
+/// so a megabyte of `q` was a megabyte of LIKE patterns run over every
+/// readable board on one unauthenticated GET (`t-bf255880` wave 2, from the
+/// wave-1 security review). The bound is `MAX_QUERY_BYTES`, the refusal is
+/// one sentence, and a query at the bound is still answered.
+#[test]
+fn an_overlong_search_query_is_refused_before_the_store_over_http() {
+    let fixture = Fixture::new("serve-search-bound");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SEARCHBOUND", "--json"]);
+    fixture.ok_json(&fixture.main, &["task", "add", "Bound the query", "--json"]);
+    let server = spawn_server(&fixture);
+
+    // At the bound: answered, because the bound is a bound and not a
+    // margin. 4096 is `MAX_QUERY_BYTES`.
+    let at_bound = "q".repeat(4096);
+    let (status, body) = http_get(server.port, &format!("/api/v1/search?q={at_bound}"));
+    assert_eq!(status, 200, "a query at the bound was refused: {body}");
+
+    let past_bound = "q".repeat(4097);
+    let (status, body) = http_get(server.port, &format!("/api/v1/search?q={past_bound}"));
+    assert_eq!(status, 400, "an overlong query reached the store: {body}");
+    assert_eq!(
+        body.trim(),
+        "{\"error\":\"The search query is too long. Shorten it and try again.\"}",
+        "the refusal is not the one sentence: {body}"
+    );
+    // It says nothing about what was sent, and it is not the store's
+    // non-enumerating denial wearing a different code.
+    assert!(
+        !body.contains("qqqq"),
+        "the refusal echoed the query: {body}"
+    );
+}
+
 #[test]
 fn a_capped_json_listing_says_it_was_capped_over_http() {
     // ADR-037 §4: a listing that was cut says so, in the envelope, with the
@@ -50576,158 +50613,96 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
     assert_eq!(resolved["decision"]["choice"], "keep-parked", "{resolved}");
 }
 
-/// WEB-38 (http): the drawer is nine anchors in the served HTML, and every
-/// one of them answers a plain `GET` with `200` and its own heading. No
-/// browser and no script - the way a phone with JavaScript blocked, a
-/// crawler behind the SSO, or `curl` sees the site.
+/// Every destination the drawer names answers, with no script anywhere.
 ///
-/// The drawer is read from `/all` since `t-1f495a7f`: `/` is the mounted
-/// deck's shell and carries no navigation of its own, and `/all` is the
-/// same queue as a served list with the same drawer in it. `/` is still
-/// swept as a destination, and what it has to answer without a script is
-/// the shell the bundle mounts into - a mount point rather than a heading,
-/// which is the cutover's recorded consequence (spec SPA-51, ADR-048).
-///
-/// `t-bf255880` wave 1 moved every remaining drawer destination onto the
-/// bundle - `/decided`, `/lanes`, `/boards`, `/sprints`, `/plans`,
-/// `/deployments` and `/subscriptions` - so their scriptless answer is the
-/// same mount point, and with `/` that is eight of the nine answering it.
-/// `/all` is the one the drawer still points at that the server renders.
-/// The wave moved routes the drawer does not name too - `/board/{project}`,
-/// `/sprints/{project}`, `/sprint/{project}/{id}`, `/task/{project}/{id}`,
-/// `/deployment/{project}/{id}` and `/search` - which is why the shapes
-/// this case can reach are fewer than the shapes `render` answers. What it
-/// holds for all nine anchors is the part that is about the drawer rather
-/// than the renderer: every anchor the spec names is there, every href is
-/// site-local, every one answers `200`, and the drawer holds no tenth
-/// destination.
+/// The drawer itself is the bundle's since `t-bf255880` wave 2, and which
+/// anchors it holds is read in Chrome. What is read here is the half a
+/// browser cannot tell you apart from a mount: that every address the spec
+/// names is an address this server answers, with the application, over
+/// plain HTTP.
 #[test]
 fn every_destination_answers_without_a_script_over_http() {
     let (fixture, _ids) = deck_fixture("serve-nav-http", "NAVHTTP");
     let server = spawn_server(&fixture);
     let port = server.port;
 
-    let (status, home) = http_get(port, "/all");
-    assert_eq!(status, 200, "{home}");
-    // The destination set is the spec's, in its words; the hrefs are read
-    // from the page rather than assumed, so a renamed route fails here.
-    let expected = [
-        // `/` is the shell: the mount point is what it has to answer with,
-        // and a heading would mean the deck went back to being served.
-        ("needs-you", "data-testid=app-root-shell"),
-        ("all", "<h1>Needs you"),
-        // Mounted since `t-bf255880` wave 1: like `/`, what these answer
-        // without a script is the mount point the bundle fills.
-        ("decided", "data-testid=app-root-shell"),
-        ("lanes", "data-testid=app-root-shell"),
-        ("boards", "data-testid=app-root-shell"),
-        ("sprints", "data-testid=app-root-shell"),
-        ("plans", "data-testid=app-root-shell"),
-        ("deployments", "data-testid=app-root-shell"),
-        ("subscriptions", "data-testid=app-root-shell"),
+    // The spec's nine destinations, in the drawer's own order
+    // (`web/src/shell.tsx`'s `DESTINATIONS`).
+    let destinations = [
+        "/",
+        "/all",
+        "/decided",
+        "/lanes",
+        "/boards",
+        "/sprints",
+        "/plans",
+        "/deployments",
+        "/subscriptions",
     ];
-    for (destination, heading) in expected {
-        let marker = format!(" data-nav={destination}>");
-        let at = home
-            .find(&marker)
-            .unwrap_or_else(|| panic!("no data-nav={destination} anchor on /all:\n{home}"));
-        let tag_start = home[..at]
-            .rfind("<a ")
-            .unwrap_or_else(|| panic!("data-nav={destination} is not on an anchor"));
-        let tag = &home[tag_start..at];
-        let href = tag
-            .split_once("href=\"")
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .map(|(href, _)| href.to_owned())
-            .unwrap_or_else(|| panic!("data-nav={destination} has no href: {tag}"));
+    for href in destinations {
+        let (status, page) = http_get(port, href);
+        assert_eq!(status, 200, "GET {href}:\n{page}");
         assert!(
-            href.starts_with('/') && !href.starts_with("//"),
-            "data-nav={destination} leaves the site: {href}"
-        );
-        let (status, page) = http_get(port, &href);
-        assert_eq!(
-            status, 200,
-            "GET {href} for data-nav={destination}:\n{page}"
-        );
-        assert!(
-            page.contains(heading),
-            "GET {href} for data-nav={destination} did not render {heading:?}:\n{page}"
+            page.contains("<div id=root data-testid=app-root-shell></div>"),
+            "GET {href} did not answer the application:\n{page}"
         );
     }
-    assert_eq!(
-        home.matches(" data-nav=").count(),
-        expected.len(),
-        "the drawer holds a destination the spec does not name:\n{home}"
+    // And an address the drawer does not name is not a page: the refusal
+    // document, which is the only other thing this server writes.
+    let (status, missing) = http_get(port, "/no-such-destination");
+    assert_eq!(status, 200, "{missing}");
+    assert!(
+        missing.contains("No page at that address"),
+        "an unnamed address answered something other than the refusal: {missing}"
     );
 }
 
-/// `/all` is the queue as one plain list, and `/` is no longer a page at
-/// all: it is the application shell (`t-1f495a7f`, spec SPA-51).
+/// `/all` is the whole queue, and it is the application answering it.
 ///
 /// The list stays because a deck is a bad way to read a queue of 133: it is
-/// where the whole thing is visible at once. It is still server-rendered,
-/// which is what this case measures over HTTP with no browser in it; the
-/// deck's own rendering is measured in Chrome, because it is the bundle's.
+/// where the whole thing is visible at once. What changed with `t-bf255880`
+/// wave 2 is that it is the same mounted application the deck is, reading
+/// the same `/api/v1/needs-you` — so what this case measures over HTTP is
+/// the two halves the server owes: the document, which carries no rows, and
+/// the projection, which carries all of them in the order both surfaces
+/// render. The rendered list is measured in Chrome, by the cases `list_tab`
+/// drives.
 #[test]
-fn the_all_route_keeps_the_plain_list_while_the_root_is_the_shell_over_http() {
+fn the_all_route_answers_the_application_and_the_queue_over_http() {
     let (fixture, ids) = deck_fixture("serve-deck-all", "DECKALL");
     let server = spawn_server(&fixture);
     let port = server.port;
 
-    let (status, list) = http_get(port, "/all");
-    assert_eq!(status, 200, "{list}");
-    for id in &ids {
+    for route in ["/", "/all"] {
+        let (status, shell) = http_get(port, route);
+        assert_eq!(status, 200, "{shell}");
         assert!(
-            list.contains(&format!("data-item=\"{id}\"")),
-            "the list is missing {id}: {list}"
+            shell.contains("<div id=root data-testid=app-root-shell></div>"),
+            "{route} is not the application shell: {shell}"
         );
-    }
-    assert!(
-        list.contains("<main id=main>"),
-        "the list is not the server-rendered page: {list}"
-    );
-    assert!(
-        list.contains("<p class=count><span data-open-count>3</span> open across 1 board</p>"),
-        "{list}"
-    );
-    assert!(
-        list.contains("<p class=explain>Each card is one question an agent is waiting on."),
-        "{list}"
-    );
-
-    // And `/` carries none of it. The deck reads the same queue through the
-    // JSON projection, so the cards cannot drift from the list's — they are
-    // one `Store` read — but nothing data-bearing is in the document the
-    // route answers.
-    let (status, shell) = http_get(port, "/");
-    assert_eq!(status, 200, "{shell}");
-    assert!(
-        shell.contains("<div id=root data-testid=app-root-shell></div>"),
-        "/ is not the application shell: {shell}"
-    );
-    for data_bearing in [
-        "<article class=item",
-        "<form class=decide",
-        "data-deck-cards",
-        "data-testid=app-root>",
-    ] {
-        assert!(
-            !shell.contains(data_bearing),
-            "the shell carries {data_bearing}: {shell}"
-        );
-    }
-    for id in &ids {
-        assert!(
-            !shell.contains(&format!("data-item=\"{id}\"")),
-            "the shell carries the queue: {shell}"
-        );
+        for data_bearing in [
+            "<article class=item",
+            "<form class=decide",
+            "data-deck-cards",
+            "data-testid=app-root>",
+            "open across",
+        ] {
+            assert!(
+                !shell.contains(data_bearing),
+                "{route} carries {data_bearing}: {shell}"
+            );
+        }
+        for id in &ids {
+            assert!(
+                !shell.contains(&format!("data-item=\"{id}\"")),
+                "{route} carries the queue: {shell}"
+            );
+        }
     }
 
-    // The projection the deck mounts from is the list's own queue, in the
-    // list's own order, card for card: one renderer's rows read twice. Both
-    // halves are asserted -- the ids in document order, and each card's
-    // typeset body -- so a queue that drifted in membership, in order or in
-    // what it says a card is about fails here.
+    // One queue for both surfaces, in one order, with the long form typeset
+    // once by the server's own `markdown`: the deck and the list cannot
+    // drift because there is nothing left to drift from.
     let (status, queue) = http_get(port, "/api/v1/needs-you");
     assert_eq!(status, 200, "{queue}");
     let projected: Value = serde_json::from_str(&queue).expect("the queue is JSON");
@@ -50736,38 +50711,21 @@ fn the_all_route_keeps_the_plain_list_while_the_root_is_the_shell_over_http() {
         .iter()
         .map(|card| card["attention"]["id"].as_str().expect("a row id"))
         .collect();
-    let mut listed: Vec<(usize, &str)> = ids
-        .iter()
-        .map(String::as_str)
-        .filter_map(|id| list.find(&format!("data-item=\"{id}\"")).map(|at| (at, id)))
-        .collect();
-    listed.sort_unstable();
-    let in_document_order: Vec<&str> = listed.into_iter().map(|(_, id)| id).collect();
     assert_eq!(
-        served, in_document_order,
-        "the deck's queue is not the list's rows in the list's order:\n{queue}\n{list}"
+        served,
+        ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        "the queue is not the seeded rows in deck order:\n{queue}"
     );
-    // The card's long form is the server's own typesetting on both surfaces:
-    // the list renders `markdown(body)` into its `.body.md`, and the deck is
-    // handed the same bytes as `bodyHtml`. One sanitiser, proved rather than
-    // assumed.
-    const BODY_OPENS: &str = "<div class=\"body md\" data-testid=deck-body>";
-    const BODY_CLOSES: &str = "</div></details>";
     for card in rows {
         let id = card["attention"]["id"].as_str().expect("a row id");
-        let served_body = card["bodyHtml"].as_str().expect("the card's bodyHtml");
-        let markup = card_markup(&list, id);
-        let opens = markup
-            .find(BODY_OPENS)
-            .unwrap_or_else(|| panic!("the list's card for {id} has no long form: {markup}"))
-            + BODY_OPENS.len();
-        let closes = markup[opens..]
-            .find(BODY_CLOSES)
-            .unwrap_or_else(|| panic!("the list's long form for {id} never closed: {markup}"));
-        assert_eq!(
-            served_body,
-            &markup[opens..opens + closes],
-            "the deck and the list disagree about what {id} says"
+        let typeset = card["bodyHtml"].as_str().expect("the card's bodyHtml");
+        assert!(
+            !typeset.is_empty(),
+            "the card for {id} reached the page with no typeset body: {queue}"
+        );
+        assert!(
+            !typeset.contains("<script"),
+            "the raiser's markup was not neutralised for {id}: {typeset}"
         );
     }
 }
@@ -51953,6 +51911,12 @@ const WIDTH_SWEEP: &str = r#"(() => {
     text: document.body.innerText.slice(0, 2400),
     widest: widest ? `${widest.tagName.toLowerCase()}.${widest.className}@${edge}` : null,
     fragment: Boolean(document.querySelector('[data-preview-card]')),
+    // WEB-03, read where the headings and links now live: the rendered
+    // page. Nothing the application writes may be prefixed with a glyph or
+    // trail an arrow.
+    glyphs: [...document.querySelectorAll('h1, h2, a')]
+      .map(el => el.textContent.trim())
+      .filter(text => text.startsWith('>') || text.endsWith('\u2192')),
   });
 })()"#;
 
@@ -51994,14 +51958,15 @@ fn declared_route_shapes() -> Vec<String> {
 ///
 /// "Them all" is held to the server rather than to this list: every shape
 /// loaded here is checked against `serve.rs`'s own `ROUTE_SHAPES`, which its
-/// unit test holds to `render`'s arm count. The hover previews are in the
-/// sweep too -- they are `render` arms, they are read on a phone, and they
-/// are fragments rather than pages, so they are measured as fragments.
+/// unit test holds to `render`'s arm count. The hover previews left the
+/// sweep with `t-bf255880` wave 2: they are not routes any more, they are
+/// `/api/v1/preview/...` reads the page builds its own card from, and they
+/// are measured where they are rendered (SPA-40).
 #[test]
 fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
     browser_loopback_reservation_supported()
         .expect("reserve loopback port for browser-backed server tests");
-    let (fixture, ids) = deck_fixture("serve-deck-routes", "DECKROUTES");
+    let (fixture, _ids) = deck_fixture("serve-deck-routes", "DECKROUTES");
     fixture.ok_json(
         &fixture.main,
         &["tag", "add", "sweep", "--as", "fixture-agent", "--json"],
@@ -52169,8 +52134,6 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
     let tab = decision_tab(&chrome, &origin);
 
     let deployment_route = format!("/deployment/DECKROUTES/{deployment_id}");
-    let attention_preview = format!("/preview/attention/DECKROUTES/{}", ids[0]);
-    let deployment_preview = format!("/preview/deployment/DECKROUTES/{deployment_id}");
     // Shape, URL, and the seeded record the page must actually have rendered.
     // The shape is what the registry is compared against; the not-found arm
     // is the one route with no shape of its own to declare.
@@ -52214,26 +52177,6 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
             deployment_route.as_str(),
             Some("geoyws/kanban-sweep"),
         ),
-        (
-            "/preview/{kind}/{project}/{id}",
-            "/preview/task/DECKROUTES/t-routes",
-            Some("A task the routes sweep can open"),
-        ),
-        (
-            "/preview/{kind}/{project}/{id}",
-            attention_preview.as_str(),
-            Some("pubsub adapter"),
-        ),
-        (
-            "/preview/{kind}/{project}/{id}",
-            deployment_preview.as_str(),
-            Some("geoyws/kanban-sweep"),
-        ),
-        (
-            "/preview/board/{project}",
-            "/preview/board/DECKROUTES",
-            Some("DECKROUTES"),
-        ),
         ("", "/no-such-page", Some("No page at that address")),
     ];
 
@@ -52256,20 +52199,18 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
     );
 
     for (shape, route, marker) in routes {
-        // A preview is a fragment rather than a page: no shell, no heading,
-        // and its own card is the thing that has to have rendered.
-        let fragment = shape.starts_with("/preview");
+        // Every shape is a mounted page since `t-bf255880` wave 2: the
+        // preview fragments left with the server-rendered pages, and a
+        // hover now reads `/api/v1/preview/...` and builds its own card.
         // A route the client mounts has nothing to measure until it has
         // read its projection: the server sends the shell, and the seeded
         // record arrives one fetch later. Waiting for the record rather
         // than for the root is what makes the marker assertion below an
-        // assertion instead of a race. After `t-bf255880` wave 1 that is
-        // every shape but three: `/all` is still the served list, the
-        // preview fragments are still served cards, and the not-found arm
-        // is still a served page.
-        let mounted = !fragment && !shape.is_empty() && shape != "/all";
+        // assertion instead of a race. After `t-bf255880` wave 2 that is
+        // every shape: only the not-found arm is still a served page.
+        let mounted = !shape.is_empty();
         for (width, height) in [(390_u32, 844_u32), (820, 1180), (1280, 800)] {
-            set_viewport_with(&tab, width, height, !fragment && width < 700);
+            set_viewport_with(&tab, width, height, width < 700);
             go(&tab, &origin, route);
             if mounted {
                 wait_for_app_root(&tab, ui::APP_ROOT);
@@ -52297,19 +52238,26 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
             );
             assert_eq!(
                 measured["fragment"],
-                Value::Bool(fragment),
-                "{route} rendered the wrong kind of document at {width}x{height}: {}",
+                Value::Bool(false),
+                "{route} rendered a preview fragment at {width}x{height}: {}",
                 measured["text"]
             );
-            if !fragment {
-                assert!(
-                    !measured["heading"]
-                        .as_str()
-                        .expect("the page's heading")
-                        .is_empty(),
-                    "{route} rendered no heading at {width}x{height}, so nothing was measured"
-                );
-            }
+            assert!(
+                !measured["heading"]
+                    .as_str()
+                    .expect("the page's heading")
+                    .is_empty(),
+                "{route} rendered no heading at {width}x{height}, so nothing was measured"
+            );
+            // WEB-03 — no glyph prefix and no trailing arrow, on any
+            // heading or link of any route. The claim was made against the
+            // served markup until `t-bf255880` wave 2 deleted it; this is
+            // the same claim against what the reader actually gets.
+            assert_eq!(
+                measured["glyphs"],
+                serde_json::json!([]),
+                "{route} carries a glyph-prefixed heading or link at {width}x{height}"
+            );
             if let Some(marker) = marker {
                 assert!(
                     measured["text"]

@@ -323,6 +323,15 @@ nav form input {
   color: var(--red);
 }
 
+/* A page that explains itself does it in prose, bounded like every other
+   prose block on the estate (WEB-06): the open list carries one of these
+   above the queue. */
+.explain {
+  max-width: 70ch;
+  margin: 0 0 1rem;
+  color: var(--subtext);
+}
+
 .live {
   color: var(--overlay);
   font-size: 0.75rem;
@@ -1449,11 +1458,14 @@ td > form {
   margin: 0.6rem 0;
   padding: 0.55rem 0.75rem;
   background: var(--mantle);
-  border-left: 2px solid var(--surface1);
 }
 
+/* The current sprint is marked the way the drawer marks the destination you
+   are on: one neutral rule down its edge. It was a blue one until
+   `t-bf255880` wave 2 put ADR-046's proofs over this stylesheet, and a hue
+   is an outcome (WEB-11) — "current" is not one. */
 .sprint-card.is-current {
-  border-left-color: var(--blue);
+  border-left: 2px solid var(--text);
 }
 
 /* The version is the identifier a reader matches against a deploy receipt,

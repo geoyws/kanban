@@ -1284,14 +1284,42 @@ fn sitrep_on<'a>(body: &'a str, lane: &'a str, repo: &'a str) -> Vec<&'a str> {
     ]
 }
 
-/// The five routes the first wave answers, for one board and one row of it.
-fn five_routes(board: &str, task: &str) -> Vec<String> {
+/// Every read route `serve.rs`'s `api` answers that one board and one row of
+/// it reach, which is every arm but the two that need an id of their own.
+///
+/// It was the five routes of the first wave until `t-bf255880` wave 2: the
+/// cases below — the Managed tag grant, the lease token, the CLI
+/// equivalence — were measuring a fifth of the surface while the rest of it
+/// shipped. The two detail arms that need an attempt id or a sprint id are
+/// [`detail_routes`], which a caller passes its own ids to.
+fn every_read_route(board: &str, task: &str) -> Vec<String> {
     vec![
         "/api/v1/needs-you".to_owned(),
+        "/api/v1/decided".to_owned(),
         "/api/v1/boards".to_owned(),
         "/api/v1/lanes".to_owned(),
+        "/api/v1/deployments".to_owned(),
+        "/api/v1/subscriptions".to_owned(),
+        "/api/v1/sprints".to_owned(),
+        "/api/v1/plans".to_owned(),
+        format!("/api/v1/search?q={task}"),
+        format!("/api/v1/sprints/{board}"),
         format!("/api/v1/board/{board}"),
         format!("/api/v1/task/{board}/{task}"),
+        format!("/api/v1/preview/task/{board}/{task}"),
+        format!("/api/v1/preview/board/{board}/{board}"),
+    ]
+}
+
+/// The arms that name a row of their own: an attempt, a sprint, and the two
+/// previews that read one. A caller that has seeded none passes ids that do
+/// not exist, which is exactly what a denial case wants.
+fn detail_routes(board: &str, deployment: &str, sprint: &str, attention: &str) -> Vec<String> {
+    vec![
+        format!("/api/v1/deployment/{board}/{deployment}"),
+        format!("/api/v1/sprint/{board}/{sprint}"),
+        format!("/api/v1/preview/deployment/{board}/{deployment}"),
+        format!("/api/v1/preview/attention/{board}/{attention}"),
     ]
 }
 
@@ -1589,9 +1617,15 @@ fn no_json_refusal_names_a_board_row_or_tag_the_caller_may_not_see_over_http() {
     let server = WebServer::start(&estate, &work_a, None);
 
     let mut refusals = Vec::new();
-    for path in five_routes("Beta", "t-bsecret")
+    for path in every_read_route("Beta", "t-bsecret")
         .into_iter()
-        .chain(five_routes("Alpha", "t-no-such-row"))
+        .chain(every_read_route("Alpha", "t-no-such-row"))
+        .chain(detail_routes(
+            "Beta",
+            "d-bsecret",
+            "sp-bsecret",
+            "a-bsecret",
+        ))
         .chain([
             "/api/v1/board/harbour-wall-survey".to_owned(),
             "/api/v1/task/Beta/t-bsecret".to_owned(),
@@ -1674,7 +1708,7 @@ fn no_json_route_serialises_a_lease_token_over_http() {
     assert!(!token.is_empty(), "{lease}");
 
     let server = WebServer::start(&estate, &work_a, None);
-    for path in five_routes("Alpha", "t-leased") {
+    for path in every_read_route("Alpha", "t-leased") {
         let answer = server.get(&path);
         assert_eq!(answer.status, 200, "{path}: {}", answer.body);
         assert!(

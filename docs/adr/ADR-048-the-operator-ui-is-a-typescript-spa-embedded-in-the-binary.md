@@ -270,6 +270,31 @@ sanitiser is the server's on both surfaces rather than a second one in TypeScrip
 deck at `/` now read `/all` or the projection; none was weakened, and `/`'s scriptless answer is
 asserted to be the shell and nothing data-bearing (SPA-51).
 
+### Addendum, 2026-09-19 — what `t-bf255880` decided
+
+**`/all` is mounted, and the SSR shell is deleted.** The 2026-09-19 addendum above kept `/all`
+server-rendered "for this wave" as the scriptless queue. This task's title is "retire the SSR
+shell", and it resolves that: `/all` is a mounted route rendered by the same component the deck
+is (`web/src/deck.tsx`, `layout="list"`) — every open card from `/api/v1/needs-you`, in the same
+order, answering through the same four POSTs. One renderer, two layouts, rather than two
+renderers of one queue. Deleted with it: `all_open`, `open_cards`, `decision_card`,
+`EMPTY_QUEUE`, `LIST_KEYS`, `reply_notices`, `preview_page` and its two `render` arms, every
+function wave 1 marked retired, and the `JS` and `CSS` constants — 3 874 lines of `rust/serve.rs`.
+`page()` survives as the one document that is not the application: what a refused POST and an
+unknown address answer, carrying `<p class=error>` because `web/src/api.ts` reads the board's own
+sentence out of it. `app_shell` is the only page document. There is no scriptless page, which is
+what SPA-51 already decided.
+
+**The payload, measured.** On a fixture of 201 open rows across three boards, the landing payload
+(`GET /` + both assets + the first `/api/v1/needs-you`) is **460 019 B at `0e8cfea`** and
+**517 888 B at wave 2's head** — the 57 869 B difference is bundle, and it is bundle because the
+remaining pages moved into it. Both are far under §3's 1.32 MB, which was the server-rendered `/`
+on `hax`'s 24 boards. What a `/live` refresh re-fetches is now the projection alone — 225 324 B
+on that fixture — where the served page re-sent its markup, its stylesheet and its script every
+time. The numbers are recorded in `docs/specs/spa.md` §3 beside SPA-50; no byte target is
+adopted, and OQ-5's "what is it reduced *to*" is answered with a measurement rather than a
+budget.
+
 ## References
 
 - Epic `e-9306a1d9` (the `SPA` rebuild, and the source of §3's measurements); task `t-aed0352a`

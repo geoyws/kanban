@@ -666,6 +666,48 @@ pub struct DeploymentDetail {
     deployment: DeploymentAttempt,
 }
 
+/// What a surface that only NAMES an attempt is given.
+///
+/// The hover preview and the sprint card print an attempt's identity and
+/// where it went; they do not print its receipt, the checkout the deployer
+/// ran from or its artifact URI, and the HTML they replaced never carried
+/// those either. Serialising the whole [`DeploymentAttempt`] there put the
+/// operational detail of a release on the wire for a mouse-over
+/// (`t-bf255880` wave 2, from the wave-1 security review). The detail route
+/// still serves the whole attempt, as the CLI does: that is the page whose
+/// job is the attempt.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentSummary {
+    id: String,
+    repo: String,
+    tier: String,
+    environment: String,
+    host: String,
+    status: String,
+    updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_commit: Option<String>,
+}
+
+impl From<DeploymentAttempt> for DeploymentSummary {
+    fn from(attempt: DeploymentAttempt) -> Self {
+        Self {
+            id: attempt.id,
+            repo: attempt.repo,
+            tier: attempt.tier,
+            environment: attempt.environment,
+            host: attempt.host,
+            status: attempt.status,
+            updated_at: attempt.updated_at,
+            served_version: attempt.served_version,
+            served_commit: attempt.served_commit,
+        }
+    }
+}
+
 /// One subscription, where it has actually got to, and what refused it.
 ///
 /// The head travels with the position because the two are only meaningful
@@ -842,7 +884,7 @@ pub struct SprintDetail {
     /// `Store::sprint_tasks` takes no bound, so this is the whole visible
     /// scope and needs no envelope to say so.
     tasks: Vec<Task>,
-    closing_deployment: Option<DeploymentAttempt>,
+    closing_deployment: Option<DeploymentSummary>,
 }
 
 /// One draft epic: the plan, what it holds back, and the plan itself.
@@ -941,7 +983,7 @@ pub fn sprint(project_name: &str, id: &str) -> Projected<SprintDetail> {
     let tasks = store.sprint_tasks(&sprint.id)?;
     let (open_tasks, done_tasks) = store.sprint_task_counts(&sprint.id)?;
     let closing_deployment = match &sprint.closed_by_deployment {
-        Some(deployment_id) => Some(store.require_deployment(deployment_id)?),
+        Some(deployment_id) => Some(store.require_deployment(deployment_id)?.into()),
         None => None,
     };
     Ok(SprintDetail {
@@ -1046,7 +1088,7 @@ pub struct Preview {
     #[serde(skip_serializing_if = "Option::is_none")]
     about: Option<TaskReference>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    deployment: Option<DeploymentAttempt>,
+    deployment: Option<DeploymentSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     board_counts: Option<BoardCounts>,
 }
@@ -1164,7 +1206,7 @@ pub fn preview(kind: &str, project_name: &str, id: &str) -> Projected<Preview> {
                 .require_deployment(id)
                 .map_err(|_| Refusal::DeniedOrNotFound)?;
             let mut card = Preview::of(kind, board);
-            card.deployment = Some(row);
+            card.deployment = Some(row.into());
             Ok(card)
         }
         "board" if id == board => {

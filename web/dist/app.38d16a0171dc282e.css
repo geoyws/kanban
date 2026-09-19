@@ -261,6 +261,11 @@ nav form input {
 .error {
   color: var(--red);
 }
+.explain {
+  max-width: 70ch;
+  margin: 0 0 1rem;
+  color: var(--subtext);
+}
 .live {
   color: var(--overlay);
   font-size: 0.75rem;
@@ -1126,10 +1131,9 @@ td > form {
   margin: 0.6rem 0;
   padding: 0.55rem 0.75rem;
   background: var(--mantle);
-  border-left: 2px solid var(--surface1);
 }
 .sprint-card.is-current {
-  border-left-color: var(--blue);
+  border-left: 2px solid var(--text);
 }
 .sprint-version {
   margin: 0 0 0.15rem;

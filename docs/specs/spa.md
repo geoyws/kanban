@@ -537,6 +537,30 @@ target and no availability target, and none may be inferred from the numbers abo
 this requirement will eventually be measured against is §7 OQ-5, owned by `t-bf255880`; until it
 is answered, the observable obligation is the strict inequality against the measured baseline.
 
+*Measured, 2026-09-19 (`t-bf255880` wave 2).* On a seeded fixture — 201 open attention rows
+across three boards, each with a full long-form body — served by the release binary, the landing
+payload is the document plus the two content-hashed assets plus the first projection read:
+
+| build | `GET /` | `/assets/app.*.js` | `/assets/app.*.css` | `GET /api/v1/needs-you` | total |
+| --- | --- | --- | --- | --- | --- |
+| `0e8cfea` (the bundle `kb.geoy.ws` served before wave 1) | 338 B | 217 098 B | 17 259 B | 225 324 B | **460 019 B** |
+| `t-bf255880` wave 2 | 338 B | 271 512 B | 20 714 B | 225 324 B | **517 888 B** |
+
+Both are far below ADR-048 §3's 1.32 MB, which SPA-50's inequality is against; that figure was
+the server-rendered `/` on `hax`'s 24 boards and cannot be reproduced on a three-board fixture,
+so it is quoted rather than re-measured. Between the two builds above the payload **grew by
+57 869 B**, all of it bundle: wave 1 and wave 2 moved every remaining page into the application,
+which is the whole of `t-bf255880`. The bundle is the half that is named by content hash and
+cached, and it is not re-fetched: what one `/live` refresh costs is the projection only — 225 324 B
+here, and nothing else. The server-rendered page re-sent its markup, its stylesheet and its
+script on every refresh.
+
+Commands (fixture seeded and served by the release binary of each build, `curl` measuring the
+served bytes): `scripts/` holds none of this — it was run as
+`kanban init --name ALPHA|BRAVO|CHARLIE` in three directories, 67 × `kanban attention raise … --kind decision`
+per board, `kanban serve --port P`, then `curl -fsS http://127.0.0.1:P/{,api/v1/needs-you}` and
+`curl -fsS http://127.0.0.1:P/assets/app.<hash>.{js,css}` piped through `wc -c`.
+
 ### What is retired
 
 **SPA-51** — with no script there is no page, and that is the decision.

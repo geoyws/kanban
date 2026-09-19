@@ -24,8 +24,8 @@ import { navigate } from "./router";
  * Every destination the drawer lists, as `[href, route name, label]`.
  *
  * The route names are `router.ts`'s, so "which one is current" is a
- * comparison rather than a second path-matching rule. `/all` is the one
- * server-rendered page left in the list and is followed as an ordinary
+ * comparison rather than a second path-matching rule. Every one of them is
+ * mounted since `t-bf255880` wave 2, so every one is an in-application
  * link.
  */
 const DESTINATIONS: readonly (readonly [string, string, string])[] = [

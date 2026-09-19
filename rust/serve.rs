@@ -34,9 +34,7 @@
 //! does not relax it.
 
 use crate::model::{
-    ATTENTION_OUTCOMES, Attention, AttentionAnswer, AttentionChoice, CUSTOM_CHOICE, DeadLetterCode,
-    DeploymentAttempt, IDENTITY_MODE_ARTIFACT, OPERATOR_ACTOR, ProjectRecord, SearchOptions,
-    Sitrep, Sprint, Subscription, SubscriptionPosition, Task,
+    Attention, AttentionAnswer, CUSTOM_CHOICE, OPERATOR_ACTOR, ProjectRecord, SearchOptions, Sitrep,
 };
 use crate::projection;
 use crate::registry::{Registry, now_ms, retired_board_message};
@@ -484,10 +482,21 @@ const METHOD_NOT_ALLOWED_JSON: &str = "{\"error\":\"Method not allowed\"}";
 /// The generic failure. It never carries a board name, a path, a row title,
 /// or the store's own sentence.
 const SERVER_ERROR_JSON: &str = "{\"error\":\"The request could not be completed.\"}";
+/// How much `q` the search route will read, in bytes of the decoded query.
+///
+/// Generous for anything a person types and small beside what a script can
+/// post: the same shape of bound as `MAX_REPLY_BYTES`, and for the same
+/// reason — the work is done per readable board, so an unbounded input is
+/// an unbounded scan.
+const MAX_QUERY_BYTES: usize = 4_096;
+/// What a query past the bound is told. One sentence, no echo of what was
+/// sent, and the same shape as every other refusal on this surface.
+const QUERY_TOO_LONG_JSON: &str =
+    "{\"error\":\"The search query is too long. Shorten it and try again.\"}";
 
 /// Dispatch one `/api/v1` request.
 ///
-/// The five reads of the first wave; every other path under the prefix gets
+/// Every read the pages make; every other path under the prefix gets
 /// the same non-enumerating refusal as an unknown board, because a route
 /// table that answered "no such route" differently from "no such board"
 /// would be an inventory of what exists.
@@ -517,9 +526,19 @@ fn api(method: &Method, path: &str, query: &str) -> WebResponse {
         ["plans"] => encode(projection::plans()),
         // The page exposes one parameter and so does this route: a filter
         // the page cannot set is a filter with no caller (SPA-06).
-        ["search"] => encode(projection::search(
-            query_value(query, "q").as_deref().unwrap_or(""),
-        )),
+        //
+        // The query is BOUNDED before the store sees it. `SEARCH_MAX_CHARS`
+        // bounds what comes back, not what goes in, so without this a
+        // megabyte of `q` was a megabyte of LIKE patterns run over every
+        // readable board — the same reason a reply is capped at
+        // `MAX_REPLY_BYTES` before it is recorded.
+        ["search"] => {
+            let asked = query_value(query, "q").unwrap_or_default();
+            if asked.len() > MAX_QUERY_BYTES {
+                return WebResponse::Json(400, QUERY_TOO_LONG_JSON.to_owned());
+            }
+            encode(projection::search(&asked))
+        }
         // One arm for both preview shapes: `/preview/board/{project}`
         // repeats the project as the id, exactly as `render` passes it.
         ["preview", kind, project, id] => encode(projection::preview(kind, project, id)),
@@ -602,6 +621,12 @@ fn app_shell() -> String {
 /// a new shape fails `render_answers_exactly_the_declared_shapes_unit`, and a
 /// new shape without a URL in the sweep fails the sweep itself. So a route
 /// cannot be added and left unmeasured on a phone.
+///
+/// Every one of them answers the same document since `t-bf255880` wave 2:
+/// the shapes are what the ADDRESS BAR may hold, and the page each one
+/// names is the bundle's (`web/src/router.ts` reads the same list on the
+/// other side). The previews left with the pages — a hover reads
+/// `/api/v1/preview/...` and builds its own card.
 #[cfg(test)]
 const ROUTE_SHAPES: &[&str] = &[
     "/",
@@ -616,16 +641,20 @@ const ROUTE_SHAPES: &[&str] = &[
     "/subscriptions",
     "/lanes",
     "/search",
-    "/preview/{kind}/{project}/{id}",
-    "/preview/board/{project}",
     "/board/{project}",
     "/task/{project}/{id}",
     "/deployment/{project}/{id}",
 ];
 
 /// Route a URL to a rendered page.
+///
+/// Every shape answers the application shell: the bundle reads the address
+/// bar and renders the page, and the data comes from `/api/v1`. What is
+/// left here is the address space itself — an address this application has
+/// a page for is answered with the application, and everything else is the
+/// refusal document.
 fn render(url: &str) -> Result<String> {
-    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -633,46 +662,21 @@ fn render(url: &str) -> Result<String> {
         .collect::<Vec<_>>();
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     match parts.as_slice() {
-        // The Needs-you deck is the mounted application (`t-1f495a7f`): the
-        // route answers the shell, the bundle mounts the deck into it, and
-        // the data comes from `/api/v1/needs-you` rather than from a second
-        // rendering of the same queue here. `?replied=` and `?undone=` are
-        // the same page and are read off the address bar by the client, so
-        // they need no arm of their own — which is why this arm ignores the
-        // query it used to interpolate.
-        //
-        // Every other route below is still server-rendered until
-        // `t-bf255880`, and `/all` is still the plain list this deck was
-        // laid over: `decision_card` and its renderers stay exactly where
-        // they are.
-        [] => Ok(app_shell()),
-        ["all"] => all_open(
-            query_value(query, "replied").as_deref(),
-            query_value(query, "undone").as_deref(),
-        ),
-        ["decided"] => Ok(app_shell()),
-        ["boards"] => Ok(app_shell()),
-        ["sprints"] => Ok(app_shell()),
-        ["sprints", _] => Ok(app_shell()),
-        ["sprint", _, _] => Ok(app_shell()),
-        ["plans"] => Ok(app_shell()),
-        ["deployments"] => Ok(app_shell()),
-        ["subscriptions"] => Ok(app_shell()),
-        ["lanes"] => Ok(app_shell()),
-        ["search"] => Ok(app_shell()),
-        // `/preview` + the item path: `/preview/task/PREVIEW/t-1`. The kind
-        // leads, exactly as it does in the path being previewed, so the page
-        // script derives the URL with one prefix and nothing else.
-        [
-            "preview",
-            kind @ ("task" | "attention" | "deployment"),
-            project,
-            id,
-        ] => preview_page(project, kind, id),
-        ["preview", "board", project] => preview_page(project, "board", project),
-        ["board", _project] => Ok(app_shell()),
-        ["task", _project, _id] => Ok(app_shell()),
-        ["deployment", _project, _id] => Ok(app_shell()),
+        []
+        | ["all"]
+        | ["decided"]
+        | ["boards"]
+        | ["sprints"]
+        | ["sprints", _]
+        | ["sprint", _, _]
+        | ["plans"]
+        | ["deployments"]
+        | ["subscriptions"]
+        | ["lanes"]
+        | ["search"]
+        | ["board", _]
+        | ["task", _, _]
+        | ["deployment", _, _] => Ok(app_shell()),
         _ => Ok(page(
             "Not found",
             "<h1>Not found</h1><p>No page at that address. \
@@ -1666,144 +1670,15 @@ pub(crate) fn task_attention_count(store: &Store, task_id: &str) -> Result<usize
     Ok(task_open_attention(store, task_id)?.len())
 }
 
-fn task_reference(project: &str, store: &Store, task_id: &str) -> String {
-    // Every reference link previews on hover and opens in its own tab
-    // (data-ref), so an id met mid-sentence answers "what is this?" without
-    // leaving the page. Previews inside previews carry the same attribute,
-    // which is what makes the nesting work.
-    match store.require_task(task_id) {
-        Ok(task) => format!(
-            "the <span data-task-type>{ty}</span> \
-             <a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\" \
-             data-ref target=_blank rel=noopener>{title}</a>",
-            project = escape(&url_encode(project)),
-            task_id = escape(&url_encode(&task.id)),
-            title = escape(&task.title),
-            ty = escape(&task.task_type),
-        ),
-        Err(_) => format!(
-            "<a href=\"/task/{project}/{task_id}\" data-task-link=\"{task_id}\" \
-             data-ref target=_blank rel=noopener>{task_id}</a>",
-            project = escape(&url_encode(project)),
-            task_id = escape(&url_encode(task_id)),
-        ),
-    }
-}
+// ------------------------------------------------- the cross-board orderings
 
-fn attention_count_badge(count: usize) -> String {
-    if count == 0 {
-        String::new()
-    } else {
-        format!(" <span class=attention-count>{count} open attention</span>")
-    }
-}
-
-/// The same count as a clause inside a row's one sentence (WEB-40): it needs
-/// its own connector, or a row with no tags reads `at P0 3 open attention`.
-fn attention_clause(count: usize) -> String {
-    if count == 0 {
-        String::new()
-    } else {
-        format!(", with{}", attention_count_badge(count))
-    }
-}
-
-fn attention_section(project: &str, title: &str, items: &[Attention]) -> String {
-    if items.is_empty() {
-        return String::new();
-    }
-    let mut html = format!(
-        "<h2>{title} <span class=count>{}</span></h2><ul class=rows>",
-        items.len()
-    );
-    for item in items {
-        html.push_str("<li>");
-        // The row is a title and one sentence (WEB-40): what the item asks
-        // leads it, and everything else about it -- what kind of ask, who
-        // raised it, when, at what priority, under which tags, about which
-        // row -- reads as the one meta sentence under it.
-        html.push_str(&format!(
-            "<span class=title>{question}</span>\
-             <p class=meta>{article} {kind} ask, raised by {who} {age} \
-             at {priority}{tags}{about}</p>",
-            question = escape(&card_question(item)),
-            article = a_or_an(&item.kind.replace('_', " ")),
-            kind = escape(&item.kind.replace('_', " ")),
-            priority = priority_badge(item.priority, item.priority_level.as_deref()),
-            who = escape(&item.raised_by),
-            age = ago(item.created_at),
-            tags = tag_list(&item.tags),
-            about = item
-                .task_id
-                .as_ref()
-                .map(|task_id| format!(
-                    ", about <a href=\"/task/{project}/{task_url}\" \
-                     data-ref target=_blank rel=noopener>{task_id}</a>",
-                    project = escape(&url_encode(project)),
-                    task_url = escape(&url_encode(task_id)),
-                    task_id = escape(task_id),
-                ))
-                .unwrap_or_default(),
-        ));
-        html.push_str(&format!(
-            "<div class=\"body md\">{}</div>",
-            markdown(&item.body)
-        ));
-        html.push_str("</li>");
-    }
-    html.push_str("</ul>");
-    html
-}
-
-// ---------------------------------------------------------------- the screens
-
-/// The open queue: every waiting item paired with the board that raised it,
-/// and the stores those boards were read from, because every card resolves
-/// its own task reference.
-type OpenQueue = (
-    Vec<(String, Attention)>,
-    std::collections::BTreeMap<String, Store>,
-);
-
-/// Every open item across every board, priority first and then oldest, so
-/// interrupts lead while age remains the tie-breaker that prevents
-/// starvation within a level.
-fn open_attention() -> Result<OpenQueue> {
-    let mut items: Vec<(String, Attention)> = Vec::new();
-    let mut stores = std::collections::BTreeMap::new();
-    for (project, store) in projects()? {
-        let name = project.name.clone();
-        for item in store.attention(
-            Some("open"),
-            None,
-            None,
-            None,
-            None,
-            OPEN_ATTENTION_ROWS,
-            false,
-        )? {
-            items.push((name.clone(), item));
-        }
-        stores.insert(name, store);
-    }
-    sort_open_queue(&mut items);
-    Ok((items, stores))
-}
-
-/// Deck order, in one place: priority first, then oldest, then id, then
-/// board.
-///
-/// The page and the JSON projection order the cross-board queue by calling
-/// this, rather than by each holding a comparator that has to be kept in
-/// step. Two orderings that agree today is a coincidence with a maintenance
-/// schedule.
 /// The decisions room's order: newest decided first, then id, then board so
 /// the list never flickers between two rows settled in the same
 /// millisecond.
 ///
-/// Shared with the JSON projection (`rust/projection.rs`'s `decided`) rather
-/// than copied: which decision is newest is one question, and two surfaces
-/// that answered it differently would put the Undo on different rows.
+/// Lives here rather than in the projection because it is the answer to one
+/// question — which decision is newest — and two surfaces that answered it
+/// differently would put the Undo on different rows.
 pub(crate) fn sort_decided_queue(items: &mut [(String, Attention)]) {
     items.sort_by(|(project_a, item_a), (project_b, item_b)| {
         let decided_a = item_a.resolved_at.unwrap_or(i64::MIN);
@@ -1815,6 +1690,13 @@ pub(crate) fn sort_decided_queue(items: &mut [(String, Attention)]) {
     });
 }
 
+/// Deck order, in one place: priority first, then oldest, then id, then
+/// board.
+///
+/// Interrupts lead and age is the tie-breaker that prevents starvation
+/// within a level. The queue is read through `/api/v1/needs-you`, and both
+/// surfaces that render it — the deck and the list — take the order from
+/// there rather than sorting again.
 pub(crate) fn sort_open_queue(items: &mut [(String, Attention)]) {
     items.sort_by(|(project_a, item_a), (project_b, item_b)| {
         (item_a.priority, item_a.created_at, &item_a.id, project_a).cmp(&(
@@ -1826,507 +1708,12 @@ pub(crate) fn sort_open_queue(items: &mut [(String, Attention)]) {
     });
 }
 
-/// The one card loop both open-item screens render: the deck at `/` and the
-/// plain list at `/all` are the same cards in the same order, so there is
-/// one renderer and the deck is presentation laid over it.
-fn open_cards(
-    items: &[(String, Attention)],
-    stores: &std::collections::BTreeMap<String, Store>,
-) -> String {
-    let mut html = String::new();
-    for (project, item) in items {
-        let store = stores
-            .get(project)
-            .expect("project store map built from same iterator");
-        html.push_str(&decision_card(project, store, item));
-    }
-    html
-}
-
-/// What a no-script POST comes back to: the redirect carries the id it
-/// settled or reopened, and both open-item screens say so.
-fn reply_notices(replied: Option<&str>, undone: Option<&str>) -> String {
-    let mut html = String::new();
-    if let Some(id) = replied {
-        html.push_str(&format!(
-            "<p class=success><code>{}</code> is decided and the board has it.</p>",
-            escape(id)
-        ));
-    }
-    if let Some(id) = undone {
-        html.push_str(&format!(
-            "<p class=success>Brought back <code>{}</code> - it is open again \
-             and back at its place in this list.</p>",
-            escape(id)
-        ));
-    }
-    html
-}
-
-/// Nothing waiting, in the words both open-item screens use for it: an
-/// answer rather than an absence, and the way on to what was decided.
-const EMPTY_QUEUE: &str = "<div class=empty-queue>\
-                           <p class=empty>Nothing is waiting. \
-                           Every question an agent raised has an answer.</p>\
-                           <p><a href=\"/decided\">See what was decided</a></p></div>";
-
-/// The keyboard map, in ONE quiet line, because the digits live on the
-/// buttons: a second badge for every key was a keyboard hint competing with
-/// the answers it describes.
-const LIST_KEYS: &str = "<p class=keys>1–4 answer · u undo · c own</p>";
-
 // The deck itself is no longer rendered here: `/` answers the application
 // shell and the bundle mounts the deck (`t-1f495a7f`, spec SPA-51). What
 // stayed behind is everything the deck was laid OVER — `open_attention`,
 // `open_cards`, `decision_card`, `EMPTY_QUEUE`, `reply_notices` — because
 // `/all` still serves the plain list from exactly those pieces, and the
 // mounted deck reads the same queue through `/api/v1/needs-you`.
-
-/// Every open item as one plain list, which is what this page was before the
-/// deck and what the deck is laid over: the same cards in the same order, one
-/// after another for a reader who wants the whole queue at once.
-fn all_open(replied: Option<&str>, undone: Option<&str>) -> Result<String> {
-    let (items, stores) = open_attention()?;
-    let mut html = String::from("<div class=heading><h1>Needs you</h1></div>");
-    html.push_str(
-        "<p class=explain>Each card is one question an agent is waiting on. Pick an answer \
-         and it is recorded on the board at once; the agent continues from there. Undo any \
-         decision from Recent decisions.</p>",
-    );
-    html.push_str(&reply_notices(replied, undone));
-    if items.is_empty() {
-        html.push_str(EMPTY_QUEUE);
-        return Ok(page("Needs you", &html));
-    }
-    let boards = items
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    html.push_str(&format!(
-        "<p class=count><span data-open-count>{}</span> open across {boards} {plural}</p>",
-        items.len(),
-        plural = if boards == 1 { "board" } else { "boards" },
-    ));
-    html.push_str(&open_cards(&items, &stores));
-    html.push_str(LIST_KEYS);
-    Ok(page("Needs you", &html))
-}
-
-/// Recent decisions: what was decided, newest first, each one undoable.
-///
-/// Deciding is one keypress, so the list it leaves behind has to be readable
-/// at the same speed: the question, the verdict in the ledger's own words, the
-/// note when one rode along, and one Undo. The rows carry the same
-/// `data-item`/`data-project` contract the receipts do, so `u` and the undo
-/// button land on the same code path both places.
-///
-/// The previous decision is NOT re-shown from the row: a reopen clears it
-/// (ADR-042 §3), so what is rendered here is whatever the row settled with,
-/// read once while it was still resolved.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn decided_page(undone: Option<&str>) -> Result<String> {
-    let mut items: Vec<(String, Attention)> = Vec::new();
-    let mut stores = std::collections::BTreeMap::new();
-    for (project, store) in projects()? {
-        let name = project.name.clone();
-        for item in store.recent_resolved_attention(DECIDED_SCAN)? {
-            items.push((name.clone(), item));
-        }
-        stores.insert(name, store);
-    }
-    sort_decided_queue(&mut items);
-    items.truncate(usize::try_from(DECIDED_ROWS).unwrap_or(usize::MAX));
-
-    let mut html = String::from("<div class=heading><h1>Recent decisions</h1></div>");
-    if let Some(id) = undone {
-        html.push_str(&format!(
-            "<p class=success>Brought back <code>{}</code> - it is open again \
-             on <a href=\"/\">Needs you</a>.</p>",
-            escape(id)
-        ));
-    }
-    if items.is_empty() {
-        html.push_str("<p class=empty>Nothing decided yet.</p>");
-        return Ok(page("Recent decisions", &html));
-    }
-    html.push_str(&format!(
-        "<p class=count>Newest {} shown. Undoing one puts it back on Needs you.</p>",
-        items.len(),
-    ));
-    for (project, item) in &items {
-        let store = stores
-            .get(project)
-            .expect("project store map built from same iterator");
-        html.push_str(&decided_row(project, store, item));
-    }
-    html.push_str("<p class=keys>u undo</p>");
-    Ok(page("Recent decisions", &html))
-}
-
-/// One decided row: the question, the decision in the words the ledger keeps,
-/// and the undo. `tabindex=0` is what makes `u` able to aim at a row.
-fn decided_row(project: &str, store: &Store, item: &Attention) -> String {
-    let id = escape(&item.id);
-    let id_url = escape(&url_encode(&item.id));
-    let project_url = escape(&url_encode(project));
-    let decision = decision_words(item);
-    let mut html = format!(
-        "<article class=decided tabindex=0 data-item=\"{id}\" data-project=\"{project}\" \
-         aria-labelledby=\"d-{id}\"><h2 id=\"d-{id}\">{question}</h2>",
-        project = escape(project),
-        question = escape(&card_question(item)),
-    );
-    html.push_str(&format!(
-        "<p class=decision><span class=\"pill status-{outcome}\">{outcome}</span> {words}</p>",
-        outcome = escape(
-            item.decision
-                .as_ref()
-                .map(|d| d.outcome.as_str())
-                .unwrap_or("other")
-        ),
-        words = escape(&decision),
-    ));
-    if let Some(decision) = &item.decision
-        && let Some(note) = &decision.note
-    {
-        html.push_str(&format!("<p class=note>{}</p>", escape(note)));
-    }
-    // One sentence, not a chain: who decided it, when, and where it lives.
-    html.push_str(&format!(
-        "<p class=meta>{who} decided this {when} on \
-         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a>\
-         {about}, {priority}</p>",
-        project = escape(project),
-        who = escape(item.resolved_by.as_deref().unwrap_or("someone")),
-        when = item
-            .resolved_at
-            .map(ago)
-            .unwrap_or_else(|| "at some point".to_owned()),
-        about = item
-            .task_id
-            .as_ref()
-            .map(|task| format!(", about {}", task_reference(project, store, task)))
-            .unwrap_or_default(),
-        priority = priority_badge(item.priority, item.priority_level.as_deref()),
-    ));
-    html.push_str(&format!(
-        "<form class=undo method=post action=\"/attention/{project_url}/{id_url}/reopen\">\
-         <input type=hidden name=back value=\"/decided\">\
-         <button type=submit class=undo-button data-undo>Undo - open it again</button></form>",
-    ));
-    html.push_str("</article>");
-    html
-}
-
-/// What the decision was, in the words the ledger keeps for it: the chosen
-/// label, or the custom answer with its verdict. Falls back to the composed
-/// resolution for a row settled before decisions were recorded, so a pre-2026
-/// decision still reads as itself rather than as nothing.
-fn decision_words(item: &Attention) -> String {
-    if let Some(decision) = &item.decision {
-        if decision.choice == CUSTOM_CHOICE {
-            return format!("Your own answer, recorded as {}.", decision.outcome);
-        }
-        if let Some(choice) = item
-            .choices
-            .iter()
-            .find(|choice| choice.key == decision.choice)
-        {
-            return format!("{}. {}", choice.label, choice.consequence);
-        }
-    }
-    item.resolution
-        .clone()
-        .unwrap_or_else(|| "Resolved.".to_owned())
-}
-
-/// One item as the card geoyws decides from (ADR-042 §5).
-///
-/// The order is the whole point, and it is the reverse of what this page used
-/// to render: the question, then what is true and what waiting costs, then
-/// the answers with the recommendation first — so `1` is always the
-/// recommendation. The body is the long form and is folded, and the meta line
-/// that used to lead now trails, because a priority pill is not a decision.
-/// A row that authored no card is this same card with the default pair and
-/// its first body line as the question, not a second template.
-///
-/// One line sits ABOVE the question: which board asked, what kind of ask it
-/// is, who is waiting and for how long (George, 2026-09-17: "I don't know
-/// what everything is doing"). It is orientation rather than a decision, so
-/// it is small, dim and carries no priority pill — that stays in the trailing
-/// meta, where it cannot be mistaken for an answer.
-///
-/// The free-text answer is FOLDED. It is the rarest path and it was the
-/// loudest thing under the choices: a verdict picker, a submit, a release and
-/// a hint standing open on every card in a list of 133, all of it asking to
-/// be read before the one-click answer above it could be trusted.
-///
-/// One reply field serves the whole card, and it sits with the choices rather
-/// than inside the free-text answer: whatever is written in it rides with
-/// whichever choice is clicked, and the free-text answer is that same field
-/// plus a verdict. Two fields would be two drafts to lose. That is why the
-/// field stays OUTSIDE the fold while the verdict picker goes into it.
-fn decision_card(project: &str, store: &Store, item: &Attention) -> String {
-    let id = escape(&item.id);
-    let id_url = escape(&url_encode(&item.id));
-    let project_url = escape(&url_encode(project));
-    let mut html = format!(
-        "<article class=item tabindex=0 data-testid=deck-card data-item=\"{id}\" \
-         data-project=\"{project}\" aria-labelledby=\"q-{id}\">\
-         <p class=eyebrow>{who} asked on \
-         <a href=\"/board/{project_url}\" data-ref target=_blank rel=noopener>{project}</a>, \
-         {age}</p>\
-         <h2 id=\"q-{id}\">{question}</h2>",
-        project = escape(project),
-        age = ago(item.created_at),
-        who = escape(&item.raised_by),
-        question = escape(&card_question(item)),
-    );
-    if let Some(context) = &item.context {
-        html.push_str(&format!("<p class=context>{}</p>", escape(context)));
-    }
-    let mut recommended = String::new();
-    let mut alternatives = String::new();
-    for (index, choice) in ordered_choices(item).iter().enumerate() {
-        let rendered = format!(
-            "<button type=submit class=\"choice outcome-{outcome}\" name=decision \
-             value=\"{key}\" data-label=\"{label}\" data-testid=\"deck-choice-{key}\">\
-             <span class=key>{digit}</span>{label}</button>\
-             <p class=consequence>{consequence}</p>",
-            outcome = escape(&choice.outcome),
-            key = escape(&choice.key),
-            label = escape(&choice.label),
-            consequence = escape(&choice.consequence),
-            digit = index + 1,
-        );
-        if choice.recommended {
-            recommended = format!(
-                "<fieldset class=recommended data-testid=deck-recommended>\
-                 <legend>Recommended</legend>{rendered}</fieldset>"
-            );
-        } else {
-            alternatives.push_str(&format!("<div class=alternative>{rendered}</div>"));
-        }
-    }
-    html.push_str(&format!(
-        "<form class=decide data-testid=deck-panel method=post \
-         action=\"/attention/{project_url}/{id_url}/reply\">\
-         {recommended}"
-    ));
-    if !alternatives.is_empty() {
-        html.push_str(&format!(
-            "<div class=alternatives data-testid=deck-answers>{alternatives}</div>"
-        ));
-    }
-    html.push_str(&format!(
-        "<div class=reply><label for=\"answer-{id_url}\">Add a note</label>\
-         <textarea id=\"answer-{id_url}\" name=reply maxlength={max} \
-         data-testid=deck-note></textarea></div>\
-         <details class=custom data-custom data-testid=deck-custom>\
-         <summary>Answer in my own words</summary>\
-         <fieldset class=outcomes>\
-         <legend>recorded as</legend><div class=picks>{picks}</div>\
-         </fieldset>\
-         <div class=actions>\
-         <button type=submit class=record name=decision value=custom \
-         data-testid=deck-record>Record my answer</button>\
-         <button type=button class=clear data-clear data-testid=deck-clear hidden>\
-         Clear verdict</button>\
-         <p class=hint data-hint data-testid=deck-hint>Pick a verdict and write your \
-         reply above.</p>\
-         </div></details></form>",
-        picks = ATTENTION_OUTCOMES
-            .iter()
-            .map(|outcome| format!(
-                "<label for=\"outcome-{id_url}-{outcome}\">\
-                 <input type=radio id=\"outcome-{id_url}-{outcome}\" name=outcome \
-                 data-testid=\"deck-outcome-{outcome}\" value={outcome}>{outcome}</label>"
-            ))
-            .collect::<String>(),
-        max = MAX_REPLY_BYTES,
-    ));
-    html.push_str(&format!(
-        "<details class=full data-testid=deck-full><summary>show the full item</summary>\
-         <div class=\"body md\" data-testid=deck-body>{}</div></details>",
-        markdown(&item.body)
-    ));
-    // The trailing meta reads as a sentence, and the priority is the only
-    // thing in it that is not prose: `about` is where the work is, and the
-    // tags are what it was filed under.
-    html.push_str(&format!(
-        "<p class=meta>{priority}{about}{tags}</p></article>",
-        priority = priority_badge(item.priority, item.priority_level.as_deref()),
-        about = item
-            .task_id
-            .as_ref()
-            .map(|task| format!(", about {}", task_reference(project, store, task)))
-            .unwrap_or_default(),
-        tags = tag_list(&item.tags),
-    ));
-    html
-}
-
-/// What the card asks, which for a row that authored no question is the first
-/// line of its body — the sentence a raiser puts the verdict in — bounded to
-/// the same 160 characters a question is bounded to.
-fn card_question(item: &Attention) -> String {
-    if let Some(question) = &item.question {
-        return question.clone();
-    }
-    let first = item.body.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= 160 {
-        return first.to_owned();
-    }
-    format!("{}…", first.chars().take(159).collect::<String>())
-}
-
-/// The choices in the order the card lists them: the recommendation first,
-/// then the alternatives as the raiser declared them.
-///
-/// The order is what the keyboard numbers, so it is decided once here rather
-/// than in the renderer and again in the script.
-fn ordered_choices(item: &Attention) -> Vec<&AttentionChoice> {
-    let mut ordered = Vec::with_capacity(item.choices.len());
-    ordered.extend(item.choices.iter().filter(|choice| choice.recommended));
-    ordered.extend(item.choices.iter().filter(|choice| !choice.recommended));
-    ordered
-}
-
-/// One reference answered on hover: what the item is, in one glance.
-///
-/// The page script fetches this fragment for every `a[data-ref]` anchor, and
-/// the anchors the fragment itself renders carry `data-ref` too — which is
-/// what makes previews nest. It is a fragment, not a page: a whole document
-/// inside a document would bring a second socket and a second copy of the
-/// keyboard map into being behind the operator's back.
-fn preview_page(project: &str, kind: &str, id: &str) -> Result<String> {
-    let (record, store) = project_named(project)?;
-    let name = record.name.as_str();
-    let body = match kind {
-        "task" => task_preview(name, &store, id)?,
-        "attention" => attention_preview(name, &store, id)?,
-        "deployment" => deployment_preview(name, &store, id)?,
-        "board" if id == name => board_preview(name, &store)?,
-        _ => return Ok(String::from("<p class=meta>Nothing to preview here.</p>")),
-    };
-    Ok(format!(
-        "<div class=preview-card data-preview-card>{body}</div>"
-    ))
-}
-
-fn task_preview(project: &str, store: &Store, id: &str) -> Result<String> {
-    let task = store.require_task(id)?;
-    let mut html = format!(
-        "<h3>{title}</h3><p class=meta>{article} {ty} in \
-         <span class=\"pill status-{state}\">{status}</span> \
-         at {priority}, updated {when}{lane}{parent}</p>",
-        title = escape(&task.title),
-        article = a_or_an(&task.task_type),
-        state = escape(&task.status),
-        status = escape(&status_label(&task.status)),
-        ty = escape(&task.task_type),
-        priority = priority_badge(task.priority, task.priority_level.as_deref()),
-        when = ago(task.updated_at),
-        lane = task
-            .lane
-            .as_ref()
-            .map(|lane| format!(" in lane {}", escape(lane)))
-            .unwrap_or_default(),
-        parent = task
-            .parent_id
-            .as_ref()
-            .map(|parent| format!(", part of {}", task_reference(project, store, parent)))
-            .unwrap_or_default(),
-    );
-    if let Some(body) = &task.body {
-        html.push_str(&format!(
-            "<div class=\"body md\">{}</div>",
-            markdown(&excerpt(body, PREVIEW_BODY_CHARS))
-        ));
-    }
-    let open = task_attention_count(store, &task.id)?;
-    if open > 0 {
-        html.push_str(&format!(
-            "<p class=meta>{open} open attention - it is on Needs you.</p>"
-        ));
-    }
-    Ok(html)
-}
-
-fn attention_preview(project: &str, store: &Store, id: &str) -> Result<String> {
-    // No single-row getter exists and none is added for a hover: the listing
-    // is bounded, indexed by id and already the read path every page uses.
-    let item = store
-        .attention(None, None, None, None, None, 500, false)?
-        .into_iter()
-        .find(|item| item.id == id)
-        .ok_or_else(|| anyhow::anyhow!("attention {id} not found"))?;
-    let mut html = format!("<h3>{}</h3>", escape(&card_question(&item)));
-    if let Some(context) = &item.context {
-        html.push_str(&format!("<p class=meta>{}</p>", escape(context)));
-    }
-    let state = if item.status == "resolved" {
-        format!("decided: {}", escape(&decision_words(&item)))
-    } else {
-        let choices = ordered_choices(&item)
-            .iter()
-            .map(|choice| {
-                format!(
-                    "{}{}",
-                    if choice.recommended { "*" } else { "" },
-                    escape(&choice.label)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("open - {choices}")
-    };
-    html.push_str(&format!(
-        "<p class=meta>{article} {kind} ask, {state}</p>",
-        article = a_or_an(&item.kind.replace('_', " ")),
-        kind = escape(&item.kind.replace('_', " ")),
-    ));
-    if let Some(task) = &item.task_id {
-        html.push_str(&format!(
-            "<p class=meta>about {}</p>",
-            task_reference(project, store, task)
-        ));
-    }
-    Ok(html)
-}
-
-fn deployment_preview(project: &str, store: &Store, id: &str) -> Result<String> {
-    let row = store.require_deployment(id)?;
-    Ok(format!(
-        "<h3><code>{id}</code></h3><p class=meta>{repo} on the {tier} tier, \
-         {environment} on {host}, {status} {when}, from board {board}</p>",
-        id = escape(&row.id),
-        repo = escape(&row.repo),
-        tier = escape(&row.tier),
-        environment = escape(&row.environment),
-        host = escape(&row.host),
-        status = escape(&row.status),
-        when = escape(&ago(row.updated_at)),
-        board = escape(project),
-    ))
-}
-
-fn board_preview(project: &str, store: &Store) -> Result<String> {
-    let tasks = store.list_tasks(None, None, None, None, false)?;
-    let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-    let open_attention = store.count_open_attention()?;
-    Ok(format!(
-        "<h3>{project}</h3><p class=meta>{attention} open attention, {todo} to do, \
-         {doing} in progress, {total} tasks in all</p>",
-        project = escape(project),
-        attention = open_attention,
-        todo = count("todo"),
-        doing = count("in_progress"),
-        total = tasks.len(),
-    ))
-}
 
 /// The first `bound` characters of a body, cut on a character boundary so the
 /// markdown renderer never sees half a grapheme, with an ellipsis when it cut.
@@ -2406,1084 +1793,6 @@ pub(crate) fn search_receipt(query: &str) -> Result<crate::model::SearchReceipt>
     ))
 }
 
-/// Cross-board retrieval for people who should not need to know which board
-/// owns a fact before they can find it. Ranking and bounds are the same shared
-/// implementation used by the CLI and MCP tool.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn search_page(query: &str) -> Result<String> {
-    let query = query.trim();
-    let mut html = format!(
-        "<h1>Search</h1><form class=search-page action=/search method=get>\
-         <input name=q value=\"{}\" aria-label=\"Search Kanban\" \
-         placeholder=\"Task, decision, handoff, rule…\" autofocus>\
-         <button type=submit>Search</button></form>",
-        escape(query)
-    );
-    if query.is_empty() {
-        html.push_str(
-            "<p class=empty>Search every board, including tasks, notes, checkpoints, \
-             handoffs, attention, sitreps, rules, and their audit trail.</p>",
-        );
-        return Ok(page("Search", &html));
-    }
-    let receipt = search_receipt(query)?;
-    html.push_str(&format!(
-        "<p class=count>{} result{} across {} board{}, model <code>{}</code>{}</p>",
-        receipt.results.len(),
-        if receipt.results.len() == 1 { "" } else { "s" },
-        receipt.boards.len(),
-        if receipt.boards.len() == 1 { "" } else { "s" },
-        escape(&receipt.embedding_model),
-        if receipt.truncated { ", bounded" } else { "" },
-    ));
-    if receipt.results.is_empty() {
-        html.push_str("<p class=empty>No matching Kanban knowledge.</p>");
-    }
-    for result in receipt.results {
-        let title = if let Some(task_id) = &result.task_id {
-            format!(
-                "<a href=\"/task/{0}/{1}\" data-task-link=\"{1}\" \
-                 data-ref target=_blank rel=noopener>{2}</a>",
-                escape(&result.board),
-                escape(task_id),
-                escape(&result.title)
-            )
-        } else {
-            escape(&result.title)
-        };
-        html.push_str(&format!(
-            "<article class=search-result><h2>{title}</h2>\
-             <p class=meta>{article} {kind} on {board}, scoring {score:.3}{status}{lane}{tags}</p>\
-             <p class=body>{snippet}</p><p class=citation><code>{citation}</code></p></article>",
-            title = title,
-            article = a_or_an(&result.source_kind.replace('_', " ")),
-            board = escape(&result.board),
-            kind = escape(&result.source_kind.replace('_', " ")),
-            score = result.score,
-            status = result
-                .status
-                .as_ref()
-                .map(|status| format!(", {}", escape(&status.replace('_', " "))))
-                .unwrap_or_default(),
-            lane = result
-                .lane
-                .as_ref()
-                .map(|lane| format!(", in lane {}", escape(lane)))
-                .unwrap_or_default(),
-            tags = tag_list(&result.tags),
-            snippet = escape(&result.snippet),
-            citation = escape(&result.citation),
-        ));
-    }
-    if !receipt.missing_boards.is_empty() {
-        html.push_str(&format!(
-            "<p class=error>Missing board files: {}</p>",
-            escape(&receipt.missing_boards.join(", "))
-        ));
-    }
-    Ok(page(&format!("Search: {query}"), &html))
-}
-
-fn deployment_link(project: &str, deployment: &DeploymentAttempt) -> String {
-    format!(
-        "<a href=\"/deployment/{0}/{1}\" data-deployment-link=\"{2}\" \
-         data-ref target=_blank rel=noopener><code>{2}</code></a>",
-        escape(&url_encode(project)),
-        escape(&url_encode(&deployment.id)),
-        escape(&deployment.id),
-    )
-}
-
-/// What one attempt's build-commit cell says.
-///
-/// A Git attempt shows the first twelve characters of its commit, as it
-/// always has. An artifact-identity attempt shows the words, never a blank
-/// and never a truncated `unknown` that could be mistaken for a short SHA
-/// (ADR-043 §4).
-fn build_commit_cell(deployment: &DeploymentAttempt) -> String {
-    if deployment.identity_mode == IDENTITY_MODE_ARTIFACT {
-        format!(
-            "<span class=meta>{}</span>",
-            escape(&deployment.build_commit_label)
-        )
-    } else {
-        format!("<code>{}</code>", escape(&deployment.build_commit[..12]))
-    }
-}
-
-/// Current releases and the attempts that still need operational attention.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn deployments() -> Result<String> {
-    let mut current = Vec::new();
-    let mut active = Vec::new();
-    let mut failures = Vec::new();
-    for (project, store) in projects()? {
-        current.extend(
-            store
-                .current_deployments()?
-                .into_iter()
-                .map(|row| (project.name.clone(), row)),
-        );
-        active.extend(
-            store
-                .deployments(Some("started"), None, false, 100)?
-                .into_iter()
-                .map(|row| (project.name.clone(), row)),
-        );
-        for status in ["failed", "abandoned"] {
-            failures.extend(
-                store
-                    .deployments(Some(status), None, false, 30)?
-                    .into_iter()
-                    .map(|row| (project.name.clone(), row)),
-            );
-        }
-    }
-    current.sort_by(|a, b| {
-        (&a.1.repo, &a.1.tier, &a.1.environment, &a.0).cmp(&(
-            &b.1.repo,
-            &b.1.tier,
-            &b.1.environment,
-            &b.0,
-        ))
-    });
-    active.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
-    failures.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
-
-    let mut html = String::from(
-        "<div class=heading><h1>Deployments</h1></div>\
-         <p class=meta>Verified current releases, derived from immutable attempts. Old non-current terminal attempts self-archive from hot views, and <code>kb deploy list --all</code> still reaches them.</p>",
-    );
-    html.push_str("<h2>Current releases</h2>");
-    if current.is_empty() {
-        html.push_str("<p class=empty>No verified release has been recorded yet.</p>");
-    } else {
-        html.push_str("<table><thead><tr><th>Repository</th><th>Tier</th><th>Environment</th><th>Commit</th><th>Host</th><th>Attempt</th><th>Verified</th></tr></thead><tbody>");
-        for (project, row) in &current {
-            html.push_str(&format!(
-                "<tr><td>{repo}<div class=meta>{project}</div></td><td><code>{tier}</code></td><td>{environment}</td><td>{commit}</td><td>{host}</td><td>{attempt}</td><td class=when>{when}</td></tr>",
-                repo = escape(&row.repo), project = escape(project), tier = escape(&row.tier),
-                environment = escape(&row.environment), commit = build_commit_cell(row),
-                host = escape(&row.host), attempt = deployment_link(project, row),
-                when = escape(&ago(row.completed_at.unwrap_or(row.updated_at))),
-            ));
-        }
-        html.push_str("</tbody></table>");
-    }
-    html.push_str("<h2>In progress</h2>");
-    if active.is_empty() {
-        html.push_str("<p class=empty>No deployment is currently in progress.</p>");
-    }
-    for (project, row) in &active {
-        html.push_str(&format!(
-            "<article class=item><p>{attempt} <strong>{repo}</strong> to the <code>{tier}</code> {environment}</p><p class=meta>{commit} on {host}, started {when} by {actor}</p></article>",
-            attempt = deployment_link(project, row), repo = escape(&row.repo), tier = escape(&row.tier),
-            environment = escape(&row.environment), commit = build_commit_cell(row),
-            host = escape(&row.host), when = escape(&ago(row.created_at)), actor = escape(&row.actor),
-        ));
-    }
-    html.push_str("<h2>Recent failures</h2>");
-    if failures.is_empty() {
-        html.push_str("<p class=empty>No failed or abandoned attempt is in the hot window.</p>");
-    }
-    for (project, row) in failures.iter().take(30) {
-        html.push_str(&format!(
-            "<article class=item><p>{attempt} <strong>{repo}</strong> <span class=\"pill status-{status}\">{status}</span></p><p class=meta>The {tier} tier, {environment}, in phase {phase} {when}</p><p class=body>{receipt}</p></article>",
-            attempt = deployment_link(project, row), repo = escape(&row.repo), status = escape(&row.status),
-            tier = escape(&row.tier), environment = escape(&row.environment),
-            phase = escape(row.phase.as_deref().unwrap_or("unknown")), when = escape(&ago(row.updated_at)),
-            receipt = escape(row.receipt.as_deref().unwrap_or("No receipt recorded.")),
-        ));
-    }
-    Ok(page("Deployments", &html))
-}
-
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn deployment_detail(project: &str, id: &str) -> Result<String> {
-    let (_, store) = project_named(project)?;
-    let row = store.require_deployment(id)?;
-    let task = row
-        .task_id
-        .as_ref()
-        .map(|task| {
-            format!(
-                "<a href=\"/task/{}/{}\" data-ref target=_blank rel=noopener>{}</a>",
-                escape(&url_encode(project)),
-                escape(&url_encode(task)),
-                escape(task)
-            )
-        })
-        .unwrap_or_else(|| "—".to_owned());
-    let fields = [
-        ("Board", escape(project)),
-        ("Status", escape(&row.status)),
-        ("Repository", escape(&row.repo)),
-        ("Identity mode", escape(&row.identity_mode)),
-        (
-            "Build commit",
-            if row.identity_mode == IDENTITY_MODE_ARTIFACT {
-                format!(
-                    "<span class=meta>{}</span>",
-                    escape(&row.build_commit_label)
-                )
-            } else {
-                format!("<code>{}</code>", escape(&row.build_commit))
-            },
-        ),
-        (
-            "Deployer checkout",
-            row.deployer_checkout
-                .as_ref()
-                .map(|value| format!("<code>{}</code>", escape(value)))
-                .unwrap_or_else(|| "—".to_owned()),
-        ),
-        ("Branch", escape(row.branch.as_deref().unwrap_or("—"))),
-        ("Tier", escape(&row.tier)),
-        ("Environment", escape(&row.environment)),
-        ("Host", escape(&row.host)),
-        ("URL", escape(&row.url)),
-        ("Task", task),
-        ("Actor", escape(&row.actor)),
-        ("Lane", escape(row.lane.as_deref().unwrap_or("—"))),
-        ("Mechanism", escape(row.mechanism.as_deref().unwrap_or("—"))),
-        ("Retry of", escape(row.retry_of.as_deref().unwrap_or("—"))),
-        ("Phase", escape(row.phase.as_deref().unwrap_or("—"))),
-        (
-            "Served commit",
-            match (&row.served_commit, row.identity_mode.as_str()) {
-                (Some(value), _) => format!("<code>{}</code>", escape(value)),
-                (None, IDENTITY_MODE_ARTIFACT) => {
-                    "not applicable - proved by artifact identity".to_owned()
-                }
-                (None, _) => "—".to_owned(),
-            },
-        ),
-        ("Started", escape(&stamp(row.created_at))),
-        (
-            "Completed",
-            row.completed_at
-                .map(|value| escape(&stamp(value)))
-                .unwrap_or_else(|| "—".to_owned()),
-        ),
-        (
-            "Archived",
-            if row.archived {
-                "yes".to_owned()
-            } else {
-                "no".to_owned()
-            },
-        ),
-    ];
-    let mut html = format!(
-        "<h1 data-deployment-detail=\"{0}\">Deployment <code>{0}</code></h1><dl>",
-        escape(&row.id)
-    );
-    for (label, value) in fields {
-        html.push_str(&format!(
-            "<dt>{0}</dt><dd data-deployment-field=\"{0}\">{1}</dd>",
-            escape(label),
-            value
-        ));
-    }
-    html.push_str("</dl>");
-    if !row.artifacts.is_empty() {
-        html.push_str(
-            "<h2>Artifact identities</h2><table><thead><tr><th>Role</th><th>Kind</th>\
-             <th>Expected</th><th>Observed</th></tr></thead><tbody>",
-        );
-        for artifact in &row.artifacts {
-            html.push_str(&format!(
-                "<tr><td>{role}</td><td>{kind}</td><td><code>{expected}</code></td><td>{observed}</td></tr>",
-                role = escape(&artifact.role),
-                kind = escape(&artifact.kind),
-                expected = escape(&artifact.expected),
-                observed = artifact
-                    .observed
-                    .as_ref()
-                    .map(|value| format!("<code>{}</code>", escape(value)))
-                    .unwrap_or_else(|| "not yet observed".to_owned()),
-            ));
-        }
-        html.push_str("</tbody></table>");
-    }
-    html.push_str("<h2>Receipt</h2>");
-    html.push_str(&format!(
-        "<pre data-deployment-receipt>{}</pre>",
-        escape(row.receipt.as_deref().unwrap_or("No terminal receipt yet."))
-    ));
-    if let Some(uri) = row.artifact_uri {
-        html.push_str(&format!(
-            "<p class=meta>Artifact: <code>{}</code></p>",
-            escape(&uri)
-        ));
-    }
-    Ok(page(&format!("Deployment {id}"), &html))
-}
-
-const DAY_MS: i64 = 86_400_000;
-
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn sprint_days_remaining(scheduled_end: i64) -> i64 {
-    let remaining = scheduled_end.saturating_sub(now_ms());
-    if remaining <= 0 {
-        0
-    } else {
-        remaining.saturating_add(DAY_MS - 1) / DAY_MS
-    }
-}
-
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn sprint_summary(store: &Store, project: &str, sprint: &Sprint, current: bool) -> Result<String> {
-    let (open, done) = store.sprint_task_counts(&sprint.id)?;
-    let route = format!("/sprint/{}/{}", url_encode(project), url_encode(&sprint.id));
-    let archived = if sprint.archived {
-        " <span class=meta data-sprint-archived>archived</span>"
-    } else {
-        ""
-    };
-    let goal =
-        sprint.body.as_deref().map(markdown).unwrap_or_else(|| {
-            "<p class=empty>No goal or success criteria recorded.</p>".to_owned()
-        });
-    Ok(format!(
-        r#"<article class="card{current_class}" data-sprint-summary="{id}"{current_attr}>
-        <h2 class=sprint-version><a href="{route}" data-sprint-link="{id}"><code data-sprint-version>{version}</code></a></h2>
-        <p><strong data-sprint-title>{title}</strong></p>
-        <div class="body md" data-sprint-goal>{goal}</div>
-        <p class=meta><span class="pill status-{status}" data-sprint-state>{status}</span>{archived}</p>
-        <dl><dt>Scheduled start</dt><dd data-sprint-scheduled-start>{scheduled_start}</dd>
-        <dt>Scheduled end</dt><dd data-sprint-scheduled-end>{scheduled_end}</dd>
-        <dt>Days remaining</dt><dd data-sprint-days-remaining>{days}</dd>
-        <dt>Open tasks</dt><dd data-sprint-open>{open}</dd>
-        <dt>Done tasks</dt><dd data-sprint-done>{done}</dd></dl></article>"#,
-        current_class = if current { " current" } else { "" },
-        current_attr = if current { " data-sprint-current" } else { "" },
-        id = escape(&sprint.id),
-        route = escape(&route),
-        version = escape(&sprint.target_version),
-        title = escape(&sprint.title),
-        goal = goal,
-        status = escape(&sprint.status),
-        archived = archived,
-        scheduled_start = escape(&stamp(sprint.scheduled_start)),
-        scheduled_end = escape(&stamp(sprint.scheduled_end)),
-        days = sprint_days_remaining(sprint.scheduled_end),
-    ))
-}
-
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn board_sprints_content(project: &ProjectRecord, store: &Store) -> Result<String> {
-    let current = store.current_sprint()?;
-    let history = store.sprints(None, true, i64::MAX)?;
-    let mut html = String::new();
-    html.push_str("<h2>Current sprint</h2>");
-    match &current {
-        Some(sprint) => html.push_str(&sprint_summary(store, &project.name, sprint, true)?),
-        None => html.push_str(
-            "<p class=empty data-no-current-sprint>No current sprint. Planned and historical sprints remain below.</p>",
-        ),
-    }
-    let secondary = history
-        .iter()
-        .filter(|sprint| sprint.status != "current")
-        .collect::<Vec<_>>();
-    if secondary.is_empty() {
-        if current.is_none() {
-            html.push_str("<p class=empty data-no-sprints>This board has no sprints.</p>");
-        } else {
-            html.push_str(
-                "<p class=empty data-no-sprint-history>No planned or historical sprints.</p>",
-            );
-        }
-    } else {
-        html.push_str(&format!(
-            "<section class=sprint-history data-sprint-history><h2>Planned and history <span class=count>{}</span></h2>",
-            secondary.len()
-        ));
-        for sprint in secondary {
-            html.push_str(&sprint_summary(store, &project.name, sprint, false)?);
-        }
-        html.push_str("</section>");
-    }
-    Ok(html)
-}
-
-/// Every registered board's current release boundary and complete sprint history.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn sprints() -> Result<String> {
-    let mut html = String::from("<h1 data-sprints-overview>Sprints</h1>");
-    let boards = projects()?;
-    if boards.is_empty() {
-        html.push_str("<p class=empty>No boards are registered.</p>");
-    }
-    for (project, store) in boards {
-        html.push_str(&format!(
-            r#"<section data-sprint-board="{name}"><h2><a href="/sprints/{route}" data-board-sprints-link>{name}</a></h2>"#,
-            name = escape(&project.name),
-            route = escape(&url_encode(&project.name)),
-        ));
-        html.push_str(&board_sprints_content(&project, &store)?);
-        html.push_str("</section>");
-    }
-    Ok(page("Sprints", &html))
-}
-
-/// One board's current release boundary and complete planned/closed/abandoned history.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn board_sprints(name: &str) -> Result<String> {
-    let (project, store) = project_named(name)?;
-    let mut html = format!(
-        r#"<h1 data-board-sprints="{name}">{name} sprints</h1><p><a href="/board/{route}">Back to board</a></p>"#,
-        name = escape(&project.name),
-        route = escape(&url_encode(&project.name)),
-    );
-    html.push_str(&board_sprints_content(&project, &store)?);
-    Ok(page(&format!("{} sprints", project.name), &html))
-}
-
-/// One sprint's release goal, dates, visible scope and authoritative deployment proof.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn sprint_detail(project_name: &str, id: &str) -> Result<String> {
-    let (project, store) = project_named(project_name)?;
-    let sprint = store.require_sprint(id)?;
-    let tasks = store.sprint_tasks(id)?;
-    let (open, done) = store.sprint_task_counts(id)?;
-    let archived = if sprint.archived { "yes" } else { "no" };
-    let actual_start = if sprint.starts_at == 0 {
-        "not started".to_owned()
-    } else {
-        stamp(sprint.starts_at)
-    };
-    let actual_end = sprint
-        .ends_at
-        .map(stamp)
-        .unwrap_or_else(|| "not ended".to_owned());
-    let mut html = format!(
-        r#"<h1 data-sprint-detail="{id}"><span data-sprint-title>{title}</span></h1>
-        <p class=meta>Release <code data-sprint-version>{version}</code> on {project}.</p>
-        <p><a href="/sprints/{board}" data-board-sprints-back>Back to {project} sprints</a></p>
-        <div class="card current"><div class="body md" data-sprint-goal>{goal}</div>
-        <dl><dt>State</dt><dd><span class="pill status-{status}" data-sprint-state>{status}</span></dd>
-        <dt>Scheduled start</dt><dd data-sprint-scheduled-start>{scheduled_start}</dd>
-        <dt>Scheduled end</dt><dd data-sprint-scheduled-end>{scheduled_end}</dd>
-        <dt>Actual start</dt><dd data-sprint-actual-start>{actual_start}</dd>
-        <dt>Actual end</dt><dd data-sprint-actual-end>{actual_end}</dd>
-        <dt>Days remaining</dt><dd data-sprint-days-remaining>{days}</dd>
-        <dt>Open tasks</dt><dd data-sprint-open>{open}</dd>
-        <dt>Done tasks</dt><dd data-sprint-done>{done}</dd>
-        <dt>Archived</dt><dd data-sprint-archived>{archived}</dd></dl></div>"#,
-        id = escape(&sprint.id),
-        version = escape(&sprint.target_version),
-        title = escape(&sprint.title),
-        board = escape(&url_encode(&project.name)),
-        project = escape(&project.name),
-        goal = sprint.body.as_deref().map(markdown).unwrap_or_else(|| {
-            "<p class=empty>No goal or success criteria recorded.</p>".to_owned()
-        }),
-        status = escape(&sprint.status),
-        scheduled_start = escape(&stamp(sprint.scheduled_start)),
-        scheduled_end = escape(&stamp(sprint.scheduled_end)),
-        actual_start = escape(&actual_start),
-        actual_end = escape(&actual_end),
-        days = sprint_days_remaining(sprint.scheduled_end),
-    );
-    if let Some(deployment_id) = &sprint.closed_by_deployment {
-        let deployment = store.require_deployment(deployment_id)?;
-        html.push_str(&format!(
-            r#"<section class=card data-sprint-deployment-proof><h2>Served deployment proof</h2>
-            <p>{link}</p><dl><dt>Served version</dt><dd data-sprint-served-version>{version}</dd>
-            <dt>Served commit</dt><dd data-sprint-served-commit>{commit}</dd></dl></section>"#,
-            link = deployment_link(&project.name, &deployment),
-            version = deployment
-                .served_version
-                .as_deref()
-                .map(escape)
-                .unwrap_or_else(|| "not recorded".to_owned()),
-            commit = deployment
-                .served_commit
-                .as_deref()
-                .map(|value| format!("<code>{}</code>", escape(value)))
-                .unwrap_or_else(|| "not recorded".to_owned()),
-        ));
-    } else if sprint.status == "closed" {
-        html.push_str(
-            "<p class=empty data-no-sprint-proof>No served deployment proof is attached.</p>",
-        );
-    }
-    html.push_str(&format!(
-        "<h2>Attached tasks <span class=count>{}</span></h2>",
-        tasks.len()
-    ));
-    if tasks.is_empty() {
-        html.push_str("<p class=empty data-no-sprint-tasks>No visible tasks are attached.</p>");
-    } else {
-        html.push_str("<ul class=rows data-sprint-tasks>");
-        for task in tasks {
-            html.push_str(&format!(
-                r#"<li data-task="{id}"><a href="/task/{project}/{task_route}" data-task-link="{id}" data-ref target=_blank rel=noopener data-task-title>{title}</a><p class=meta>Attached as <code>{id}</code> in <span class="pill status-{state}" data-task-state>{status}</span></p></li>"#,
-                project = escape(&url_encode(&project.name)),
-                task_route = escape(&url_encode(&task.id)),
-                id = escape(&task.id),
-                state = escape(&task.status),
-                status = escape(&status_label(&task.status)),
-                title = escape(&task.title),
-            ));
-        }
-        html.push_str("</ul>");
-    }
-    Ok(page(&format!("Sprint {}", sprint.id), &html))
-}
-
-/// Every board at a glance — the `dashboard` projection, rendered.
-///
-/// The counts, and the order they arrive in, are
-/// [`projection::board_summaries`]: the JSON surface serves the same rows
-/// from the same computation, so the page and `/api/v1/boards` cannot drift
-/// into disagreeing about how many rows a board holds.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn boards() -> Result<String> {
-    let mut html = String::from(
-        "<h1>Boards</h1><table><thead><tr>\
-        <th>Board</th><th class=n>Open attention</th><th class=n>To do</th>\
-        <th class=n>In progress</th><th class=n>Stale</th>\
-        <th class=n>Handoffs</th><th class=n>Tasks</th></tr></thead><tbody>",
-    );
-    for summary in projection::board_summaries()? {
-        html.push_str(&format!(
-            "<tr data-board=\"{name}\"><td><a href=\"/board/{url}\" data-board-link data-ref target=_blank rel=noopener>{name}</a></td>\
-             <td class=\"n{flag}\">{attention}</td><td class=n>{todo}</td>\
-             <td class=n>{doing}</td><td class=n>{stale}</td>\
-             <td class=n>{handoffs}</td><td class=n>{total}</td></tr>",
-            url = escape(&summary.board),
-            name = escape(&summary.board),
-            flag = if summary.open_attention == 0 {
-                ""
-            } else {
-                " waiting"
-            },
-            attention = summary.open_attention,
-            todo = summary.todo,
-            doing = summary.in_progress,
-            stale = summary.stale,
-            handoffs = summary.handoffs,
-            total = summary.tasks,
-        ));
-    }
-    html.push_str("</tbody></table>");
-    html.push_str(
-        "<p class=meta>Counts come from the same projection \
-         <code>kb dash</code> reads. Integrity is what <code>kb doctor</code> \
-         checks, not what this page claims.</p>",
-    );
-    Ok(page("Boards", &html))
-}
-
-/// Plans: draft epics, whose body is the plan itself.
-///
-/// A draft holds back everything beneath it, so this page is also the answer to
-/// "what work is currently gated" — the children are listed with each plan
-/// because opening the plan is what releases them.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn plans(opened: Option<&str>) -> Result<String> {
-    let mut html = String::from("<h1>Plans</h1>");
-    if let Some(id) = opened {
-        html.push_str(&format!(
-            "<p class=success data-plan-opened>Opened plan <code>{}</code> and its child work is now eligible for claims.</p>",
-            escape(id)
-        ));
-    }
-    let mut found = 0;
-    for (project, store) in projects()? {
-        let tasks = store.list_tasks(None, None, None, None, false)?;
-        let drafts = tasks
-            .iter()
-            .filter(|task| task.status == "draft" && task.task_type == "epic")
-            .collect::<Vec<_>>();
-        for plan in drafts {
-            found += 1;
-            let plan_attention = task_attention_count(&store, &plan.id)?;
-            html.push_str(&format!(
-                "<article class=plan data-plan=\"{}\">",
-                escape(&plan.id)
-            ));
-            html.push_str(&format!(
-                "<h2><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
-                 data-ref target=_blank rel=noopener>{title}</a>{attention}</h2>\
-                 <p class=meta>Drafted {age} on \
-                 <a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a> \
-                 as <code>{id}</code> at {priority}{tags}</p>",
-                project = escape(&project.name),
-                id = escape(&plan.id),
-                title = escape(&plan.title),
-                priority = priority_badge(plan.priority, plan.priority_level.as_deref()),
-                age = ago(plan.created_at),
-                tags = tag_list(&plan.tags),
-                attention = attention_count_badge(plan_attention),
-            ));
-            let children = tasks
-                .iter()
-                .filter(|task| task.parent_id.as_deref() == Some(plan.id.as_str()))
-                .collect::<Vec<_>>();
-            if !children.is_empty() {
-                html.push_str(&format!(
-                    "<p class=meta>Holds back {} row{}, none claimable until this plan \
-                     is opened:</p><ul class=children>",
-                    children.len(),
-                    if children.len() == 1 { "" } else { "s" }
-                ));
-                for child in children {
-                    let child_attention = task_attention_count(&store, &child.id)?;
-                    html.push_str(&format!(
-                        "<li><a href=\"/task/{project}/{id}\" \
-                         data-ref target=_blank rel=noopener>{title}</a>\
-                         <p class=meta>In <span class=\"pill status-{state}\">{status}</span> \
-                         at {priority}, filed as <code>{id}</code>{attention}</p></li>",
-                        project = escape(&project.name),
-                        id = escape(&child.id),
-                        state = escape(&child.status),
-                        status = escape(&status_label(&child.status)),
-                        title = escape(&child.title),
-                        priority = priority_badge(child.priority, child.priority_level.as_deref()),
-                        attention = attention_clause(child_attention),
-                    ));
-                }
-                html.push_str("</ul>");
-            }
-            if let Some(body) = &plan.body {
-                html.push_str(&format!(
-                    "<div class=\"body md plan-body\" data-plan-body>{}</div>",
-                    markdown(body)
-                ));
-            }
-            html.push_str(&format!(
-                "<form method=post action=\"/plan/{project_path}/{id_path}/open\">\
-                 <button type=submit data-plan-open>Open plan</button></form>\
-                 <p class=cmd>Equivalent: <code>kb t mv {id} todo --as {OPERATOR_ACTOR} --project {project}</code></p>",
-                project_path = url_encode(&project.name),
-                id_path = url_encode(&plan.id),
-                id = escape(&plan.id),
-                project = escape(&project.name),
-            ));
-            html.push_str("</article>");
-        }
-    }
-    if found == 0 {
-        html.push_str(
-            "<p class=empty>No drafted plans. A plan is an epic with \
-             <code>--status draft</code>; its body is the plan and its children are \
-             the work, gated until it is opened.</p>",
-        );
-    }
-    Ok(page("Plans", &html))
-}
-
-/// One rendered subscription: the row, the board it belongs to, the position
-/// derived for it against that board's head, and what its dead letters were
-/// refused with.
-struct SubscriptionView {
-    board: String,
-    subscription: Subscription,
-    position: SubscriptionPosition,
-    /// Empty unless this subscription has dead letters, which is most of the
-    /// time: the codes exist to be loud when a delivery has stopped, not to
-    /// occupy the row when nothing has.
-    dead_letter_codes: Vec<DeadLetterCode>,
-    head_event_seq: i64,
-}
-
-/// Subscriptions: what each consumer watches, where it delivers, and how far
-/// it has actually got.
-///
-/// **Position is a presented cursor and nothing else.** Cursor presentation
-/// means showing a cursor's *meaning* — never an opaque token, and never a
-/// copy kept in the browser: a cursor held client-side becomes a claim the
-/// server must trust, and a stale one silently skips rows, which is missing
-/// information that reads as absence of information
-/// (`docs/ui-pubsub-consumption-seams.md`). Everything in that column is
-/// derived per request from the delivery rows and the event head, so a
-/// reload is always the truth and there is nothing to invalidate.
-///
-/// **The one display preference lives in the URL.** `?show=all` lists paused
-/// subscriptions, exactly as `/plans?opened=` and `/search?q=` carry theirs.
-/// It is deliberately not stored: a preferences table would need a migration,
-/// an actor, an authorization rule and a `doctor` check to express something a
-/// shareable URL already says, and two operators would then disagree about
-/// what "the page" lists. If another display choice arrives, it is another
-/// query parameter.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn subscriptions(show: Option<&str>, changed: Option<&str>) -> Result<String> {
-    let mut views = Vec::new();
-    for (project, store) in projects()? {
-        // Two statements per board, both outside the row loop: the grouped
-        // delivery projection plus the head it is measured against. Paused
-        // rows are read whatever the filter says, so a hidden row can be
-        // counted and offered rather than reading as "nothing exists".
-        let positions = store.subscription_positions()?;
-        for subscription in store.subscriptions(None, None, true)? {
-            views.push(SubscriptionView {
-                board: project.name.clone(),
-                position: positions.position(&subscription.id),
-                // Copied out of the projection rather than borrowed from it:
-                // an empty slice copies without allocating, so a board with
-                // nothing dead-lettered pays nothing for this.
-                dead_letter_codes: positions.dead_letter_codes(&subscription.id).to_vec(),
-                head_event_seq: positions.head_event_seq,
-                subscription,
-            });
-        }
-    }
-    views.sort_by(|a, b| {
-        (&a.board, a.subscription.created_at, &a.subscription.id).cmp(&(
-            &b.board,
-            b.subscription.created_at,
-            &b.subscription.id,
-        ))
-    });
-    Ok(page(
-        "Subscriptions",
-        &subscriptions_body(&views, show == Some("all"), changed),
-    ))
-}
-
-fn subscriptions_body(views: &[SubscriptionView], show_all: bool, changed: Option<&str>) -> String {
-    let mut html = String::from("<div class=heading><h1>Subscriptions</h1></div>");
-    if let Some(id) = changed {
-        html.push_str(&format!(
-            "<p class=success>Recorded the change to <code>{}</code> and the dispatcher reads its state on the next pass.</p>",
-            escape(id)
-        ));
-    }
-    let (shown, hidden): (Vec<_>, Vec<_>) = views
-        .iter()
-        .partition(|view| show_all || view.subscription.status == "active");
-    if shown.is_empty() {
-        // An empty list has two very different causes, and saying the wrong
-        // one is how absence reads as a finding.
-        html.push_str(&if hidden.is_empty() {
-            format!(
-                "<p class=empty>Nothing is subscribed yet. \
-                 <code>kb subscription add --consumer NAME --action NAME --timeout-ms 30000 \
-                 --max-retries 3 --rate-per-minute 60 --max-concurrency 1 --as {OPERATOR_ACTOR}</code> \
-                 registers one, and it starts watching from the event that created it — \
-                 add <code>--kind</code> or <code>--subject</code> or \
-                 <code>--current-status</code> or <code>--tag</code> to narrow what it sees.</p>"
-            )
-        } else {
-            format!(
-                "<p class=empty>Every subscription here is paused right now. \
-                 <a href=\"/subscriptions?show=all\">Show the {} paused one{}</a> to see \
-                 where each of them stopped.</p>",
-                hidden.len(),
-                if hidden.len() == 1 { "" } else { "s" },
-            )
-        });
-        return html;
-    }
-    html.push_str(
-        "<p class=meta>Position is derived per request: the start anchor, the highest acked \
-         seq, and the distance to that board's event head. The distance counts board events, \
-         and a subscription only receives the ones its filter selects — the queued counts are \
-         what is actually waiting for it.</p>",
-    );
-    html.push_str(
-        "<table><thead><tr><th>Subscription</th><th>Watches</th><th>Delivers to</th>\
-         <th>State</th><th>Position</th><th>Limits</th></tr></thead><tbody>",
-    );
-    for view in &shown {
-        html.push_str(&subscription_row(view, show_all));
-    }
-    html.push_str("</tbody></table>");
-    if !hidden.is_empty() {
-        html.push_str(&format!(
-            "<p class=meta>{} paused subscription{} hidden. \
-             <a href=\"/subscriptions?show=all\">Show paused subscriptions</a>.</p>",
-            hidden.len(),
-            if hidden.len() == 1 { " is" } else { "s are" },
-        ));
-    } else if show_all {
-        html.push_str(
-            "<p class=meta>Listing paused subscriptions too. \
-             <a href=\"/subscriptions\">Show active only</a>.</p>",
-        );
-    }
-    html
-}
-
-/// How many codes a dead-letter line names before it summarises the rest.
-///
-/// The set is not bounded by anything this page controls. One subscription's
-/// deliveries can carry its adapter's five or six classifications plus any of
-/// the `adapter_*` classes the delivery process itself fails with, so twenty
-/// distinct codes on one row is reachable, and naming all of them lets ledger
-/// cardinality decide how tall a table row is.
-///
-/// Three is where the summary starts paying for itself. Measured at 1180px, a
-/// count and a thirty-character code fill about one wrapped line of the
-/// position column, so three names plus the tail is four lines of the page's
-/// loudest treatment — barely shorter than listing five, and still four for
-/// twenty. What is left over stays counted rather than dropped, so this caps
-/// names and never arithmetic.
-const DEAD_LETTER_CODES_NAMED: usize = 3;
-
-/// What is actually waiting, rendered only when something is.
-///
-/// These three counts are aspects of position rather than peer facts, and at
-/// rest all three are zero — three columns of nothing crowded out the sentence
-/// that carries the meaning. Silence here reads correctly: nothing queued.
-/// A dead-lettered delivery is the one thing on this page that needs a person,
-/// so it is the one thing that gets loud, in the same treatment open attention
-/// gets on Boards.
-fn queued_state(position: SubscriptionPosition, dead_letter_codes: &[DeadLetterCode]) -> String {
-    let mut parts = Vec::new();
-    if position.pending > 0 {
-        parts.push(format!("{} pending", position.pending));
-    }
-    if position.retry_wait > 0 {
-        parts.push(format!(
-            "<span class=retrying>{} retrying</span>",
-            position.retry_wait
-        ));
-    }
-    if position.dead_letter > 0 {
-        parts.push(format!(
-            "<span class=dead>{} dead-lettered{}</span>",
-            position.dead_letter,
-            dead_letter_attribution(position.dead_letter, dead_letter_codes),
-        ));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
-    format!("<div class=queued>{}</div>", parts.join(", "))
-}
-
-/// Which refusal the dead letters are, in the same sentence as how many.
-///
-/// `3 dead-lettered` says which subscription stopped; it does not say whether
-/// to check a port or a payload. The code the adapter classified the failure
-/// as is exactly that difference, so it rides along: one code becomes
-/// `, all opencode_endpoint_unreachable` and an operator goes and looks at a
-/// port.
-///
-/// Mixed codes stay apart — `: 3 opencode_endpoint_unreachable,
-/// 1 kimi_frame_oversized` — and are never collapsed into the count or
-/// represented by whichever code came first. Two adapters refusing for two
-/// reasons is two pieces of work, and "all" said about a mixed set is a false
-/// sentence that reads as a diagnosis.
-///
-/// Beyond `DEAD_LETTER_CODES_NAMED` the tail is summarised rather than
-/// listed, and it is summarised with its own numbers — how many codes and how
-/// many deliveries — so the named counts plus the tail still add up to the
-/// total beside them and the named codes cannot read as the whole story. It
-/// carries those numbers instead of pointing at a fuller view because there
-/// is no fuller view to point at: `kanban subscription show` prints the
-/// subscription row, and nothing in the CLI or on this page lists deliveries
-/// one by one.
-///
-/// No `<code>` markup around the code. The queued line is plain prose in the
-/// row (`2 pending`, `3 retrying`), and a monospace chip inside the one bold
-/// orange line on the page is decoration competing with the alarm.
-fn dead_letter_attribution(dead_letter: i64, codes: &[DeadLetterCode]) -> String {
-    match codes {
-        // A count with no code behind it is a state the table's CHECK forbids,
-        // not an adapter that failed anonymously. Say nothing rather than
-        // invent an attribution; the count is still true.
-        [] => String::new(),
-        [only] if only.deliveries == dead_letter => format!(", all {}", escape(&only.code)),
-        _ => {
-            let named = codes.len().min(DEAD_LETTER_CODES_NAMED);
-            let mut attribution = String::from(": ");
-            for (index, code) in codes[..named].iter().enumerate() {
-                if index > 0 {
-                    attribution.push_str(", ");
-                }
-                attribution.push_str(&format!("{} {}", code.deliveries, escape(&code.code)));
-            }
-            let rest = codes.len() - named;
-            if rest > 0 {
-                let deliveries = dead_letter
-                    - codes[..named]
-                        .iter()
-                        .map(|code| code.deliveries)
-                        .sum::<i64>();
-                attribution.push_str(&format!(
-                    ", and {rest} more code{} across {deliveries} deliver{}",
-                    if rest == 1 { "" } else { "s" },
-                    if deliveries == 1 { "y" } else { "ies" },
-                ));
-            }
-            attribution
-        }
-    }
-}
-
-fn subscription_row(view: &SubscriptionView, show_all: bool) -> String {
-    let subscription = &view.subscription;
-    let position = view.position;
-    let paused = subscription.status != "active";
-    // Nothing acked yet means the subscription is still sitting on its start
-    // anchor, which is where it began — not seq 0, and not "caught up".
-    let acked_position = position
-        .acked_through_seq
-        .unwrap_or(subscription.start_event_seq);
-    // Neither control is destructive: pausing is reversible and resuming
-    // restores the default, so neither gets the approve/decline weight the
-    // attention surface uses for a decision. The page's one loud element is a
-    // dead-lettered delivery, which is the only thing here needing a person.
-    let (verb, verb_label) = if paused {
-        ("resume", "Resume delivery")
-    } else {
-        ("pause", "Pause delivery")
-    };
-    let position_meta = format!(
-        "started at seq {}{}{}",
-        subscription.start_event_seq,
-        match position.acked_through_seq {
-            Some(seq) => format!(", acked through seq {seq}"),
-            None => ", nothing acked yet".to_owned(),
-        },
-        if position.leased == 0 {
-            String::new()
-        } else {
-            format!(", {} in flight", position.leased)
-        },
-    );
-    format!(
-        "<tr data-subscription=\"{id}\"><td><code>{id}</code><div class=meta><a href=\"/board/{board_url}\" data-ref target=_blank rel=noopener>{board}</a></div></td>\
-         <td>{watches}</td>\
-         <td><code>{consumer}</code><div class=meta>action <code>{action}</code> and {secret}</div></td>\
-         <td><span class=\"pill status-{status}\" data-subscription-state>{status}</span>{paused_by}\
-         <form method=post action=\"/subscription/{board_path}/{id_path}/{verb}{carry}\">\
-         <button class=quick type=submit data-subscription-action=\"{verb}\">{verb_label}</button></form></td>\
-         <td>{position_sentence}<div class=meta>{position_meta}</div>{queued}</td>\
-         <td><div class=meta>{limits}</div></td></tr>",
-        id = escape(&subscription.id),
-        board_url = escape(&url_encode(&view.board)),
-        board = escape(&view.board),
-        watches = escape(&watch_sentence(subscription)),
-        consumer = escape(&subscription.consumer_id),
-        action = escape(&subscription.action_id),
-        // Whether a secret is configured is operational; which secret it is
-        // stays a host-local lookup name the page has no business repeating.
-        secret = if subscription.secret_ref.is_some() {
-            "a secret is configured"
-        } else {
-            "no secret configured"
-        },
-        status = escape(&subscription.status),
-        paused_by = match (&subscription.paused_by, subscription.paused_at) {
-            (Some(actor), Some(at)) => format!(
-                "<div class=meta>paused by {} {}</div>",
-                escape(actor),
-                escape(&ago(at))
-            ),
-            _ => String::new(),
-        },
-        board_path = url_encode(&view.board),
-        id_path = url_encode(&subscription.id),
-        carry = if show_all && paused { "?show=all" } else { "" },
-        position_sentence = escape(&position_sentence(view.head_event_seq, acked_position)),
-        queued = queued_state(position, &view.dead_letter_codes),
-        limits = escape(&format!(
-            "{} ms timeout, {} retries, {}/min, {} at a time",
-            subscription.timeout_ms,
-            subscription.max_retries,
-            subscription.rate_per_minute,
-            subscription.max_concurrency,
-        )),
-    )
-}
-
-/// What a subscription watches, in a sentence.
-///
-/// Six selector fields rendered as six columns is six things to decode; what
-/// an operator wants is to read what the thing is for. Empty selectors narrow
-/// nothing, so a subscription with none of them watches the whole board and
-/// says exactly that.
-///
-/// The rule: `Every <kinds> event`, then the narrowing clauses in a fixed
-/// order — subject, relations, prior statuses, current statuses, tags — the
-/// first attached with a space and any others with commas.
-fn watch_sentence(subscription: &Subscription) -> String {
-    let opening = if subscription.kinds.is_empty() {
-        "Every event".to_owned()
-    } else {
-        format!("Every {} event", or_list(&subscription.kinds))
-    };
-    let mut clauses = Vec::new();
-    if let Some(task) = &subscription.subject_task_id {
-        clauses.push(format!("about task {task}"));
-    }
-    if !subscription.relations.is_empty() {
-        clauses.push(format!(
-            "related through {}",
-            or_list(&subscription.relations)
-        ));
-    }
-    if !subscription.prior_statuses.is_empty() {
-        clauses.push(format!("leaving {}", or_list(&subscription.prior_statuses)));
-    }
-    if !subscription.current_statuses.is_empty() {
-        clauses.push(format!(
-            "arriving at {}",
-            or_list(&subscription.current_statuses)
-        ));
-    }
-    if !subscription.tags.is_empty() {
-        clauses.push(format!("tagged {}", or_list(&subscription.tags)));
-    }
-    let Some((first, rest)) = clauses.split_first() else {
-        return format!("{opening} on the board.");
-    };
-    let mut sentence = format!("{opening} {first}");
-    for clause in rest {
-        sentence.push_str(", ");
-        sentence.push_str(clause);
-    }
-    sentence.push('.');
-    sentence
-}
-
-/// How far behind the board head a subscription is, in words.
-///
-/// "Caught up" is only honest when nothing sits between the last ack and the
-/// head. The count is board events rather than matching events, and the page
-/// says so beside the table: a subscription receives only what its filter
-/// selects, so calling every newer event a backlog would report work as lost
-/// that was never addressed to it.
-fn position_sentence(head_event_seq: i64, acked_position: i64) -> String {
-    match head_event_seq.saturating_sub(acked_position) {
-        behind if behind <= 0 => format!("Caught up with head seq {head_event_seq}."),
-        1 => format!("1 board event behind head seq {head_event_seq}."),
-        behind => format!("{behind} board events behind head seq {head_event_seq}."),
-    }
-}
-
-/// "a", "b", or "c", in the Oxford-comma shape the store's refusals use.
-fn or_list(values: &[String]) -> String {
-    match values {
-        [] => String::new(),
-        [only] => only.clone(),
-        [first, second] => format!("{first} or {second}"),
-        _ => {
-            let (last, rest) = values.split_last().expect("more than two values");
-            format!("{}, or {last}", rest.join(", "))
-        }
-    }
-}
-
 /// Every board's sitreps, grouped by `(board, lane)` and ordered most
 /// recently active first, plus whether any one board's scan was cut at
 /// `limit`.
@@ -3538,433 +1847,7 @@ pub(crate) fn lane_groups(limit: i64) -> Result<(Vec<((String, String), Vec<Sitr
     Ok((ordered, truncated))
 }
 
-/// Where every lane stands, newest first.
-///
-/// The counterpart to Needs you: that page is what waits on the operator, this
-/// is what the agents are doing. A lane that has been posting is legible here
-/// without anyone opening a terminal or waiting for a handoff.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn lanes() -> Result<String> {
-    let (ordered, _truncated) = lane_groups(LANE_UPDATE_ROWS)?;
-    let mut html = String::from("<h1>Lanes</h1>");
-    if ordered.is_empty() {
-        html.push_str(
-            "<p class=empty>No lane has posted a sitrep. \
-             <code>kb sr new \"…\" --as AGENT --lane LANE</code> writes one — no task \
-             and no lease required, which is the point of it.</p>",
-        );
-        return Ok(page("Lanes", &html));
-    }
-    for ((project, lane), updates) in &ordered {
-        html.push_str(&format!(
-            "<article class=item data-lane=\"{}\">",
-            escape(lane)
-        ));
-        html.push_str(&format!(
-            "<h2>{lane} <span class=count><a href=\"/board/{project_url}\" \
-             data-ref target=_blank rel=noopener>{project}</a></span></h2>",
-            lane = escape(lane),
-            project_url = escape(project),
-            project = escape(project),
-        ));
-        for update in updates {
-            html.push_str(&format!(
-                "<p class=meta>{author} wrote this {age}{task}{branch}</p>\
-                 <div class=\"body md\" data-lane-body>{body}</div>",
-                author = escape(&update.author),
-                age = ago(update.created_at),
-                task = update
-                    .task_id
-                    .as_ref()
-                    .map(|id| format!(
-                        ", about <a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
-                         data-ref target=_blank rel=noopener>{id}</a>",
-                        project = escape(project),
-                        id = escape(id)
-                    ))
-                    .unwrap_or_default(),
-                branch = update
-                    .branch
-                    .as_ref()
-                    .map(|branch| format!(", on {}", escape(branch)))
-                    .unwrap_or_default(),
-                body = markdown(&update.body),
-            ));
-        }
-        html.push_str("</article>");
-    }
-    Ok(page("Lanes", &html))
-}
-
-/// One board's rows, grouped by status in workflow order.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn board(name: &str) -> Result<String> {
-    let (project, store) = project_named(name)?;
-    let tasks = store.list_tasks(None, None, None, None, false)?;
-    let rules = Registry::open()?.applicable_rules(Some(&project.name), None, None, false)?;
-    let mut html = format!(
-        "<h1>{0}</h1><p><a href=\"/sprints/{1}\" data-board-sprints-link>Sprints for {0}</a></p>",
-        escape(&project.name),
-        escape(&url_encode(&project.name)),
-    );
-    let roots = if project.workspace_roots.is_empty() {
-        "Rootless".to_owned()
-    } else {
-        project
-            .workspace_roots
-            .iter()
-            .map(|root| escape(root))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    html.push_str(&format!(
-        "<p class=meta>Roots: {}, holding {} rows</p>",
-        roots,
-        tasks.len()
-    ));
-    if !rules.is_empty() {
-        html.push_str(&format!(
-            "<h2>Rules <span class=count>{}</span></h2>",
-            rules.len()
-        ));
-        for rule in rules {
-            let headline = rule.body.lines().next().unwrap_or_default();
-            let targets = if rule.tags.is_empty() {
-                String::new()
-            } else {
-                format!(", tagged {}", escape(&rule.tags.join(", ")))
-            };
-            html.push_str(&format!(
-                "<details class=rule><summary><code>{id}</code> {headline}{targets}</summary>\
-                 <pre>{body}</pre></details>",
-                id = escape(&rule.id),
-                headline = escape(headline),
-                targets = targets,
-                body = escape(&rule.body),
-            ));
-        }
-    }
-    for status in crate::model::TASK_STATUSES {
-        let rows = tasks
-            .iter()
-            .filter(|task| task.status == status)
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
-            continue;
-        }
-        html.push_str(&format!(
-            "<h2>{} <span class=count>{}</span></h2><ul class=rows>",
-            escape(&status_label(status)),
-            rows.len()
-        ));
-        for task in rows {
-            let attention = task_attention_count(&store, &task.id)?;
-            html.push_str(&format!(
-                "<li data-task=\"{id}\"><a href=\"/task/{project}/{id}\" data-task-link=\"{id}\" \
-                 data-ref target=_blank rel=noopener>{title}</a>\
-                 <p class=meta>{article} {ty} in \
-                 <span class=\"pill status-{state}\">{status}</span> \
-                 at {priority}{lane}{tags}{attention}, filed as <code>{id}</code></p></li>",
-                project = escape(&project.name),
-                id = escape(&task.id),
-                article = a_or_an(&task.task_type),
-                ty = escape(&task.task_type),
-                state = escape(&task.status),
-                status = escape(&status_label(&task.status)),
-                title = escape(&task.title),
-                priority = priority_badge(task.priority, task.priority_level.as_deref()),
-                lane = task
-                    .lane
-                    .as_ref()
-                    .map(|lane| format!(", in lane {}", escape(lane)))
-                    .unwrap_or_default(),
-                tags = tag_list(&task.tags),
-                attention = attention_clause(attention),
-            ));
-        }
-        html.push_str("</ul>");
-    }
-    Ok(page(&project.name, &html))
-}
-
-/// One task in full: what it is, where its work happened, and the trail.
-// retired by t-bf255880 wave 1; deleted in wave 2
-#[allow(dead_code)]
-fn task_detail(project_name: &str, id: &str) -> Result<String> {
-    let (project, store) = project_named(project_name)?;
-    let task = store.require_task(id)?;
-    let mut html = format!(
-        "<h1 data-task-detail=\"{}\" data-task-title>{}</h1>",
-        escape(&task.id),
-        escape(&task.title)
-    );
-    html.push_str(&format!(
-        "<p class=meta>{article} {ty} on \
-         <a href=\"/board/{project}\" data-ref target=_blank rel=noopener>{project}</a>, \
-         in <span class=\"pill status-{state}\" data-task-status>{status}</span> \
-         at {priority}{tags}, filed as <code>{id}</code></p>",
-        project = escape(&project.name),
-        id = escape(&task.id),
-        article = a_or_an(&task.task_type),
-        ty = escape(&task.task_type),
-        state = escape(&task.status),
-        status = escape(&status_label(&task.status)),
-        priority = priority_badge(task.priority, task.priority_level.as_deref()),
-        tags = tag_list(&task.tags),
-    ));
-    html.push_str(&facts(&project.name, &task));
-    if let Some(body) = &task.body {
-        html.push_str(&format!(
-            "<h2>Body</h2><div class=\"body md\" data-task-body>{}</div>",
-            markdown(body)
-        ));
-    }
-
-    if let Some(claim) = store.get_claim(&task.id)? {
-        html.push_str(&held_by(&claim));
-    }
-
-    let open_attention = task_open_attention(&store, &task.id)?;
-    html.push_str(&attention_section(
-        &project.name,
-        "Open attention",
-        &open_attention,
-    ));
-
-    let notes = store.notes(&task.id, DETAIL_ROWS)?;
-    if !notes.is_empty() {
-        html.push_str("<h2>Notes</h2>");
-        for note in notes {
-            html.push_str(&format!(
-                "<article class=note data-task-note><p class=meta>{article} {kind} note \
-                 by {author} at {when}</p><div class=\"body md\">{body}</div></article>",
-                article = a_or_an(&note.kind),
-                kind = escape(&note.kind),
-                author = escape(&note.author),
-                when = stamp(note.created_at),
-                body = markdown(&note.body),
-            ));
-        }
-    }
-
-    let checkpoints = store.checkpoints(&task.id, DETAIL_ROWS)?;
-    if !checkpoints.is_empty() {
-        html.push_str("<h2>Checkpoints</h2>");
-        for point in checkpoints {
-            html.push_str(&format!(
-                "<article class=note><p class=meta>{article} {state} checkpoint \
-                 by {author} at {when}</p><dl>",
-                article = a_or_an(&point.state),
-                state = escape(&point.state),
-                author = escape(&point.author),
-                when = stamp(point.created_at),
-            ));
-            html.push_str(&row("summary", &escape(&point.summary)));
-            html.push_str(&row("intent", &escape(&point.intent)));
-            html.push_str(&row("next", &escape(&point.next_action)));
-            for (label, value) in [
-                ("branch", point.branch.as_deref()),
-                ("HEAD", point.head_sha.as_deref()),
-                ("root HEAD", point.root_head.as_deref()),
-                ("tree", point.dirty_summary.as_deref()),
-            ] {
-                if let Some(value) = value {
-                    html.push_str(&row(label, &escape(value)));
-                }
-            }
-            html.push_str("</dl></article>");
-        }
-    }
-
-    let events = store.events(Some(&task.id), None, DETAIL_ROWS, true)?;
-    if !events.is_empty() {
-        html.push_str(
-            "<h2>Trail</h2><table data-task-trail><thead><tr><th>When</th><th>What</th>\
-                       <th>Who</th><th>Detail</th></tr></thead><tbody>",
-        );
-        for event in events {
-            html.push_str(&format!(
-                "<tr data-event-kind=\"{kind}\"><td class=when>{when}</td><td><code>{kind}</code></td>\
-                 <td>{who}</td><td class=payload>{payload}</td></tr>",
-                when = stamp(event.created_at),
-                kind = escape(&event.kind),
-                who = escape(event.actor.as_deref().unwrap_or("—")),
-                payload = escape(&compact(&event.payload)),
-            ));
-        }
-        html.push_str("</tbody></table>");
-        html.push_str(&format!(
-            "<p class=meta>Newest {DETAIL_ROWS} shown, and \
-             <code>kb ev --task {id} --project {project} --json</code> prints the rest.</p>",
-            id = escape(&task.id),
-            project = escape(&project.name),
-        ));
-    }
-    Ok(page(&task.title, &html))
-}
-
 // ------------------------------------------------------------------ rendering
-
-/// The live lease, as the reader needs to see it.
-///
-/// Provenance: where the work actually happened, and now which model is
-/// doing it. Captured rather than asked for, so each line is present when
-/// there was something to capture and absent when there was not — never
-/// invented. Never the lease token: it is a capability, and a read surface
-/// that renders one hands whoever loads the page the ability to write.
-fn held_by(claim: &crate::model::Claim) -> String {
-    let mut html = String::from("<h2>Held by</h2><dl>");
-    html.push_str(&row("agent", &escape(&claim.agent_id)));
-    html.push_str(&row("claimed", &stamp(claim.claimed_at)));
-    html.push_str(&row("expires", &stamp(claim.expires_at)));
-    for (label, value) in [
-        ("model", claim.model.as_deref()),
-        ("worktree", claim.worktree.as_deref()),
-        ("kind", claim.worktree_kind.as_deref()),
-        ("branch", claim.branch.as_deref()),
-        ("HEAD", claim.head_sha.as_deref()),
-        ("root HEAD", claim.root_head.as_deref()),
-    ] {
-        if let Some(value) = value {
-            html.push_str(&row(label, &escape(value)));
-        }
-    }
-    html.push_str("</dl>");
-    html
-}
-
-fn facts(project: &str, task: &Task) -> String {
-    let mut html = String::from("<dl class=facts>");
-    html.push_str(&row("created", &stamp(task.created_at)));
-    html.push_str(&row("updated", &stamp(task.updated_at)));
-    if let Some(done) = task.completed_at {
-        html.push_str(&row("completed", &stamp(done)));
-    }
-    if let Some(parent) = &task.parent_id {
-        html.push_str(&row(
-            "parent",
-            &format!(
-                "<a href=\"/task/{project}/{parent}\" data-ref target=_blank rel=noopener>{parent}</a>",
-                project = escape(project),
-                parent = escape(parent),
-            ),
-        ));
-    }
-    for (label, value) in [
-        ("assignee", task.assignee.as_deref()),
-        ("lane", task.lane.as_deref()),
-        ("deliverable", task.deliverable.as_deref()),
-    ] {
-        if let Some(value) = value {
-            html.push_str(&row(label, &escape(value)));
-        }
-    }
-    if task.driver_only {
-        html.push_str(&row("driver only", "yes"));
-    }
-    if !task.allowed_models.is_empty() {
-        // Only when the row is restricted: an empty list is the default every
-        // row carries, and a `allowed models —` line on every page would be
-        // noise that says nothing.
-        html.push_str(&row(
-            "allowed models",
-            &task
-                .allowed_models
-                .iter()
-                .map(|model| escape(model))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
-    }
-    html.push_str("</dl>");
-    html
-}
-
-fn row(label: &str, value: &str) -> String {
-    format!("<dt>{}</dt><dd>{value}</dd>", escape(label))
-}
-
-/// The tags a row was filed under, as a fragment of the row's own sentence.
-///
-/// A tag is neither a state nor an outcome, so it gets no pill and no hue
-/// (WEB-41): it is the words the row was filed under, read inside the
-/// sentence that already says what the row is.
-fn tag_list(tags: &[String]) -> String {
-    if tags.is_empty() {
-        return String::new();
-    }
-    format!(
-        ", tagged {}",
-        tags.iter()
-            .map(|tag| escape(tag))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-/// `A` or `An`, so a meta sentence that opens with a row's kind reads as
-/// English rather than as a filled-in template.
-fn a_or_an(word: &str) -> &'static str {
-    match word.chars().next().map(|first| first.to_ascii_lowercase()) {
-        Some('a' | 'e' | 'i' | 'o' | 'u') => "An",
-        _ => "A",
-    }
-}
-
-/// One board status as a heading and a pill read it.
-///
-/// The stored value is a slug because it is a key (`in_progress`); a section
-/// heading and a pill are prose, and WEB-03 and the plan's fifth principle
-/// want prose. One function, so the heading and the pill beneath it can
-/// never drift into saying the same state two ways.
-fn status_label(status: &str) -> String {
-    // `todo` is two words in English, and the Boards table already writes it
-    // that way; every other status is one word or underscore-joined.
-    if status == "todo" {
-        return "To do".to_owned();
-    }
-    let words = status.replace('_', " ");
-    let mut characters = words.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
-        None => words,
-    }
-}
-
-fn priority_badge(priority: i64, level: Option<&str>) -> String {
-    match level {
-        Some(level) => format!(
-            "<span class=\"priority priority-{class}\" data-testid=deck-priority \
-             title=\"stored priority {priority}\">{level}</span>",
-            class = escape(&level.to_ascii_lowercase()),
-            level = escape(level),
-        ),
-        None => format!(
-            "<span class=\"priority priority-legacy\" data-testid=deck-priority \
-             title=\"legacy out-of-band priority\">{priority}</span>"
-        ),
-    }
-}
-
-/// A one-line rendering of an event payload, since the column is free JSON and
-/// a pretty-printed object per row would bury the trail it is meant to show.
-fn compact(payload: &serde_json::Value) -> String {
-    match payload {
-        serde_json::Value::Object(map) if map.is_empty() => String::new(),
-        serde_json::Value::Object(map) => map
-            .iter()
-            .map(|(key, value)| match value {
-                serde_json::Value::String(text) => format!("{key}={text}"),
-                other => format!("{key}={other}"),
-            })
-            .collect::<Vec<_>>()
-            .join("  "),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
 
 /// Long board texts as markdown, so structure reads at a glance (George,
 /// 2026-09-11: "use formatting and markdown and etc to make it easier to read
@@ -4054,1773 +1937,36 @@ fn escape(value: &str) -> String {
     out
 }
 
-/// A millisecond stamp as a readable UTC instant.
+/// The one document that is not the application: what a refusal is written
+/// on.
 ///
-/// Deliberately not localised: this box runs on UTC, the ledger stores UTC, and
-/// a page that quietly shifted stamps would disagree with every `--json` read
-/// of the same row.
-fn stamp(ms: i64) -> String {
-    let seconds = ms.div_euclid(1000);
-    let days = seconds.div_euclid(86_400);
-    let time = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
-        time / 3600,
-        (time % 3600) / 60,
-        time % 60
-    )
-}
-
-/// How long ago, in the coarsest unit that is still true.
-fn age(ms: i64) -> String {
-    let minutes = (now_ms() - ms).max(0) / 60_000;
-    match minutes {
-        0 => "just now".to_owned(),
-        1 => "1 min".to_owned(),
-        m if m < 60 => format!("{m} min"),
-        m if m < 1440 => format!("{}h{:02}m", m / 60, m % 60),
-        // Past a day the coarsest true unit is the day, and it is a word:
-        // the card's eyebrow reads `codex@driver asked on px, 3 days ago`
-        // (spec WEB-23), and `72h ago` is a duration a reader has to divide.
-        m if m < 2880 => "1 day".to_owned(),
-        m => format!("{} days", m / 1440),
-    }
-}
-
-/// How long ago, as a phrase that reads correctly in a sentence.
+/// Every page of the operator UI is the bundle now (`t-bf255880`), so this
+/// is no longer a shell at all — no stylesheet, no script, no navigation.
+/// It answers the three things that are not pages: a POST to a path that
+/// takes no POST, a POST the route refuses, and a GET of an address that
+/// names nothing.
 ///
-/// `age` alone produced "just now ago", because the shortest interval is
-/// already a complete phrase and the rest are bare durations.
-fn ago(ms: i64) -> String {
-    let text = age(ms);
-    if text == "just now" {
-        text
-    } else {
-        format!("{text} ago")
-    }
-}
-
-/// Days since the epoch to a civil date (Howard Hinnant's algorithm).
-///
-/// Written out rather than pulled in: a date crate would be a sixth dependency
-/// for one formatting call, and this is the one calculation in it.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
-/// The page shell.
-///
-/// A phone-first operator shell. It stays inline because a second request for a
-/// stylesheet is another route and cache contract for a page this small.
-///
-/// The links live behind a hamburger rather than across the top (George,
-/// 2026-09-17). Eight destinations and a search box on a 390-wide screen was
-/// a scrolling strip of tabs above every page, and on the deck it was the
-/// screen's whole top edge spent on navigation nobody uses while deciding.
-/// The drawer is one button, and the links inside it keep their `data-nav`
-/// names: the destinations did not change, only where they are kept.
-/// `<main>` carries no deck marker any more: the deck is the mounted
-/// application's, so every page this shell serves is a server-rendered read
-/// page (`t-1f495a7f`).
+/// The `<p class=error>` is a CONTRACT, not decoration: `web/src/api.ts`'s
+/// `postForm` parses this document and reads the board's own sentence out
+/// of that element to put it under the control that was pressed. A refusal
+/// that dropped the class would reach the operator as a bare status code.
 fn page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>{title} — kanban</title><style>{CSS}</style></head><body>\
-         <nav aria-label=Primary data-primary-nav>\
-         <button type=button class=menu data-menu aria-label=Menu aria-expanded=false \
-         aria-controls=nav-drawer><span class=bars aria-hidden=true></span></button>\
-         <a class=brand href=\"/\" aria-label=\"Kanban home\">kb</a>\
-         <span class=live data-live role=status aria-live=polite>connecting</span></nav>\
-         <div class=backdrop data-backdrop hidden></div>\
-         <nav class=drawer id=nav-drawer data-drawer aria-label=Destinations hidden>\
-         <form action=/search method=get data-nav-search><input name=q aria-label=\"Search Kanban\" placeholder=\"Search\"></form>\
-         <div class=nav-links><a href=\"/\" data-nav=needs-you>Needs you</a><a href=\"/all\" data-nav=all>All open</a><a href=\"/decided\" data-nav=decided>Recent decisions</a><a href=\"/lanes\" data-nav=lanes>Lanes</a>\
-         <a href=\"/boards\" data-nav=boards>Boards</a><a href=\"/sprints\" data-nav=sprints>Sprints</a><a href=\"/plans\" data-nav=plans>Plans</a><a href=\"/deployments\" data-nav=deployments>Deployments</a>\
-         <a href=\"/subscriptions\" data-nav=subscriptions>Subscriptions</a></div>\
-         </nav><main id=main>{body}</main>\
-         <footer>The live operator view, served by <code>kanban serve</code> on this host.</footer>\
-         <script>{JS}</script></body></html>",
+         <title>{title} — kanban</title></head><body>\
+         <main id=main>{body}</main></body></html>",
         title = escape(title),
     )
 }
-
-const JS: &str = r#"
-// The first thing this script does is say that it ran. Every rule that turns
-// the open list into a deck is scoped to `html.js`, because the deck is one
-// card only while there is a script to hide the others: without one the same
-// markup has to stay the plain scrolling list it is served as, with every
-// card's form posting on its own. This line is what makes that true, so it
-// comes before anything that could throw.
-document.documentElement.classList.add('js');
-const setLive = text => { const el = document.querySelector('[data-live]'); if (el) el.textContent = text; };
-// Whether the live socket is up, which is a different question from whether
-// a decision is in flight -- and the live line has to answer both.
-let liveSocketUp = false;
-// A decision that has landed, or been refused, is no longer `sending`. The
-// line went on saying so until the socket happened to say something next,
-// which on a quiet board was minutes and on a reconnect was the word
-// `reconnecting` standing over a decision that had already been recorded.
-// So the answer to the click is retired by the click's own path, and the
-// line goes back to saying what the socket is: live, or not.
-const settleLive = () => setLive(liveSocketUp ? 'live' : 'reconnecting');
-// A redelivered notice must not act twice, so every key the page has already
-// rendered is remembered. Bounded at 200: a reconnect never replays (the
-// server starts a new connection at the head), so this only ever holds a
-// short recent history, and a page left open for days must not grow a set
-// that never forgets.
-const NOTICE_MEMORY = 200;
-// How many notices stay on screen. Three, newest on top: the strip is meant
-// to be readable at a glance, not to be a log; `kb ev` is the log.
-const NOTICE_SHOWN = 3;
-const seenNotices = new Set();
-let liveConnects = 0;
-// A decision is one click and no page load, because the list is long: a
-// reload after every answer would throw the reader back to the top of it.
-// The card posts its own form, is replaced in place by its receipt, and the
-// open count drops by one.
-const CHOICE_KEYS = ['1', '2', '3', '4'];
-// How long a decision may be in flight before the button says so a second
-// time. Chosen to be longer than any answer that is actually going to land:
-// a local board answers in milliseconds and the proxy in tens of them, so
-// eight seconds means something is wrong rather than something is slow.
-const STILL_SENDING_AFTER = 8000;
-// A decision, or an undo, that has been posted and not yet answered. The
-// card it is on must survive a projection swap, so it counts as an answer in
-// progress: the server renders no receipt for a decision it has not recorded
-// yet, so swapping the card away mid-flight would leave the operator looking
-// at a list with no trace of the click they just made.
-const sendingInFlight = () => Boolean(document.querySelector('[data-state=sending]'));
-// An answer in progress anywhere on the page: words typed into a reply, a
-// verdict picked for a free-text answer, or a decision already posted and
-// still in flight. All three are lost the moment the projection is swapped
-// -- the server renders every card empty, with no verdict checked -- so all
-// three hold the swap. A picked verdict with nothing typed yet is an answer
-// being written, not an idle page.
-const answerInProgress = () =>
-  [...document.querySelectorAll('textarea[name=reply]')].some(el => el.value.trim().length > 0)
-  || Boolean(document.querySelector('input[name=outcome]:checked'))
-  || sendingInFlight();
-// What a click looks like from the instant it is made until the board
-// answers (George, 2026-09-17: "I want to know that what I clicked on
-// actually did something instead of having no feedback like right now").
-//
-// The pressed control says what it is doing ON ITS OWN FILL, and nothing is
-// disabled: a disabled button is greyed out, which reads as an answer that
-// can no longer be given, and it is the one control that cannot report its
-// own refusal. The OTHER answers step back instead -- the card carries
-// `data-state=sending` and the stylesheet dims every answer but the pressed
-// one -- the card is marked busy for a screen reader and for the swap guard,
-// and the live line says `sending`. The pressed control's markup is put back
-// verbatim on a refusal -- the label, the key badge and all -- because a
-// button that came back reading `Sending…` would be a dead button.
-//
-// A second click cannot post twice: `decide` and `undoDecision` each hold
-// their own in-flight flag, which is a guard on the action rather than on
-// the control that reaches it.
-//
-// `settle` is for a decision that landed and is about to be replaced by its
-// receipt: there is nothing left to restore, only the timer to stop.
-function beginSending(card, pressed, label, stillLabel) {
-  const markup = pressed ? pressed.innerHTML : null;
-  card.dataset.state = 'sending';
-  card.setAttribute('aria-busy', 'true');
-  if (pressed) { pressed.dataset.pressed = ''; pressed.textContent = label; }
-  setLive('sending');
-  const timer = pressed
-    ? setTimeout(() => { pressed.textContent = stillLabel; }, STILL_SENDING_AFTER)
-    : null;
-  const settle = () => { if (timer !== null) clearTimeout(timer); };
-  return {
-    settle,
-    revert: () => {
-      settle();
-      card.removeAttribute('aria-busy');
-      delete card.dataset.state;
-      if (pressed) { delete pressed.dataset.pressed; pressed.innerHTML = markup; }
-    },
-  };
-}
-const cardOf = node => (node && node.closest ? node.closest('article.item') : null);
-// What the composer says when it refuses to post a half-written answer, in
-// the page's language.
-//
-// Two voices, deliberately. This one is the CARD refusing to send an answer
-// it can see is half-written, so it speaks to somebody holding a phone: the
-// picker's own verdicts and the reply field's own name, no flags for a
-// command line they are not using. What the ROUTE or the network said is
-// quoted verbatim instead, flags and all, because that is a different thing
-// being reported and the operator may have to act on the exact words. The
-// route's wording for this same case is `incomplete_answer_refusal`, which
-// the CLI and the MCP tool share and which a no-script POST still lands on.
-const INCOMPLETE_ANSWER = 'Your own answer needs both halves: pick a verdict (approve, reject, defer or other) and write your reply.';
-// The free-text answer carries a verdict or it is not an answer, and the hint
-// keeps asking for both halves until both are there. It does NOT say which
-// half is missing -- it is one fixed sentence; what identifies the missing
-// half is the cursor, which a refused submit moves onto it. The button stays
-// live either way: a disabled button is the one control that cannot report
-// its own refusal, and it was the card's only feedback channel.
-// `aria-disabled` is not set for the same reason -- the control does respond,
-// in the card's own words, so announcing it as unavailable would be a lie.
-// The release shows up exactly while there is a verdict to release, and a
-// refusal never outlives what it refused.
-function syncAnswer(form) {
-  const text = form.querySelector('textarea[name=reply]');
-  const hint = form.querySelector('[data-hint]');
-  if (!text || !hint) return;
-  const verdict = Boolean(form.querySelector('input[name=outcome]:checked'));
-  const ready = verdict && text.value.trim().length > 0;
-  hint.hidden = ready;
-  const clear = form.querySelector('[data-clear]');
-  if (clear) clear.hidden = !verdict;
-  // A picked verdict holds the live projection for the whole page, and the
-  // only way to release it by thumb is the button inside this fold. So the
-  // fold cannot close over one: the hold would be unreachable, which is the
-  // frozen page the release exists to prevent.
-  const custom = form.querySelector('details[data-custom]');
-  if (custom && verdict) custom.open = true;
-  if (ready) clearRefusal(form);
-}
-// Only the composer's own pre-flight sentence, never the board's. What the
-// route or the network said is not the operator's to type away. Both callers
-// here are about the composer's own: either it has stopped being true, or the
-// answer it was asking for has just been abandoned.
-function clearRefusal(form) {
-  const refusal = form.querySelector('[data-refusal=incomplete]');
-  if (!refusal) return;
-  undescribeRefusal(cardOf(form) || form, refusal.id);
-  refusal.remove();
-}
-// The way back out of an answer that was started and is not wanted. HTML
-// offers no way to un-check a radio group, and a picked verdict holds the
-// live projection for the WHOLE page while this release sits on one card:
-// the swap replaces all of `<main>`, so there is nothing narrower than the
-// page to hold, and the only honest place for the button is beside the
-// verdict it clears. A card scrolled out of view holds the page with its own
-// release off screen, and the connection line says nothing about it: it is
-// the socket's line, not the page's commentary.
-// The release therefore has to be reachable by a thumb as well as a
-// keyboard: this control, and `Escape` inside the card.
-//
-// The typed words are NOT cleared -- losing them is the thing the hold exists
-// to prevent. The composer's own refusal IS, even though it is still true:
-// it was asking for the two halves of an answer the operator has just said
-// they are not giving, and a red refusal standing over an abandoned answer
-// reads as a failure rather than a prompt. Nothing is lost by removing it --
-// the hint under the submit comes straight back and asks for the same two
-// halves in calmer words. What the BOARD refused stays.
-function clearVerdict(form) {
-  form.querySelectorAll('input[name=outcome]:checked').forEach(input => { input.checked = false; });
-  clearRefusal(form);
-  syncAnswer(form);
-}
-// --- the deck ---------------------------------------------------------------
-// One card on screen, and the next one a keystroke away (George, 2026-09-17:
-// "we are looking at one item at a time ... and then we quickly advance
-// through item by item without scrolling, e.g. when i hit 1 it sends it off
-// and gives me the next item via a quick animation").
-//
-// The queue is the DOM order the server rendered, which is the priority
-// order every other surface uses: the deck decides which of those cards is
-// on screen and nothing else. A card whose decision is in flight is
-// `data-sent` -- out of the queue, still in the document -- because a
-// refusal has to bring it back to the slot it left.
-const DECK_SLIDE = 140;
-const deckNode = () => document.querySelector('[data-deck-cards]');
-const deckQueue = () => {
-  const deck = deckNode();
-  return deck ? [...deck.querySelectorAll('article.item:not([data-sent])')] : [];
-};
-const currentCard = () => document.querySelector('article.item[data-current]');
-let deckIndex = 0;
-let deckShown = null;
-// The card that is animating out. It is out of the queue but stays visible
-// until the animation lands, so the swap is a move rather than a blink.
-let deckGhost = null;
-let deckGhostTimer = null;
-function bindDeck() {
-  const deck = deckNode();
-  if (!deck) return;
-  const queue = deckQueue();
-  deckIndex = Math.min(Math.max(deckIndex, 0), Math.max(0, queue.length - 1));
-  const showing = queue[deckIndex] || null;
-  [...deck.querySelectorAll('article.item')].forEach(card => {
-    if (card === showing) card.dataset.current = ''; else delete card.dataset.current;
-    card.hidden = card !== showing && card !== deckGhost;
-  });
-  if (showing) {
-    // The long form is this card's body and the region the deck scrolls, so
-    // on the deck it is open. The fold exists for a list of 133 cards; a
-    // deck is a list of one.
-    const full = showing.querySelector('details.full');
-    if (full) full.open = true;
-    // ...and the raiser's context is its first block. The server renders it
-    // above the answers, which is the order ADR-042 §5 fixes and the order
-    // a scriptless browser reads; the DECK moves it inside the body region
-    // so the two share one capped, fading scroller. Left as a free block in
-    // the card's column it pushed the recommended answer off the first
-    // screen of a phone -- 790 characters of context and the answer a deck
-    // exists to offer was two scrolls away (George, 2026-09-18).
-    //
-    // Idempotent by construction: once moved the paragraph is no longer a
-    // child of the card, so a re-bind finds nothing to move. A card the
-    // server re-rendered arrives with it back in place and is moved again.
-    const body = full && full.querySelector('.body');
-    const context = showing.querySelector('p.context');
-    if (body && context && context.parentElement === showing) body.prepend(context);
-    // The trailing meta goes UP, onto the end of the eyebrow: one line of
-    // orientation instead of two. It trailed, which on the deck meant the
-    // priority pill sat directly under the dissolving last line of the long
-    // form with two rem of empty band below it -- the pill over clipped text
-    // George objected to on 2026-09-17, moved a few pixels down (George,
-    // 2026-09-18, on the v6 screenshots). Above the question it cannot be
-    // read as an answer, which is why it left the head of the card in the
-    // first place, and beside the eyebrow it is what it is: who asked, where,
-    // when, and how urgent.
-    //
-    // Same bargain as the context: the SERVER still renders the meta line
-    // last (ADR-042 §5), so a scriptless page keeps both paragraphs where
-    // they were, and the deck's own script joins them. Idempotent for the
-    // same reason -- the node is gone once its contents have moved.
-    const eyebrow = showing.querySelector('p.eyebrow');
-    const meta = showing.querySelector('p.meta');
-    if (eyebrow && meta && meta.parentElement === showing) {
-      eyebrow.append(' · ');
-      while (meta.firstChild) eyebrow.append(meta.firstChild);
-      meta.remove();
-    }
-    // The advance runs when the card on screen CHANGED, and never because a
-    // projection was refreshed under an unchanged one: that was the blink
-    // (George, 2026-09-17: "it keeps blinking"). `deckShown` survives a
-    // refresh because the node does.
-    if (showing !== deckShown) {
-      showing.classList.add('entering');
-      setTimeout(() => showing.classList.remove('entering'), DECK_SLIDE);
-    }
-  }
-  deckShown = showing;
-  // An empty queue says so at once, rather than after the board answers.
-  // Deciding the last card used to leave a blank deck for the length of a
-  // round trip: the card was gone the instant it was posted and the
-  // server's empty state was a projection away. The server ships the
-  // sentence as a template so there is one wording, not two.
-  const template = deck.querySelector('template[data-empty]');
-  const placed = deck.querySelector('[data-deck-empty]');
-  if (!queue.length && !placed && !deck.querySelector('.empty') && template) {
-    const empty = template.content.firstElementChild.cloneNode(true);
-    empty.dataset.deckEmpty = '';
-    deck.append(empty);
-  }
-  // ...and takes it back when a refusal, or an undo, puts a card back.
-  if (queue.length && placed) placed.remove();
-  const position = document.querySelector('.progress');
-  // Nothing left to count, and `0 left` over an empty state says it twice.
-  if (position) position.hidden = queue.length === 0;
-  syncHistoryCount();
-}
-// Keep the keyboard on the card the deck is showing, so 1-4 keeps deciding
-// without a click first. Focus is only taken when it is not already
-// somewhere the operator put it: a swap must never pull the cursor out of a
-// note being written, out of the menu, or out of the side history.
-function focusCurrent() {
-  const card = currentCard();
-  if (!card) return;
-  const focus = document.activeElement;
-  if (focus && focus.isConnected && focus !== document.body && focus.matches
-    && (card.contains(focus) || focus.closest('[data-drawer], [data-side]') || focus.matches('input, textarea'))) return;
-  card.focus();
-}
-function ghostCard(card, direction) {
-  if (deckGhostTimer !== null) clearTimeout(deckGhostTimer);
-  if (deckGhost && deckGhost !== card) settleGhost();
-  deckGhost = card;
-  card.classList.add(direction === 'back' ? 'leaving-back' : 'leaving');
-  deckGhostTimer = setTimeout(settleGhost, DECK_SLIDE);
-}
-function settleGhost() {
-  if (deckGhostTimer !== null) clearTimeout(deckGhostTimer);
-  deckGhostTimer = null;
-  const card = deckGhost;
-  deckGhost = null;
-  if (!card) return;
-  card.classList.remove('leaving', 'leaving-back');
-  if (card.isConnected) bindDeck();
-}
-// Step through the queue without recording anything: `ArrowRight` to the
-// next card, `ArrowLeft` back to the one before it.
-function deckMove(step) {
-  const queue = deckQueue();
-  if (queue.length < 2) return;
-  const leaving = currentCard();
-  const next = Math.min(Math.max(deckIndex + step, 0), queue.length - 1);
-  if (next === deckIndex) return;
-  deckIndex = next;
-  if (leaving) ghostCard(leaving, step < 0 ? 'back' : 'forward');
-  bindDeck();
-  focusCurrent();
-}
-// `s` puts this card at the back of the queue and shows the next one, with
-// nothing recorded: the answer needs thinking about and there are 132 other
-// cards. The position does not move -- the same slot now holds the next
-// card -- and the skipped card comes round again at the end.
-function deckSkip() {
-  const deck = deckNode();
-  const card = currentCard();
-  if (!deck || !card || deckQueue().length < 2) return;
-  deck.append(card);
-  ghostCard(card, 'forward');
-  bindDeck();
-  focusCurrent();
-}
-// A decision leaves the queue the instant it is posted, which is the whole
-// point: the next card is on screen while the board is still answering. The
-// posted card stays in the document, hidden and out of the queue, so a
-// refusal can bring it back to exactly the slot it left.
-function deckSend(card, label) {
-  if (!deckNode() || !card.closest('[data-deck-cards]')) return null;
-  const slot = deckQueue().indexOf(card);
-  card.dataset.sent = '1';
-  const pending = showPending(card, label);
-  ghostCard(card, 'forward');
-  if (slot >= 0) deckIndex = slot;
-  bindDeck();
-  focusCurrent();
-  return {
-    restore: () => {
-      if (pending) pending.remove();
-      delete card.dataset.sent;
-      if (deckGhost === card) settleGhost();
-      card.classList.remove('leaving', 'leaving-back');
-      const back = deckQueue().indexOf(card);
-      if (back >= 0) deckIndex = back;
-      bindDeck();
-      const returned = currentCard();
-      if (returned) returned.focus();
-    },
-  };
-}
-// Put the deck on one item by id: what an undo needs, because the card it
-// brought back is the card the operator is now looking at.
-function deckShow(id) {
-  if (!deckNode()) return;
-  const at = deckQueue().findIndex(card => card.dataset.item === id);
-  if (at >= 0) { deckIndex = at; bindDeck(); }
-}
-// --- the side: toasts above, this sitting's decisions below ------------------
-// Every receipt this tab produced, newest first, each with its undo. A
-// receipt used to sit where the card had been, which on a deck is a place
-// nobody is looking any more -- the next card is there.
-function historyRow(row) {
-  const history = document.querySelector('[data-history]');
-  if (!history) return false;
-  const heading = history.querySelector('h2');
-  if (heading) heading.after(row); else history.prepend(row);
-  return true;
-}
-// What the history says while the board is still answering. It is NOT a
-// receipt: nothing is recorded yet, so it carries no undo and no receipt
-// tag. Offering to reverse a decision that may still be refused would be
-// offering to reverse something that never happened.
-//
-// It carries no `role` of its own either: the connection line is the page's
-// one `role=status` and the toast strip is its one `role=log`, so a third
-// live region here would be two channels claiming the same job.
-function showPending(card, label) {
-  const row = document.createElement('p');
-  row.className = 'pending';
-  row.dataset.pending = card.dataset.item;
-  row.textContent = `Sending… ${label}`;
-  return historyRow(row) ? row : null;
-}
-function syncHistoryCount() {
-  const badge = document.querySelector('[data-history-count]');
-  if (badge) badge.textContent = String(document.querySelectorAll('[data-history] [data-receipt]').length);
-}
-// --- the menu and the side drawer -------------------------------------------
-// Eight destinations and a search box used to stand across the top of every
-// page, which on a 390-wide screen is a scrolling strip of tabs above the
-// thing being read and, on the deck, the whole top edge of the screen spent
-// on navigation nobody uses while deciding. One button now, and `m`.
-const drawerOpen = () => {
-  const drawer = document.querySelector('[data-drawer]');
-  return Boolean(drawer) && !drawer.hidden;
-};
-const historyOpen = () => document.body.hasAttribute('data-history-open');
-function syncBackdrop() {
-  const backdrop = document.querySelector('[data-backdrop]');
-  if (backdrop) backdrop.hidden = !(drawerOpen() || historyOpen());
-}
-function setDrawer(open) {
-  const drawer = document.querySelector('[data-drawer]');
-  const button = document.querySelector('[data-menu]');
-  if (!drawer) return;
-  drawer.hidden = !open;
-  if (button) button.setAttribute('aria-expanded', open ? 'true' : 'false');
-  syncBackdrop();
-  if (open) { const first = drawer.querySelector('a'); if (first) first.focus(); }
-  else if (button && drawer.contains(document.activeElement)) button.focus();
-}
-function setHistory(open) {
-  const button = document.querySelector('[data-history-toggle]');
-  if (!document.querySelector('[data-side]')) return;
-  document.body.toggleAttribute('data-history-open', open);
-  if (button) button.setAttribute('aria-expanded', open ? 'true' : 'false');
-  syncBackdrop();
-}
-document.addEventListener('click', event => {
-  if (!event.target.closest) return;
-  if (event.target.closest('[data-menu]')) { setDrawer(!drawerOpen()); return; }
-  if (event.target.closest('[data-history-toggle]')) { setHistory(!historyOpen()); return; }
-  if (event.target.closest('[data-backdrop]')) { setDrawer(false); setHistory(false); return; }
-  // A destination chosen is a menu finished with, and the click still
-  // navigates: the drawer only decides where the links are kept.
-  if (event.target.closest('[data-drawer] a')) setDrawer(false);
-});
-// The note field starts one line tall and grows to four as it is written:
-// on a deck it sits in the panel with the answers, where an empty box three
-// lines deep is three lines of the screen spent on nothing.
-const NOTE_LINES = 4;
-function growNote(field) {
-  field.style.height = 'auto';
-  const line = parseFloat(getComputedStyle(field).lineHeight) || 20;
-  const frame = field.offsetHeight - field.clientHeight;
-  field.style.height = `${Math.min(field.scrollHeight, line * NOTE_LINES + frame + 16) + frame}px`;
-}
-function bindCards() {
-  // First, and before anything on a card is touched: what the server served
-  // is what a later refresh is diffed against.
-  snapshotCards();
-  document.querySelectorAll('form.decide').forEach(form => {
-    if (form.dataset.cardBound) return;
-    form.dataset.cardBound = '1';
-    form.addEventListener('input', () => syncAnswer(form));
-    form.addEventListener('change', () => syncAnswer(form));
-    form.addEventListener('click', event => {
-      if (event.target.closest('[data-clear]')) clearVerdict(form);
-    });
-    form.addEventListener('submit', event => { event.preventDefault(); decide(form, event.submitter); });
-    const note = form.querySelector('textarea[name=reply]');
-    if (note && document.querySelector('[data-deck]')) {
-      form.addEventListener('input', () => growNote(note));
-      growNote(note);
-    }
-    syncAnswer(form);
-  });
-}
-// The form's fields plus the button that was pressed. A submit button is
-// only submitted when it is the submitter, and the pressed button is the
-// whole decision, so it is named here rather than left to the newer
-// FormData(form, submitter) overload that a phone's browser may not have.
-function decisionBody(form, submitter) {
-  const body = new URLSearchParams(new FormData(form));
-  if (submitter) body.set('decision', submitter.value);
-  return body;
-}
-// What the receipt says, in the words the ledger will use for the same
-// decision: the choice's own label, or the custom answer with its verdict.
-function decidedLabel(form, submitter) {
-  if (!submitter) return 'Custom answer';
-  if (submitter.value !== 'custom') return submitter.dataset.label;
-  const outcome = form.querySelector('input[name=outcome]:checked');
-  return outcome ? `Custom answer, recorded as ${outcome.value}` : 'Custom answer';
-}
-// Which of the four outcomes was just recorded, so the receipt can encode it
-// as its own left rule: an authored choice carries its outcome on the button
-// that was pressed, and the free-text answer carries the verdict that was
-// picked for it.
-function decidedOutcome(form, submitter) {
-  if (submitter && submitter.value !== 'custom') {
-    const named = [...submitter.classList].find(name => name.startsWith('outcome-'));
-    if (named) return named.slice('outcome-'.length);
-    return 'other';
-  }
-  const outcome = form.querySelector('input[name=outcome]:checked');
-  return outcome ? outcome.value : 'other';
-}
-// Whether the body about to be posted carries words as well as a choice. The
-// custom answer IS those words and its label already says so, so only an
-// authored key earns the extra sentence.
-function replySent(body) {
-  return body.get('decision') !== 'custom' && (body.get('reply') || '').trim().length > 0;
-}
-function showReceipt(card, label, noted, outcome) {
-  const receipt = document.createElement('p');
-  // No flash: what says the board answered is that the row is THERE, with
-  // the outcome it recorded on its own left rule. A one-shot highlight was
-  // a second motion competing with the card advance.
-  receipt.className = `receipt outcome-${outcome}`;
-  receipt.dataset.testid = 'deck-receipt';
-  receipt.dataset.receipt = card.dataset.item;
-  receipt.dataset.item = card.dataset.item;
-  receipt.dataset.project = card.dataset.project || '';
-  const decided = document.createElement('span');
-  decided.className = 'decided';
-  decided.textContent = noted ? `Decided: ${label}. Your reply is recorded.` : `Decided: ${label}.`;
-  const undo = document.createElement('button');
-  undo.type = 'button';
-  undo.className = 'undo-button';
-  undo.dataset.undo = '';
-  undo.textContent = 'Undo';
-  receipt.append(decided, document.createTextNode(' '), undo);
-  lastDecided = receipt;
-  const following = card.nextElementSibling;
-  const held = card.contains(document.activeElement);
-  // On the deck the card has already left the queue and the next one is on
-  // screen, so a receipt where the card used to be is a receipt nobody is
-  // looking at. It goes to the side history instead, newest first, and the
-  // row that said `Sending…` becomes it.
-  const pending = document.querySelector(`[data-pending="${cssEscape(card.dataset.item)}"]`);
-  const filed = pending ? (pending.replaceWith(receipt), true) : historyRow(receipt);
-  if (filed) card.remove(); else card.replaceWith(receipt);
-  const counter = document.querySelector('[data-open-count]');
-  if (counter) counter.textContent = Math.max(0, Number(counter.textContent) - 1);
-  if (filed) {
-    bindDeck();
-    focusCurrent();
-    return;
-  }
-  // Keep the keyboard where the work is: the next card, so 1-4 keeps deciding.
-  if (held && following && following.matches('article.item')) following.focus();
-}
-// The most recent decision on the page, so `u` has a target after the focus
-// has already moved on to the next card. Only ever a live DOM node.
-let lastDecided = null;
-// Reopen one decided item through the same trusted-edge route a reply uses.
-// The reopen note is fixed prose on the server; an undo that demanded words
-// would be a dialog wearing a button.
-async function undoDecision(row) {
-  const id = row.dataset.item;
-  const project = row.dataset.project;
-  if (!id || !project || row.dataset.undoing) return;
-  row.dataset.undoing = '1';
-  const sending = beginSending(row, row.querySelector('[data-undo]'), 'Undoing…', 'Still undoing…');
-  try {
-    const response = await fetch(
-      `/attention/${encodeURIComponent(project)}/${encodeURIComponent(id)}/reopen`,
-      {method: 'POST', credentials: 'same-origin', redirect: 'manual'}
-    );
-    if (response.type === 'opaqueredirect' || response.ok) {
-      sending.settle();
-      noteOwnChange(project);
-      row.remove();
-      syncHistoryCount();
-      // The item is open again: pull the fresh projection so it reappears as
-      // a card (on Needs you) or leaves this list (on Recent decisions), then
-      // put the deck and the keyboard back on the returned card so 1-4 keeps
-      // working. The deck has to be moved onto it first: a card the deck is
-      // not showing is hidden, and a hidden card cannot take focus.
-      await refreshProjection();
-      deckShow(id);
-      const back = document.querySelector(`article.item[data-item="${cssEscape(id)}"]`);
-      if (back) back.focus();
-      applyNotice({type: 'notice', key: `undone-${id}-${Date.now()}`, what: `Brought back ${id}. It is open again.`});
-    } else {
-      sending.revert();
-      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
-      const refused = page.querySelector('.error');
-      showRowRefusal(row, refused ? refused.textContent : `The board refused to bring back ${id} (${response.status}).`);
-    }
-  } catch (error) {
-    sending.revert();
-    showRowRefusal(row, `The undo did not reach the board. Try again.`);
-  } finally {
-    delete row.dataset.undoing;
-    // Every exit, not just the one that worked: a refused reopen, or one
-    // that never reached the board, is no longer `sending` either, and the
-    // line used to go on saying so until the socket happened to speak.
-    settleLive();
-  }
-}
-// A refusal on a decided row has no form to live in, so it lives on the row.
-//
-// It is not a live region: the page has exactly two announcement channels --
-// the socket's status line and the toast log -- and a third one that shouts
-// whatever the board said would be the page narrating itself, which WEB-52
-// forbids. A refusal is inline text tied to the thing that was refused, so
-// the row points at it with `aria-describedby` and a reader reaching the row
-// reads the sentence as part of it.
-function showRowRefusal(row, text) {
-  let refusal = row.querySelector('[data-refusal=board]');
-  if (!refusal) {
-    refusal = document.createElement('p');
-    refusal.className = 'error';
-    refusal.setAttribute('data-refusal', 'board');
-    refusal.id = `refusal-row-${row.dataset.item || 'row'}`;
-    row.append(refusal);
-  }
-  refusal.textContent = text;
-  row.setAttribute('aria-describedby', refusal.id);
-}
-// `CSS.escape` is the standard name; the fallback keeps the selector honest
-// on a browser that predates it, and ids are slugs anyway.
-const cssEscape = value => (window.CSS && CSS.escape) ? CSS.escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
-// One refusal line per KIND, and no kind ever takes another's line.
-// `incomplete` is the composer's own sentence, true only while a half is
-// missing, and cleared the moment it stops being true or the answer is
-// abandoned. `board` is what the route or the network said about an attempt
-// that was actually made: no amount of typing can make it untrue and only
-// another attempt may replace it.
-//
-// Separate nodes because one shared node was a hole. The composer reused and
-// retagged it, so a pre-flight refusal OVERWROTE the board's sentence and the
-// next keystroke then removed it as the composer's own -- leaving a card that
-// looked as though the board had never refused anything, with nothing
-// recorded anywhere.
-// It is not a live region either, for the reason the row's refusal is not:
-// two channels, and a refusal is not an announcement. It is described text,
-// so it carries an id and the caller points whatever it focuses -- the half
-// of the answer that is missing, or the card the board refused -- at that id
-// with `aria-describedby`. The node is returned for that wiring.
-function showRefusal(form, text, kind) {
-  const card = cardOf(form);
-  let refusal = form.querySelector(`[data-refusal="${kind}"]`);
-  if (!refusal) {
-    refusal = document.createElement('p');
-    refusal.className = 'error';
-    refusal.setAttribute('data-refusal', kind);
-    refusal.id = `refusal-${kind}-${(card && card.dataset.item) || 'card'}`;
-    form.append(refusal);
-  }
-  refusal.textContent = text;
-  return refusal;
-}
-// A refusal describes the control the operator is sent to, and stops
-// describing it the moment the sentence is gone: a reader that still reads
-// out a refusal which is no longer on the page is worse than one that never
-// read it.
-function describeRefusal(target, refusal) {
-  if (target && refusal) target.setAttribute('aria-describedby', refusal.id);
-}
-function undescribeRefusal(scope, id) {
-  if (!scope || !id) return;
-  scope
-    .querySelectorAll(`[aria-describedby="${cssEscape(id)}"]`)
-    .forEach(element => element.removeAttribute('aria-describedby'));
-}
-async function decide(form, submitter) {
-  const card = cardOf(form);
-  if (!card || form.dataset.deciding) return;
-  // A free-text answer missing a half is refused here, in the card's own
-  // words, with the focus moved to the half that is missing. Nothing is
-  // posted. The alternative was a disabled button, which produced no event,
-  // no request and no sentence at all: the click simply did nothing. An
-  // authored choice carries its own verdict and is never held here, with or
-  // without a note.
-  if (submitter && submitter.value === 'custom') {
-    const text = form.querySelector('textarea[name=reply]');
-    const verdict = form.querySelector('input[name=outcome]:checked');
-    if (!verdict || !text || text.value.trim().length === 0) {
-      const refusal = showRefusal(form, INCOMPLETE_ANSWER, 'incomplete');
-      const missing = verdict ? text : form.querySelector('input[name=outcome]');
-      if (missing) {
-        describeRefusal(missing, refusal);
-        missing.focus();
-      }
-      return;
-    }
-  }
-  // An authored choice carries its own verdict and the route forwards no
-  // picker value onto it, so a verdict the operator left picked is not part
-  // of THIS decision. The card must not go on showing it as though it were:
-  // the release runs before the body is built, so what is posted, what the
-  // ledger records and what is on screen say the same thing whether the
-  // attempt lands or comes back refused.
-  if (submitter && submitter.value !== 'custom') clearVerdict(form);
-  form.dataset.deciding = '1';
-  const body = decisionBody(form, submitter);
-  const label = decidedLabel(form, submitter);
-  const outcome = decidedOutcome(form, submitter);
-  const noted = replySent(body);
-  const sending = beginSending(card, submitter, 'Sending…', 'Still sending…');
-  // The deck hands over to the next card now rather than when the board
-  // answers: `1` sends this one off and shows the next one, and what this
-  // one is doing is said in the side history instead of on a card that is
-  // no longer on screen.
-  const advanced = deckSend(card, label);
-  try {
-    const response = await fetch(form.action, {
-      method: 'POST',
-      body,
-      credentials: 'same-origin',
-      redirect: 'manual',
-    });
-    // The route answers a recorded decision with a redirect and every
-    // refusal with a page, so an opaque redirect is the receipt. A refusal
-    // is shown in the card's own words -- a card left open while the item
-    // was rewritten names a choice the row no longer carries, and that is
-    // refused by name rather than mapped onto whatever now sits there.
-    if (response.type === 'opaqueredirect' || response.ok) {
-      sending.settle();
-      noteOwnChange(card.dataset.project);
-      showReceipt(card, label, noted, outcome);
-      settleLive();
-      return;
-    }
-    // Nothing was recorded, so the card comes all the way back before it is
-    // told why: a refusal under a disabled button reads as a card that can
-    // no longer be answered at all.
-    sending.revert();
-    if (advanced) advanced.restore();
-    settleLive();
-    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
-    const refused = page.querySelector('.error');
-    describeRefusal(card, showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board'));
-  } catch (error) {
-    sending.revert();
-    if (advanced) advanced.restore();
-    settleLive();
-    describeRefusal(card, showRefusal(form, 'The decision did not reach the board. Try again.', 'board'));
-  } finally {
-    delete form.dataset.deciding;
-  }
-}
-// Every card node the server has rendered into this page, as it was served.
-// It is the only way to know later whether a freshly fetched card SAYS
-// anything new: by the time a refresh arrives the live node carries the
-// deck's own attributes -- `data-current`, `hidden`, an opened fold, a bound
-// form -- so its current markup can never be compared with the server's.
-//
-// Taken before anything is bound, which is why `bindCards` calls it first.
-// A property rather than an attribute: it travels with the node and is not
-// served to anybody.
-function snapshotCards() {
-  document.querySelectorAll('article.item').forEach(card => {
-    if (card.servedMarkup === undefined) card.servedMarkup = card.outerHTML;
-  });
-}
-async function refreshProjection() {
-  // A decision already in flight holds the swap too, and while it does the
-  // live line goes on saying what the page is doing rather than what the
-  // socket is waiting for: `sending` is the answer to the click that was
-  // just made, and it must not be overwritten a tick later. A draft being
-  // written says nothing at all -- the connection line is the connection's,
-  // and the four words it may say are the socket's states.
-  if (answerInProgress()) { if (sendingInFlight()) setLive('sending'); return; }
-  // A card that is halfway out of the deck is not a page to swap: the
-  // animation is 140ms and the node it is moving is one of the nodes being
-  // replaced, so the swap waits for it to land rather than deleting it
-  // mid-flight.
-  if (deckGhost) await new Promise(resolve => setTimeout(resolve, DECK_SLIDE));
-  const response = await fetch(location.pathname + location.search, {credentials: 'same-origin'});
-  if (!response.ok) throw new Error(`refresh ${response.status}`);
-  const next = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('main');
-  // The same gate again, and it has to sit exactly here. An answer can be
-  // started while the projection is in flight -- the first gate ran a
-  // network round trip ago -- and everything below MOVES live nodes into
-  // the detached document: the notices strip, then every receipt. Bailing
-  // out after that point would delete them instead of preserving a draft.
-  if (answerInProgress()) { if (sendingInFlight()) setLive('sending'); return; }
-  // Where the deck is, so the swap puts it back: the same item if it is
-  // still open, and otherwise the same slot in the queue -- a refresh must
-  // not throw the operator back to the top of a queue of 133.
-  const showing = currentCard();
-  const showingItem = showing ? showing.dataset.item : null;
-  const slot = deckIndex;
-  // ...and WHERE IN THE CARD the reader is, for the same reason one step
-  // smaller. Since the panel stopped being its own scroller the card's own
-  // column carries the whole card (2026-09-18), so a card the server
-  // re-rendered comes back as a fresh node scrolled to the top: the
-  // paragraph being read, the answers, the note, all of it jumps while
-  // George is looking at it. Two positions are enough to put him back --
-  // the card's column and the body region inside it -- and they are
-  // restored only if the SAME item is still the card on screen.
-  const showingScroll = showing ? showing.scrollTop : 0;
-  const showingBody = showing ? showing.querySelector('.full .body') : null;
-  const showingBodyScroll = showingBody ? showingBody.scrollTop : 0;
-  // The card the operator is looking at is NOT replaced when the server has
-  // nothing new to say about it (George, 2026-09-17: "it keeps blinking").
-  // Every notice used to swap all of `<main>`, which meant a brand new node
-  // for the same item, which meant the advance ran again on a card that had
-  // not moved -- two or three times a minute, under the question being read.
-  //
-  // So the fresh cards are diffed by `data-item` against what the server
-  // served for the same item, and an identical one hands its place back to
-  // the live node: same object, same scroll position, same focus, no
-  // animation. A card whose markup DID change is replaced, because then the
-  // page is showing something the board no longer says.
-  const live = new Map();
-  document.querySelectorAll('article.item[data-item]').forEach(card => {
-    if (card.servedMarkup !== undefined) live.set(card.dataset.item, card);
-  });
-  next.querySelectorAll('article.item[data-item]').forEach(incoming => {
-    const held = live.get(incoming.dataset.item);
-    if (held && held.servedMarkup === incoming.outerHTML) incoming.replaceWith(held);
-  });
-  // The side carries the whole sitting across: the notices and every
-  // receipt with its undo live in it, so one node moves instead of a strip
-  // plus a list of receipts threaded back in one at a time.
-  const side = document.querySelector('[data-side]');
-  const fresh = side ? next.querySelector('[data-side]') : null;
-  if (side && fresh) fresh.replaceWith(side);
-  if (!side) {
-    const strip = document.querySelector('[data-notices]');
-    if (strip) next.prepend(strip);
-    // A receipt outlives the projection it was decided in. The row is gone
-    // from the new one, so the receipts move to the head of the list in the
-    // order they were decided; an undo that vanished a second after the
-    // click would be no undo at all.
-    let cursor = next.querySelector('.count');
-    document.querySelectorAll('[data-receipt]').forEach(receipt => {
-      if (cursor) cursor.after(receipt); else next.prepend(receipt);
-      cursor = receipt;
-    });
-  }
-  document.querySelector('main').replaceWith(next);
-  bindCards();
-  deckIndex = slot;
-  // `deckShown` is NOT cleared: the card that was showing is the same node
-  // when the server said nothing new about it, and clearing this was the
-  // other half of the blink -- `bindDeck` would re-enter the same card.
-  bindDeck();
-  if (showingItem) deckShow(showingItem);
-  // The reader goes back where they were, in the card as well as in the
-  // queue. After `deckShow`, because a card that is still hidden has no
-  // scrollport to put a position into, and only for the same item: a
-  // different card is a different piece of writing and starts at its top.
-  const shown = currentCard();
-  if (shown && showingItem && shown.dataset.item === showingItem) {
-    shown.scrollTop = showingScroll;
-    const body = shown.querySelector('.full .body');
-    if (body) body.scrollTop = showingBodyScroll;
-  }
-  focusCurrent();
-  setLive('live');
-}
-function noticeStrip() {
-  let strip = document.querySelector('[data-notices]');
-  if (!strip) {
-    strip = document.createElement('div');
-    strip.className = 'notices';
-    strip.setAttribute('data-notices', '');
-    // A log, not a status: what arrived is a list of entries, and the
-    // connection line is the page's one status.
-    strip.setAttribute('role', 'log');
-    strip.setAttribute('aria-live', 'polite');
-    document.querySelector('main').prepend(strip);
-  }
-  return strip;
-}
-// What this tab has just done to a board, so the socket does not report the
-// operator to themselves. A decision made here is already on screen as a
-// receipt in the side history; the same change arriving a second later as
-// `Attention resolved` is noise over the card being read next (George,
-// 2026-09-17). Only the words this page can cause are suppressed, only on
-// the board it just wrote to, and only for half a minute: a change somebody
-// else makes is still news.
-//
-// The board and the words are the whole match, because that is all the
-// notice frame carries -- and the frame's shape is pinned on purpose. An id
-// on the wire would be a new field on every notice for the sake of one
-// tab's echo.
-//
-// The trade, named: a row settled by SOMEBODY ELSE on the same board within
-// ten seconds of a decision made here is silent. Ten seconds is about one
-// refresh cycle, so that change still arrives -- as the projection swap that
-// takes its card out of the queue -- it just arrives without a sentence. The
-// alternative was leaving every operator's own decision reported back to
-// them a second after they made it, over the card they are reading next.
-const ECHO_WINDOW = 10000;
-const OWN_WORDS = ['Attention resolved', 'Attention reopened'];
-const ownChanges = new Map();
-const noteOwnChange = board => { if (board) ownChanges.set(board, Date.now()); };
-const ownEcho = notice => {
-  if (!notice.board || notice.type !== 'notice' || !OWN_WORDS.includes(notice.what)) return false;
-  const at = ownChanges.get(notice.board);
-  return typeof at === 'number' && Date.now() - at < ECHO_WINDOW;
-};
-function applyNotice(notice) {
-  if (!notice || !notice.key || seenNotices.has(notice.key)) return false;
-  seenNotices.add(notice.key);
-  // Remembered, then dropped: an echo that is redelivered must not be
-  // rendered the second time either.
-  if (ownEcho(notice)) return false;
-  while (seenNotices.size > NOTICE_MEMORY) seenNotices.delete(seenNotices.values().next().value);
-  const row = document.createElement('p');
-  row.className = notice.type === 'notice' ? 'notice' : 'notice summary';
-  row.dataset.key = notice.key;
-  if (notice.board) {
-    const board = document.createElement('span');
-    board.className = 'notice-board';
-    board.textContent = notice.board;
-    row.append(board);
-  }
-  const what = document.createElement('span');
-  what.className = 'notice-what';
-  what.textContent = notice.what || '';
-  row.append(what);
-  if (notice.task) {
-    const link = document.createElement('a');
-    link.href = `/task/${encodeURIComponent(notice.board)}/${encodeURIComponent(notice.task)}`;
-    link.textContent = notice.title ? `${notice.task} ${notice.title}` : notice.task;
-    row.append(link);
-  }
-  const dismiss = document.createElement('button');
-  dismiss.type = 'button';
-  dismiss.className = 'dismiss';
-  dismiss.textContent = 'Dismiss';
-  row.append(dismiss);
-  const strip = noticeStrip();
-  strip.prepend(row);
-  while (strip.children.length > NOTICE_SHOWN) strip.lastElementChild.remove();
-  toast(row);
-  return true;
-}
-// A toast stays twenty seconds (George, 2026-09-17: "the toast is too
-// fast"), and the clock stops while the pointer is on it or the keyboard is
-// in it -- a notice that vanished out from under the eye reading it would be
-// worse than one that stayed. It goes on a click anywhere on it, or on
-// `Escape`; three stay on screen at once, newest first. `kb ev` is the log,
-// and the list at `/all` keeps its strip without a clock at all.
-const TOAST_LIFE = 20000;
-function toast(row) {
-  if (!document.querySelector('[data-deck]')) return;
-  let timer = setTimeout(() => row.remove(), TOAST_LIFE);
-  const hold = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
-  const release = () => { if (timer === null) timer = setTimeout(() => row.remove(), TOAST_LIFE); };
-  row.addEventListener('mouseenter', hold);
-  row.addEventListener('mouseleave', release);
-  row.addEventListener('focusin', hold);
-  row.addEventListener('focusout', release);
-}
-// Every toast at once, because `Escape` is not aimed at one of them.
-const dismissToasts = () => {
-  const rows = [...document.querySelectorAll('[data-notices] .notice')];
-  rows.forEach(row => row.remove());
-  return rows.length > 0;
-};
-function connectLive() {
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const socket = new WebSocket(`${scheme}://${location.host}/live`);
-  socket.onopen = () => { liveSocketUp = true; setLive('live'); };
-  socket.onmessage = event => {
-    let frame;
-    try { frame = JSON.parse(event.data); } catch (_) { return; }
-    if (frame.type === 'notice' || frame.type === 'behind') { applyNotice(frame); return; }
-    if (frame.type === 'ready') {
-      // The server starts every connection at the head and says so. Only a
-      // RECONNECT needs saying out loud: the operator who just lost a socket
-      // is the one who would otherwise wonder what they missed.
-      if (liveConnects++ > 0 && frame.noticesFrom === 'now') {
-        applyNotice({type: 'reconnected', key: `reconnected-${liveConnects}`, what: 'Reconnected. Showing changes from now.'});
-      }
-      return;
-    }
-    // A refresh that did not land leaves the line saying what the socket
-    // is, which is the only thing this line is allowed to say.
-    if (frame.type === 'refresh') refreshProjection().catch(settleLive);
-  };
-  socket.onclose = () => { liveSocketUp = false; setLive('reconnecting'); setTimeout(connectLive, 1500); };
-  socket.onerror = () => socket.close();
-}
-// A click anywhere on a notice takes it away: the dismiss button is the
-// keyboard's way in and the label that says so, and the row itself is the
-// thumb's.
-document.addEventListener('click', event => {
-  const row = event.target.closest ? event.target.closest('.notice') : null;
-  if (row) row.remove();
-});
-// The undo button on a receipt (Needs you) and the submit on a decided row's
-// form (Recent decisions) are the same action through the same route; the
-// form keeps its real POST so a browser without script still undoes.
-document.addEventListener('click', event => {
-  const undo = event.target.closest('[data-undo]');
-  if (!undo) return;
-  const row = undo.closest('[data-receipt], article.decided');
-  if (row) { event.preventDefault(); undoDecision(row); }
-});
-document.addEventListener('submit', event => {
-  const form = event.target.closest('form.undo');
-  if (!form) return;
-  const row = form.closest('article.decided');
-  if (row) { event.preventDefault(); undoDecision(row); }
-});
-// --- hover previews ---------------------------------------------------------
-// Every `a[data-ref]` shows what it points at on hover, and the fragment it
-// fetches can itself carry `data-ref` anchors, so previews nest: hovering a
-// reference inside a preview opens the next one beside it. All listening is
-// delegated to the document, which is what makes that true for content that
-// did not exist when the page loaded. Focus opens the same preview, so the
-// keyboard path is not a second-class citizen.
-const PREVIEW_DELAY = 120;
-const previewCache = new Map();
-const openPreviews = [];
-let previewTimer = null;
-let previewCloseTimer = null;
-const previewUrl = anchor => {
-  try {
-    const url = new URL(anchor.href, location.href);
-    if (url.origin !== location.origin) return null;
-    return `/preview${url.pathname}`;
-  } catch (_) { return null; }
-};
-// Pop every popup that is not an ancestor of `keep`: hovering a new anchor
-// in the page closes everything, hovering one inside a popup closes only the
-// popups deeper than that one.
-const closePreviews = keep => {
-  while (openPreviews.length && !(openPreviews[openPreviews.length - 1].contains(keep) || openPreviews[openPreviews.length - 1] === keep)) {
-    openPreviews.pop().remove();
-  }
-};
-const closeAllPreviews = () => { while (openPreviews.length) openPreviews.pop().remove(); };
-function positionPreview(popup, anchor) {
-  const rect = anchor.getBoundingClientRect();
-  const margin = 8;
-  popup.style.visibility = 'hidden';
-  document.body.append(popup);
-  const box = popup.getBoundingClientRect();
-  let left = Math.min(rect.right + margin, window.innerWidth - box.width - margin);
-  left = Math.max(margin, left);
-  const below = rect.bottom + margin + box.height < window.innerHeight;
-  popup.style.top = below ? `${rect.bottom + margin}px` : `${Math.max(margin, rect.top - box.height - margin)}px`;
-  popup.style.left = `${left}px`;
-  popup.style.visibility = 'visible';
-}
-async function showPreview(anchor) {
-  const url = previewUrl(anchor);
-  if (!url) return;
-  closePreviews(anchor);
-  if (openPreviews.some(popup => popup.dataset.previewFor === url && popup.contains(anchor))) return;
-  const popup = document.createElement('div');
-  popup.className = 'preview-pop';
-  popup.dataset.previewFor = url;
-  popup.setAttribute('role', 'tooltip');
-  const loading = document.createElement('p');
-  loading.className = 'meta';
-  loading.textContent = 'Loading…';
-  popup.append(loading);
-  openPreviews.push(popup);
-  positionPreview(popup, anchor);
-  try {
-    let html = previewCache.get(url);
-    if (html === undefined) {
-      const response = await fetch(url, {credentials: 'same-origin'});
-      if (!response.ok) throw new Error(`preview ${response.status}`);
-      html = await response.text();
-      previewCache.set(url, html);
-    }
-    if (!popup.isConnected) return;
-    popup.innerHTML = html;
-    positionPreview(popup, anchor);
-  } catch (error) {
-    if (popup.isConnected) {
-      popup.innerHTML = '';
-      const failed = document.createElement('p');
-      failed.className = 'meta';
-      failed.textContent = 'The preview did not load. Click the link to open the item.';
-      popup.append(failed);
-    }
-  }
-}
-const schedulePreview = anchor => {
-  clearTimeout(previewCloseTimer);
-  clearTimeout(previewTimer);
-  previewTimer = setTimeout(() => showPreview(anchor), PREVIEW_DELAY);
-};
-const scheduleCloseAll = () => {
-  clearTimeout(previewTimer);
-  clearTimeout(previewCloseTimer);
-  previewCloseTimer = setTimeout(closeAllPreviews, PREVIEW_DELAY * 2);
-};
-document.addEventListener('mouseover', event => {
-  const anchor = event.target.closest ? event.target.closest('a[data-ref]') : null;
-  if (anchor) { schedulePreview(anchor); return; }
-  if (!event.target.closest || !event.target.closest('.preview-pop')) scheduleCloseAll();
-});
-document.addEventListener('focusin', event => {
-  const anchor = event.target.closest ? event.target.closest('a[data-ref]') : null;
-  if (anchor) schedulePreview(anchor);
-});
-// 1-4 answer the card that has focus, in the order it lists them, so 1 is
-// always the recommendation -- the muscle memory that makes a long list
-// tractable. `c` reaches that card's reply field instead.
-//
-// The digits are inert while no card has focus, and inert on a card that is
-// COMPOSING ITS OWN ANSWER, which is decided by the card and not by what
-// happens to have focus: one Tab from the verdict picker lands on the
-// submit, and from there `1` used to click the recommendation and record it
-// -- dropping the operator's picked verdict on the way, because the route
-// forwards no picker value onto an authored key. A picked verdict is that
-// signal. A typed reply is NOT: it rides with whichever choice is clicked,
-// which is the contract the reply field itself states.
-//
-// Enter from the verdict picker has to be aimed for the same reason: the
-// browser's own implicit submission would pick the form's first submit
-// button, which is that same recommendation. It goes to the card's own
-// submit instead, which records the free-text answer or refuses it in the
-// board's words.
-//
-// `u` brings back the last decided item (George, 2026-09-11): the receipt
-// under focus on Needs you, the decided row under focus on Recent decisions,
-// and otherwise the newest receipt on the page -- which is the one the last
-// keypress just made. It is inert while composing, like every other key.
-//
-// `Escape` is the release, and it works while composing because that is
-// where it is needed: a picked verdict holds the live projection and HTML
-// has no other way to un-check a radio group. An `Escape` that is ending an
-// IME composition is the input method's, not ours.
-document.addEventListener('keydown', event => {
-  if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing) return;
-  const target = event.target;
-  // Focus that is INSIDE the card's composer is composing, whatever kind of
-  // element the focus happens to be on: the note field, the verdict picker,
-  // the fold's own summary, the submit, the release. It is not about being a
-  // text field -- it is about the operator working the composer, where a
-  // digit is a digit and not a decision.
-  //
-  // A `summary` is a TAB STOP, and the fold's summary is the next one after
-  // the note field. So `Tab` then `1` reached the choice shortcut and
-  // recorded the recommendation over a note the operator was still writing --
-  // the same hole `a_digit_after_tabbing_off_a_picked_verdict...` found on
-  // the submit, reopened by folding the answer, and closed here by the kind
-  // of place focus is rather than by a verdict happening to be picked.
-  // Every `summary` counts, the long form's included: focus on a disclosure
-  // control is focus on that control.
-  const composing = Boolean(target && target.matches
-    && target.matches('textarea, input, summary, details[data-custom] *'));
-  if (event.key === 'Escape') {
-    if (openPreviews.length) { event.preventDefault(); closeAllPreviews(); return; }
-    // The menu and the side history are the outermost things Escape closes:
-    // whatever is over the page goes first, and only then the verdict. A
-    // toast is over the page too, and it is the thing an operator reaches
-    // for Escape about most often, so it goes first of all.
-    if (dismissToasts()) { event.preventDefault(); return; }
-    if (drawerOpen() || historyOpen()) { event.preventDefault(); setDrawer(false); setHistory(false); return; }
-    const escaped = cardOf(target) || cardOf(document.activeElement);
-    const form = escaped && escaped.querySelector('form.decide');
-    if (form) { event.preventDefault(); clearVerdict(form); }
-    return;
-  }
-  if (composing) {
-    if (event.key === 'Enter' && target.matches('input[name=outcome]') && target.form) {
-      const record = target.form.querySelector('button.record');
-      if (record) { event.preventDefault(); record.click(); }
-    }
-    return;
-  }
-  if (event.key === 'u') {
-    const row = (target.closest && target.closest('[data-receipt], article.decided'))
-      || (lastDecided && lastDecided.isConnected ? lastDecided : null);
-    if (row) { event.preventDefault(); undoDecision(row); }
-    return;
-  }
-  // `m` is the menu, which is now the only way to the other pages: eight
-  // links across the top of a phone were eight links in the way.
-  //
-  // Every key below calls `preventDefault`, and not only to stop the
-  // browser's own default. A keydown this page leaves unhandled arrives
-  // again, and again: the driver the browser tests run through delivers one
-  // keypress as thousands of keydowns (measured 2026-09-17: 18,000 in three
-  // seconds) until one of them is prevented. A skip that fired on every one
-  // of those would walk the whole queue on one tap of `s`.
-  if (event.key === 'm') { event.preventDefault(); setDrawer(!drawerOpen()); return; }
-  // The deck's own keys: the card that cannot be answered yet goes to the
-  // back of the queue, and the arrows walk it without recording anything.
-  if (deckNode()) {
-    if (event.key === 's') { event.preventDefault(); deckSkip(); return; }
-    if (event.key === 'ArrowRight') { event.preventDefault(); deckSkip(); return; }
-    if (event.key === 'ArrowLeft') { event.preventDefault(); deckMove(-1); return; }
-  }
-  // The deck answers for the card it is showing even when focus has been
-  // put somewhere that is not a card at all -- a tap on the backdrop, a
-  // link followed back -- because on a deck there is exactly one card a
-  // digit could mean.
-  const card = cardOf(document.activeElement) || (deckNode() ? currentCard() : null);
-  if (!card) return;
-  const digit = CHOICE_KEYS.indexOf(event.key);
-  if (digit >= 0) {
-    if (card.querySelector('form.decide input[name=outcome]:checked')) return;
-    const choices = card.querySelectorAll('form.decide button.choice');
-    if (digit < choices.length) { event.preventDefault(); choices[digit].click(); }
-    return;
-  }
-  // `c` is the way into the answer nobody authored a button for, and that
-  // answer is folded: the key unfolds it and lands on the field, so one
-  // keystroke still reaches the whole path rather than half of it.
-  if (event.key === 'c') {
-    const custom = card.querySelector('details[data-custom]');
-    const text = card.querySelector('textarea[name=reply]');
-    if (custom) custom.open = true;
-    if (text) { event.preventDefault(); text.focus(); }
-  }
-});
-// Which destination this is, marked by a rule rather than by a fill: the
-// drawer's own current-page mark. It is read off the address bar rather than
-// rendered, because one shell serves every page and the page it is serving
-// is exactly what `location` says.
-function markCurrentPage() {
-  const here = location.pathname.replace(/\/+$/, '') || '/';
-  document.querySelectorAll('[data-drawer] .nav-links a[href]').forEach(link => {
-    const target = new URL(link.href, location.href).pathname.replace(/\/+$/, '') || '/';
-    if (target === here) link.setAttribute('aria-current', 'page');
-    else link.removeAttribute('aria-current');
-  });
-}
-markCurrentPage();
-bindCards();
-// The deck starts on the first card with the keyboard already on it, so the
-// first thing the page is good for is answering it.
-bindDeck();
-focusCurrent();
-connectLive();
-"#;
-/// One designed system, in one inline stylesheet (ADR-046, spec WEB).
-///
-/// Two desk surfaces and nothing else: `--base` is the page, `--mantle` is
-/// the answer panel, the side column and the drawer. Hierarchy is carried by
-/// fill, size and type — there is no outline but the focus ring, one hairline
-/// between a card's body and its answers, one row separator, and two radii
-/// with one job each (8px for a control, 999px for a pill). A colour is an
-/// outcome: green, red, yellow and blue mean approve, reject, defer and
-/// other, and nothing decorative is ever coloured. The outcome hue travels
-/// on `--hue`, set by the one class that knows the outcome, so exactly one
-/// rule fills the recommended answer and exactly one rule rules a receipt.
-///
-/// One serif, and it is the question: the system serif, sized by the
-/// viewport between 1.375rem and 1.75rem, is the largest thing on the screen
-/// and the only thing set in it. Mono is reserved for what is literally code
-/// — an id, a key map, a numeric column. One motion exists, the card
-/// advance, at 140ms each way; a notice, a receipt and a toast simply appear.
-///
-/// Every rule that lays the deck out is scoped to `html.js`, because the deck
-/// is one card only while there is a script to hide the others: without one
-/// the same markup has to stay the plain scrolling list it is served as.
-const CSS: &str = "\
-*{box-sizing:border-box}\
-:root{color-scheme:dark;\
---base:#1e1e2e;--mantle:#181825;--surface0:#313244;--surface1:#45475a;\
---text:#cdd6f4;--subtext:#a6adc8;--overlay:#9399b2;\
---green:#a6e3a1;--red:#f38ba8;--yellow:#f9e2af;--blue:#89b4fa;\
---link:#89b4fa;--focus:#b4befe;\
---serif:ui-serif,'New York','Iowan Old Style',Charter,Georgia,serif;\
---sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;\
---mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
-body{margin:0;min-height:100vh;color:var(--text);background:var(--base);\
-font-family:var(--sans);font-size:1rem;line-height:1.55;\
-scrollbar-color:var(--surface1) var(--base)}\
-main{max-width:66rem;margin:0 auto;padding:clamp(1rem,3vw,2rem);overflow-x:auto}\
-footer{max-width:66rem;margin:0 auto;\
-padding:1.2rem clamp(1rem,3vw,2rem) calc(1.2rem + env(safe-area-inset-bottom));\
-color:var(--overlay);font-size:.8125rem}\
-h1{margin:.2rem 0 1rem;font-family:var(--serif);font-size:1.5rem;line-height:1.2;\
-font-weight:600;color:var(--text)}\
-h2{margin:1.6rem 0 .5rem;font-size:1.0625rem;line-height:1.3;font-weight:600;color:var(--subtext)}\
-a{color:var(--link);text-decoration:none}\
-a:hover{text-decoration:underline}\
-code{padding:.12em .3em;color:var(--text);background:var(--surface0);border-radius:8px;\
-font-family:var(--mono);font-size:.92em}\
-pre{margin:.6rem 0;padding:.8rem;background:var(--surface0);border-radius:8px;\
-overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:.85rem}\
-input,textarea{min-height:2.75rem;padding:.6rem .7rem;font-family:var(--sans);font-size:1rem;\
-line-height:1.55;color:var(--text);background:var(--surface0);border:0;border-radius:8px}\
-input::placeholder,textarea::placeholder{color:var(--subtext)}\
-button{min-height:2.75rem;padding:.6rem .8rem;font-family:var(--sans);font-size:1rem;\
-line-height:1.2;font-weight:600;color:var(--text);background:var(--surface0);border:0;\
-border-radius:8px;cursor:pointer}\
-*:focus-visible{outline:2px solid var(--focus);outline-offset:2px}\
-/* ...except the card the deck is showing. The deck moves focus to it so\
-   `1` decides without a click first, which means the ring would be drawn\
-   around the whole card permanently -- a box around everything, saying\
-   nothing (WEB-13). Focus is still visible on every control inside it, and\
-   on the same card in the plain list, where it is reached by Tab. */\
-html.js .deck article.item[data-current]:focus-visible{outline:0}\
-/* --- the shell ----------------------------------------------------------- */\
-nav{z-index:10;display:flex;align-items:center;gap:.8rem;\
-padding:.45rem max(1rem,env(safe-area-inset-right)) .45rem max(1rem,env(safe-area-inset-left));\
-background:var(--mantle);position:sticky;top:0}\
-/* Two letters, and a 44px hit box around them: the home link is a control\
-   in the bar, and WEB-45's floor is every control in it. */\
-.brand{justify-content:center;min-width:2.75rem;padding:0;background:none;color:var(--link);\
-font-weight:600}\
-.nav-links{display:flex;align-items:center;gap:.15rem}\
-nav a{display:flex;align-items:center;min-height:2.75rem;padding:0 .7rem;color:var(--subtext);\
-white-space:nowrap}\
-nav form{margin-left:auto;min-width:8rem}nav form input{width:100%}\
-.menu{display:flex;align-items:center;justify-content:center;width:2.75rem;min-height:2.75rem;\
-padding:0;background:none}\
-.menu .bars{display:block;width:1.1rem;height:10px;\
-background:repeating-linear-gradient(var(--text) 0 2px,transparent 2px 4px)}\
-.backdrop{position:fixed;inset:0;z-index:40;background:var(--base);opacity:.72}\
-.drawer{position:fixed;left:0;top:0;bottom:0;z-index:50;display:flex;flex-direction:column;\
-gap:.6rem;width:min(17rem,82vw);padding:.8rem max(.7rem,env(safe-area-inset-left));\
-overflow-y:auto;background:var(--mantle)}\
-.drawer form{margin:0}.drawer form input{width:100%}\
-.drawer .nav-links{display:flex;flex-direction:column;align-items:stretch;gap:0}\
-.drawer .nav-links a{min-height:2.75rem;padding:0 .7rem;color:var(--text);\
-border-bottom:1px solid var(--surface0)}\
-.drawer .nav-links a[aria-current=page]{background:var(--mantle);border-left:2px solid var(--text)}\
-/* `hidden` is a display rule, and so is the one above it -- but only a page\
-   with a script has a button to open the drawer with, so only there is the\
-   drawer allowed to be shut. Without one it is a block of links under the\
-   top bar, which is what this shell was before the menu. */\
-html.js .drawer[hidden]{display:none}\
-/* `!important`, because the UA rule for `[hidden]` is one too: a page with\
-   no script has no button to open this with, so the attribute the script\
-   manages has to lose to the layout that does not need it. */\
-html:not(.js) .drawer[hidden],html:not(.js) .drawer{display:flex!important}\
-html:not(.js) .drawer{position:static;width:auto;\
-padding:.5rem max(1rem,env(safe-area-inset-left))}\
-html:not(.js) .drawer .nav-links{flex-direction:row;flex-wrap:wrap}\
-html:not(.js) .drawer .nav-links a{border-bottom:0}\
-html:not(.js) .menu{display:none}\
-/* --- rows, tables and pills ---------------------------------------------- */\
-table{width:100%;border-collapse:collapse;font-size:.88rem}\
-th,td{padding:.45rem .6rem;text-align:left;vertical-align:top;\
-border-bottom:1px solid var(--surface0)}\
-th{font-size:.75rem;font-weight:600;color:var(--overlay)}\
-td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}\
-td.waiting{font-weight:600}\
-td.when{white-space:nowrap;color:var(--subtext)}\
-td.payload{color:var(--subtext);font-size:.85rem;word-break:break-word}\
-ul.rows,ul.children{list-style:none;margin:.3rem 0;padding:0}\
-ul.rows li,ul.children li{padding:.4rem 0;border-bottom:1px solid var(--surface0)}\
-/* A row's title leads it, so it carries the row's weight; the sentence\
-   under it is the quiet `.meta` every page already declares. */\
-ul.rows li>a,ul.children li>a,.title{font-weight:500}\
-.title{display:inline-block;color:var(--text)}\
-dl{display:grid;grid-template-columns:max-content 1fr;gap:.15rem .8rem;margin:.4rem 0}\
-dt{color:var(--overlay);font-size:.8125rem}\
-dd{margin:0;font-size:.9375rem;word-break:break-word}\
-.pill{display:inline-block;padding:.1em .4em;color:var(--subtext);background:var(--surface0);\
-font-size:.75rem;border-radius:999px}\
-.pill.status-done,.pill.status-approve,.pill.status-succeeded{color:var(--green)}\
-.pill.status-in_progress,.pill.status-other{color:var(--blue)}\
-.pill.status-blocked,.pill.status-reject,.pill.status-failed{color:var(--red)}\
-.pill.status-review,.pill.status-defer{color:var(--yellow)}\
-.priority{font-family:var(--mono);color:var(--overlay)}\
-.priority-p0{color:var(--red)}\
-.meta{margin:.2rem 0;color:var(--overlay);font-size:.8125rem;line-height:1.4}\
-.count,.empty{color:var(--subtext);font-size:.8125rem;font-weight:400}\
-.attention-count{margin-left:.4rem;color:var(--overlay);font-size:.8125rem}\
-.citation{margin:.4rem 0 0;color:var(--overlay)}\
-.cmd{margin:.5rem 0 0;font-size:.8125rem}\
-.success{margin:0 0 1rem;color:var(--subtext)}\
-.error{color:var(--red)}\
-.live{color:var(--overlay);font-size:.75rem}\
-/* The connection line is the shell's, not any one page's: it says whether\
-   this document is still hearing from the boards, so it is announced once\
-   per page from the bar that is on every page. */\
-nav>.live{margin-left:auto}\
-.heading{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem}\
-.search-page{display:flex;gap:.5rem}.search-page input{flex:1}\
-.search-result h2{margin:.1rem 0}\
-.sprint-version{font-size:1.15rem}.sprint-history{margin-top:1.5rem}\
-.plan-body{max-height:28rem;overflow-y:auto}\
-.queued{margin-top:.25rem;color:var(--subtext);font-size:.8125rem}\
-.queued .retrying,.queued .dead{color:var(--text);font-weight:700}\
-/* --- the card (ADR-042 §5) ----------------------------------------------- */\
-.item,.note,.plan,.search-result,.card,.decided{margin:1.4rem 0;padding:0}\
-.eyebrow{max-width:70ch;margin:0 0 .5rem;color:var(--overlay);font-size:.8125rem;line-height:1.4}\
-.item>h2{max-width:70ch;margin:0 0 .7rem;font-family:var(--serif);\
-font-size:clamp(1.375rem,1.1rem + 1vw,1.75rem);line-height:1.15;font-weight:600;\
-color:var(--text)}\
-.context{max-width:70ch;margin:0 0 1rem;color:var(--subtext)}\
-.explain{max-width:70ch;margin:0 0 1rem;color:var(--subtext)}\
-.consequence{max-width:70ch;margin:.35rem 0 0;color:var(--subtext);font-size:.9375rem}\
-.body{max-width:70ch;margin:.5rem 0}\
-.decide{margin:0}\
-fieldset{min-width:0;margin:0;padding:0;border:0}\
-legend{padding:0;color:var(--overlay);font-size:.8125rem}\
-.choice{display:block;width:100%;margin:0;padding:.7rem .9rem;text-align:left;\
-white-space:normal;background:var(--surface0)}\
-.choice .key{display:inline-block;min-width:1.4em;margin-right:.5em;font-family:var(--mono);\
-font-size:.75rem;font-weight:400}\
-.choice.outcome-approve{--hue:var(--green);color:var(--hue)}\
-.choice.outcome-reject{--hue:var(--red);color:var(--hue)}\
-.choice.outcome-defer{--hue:var(--yellow);color:var(--hue)}\
-.choice.outcome-other{--hue:var(--blue);color:var(--hue)}\
-/* The one rule that fills an answer, and it is the recommendation: the hue\
-   rides in on `--hue` from the class that knows the outcome, so adding a\
-   fifth outcome is a token line rather than a fifth fill. */\
-.recommended .choice{color:var(--base);background:var(--hue,var(--surface1))}\
-/* One answer per row, at every width. Two-up put a 37-character label on\
-   three or four wrapped lines in a 177px button on a 390px phone and read\
-   as a squeezed table of fragments (George, 2026-09-18: \"it's up but it's\
-   squished and not mobile responsive\"). A choice is a sentence, so it gets\
-   the card's whole width and its consequence sits under it. */\
-.alternatives{display:grid;grid-template-columns:1fr;gap:.6rem .8rem;margin:1rem 0 0}\
-.alternative .consequence{margin-top:.3rem}\
-.reply{margin-top:1rem}\
-.reply>label{display:block;margin:0 0 .35rem;color:var(--subtext);font-size:.8125rem}\
-.reply textarea{display:block;width:100%;resize:vertical}\
-.custom{margin-top:1rem}\
-.custom>summary{display:flex;align-items:center;min-height:2.75rem;color:var(--overlay);\
-font-size:.8125rem;cursor:pointer;list-style:none}\
-.custom>summary::-webkit-details-marker{display:none}\
-.custom>summary::after{content:'\\25be';margin-left:.4em}\
-.custom[open]>summary::after{content:'\\25b4'}\
-.picks{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}\
-.picks label{display:inline-flex;align-items:center;gap:.4rem;min-height:2.75rem;\
-padding:.25rem .8rem;color:var(--subtext);background:var(--surface0);border-radius:999px;\
-cursor:pointer}\
-.picks label:has(input:checked){color:var(--text);background:var(--surface1)}\
-.picks input{width:.9rem;height:.9rem;min-height:auto;margin:0;padding:0;background:none;\
-accent-color:var(--focus)}\
-.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.7rem}\
-.full{margin:1.2rem 0 0}\
-.full summary{color:var(--subtext);cursor:pointer}\
-.full .body{max-height:24rem;margin:.6rem 0 0;overflow-y:auto;color:var(--subtext)}\
-p.keys{margin:.9rem 0 0;color:var(--overlay);font-family:var(--mono);font-size:.75rem}\
-/* What a click is doing, said on the pressed answer's own fill: nothing is\
-   disabled -- a disabled button is the one control that cannot report its\
-   own refusal -- so the OTHER answers step back instead. */\
-.item[data-state=sending] .choice:not([data-pressed]),\
-.item[data-state=sending] .record:not([data-pressed]){opacity:.5}\
-.decided h2{margin:0 0 .35rem;color:var(--text)}\
-.decided .decision{margin:.2rem 0;color:var(--text)}\
-.decided .note{margin:.3rem 0;color:var(--subtext);font-style:italic}\
-.undo-button{min-height:2.25rem;margin-top:.4rem;padding:.2rem .7rem;color:var(--subtext);\
-background:none;font-size:.8125rem;font-weight:400}\
-/* --- what arrives: notices, toasts, receipts ----------------------------- */\
-.notices{display:grid;gap:.35rem;margin:0 0 1.1rem}\
-.notice{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem;margin:0;padding:.5rem .65rem;\
-background:var(--surface0);border-radius:8px;font-size:.8125rem}\
-.notice-board{color:var(--subtext)}\
-.notice.summary .notice-what{font-weight:600}\
-.notice .dismiss{min-height:auto;margin-left:auto;padding:.1rem .5rem;color:var(--subtext);\
-background:none;font-size:.75rem;font-weight:400}\
-.preview-pop{position:fixed;z-index:300;max-width:26rem;max-height:22rem;overflow-y:auto;\
-padding:.8rem .9rem;color:var(--text);background:var(--surface0);border-radius:8px}\
-.preview-card h3{margin:.1rem 0 .4rem;color:var(--text);font-size:.95rem;font-weight:600}\
-.preview-card h3 a{color:inherit}\
-.preview-card .body{margin:.4rem 0 0;color:var(--subtext);font-size:.88rem}\
-.body.md>*:first-child{margin-top:0}.body.md>*:last-child{margin-bottom:0}\
-.body.md p{margin:.5rem 0;max-width:70ch}\
-.body.md h1,.body.md h2,.body.md h3,.body.md h4{margin:.9rem 0 .35rem;color:var(--text);\
-font-weight:600}\
-.body.md h1{font-size:1.1rem}.body.md h2{font-size:1.05rem}\
-.body.md h3{font-size:1rem}.body.md h4{font-size:.95rem}\
-.body.md ul,.body.md ol{margin:.5rem 0;padding-left:1.4rem;max-width:70ch}\
-.body.md li{margin:.2rem 0}\
-.body.md ul{list-style:disc}.body.md ol{list-style:decimal}\
-.body.md blockquote{margin:.6rem 0;padding:.2rem .9rem;color:var(--subtext)}\
-.body.md table{margin:.6rem 0}\
-.body.md hr{height:1px;margin:1rem 0;background:var(--surface0);border:0}\
-/* --- the deck: one card, and its own column the one thing that scrolls -- */\
-/* Every rule here is scoped to `html.js`, and that scope is load-bearing:\
-   the deck is one card because a script hides the others, so without a\
-   script the same markup has to stay what it is -- a plain scrolling list\
-   of cards whose forms post on their own. A page laid out as a deck with\
-   nothing to drive it would show one crushed card and no way past it.\
-\
-   The answers have to be where the thumb is, so the card is a column: what\
-   the item is at the top, the long form in the middle taking whatever is\
-   left, and the form at the bottom of the screen. The form is rendered\
-   before the long form (ADR-042 §5 keeps the answers above the detail in\
-   the markup, and that is the order a scriptless browser reads), so the\
-   deck orders the column visually and leaves the document alone. */\
-html.js:has(main[data-deck]){height:100%}\
-html.js body:has(main[data-deck]){height:100%;overflow:hidden;display:flex;flex-direction:column}\
-html.js body:has(main[data-deck])>nav[data-primary-nav]{flex:none}\
-html.js main[data-deck]~footer{display:none}\
-html.js main[data-deck]{position:relative;flex:1;min-height:0;width:100%;display:flex;\
-flex-direction:column;gap:.45rem;overflow:hidden;padding:.6rem clamp(.7rem,3vw,1.2rem) 0}\
-html.js main[data-deck]>.heading,html.js main[data-deck]>.success{flex:none}\
-/* Everything that is not the card gives up its room to the card: on a\
-   phone every line of page furniture is a line the long form or an answer\
-   does not get. */\
-html.js main[data-deck]>.heading h1{margin:0;font-size:1rem}\
-html.js main[data-deck]>p.keys{flex:none;margin:0;\
-padding:.3rem 0 calc(.3rem + env(safe-area-inset-bottom))}\
-html.js .progress{margin:0;color:var(--overlay);font-size:.8125rem;\
-font-variant-numeric:tabular-nums}\
-html.js .deck{position:relative;flex:1;min-height:0;display:flex}\
-html.js .deck .item{flex:1;min-height:0;display:flex;flex-direction:column;margin:0;\
-overflow:hidden auto;overscroll-behavior:contain}\
-/* `hidden` is a display rule and the rule above is one too, so the card the\
-   deck is not showing needs saying twice to stay off the screen. */\
-html.js .deck .item[hidden]{display:none}\
-html.js .deck .item>.eyebrow{order:1;flex:none;margin-bottom:.25rem}\
-html.js .deck .item>h2{order:2;flex:none}\
-/* A raiser's context is the FIRST block of the long form on the deck, and\
-   it is the DECK that puts it there: the served markup keeps the ADR-042\
-   §5 order (question, context, answers, folded body), and `bindDeck` moves\
-   the paragraph into the body region so the two share one soft-edged,\
-   capped scroller. It used to be a clipped region of its own at the top of\
-   the card, which cut the paragraph mid-sentence with the priority pill\
-   over it (George, 2026-09-17, on the deck screenshots); then it was a\
-   free block in the card's column, which pushed the recommended answer off\
-   the first screen of a phone whenever a raiser wrote 790 characters of\
-   context (George, 2026-09-18). Now it scrolls inside the body region with\
-   the long form it introduces, under the same fade, and the answers are on\
-   the screen the card opens on.\
-\
-   The rule below is what the paragraph is while it is still a child of the\
-   card -- one frame at most, before the deck's script has moved it, and\
-   every frame on a page whose script never ran. */\
-html.js .deck .item>.context{order:3;flex:none;margin-bottom:.4rem}\
-html.js .deck .item .body>.context{margin:0 0 .8rem}\
-/* The long form is the card's body and clips: a region that overflowed\
-   instead would paint the body straight over the answers. It keeps a floor\
-   so that a card with a long context and four answers still shows some of\
-   what it is about, and a 40vh cap so it scrolls inside itself rather than\
-   pushing the answers down the card. */\
-html.js .deck .item>.full{order:4;flex:1 1 0;min-height:8rem;overflow:hidden;\
-display:flex;flex-direction:column;margin:0}\
-/* The disclosure control goes: on the deck the long form is not folded, so\
-   a control that says `show the full item` above an item already shown is\
-   one line of a phone spent saying nothing. */\
-html.js .deck .item>.full>summary{display:none}\
-/* Chrome wraps what a `<details>` reveals in `::details-content`, so the\
-   long form is a grandchild of the card's column and not a child: the\
-   wrapper has to carry the column through, or the body sizes itself to its\
-   content and paints over the answers. The viewport bound behind it is for\
-   a browser without that pseudo-element, where the body is bounded\
-   directly rather than by what the column has left. */\
-html.js .deck .item>.full::details-content{flex:1 1 0;min-height:0;overflow:hidden;\
-display:flex;flex-direction:column}\
-/* The foot of the long form fades, because a hard cut at the panel's edge\
-   says the item ended there. Two rem of it is the plan's figure, and it is\
-   the only fade on the page. */\
-html.js .deck .item>.full .body{flex:1;min-height:0;max-height:40vh;overflow-y:auto;\
-padding-right:.3rem;\
--webkit-mask-image:linear-gradient(to bottom,var(--text) calc(100% - 2rem),transparent);\
-mask-image:linear-gradient(to bottom,var(--text) calc(100% - 2rem),transparent)}\
-/* The trailing meta line does not trail on the deck: the script moves its\
-   contents onto the end of the eyebrow, above the question, because trailing\
-   put the priority pill directly under the dissolving last line of the long\
-   form (George, 2026-09-18, on the v6 screenshots) -- the pill over clipped\
-   text, which is the thing it was moved out of the card's head to avoid.\
-   The rule below is what the paragraph is before the script has moved it,\
-   and on every card the deck is not showing: at the foot of the body region\
-   rather than floating in the middle of a short card. */\
-html.js .deck .item>.meta{order:5;flex:none;margin:auto 0 0}\
-/* The panel: the answers and the note, on the desk surface at the foot of\
-   the card. It is sized to its content and scrolls nothing of its own.\
-\
-   It used to be capped at three fifths of the card and scroll its answers\
-   past that cap. That put the note field at y=961 on a 390x844 phone --\
-   off the screen, inside a nested scroller with no affordance -- and cut\
-   the fourth answer at the cap (George, 2026-09-18, on the served deck:\
-   \"it's up but it's squished and not mobile responsive\"; \"the web version\
-   looks mushed up ... (iPad has it squished up)\"). So the cap is gone and\
-   with it the panel's own overflow: the card's column above is the ONE\
-   scroller, and the note is reached by scrolling the card the reader is\
-   already scrolling.\
-\
-   Its top two rem is the fade, because a line of the raiser's paragraph\
-   meeting an opaque edge mid-sentence reads as text that was cut off. The\
-   gradient's last stop is the desk's second surface, so the panel below\
-   the band is `--mantle` and the band lets the text above it dissolve into\
-   it. It is a gradient and not a second mask: the one mask on the page is\
-   the long form's own foot. */\
-html.js .deck .item>.decide{order:6;flex:none;\
-margin:.45rem calc(-1 * clamp(.7rem,3vw,1.2rem)) 0;\
-padding:0 clamp(.7rem,3vw,1.2rem) calc(.5rem + env(safe-area-inset-bottom));\
-background:linear-gradient(to bottom,transparent,var(--mantle) 2rem)}\
-/* The one hairline the design keeps, between the card's body and its\
-   answers -- at the foot of the band and not its head, because a rule\
-   drawn across text that is still dissolving reads as a strikethrough.\
-   It is the panel's own first block, two rem tall, carrying the same ramp.\
-   It is a plain block and no longer a sticky one: the panel scrolls\
-   nothing, so `position:sticky` here would resolve against the CARD's\
-   scrollport and float the band over the long form. */\
-html.js .deck .item>.decide::before{content:'';display:block;\
-height:2rem;box-sizing:border-box;pointer-events:none;\
-background:linear-gradient(to bottom,transparent,var(--mantle) 2rem);\
-border-bottom:1px solid var(--surface1)}\
-html.js .deck .item>.decide .consequence{font-size:.875rem}\
-html.js .deck .item>.decide .reply{margin-top:.7rem}\
-html.js .deck .item>.decide .custom{margin-top:.5rem}\
-html.js .deck .item>.decide textarea{min-height:2.75rem;max-height:7.5rem;overflow-y:auto;\
-resize:none}\
-/* The one motion: the card that was answered leaves to the left, the next\
-   one arrives from the right, 140ms each way. */\
-html.js .deck .item.entering{animation:deck-in .14s ease-out}\
-html.js .deck .item.leaving,html.js .deck .item.leaving-back{position:absolute;left:0;right:0;\
-top:0;bottom:0;pointer-events:none;animation:deck-out .14s ease-out forwards}\
-html.js .deck .item.leaving-back{animation-name:deck-out-back}\
-@keyframes deck-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}\
-@keyframes deck-out{to{opacity:0;transform:translateX(-16px)}}\
-@keyframes deck-out-back{to{opacity:0;transform:translateX(16px)}}\
-/* --- the side: toasts above, this sitting's decisions below -------------- */\
-/* A list, not a stack of tiles: one heading, then one row per decision on\
-   the desk surface. A receipt's own left rule is its outcome, which is the\
-   one thing a reader needs from a decision already made. */\
-html.js .side{display:flex;flex-direction:column;gap:.7rem;min-height:0}\
-html.js .toasts{display:grid;gap:.35rem;margin:0}\
-html.js .history{display:flex;flex-direction:column;gap:.5rem;min-height:0;overflow-y:auto}\
-html.js .history h2{margin:0;padding:0;font-size:.75rem;font-weight:600;color:var(--overlay)}\
-html.js .history .receipt,html.js .history .pending{margin:0;padding:.45rem .65rem;\
-color:var(--subtext);background:var(--surface0);font-size:.8125rem}\
-html.js .history .receipt{border-left:3px solid var(--hue,var(--surface1))}\
-html.js .receipt.outcome-approve{--hue:var(--green)}\
-html.js .receipt.outcome-reject{--hue:var(--red)}\
-html.js .receipt.outcome-defer{--hue:var(--yellow)}\
-html.js .receipt.outcome-other{--hue:var(--blue)}\
-html.js .history-toggle{min-height:2.75rem;padding:.2rem .7rem;color:var(--subtext);\
-font-size:.8125rem;font-weight:400}\
-html.js .history-toggle [data-history-count]{margin-left:.4rem;color:var(--text)}\
-/* The desk on a Mac: the deck column left, the side column right on its own\
-   surface, holding the toasts above this sitting's decisions. */\
-@media(min-width:900px){html.js main[data-deck]{padding-right:calc(22rem + 1.2rem)}\
-html.js .deck{max-width:44rem}\
-html.js main[data-deck]>.heading h1{font-size:1.5rem}\
-html.js main[data-deck]>.side{position:absolute;top:0;right:0;bottom:0;width:22rem;\
-padding:.8rem 1rem calc(.8rem + env(safe-area-inset-bottom));background:var(--mantle)}\
-html.js .history-toggle{display:none}}\
-/* Below the desktop column the side is a drawer, and the toasts come out of\
-   it: news has to arrive whether or not the history is open. */\
-@media(max-width:899px){html.js main[data-deck]>.side{display:contents}\
-/* A toast is IN the column on a phone, between the heading and the card: one\
-   line that pushes the card down while it is there. Floated over the card it\
-   covered the eyebrow and the question -- the two lines that say what is\
-   being decided -- which is a notice getting in the way of the decision. */\
-html.js main[data-deck]>.heading,html.js main[data-deck]>.success{order:0}\
-html.js main[data-deck] .toasts{order:1;position:static;margin:0;pointer-events:auto}\
-html.js main[data-deck]>.deck{order:3}\
-html.js main[data-deck]>p.keys{order:4}\
-html.js main[data-deck] .toasts .notice{flex-wrap:nowrap;overflow:hidden}\
-html.js main[data-deck] .toasts .notice .notice-what,\
-html.js main[data-deck] .toasts .notice a{overflow:hidden;white-space:nowrap;\
-text-overflow:ellipsis}\
-/* One at a time: the strip is a line of the screen, and the newest notice is\
-   the one worth that line. */\
-html.js main[data-deck] .toasts .notice~.notice{display:none}\
-html.js main[data-deck] .history{position:fixed;top:0;right:0;bottom:0;z-index:50;\
-width:min(19rem,86vw);\
-padding:.8rem max(.7rem,env(safe-area-inset-right)) calc(.8rem + env(safe-area-inset-bottom));\
-background:var(--mantle);transform:translateX(100%);transition:transform .14s ease-out}\
-html.js body[data-history-open] main[data-deck] .history{transform:none}}\
-@media(max-width:700px){nav{align-items:stretch;flex-wrap:wrap}\
-.brand{flex:0 0 2.5rem}\
-.nav-links{flex:1;overflow-x:auto;scrollbar-width:none}\
-.nav-links::-webkit-scrollbar{display:none}\
-nav form{order:3;flex:1 0 100%;margin:0}\
-.actions button{flex:1}\
-.picks{display:grid;grid-template-columns:1fr 1fr}\
-table{min-width:38rem}\
-.drawer{flex-wrap:nowrap}\
-.drawer .nav-links{flex:none;overflow:visible}\
-.drawer nav form,.drawer form{order:0;flex:none}}\
-/* A short screen -- a laptop window, a phone in landscape -- lets the long\
-   form give up its floor, so the answers keep their room and what does not\
-   fit scrolls with the card rather than being cut off. */\
-@media(max-height:620px){html.js .deck .item>.full{min-height:0}}\
-/* The operator who asked for the page not to move gets the same page with\
-   the one motion left out: the queue still advances, in no time at all. */\
-@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}\
-html.js .deck .item.entering{animation:none}\
-html.js .deck .item.leaving,html.js .deck .item.leaving-back{animation:none;opacity:0}\
-html.js main[data-deck] .history{transition:none}}\
-";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::authz::AuthzContext;
     use crate::model::{
-        AddSubscription, AddTask, AttentionDecision, DecisionCard, DeployIdentity,
-        FinishDeployment, NewSprint, StartDeployment,
+        AddSubscription, AddTask, DecisionCard, DeployIdentity, FinishDeployment, NewSprint,
+        StartDeployment, Subscription,
     };
     use crate::policy::{Capability, ScopeTuple, authority};
     use crate::routing::Enforcement;
@@ -5834,11 +1980,14 @@ mod tests {
     const RENDER_CHILD_TEST: &str = "serve::tests::serve_render_fixture_child_process";
     const RENDER_CHILD_MARKER: &str = "serve-render-fixture-child";
 
-    /// A restricted row says so, and the lease says which model holds it.
+    /// A restricted row says so, and the holder is served without its lease
+    /// token (SPA-09).
     ///
-    /// Both are conditional: an unrestricted row must carry no `allowed
-    /// models` line at all, and a claim taken without `--model` must not
-    /// render an empty `model` row, because a blank fact reads as a fact.
+    /// The page that said both is the bundle's now, so what is asserted
+    /// here is what the SERVER hands it: the row's own `allowedModels`, and
+    /// a holder serialised as `ClaimSummary`, which has no token field to
+    /// forget to strip. The rendered sentences are read in Chrome by
+    /// `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records`.
     #[test]
     fn task_detail_lists_allowed_models_and_the_holders_model_unit() {
         let mut task = crate::model::Task {
@@ -5864,15 +2013,17 @@ mod tests {
             tags: Vec::new(),
             allowed_models: Vec::new(),
         };
-        assert!(
-            !facts("px", &task).contains("allowed models"),
-            "an unrestricted row must carry no allow-list row"
+        let projected =
+            |task: &crate::model::Task| serde_json::to_value(task).expect("the row serialises");
+        assert_eq!(
+            projected(&task)["allowedModels"],
+            serde_json::json!([]),
+            "an unrestricted row must carry an empty allow-list, not a missing one"
         );
         task.allowed_models = vec!["Astra".to_owned(), "Blender-1".to_owned()];
-        assert!(
-            facts("px", &task).contains("<dt>allowed models</dt><dd>Astra, Blender-1</dd>"),
-            "{}",
-            facts("px", &task)
+        assert_eq!(
+            projected(&task)["allowedModels"],
+            serde_json::json!(["Astra", "Blender-1"])
         );
 
         let mut claim = crate::model::Claim {
@@ -5890,15 +2041,24 @@ mod tests {
             root_head: None,
             model: None,
         };
-        let without = held_by(&claim);
-        assert!(!without.contains("<dt>model</dt>"), "{without}");
-        claim.model = Some("Astra".to_owned());
-        let with = held_by(&claim);
-        assert!(with.contains("<dt>model</dt><dd>Astra</dd>"), "{with}");
+        let served = |claim: &crate::model::Claim| {
+            serde_json::to_string(&crate::model::ClaimSummary::from(claim))
+                .expect("the holder serialises")
+        };
+        let without = served(&claim);
         assert!(
-            !with.contains("secret-token"),
-            "the lease token must never reach the page: {with}"
+            !without.contains("\"model\":\""),
+            "a claim taken without --model served an empty model: {without}"
         );
+        claim.model = Some("Astra".to_owned());
+        let with = served(&claim);
+        assert!(with.contains("\"model\":\"Astra\""), "{with}");
+        for held in [&without, &with] {
+            assert!(
+                !held.contains("secret-token") && !held.contains("leaseToken"),
+                "the lease token must never reach the page: {held}"
+            );
+        }
     }
 
     struct RenderFixture {
@@ -6419,80 +2579,6 @@ mod tests {
         assert_html_contains(html, &format!("<title>{title} — kanban</title>"));
     }
 
-    /// Every selector in the stylesheet, comma-separated parts split out and
-    /// keyframe stops dropped: enough to ask what a rule is scoped to.
-    fn css_selectors(css: &str) -> Vec<String> {
-        let mut stripped = String::with_capacity(css.len());
-        let mut rest = css;
-        while let Some(open) = rest.find("/*") {
-            stripped.push_str(&rest[..open]);
-            rest = match rest[open..].find("*/") {
-                Some(close) => &rest[open + close + 2..],
-                None => "",
-            };
-        }
-        stripped.push_str(rest);
-        let mut selectors = Vec::new();
-        for chunk in stripped.split('{') {
-            let tail = chunk.rsplit('}').next().unwrap_or("").trim();
-            if tail.is_empty() || tail.starts_with('@') {
-                continue;
-            }
-            for part in tail.split(',') {
-                let part = part.trim();
-                if part.is_empty() || part == "from" || part == "to" || part.ends_with('%') {
-                    continue;
-                }
-                selectors.push(part.to_owned());
-            }
-        }
-        selectors
-    }
-
-    /// The deck's layout is scoped to a page whose script ran, and nothing
-    /// else is allowed to claim it.
-    ///
-    /// The deck is one card because the script hides the others. The same
-    /// markup with no script has to stay the plain scrolling list it is
-    /// served as: a viewport-height column with `overflow:hidden` and a flex
-    /// row of cards, applied with nothing to drive it, is one crushed card
-    /// and no way past it — every open item unreachable on the page whose
-    /// whole job is to reach them. So every rule that mentions the deck, or
-    /// styles the parts only the deck renders, MUST be behind `html.js`.
-    #[test]
-    fn every_deck_rule_is_scoped_to_a_page_whose_script_ran() {
-        let deck_parts = [
-            "data-deck",
-            ".deck",
-            ".progress",
-            ".side",
-            ".history",
-            ".pending",
-            ".toasts",
-        ];
-        let mut unscoped = Vec::new();
-        for selector in css_selectors(CSS) {
-            let mentions_deck = deck_parts.iter().any(|part| selector.contains(part));
-            if mentions_deck && !selector.starts_with("html.js") {
-                unscoped.push(selector);
-            }
-        }
-        assert!(
-            unscoped.is_empty(),
-            "these deck rules would apply to a page with no script: {unscoped:?}"
-        );
-        // And the script says so before it can throw: the class is added on
-        // the first line, not after the page is wired up.
-        let marker = "document.documentElement.classList.add('js');";
-        let at = JS.find(marker).expect("the script marks the document");
-        assert!(
-            JS[..at]
-                .lines()
-                .all(|line| line.trim().is_empty() || line.trim_start().starts_with("//")),
-            "something runs before the document is marked as scripted"
-        );
-    }
-
     /// One parsed rule of the stylesheet: the at-rule it sits inside, what
     /// it selects, and its declarations verbatim.
     ///
@@ -6583,7 +2669,7 @@ mod tests {
     /// not a rule about an element.
     fn css_styled_declarations() -> Vec<(Vec<String>, String, String)> {
         let mut out = Vec::new();
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             if rule
                 .at
                 .as_deref()
@@ -6601,7 +2687,7 @@ mod tests {
     /// The selectors of every rule whose declarations mention `needle`.
     fn css_selectors_declaring(needle: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             if rule
                 .at
                 .as_deref()
@@ -6619,11 +2705,11 @@ mod tests {
     /// The declarations of the one rule that selects exactly `selector`,
     /// joined across every rule that names it on its own.
     fn css_rule_body(selector: &str) -> String {
-        css_rule_body_in(CSS, selector)
+        css_rule_body_in(&bundle_stylesheet(), selector)
     }
 
-    /// The same, in a named stylesheet: the served `CSS`, or the bundle's own
-    /// (SPA-56 runs ADR-046's token proofs over both).
+    /// The same, in a named stylesheet. One stylesheet ships now — the
+    /// bundle's — and this is the seam the proofs above read it through.
     fn css_rule_body_in(css: &str, selector: &str) -> String {
         let mut body = String::new();
         for rule in css_rules(css) {
@@ -6667,7 +2753,7 @@ mod tests {
 
     /// WCAG 2.2 contrast ratio between two token names.
     fn token_contrast(foreground: &str, background: &str) -> f64 {
-        token_contrast_in(CSS, foreground, background)
+        token_contrast_in(&bundle_stylesheet(), foreground, background)
     }
 
     fn token_contrast_in(css: &str, foreground: &str, background: &str) -> f64 {
@@ -6689,9 +2775,20 @@ mod tests {
     /// stops meaning anything.
     #[test]
     fn the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit() {
-        assert!(
-            CSS.contains("--serif:ui-serif,'New York','Iowan Old Style',Charter,Georgia,serif"),
-            "{CSS}"
+        let stylesheet = bundle_stylesheet();
+        let serif_token = css_token_in(&stylesheet, "--serif");
+        let named = serif_token.split(',').map(str::trim).collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            [
+                "ui-serif",
+                "\"New York\"",
+                "\"Iowan Old Style\"",
+                "Charter",
+                "Georgia",
+                "serif"
+            ],
+            "the serif stack moved"
         );
         let mut serif = css_selectors_declaring("var(--serif)");
         serif.sort();
@@ -6699,7 +2796,20 @@ mod tests {
         // Mono is for an identifier, a key map and a numeric column, and the
         // allowlist is the spec's (WEB-05). A selector is judged by the
         // element it lands on, so `.choice .key` is `.key`.
-        let allowed = ["code", ".id", ".key", ".priority", "p.keys", "td.n", "th.n"];
+        // `.sprint-version` joined the list with the mounted sprints page:
+        // a served version is an identifier a reader matches character by
+        // character against a deploy receipt, which is what the allowlist
+        // is for (WEB-05).
+        let allowed = [
+            "code",
+            ".id",
+            ".key",
+            ".priority",
+            "p.keys",
+            "td.n",
+            "th.n",
+            ".sprint-version",
+        ];
         for selector in css_selectors_declaring("var(--mono)") {
             let landed = selector.split_whitespace().last().unwrap_or(&selector);
             assert!(
@@ -6729,10 +2839,10 @@ mod tests {
                 "button",
                 vec!["font-size:1rem", "line-height:1.2", "font-weight:600"],
             ),
-            (".meta", vec!["font-size:.8125rem", "line-height:1.4"]),
+            (".meta", vec!["font-size:0.8125rem", "line-height:1.4"]),
             (
                 ".choice .key",
-                vec!["font-size:.75rem", "font-family:var(--mono)"],
+                vec!["font-size:0.75rem", "font-family:var(--mono)"],
             ),
             (
                 ".item>h2",
@@ -6806,7 +2916,7 @@ mod tests {
         );
         // And no hex is written anywhere else: a colour picked at a rule is
         // a colour that means nothing.
-        let stripped = css_without_comments(CSS);
+        let stripped = css_without_comments(&bundle_stylesheet());
         let root_at = stripped.find(":root{").expect("the token block");
         let root_end = root_at + stripped[root_at..].find('}').expect("the block closes");
         let outside = format!("{}{}", &stripped[..root_at], &stripped[root_end..]);
@@ -6849,10 +2959,13 @@ mod tests {
                 || (property == "border-left"
                     && value.starts_with("3px solid")
                     && selector.contains(".receipt"))
-                // the drawer's current destination
+                // the current destination in the drawer, and the current
+                // sprint on the sprints page: the same neutral rule saying
+                // the same thing, which is why a hue is not needed for it
                 || (property == "border-left"
                     && value == "2px solid var(--text)"
-                    && selector.contains("aria-current"));
+                    && (selector.contains("aria-current")
+                        || selector.contains(".is-current")));
             assert!(
                 allowed,
                 "{selector} declares {property}:{value}, which is not in the allowlist"
@@ -6891,7 +3004,7 @@ mod tests {
     fn an_outcome_hue_appears_only_on_an_outcome_unit() {
         let hues = ["var(--green)", "var(--red)", "var(--yellow)", "var(--blue)"];
         let mut filled = Vec::new();
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             if rule
                 .at
                 .as_deref()
@@ -6936,7 +3049,7 @@ mod tests {
     /// WEB-14 — one motion exists in the stylesheet.
     #[test]
     fn one_motion_is_declared_and_nothing_else_animates_unit() {
-        let stripped = css_without_comments(CSS);
+        let stripped = css_without_comments(&bundle_stylesheet());
         let keyframes: Vec<&str> = stripped
             .match_indices("@keyframes ")
             .map(|(at, _)| {
@@ -6984,17 +3097,14 @@ mod tests {
     #[test]
     fn the_deck_body_fades_at_its_foot_unit() {
         let mut faded = Vec::new();
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             if rule.body.contains("mask-image") {
                 faded.push(rule);
             }
         }
         assert_eq!(faded.len(), 1, "more than one element fades");
         let fade = &faded[0];
-        assert_eq!(
-            fade.selectors,
-            vec!["html.js .deck .item>.full .body".to_owned()]
-        );
+        assert_eq!(fade.selectors, vec![".deck .item>.full .body".to_owned()]);
         assert!(fade.body.contains("linear-gradient"), "{}", fade.body);
         assert!(fade.body.contains("2rem"), "{}", fade.body);
     }
@@ -7015,7 +3125,7 @@ mod tests {
             answers.contains("grid-template-columns:1fr;"),
             "the answers are not one column: {answers}"
         );
-        let panel = css_rule_body("html.js .deck .item>.decide");
+        let panel = css_rule_body(".deck .item>.decide");
         assert!(panel.contains("flex:none"), "{panel}");
         for banned in ["max-height", "overflow"] {
             assert!(
@@ -7025,7 +3135,7 @@ mod tests {
             );
         }
         // The card's own column is the one scroller the deck has.
-        let card = css_rule_body("html.js .deck .item");
+        let card = css_rule_body(".deck .item");
         assert!(card.contains("overflow:hidden auto"), "{card}");
     }
 
@@ -7079,7 +3189,7 @@ mod tests {
             ratio < 4.5,
             "{ratio:.2}:1 -- if overlay now clears AA on surface0 this rule can go"
         );
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             let declarations = css_declarations(&rule.body);
             let quiet = declarations
                 .iter()
@@ -7117,86 +3227,44 @@ mod tests {
         }
     }
 
-    /// The bundle's stylesheet, as the browser receives it.
+    /// The one stylesheet that ships: the bundle's own, as the browser
+    /// receives it, with its layout whitespace taken out.
+    ///
+    /// Every ADR-046 proof in this module reads it. There was a second one
+    /// — the served `CSS` const, inlined into every server-rendered page —
+    /// and `t-bf255880` wave 2 deleted it with the pages, so the design
+    /// system now has one place to be true of.
+    ///
+    /// The served copy was authored compact and this one is authored to be
+    /// read, so the whitespace between a property and its value is a
+    /// formatting choice rather than a design one: it is normalised away
+    /// here so that a proof states the declaration it is about rather than
+    /// the way the file happens to be laid out. Nothing inside a value is
+    /// touched beyond collapsing runs of blanks, which no declaration in
+    /// this stylesheet distinguishes.
     fn bundle_stylesheet() -> String {
         let asset = crate::bundle::asset(crate::bundle::STYLESHEET)
             .expect("the bundle's stylesheet is embedded under the name the shell links");
-        String::from_utf8(asset.bytes.to_vec()).expect("the stylesheet is UTF-8")
-    }
-
-    /// SPA-56 — ADR-046's token proofs, re-run over the bundle's own CSS.
-    ///
-    /// The served `CSS` const and the bundle's stylesheet are two stylesheets
-    /// for one product, and the cutover moves rules from the first to the
-    /// second one page at a time. A token block that drifted while it moved
-    /// would be a different palette wearing the same names, so the bundle's
-    /// block must be the served one exactly, the contrast arithmetic is
-    /// re-run on it, and no colour may be written outside it.
-    ///
-    /// What this does NOT yet re-run, because the rules it judges have not
-    /// moved: `.pill`'s quiet-text rule, and the type-scale, serif/mono,
-    /// prose-width and glyph-prefix proofs, all of which select elements the
-    /// deck brings with it (`t-1f495a7f`, `t-bf255880`).
-    #[test]
-    fn the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit() {
-        let bundle = bundle_stylesheet();
-        let colours = |css: &str| -> Vec<(String, String)> {
-            css_declarations(&css_rule_body_in(css, ":root"))
-                .into_iter()
-                .filter(|(_, value)| value.starts_with('#'))
-                .collect()
-        };
-        assert_eq!(
-            colours(&bundle),
-            colours(CSS),
-            "the bundle's token block is not the served stylesheet's"
-        );
-
-        // No hex outside the token block, in the bundle as in the document.
-        let stripped = css_without_comments(&bundle);
-        let root_at = stripped.find(":root").expect("the token block");
-        let root_end = root_at + stripped[root_at..].find('}').expect("the block closes");
-        let outside = format!("{}{}", &stripped[..root_at], &stripped[root_end..]);
-        assert!(
-            !outside.contains('#'),
-            "the bundle writes a hex literal outside its token block: {outside}"
-        );
-
-        for (foreground, background) in AA_TOKEN_PAIRS {
-            let ratio = token_contrast_in(&bundle, foreground, background);
-            assert!(
-                ratio >= 4.5,
-                "in the bundle, {foreground} on {background} is {ratio:.2}:1, below AA"
-            );
+        let raw = String::from_utf8(asset.bytes.to_vec()).expect("the stylesheet is UTF-8");
+        let mut compact = String::with_capacity(raw.len());
+        let mut blank = false;
+        for character in raw.chars() {
+            if character.is_whitespace() {
+                blank = true;
+                continue;
+            }
+            if blank && !compact.is_empty() {
+                let previous = compact.chars().next_back().unwrap_or(' ');
+                if !matches!(previous, ':' | ';' | ',' | '{' | '}' | '(' | '>')
+                    && !matches!(character, ';' | ',' | '{' | '}' | ')' | '>')
+                {
+                    compact.push(' ');
+                }
+            }
+            blank = false;
+            compact.push(character);
         }
-        for ground in ["--base", "--mantle"] {
-            let ratio = token_contrast_in(&bundle, "--focus", ground);
-            assert!(
-                ratio >= 3.0,
-                "the bundle's focus ring is {ratio:.2}:1 on {ground}"
-            );
-        }
-        for hue in ["--green", "--red", "--yellow", "--blue"] {
-            let ratio = token_contrast_in(&bundle, hue, "--base");
-            assert!(
-                ratio >= 3.0,
-                "a filled answer in {hue} is {ratio:.2}:1 against the bundle's page"
-            );
-        }
-        for rule in css_rules(&bundle) {
-            let declarations = css_declarations(&rule.body);
-            let quiet = declarations
-                .iter()
-                .any(|(property, value)| property == "color" && value == "var(--overlay)");
-            let filled = declarations
-                .iter()
-                .any(|(property, value)| property == "background" && value == "var(--surface0)");
-            assert!(
-                !(quiet && filled),
-                "{:?} puts overlay text on a surface0 fill",
-                rule.selectors
-            );
-        }
+        compact
     }
 
     /// SPA-05, and the edge's injection point.
@@ -7364,317 +3432,38 @@ mod tests {
         assert_eq!(lines[1], format!("bundle {recomputed}"), "{banner}");
     }
 
-    /// One board with one fully carded open item, three days old.
-    ///
-    /// Opened directly rather than through the registry: the card renderers
-    /// need a store for a task reference and nothing else, so the copy this
-    /// slice is about is readable without a spawned process.
-    struct CardFixture {
-        _dir: TempDataDir,
-        store: Store,
-        board: String,
-        item: Attention,
-    }
-
-    fn card_fixture(label: &str) -> CardFixture {
-        let dir = TempDataDir::new(label);
-        let path = dir.path().join("px.db");
-        let mut store = Store::open(&path).expect("open the card board");
-        store
-            .initialize("px", "seed")
-            .expect("initialize the board");
-        let card = DecisionCard {
-            question: Some("Ship the sprint tonight, or wait for Monday?".to_owned()),
-            context: Some("Gate green at 353/0. Rollback is one command.".to_owned()),
-            choices: vec![
-                AttentionChoice {
-                    key: "ship".to_owned(),
-                    label: "Ship tonight".to_owned(),
-                    consequence: "The release goes out now.".to_owned(),
-                    outcome: "approve".to_owned(),
-                    recommended: true,
-                },
-                AttentionChoice {
-                    key: "wait".to_owned(),
-                    label: "Wait for Monday".to_owned(),
-                    consequence: "Nothing goes out today.".to_owned(),
-                    outcome: "defer".to_owned(),
-                    recommended: false,
-                },
-                AttentionChoice {
-                    key: "stop".to_owned(),
-                    label: "Stop the release".to_owned(),
-                    consequence: "The sprint does not ship at all.".to_owned(),
-                    outcome: "reject".to_owned(),
-                    recommended: false,
-                },
-            ],
-        };
-        let mut item = store
-            .raise_attention(
-                "The long form of the ask, as a raiser writes it.",
-                "decision",
-                "codex@driver",
-                None,
-                0,
-                &[],
-                &card,
-            )
-            .expect("raise a carded item");
-        item.created_at = now_ms() - 3 * 24 * 60 * 60_000;
-        CardFixture {
-            _dir: dir,
-            store,
-            board: "px".to_owned(),
-            item,
-        }
-    }
-
-    /// Everything between `<p class=X>` and its close, for every occurrence.
-    fn rendered_regions(html: &str, class: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        for tag in ["p", "div"] {
-            let open = format!("<{tag} class={class}>");
-            let close = format!("</{tag}>");
-            let mut rest = html;
-            while let Some(at) = rest.find(&open) {
-                let body = &rest[at + open.len()..];
-                let end = body.find(&close).expect("the region closes");
-                out.push(body[..end].to_owned());
-                rest = &body[end..];
-            }
-        }
-        out
-    }
-
-    /// WEB-23 — the eyebrow names who asked, where, and when, in one
-    /// sentence.
-    #[test]
-    fn the_eyebrow_names_raiser_board_and_age_unit() {
-        let fixture = card_fixture("eyebrow");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        assert!(
-            card.contains(
-                "<p class=eyebrow>codex@driver asked on \
-                 <a href=\"/board/px\" data-ref target=_blank rel=noopener>px</a>, 3 days ago</p>"
-            ),
-            "{card}"
-        );
-        let eyebrow = rendered_regions(&card, "eyebrow");
-        assert_eq!(eyebrow.len(), 1, "{eyebrow:?}");
-        for absent in ["kind", "waiting", "priority", "decision"] {
-            assert!(
-                !eyebrow[0].contains(absent),
-                "the eyebrow still carries {absent}: {}",
-                eyebrow[0]
-            );
-        }
-    }
-
-    /// WEB-22 — meta is a sentence, never a chain.
-    #[test]
-    fn rendered_meta_is_a_sentence_with_no_dot_chain_unit() {
-        let fixture = card_fixture("meta");
-        let mut settled = fixture.item.clone();
-        settled.status = "resolved".to_owned();
-        settled.resolved_by = Some(OPERATOR_ACTOR.to_owned());
-        settled.resolved_at = Some(now_ms());
-        settled.decision = Some(AttentionDecision {
-            choice: "ship".to_owned(),
-            outcome: "approve".to_owned(),
-            note: Some("go".to_owned()),
-            by: OPERATOR_ACTOR.to_owned(),
-            at: now_ms(),
-        });
-        let surfaces = [
-            decision_card(&fixture.board, &fixture.store, &fixture.item),
-            decided_row(&fixture.board, &fixture.store, &settled),
-            attention_section(
-                &fixture.board,
-                "Open attention",
-                std::slice::from_ref(&fixture.item),
-            ),
-        ];
-        for surface in &surfaces {
-            for class in ["eyebrow", "meta", "decision"] {
-                for region in rendered_regions(surface, class) {
-                    for chain in [" · ", " | "] {
-                        assert!(
-                            !region.contains(chain),
-                            "a {class} line reads as a chain: {region}"
-                        );
-                    }
-                    assert!(!region.trim_end().ends_with('→'), "{region}");
-                }
-            }
-        }
-        // A receipt is built by the script, and its sentences are written
-        // there: no chain, and no arrow. The ONE separator the script writes
-        // is the deck's own eyebrow join (WEB-22, superseded 2026-09-18):
-        // the card's meta line moves onto the end of the eyebrow so the
-        // priority pill stops sitting under text dissolving into the fade,
-        // and one line of orientation carries who asked, where, when and how
-        // urgent. Counted rather than banned, so a second chain written
-        // anywhere in the script still fails here.
-        assert_eq!(
-            JS.matches(" · ").count(),
-            1,
-            "the script writes a dot chain somewhere other than the eyebrow join"
-        );
-        assert!(
-            JS.contains("eyebrow.append(' · ')"),
-            "the one separator the script writes is not the eyebrow join"
-        );
-        assert!(!JS.contains('→'), "the script writes an arrow");
-    }
-
-    /// WEB-24, WEB-25 — the note field's label, and only its label; and the
-    /// custom answer's button says what happens.
-    #[test]
-    fn the_note_field_is_labelled_add_a_note_with_no_hint_unit() {
-        let fixture = card_fixture("note");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        let id = url_encode(&fixture.item.id);
-        assert!(
-            card.contains(&format!(
-                "<div class=reply><label for=\"answer-{id}\">Add a note</label>"
-            )),
-            "{card}"
-        );
-        assert!(!card.contains("Add a note (optional)"), "{card}");
-        assert!(!card.contains("aria-describedby=\"reply-hint"), "{card}");
-        assert!(
-            !card.contains("Sent with whichever answer you pick"),
-            "the note kept its hint paragraph: {card}"
-        );
-    }
-
-    /// WEB-25 — the custom answer's button says what happens.
-    #[test]
-    fn the_custom_answer_button_says_record_my_answer_unit() {
-        let fixture = card_fixture("record");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        assert!(
-            card.contains(
-                "<button type=submit class=record name=decision value=custom \
-                 data-testid=deck-record>Record my answer</button>"
-            ),
-            "{card}"
-        );
-        assert!(!card.contains("Record this answer"), "{card}");
-    }
-
-    /// WEB-26 — the empty deck is an answer, not an absence.
-    #[test]
-    fn the_empty_deck_copy_and_its_link_are_exact_unit() {
-        assert!(
-            EMPTY_QUEUE.contains(
-                "<p class=empty>Nothing is waiting. \
-                 Every question an agent raised has an answer.</p>"
-            ),
-            "{EMPTY_QUEUE}"
-        );
-        assert!(
-            EMPTY_QUEUE.contains("<a href=\"/decided\">See what was decided</a>"),
-            "{EMPTY_QUEUE}"
-        );
-        assert!(
-            !EMPTY_QUEUE.contains("every raised item has been settled"),
-            "the absence wording is still served: {EMPTY_QUEUE}"
-        );
-    }
-
-    /// WEB-27 — one quiet keyboard line, and the digits live on the buttons.
-    ///
-    /// The DECK's line moved into the bundle with the deck itself
-    /// (`t-1f495a7f`), where it is observed in the browser by
-    /// `the_deck_keeps_one_quiet_keys_line_in_real_chrome`; what is still
-    /// served here is the plain list's, and the digits on the card are the
-    /// half both surfaces share.
-    #[test]
-    fn one_quiet_keys_line_carries_no_kbd_badges_unit() {
-        assert_eq!(LIST_KEYS, "<p class=keys>1–4 answer · u undo · c own</p>");
-        assert!(!LIST_KEYS.contains("<kbd>"), "{LIST_KEYS}");
-        assert_eq!(LIST_KEYS.matches("<p class=keys").count(), 1, "{LIST_KEYS}");
-        let body = css_rule_body("p.keys");
-        assert!(body.contains("font-size:.75rem"), "{body}");
-        assert!(body.contains("color:var(--overlay)"), "{body}");
-        assert!(body.contains("font-family:var(--mono)"), "{body}");
-        // And the digits are on the answers themselves -- which is why the
-        // legend over the recommendation says the one word and not the key
-        // a second time (George, 2026-09-17, on the deck screenshots).
-        let fixture = card_fixture("keys");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        for digit in ["1", "2", "3"] {
-            assert!(
-                card.contains(&format!("<span class=key>{digit}</span>")),
-                "{card}"
-            );
-        }
-        assert!(
-            card.contains("<legend>Recommended</legend>"),
-            "the recommendation's legend is not the one word: {card}"
-        );
-        assert!(
-            !card.contains("press 1"),
-            "the legend still repeats the digit the button carries: {card}"
-        );
-        assert!(!card.contains("<kbd>"), "{card}");
-    }
-
     /// WEB-03 — no glyph prefix anywhere.
     #[test]
     fn no_heading_or_link_carries_a_glyph_prefix_unit() {
-        let stripped = css_without_comments(CSS);
-        assert!(!stripped.contains("content:'>'"), "{stripped}");
-        assert!(!stripped.contains("content:'> '"), "{stripped}");
-        let fixture = card_fixture("glyph");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        let rendered = page("Needs you", &format!("<h1>Needs you</h1>{card}"));
-        // Every heading and every link text the renderers produce, read out
-        // of the served bytes.
-        for opener in ["<h1>", "<h2 ", "<h2>", "<a "] {
-            let mut rest = rendered.as_str();
-            while let Some(at) = rest.find(opener) {
-                let after = &rest[at + opener.len()..];
-                let text_at = match after.find('>') {
-                    Some(close) if opener.ends_with(' ') => close + 1,
-                    _ => 0,
-                };
-                let text = &after[text_at..];
-                let end = text.find('<').unwrap_or(text.len());
-                let text = text[..end].trim();
-                assert!(
-                    !text.starts_with('>'),
-                    "{opener} text starts with >: {text}"
-                );
-                assert!(
-                    !text.ends_with('→'),
-                    "{opener} text ends with an arrow: {text}"
-                );
-                rest = after;
-            }
+        let stripped = css_without_comments(&bundle_stylesheet());
+        // The headings and link texts are the bundle's now, and the width
+        // sweep reads them in Chrome on every route
+        // (`no_route_overflows_sideways_at_three_widths_in_real_chrome`).
+        // What is still decidable here is that the stylesheet injects no
+        // glyph of its own, which is the half a rendered page cannot show.
+        for injected in [
+            "content:'>'",
+            "content:'> '",
+            "content:\">\"",
+            "content: \">\"",
+        ] {
+            assert!(!stripped.contains(injected), "{stripped}");
         }
     }
 
     /// WEB-29 — a board refusal is the board's own sentence.
     #[test]
     fn a_refusal_is_the_boards_sentence_in_red_unit() {
-        // The two channels are distinguished by attribute and never share a
-        // node: the composer's own sentence is `incomplete`, the board's is
-        // `board`.
-        assert!(
-            JS.contains("refusal.setAttribute('data-refusal', kind)"),
-            "{JS}"
-        );
-        assert!(JS.contains("[data-refusal=board]"), "{JS}");
-        assert!(
-            JS.contains("showRefusal(form, INCOMPLETE_ANSWER, 'incomplete')"),
-            "{JS}"
+        // The refusal DOCUMENT is a contract: `web/src/api.ts`'s `postForm`
+        // reads the board's own sentence out of `.error` and puts it under
+        // the control that was pressed, so a refused POST has to carry one.
+        let refusal = page(
+            "Needs you",
+            &format!("<p class=error>{}</p>", escape(&choice_required())),
         );
         assert!(
-            JS.contains("showRefusal(form, refused ? refused.textContent : `The board refused this decision (${response.status}).`, 'board')"),
-            "{JS}"
+            refusal.contains("<p class=error>"),
+            "the refusal document lost the element the client reads: {refusal}"
         );
         let body = css_rule_body(".error");
         assert!(body.contains("color:var(--red)"), "{body}");
@@ -7687,108 +3476,38 @@ mod tests {
         }
     }
 
-    /// WEB-39 — search is the first thing in the drawer.
-    #[test]
-    fn the_drawer_puts_search_before_every_destination_unit() {
-        let rendered = page("Boards", "<h1>Boards</h1>");
-        let drawer_at = rendered.find("<nav class=drawer").expect("the drawer");
-        let drawer = &rendered[drawer_at..];
-        let search = drawer.find("data-nav-search").expect("the search form");
-        for destination in [
-            "needs-you",
-            "all",
-            "decided",
-            "lanes",
-            "boards",
-            "sprints",
-            "plans",
-            "deployments",
-            "subscriptions",
-        ] {
-            let at = drawer
-                .find(&format!("data-nav={destination}"))
-                .unwrap_or_else(|| panic!("no {destination} anchor in the drawer"));
-            assert!(
-                search < at,
-                "the search field comes after {destination} in the drawer"
-            );
-        }
-    }
-
-    /// WEB-52 — two announcement channels, each with one role, and every
-    /// field is named.
-    ///
-    /// Asserted here on the shell and the card, which is every input and
-    /// textarea this slice renders; the same helper runs over every in-scope
-    /// route inside the render fixture, where the registry exists.
-    #[test]
-    fn every_field_is_labelled_and_status_is_announced_once_unit() {
-        let fixture = card_fixture("labels");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        let deck = page(
-            "Needs you",
-            &format!(
-                "<div class=heading><h1>Needs you</h1></div>\
-                 {card}\
-                 <aside class=side data-side>\
-                 <div class=toasts data-notices role=log aria-live=polite></div></aside>"
-            ),
-        );
-        assert_announcement_channels(&deck, "/");
-        assert_every_field_is_named(&deck, "/");
-        // The card's own name is its question.
-        let id = escape(&fixture.item.id);
-        assert!(
-            card.contains(&format!("aria-labelledby=\"q-{id}\"")),
-            "{card}"
-        );
-        assert!(card.contains(&format!("<h2 id=\"q-{id}\">")), "{card}");
-        // The markup is only half of it: the script builds nodes too, and a
-        // refusal that carried `role=alert` was a third announcement channel
-        // that shouted whatever the board said. Every role the script writes
-        // is named here, so adding one is a decision rather than an
-        // accident: the toast log it creates when a page has none, and the
-        // hover preview's tooltip, which announces nothing.
-        let mut roles = Vec::new();
-        let mut rest = JS;
-        while let Some(at) = rest.find("setAttribute('role', '") {
-            let after = &rest[at + "setAttribute('role', '".len()..];
-            let end = after.find('\'').expect("the role closes");
-            roles.push(&after[..end]);
-            rest = &after[end..];
-        }
-        assert_eq!(
-            roles,
-            ["log", "tooltip"],
-            "the script writes a role that is neither the toast log nor a hover preview"
-        );
-        assert!(
-            !JS.contains("'alert'") && !JS.contains("\"alert\""),
-            "the script raises an alert region: a refusal is described text, not an announcement"
-        );
-        assert_eq!(
-            JS.matches("aria-live").count(),
-            1,
-            "the script writes aria-live somewhere other than the toast log it creates"
-        );
-        // ...and the refusal it does build is tied to what it focuses.
-        assert!(
-            JS.contains("describeRefusal(missing, refusal)")
-                && JS.contains("setAttribute('aria-describedby', refusal.id)"),
-            "a refusal no longer describes the control the operator is sent to"
-        );
-    }
-
-    /// WEB-44 — every route the server answers is a route the sweep loads.
+    /// WEB-44 — every route the server answers is a route the sweep loads,
+    /// and every one of them answers the application.
     ///
     /// The sweep is a list of URLs in `tests/e2e.rs`, and a list can fall
     /// behind the match it is a list of. So `ROUTE_SHAPES` is the registry
-    /// both read, and this counts `render`'s arms in the source to hold the
-    /// registry to the match: adding an arm without declaring its shape
-    /// fails here, and declaring a shape the sweep does not load fails in
-    /// the sweep.
+    /// both read, and this drives `render` with one URL per declared shape:
+    /// a shape that is declared and not answered fails here, an arm that
+    /// answers something no shape declares fails on the head-segment check
+    /// below, and a shape the sweep does not load fails in the sweep.
     #[test]
     fn render_answers_exactly_the_declared_shapes_unit() {
+        for shape in ROUTE_SHAPES {
+            let url = shape
+                .replace("{project}", "SHAPES")
+                .replace("{id}", "x-1")
+                .replace("{kind}", "task");
+            let answered = render(&url).unwrap_or_else(|error| panic!("render {url}: {error}"));
+            assert_eq!(
+                answered,
+                app_shell(),
+                "{url} is declared but does not answer the application"
+            );
+        }
+        // And nothing else does: an address no shape declares is the
+        // refusal document, which is the only other thing `render` writes.
+        for unknown in ["/no-such-page", "/preview/task/SHAPES/t-1", "/a/b/c/d"] {
+            let answered = render(unknown).expect("render an unknown address");
+            assert_ne!(answered, app_shell(), "{unknown} answered the application");
+            assert!(answered.contains("No page at that address"), "{answered}");
+        }
+        // The match's own leading segments, read off the source, so an arm
+        // added without a shape is caught rather than silently mounted.
         let source = include_str!("serve.rs");
         let body = source
             .split_once("fn render(url: &str) -> Result<String> {")
@@ -7797,41 +3516,51 @@ mod tests {
             .split_once("\nfn post(")
             .expect("render ends before post")
             .0;
-        let arms = body.matches("=>").count();
+        let matched = body
+            .split_once("match parts.as_slice() {")
+            .expect("render matches the path")
+            .1
+            .split_once("=> Ok(app_shell()),")
+            .expect("the mounted arms end")
+            .0;
+        let mut answered = matched
+            .split('|')
+            .filter_map(|arm| arm.split_once('"').map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split_once('"').map(|(head, _)| head.to_owned()))
+            .collect::<Vec<_>>();
+        answered.push(String::new());
+        answered.sort();
+        let mut declared = ROUTE_SHAPES
+            .iter()
+            .map(|shape| {
+                shape
+                    .split('/')
+                    .find(|segment| !segment.is_empty())
+                    .filter(|segment| !segment.starts_with('{'))
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        declared.sort();
+        declared.dedup();
+        answered.dedup();
         assert_eq!(
-            arms,
-            ROUTE_SHAPES.len() + 1,
-            "render answers {arms} arms (the last being not-found) but {} shapes are \
-             declared: declare the new shape in ROUTE_SHAPES and load it in \
-             no_route_overflows_sideways_at_three_widths_in_real_chrome",
-            ROUTE_SHAPES.len()
+            answered, declared,
+            "render answers a leading segment no shape declares, or the other way about"
         );
     }
-
-    /// Every badge class the restyle retired, in the two spellings the
-    /// renderers used.
-    const RETIRED_BADGES: [&str; 8] = [
-        "class=tag",
-        "class=\"tag",
-        "class=kind",
-        "class=\"kind",
-        "class=type",
-        "class=\"type",
-        "class=lane",
-        "class=\"lane",
-    ];
 
     /// WEB-41 — one pill style everywhere.
     ///
     /// The stylesheet is asked what it DECLARES: exactly one `.pill` rule,
     /// status modifiers that only recolour it, and no surviving rule that
     /// makes a tag, a kind, a type or a priority into a second badge. The
-    /// renderers are asked what they EMIT, because "no served markup uses a
-    /// second badge class" is a claim about every page rather than about the
-    /// pages one fixture happens to seed.
+    /// markup half went with the renderers — nothing in this crate writes a
+    /// badge any more — and a class nothing styles cannot be a second
+    /// badge.
     #[test]
     fn exactly_one_pill_style_exists_unit() {
-        let pill_rules = css_rules(CSS)
+        let pill_rules = css_rules(&bundle_stylesheet())
             .into_iter()
             .filter(|rule| rule.selectors == vec![".pill".to_owned()])
             .collect::<Vec<_>>();
@@ -7841,18 +3570,20 @@ mod tests {
             "the stylesheet declares {} rules that select exactly .pill",
             pill_rules.len()
         );
-        let body = &pill_rules[0].body;
-        for declaration in [
-            "background:var(--surface0)",
-            "font-size:.75rem",
-            "border-radius:999px",
+        let declared = css_declarations(&pill_rules[0].body);
+        for (property, value) in [
+            ("background", "var(--surface0)"),
+            ("font-size", "0.75rem"),
+            ("border-radius", "999px"),
         ] {
             assert!(
-                body.contains(declaration),
-                "the pill does not declare {declaration}: {body}"
+                declared
+                    .iter()
+                    .any(|(name, held)| name == property && held == value),
+                "the pill does not declare {property}:{value}: {declared:?}"
             );
         }
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             if !rule
                 .selectors
                 .iter()
@@ -7870,7 +3601,7 @@ mod tests {
         }
         // The baseline's second badges are gone from the stylesheet, and the
         // priority is plain text: no fill, no radius, no border.
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             for selector in &rule.selectors {
                 let landed = selector.split_whitespace().last().unwrap_or(selector);
                 for retired in [".tag", ".kind", ".type"] {
@@ -7892,30 +3623,13 @@ mod tests {
                 }
             }
         }
-        // What the renderers emit. The source is read rather than one page,
-        // because the claim is about every arm of `render`.
-        const SOURCE: &str = include_str!("serve.rs");
-        let renderers = SOURCE
-            .split_once("#[cfg(test)]\nmod tests {")
-            .expect("the module has tests")
-            .0;
-        for badge in RETIRED_BADGES {
-            assert!(
-                !renderers.contains(badge),
-                "a renderer still emits the retired badge {badge}"
-            );
-        }
-        assert!(
-            !renderers.contains("class=status") && !renderers.contains("class=\"status"),
-            "a renderer still emits a bare status badge instead of the one pill"
-        );
     }
 
     /// WEB-42 — tables lose their borders and keep the hairline.
     #[test]
     fn tables_declare_only_the_row_hairline_unit() {
         let parts = ["table", "th", "td", "th.n", "td.n"];
-        for rule in css_rules(CSS) {
+        for rule in css_rules(&bundle_stylesheet()) {
             if !rule
                 .selectors
                 .iter()
@@ -7944,7 +3658,7 @@ mod tests {
         );
         let head = css_rule_body("th");
         assert!(
-            head.contains("font-size:.75rem") && head.contains("color:var(--overlay)"),
+            head.contains("font-size:0.75rem") && head.contains("color:var(--overlay)"),
             "the header row is not quiet .75rem overlay: {head}"
         );
         for numeric in ["td.n", "th.n"] {
@@ -7979,8 +3693,6 @@ mod tests {
                 "/subscriptions",
                 "/lanes",
                 "/search",
-                "/preview/{kind}/{project}/{id}",
-                "/preview/board/{project}",
                 "/board/{project}",
                 "/task/{project}/{id}",
                 "/deployment/{project}/{id}",
@@ -8004,65 +3716,6 @@ mod tests {
              | [\"plan\", _, _, \"open\"] | [\"subscription\", _, _, \"pause\" | \"resume\"]",
             "the write surface moved"
         );
-    }
-
-    /// One `role=status`, one `role=log`, and no third live region.
-    ///
-    /// Read off the MARKUP: the script is inlined into the same document and
-    /// its comments name the roles it manages, which is prose about the
-    /// contract rather than a region claiming one.
-    fn assert_announcement_channels(html: &str, route: &str) {
-        let markup = html.split("<script>").next().unwrap_or(html);
-        assert_eq!(
-            markup.matches("role=status").count(),
-            1,
-            "{route} does not carry exactly one role=status"
-        );
-        assert!(
-            markup.matches("role=log").count() <= 1,
-            "{route} carries more than one role=log"
-        );
-        assert_eq!(
-            markup.matches("aria-live").count(),
-            markup.matches("role=status").count() + markup.matches("role=log").count(),
-            "{route} has a live region that is neither the status nor the log"
-        );
-    }
-
-    /// Every `input` and `textarea` is named by a label or an aria-label.
-    fn assert_every_field_is_named(html: &str, route: &str) {
-        for opener in ["<input ", "<textarea "] {
-            let mut rest = html;
-            while let Some(at) = rest.find(opener) {
-                let after = &rest[at..];
-                let end = after.find('>').expect("the element closes");
-                let element = &after[..end];
-                rest = &after[end..];
-                if element.contains("type=hidden") {
-                    continue;
-                }
-                if element.contains("aria-label") {
-                    continue;
-                }
-                let id = element
-                    .split_once("id=\"")
-                    .map(|(_, tail)| tail.split('"').next().unwrap_or("").to_owned())
-                    .or_else(|| {
-                        element.split_once("id=").map(|(_, tail)| {
-                            tail.split_whitespace().next().unwrap_or("").to_owned()
-                        })
-                    })
-                    .unwrap_or_default();
-                assert!(
-                    !id.is_empty(),
-                    "{route} renders an unnamed field with no id: {element}"
-                );
-                assert!(
-                    html.contains(&format!("for=\"{id}\"")) || html.contains(&format!("for={id}")),
-                    "{route} renders {element} with no label naming {id}"
-                );
-            }
-        }
     }
 
     const COUNTS_CHILD_TEST: &str = "serve::tests::web_counts_child_process";
@@ -8140,17 +3793,19 @@ mod tests {
             }
         }
 
-        // Twelve open across two boards, said as a count on the list and as
-        // the length of the queue the deck reads. The deck's own `12 left`
-        // is rendered by the bundle now (`t-1f495a7f`) and is observed in
-        // the browser; what the SERVER owes both surfaces is one queue, so
-        // that is what is counted here.
-        let list = render("/all").expect("render the plain list");
-        assert_html_contains(
-            &list,
-            "<p class=count><span data-open-count>12</span> open across 2 boards</p>",
-        );
-        assert_eq!(queue_length(), 12, "the deck's queue is not the list's");
+        // Twelve open across two boards. Both surfaces that say so — the
+        // deck's `12 left` and the list's `12 open across 2 boards` — are
+        // rendered by the bundle and read in Chrome; what the SERVER owes
+        // them is ONE queue, and that is what is counted here.
+        assert_eq!(queue_length(), 12, "the queue is not every board's");
+        let list = render("/all").expect("render the open list");
+        assert_eq!(list, app_shell(), "/all is not the application shell");
+        for data_bearing in ["data-open-count", "open across", "<article class=item"] {
+            assert!(
+                !list.contains(data_bearing),
+                "the shell carries {data_bearing}: {list}"
+            );
+        }
 
         // And the queue is the open rows', not the page's: settling the
         // nine atmux rows leaves three.
@@ -8169,43 +3824,62 @@ mod tests {
                 .expect("settle an atmux row");
         }
         assert_eq!(queue_length(), 3, "settled rows are still in the queue");
-        let list = render("/all").expect("re-render the plain list");
-        assert_html_contains(
-            &list,
-            "<p class=count><span data-open-count>3</span> open across 1 board</p>",
-        );
 
-        // Every in-scope SERVER-RENDERED route keeps both announcement
-        // channels and reaches no third party (WEB-52, WEB-54), which is a
-        // claim about the routes and so is made where the routes can be
-        // rendered. `/`, `/search` and `/task/{project}/{id}` are not in
-        // the list because they are no longer among them: they answer the
-        // application shell, whose own shape is held by
-        // `the_app_shell_closes_its_head_exactly_once_unit` (it links the
-        // two embedded assets and nothing else) and whose rendered page is
-        // judged in the browser. `/decided`, `/boards`, `/board/{project}`,
-        // `/lanes`, `/deployments`, `/deployment/{project}/{id}`,
-        // `/subscriptions`, `/sprints`, `/sprints/{project}`,
-        // `/sprint/{project}/{id}` and `/plans` left the list the same way
-        // with `t-bf255880` wave 1.
+        // Neither document the server still writes reaches a third party
+        // (WEB-54): the shell, and the refusal a nonexistent address gets.
         for route in ["/all", "/no/such/page"] {
             let html = render(route).unwrap_or_else(|error| panic!("render {route}: {error}"));
-            assert_announcement_channels(&html, route);
-            assert_every_field_is_named(&html, route);
             assert_no_third_party(&html, route);
         }
     }
 
-    /// WEB-54 — the document reaches no third party.
+    /// WEB-54, SPA-57 — nothing the operator loads reaches a third party.
+    ///
+    /// Three documents are all there are now: the application shell, the
+    /// refusal page, and the two assets the shell links. The shell's own
+    /// links are same-site by construction and the ASSETS are where a
+    /// third-party reference would actually hide — a font, a CDN, an
+    /// analytics beacon — so the bundle's bytes are read here too.
     #[test]
     fn the_document_references_no_third_party_unit() {
-        let fixture = card_fixture("third-party");
-        let card = decision_card(&fixture.board, &fixture.store, &fixture.item);
-        assert_no_third_party(&page("Needs you", &card), "/");
+        assert_no_third_party(&app_shell(), "/");
+        assert_no_third_party(
+            &page("Not found", "<h1>Not found</h1>"),
+            "the refusal document",
+        );
+        let script = crate::bundle::asset(crate::bundle::SCRIPT).expect("the embedded script");
+        let bundled = [
+            ("the stylesheet", bundle_stylesheet()),
+            (
+                "the script",
+                String::from_utf8_lossy(script.bytes).into_owned(),
+            ),
+        ];
+        // A fetch, not a mention: React carries XML namespace URIs and the
+        // address of its own error index as data, and neither is a request.
+        // What would actually leave the estate is a stylesheet import, a
+        // font, an image or a script naming an absolute origin.
+        for (what, bytes) in bundled {
+            for fetched in [
+                "url(http",
+                "@import \"http",
+                "src=\"http",
+                "href=\"http",
+                "fonts.googleapis",
+                "fonts.gstatic",
+            ] {
+                assert!(
+                    !bytes.contains(fetched),
+                    "{what} fetches {fetched}, which is outside this estate"
+                );
+            }
+        }
     }
 
     fn assert_no_third_party(html: &str, route: &str) {
-        for forbidden in ["<link ", "<img ", "<iframe ", "<script src"] {
+        // The shell links the two embedded assets; anything else that
+        // fetches is a third party by another name.
+        for forbidden in ["<img ", "<iframe ", "<script src=http"] {
             assert!(
                 !html.contains(forbidden),
                 "{route} reaches outside the document with {forbidden}"
@@ -8267,25 +3941,28 @@ mod tests {
         }
     }
 
+    /// WEB-45, SPA-54 — what the operator's phone is promised, read off the
+    /// two artefacts that still make the promise: the shell document and
+    /// the one stylesheet it links.
     #[test]
     fn operator_shell_keeps_phone_touch_and_live_status_contract() {
-        let rendered = page(
-            "Needs you",
-            "<span class=live data-live role=status aria-live=polite>live</span>",
+        let shell = app_shell();
+        assert!(
+            shell.contains("width=device-width,initial-scale=1"),
+            "{shell}"
         );
-        assert!(rendered.contains("width=device-width,initial-scale=1"));
-        assert!(rendered.contains("role=status aria-live=polite"));
+        let stylesheet = bundle_stylesheet();
         // 44 CSS px is the floor a thumb needs (spec WEB-45, Apple's HIG
         // minimum), and 2.75rem is that at the root size this page sets.
-        assert!(CSS.contains("min-height:2.75rem"));
-        assert!(!CSS.contains("min-height:2.6rem"), "{CSS}");
-        assert!(CSS.contains("env(safe-area-inset-bottom)"));
-        assert!(CSS.contains(".attention-count"));
-        assert!(CSS.contains("@media(max-width:700px)"));
-        assert!(CSS.contains(":focus-visible"));
-        assert!(JS.contains("input[name=outcome]:checked"));
-        assert!(JS.contains("dataset.cardBound"));
-        assert!(JS.contains("data-receipt"));
+        assert!(stylesheet.contains("min-height:2.75rem"), "{stylesheet}");
+        assert!(!stylesheet.contains("min-height:2.6rem"), "{stylesheet}");
+        assert!(
+            stylesheet.contains("env(safe-area-inset-bottom)"),
+            "{stylesheet}"
+        );
+        assert!(stylesheet.contains(".attention-count"), "{stylesheet}");
+        assert!(stylesheet.contains("max-width:700px"), "{stylesheet}");
+        assert!(stylesheet.contains(":focus-visible"), "{stylesheet}");
     }
 
     #[test]
@@ -8370,85 +4047,40 @@ mod tests {
         let replied = render(&format!("/?replied={}", fixture.epic_id)).expect("render replied");
         assert_eq!(replied, home, "?replied= is a different page from /");
 
-        // `/all` is the queue as one plain list, and the card is the card:
-        // the page explains itself at length here, where there is room for
-        // a paragraph.
-        let list = render("/all").expect("render all open");
-        assert_page_title(&list, "Needs you");
-        assert_html_contains(&list, "Needs you");
-        assert_html_contains(&list, "Please review before release");
-        assert_html_contains(
-            &list,
-            "<p class=explain>Each card is one question an agent is waiting on.",
+        // `/all` is the mounted list since `t-bf255880` wave 2: the same
+        // shell, and the same `/api/v1/needs-you` the deck reads. Every
+        // claim this fixture used to make about the served card — the
+        // eyebrow, the folded own-words answer, the live submit, the
+        // card's own refusal sentence — is made in Chrome on this route by
+        // the cases `list_tab` drives, and what the SERVER owes it is the
+        // row below.
+        for route in [
+            "/all".to_owned(),
+            format!("/all?replied={}", fixture.epic_id),
+        ] {
+            let answered = render(&route).unwrap_or_else(|error| panic!("render {route}: {error}"));
+            assert_eq!(
+                answered,
+                app_shell(),
+                "{route} is not the application shell"
+            );
+        }
+        let queue = serde_json::to_value(projection::needs_you().expect("project the queue"))
+            .expect("the queue serialises");
+        let card = queue["items"]
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .find(|card| card["board"] == "SERVE-RENDER")
+            .unwrap_or_else(|| panic!("the seeded ask is not in the queue: {queue}"));
+        assert_eq!(
+            card["attention"]["body"], "Please review <strong>before release</strong>.",
+            "{queue}"
         );
-        assert_html_contains(
-            &list,
-            "<p class=count><span data-open-count>1</span> open across",
-        );
-        // The page script is the same on every page, and it names the deck's
-        // hooks; what says this page is not a deck is its `<main>`.
-        assert_html_contains(&list, "<main id=main>");
-        // Orientation above the question, in one sentence naming who asked,
-        // where, and when -- and the free-text answer folded out of the way
-        // beneath the choices.
-        assert_html_contains(&list, "<p class=eyebrow>geoyws asked on ");
-        assert_html_contains(
-            &list,
-            "<details class=custom data-custom data-testid=deck-custom>\
-             <summary>Answer in my own words</summary>",
-        );
-        assert_html_contains(&list, "<legend>recorded as</legend>");
-        // No recommendation is authored on this row, so no recommended
-        // fieldset is rendered for it; the carded case is pinned in the e2e
-        // suite.
-        assert!(!list.contains("class=recommended"), "{list}");
-        assert_html_contains(&list, "<div class=reply><label for=\"answer-");
-        assert_html_contains(&list, ">Add a note</label>");
+        let typeset = card["bodyHtml"].as_str().expect("the typeset ask");
         assert!(
-            !list.contains("Sent with whichever answer you pick"),
-            "the note field grew a hint paragraph again: {list}"
-        );
-        assert_html_contains(&list, "value=\"approve\" data-label=\"Approve - proceed\"");
-        // The submit is live in the markup: a rendered `disabled` made the
-        // click do nothing at all, and the native POST has to reach the
-        // route's own validation.
-        assert_html_contains(
-            &list,
-            "<button type=submit class=record name=decision value=custom \
-             data-testid=deck-record>Record my answer</button>",
-        );
-        // Two voices. The card refuses in the page's language, naming both
-        // halves the way the card itself names them, and nothing served here
-        // speaks CLI flags: the route's wording is quoted only when the route
-        // has actually said it.
-        assert_html_contains(
-            &list,
-            "Your own answer needs both halves: pick a verdict \
-             (approve, reject, defer or other) and write your reply.",
-        );
-        assert!(
-            !list.contains("--outcome"),
-            "the card is refusing in command-line flags to somebody on a phone: {list}"
-        );
-        // The release for a picked verdict, rendered away until there is one
-        // to release. It is a control and not only a keystroke because this
-        // shell is phone-first and a phone has no Escape key.
-        assert_html_contains(
-            &list,
-            "<button type=button class=clear data-clear data-testid=deck-clear hidden>\
-             Clear verdict</button>",
-        );
-        assert!(
-            !list.contains("value=custom disabled"),
-            "the free-text submit is rendered disabled, so a click reports nothing: {list}"
-        );
-        assert_html_contains(&list, "/board/SERVE-RENDER");
-        assert!(!list.contains("<strong>before release</strong>"));
-        let replied_list =
-            render(&format!("/all?replied={}", fixture.epic_id)).expect("render replied");
-        assert_html_contains(
-            &replied_list,
-            "<code>e-serve-render</code> is decided and the board has it.",
+            typeset.contains("Please review") && !typeset.contains("<strong>"),
+            "the raiser's markup was not neutralised: {typeset}"
         );
 
         // `/boards`, `/lanes`, `/decided` and `/board/{project}` answer the
@@ -9193,39 +4825,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stamp_reads_as_a_utc_instant() {
-        // 2026-08-24T00:00:00Z, and a value inside that day.
-        assert_eq!(stamp(1_787_529_600_000), "2026-08-24 00:00:00Z");
-        assert_eq!(stamp(0), "1970-01-01 00:00:00Z");
-        // Leap day, because the civil-date arithmetic is written out here.
-        assert_eq!(stamp(1_709_164_800_000), "2024-02-29 00:00:00Z");
-    }
-
-    #[test]
-    fn an_age_uses_the_coarsest_unit_that_is_still_true() {
-        let now = now_ms();
-        assert_eq!(age(now), "just now");
-        assert_eq!(age(now - 60_000), "1 min");
-        assert_eq!(age(now - 45 * 60_000), "45 min");
-        assert_eq!(age(now - 90 * 60_000), "1h30m");
-        assert_eq!(age(now - 3 * 24 * 60 * 60_000), "3 days");
-        assert_eq!(age(now - 25 * 60 * 60_000), "1 day");
-        // A stamp from the future is not negative time; it is "just now".
-        assert_eq!(age(now + 60_000), "just now");
-    }
-
-    #[test]
-    fn an_elapsed_phrase_reads_correctly_in_a_sentence() {
-        // "just now" is already a complete phrase; the rest are bare
-        // durations. Appending "ago" to both produced "just now ago".
-        let now = now_ms();
-        assert_eq!(ago(now), "just now");
-        assert_eq!(ago(now - 45 * 60_000), "45 min ago");
-        assert_eq!(ago(now - 90 * 60_000), "1h30m ago");
-        assert_eq!(ago(now - 3 * 24 * 60 * 60_000), "3 days ago");
-    }
-
-    #[test]
     fn a_url_decodes_before_it_is_matched() {
         assert_eq!(decode("mx-root"), "mx-root");
         assert_eq!(decode("a%20b"), "a b");
@@ -9234,18 +4833,6 @@ mod tests {
         // simply match no board, which beats silently matching another one.
         assert_eq!(decode("%zz"), "%zz");
         assert_eq!(decode("100%"), "100%");
-    }
-
-    #[test]
-    fn an_event_payload_renders_on_one_line() {
-        let payload = serde_json::json!({"tag": "infra", "strippedFrom": 2});
-        let line = compact(&payload);
-        assert!(line.contains("tag=infra"), "{line}");
-        assert!(line.contains("strippedFrom=2"), "{line}");
-        assert!(!line.contains('\n'), "{line}");
-        // A string value loses its quotes; anything else keeps its JSON shape.
-        assert_eq!(compact(&serde_json::json!({})), "");
-        assert_eq!(compact(&serde_json::Value::Null), "");
     }
 
     const SUBSCRIPTIONS_CHILD_TEST: &str =
@@ -9261,494 +4848,6 @@ mod tests {
         secret_ref: String,
         head_event_seq: i64,
         acked_seq: i64,
-    }
-
-    fn subscription_fixture(id: &str) -> Subscription {
-        Subscription {
-            id: id.to_owned(),
-            protocol_version: 1,
-            subject_task_id: None,
-            relations: Vec::new(),
-            kinds: Vec::new(),
-            prior_statuses: Vec::new(),
-            current_statuses: Vec::new(),
-            tags: Vec::new(),
-            consumer_id: "codex.queue".to_owned(),
-            action_id: "enqueue-turn".to_owned(),
-            timeout_ms: 30_000,
-            max_retries: 3,
-            rate_per_minute: 60,
-            max_concurrency: 1,
-            start_event_seq: 4,
-            secret_ref: None,
-            status: "active".to_owned(),
-            created_at: 1_787_529_600_000,
-            created_by: OPERATOR_ACTOR.to_owned(),
-            updated_at: 1_787_529_600_000,
-            updated_by: OPERATOR_ACTOR.to_owned(),
-            paused_at: None,
-            paused_by: None,
-        }
-    }
-
-    fn subscription_view(
-        board: &str,
-        subscription: Subscription,
-        head_event_seq: i64,
-        position: SubscriptionPosition,
-    ) -> SubscriptionView {
-        SubscriptionView {
-            board: board.to_owned(),
-            subscription,
-            position,
-            dead_letter_codes: Vec::new(),
-            head_event_seq,
-        }
-    }
-
-    /// A caught-up subscription whose only queued state is dead letters
-    /// carrying the given codes, with the count derived from them so a
-    /// fixture cannot claim a total its own codes contradict.
-    fn dead_lettered_view(id: &str, codes: &[(&str, i64)]) -> SubscriptionView {
-        SubscriptionView {
-            board: "PX".to_owned(),
-            subscription: subscription_fixture(id),
-            position: SubscriptionPosition {
-                acked_through_seq: Some(12),
-                dead_letter: codes.iter().map(|(_, deliveries)| deliveries).sum(),
-                ..SubscriptionPosition::default()
-            },
-            dead_letter_codes: codes
-                .iter()
-                .map(|(code, deliveries)| DeadLetterCode {
-                    code: (*code).to_owned(),
-                    deliveries: *deliveries,
-                })
-                .collect(),
-            head_event_seq: 12,
-        }
-    }
-
-    #[test]
-    fn a_watch_sentence_names_every_narrowing_in_plain_words() {
-        // Nothing narrowing it means it really does watch everything, and
-        // saying so is the difference between "all events" and six empty
-        // columns an operator has to interpret.
-        assert_eq!(
-            watch_sentence(&subscription_fixture("sub-bare")),
-            "Every event on the board."
-        );
-
-        let mut narrowed = subscription_fixture("sub-narrowed");
-        narrowed.kinds = vec!["task_moved".to_owned()];
-        narrowed.current_statuses = vec!["done".to_owned()];
-        assert_eq!(
-            watch_sentence(&narrowed),
-            "Every task_moved event arriving at done."
-        );
-
-        let mut every = subscription_fixture("sub-every");
-        every.kinds = vec!["note_added".to_owned(), "checkpoint_added".to_owned()];
-        every.subject_task_id = Some("t-1".to_owned());
-        every.relations = vec!["parent:t-9".to_owned()];
-        every.prior_statuses = vec!["todo".to_owned()];
-        every.current_statuses = vec!["in_progress".to_owned(), "review".to_owned()];
-        every.tags = vec!["ops".to_owned(), "release".to_owned(), "infra".to_owned()];
-        assert_eq!(
-            watch_sentence(&every),
-            "Every note_added or checkpoint_added event about task t-1, related through \
-             parent:t-9, leaving todo, arriving at in_progress or review, tagged ops, release, \
-             or infra."
-        );
-    }
-
-    #[test]
-    fn a_position_reads_as_caught_up_only_when_the_head_is_reached() {
-        assert_eq!(position_sentence(12, 12), "Caught up with head seq 12.");
-        assert_eq!(
-            position_sentence(12, 11),
-            "1 board event behind head seq 12."
-        );
-        assert_eq!(
-            position_sentence(12, 8),
-            "4 board events behind head seq 12."
-        );
-        // An ack that reads past the head is not a negative backlog.
-        assert_eq!(position_sentence(12, 14), "Caught up with head seq 12.");
-    }
-
-    #[test]
-    fn an_empty_subscriptions_page_invites_the_command_that_creates_one() {
-        let html = subscriptions_body(&[], false, None);
-        assert_html_contains(&html, "Nothing is subscribed yet.");
-        assert_html_contains(&html, "kb subscription add --consumer NAME --action NAME");
-        assert_html_contains(&html, &format!("--as {OPERATOR_ACTOR}"));
-        assert!(!html.contains("<table"), "{html}");
-    }
-
-    #[test]
-    fn a_subscription_row_carries_its_sentence_delivery_state_position_and_limits() {
-        let mut subscription = subscription_fixture("sub-one");
-        subscription.kinds = vec!["task_moved".to_owned()];
-        subscription.current_statuses = vec!["done".to_owned()];
-        let html = subscriptions_body(
-            &[subscription_view(
-                "PX",
-                subscription,
-                12,
-                SubscriptionPosition {
-                    acked_through_seq: Some(8),
-                    pending: 2,
-                    leased: 1,
-                    retry_wait: 0,
-                    dead_letter: 0,
-                },
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(&html, "<code>sub-one</code>");
-        assert_html_contains(
-            &html,
-            "<a href=\"/board/PX\" data-ref target=_blank rel=noopener>PX</a>",
-        );
-        assert_html_contains(&html, "Every task_moved event arriving at done.");
-        assert_html_contains(&html, "<code>codex.queue</code>");
-        assert_html_contains(&html, "action <code>enqueue-turn</code> and");
-        assert_html_contains(&html, "4 board events behind head seq 12.");
-        assert_html_contains(&html, "started at seq 4, acked through seq 8, 1 in flight");
-        assert_html_contains(&html, "30000 ms timeout, 3 retries, 60/min, 1 at a time");
-        assert_html_contains(&html, "action=\"/subscription/PX/sub-one/pause\"");
-        assert_html_contains(&html, "Pause delivery");
-        assert_html_contains(&html, "2 pending");
-    }
-
-    #[test]
-    fn subscription_positions_keep_each_sentence_and_order() {
-        let views = [
-            subscription_view(
-                "PX",
-                subscription_fixture("sub-one"),
-                20,
-                SubscriptionPosition {
-                    acked_through_seq: Some(20),
-                    ..SubscriptionPosition::default()
-                },
-            ),
-            subscription_view(
-                "PX",
-                subscription_fixture("sub-two"),
-                20,
-                SubscriptionPosition {
-                    acked_through_seq: Some(15),
-                    pending: 5,
-                    ..SubscriptionPosition::default()
-                },
-            ),
-            subscription_view(
-                "KB",
-                subscription_fixture("sub-three"),
-                20,
-                SubscriptionPosition::default(),
-            ),
-        ];
-        let html = subscriptions_body(&views, false, None);
-        assert_html_contains(&html, "Caught up with head seq 20.");
-        assert_html_contains(&html, "5 board events behind head seq 20.");
-        // Nothing acked leaves a subscription on its start anchor, seq 4 here,
-        // rather than at seq 0 — which would report 20 events of phantom lag.
-        assert_html_contains(&html, "16 board events behind head seq 20.");
-        assert_html_contains(&html, "nothing acked yet");
-        let placed = ["sub-one", "sub-two", "sub-three"].map(|id| {
-            html.find(id)
-                .unwrap_or_else(|| panic!("missing {id} in {html}"))
-        });
-        assert!(placed[0] < placed[1] && placed[1] < placed[2], "{html}");
-    }
-
-    #[test]
-    fn a_dead_lettered_delivery_is_flagged_for_the_operator_and_a_retrying_one_is_not() {
-        let retrying = subscriptions_body(
-            &[subscription_view(
-                "PX",
-                subscription_fixture("sub-retry"),
-                12,
-                SubscriptionPosition {
-                    acked_through_seq: Some(12),
-                    retry_wait: 2,
-                    ..SubscriptionPosition::default()
-                },
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(&retrying, "<span class=retrying>2 retrying</span>");
-        // Zero is silence, not a rendered nought: nothing pending and nothing
-        // dead-lettered must not appear at all.
-        assert!(
-            !retrying.contains("pending") && !retrying.contains("dead-lettered"),
-            "an empty count must be silent, not a zero: {retrying}"
-        );
-        assert!(
-            !retrying.contains("class=dead"),
-            "a retry needs no operator: {retrying}"
-        );
-
-        let dead = subscriptions_body(
-            &[dead_lettered_view(
-                "sub-dead",
-                &[("opencode_endpoint_unreachable", 3)],
-            )],
-            false,
-            None,
-        );
-        // The count says a person is needed; the code says whether to go and
-        // look at a port or at a payload.
-        assert_html_contains(
-            &dead,
-            "<span class=dead>3 dead-lettered, all opencode_endpoint_unreachable</span>",
-        );
-        assert!(
-            !dead.contains("pending") && !dead.contains("retrying"),
-            "an empty count must be silent, not a zero: {dead}"
-        );
-        // Nothing queued renders no queued line at all, which is the whole
-        // reason these three stopped being columns: at rest the cell is the
-        // position sentence and nothing else.
-        let quiet = subscriptions_body(
-            &[subscription_view(
-                "PX",
-                subscription_fixture("sub-quiet"),
-                12,
-                SubscriptionPosition {
-                    acked_through_seq: Some(12),
-                    ..SubscriptionPosition::default()
-                },
-            )],
-            false,
-            None,
-        );
-        assert!(
-            !quiet.contains("class=queued"),
-            "a subscription with nothing waiting must render no queued line: {quiet}"
-        );
-
-        // A colour is an outcome now (spec WEB-11): the four hues mean
-        // approve, reject, defer and other, and nothing else is coloured. So
-        // the queued line is quiet prose and a retry or a dead letter is
-        // marked by WEIGHT and by naming itself in words -- which is what
-        // the rest of this case reads -- rather than by an amber or a red
-        // that would make a colour mean two things.
-        assert!(
-            CSS.contains(".queued{margin-top:.25rem;color:var(--subtext);font-size:.8125rem}"),
-            "{CSS}"
-        );
-        assert!(
-            CSS.contains(".queued .retrying,.queued .dead{color:var(--text);font-weight:700}"),
-            "{CSS}"
-        );
-        assert!(
-            CSS.contains("td.waiting{font-weight:600}"),
-            "a board with items waiting is marked by weight, not by a hue: {CSS}"
-        );
-    }
-
-    #[test]
-    fn mixed_dead_letter_codes_stay_apart_and_a_summarised_tail_still_adds_up() {
-        // Two adapters refusing for two reasons is two pieces of work. A
-        // single count, or one code standing in for the set, sends an
-        // operator to check one thing and leaves the other one broken.
-        let mixed = subscriptions_body(
-            &[dead_lettered_view(
-                "sub-mixed",
-                &[
-                    ("opencode_endpoint_unreachable", 3),
-                    ("kimi_frame_oversized", 1),
-                ],
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(
-            &mixed,
-            "<span class=dead>4 dead-lettered: 3 opencode_endpoint_unreachable, \
-             1 kimi_frame_oversized</span>",
-        );
-        assert!(
-            !mixed.contains(", all "),
-            "\"all\" said about a mixed set is a false diagnosis: {mixed}"
-        );
-
-        // Past three codes the tail is summarised, and summarised with its
-        // own numbers: 4 + 3 + 2 named plus 1 in the tail is the 10 printed
-        // beside them, so the named codes cannot read as the whole story.
-        let tail = subscriptions_body(
-            &[dead_lettered_view(
-                "sub-tail",
-                &[
-                    ("cursor_worker_busy", 4),
-                    ("opencode_request_rejected", 3),
-                    ("kimi_peer_unanswered", 2),
-                    ("kimi_identity_mismatch", 1),
-                ],
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(
-            &tail,
-            "<span class=dead>10 dead-lettered: 4 cursor_worker_busy, \
-             3 opencode_request_rejected, 2 kimi_peer_unanswered, \
-             and 1 more code across 1 delivery</span>",
-        );
-        assert!(
-            !tail.contains("kimi_identity_mismatch"),
-            "the tail is summarised, not listed: {tail}"
-        );
-
-        let longer_tail = subscriptions_body(
-            &[dead_lettered_view(
-                "sub-longer-tail",
-                &[
-                    ("cursor_worker_unavailable", 5),
-                    ("opencode_deadline_exceeded", 4),
-                    ("opencode_response_invalid", 3),
-                    ("kimi_frame_malformed", 2),
-                    ("kimi_request_rejected", 1),
-                ],
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(
-            &longer_tail,
-            "15 dead-lettered: 5 cursor_worker_unavailable, 4 opencode_deadline_exceeded, \
-             3 opencode_response_invalid, and 2 more codes across 3 deliveries</span>",
-        );
-
-        // A code is ledger text rendered on an operator page, so it is
-        // escaped like every other value: a delivery cannot smuggle markup
-        // into the one line on this page that is meant to be believed.
-        let hostile = subscriptions_body(
-            &[dead_lettered_view(
-                "sub-hostile",
-                &[("<script>steal()</script>", 2)],
-            )],
-            false,
-            None,
-        );
-        assert!(!hostile.contains("<script>"), "{hostile}");
-        assert_html_contains(
-            &hostile,
-            "2 dead-lettered, all &lt;script&gt;steal()&lt;/script&gt;",
-        );
-
-        // A dead letter with no code is a state the delivery table's CHECK
-        // forbids. If one ever appears, the page reports the count it has
-        // instead of inventing an attribution for it.
-        assert_eq!(
-            queued_state(
-                SubscriptionPosition {
-                    dead_letter: 2,
-                    ..SubscriptionPosition::default()
-                },
-                &[],
-            ),
-            "<div class=queued><span class=dead>2 dead-lettered</span></div>"
-        );
-    }
-
-    #[test]
-    fn a_paused_subscription_is_listed_only_when_the_url_asks_for_it() {
-        let mut paused = subscription_fixture("sub-halted");
-        paused.status = "paused".to_owned();
-        paused.paused_at = Some(now_ms() - 90 * 60_000);
-        paused.paused_by = Some(OPERATOR_ACTOR.to_owned());
-        let views = [
-            subscription_view(
-                "PX",
-                subscription_fixture("sub-live"),
-                12,
-                SubscriptionPosition {
-                    acked_through_seq: Some(12),
-                    ..SubscriptionPosition::default()
-                },
-            ),
-            subscription_view(
-                "PX",
-                paused,
-                12,
-                SubscriptionPosition {
-                    acked_through_seq: Some(6),
-                    pending: 4,
-                    ..SubscriptionPosition::default()
-                },
-            ),
-        ];
-
-        let default_view = subscriptions_body(&views, false, None);
-        assert_html_contains(&default_view, "sub-live");
-        assert!(!default_view.contains("sub-halted"), "{default_view}");
-        assert_html_contains(&default_view, "1 paused subscription is hidden.");
-        assert_html_contains(
-            &default_view,
-            "<a href=\"/subscriptions?show=all\">Show paused subscriptions</a>",
-        );
-
-        let everything = subscriptions_body(&views, true, None);
-        assert_html_contains(&everything, "sub-halted");
-        assert_html_contains(
-            &everything,
-            &format!("paused by {OPERATOR_ACTOR} 1h30m ago"),
-        );
-        assert_html_contains(&everything, "Resume delivery");
-        assert_html_contains(
-            &everything,
-            "action=\"/subscription/PX/sub-halted/resume?show=all\"",
-        );
-        assert!(
-            !everything.contains("paused subscription is hidden"),
-            "{everything}"
-        );
-
-        // Hiding every row is not the same fact as having no subscriptions,
-        // and the page must not report the filter as an absence.
-        let hidden_only = subscriptions_body(&views[1..], false, None);
-        assert_html_contains(&hidden_only, "Every subscription here is paused right now.");
-        assert!(
-            !hidden_only.contains("Nothing is subscribed yet"),
-            "{hidden_only}"
-        );
-    }
-
-    #[test]
-    fn a_configured_secret_is_reported_without_naming_it() {
-        let mut configured = subscription_fixture("sub-secret");
-        configured.secret_ref = Some("codex_queue_token".to_owned());
-        let html = subscriptions_body(
-            &[subscription_view(
-                "PX",
-                configured,
-                4,
-                SubscriptionPosition::default(),
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(&html, "a secret is configured");
-        assert!(!html.contains("codex_queue_token"), "{html}");
-
-        let without = subscriptions_body(
-            &[subscription_view(
-                "PX",
-                subscription_fixture("sub-plain"),
-                4,
-                SubscriptionPosition::default(),
-            )],
-            false,
-            None,
-        );
-        assert_html_contains(&without, "no secret configured");
     }
 
     fn append_watched_event(store: &Store, created_at: i64) {
@@ -10411,10 +5510,14 @@ mod tests {
         let row = managed
             .require_sprint(&sprint.id)
             .expect("read board sprint");
-        let summary = sprint_summary(&managed, "SPRINT-AUTHZ", &row, true)
-            .expect("render visibility-safe summary");
-        assert_html_contains(&summary, "data-sprint-open>1");
-        assert_html_contains(&summary, "data-sprint-done>1");
+        // The counts the sprint card carries are the store's, taken under
+        // this principal's authority: `projection::sprint` reads them
+        // through `sprint_task_counts`, so a row this principal may not see
+        // must not be counted for it.
+        let (open, done) = managed
+            .sprint_task_counts(&row.id)
+            .expect("count the visible scope");
+        assert_eq!((open, done), (1, 1), "the counts leaked a hidden row");
         let visible = managed
             .sprint_tasks(&sprint.id)
             .expect("read visible sprint tasks");
