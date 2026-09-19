@@ -362,6 +362,41 @@ source, because the lib test target does not compile in this documentation workt
 | `SPRINT-38` | MUST | process | `sprint_search_is_board_scoped_fresh_rebuildable_and_exactly_cited` | the `kanban://BOARD/sprint/ID` citation, freshness across lifecycle writes, board scoping and rebuild; `v27_board_migrates_sprint_search_with_citation_cache_identity_and_index_health` holds the same over a board migrated from V27 |
 | `SPRINT-39` | MUST | unit | `board_schema_v28_backfills_sprints_without_rekeying_or_erasing_cached_documents` | `rust/db.rs` `mod tests`: `seq`, `source_hash` and cached embeddings survive the document-table rebuild and existing sprints are backfilled |
 
+## Requirements trace — `docs/specs/model-restriction.md` MODEL-01..MODEL-18
+
+One row per requirement, on branch `docs/t-1331c416-model-spec` at 2026-09-19: commit `7d1505d`,
+where the specification is at `Draft — gate requested 2026-09-19` and ADR-049 is pending, so these
+rows land with the specification and the gate reviewer reads the trace rather than a promise of
+one. The tests these rows name do not exist at that commit: they are the fixed test set the
+implementation commit lands under `t-1331c416`, and the main loop enumerates every name with
+`cargo test --locked --test e2e -- --list` (for `process`) and verifies each `unit` name as
+`fn <name>(` in `rust/model.rs` and `rust/serve.rs` before the `SPEC-READY` stamp — an unenumerated
+name blocks the stamp. `Layer` uses the specification's own vocabulary, where `process` is a
+compiled-binary process-boundary exchange in `tests/e2e.rs` and `unit` is an in-process `#[test]`.
+Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `unit`, and 1 carries
+`none` and says `no e2e coverage` plainly: `MODEL-16`. This slice has no browser evidence at all.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `MODEL-01` | MUST | unit | `a_model_name_has_one_shape` | `rust/model.rs` `mod tests`: the regex table — accepted and refused shapes, the 64-character bound, the leading-character rule, and case sensitivity |
+| `MODEL-02` | MUST | process | `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` | reads `allowedModels` back off `task show --json`: present on every task, sorted, empty on an unrestricted row |
+| `MODEL-03` | MUST | process | `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` | `task add --allowed-model` repeated, then read back as the filed row's list |
+| `MODEL-04` | MUST | process | `task_update_replaces_or_clears_the_allow_list_and_refuses_both_flags` | the wholesale replace and the `--clear-allowed-models` empty, each read back |
+| `MODEL-05` | MUST | process | `task_update_replaces_or_clears_the_allow_list_and_refuses_both_flags` | both flags together refused with the pair sentence, and a bad name refused, with the previous list intact |
+| `MODEL-06` | MUST | process | `task_update_replaces_or_clears_the_allow_list_and_refuses_both_flags` | `task list --allowed-model` returns the restricted row and not the unrestricted one |
+| `MODEL-07` | MUST | process | `task_update_replaces_or_clears_the_allow_list_and_refuses_both_flags` | `allowedModels` in the `task_updated` changed-fields list when the set moved, absent when it did not |
+| `MODEL-08` | MUST | process | `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` | the allowed claim succeeds and `claim.model` reads the declared name; an unrestricted claim without `--model` reads `null` |
+| `MODEL-09` | MUST | process | `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` | the verbatim `pass --model with one of them to claim it` refusal, with the sorted set rendered, and no claim written |
+| `MODEL-10` | MUST | process | `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` | the verbatim `model {m} may not claim it` refusal, then the allowed model succeeding |
+| `MODEL-11` | MUST | process | `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` | a driver-only restricted row refuses as driver-only, and an assigned restricted row refuses as model-restricted — the order assertion |
+| `MODEL-12` | MUST | process | `claim_next_and_candidates_skip_restricted_rows_unless_the_model_matches` | the restricted row absent from `--candidates` with no model and with a non-listed one, present with a matching one, and `--next` never selecting it otherwise; unrestricted rows unaffected |
+| `MODEL-13` | MUST | process | `handoff_accept_honours_the_task_model_allow_list` | acceptance refused without a matching `--model` with the identical sentence and the handoff still `pending`, then accepted with it |
+| `MODEL-14` | MUST | process | `handoff_accept_honours_the_task_model_allow_list` | `model` on the `handoff_accepted` payload when given; `model_restricted_task_refuses_a_claim_without_or_outside_its_allow_list` holds the `task_claimed` half and the absent key |
+| `MODEL-15` | MUST | process | `a_v29_board_gains_task_models_and_claim_model_and_existing_claims_read_null` | a real V29 board opens at 30, gains the table, index and column, and its pre-existing claim reads `model: null`; `compiled_binary_still_migrates_a_board_that_is_behind` holds the re-run half of the same step |
+| `MODEL-16` | MUST | none | `none` | no e2e coverage — owed, owner George (OQ-4): reopen a board and re-read a restricted row's list, pass the same `--allowed-model` twice and read one entry back, and remove the task and assert its `task_models` rows are gone. The property is structural today — the primary key and the `ON DELETE CASCADE` on `task_models` |
+| `MODEL-17` | MUST | process | `mcp_schema_exposes_allowed_model_array_and_claim_model_string` | `schema --json` kinds `list`/`list`/`value` for `allowed-model` on `task add`/`task update`/`task list` and `value` for `model`; the MCP tools type it array on `task_add`/`task_update`, string on `task_list`, and `model` string on `claim`/`handoff accept` |
+| `MODEL-18` | MUST | unit | `task_detail_lists_allowed_models_and_the_holders_model_unit` | `rust/serve.rs` `mod tests` reading served bytes: the `allowed models` row present when restricted and absent when not, and the holder's `model` line — no e2e coverage, and none planned for this row |
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
