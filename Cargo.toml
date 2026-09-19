@@ -3,6 +3,10 @@ name = "kanban"
 version = "0.3.0"
 edition = "2024"
 description = "Durable private work ledger for long-horizon agents"
+# The operator UI bundle lives in `web/dist`, committed, and is embedded by
+# `include_bytes!` through a table `build.rs` generates (ADR-048; the release
+# container has no Node in it and must not need one).
+build = "build.rs"
 license = "MIT"
 
 [lib]
@@ -69,6 +73,9 @@ uuid = { version = "1.18.1", features = ["v4"] }
 [dev-dependencies]
 headless_chrome = "1"
 syn = { version = "2.0.119", features = ["full", "visit"] }
+
+[build-dependencies]
+sha2 = "0.10.9"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }

@@ -1,5 +1,10 @@
 node_modules/
 dist/
+# ...except the operator UI bundle, which is COMMITTED: the release build is
+# cargo-only and offline (ADR-044), so the bytes the binary embeds arrive in
+# the repository, and `web/check-reproducible.sh` proves they are the ones
+# this source builds (ADR-048, 2026-09-19).
+!web/dist/
 coverage/
 target/
 *.db

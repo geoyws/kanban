@@ -122,7 +122,41 @@ version_probe_kind() {
   fi
 }
 
-file_version() {
+# Everything one release binary says when it is asked what it is, left in
+# FILE_PROBE_REPORT rather than printed.
+#
+# A global rather than stdout, for one reason that is not style: `die` inside
+# a command substitution exits only that substitution. Every caller runs
+# inside one already - `version="$(file_version "$binary")"` - so a probe
+# that printed its answer would put its own refusals one subshell deeper
+# than the caller, where a runner that cannot be executed, or that reports
+# nothing, would be swallowed and packaging would succeed with an empty
+# version. The refusal has to happen in the caller's subshell, so the value
+# comes back in a variable and nothing here is nested.
+#
+# HIG_RELEASE_TARGET_RUNNER is how THIS host runs a binary built for the
+# release platform: one executable program taking no arguments of its own,
+# invoked as "$runner" <binary> <probe>. Unset - and an empty value, which
+# takes the same branch - means the host executes the release artifact
+# itself, which is the hax and hig case and the path production runs; the
+# container path sets it to the program that runs the artifact inside the
+# same pinned image the binaries were built in, because a host that is not
+# linux x86-64 cannot ask a release binary anything.
+#
+# What it can and cannot reach, stated as it is rather than as it should be:
+# it never carries a gate, because the platform header, the byte count and
+# every sha256 read the bytes on disk and never pass through it, and a
+# runner that fails or reports nothing is a refusal, so an empty version is
+# never recorded. But a runner that is set is TRUSTED: files[].version is
+# whatever it prints, a false runner yields a false version that
+# package_validate then re-validates against itself and accepts. What a
+# receipt can honestly say about that is WHICH BRANCH answered, so the
+# branch is chosen by version_probe_kind and the package receipt records
+# that same verdict in versionProbe.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+FILE_PROBE_REPORT=""
+file_probe() {
   local binary="$1"
   local name="${binary##*/}"
   release_binary_known "$name" || die "unknown release binary $name"
@@ -134,25 +168,6 @@ file_version() {
       probe="version"
       ;;
   esac
-  # HIG_RELEASE_TARGET_RUNNER is how THIS host runs a binary built for the
-  # release platform: one executable program taking no arguments of its own,
-  # invoked as "$runner" <binary> <probe>. Unset - and an empty value, which
-  # takes the same branch - means the host executes the release artifact
-  # itself, which is the hax and hig case and the path production runs; the
-  # container path sets it to the program that runs the artifact inside the
-  # same pinned image the binaries were built in, because a host that is not
-  # linux x86-64 cannot ask a release binary anything.
-  #
-  # What it can and cannot reach, stated as it is rather than as it should be:
-  # it never carries a gate, because the platform header, the byte count and
-  # every sha256 read the bytes on disk and never pass through it, and a
-  # runner that fails or reports nothing is a refusal, so an empty version is
-  # never recorded. But a runner that is set is TRUSTED: files[].version is
-  # whatever it prints, a false runner yields a false version that
-  # package_validate then re-validates against itself and accepts. What a
-  # receipt can honestly say about that is WHICH BRANCH answered, so the
-  # branch is chosen by version_probe_kind and the package receipt records
-  # that same verdict in versionProbe.
   local reported
   if [[ "$(version_probe_kind)" == runner ]]; then
     [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
@@ -164,7 +179,45 @@ file_version() {
       die "refusing $binary: it could not report a version"
   fi
   [[ -n "$reported" ]] || die "refusing $binary: the version probe reported nothing"
-  printf '%s\n' "$reported"
+  FILE_PROBE_REPORT="$reported"
+}
+
+# The version a binary reports: the FIRST line of its probe.
+#
+# The operator CLI answers on two lines since the operator UI became an
+# embedded bundle (ADR-048): the version, then `bundle <sha256>`. The version
+# is the first line for every binary in the set, and what comes after it is
+# additional provenance read by its own probe below - so files[].version
+# stays the one-line fact it has always been.
+file_version() {
+  file_probe "$1"
+  printf '%s\n' "${FILE_PROBE_REPORT%%$'\n'*}"
+}
+
+# The operator UI bundle a binary carries, or nothing.
+#
+# `kanban --version` prints `bundle <sha256>` as its second line, derived by
+# the build from the embedded bytes (SPA-03). Nothing - an adapter, or any
+# binary built before the bundle existed - is not a failure here: the field
+# is additive, and a receipt without it is a valid `formatVersion` 2 receipt
+# that simply proves one thing less. A malformed line IS a failure: a
+# fingerprint that is not 64 hex digits is not a fingerprint.
+file_bundle_sha256() {
+  local binary="$1"
+  file_probe "$binary"
+  local line="" candidate
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      "bundle "*)
+        line="${candidate#bundle }"
+        break
+        ;;
+    esac
+  done <<< "$FILE_PROBE_REPORT"
+  [[ -n "$line" ]] || return 0
+  [[ "$line" =~ ^[0-9a-f]{64}$ ]] ||
+    die "refusing $binary: it reported the bundle fingerprint $line, which is not 64 hex digits"
+  printf '%s\n' "$line"
 }
 
 ensure_regular_dir() {
@@ -341,6 +394,16 @@ validate_release_files() {
       die "package binary $name version mismatch"
     }
   done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$manifest")
+
+  # The operator UI the executable carries, when the manifest names one.
+  # Additive: a manifest without the field is a manifest from before the UI
+  # was embedded and proves one thing less, which is a valid thing to be.
+  local declared_bundle
+  declared_bundle="$(jq -r '.bundleSha256 // empty' "$manifest")"
+  if [[ -n "$declared_bundle" ]]; then
+    [[ "$(file_bundle_sha256 "$dir/kanban")" == "$declared_bundle" ]] ||
+      die "kanban in $dir does not carry the bundle its manifest names ($declared_bundle)"
+  fi
 }
 
 validate_package() {
@@ -389,6 +452,13 @@ def receipt_provenance_ok:
   and (if .versionProbe == "native"
        then .buildPlatform == .artifactPlatform
        else true
+       end)
+  # Additive (ADR-048): a receipt that names the embedded operator UI bundle
+  # must name a fingerprint; a receipt from before the UI was embedded is
+  # still a valid formatVersion 2 receipt.
+  and (if has("bundleSha256")
+       then ((.bundleSha256 | type) == "string") and (.bundleSha256 | test("^[0-9a-f]{64}$"))
+       else true
        end);
 JQ
 }
@@ -419,6 +489,15 @@ validate_receipt() {
   ' "$receipt" >/dev/null || die "package receipt is incomplete or mismatched"
   [[ "$(jq -r '.sourceCommit' "$receipt")" == "$manifest_commit" ]] || {
     die "package receipt source commit mismatch"
+  }
+  # The receipt and the manifest name the same bundle, or neither names one:
+  # a receipt that proved a UI the package does not carry would be the exact
+  # false proof SPA-03 exists to stop.
+  local manifest_bundle receipt_bundle
+  manifest_bundle="$(jq -r '.bundleSha256 // empty' "$(manifest_path "$package_dir")")"
+  receipt_bundle="$(jq -r '.bundleSha256 // empty' "$receipt")"
+  [[ "$manifest_bundle" == "$receipt_bundle" ]] || {
+    die "package receipt names bundle ${receipt_bundle:-none} and its manifest names ${manifest_bundle:-none}"
   }
   reject_carried_release_identity "$receipt" "${manifest_commit}-${manifest_sha}"
 }
@@ -1166,6 +1245,33 @@ serve_prove_release() {
   SERVE_PROVED_HTTP="$http"
 }
 
+# The second half of the release proof, asked of the INSTALLED executable
+# (SPA-03, ADR-048). `serve_prove_release` above proves WHICH BINARY is
+# serving by resolving `/proc/<MainPID>/exe` inside the activated release;
+# this proves WHICH OPERATOR UI that binary carries, by running it and
+# reading the `bundle <sha256>` line its version banner prints. A receipt
+# that names one bundle and an installed binary that carries another is an
+# activation nobody can describe, so it is refused before the receipt - the
+# commit - is written.
+#
+# Additive: a receipt with no `bundleSha256` - one built before the UI was
+# embedded - proves one thing less and installs exactly as it did before.
+#
+# Embedded verbatim in the remote install script (see install_remote).
+prove_installed_bundle() {
+  local release_path="$1"
+  local receipt="$2"
+  local declared reported
+  declared="$(jq -r '.bundleSha256 // empty' "$receipt")"
+  [[ -n "$declared" ]] || return 0
+  reported="$(file_bundle_sha256 "$release_path/kanban")"
+  [[ -n "$reported" ]] ||
+    die "refusing this activation: the installed kanban reports no bundle, and its receipt names $declared"
+  [[ "$reported" == "$declared" ]] ||
+    die "refusing this activation: the installed kanban carries bundle $reported and its receipt names $declared"
+  printf 'hig-release: the installed kanban carries bundle %s\n' "$reported" >&2
+}
+
 release_entries() {
   local root="$1"
   local files=()
@@ -1256,6 +1362,16 @@ package_validate() {
       die "package binary $name version mismatch"
     }
   done < <(jq -r '.files[] | [.name, .sha256, (.bytes | tostring), .version] | @tsv' "$manifest")
+
+  # Same additive rule as validate_release_files: when the manifest names an
+  # embedded operator UI bundle, the packaged executable has to be carrying
+  # exactly that one.
+  local declared_bundle
+  declared_bundle="$(jq -r '.bundleSha256 // empty' "$manifest")"
+  if [[ -n "$declared_bundle" ]]; then
+    [[ "$(file_bundle_sha256 "$package_dir/kanban")" == "$declared_bundle" ]] ||
+      die "packaged kanban does not carry the bundle its manifest names ($declared_bundle)"
+  fi
 }
 
 write_manifest() {
@@ -1263,11 +1379,16 @@ write_manifest() {
   local target="$2"
   local commit="$3"
   local files="$4"
+  # The operator UI bundle the packaged `kanban` reports, or empty for a
+  # build that carries none. Additive: `formatVersion` stays 1 and a reader
+  # that does not know the field is unaffected (ADR-044 §2, ADR-048).
+  local bundle_sha="$5"
   local targets
   targets="$(package_targets_json "$target")"
   jq -n -S \
     --argjson targets "$targets" \
     --arg source_commit "$commit" \
+    --arg bundle_sha "$bundle_sha" \
     --argjson files "$files" \
     '{
       formatVersion: 1,
@@ -1275,7 +1396,8 @@ write_manifest() {
       sourceCommit: $source_commit,
       sourceTreeClean: true,
       files: $files
-    }' > "$output/manifest.json"
+    }
+    + (if $bundle_sha == "" then {} else {bundleSha256: $bundle_sha} end)' > "$output/manifest.json"
 }
 
 # Runs one command with a deadline, stdout and stderr each to their own file,
@@ -1641,7 +1763,12 @@ package_create() {
       '$files + [{name:$name, sha256:$sha256, bytes:$bytes, version:$version}]')"
   done
 
-  write_manifest "$output" "$target" "$commit" "$files"
+  # The embedded operator UI, asked of the packaged executable itself
+  # (SPA-03). Empty for a build that carries none, which keeps a release of
+  # an older tree packageable by this script.
+  local bundle_sha
+  bundle_sha="$(file_bundle_sha256 "$output/kanban")"
+  write_manifest "$output" "$target" "$commit" "$files" "$bundle_sha"
   local dirty_after
   dirty_after="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
   [[ "$dirty_after" == "$dirty_before" ]] || die "release packaging changed the worktree"
@@ -1668,6 +1795,7 @@ package_create() {
     --arg manifest_sha "$manifest_sha" \
     --arg source_commit "$commit" \
     --argjson files "$files" \
+    --arg bundle_sha "$bundle_sha" \
     --argjson targets "$(package_targets_json "$target")" \
     '{
       formatVersion: 2,
@@ -1683,7 +1811,8 @@ package_create() {
       sourceCommit: $source_commit,
       sourceTreeClean: true,
       files: $files
-    }' > "$receipt"
+    }
+    + (if $bundle_sha == "" then {} else {bundleSha256: $bundle_sha} end)' > "$receipt"
   # Read back what was just written, through the same validator an install
   # runs: a writer that cannot read its own receipt is how an empty `host`
   # shipped in the first place, and this run is the last place that can be
@@ -1694,8 +1823,10 @@ package_create() {
     --arg manifest "$(manifest_path "$output")" \
     --arg receipt "$receipt" \
     --arg manifestSha256 "$manifest_sha" \
+    --arg bundleSha256 "$bundle_sha" \
     --argjson targets "$(package_targets_json "$target")" \
-    '{packageDir:$packageDir, manifest:$manifest, receipt:$receipt, manifestSha256:$manifestSha256, targets:$targets}'
+    '{packageDir:$packageDir, manifest:$manifest, receipt:$receipt, manifestSha256:$manifestSha256, targets:$targets}
+    + (if $bundleSha256 == "" then {} else {bundleSha256: $bundleSha256} end)'
 }
 
 install_release_tree() {
@@ -1770,6 +1901,7 @@ install_release_tree() {
   # Every check that can still refuse this activation runs BEFORE the receipt
   # is written; the receipt is the commit.
   validate_release_files "$release_path" "$target"
+  prove_installed_bundle "$release_path" "$receipt"
 
   if [[ ! -f "$release_meta" ]]; then
     receipt_json="$(jq -c '.' "$receipt")"
@@ -1989,7 +2121,11 @@ version_probe_kind() {
   fi
 }
 
-file_version() {
+# Verbatim copy of the local probe; see the comment above the local
+# file_probe for why the answer comes back in a variable and what
+# HIG_RELEASE_TARGET_RUNNER can and cannot reach.
+FILE_PROBE_REPORT=""
+file_probe() {
   local binary="$1"
   local name="${binary##*/}"
   release_binary_known "$name" || die "unknown release binary $name"
@@ -2001,25 +2137,6 @@ file_version() {
       probe="version"
       ;;
   esac
-  # HIG_RELEASE_TARGET_RUNNER is how THIS host runs a binary built for the
-  # release platform: one executable program taking no arguments of its own,
-  # invoked as "$runner" <binary> <probe>. Unset - and an empty value, which
-  # takes the same branch - means the host executes the release artifact
-  # itself, which is the hax and hig case and the path production runs; the
-  # container path sets it to the program that runs the artifact inside the
-  # same pinned image the binaries were built in, because a host that is not
-  # linux x86-64 cannot ask a release binary anything.
-  #
-  # What it can and cannot reach, stated as it is rather than as it should be:
-  # it never carries a gate, because the platform header, the byte count and
-  # every sha256 read the bytes on disk and never pass through it, and a
-  # runner that fails or reports nothing is a refusal, so an empty version is
-  # never recorded. But a runner that is set is TRUSTED: files[].version is
-  # whatever it prints, a false runner yields a false version that
-  # package_validate then re-validates against itself and accepts. What a
-  # receipt can honestly say about that is WHICH BRANCH answered, so the
-  # branch is chosen by version_probe_kind and the package receipt records
-  # that same verdict in versionProbe.
   local reported
   if [[ "$(version_probe_kind)" == runner ]]; then
     [[ -x "$HIG_RELEASE_TARGET_RUNNER" ]] ||
@@ -2031,7 +2148,55 @@ file_version() {
       die "refusing $binary: it could not report a version"
   fi
   [[ -n "$reported" ]] || die "refusing $binary: the version probe reported nothing"
-  printf '%s\n' "$reported"
+  FILE_PROBE_REPORT="$reported"
+}
+
+# The version a binary reports: the FIRST line of its probe. The operator CLI
+# answers on two lines since the operator UI became an embedded bundle.
+file_version() {
+  file_probe "$1"
+  printf '%s\n' "${FILE_PROBE_REPORT%%$'\n'*}"
+}
+
+# The operator UI bundle a binary carries, or nothing (SPA-03).
+file_bundle_sha256() {
+  local binary="$1"
+  file_probe "$binary"
+  local line="" candidate
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      "bundle "*)
+        line="${candidate#bundle }"
+        break
+        ;;
+    esac
+  done <<< "$FILE_PROBE_REPORT"
+  [[ -n "$line" ]] || return 0
+  [[ "$line" =~ ^[0-9a-f]{64}$ ]] ||
+    die "refusing $binary: it reported the bundle fingerprint $line, which is not 64 hex digits"
+  printf '%s\n' "$line"
+}
+
+# The second half of the release proof, asked of the INSTALLED executable
+# (SPA-03): `readlink /proc/<MainPID>/exe` says which binary is serving, and
+# this says which operator UI that binary carries. A receipt that names one
+# and an installed binary that carries another is an activation nobody can
+# describe, so it is refused before the receipt - the commit - is written.
+#
+# Additive: a receipt with no `bundleSha256` proves one thing less and
+# installs exactly as it did before.
+prove_installed_bundle() {
+  local release_path="$1"
+  local receipt="$2"
+  local declared reported
+  declared="$(jq -r '.bundleSha256 // empty' "$receipt")"
+  [[ -n "$declared" ]] || return 0
+  reported="$(file_bundle_sha256 "$release_path/kanban")"
+  [[ -n "$reported" ]] ||
+    die "refusing this activation: the installed kanban reports no bundle, and its receipt names $declared"
+  [[ "$reported" == "$declared" ]] ||
+    die "refusing this activation: the installed kanban carries bundle $reported and its receipt names $declared"
+  printf 'hig-release: the installed kanban carries bundle %s\n' "$reported" >&2
 }
 
 # The release set as a JSON array, so the receipt name check compares against
@@ -2094,6 +2259,13 @@ def receipt_provenance_ok:
   and ((.versionProbe == "native") or (.versionProbe == "runner"))
   and (if .versionProbe == "native"
        then .buildPlatform == .artifactPlatform
+       else true
+       end)
+  # Additive (ADR-048): a receipt that names the embedded operator UI bundle
+  # must name a fingerprint; a receipt from before the UI was embedded is
+  # still a valid formatVersion 2 receipt.
+  and (if has("bundleSha256")
+       then ((.bundleSha256 | type) == "string") and (.bundleSha256 | test("^[0-9a-f]{64}$"))
        else true
        end);
 JQ
@@ -2871,6 +3043,7 @@ if (( activation_status != 0 )); then
 fi
 
 serve_restart_and_prove "$release_path"
+prove_installed_bundle "$release_path" "$receipt"
 
 installed_at="$(( $(date +%s) * 1000 ))"
 if [[ ! -f "$release_receipt" ]]; then
