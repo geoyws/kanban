@@ -1728,10 +1728,26 @@ fn serve_readiness_banner_matches_exact_output() {
     ));
 }
 
+/// Restore the pre-rename `tags` shape before any older fixture is built.
+///
+/// Every "behind" board here is a CURRENT board stripped downward, so the
+/// newest migration has to be undone first or the ladder's
+/// `ALTER TABLE tags ADD COLUMN` meets a column that is already there. No view
+/// or trigger reads these two, so dropping them is the whole of it.
+fn remove_v29_tag_rename_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "ALTER TABLE tags DROP COLUMN renamed_from; \
+             ALTER TABLE tags DROP COLUMN renamed_at;",
+        )
+        .unwrap();
+}
+
 /// Restore the exact v27 search corpus before removing v27's sprint tables.
 /// Historical fixtures must exercise the real ladder input, not a current
 /// schema with only user_version lowered.
 fn remove_v28_sprint_search_schema(connection: &Connection) {
+    remove_v29_tag_rename_schema(connection);
     let view_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_schema WHERE type='view' AND name='search_source_rows'",
@@ -2387,9 +2403,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 28);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 28);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 28);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 29);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 29);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 29);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -3578,7 +3594,7 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        28
+        29
     );
     assert_eq!(
         reopened
@@ -7631,7 +7647,7 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let lines: Vec<&str> = version.lines().collect();
     assert!(lines[0].contains("kanban"), "version output: {version}");
     assert!(
-        lines[0].contains("board schema 28"),
+        lines[0].contains("board schema 29"),
         "version output: {version}"
     );
     assert!(
@@ -18195,7 +18211,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        28
+        29
     );
 }
 
@@ -19322,7 +19338,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        28
+        29
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -21965,7 +21981,7 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        28
+        29
     );
     assert_eq!(
         connection
@@ -24538,7 +24554,7 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 29_i64)
+        .pragma_update(None, "user_version", 30_i64)
         .unwrap();
     drop(newer_connection);
 
