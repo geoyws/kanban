@@ -4640,6 +4640,15 @@ impl Store {
     /// name is checked for shape and then matched exactly against the rows'
     /// lists. It selects restricted rows only — an unrestricted row is open to
     /// every model and belongs to none of their listings.
+    ///
+    /// A row whose tags this caller may not read is not in the answer, on the
+    /// same all-of-tag test a named read is refused with, and exactly as
+    /// [`Store::sprint_tasks`] filters. The filtering is here rather than in
+    /// each caller because every task listing in the product — `task list`,
+    /// the dashboard's counts, the JSON projection, the web board page, the
+    /// context pack and MCP — reads through this one function, and a count
+    /// taken over rows this caller may not see reports their existence as
+    /// surely as printing their titles would.
     pub fn list_tasks(
         &self,
         status: Option<&str>,
@@ -4659,12 +4668,14 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut())?;
+        rows.retain(|task| self.authz.permits_read(&task.tags));
         attach_allowed_models(&self.connection, rows.iter_mut())?;
         apply_lapsed_leases(&self.connection, rows.iter_mut())?;
         Ok(rows)
     }
 
-    /// [`Store::list_tasks`] with each row's live lease beside it.
+    /// [`Store::list_tasks`] with each row's live lease beside it, filtered by
+    /// the same per-row tag read test.
     ///
     /// The lease is read in the same query, one `LEFT JOIN` on the claims
     /// primary key, so a thousand-task board pays one round trip and not a
@@ -4717,6 +4728,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
+        rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
         attach_allowed_models(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         apply_lapsed_leases(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         Ok(rows)
@@ -9386,6 +9398,144 @@ mod tests {
         assert_denied(
             store.resume_subscription("sub-x", "actor"),
             "subscription resume",
+        );
+    }
+
+    /// A readable board whose rows are not all readable: the task listings and
+    /// the aggregates taken over them count only what this caller may see.
+    ///
+    /// Board read plus one tag's read is the authority; `secret` is held on
+    /// neither capability. The row carrying BOTH tags is in the fixture on
+    /// purpose: the read test is all-of-tag, so holding one of a row's two
+    /// tags is not authority over the row, and a filter written as any-of
+    /// would hand it over.
+    ///
+    /// The counts asserted are the dashboard's own arithmetic — a per-status
+    /// tally and `len()` over `list_tasks` (`rust/lib.rs`, `taskCounts` and
+    /// `totalTasks`) — so a listing that leaked a row would be caught here as
+    /// a wrong aggregate as well as a wrong set.
+    #[test]
+    fn managed_task_listings_and_their_counts_exclude_a_tag_denied_row() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "dddddddd-6666-4666-8666-666666666666";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-listing-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible");
+            seed.add_task(task_input(
+                "t-visible-done",
+                "visible finished row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible done");
+            seed.move_task(
+                "t-visible-done",
+                "done",
+                "seed",
+                serde_json::json!({}),
+                true,
+            )
+            .expect("finish the visible row");
+            seed.add_task(task_input(
+                "t-secret",
+                "secret row",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret");
+            seed.add_task(task_input(
+                "t-both",
+                "row carrying both tags",
+                vec!["visible".to_owned(), "secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed both");
+        }
+
+        let grants = authority([
+            (
+                ScopeTuple::Board {
+                    board_id: board.to_owned(),
+                },
+                Capability::Read,
+            ),
+            (
+                ScopeTuple::BoardTag {
+                    board_id: board.to_owned(),
+                    tag: "visible".to_owned(),
+                },
+                Capability::Read,
+            ),
+        ]);
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+
+        // The control: the board itself is readable and the hidden row is not.
+        assert_denied(store.require_task("t-secret"), "task show t-secret");
+        assert_denied(store.require_task("t-both"), "task show t-both");
+        store
+            .require_task("t-visible")
+            .expect("task show t-visible");
+
+        let listed = store
+            .list_tasks(None, None, None, None, false)
+            .expect("task list");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-visible", "t-visible-done"],
+            "the listing handed over a row this caller may not read"
+        );
+        let with_claims = store
+            .list_tasks_with_claims(None, None, None, None, false)
+            .expect("task list --with-claims");
+        assert_eq!(
+            with_claims
+                .iter()
+                .map(|(task, _)| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-visible", "t-visible-done"],
+            "the claims listing handed over a row this caller may not read"
+        );
+
+        // Asking for the hidden tag by name is not a way round it either, and
+        // the answer is the same empty listing a tag with no rows would give.
+        assert!(
+            store
+                .list_tasks(None, Some("secret"), None, None, false)
+                .expect("task list --tag secret")
+                .is_empty(),
+            "the tag filter named the hidden rows"
+        );
+
+        // The dashboard's own arithmetic over that listing.
+        let count = |status: &str| listed.iter().filter(|task| task.status == status).count();
+        assert_eq!(count("todo"), 1, "the visible open row is not counted");
+        assert_eq!(count("done"), 1, "the visible finished row is not counted");
+        assert_eq!(
+            listed.len(),
+            2,
+            "the total counts rows this caller may not read"
         );
     }
 

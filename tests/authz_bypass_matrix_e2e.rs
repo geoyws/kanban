@@ -1349,13 +1349,14 @@ const TASK_ANCHORS: &[&str] = &[
 /// CLI's own whole-estate listing refuses; and granting B afterwards makes
 /// both surfaces answer, from the same unchanged request.
 ///
-/// The tag half is asserted as an EQUIVALENCE rather than as a hiding rule,
-/// because that is what the store does: a named read of a row whose tag the
-/// caller lacks is refused on both surfaces, and a listing is filtered on
-/// neither. SPA-08's claim is that the JSON route returns what the CLI would
-/// return with the enforcement in the store, and a test that asserted the
-/// route filtered what the CLI does not would be asserting a second rule in
-/// the route — the one thing SPA-08 forbids.
+/// The tag half is asserted as an EQUIVALENCE rather than as a hiding rule:
+/// SPA-08's claim is that the JSON route returns what the CLI would return
+/// with the enforcement in the store, and a test that asserted the route
+/// filtered what the CLI does not would be asserting a second rule in the
+/// route — the one thing SPA-08 forbids. Since `t-34f6eed5` the store hides
+/// a tag-denied row from BOTH listings, so the seeded `t-asec` is in neither
+/// answer and the equivalence holds over a smaller set; the hiding itself is
+/// asserted in `a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http`.
 #[test]
 fn the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over_http() {
     let estate = ManagedEstate::new("json-authz");
@@ -1465,8 +1466,8 @@ fn the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over
     }
 
     // The caller's own board answers, and it answers exactly the rows the
-    // CLI hands the same identity — including the tagged row, which neither
-    // surface filters out of a listing and both refuse by name.
+    // CLI hands the same identity — the tagged row in neither, since both
+    // read the store's one filtered listing and both refuse it by name.
     let alpha = server.get_json("/api/v1/board/Alpha");
     let listed = estate.ok_json(&work_a, &["task", "list", "--json"]);
     let api_rows = alpha["tasks"]["items"].as_array().unwrap();
@@ -2534,6 +2535,143 @@ fn the_write_refusals_answer_the_contracts_json_error_body_over_http() {
         cross.body,
         format!("{{\"error\":\"{NOT_FROM_THIS_SITE}\"}}"),
         "the same-origin refusal is not the contract's Error body"
+    );
+}
+
+/// A tag-denied row is in none of the four task listings, and in none of the
+/// aggregates taken over them (`t-34f6eed5`).
+///
+/// INTEGRATION, at the layer `process`/`http`: the real binary, a real
+/// managed estate, the CLI and the serving process running as the same
+/// identity. The caller holds board read plus `tag:visible` read on Alpha,
+/// and full ownership of Beta so the whole-estate `dashboard` answers at all
+/// rather than refusing entire (that refusal is the separate finding
+/// `a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`).
+///
+/// `t-aboth` carries both tags. The read test is all-of-tag, so one of two
+/// tags is not authority over the row, and a listing filtered as any-of
+/// would hand it over while `task show` refused it.
+///
+/// Every assertion is paired with its positive control: `t-avis` IS listed
+/// and IS counted, so a listing that had simply broken would fail here too.
+#[test]
+fn a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http() {
+    let estate = ManagedEstate::new("json-tag-listing");
+    let work_a = estate.work_a.clone();
+
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    for (id, title, tags) in [
+        ("t-avis", "alpha visible row", vec!["visible"]),
+        ("t-asec", "alpha secret row", vec!["secret"]),
+        (
+            "t-aboth",
+            "alpha row with both tags",
+            vec!["visible", "secret"],
+        ),
+    ] {
+        let mut args = vec!["task", "add", title, "--id", id];
+        for tag in &tags {
+            args.push("--tag");
+            args.push(tag);
+        }
+        args.extend(["--as", "seed", "--json"]);
+        estate.ok_json(&work_a, &args);
+    }
+
+    estate.bind_self(
+        "p-visible-only",
+        &[
+            board_scope("read", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+        ],
+    );
+    estate.grant("p-visible-only", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // The control: the named read of each hidden row is refused, and the
+    // visible one is not.
+    estate.denied(&work_a, &["task", "show", "t-asec", "--json"]);
+    estate.denied(&work_a, &["task", "show", "t-aboth", "--json"]);
+    estate.ok_json(&work_a, &["task", "show", "t-avis", "--json"]);
+
+    // 1. `task list`.
+    let listed = estate.ok_json(&work_a, &["task", "list", "--json"]);
+    let ids = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec!["t-avis".to_owned()],
+        "task list handed over a row this caller may not read: {listed}"
+    );
+
+    // 2. `dashboard`: the aggregates over that listing.
+    let dashboard = estate.ok_json(&work_a, &["dashboard", "--json"]);
+    let alpha = dashboard
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Alpha")
+        .unwrap_or_else(|| panic!("the dashboard did not report Alpha: {dashboard}"));
+    assert_eq!(
+        alpha["totalTasks"], 1,
+        "the dashboard total counts rows this caller may not read: {alpha}"
+    );
+    assert_eq!(
+        alpha["taskCounts"]["todo"], 1,
+        "the dashboard status counts are wrong: {alpha}"
+    );
+
+    // 3. The JSON board route, and its own summary count in the index.
+    let board = server.get_json("/api/v1/board/Alpha");
+    let api_ids = board["tasks"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        api_ids,
+        vec!["t-avis".to_owned()],
+        "/api/v1/board/Alpha handed over a row this caller may not read: {board}"
+    );
+    let boards = server.get_json("/api/v1/boards");
+    let summary = boards["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["board"] == "Alpha")
+        .unwrap_or_else(|| panic!("the index did not report Alpha: {boards}"));
+    assert_eq!(
+        summary["tasks"], 1,
+        "the board index counts rows this caller may not read: {summary}"
+    );
+
+    // 4. The rendered board page, searched for every string the hidden rows
+    //    carry: a page that named one would confirm its existence as surely
+    //    as the JSON would.
+    let page = server.get("/board/Alpha");
+    assert_eq!(page.status, 200, "{}", page.body);
+    for needle in [
+        "t-asec",
+        "alpha secret row",
+        "t-aboth",
+        "alpha row with both tags",
+    ] {
+        assert!(
+            !page.body.contains(needle),
+            "the board page named {needle}, which this caller may not read"
+        );
+    }
+    assert!(
+        page.body.contains("t-avis") && page.body.contains("alpha visible row"),
+        "the board page did not render the row this caller MAY read"
     );
 }
 
