@@ -1439,3 +1439,53 @@ td > form {
   color: var(--text);
   font-weight: 700;
 }
+
+/* --- sprints and plans (t-bf255880) -------------------------------------- */
+
+/* A sprint card is a release boundary rather than a decision, so it does not
+   wear the deck card's fill: it sits on the page surface behind one rule,
+   and only the boundary the board is actually on takes the accent. */
+.sprint-card {
+  margin: 0.6rem 0;
+  padding: 0.55rem 0.75rem;
+  background: var(--mantle);
+  border-left: 2px solid var(--surface1);
+}
+
+.sprint-card.is-current {
+  border-left-color: var(--blue);
+}
+
+/* The version is the identifier a reader matches against a deploy receipt,
+   so it leads the card and is set in the stack receipts are set in. */
+.sprint-version {
+  margin: 0 0 0.15rem;
+  font-family: var(--mono);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.sprint-history {
+  margin-top: 1.1rem;
+}
+
+.plan {
+  margin: 0 0 1.4rem;
+}
+
+.plan > h2 {
+  margin: 0 0 0.15rem;
+  font-size: 1rem;
+}
+
+.plan-body {
+  margin: 0.5rem 0 0.7rem;
+}
+
+/* These cards carry identifiers that cannot be hyphenated — a target
+   version, a sprint id, a forty-character served commit — so they wrap
+   inside the card rather than pushing the phone's viewport wider (SPA-37). */
+.sprint-card,
+.plan {
+  overflow-wrap: anywhere;
+}

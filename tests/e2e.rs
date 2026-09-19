@@ -25345,15 +25345,18 @@ fn the_served_pages_read_the_real_boards_and_write_to_none_of_them() {
     );
     assert!(!typeset.contains("<i>underway</i>"), "{typeset}");
 
-    let (status, plans) = http_get(port, "/plans");
-    assert_eq!(status, 200);
+    // `/plans` is mounted since `t-bf255880`, so the page's claims are
+    // read where its data now comes from. The rendered page is proved in
+    // Chrome by `opening_a_draft_plan_in_real_chrome_moves_the_real_task_to_todo`.
+    let (status, plans) = http_get(port, "/api/v1/plans");
+    assert_eq!(status, 200, "{plans}");
     assert!(plans.contains("Plan the migration"), "{plans}");
     assert!(plans.contains("Because the queue is wrong."), "{plans}");
     assert!(
         plans.contains("t-gated"),
         "a plan must name the work it gates: {plans}"
     );
-    assert!(plans.contains("infra"), "tags must render: {plans}");
+    assert!(plans.contains("infra"), "tags must be carried: {plans}");
 
     // The board's projection carries exactly the rules that apply to it
     // and no others. An agent-authored title and an agent-authored rule
@@ -26548,13 +26551,16 @@ fn needs_you_replies_and_live_revisions_cross_the_real_server_process() {
     assert_eq!(still_open.as_array().unwrap().len(), 4);
 
     let origin = format!("http://127.0.0.1:{port}");
-    let (status, plans) = http_get(port, "/plans");
+    // The page is mounted (`t-bf255880`); the row it offers the control
+    // for is read from the projection, and the verb itself is posted
+    // below exactly as the page posts it.
+    let (status, plans) = http_get(port, "/api/v1/plans");
     assert_eq!(status, 200, "{plans}");
     assert!(
-        plans.contains("/plan/SERVEWRITE/e-web-open/open"),
-        "the draft epic had no approval action: {plans}"
+        plans.contains("e-web-open"),
+        "the draft epic is not on the plans surface: {plans}"
     );
-    assert!(plans.contains("1 open attention"), "{plans}");
+    assert!(plans.contains("\"openAttention\":1"), "{plans}");
     assert!(plans.contains("Ship the rollout task"), "{plans}");
     assert!(plans.contains("s-web-open"), "{plans}");
     let (status, _) = http_post(
@@ -26878,6 +26884,40 @@ mod ui {
     /// The same refusal where it is the form's own error line.
     pub fn error_refusal(reason: &str) -> String {
         format!("{ERROR}[data-refusal={reason}]")
+    }
+
+    /// The four pages `t-bf255880` mounted, each named by the test id its
+    /// page component writes on the node that only exists once the
+    /// projection has answered -- so a journey waits for the PAGE, not for
+    /// the shell that would be there either way.
+    pub const SPRINTS_PAGE: &str = "[data-testid=sprints-page]";
+    pub const BOARD_SPRINTS_PAGE: &str = "[data-testid=board-sprints-page]";
+    pub const SPRINT_PAGE: &str = "[data-testid=sprint-page]";
+    /// The control that opens one draft plan. The plans page itself needs
+    /// no name: a plans page with no plan on it is not the arrival any
+    /// journey waits for, so `ui::plan` is the name that matters.
+    pub const PLAN_OPEN: &str = "[data-testid=plan-open]";
+    /// The banner a page shows for the plan it just opened.
+    pub const PLAN_OPENED: &str = "[data-plan-opened]";
+
+    /// One sprint card, by the sprint it carries.
+    pub fn sprint_summary(id: &str) -> String {
+        format!("[data-testid=sprint-summary][data-sprint-summary=\"{id}\"]")
+    }
+
+    /// One sprint's own page, by the sprint it is about.
+    pub fn sprint_detail(id: &str) -> String {
+        format!("{SPRINT_PAGE}[data-sprint-detail=\"{id}\"]")
+    }
+
+    /// One board's sprints page, by the board.
+    pub fn board_sprints(board: &str) -> String {
+        format!("{BOARD_SPRINTS_PAGE}[data-board-sprints=\"{board}\"]")
+    }
+
+    /// One plan on the plans page, by the epic it is.
+    pub fn plan(id: &str) -> String {
+        format!("[data-testid=plan][data-plan=\"{id}\"]")
     }
 
     /// Splice the names above into a page expression: every `__NAME__`
@@ -31836,13 +31876,16 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         sprints_link.get_attribute_value("href").unwrap().as_deref(),
         Some("/sprints")
     );
-    click_navigating(
+    // The sprint pages are mounted since `t-bf255880`: the arrival is the
+    // page's own node at the page's own address, because a client-routed
+    // click never replaces the document.
+    click_routing(
         &tab,
         "[data-nav=sprints]",
-        "[data-sprints-overview]",
+        ui::SPRINTS_PAGE,
+        "/sprints",
         "Sprints nav",
     );
-    assert_eq!(js_value(&tab, "location.pathname"), "/sprints");
     assert_element_text(
         &tab,
         "[data-sprint-board=\"EMPTY-SPRINTS\"] [data-no-current-sprint]",
@@ -31855,29 +31898,35 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     );
     assert_element_text(
         &tab,
-        "[data-sprint-summary=\"sp-mobile-current\"] [data-sprint-version]",
+        &format!(
+            "{} [data-sprint-version]",
+            ui::sprint_summary("sp-mobile-current")
+        ),
         "2.4.0",
     );
     assert_element_text(
         &tab,
-        "[data-sprint-summary=\"sp-mobile-closed\"] [data-sprint-state]",
+        &format!(
+            "{} [data-sprint-state]",
+            ui::sprint_summary("sp-mobile-closed")
+        ),
         "closed",
     );
     assert_element_text(
         &tab,
-        "[data-sprint-summary=\"sp-mobile-next\"] [data-sprint-state]",
+        &format!(
+            "{} [data-sprint-state]",
+            ui::sprint_summary("sp-mobile-next")
+        ),
         "planned",
     );
     assert_no_horizontal_overflow(&tab, "Sprints overview");
-    click_navigating(
+    click_routing(
         &tab,
         "[data-sprint-board=\"MOBILE-JOURNEY\"] > h2 [data-board-sprints-link]",
-        "[data-board-sprints=\"MOBILE-JOURNEY\"]",
+        &ui::board_sprints("MOBILE-JOURNEY"),
+        "/sprints/MOBILE-JOURNEY",
         "board sprint overview",
-    );
-    assert_eq!(
-        js_value(&tab, "location.pathname"),
-        "/sprints/MOBILE-JOURNEY"
     );
     assert_element_text(
         &tab,
@@ -31903,10 +31952,11 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         ),
         true
     );
-    click_navigating(
+    click_routing(
         &tab,
         "[data-sprint-link=\"sp-mobile-closed\"]",
-        "[data-sprint-detail=\"sp-mobile-closed\"]",
+        &ui::sprint_detail("sp-mobile-closed"),
+        "/sprint/MOBILE-JOURNEY/sp-mobile-closed",
         "closed sprint detail",
     );
     assert_element_text(&tab, "[data-sprint-served-version]", "2.3.3");
@@ -31925,16 +31975,18 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
     );
 
     assert_no_horizontal_overflow(&tab, "closed sprint detail");
-    click_navigating(
+    click_routing(
         &tab,
         "[data-board-sprints-back]",
-        "[data-board-sprints=\"MOBILE-JOURNEY\"]",
+        &ui::board_sprints("MOBILE-JOURNEY"),
+        "/sprints/MOBILE-JOURNEY",
         "return to board sprints",
     );
-    click_navigating(
+    click_routing(
         &tab,
         "[data-sprint-current] [data-sprint-link=\"sp-mobile-current\"]",
-        "[data-sprint-detail=\"sp-mobile-current\"]",
+        &ui::sprint_detail("sp-mobile-current"),
+        "/sprint/MOBILE-JOURNEY/sp-mobile-current",
         "current sprint detail",
     );
     assert_element_text(
@@ -31961,6 +32013,19 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
         ),
         true,
         "the sprint detail exposed mutation controls",
+    );
+    // An attached row is a title and one sentence with one pill, which the
+    // served page used to be pinned on byte for byte (SPA-35). The pill
+    // reads the status as prose, not as the stored slug.
+    assert_element_text(
+        &tab,
+        "[data-sprint-tasks] [data-task=\"t-mobile-journey\"] [data-task-state]",
+        "To do",
+    );
+    assert_element_text(
+        &tab,
+        "[data-sprint-tasks] [data-task=\"t-mobile-journey\"] [data-task-title]",
+        task_title,
     );
 
     let opaque_link = tab
@@ -32290,10 +32355,14 @@ fn opening_a_draft_plan_in_real_chrome_moves_the_real_task_to_todo() {
         plans_nav.get_attribute_value("href").unwrap().as_deref(),
         Some("/plans")
     );
-    click_navigating(
+    // `/plans` is mounted since `t-bf255880`: the click routes rather than
+    // replacing the document, and the plan appears when the projection has
+    // answered.
+    click_routing(
         &tab,
         "[data-nav=plans]",
-        &format!("[data-plan=\"{plan_id}\"]"),
+        &ui::plan(plan_id),
+        "/plans",
         "Plans nav",
     );
     assert_element_text(
@@ -32313,17 +32382,22 @@ fn opening_a_draft_plan_in_real_chrome_moves_the_real_task_to_todo() {
         form.get_attribute_value("action").unwrap().as_deref(),
         Some("/plan/WEB-PLAN/e-browser-open-plan/open")
     );
-    click_navigating(
+    // The write itself is unchanged: the same form, posted to the same
+    // address, and the receipt is the address bar plus the page's own
+    // banner. What proves it is the CLI read below -- a client-side state
+    // change would leave the ledger where it was (SPA-44).
+    click_routing(
         &tab,
-        &format!("[data-plan=\"{plan_id}\"] [data-plan-open]"),
-        "[data-plan-opened]",
+        &format!("{} {}", ui::plan(plan_id), ui::PLAN_OPEN),
+        ui::PLAN_OPENED,
+        "/plans",
         "Open plan",
     );
     assert_eq!(
         js_value(&tab, "location.pathname + location.search"),
         "/plans?opened=e-browser-open-plan"
     );
-    assert_element_text(&tab, "[data-plan-opened] code", plan_id);
+    assert_element_text(&tab, &format!("{} code", ui::PLAN_OPENED), plan_id);
     let opened = fixture.ok_json(&fixture.main, &["task", "show", plan_id, "--json"]);
     assert_eq!(opened["id"], plan_id);
     assert_eq!(opened["status"], "todo");
@@ -45793,6 +45867,367 @@ fn the_json_decided_projection_answers_the_same_rows_as_the_cli_over_http() {
     assert_eq!(room["scanLimit"], 200, "{body}");
 }
 
+/// Seed one board with a boundary, a history row and a draft plan.
+///
+/// The four sprint/plan cases below all need the same shape, and a fixture
+/// written four times is four chances to seed something the page never
+/// sees.
+fn seed_sprint_board(fixture: &Fixture, cwd: &Path, board: &str) {
+    fixture.ok_json(cwd, &["init", "--name", board, "--json"]);
+    fixture.ok_json(
+        cwd,
+        &[
+            "task",
+            "add",
+            "In the boundary",
+            "--id",
+            "t-scope",
+            "--status",
+            "todo",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        cwd,
+        &[
+            "sprint",
+            "new",
+            "The one before",
+            "--id",
+            "sp-history",
+            "--target-version",
+            "1.0.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        cwd,
+        &[
+            "sprint",
+            "plan",
+            "sp-history",
+            "--body",
+            "The **previous** boundary.",
+            "--empty-scope",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        cwd,
+        &[
+            "sprint",
+            "new",
+            "The one we are on",
+            "--id",
+            "sp-now",
+            "--target-version",
+            "1.1.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        cwd,
+        &[
+            "sprint",
+            "plan",
+            "sp-now",
+            "--body",
+            "Ship it **safely**.",
+            "--candidate",
+            "t-scope",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        cwd,
+        &[
+            "sprint",
+            "start",
+            "sp-now",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
+}
+
+#[test]
+fn the_json_sprints_projection_answers_the_same_sprints_as_the_cli_over_http() {
+    // SPA-06, SPA-47. The index's claim is that it is the CLI's own sprint
+    // rows, grouped by board: the boundary the board is on, and everything
+    // else as history. A board with no sprints at all is in the listing
+    // too, saying so -- the page names that state rather than hiding the
+    // board, so the projection has to carry it.
+    let fixture = Fixture::new("json-sprints");
+    let bare = fixture.root.join("bare");
+    fs::create_dir_all(&bare).unwrap();
+    seed_sprint_board(&fixture, &fixture.main, "SPRINTS-JSON");
+    fixture.ok_json(&bare, &["init", "--name", "SPRINTS-BARE", "--json"]);
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/sprints");
+    assert_eq!(status, 200, "{body}");
+    let listing: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/sprints is not JSON: {error}\n{body}"));
+    let items = listing["items"].as_array().unwrap();
+    let boards = items
+        .iter()
+        .map(|item| item["board"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        boards.contains(&"SPRINTS-JSON".to_owned()) && boards.contains(&"SPRINTS-BARE".to_owned()),
+        "a readable board is missing from the sprint index: {body}"
+    );
+    let seeded = items
+        .iter()
+        .find(|item| item["board"] == "SPRINTS-JSON")
+        .unwrap();
+    let cli = fixture.ok_json(&fixture.main, &["sprint", "list", "--all", "--json"]);
+    let rows = cli.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "the fixture seeded the wrong history: {cli}");
+    assert_eq!(seeded["current"]["sprint"], rows[0], "{body}\n{cli}");
+    assert_eq!(seeded["history"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(seeded["history"][0]["sprint"], rows[1], "{body}\n{cli}");
+    // The counts are the store's own pair, and the goal is the server's own
+    // markdown: a client that had to typeset it would be a second sanitiser.
+    assert_eq!(seeded["current"]["openTasks"], 1, "{body}");
+    assert_eq!(seeded["current"]["doneTasks"], 0, "{body}");
+    assert_eq!(
+        seeded["current"]["goalHtml"], "<p>Ship it <strong>safely</strong>.</p>\n",
+        "{body}"
+    );
+    let bare_row = items
+        .iter()
+        .find(|item| item["board"] == "SPRINTS-BARE")
+        .unwrap();
+    assert!(bare_row["current"].is_null(), "{body}");
+    assert!(bare_row["history"].as_array().unwrap().is_empty(), "{body}");
+    // Uncapped by construction: the history call passes `i64::MAX`.
+    assert_eq!(listing["returned"], items.len(), "{body}");
+    assert!(listing["limit"].is_null(), "{body}");
+    assert_eq!(listing["truncated"], Value::Bool(false), "{body}");
+}
+
+#[test]
+fn the_json_board_sprints_projection_answers_one_board_over_http() {
+    // SPA-06, SPA-08, SPA-47. One board's sprint state is the index's own
+    // row for that board -- the same computation, not a second one -- and a
+    // board that is not readable is refused with the one non-enumerating
+    // body.
+    let fixture = Fixture::new("json-board-sprints");
+    seed_sprint_board(&fixture, &fixture.main, "SPRINTS-ONE");
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/sprints/SPRINTS-ONE");
+    assert_eq!(status, 200, "{body}");
+    let board: Value = serde_json::from_str(&body).unwrap();
+    let (_, index_body) = http_get(server.port, "/api/v1/sprints");
+    let index: Value = serde_json::from_str(&index_body).unwrap();
+    let same = index["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["board"] == "SPRINTS-ONE")
+        .unwrap();
+    assert_eq!(
+        &board, same,
+        "one board's sprints differ between the index and its own route:\n{body}\n{index_body}"
+    );
+    let (status, refused) = http_get(server.port, "/api/v1/sprints/NO-SUCH-BOARD");
+    assert_eq!(status, 404, "{refused}");
+    assert_eq!(refused, JSON_DENIED_OR_NOT_FOUND, "{refused}");
+}
+
+#[test]
+fn the_json_sprint_projection_answers_the_same_scope_as_the_cli_over_http() {
+    // SPA-06, SPA-08, SPA-47. `kb sprint show` is the same three reads this
+    // route makes, so the row and its visible scope are asserted against it
+    // rather than against a copy of the fixture. An unknown sprint id and
+    // an unknown board answer the same refusal, which is the whole of the
+    // denial.
+    let fixture = Fixture::new("json-sprint");
+    seed_sprint_board(&fixture, &fixture.main, "SPRINT-ONE");
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/sprint/SPRINT-ONE/sp-now");
+    assert_eq!(status, 200, "{body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    let cli = fixture.ok_json(&fixture.main, &["sprint", "show", "sp-now", "--json"]);
+    assert_eq!(detail["board"], "SPRINT-ONE", "{body}");
+    assert_eq!(detail["sprint"], cli["sprint"], "{body}\n{cli}");
+    assert_eq!(detail["tasks"], cli["tasks"], "{body}\n{cli}");
+    assert_eq!(
+        detail["tasks"][0]["id"], "t-scope",
+        "the sprint's visible scope is not the row the CLI attached: {body}"
+    );
+    assert_eq!(detail["openTasks"], 1, "{body}");
+    assert_eq!(detail["doneTasks"], 0, "{body}");
+    assert_eq!(
+        detail["goalHtml"], "<p>Ship it <strong>safely</strong>.</p>\n",
+        "{body}"
+    );
+    // Nothing closed it, so there is no proof to serve and the field says
+    // so rather than being absent.
+    assert!(detail["closingDeployment"].is_null(), "{body}");
+    for path in [
+        "/api/v1/sprint/SPRINT-ONE/sp-no-such-sprint",
+        "/api/v1/sprint/NO-SUCH-BOARD/sp-now",
+    ] {
+        let (status, refused) = http_get(server.port, path);
+        assert_eq!(status, 404, "{path}: {refused}");
+        assert_eq!(refused, JSON_DENIED_OR_NOT_FOUND, "{path}: {refused}");
+    }
+}
+
+#[test]
+fn the_json_plans_projection_answers_the_draft_epics_the_cli_lists_over_http() {
+    // SPA-06, SPA-44. A plan is a draft epic, and the page is about what it
+    // HOLDS BACK -- so the projection is asserted to carry the plan's own
+    // body as the server typeset it, the children the draft gates, and
+    // nothing that is merely an epic or merely a draft.
+    let fixture = Fixture::new("json-plans");
+    fixture.ok_json(&fixture.main, &["init", "--name", "PLANS-JSON", "--json"]);
+    for args in [
+        vec![
+            "task",
+            "add",
+            "The drafted plan",
+            "--id",
+            "e-plan",
+            "--type",
+            "epic",
+            "--status",
+            "draft",
+            "--body",
+            "Open me and **three** rows become claimable.",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+        vec![
+            "task",
+            "add",
+            "Gated by the plan",
+            "--id",
+            "t-gated",
+            "--parent",
+            "e-plan",
+            "--status",
+            "draft",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+        // An epic that is already open, and a draft that is not an epic:
+        // neither is a plan, and the page must not list either.
+        vec![
+            "task",
+            "add",
+            "An opened epic",
+            "--id",
+            "e-open",
+            "--type",
+            "epic",
+            "--status",
+            "todo",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+        vec![
+            "task",
+            "add",
+            "A drafted task",
+            "--id",
+            "t-draft",
+            "--status",
+            "draft",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    ] {
+        fixture.ok_json(&fixture.main, &args);
+    }
+
+    let server = spawn_server(&fixture);
+    let (status, body) = http_get(server.port, "/api/v1/plans");
+    assert_eq!(status, 200, "{body}");
+    let listing: Value = serde_json::from_str(&body).unwrap();
+    let items = listing["items"].as_array().unwrap();
+    let cli = fixture.ok_json(&fixture.main, &["task", "list", "--all", "--json"]);
+    let drafts = cli
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["status"] == "draft" && row["type"] == "epic")
+        .collect::<Vec<_>>();
+    assert_eq!(drafts.len(), 1, "the fixture seeded the wrong plans: {cli}");
+    assert_eq!(
+        items.len(),
+        drafts.len(),
+        "the JSON plans and the CLI's draft epics disagree:\n{body}\n{cli}"
+    );
+    let plan = &items[0];
+    assert_eq!(plan["board"], "PLANS-JSON", "{body}");
+    // Field for field rather than whole-object: `kb task list` adds its own
+    // `claimed` view field, which is the CLI's rendering rather than the
+    // row, and the projection serves the row.
+    for field in [
+        "id",
+        "type",
+        "parentID",
+        "title",
+        "body",
+        "status",
+        "priority",
+        "priorityLevel",
+        "createdAt",
+        "tags",
+        "archived",
+    ] {
+        assert_eq!(
+            plan["task"][field], drafts[0][field],
+            "{field} differs between the JSON plan and the CLI row:\n{body}\n{cli}"
+        );
+    }
+    assert_eq!(
+        plan["bodyHtml"], "<p>Open me and <strong>three</strong> rows become claimable.</p>\n",
+        "{body}"
+    );
+    assert_eq!(plan["openAttention"], 0, "{body}");
+    let children = plan["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "{body}");
+    assert_eq!(children[0]["task"]["id"], "t-gated", "{body}");
+    assert_eq!(children[0]["openAttention"], 0, "{body}");
+    assert!(
+        !body.contains("e-open") && !body.contains("t-draft"),
+        "an opened epic or a drafted task was served as a plan: {body}"
+    );
+    // `Store::list_tasks` takes no bound, so the listing cannot be cut.
+    assert_eq!(listing["returned"], 1, "{body}");
+    assert!(listing["limit"].is_null(), "{body}");
+    assert_eq!(listing["truncated"], Value::Bool(false), "{body}");
+}
+
 #[test]
 fn the_json_projection_never_serialises_a_lease_token_over_http() {
     // SPA-09. A lease token is a capability: whoever holds it can heartbeat
@@ -49877,10 +50312,11 @@ fn decided_receipts_collect_in_the_side_history_in_real_chrome() {
 /// the shell the bundle mounts into - a mount point rather than a heading,
 /// which is the cutover's recorded consequence (spec SPA-51, ADR-048).
 ///
-/// `t-bf255880` wave 1 moved five more destinations onto the bundle -
-/// `/decided`, `/lanes`, `/boards`, `/deployments` and `/subscriptions` -
-/// so their scriptless answer is the same mount point. What this case
-/// still holds for all nine is the part that is about the drawer rather
+/// `t-bf255880` wave 1 moved seven more destinations onto the bundle -
+/// `/decided`, `/lanes`, `/boards`, `/sprints`, `/plans`, `/deployments`
+/// and `/subscriptions` - so their scriptless answer is the same mount
+/// point. What this case still holds for all nine is the part that is
+/// about the drawer rather
 /// than the renderer: every anchor the spec names is there, every href is
 /// site-local, every one answers `200`, and the drawer holds no tenth
 /// destination.
@@ -49899,11 +50335,13 @@ fn every_destination_answers_without_a_script_over_http() {
         // and a heading would mean the deck went back to being served.
         ("needs-you", "data-testid=app-root-shell"),
         ("all", "<h1>Needs you"),
+        // Mounted since `t-bf255880` wave 1: like `/`, what these answer
+        // without a script is the mount point the bundle fills.
         ("decided", "data-testid=app-root-shell"),
         ("lanes", "data-testid=app-root-shell"),
         ("boards", "data-testid=app-root-shell"),
-        ("sprints", "<h1 data-sprints-overview>Sprints"),
-        ("plans", "<h1>Plans"),
+        ("sprints", "data-testid=app-root-shell"),
+        ("plans", "data-testid=app-root-shell"),
         ("deployments", "data-testid=app-root-shell"),
         ("subscriptions", "data-testid=app-root-shell"),
     ];

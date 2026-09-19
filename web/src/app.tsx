@@ -12,11 +12,15 @@ import {
 import { connectLive, type Notice } from "./live";
 import { NOTICE_SHOWN, Notices } from "./notices";
 import BoardPage from "./pages/board";
+import BoardSprintsPage from "./pages/board-sprints";
 import BoardsPage from "./pages/boards";
 import DecidedPage from "./pages/decided";
 import DeploymentPage from "./pages/deployment";
 import DeploymentsPage from "./pages/deployments";
 import LanesPage from "./pages/lanes";
+import PlansPage from "./pages/plans";
+import SprintPage from "./pages/sprint";
+import SprintsPage from "./pages/sprints";
 import SubscriptionsPage from "./pages/subscriptions";
 import { bindPreviews, dismissPreviews } from "./previews";
 import { type Route, setMountedRoutes, useRoute } from "./router";
@@ -1017,6 +1021,10 @@ const PAGES: Record<string, (route: Route) => ReactElement> = {
   subscriptions: (route) => <SubscriptionsPage route={route} />,
   deployments: () => <DeploymentsPage />,
   deployment: (route) => <DeploymentPage route={route} />,
+  sprints: (route) => <SprintsPage route={route} />,
+  "board-sprints": (route) => <BoardSprintsPage route={route} />,
+  sprint: (route) => <SprintPage route={route} />,
+  plans: (route) => <PlansPage route={route} />,
 };
 
 setMountedRoutes(["needs-you", ...Object.keys(PAGES)]);
