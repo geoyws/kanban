@@ -56,3 +56,18 @@ export function cardQuestion(
   }
   return `${glyphs.slice(0, QUESTION_BOUND - 1).join("")}…`;
 }
+
+/* read pages */
+
+/**
+ * `rust/serve.rs`'s `stamp`: an absolute UTC instant, to the second.
+ *
+ * A receipt is read against other receipts and against a shell's scrollback,
+ * so a detail page says when rather than how long ago. LOCAL CONTRACT COPY —
+ * writer A is landing this name in this banner; delete whichever copy loses
+ * at the merge.
+ */
+export function stamp(ms: number): string {
+  const iso = new Date(ms).toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 19)}Z`;
+}

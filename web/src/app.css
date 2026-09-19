@@ -1223,3 +1223,124 @@ main[data-deck] > p.keys {
     transition: none;
   }
 }
+
+/* --- the read pages: LOCAL CONTRACT COPY, writer A owns these ------------ */
+/* Ported verbatim from `rust/serve.rs`'s CSS const so this branch's pages
+   render at their real addresses before A's branch merges. A's copy of this
+   banner wins at the merge and this one is deleted; nothing below it in this
+   file depends on anything here that A is not also shipping. */
+main[data-page] {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  padding: 0.6rem clamp(0.7rem, 3vw, 1.2rem) calc(1.5rem + env(safe-area-inset-bottom));
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+th,
+td {
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--surface0);
+}
+
+th {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--overlay);
+}
+
+td.n,
+th.n {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pill {
+  display: inline-block;
+  padding: 0.1em 0.4em;
+  color: var(--subtext);
+  background: var(--surface0);
+  font-size: 0.75rem;
+  border-radius: 999px;
+}
+
+.pill.status-done,
+.pill.status-approve,
+.pill.status-succeeded {
+  color: var(--green);
+}
+
+.pill.status-in_progress,
+.pill.status-other {
+  color: var(--blue);
+}
+
+.pill.status-blocked,
+.pill.status-reject,
+.pill.status-failed {
+  color: var(--red);
+}
+
+.pill.status-review,
+.pill.status-defer {
+  color: var(--yellow);
+}
+
+/* --- subscriptions + deployments ----------------------------------------- */
+/* A label/value list, so a receipt reads as one: the label is quiet and the
+   value keeps the column. */
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.8rem;
+  margin: 0.4rem 0;
+}
+
+dt {
+  color: var(--overlay);
+  font-size: 0.8125rem;
+}
+
+dd {
+  margin: 0;
+  font-size: 0.9375rem;
+  word-break: break-word;
+}
+
+td.when {
+  white-space: nowrap;
+  color: var(--subtext);
+}
+
+/* The row's one control sits under the state it changes, where the state is
+   what an operator is looking at when they decide to change it. */
+td > form {
+  margin: 0.4rem 0 0;
+}
+
+/* What is waiting, said only when something is: at rest this line is absent
+   rather than three zeroes. */
+.queued {
+  margin-top: 0.25rem;
+  color: var(--subtext);
+  font-size: 0.8125rem;
+}
+
+/* The page's one loud element. A dead-lettered delivery is the only thing on
+   this surface that needs a person, so it is the only thing that raises its
+   voice — and it does it with weight, not with a second colour competing
+   with the status pill beside it. */
+.queued .retrying,
+.queued .dead {
+  color: var(--text);
+  font-weight: 700;
+}

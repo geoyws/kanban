@@ -78,7 +78,19 @@ export type WriteResult =
   | { recorded: true }
   | { recorded: false; refusal: string | null; status: number };
 
-async function post(path: string, body?: URLSearchParams): Promise<WriteResult> {
+/**
+ * Post one form to a write route, and read what it answered.
+ *
+ * Exported because three pages write through it — the deck's reply and
+ * reopen, the plan's open, and a subscription's pause and resume — and a
+ * second reading of a refusal page would be a second place the operator's
+ * own sentence could be lost. (Writer A owns this rename; this branch
+ * carries it so its pages compile before the merge.)
+ */
+export async function postForm(
+  path: string,
+  body?: URLSearchParams,
+): Promise<WriteResult> {
   const response = await fetch(path, {
     method: "POST",
     credentials: "same-origin",
@@ -105,7 +117,7 @@ export function postDecision(
   id: string,
   body: URLSearchParams,
 ): Promise<WriteResult> {
-  return post(
+  return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reply`,
     body,
   );
@@ -116,7 +128,7 @@ export function postDecision(
  * undo that demanded words would be a dialog wearing a button.
  */
 export function postReopen(board: string, id: string): Promise<WriteResult> {
-  return post(
+  return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reopen`,
   );
 }

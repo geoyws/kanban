@@ -971,3 +971,91 @@ main[data-deck] > p.keys {
     transition: none;
   }
 }
+main[data-page] {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  padding: 0.6rem clamp(0.7rem, 3vw, 1.2rem) calc(1.5rem + env(safe-area-inset-bottom));
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+th,
+td {
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--surface0);
+}
+th {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--overlay);
+}
+td.n,
+th.n {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.pill {
+  display: inline-block;
+  padding: 0.1em 0.4em;
+  color: var(--subtext);
+  background: var(--surface0);
+  font-size: 0.75rem;
+  border-radius: 999px;
+}
+.pill.status-done,
+.pill.status-approve,
+.pill.status-succeeded {
+  color: var(--green);
+}
+.pill.status-in_progress,
+.pill.status-other {
+  color: var(--blue);
+}
+.pill.status-blocked,
+.pill.status-reject,
+.pill.status-failed {
+  color: var(--red);
+}
+.pill.status-review,
+.pill.status-defer {
+  color: var(--yellow);
+}
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.8rem;
+  margin: 0.4rem 0;
+}
+dt {
+  color: var(--overlay);
+  font-size: 0.8125rem;
+}
+dd {
+  margin: 0;
+  font-size: 0.9375rem;
+  word-break: break-word;
+}
+td.when {
+  white-space: nowrap;
+  color: var(--subtext);
+}
+td > form {
+  margin: 0.4rem 0 0;
+}
+.queued {
+  margin-top: 0.25rem;
+  color: var(--subtext);
+  font-size: 0.8125rem;
+}
+.queued .retrying,
+.queued .dead {
+  color: var(--text);
+  font-weight: 700;
+}
