@@ -211,6 +211,33 @@ dashboard's `taskCounts` and `totalTasks` and the board index's `tasks` and
 their existence as surely as their titles would. Held by
 `a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http`.
 
+The RELATIONS of a readable row obey it at the store since `t-3548303e`
+(2026-09-19), and the three of them answer differently because the three
+questions are different:
+
+- `Store::dependencies` is an enumeration, so it is filtered exactly as the
+  listings above are: a prerequisite whose tags fail the read test is absent
+  from `task show`'s `dependencies`, from `task list --with-relations` and
+  from the context pack.
+- `Store::blocking_gates` and `blocking_gates_for` keep that prerequisite and
+  blank its title: `prerequisiteTitle` is `null`, while `prerequisiteID` and
+  `prerequisiteStatus` stay. The gate is the read every refusal is taken
+  through, so dropping the blocker would leave a row reading as ungated while
+  every claim on it is refused by that gate — a worse answer than a partial
+  one. The id is the gate's function, not disclosure: the refusal sentence
+  names it, unchanged, and the caller is told why it cannot claim. This is a
+  CLI-JSON shape only; no web route serves a gate, so the OpenAPI contract is
+  unchanged (there is no `GateBlocker` schema in it, and `TaskDetail` carries
+  no relations).
+- `Store::ancestors` truncates at the first ancestor the caller may not read.
+  Dropping it would punch a hole in a chain that says which plan owns which,
+  and refusing outright is what it used to do — one denied epic made `context`
+  answer `denied or not found` for a leaf the caller WAS authorized to read.
+  The readable run nearest the row survives, and it discloses nothing the row
+  does not already carry: `parentID` is a field on the row itself.
+
+Held by `a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http`.
+
 Two refusals are deliberately *not* generic, and both are the product's own
 words rather than the store's state:
 

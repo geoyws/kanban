@@ -16,12 +16,17 @@ fn task_line(task: &Task) -> String {
 /// The owner is named because a leaf inherits the gates of every plan above
 /// it: told only that some other row is unfinished, a resuming agent reads
 /// its own dependencies, finds none, and concludes the tool is confused.
+///
+/// A title the caller may not read is `None` (`t-3548303e`), rendered as the
+/// em dash this product writes every absent value as. The gate itself — its
+/// id, its status and its owner — is on the line either way, because that is
+/// what the agent needs to understand why its claim is refused.
 fn gate_line(blocker: &GateBlocker) -> String {
     format!(
         "- {} [{}] {} (gate declared on {})",
         blocker.prerequisite_id,
         blocker.prerequisite_status,
-        blocker.prerequisite_title,
+        blocker.prerequisite_title.as_deref().unwrap_or("—"),
         blocker.source_task_id
     )
 }
