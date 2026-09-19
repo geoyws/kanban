@@ -45,8 +45,34 @@ pub struct Tag {
     pub description: Option<String>,
     pub created_by: Option<String>,
     pub created_at: i64,
+    /// The spelling this tag was registered under, when it has been renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_at: Option<i64>,
     /// How many rows currently carry it, so a listing answers "is this used".
     pub uses: i64,
+}
+
+/// What one `tag rename` moved: the receipt, per table.
+///
+/// Counted rather than listed, because the answer a caller acts on is "did
+/// this reach everything" and a board with a thousand tagged rows would
+/// otherwise answer with a thousand ids.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagRename {
+    pub old: String,
+    pub new: String,
+    /// Live task rows retagged.
+    pub tasks: i64,
+    /// Archived task rows retagged — counted apart, because a rename that
+    /// skipped history would leave the old spelling readable and unfindable.
+    pub archived_tasks: i64,
+    pub attention: i64,
+    /// Registry rules rewritten. See [`crate::store::Store::rename_tag`] for
+    /// why this one is not inside the board's transaction.
+    pub rules: i64,
 }
 
 /// One operator rule in the registry-owned, tag-scoped document.

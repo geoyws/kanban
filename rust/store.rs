@@ -354,20 +354,51 @@ fn can_contain(parent_type: &str, child_type: &str) -> bool {
     }
 }
 
+/// The estates a namespaced tag may be filed under.
+///
+/// The source of truth until a registry row supersedes it. A slashed tag is a
+/// claim about *whose* subsystem it names, and a claim nothing checks is a
+/// typo waiting to become a second vocabulary: `ifac/aix-chat` beside
+/// `ifca/aix-chat` is exactly the collision the master file exists to prevent,
+/// one level up. Three names, written down once, so adding a fourth is a
+/// deliberate edit rather than a side effect of a mistyped filter.
+pub(crate) const ESTATES: [&str; 3] = ["ifca", "unum", "geoyws"];
+
 /// A tag name the master file will accept.
 ///
 /// Lowercase, digits and hyphens. The point of a registry is that one concept
 /// has one spelling, and `Infra` beside `infra` defeats it before anything else
 /// can — so the shape is fixed at the door rather than argued about later.
+///
+/// A name may also be namespaced as `<estate>/<subsystem>` — one or more
+/// segments of that same alphabet joined by single slashes, with no leading,
+/// trailing or doubled slash. The first segment of a slashed name must be one
+/// of [`ESTATES`]; a slash-free name stays exactly what it always was, so
+/// every board that never adopted a namespace is untouched.
 pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
     let name = nonempty(name, "tag name")?.to_owned();
-    let shaped = name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if !shaped || name.starts_with('-') || name.ends_with('-') {
+    let segment_shaped = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !segment.starts_with('-')
+            && !segment.ends_with('-')
+    };
+    let shaped = name.split('/').all(segment_shaped);
+    if !shaped {
         bail!(
             "tag {name} is not a usable name: lowercase letters, digits and \
              inner hyphens only, so one concept cannot arrive under two spellings"
+        );
+    }
+    if let Some((estate, _)) = name.split_once('/')
+        && !ESTATES.contains(&estate)
+    {
+        bail!(
+            "tag {name} names estate {estate}, which is not registered: a namespaced tag \
+             is filed under one of {}, so one subsystem cannot arrive under two owners",
+            ESTATES.join(", ")
         );
     }
     Ok(name)
@@ -2803,6 +2834,12 @@ impl Store {
         }
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
+    }
+
+    /// Whether a batch's outer scope is open, so a caller that owes work to a
+    /// *committed* board can tell "already landed" from "lands later".
+    pub(crate) fn in_batch(&self) -> bool {
+        !self.connection.is_autocommit()
     }
 
     /// Land every item of a batch.
@@ -5429,7 +5466,7 @@ impl Store {
     pub fn tags(&self) -> Result<Vec<Tag>> {
         self.authz.check_read(&[])?;
         let mut statement = self.connection.prepare(
-            "SELECT t.name,t.description,t.created_by,t.created_at,
+            "SELECT t.name,t.description,t.created_by,t.created_at,t.renamed_from,t.renamed_at,
                     ((SELECT count(*) FROM task_tags x WHERE x.tag=t.name) +
                      (SELECT count(*) FROM attention_tags x WHERE x.tag=t.name)) AS uses
              FROM tags t ORDER BY t.name",
@@ -5441,11 +5478,108 @@ impl Store {
                     description: row.get("description")?,
                     created_by: row.get("created_by")?,
                     created_at: row.get("created_at")?,
+                    renamed_from: row.get("renamed_from")?,
+                    renamed_at: row.get("renamed_at")?,
                     uses: row.get("uses")?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Move every use of one registered tag onto a new name, in one write.
+    ///
+    /// A rename is not an add plus a remove: `remove_tag` strips rows, and a
+    /// two-command spelling would leave a window in which the tag exists under
+    /// neither name and every filter misses the rows. So the master row, every
+    /// `task_tags` row (archived ones included — history that kept the old
+    /// spelling would be readable and unfindable), and every `attention_tags`
+    /// row move together inside one transaction, under the mutation lock.
+    ///
+    /// The new row is inserted before the children move and the old row is
+    /// deleted after, because both child tables carry a foreign key to
+    /// `tags(name)` with no `ON UPDATE` action: renaming the parent in place
+    /// would orphan them mid-statement.
+    ///
+    /// **The registry is not in this transaction.** Rule tags live in a
+    /// separate SQLite database with its own hash chain, and two connections
+    /// cannot share one transaction, so the rule rewrite is a second
+    /// transaction the caller runs strictly *after* this one commits
+    /// (`Registry::rename_rule_tag`, driven from the `tag rename` dispatch in
+    /// `rust/lib.rs`). If that second transaction fails, the board is renamed
+    /// and the rules still carry the old spelling — which narrows those rules
+    /// rather than widening them, and the refusal names
+    /// `kanban rule update ID --tag NEW` as the repair. The reverse order was
+    /// rejected because a failed board rename would then leave rules pointing
+    /// at a tag no board has.
+    pub fn rename_tag(&mut self, old: &str, new: &str, actor: Option<&str>) -> Result<TagRename> {
+        let new = validate_tag_name(new)?;
+        let transaction = self.begin_write()?;
+        // The master file has no tags of its own: board scope, under the lock.
+        self.authz.check_write(&[], &[])?;
+        let known: Option<String> = transaction
+            .query_row("SELECT name FROM tags WHERE name=?", [old], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if known.is_none() {
+            bail!(
+                "tag {old} is not in this board's master file, so there is nothing to rename — \
+                 `kanban tag list` names the ones that are"
+            );
+        }
+        let taken: Option<String> = transaction
+            .query_row("SELECT name FROM tags WHERE name=?", [&new], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if taken.is_some() {
+            bail!(
+                "tag {new} is already in the master file and a rename does not merge two tags \
+                 into one — pick a free name, or retire one of them with `kanban tag remove` first"
+            );
+        }
+        let now = now_ms();
+        let (tasks, archived_tasks): (i64, i64) = transaction.query_row(
+            "SELECT coalesce(sum(archived=0),0),coalesce(sum(archived=1),0) \
+             FROM task_tags WHERE tag=?",
+            [old],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.execute(
+            "INSERT INTO tags(name,description,created_by,created_at,renamed_from,renamed_at) \
+             SELECT ?,description,created_by,created_at,?,? FROM tags WHERE name=?",
+            params![new, old, now, old],
+        )?;
+        transaction.execute("UPDATE task_tags SET tag=? WHERE tag=?", params![new, old])?;
+        let attention = i64::try_from(transaction.execute(
+            "UPDATE attention_tags SET tag=? WHERE tag=?",
+            params![new, old],
+        )?)?;
+        transaction.execute("DELETE FROM tags WHERE name=?", [old])?;
+        event(
+            &transaction,
+            None,
+            "tag_renamed",
+            actor,
+            json!({
+                "old": old,
+                "new": new,
+                "tasks": tasks,
+                "archivedTasks": archived_tasks,
+                "attention": attention,
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(TagRename {
+            old: old.to_owned(),
+            new,
+            tasks,
+            archived_tasks,
+            attention,
+            // Filled in by the caller, after this transaction has landed.
+            rules: 0,
+        })
     }
 
     /// Retire a tag. One still in use needs `--force`, and says how many rows.
@@ -12721,6 +12855,42 @@ mod tests {
             .expect_err("an empty tag name is not a tag")
             .to_string();
         assert!(empty.contains("tag name"), "{empty}");
+
+        // A namespaced name is the same alphabet, one level deeper, and the
+        // estate half is checked because `ifac/aix-chat` beside
+        // `ifca/aix-chat` is the master file's own collision one level up.
+        // One table, because every row here is the same question.
+        for (name, accepted) in [
+            ("ifca/aix-chat", true),
+            ("geoyws/infra", true),
+            ("unum/a/b", true),
+            ("infra", true),
+            ("Ifca/x", false),
+            ("ifca//x", false),
+            ("/ifca", false),
+            ("ifca/", false),
+            ("ifca_x", false),
+            ("acme/x", false),
+        ] {
+            let outcome = validate_tag_name(name);
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "tag {name}: {:?}",
+                outcome.as_ref().err().map(ToString::to_string)
+            );
+            if accepted {
+                assert_eq!(outcome.expect("accepted"), name);
+            }
+        }
+
+        // An unregistered estate is refused by name, not by shape: the fix is
+        // a different first segment, and the sentence has to say so.
+        let estate = validate_tag_name("acme/x")
+            .expect_err("acme is not a registered estate")
+            .to_string();
+        assert!(estate.contains("acme"), "{estate}");
+        assert!(estate.contains("ifca, unum, geoyws"), "{estate}");
     }
 
     #[test]

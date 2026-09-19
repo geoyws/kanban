@@ -23042,6 +23042,421 @@ fn a_tag_is_a_master_file_entry_before_it_is_a_label() {
 }
 
 #[test]
+fn tag_rename_rewrites_every_table_in_one_transaction_and_the_chain_verifies() {
+    // A tag is carried by rows in three places and scoped by rules in a
+    // fourth, so "rename" is only a rename if every one of them moves. Doing
+    // it by hand -- add the new name, retag, retire the old -- leaves a window
+    // where filters answer with half the rows and reads like a complete
+    // answer, which is the failure the master file exists to prevent.
+    let fixture = Fixture::new("tag-rename");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TAGRENAME", "--json"]);
+    fixture.ok_json(
+        &fixture.worktree,
+        &["init", "--name", "OTHERBOARD", "--json"],
+    );
+    for cwd in [&fixture.main, &fixture.worktree] {
+        fixture.ok_json(cwd, &["tag", "add", "infra", "--as", "geoyws", "--json"]);
+    }
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Live work",
+            "--id",
+            "t-live",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Old work", "--id", "t-old", "--tag", "infra", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "move", "t-old", "done", "--as", "geoyws", "--json"],
+    );
+    // Archiving needs a completion old enough to sweep; the clock is the only
+    // thing being faked here.
+    let board_path = board_path_for_project(&fixture, &fixture.main, "TAGRENAME");
+    Connection::open(&board_path)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET completed_at=1,updated_at=1 WHERE id='t-old'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &[
+                "archive",
+                "--older-than-days",
+                "1",
+                "--as",
+                "geoyws",
+                "--json"
+            ],
+        )["tasks"],
+        1
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Which queue owns retries?",
+            "--as",
+            "geoyws",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Everything infra ships behind a flag.",
+            "--as",
+            "geoyws",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Other board infra rule.",
+            "--as",
+            "geoyws",
+            "--board",
+            "OTHERBOARD",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+
+    let renamed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "tag",
+            "rename",
+            "infra",
+            "ifca/infra",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        renamed,
+        json!({
+            "old": "infra",
+            "new": "ifca/infra",
+            "tasks": 1,
+            "archivedTasks": 1,
+            "attention": 1,
+            "rules": 1,
+        }),
+        "the receipt must count every table it moved"
+    );
+
+    // The live row, the archived row and the attention row all carry the new
+    // spelling, and the namespaced name is a usable filter -- a rename that
+    // produced a name no filter accepts would have moved the rows out of
+    // reach.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-live", "--json"])["tags"],
+        json!(["ifca/infra"])
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-old", "--json"])["tags"],
+        json!(["ifca/infra"]),
+        "history kept the old spelling: readable and unfindable"
+    );
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--tag", "ifca/infra", "--json"],
+    );
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["t-live"]
+    );
+    assert_eq!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["attention", "list", "--tag", "ifca/infra", "--json"],
+            )
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "an attention filter must take the namespaced form verbatim"
+    );
+
+    let master = fixture.ok_json(&fixture.main, &["tag", "list", "--json"]);
+    let entry = master.as_array().unwrap();
+    assert_eq!(entry.len(), 1, "{master}");
+    assert_eq!(entry[0]["name"], "ifca/infra");
+    assert_eq!(entry[0]["renamedFrom"], "infra");
+    assert_eq!(entry[0]["createdBy"], "geoyws", "provenance is preserved");
+    assert_eq!(entry[0]["uses"], 3);
+
+    // The rule scoped to this board moved; the one scoped to another board is
+    // another board's vocabulary and is left exactly as it was.
+    let rules = fixture.ok_json(&fixture.main, &["rule", "list", "--full", "--json"]);
+    let tags = rules
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| {
+            (
+                rule["body"].as_str().unwrap().to_owned(),
+                rule["tags"].clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        tags.iter()
+            .any(|(body, tags)| body.starts_with("Everything infra ships")
+                && tags == &json!(["ALL", "ifca/infra"])),
+        "{tags:?}"
+    );
+    assert!(
+        tags.iter()
+            .any(|(body, tags)| body.starts_with("Other board infra rule")
+                && tags == &json!(["ONLY:OTHERBOARD", "infra"])),
+        "another board's rule must be untouched: {tags:?}"
+    );
+
+    let events = fixture.ok_json(&fixture.main, &["events", "--limit", "50", "--json"]);
+    let rename_event = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "tag_renamed")
+        .expect("the rename must be in the ledger");
+    assert_eq!(rename_event["payload"]["old"], "infra");
+    assert_eq!(rename_event["payload"]["new"], "ifca/infra");
+    assert_eq!(rename_event["payload"]["tasks"], 1);
+    assert_eq!(rename_event["payload"]["archivedTasks"], 1);
+    assert_eq!(rename_event["payload"]["attention"], 1);
+    assert_eq!(rename_event["actor"], "geoyws");
+
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
+        json!(true),
+        "a rename must leave the hash chain verifiable"
+    );
+}
+
+#[test]
+fn tag_rename_refuses_unknown_existing_and_malformed_names() {
+    // Each refusal names the one move that makes it work: a rename is a
+    // destructive rewrite over rows nobody is looking at, so "no" without a
+    // next step is how an operator reaches for raw SQL instead.
+    let fixture = Fixture::new("tag-rename-refusals");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REFUSALS", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "infra", "--as", "geoyws", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "queuer", "--as", "geoyws", "--json"],
+    );
+
+    let unknown = fixture.run(
+        &fixture.main,
+        &["tag", "rename", "ghost", "ifca/ghost", "--as", "geoyws"],
+    );
+    assert!(!unknown.status.success(), "an unknown tag was renamed");
+    let unknown = String::from_utf8_lossy(&unknown.stderr).to_string();
+    assert!(
+        unknown.contains(
+            "tag ghost is not in this board's master file, so there is nothing to rename \
+             — `kanban tag list` names the ones that are"
+        ),
+        "{unknown}"
+    );
+
+    let taken = fixture.run(
+        &fixture.main,
+        &["tag", "rename", "infra", "queuer", "--as", "geoyws"],
+    );
+    assert!(!taken.status.success(), "a rename merged two tags");
+    let taken = String::from_utf8_lossy(&taken.stderr).to_string();
+    assert!(
+        taken.contains(
+            "tag queuer is already in the master file and a rename does not merge two tags \
+             into one — pick a free name, or retire one of them with `kanban tag remove` first"
+        ),
+        "{taken}"
+    );
+
+    let shouted = fixture.run(
+        &fixture.main,
+        &["tag", "rename", "infra", "Ifca/infra", "--as", "geoyws"],
+    );
+    assert!(!shouted.status.success(), "a malformed name was accepted");
+    let shouted = String::from_utf8_lossy(&shouted.stderr).to_string();
+    assert!(
+        shouted.contains(
+            "tag Ifca/infra is not a usable name: lowercase letters, digits and inner \
+             hyphens only, so one concept cannot arrive under two spellings"
+        ),
+        "{shouted}"
+    );
+
+    let estate = fixture.run(
+        &fixture.main,
+        &["tag", "rename", "infra", "acme/infra", "--as", "geoyws"],
+    );
+    assert!(!estate.status.success(), "an unregistered estate was taken");
+    let estate = String::from_utf8_lossy(&estate.stderr).to_string();
+    assert!(
+        estate.contains(
+            "tag acme/infra names estate acme, which is not registered: a namespaced tag \
+             is filed under one of ifca, unum, geoyws, so one subsystem cannot arrive under \
+             two owners"
+        ),
+        "{estate}"
+    );
+
+    // Every refusal left the master file exactly as it was.
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["tag", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["infra".to_owned(), "queuer".to_owned()]
+    );
+}
+
+#[test]
+fn tag_rename_is_admissible_inside_transact() {
+    // A rename is a write like any other, so it belongs in the one batch that
+    // is all-or-nothing (ADR-041). The registry half is the part that has to
+    // be proved: it cannot join the board's transaction, so it is held until
+    // the batch commits -- a rolled-back batch that had already rewritten the
+    // rules would leave them pointing at a tag no board has.
+    let fixture = Fixture::new("tag-rename-transact");
+    fixture.ok_json(&fixture.main, &["init", "--name", "TRANSACTED", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "infra", "--as", "geoyws", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task", "add", "Ship it", "--id", "t-ship", "--tag", "infra", "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "rule",
+            "add",
+            "Infra ships behind a flag.",
+            "--as",
+            "geoyws",
+            "--tag",
+            "infra",
+            "--json",
+        ],
+    );
+
+    let rule_tags = |fixture: &Fixture| {
+        fixture.ok_json(&fixture.main, &["rule", "list", "--full", "--json"])[0]["tags"].clone()
+    };
+
+    // A second item that cannot land: the rename must go back with it.
+    let rolled_back = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({
+                "name": "tag_rename",
+                "arguments": { "old": "infra", "new": "ifca/infra", "as": "geoyws" },
+            }),
+            json!({
+                "name": "task_update",
+                "arguments": { "id": "t-missing", "title": "no such task", "as": "geoyws" },
+            }),
+        ],
+    );
+    assert_eq!(rolled_back["ok"], false, "{rolled_back}");
+    assert_eq!(rolled_back["failedIndex"], 1, "{rolled_back}");
+    assert_eq!(rolled_back["rolledBack"], true, "{rolled_back}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["tag", "list", "--json"])[0]["name"],
+        "infra",
+        "the rename survived a rolled-back batch"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-ship", "--json"])["tags"],
+        json!(["infra"])
+    );
+    assert_eq!(
+        rule_tags(&fixture),
+        json!(["ALL", "infra"]),
+        "the registry rewrite must wait for the board's commit"
+    );
+
+    // The same batch with a second item that works: both land.
+    let landed = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            json!({
+                "name": "tag_rename",
+                "arguments": { "old": "infra", "new": "ifca/infra", "as": "geoyws" },
+            }),
+            json!({
+                "name": "task_update",
+                "arguments": { "id": "t-ship", "title": "Ship it now", "as": "geoyws" },
+            }),
+        ],
+    );
+    assert_eq!(landed["ok"], true, "{landed}");
+    assert_eq!(landed["results"][0]["result"]["rules"], 1, "{landed}");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-ship", "--json"])["tags"],
+        json!(["ifca/infra"])
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-ship", "--json"])["title"],
+        "Ship it now"
+    );
+    assert_eq!(rule_tags(&fixture), json!(["ALL", "ifca/infra"]));
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["audit", "verify", "--json"])["healthy"],
+        json!(true)
+    );
+}
+
+#[test]
 fn a_project_whose_tree_moved_is_reported_rather_than_silently_unreachable() {
     // Registration canonicalises, so a stored root is right when written and
     // can only go wrong afterwards. This repository is the worked example: it

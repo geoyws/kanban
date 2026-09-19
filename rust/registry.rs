@@ -264,6 +264,28 @@ fn active_rule_tags(connection: &Connection) -> Result<Vec<(String, Vec<String>)
         .map_err(Into::into)
 }
 
+/// The active rules that carry `tag` as a subsystem tag and whose board
+/// selector reaches `board_name`.
+///
+/// A selector tag (`ALL`, `ONLY:`, `EXCEPT:`, `SPRINT:`) that happens to read
+/// like the renamed tag is not a match: the two share one ordered list, and
+/// only the subsystem half is a board's vocabulary.
+fn rules_carrying_tag(
+    connection: &Connection,
+    tag: &str,
+    board_name: Option<&str>,
+) -> Result<Vec<(String, Vec<String>)>> {
+    Ok(active_rule_tags(connection)?
+        .into_iter()
+        .filter(|(_, tags)| {
+            selector_tags_apply(tags, board_name)
+                && tags
+                    .iter()
+                    .any(|candidate| !is_selector_tag(candidate) && candidate == tag)
+        })
+        .collect())
+}
+
 fn validate_active_rule_selectors(
     connection: &Connection,
     rule_id: &str,
@@ -3937,6 +3959,74 @@ impl Registry {
         let rule = transaction.query_row("SELECT * FROM rules WHERE id=?", [&id], rule_row)?;
         transaction.commit()?;
         Ok(rule)
+    }
+
+    /// Move one board's subsystem tag onto a new spelling across the rules
+    /// that scope to that board.
+    ///
+    /// The second half of `tag rename`, and deliberately a **second
+    /// transaction**: rules live in this registry database, the tagged rows
+    /// live in the board database, and two connections cannot share one
+    /// SQLite transaction. The caller runs this strictly after the board's
+    /// rename has committed (`rust/store.rs`'s `rename_tag`), so the only
+    /// reachable half-state is "board renamed, rules still on the old
+    /// spelling" — rules that now match fewer rows rather than more, repaired
+    /// by `kanban rule update ID --tag NEW`.
+    ///
+    /// Only active rules are touched, and only those whose board selector
+    /// covers the renaming board: a tag is a board's vocabulary, and `ALL` or
+    /// `ONLY:<board>` is what says this rule reads that board's rows. A
+    /// retired rule is a record of what was, so it keeps the spelling it was
+    /// retired with, exactly as `remove_tag` only counts active rules.
+    pub fn rename_rule_tag(
+        &mut self,
+        old: &str,
+        new: &str,
+        board_name: Option<&str>,
+        actor: &str,
+    ) -> Result<i64> {
+        let actor = validate_rule_actor(actor)?.to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let affected = rules_carrying_tag(&transaction, old, board_name)?;
+        let now = now_ms();
+        for (id, tags) in &affected {
+            let rewritten = tags
+                .iter()
+                .map(|tag| {
+                    if !is_selector_tag(tag) && tag == old {
+                        new.to_owned()
+                    } else {
+                        tag.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            transaction.execute(
+                "UPDATE rules SET tags=?,updated_at=? WHERE id=?",
+                params![serde_json::to_string(&rewritten)?, now, id],
+            )?;
+            crate::audit::append_registry_event(
+                &transaction,
+                id,
+                "rule_tag_renamed",
+                &actor,
+                &json!({"ruleID": id, "old": old, "new": new, "previousTags": tags}).to_string(),
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        i64::try_from(affected.len()).context("more rules than a count can hold")
+    }
+
+    /// How many active rules a board's `tag rename` would rewrite.
+    ///
+    /// Read through the same filter the rewrite uses, because the receipt is
+    /// printed by the item and the rewrite may be owed until a `transact`
+    /// batch commits — two predicates would let the two disagree.
+    pub fn rule_tag_uses(&self, tag: &str, board_name: Option<&str>) -> Result<i64> {
+        let affected = rules_carrying_tag(&self.connection, tag, board_name)?;
+        i64::try_from(affected.len()).context("more rules than a count can hold")
     }
 
     pub fn rules(&self, include_archived: bool) -> Result<Vec<Rule>> {
