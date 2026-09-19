@@ -138,7 +138,9 @@ function Answer({
           )
         ) : (
           <>
-            <span className="key">{digit}</span>
+            <span className="key" data-testid="deck-digit">
+              {digit}
+            </span>
             {choice.label}
           </>
         )}

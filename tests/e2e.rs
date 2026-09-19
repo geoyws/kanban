@@ -26750,6 +26750,12 @@ mod ui {
     pub const DECK_NOTE: &str = "[data-testid=deck-note]";
     pub const DECK_KEYS: &str = "[data-testid=deck-keys]";
     pub const DECK_BODY: &str = "[data-testid=deck-body]";
+    /// The digit one answer button carries, in its own node: the keyboard
+    /// map is printed on the control it drives (WEB-27), so the digit is
+    /// read off the button rather than off a badge cluster beside it.
+    pub const DECK_DIGIT: &str = "[data-testid=deck-digit]";
+    /// How many items the deck says are still waiting.
+    pub const DECK_COUNT: &str = "[data-open-count]";
     /// The priority pill, wherever the deck has put it.
     pub const DECK_PRIORITY: &str = "[data-testid=deck-priority]";
 
@@ -26836,6 +26842,8 @@ mod ui {
         ("__DECK_NOTE__", DECK_NOTE),
         ("__DECK_KEYS__", DECK_KEYS),
         ("__DECK_BODY__", DECK_BODY),
+        ("__DECK_DIGIT__", DECK_DIGIT),
+        ("__DECK_COUNT__", DECK_COUNT),
         ("__DECK_PRIORITY__", DECK_PRIORITY),
     ];
 }
@@ -51163,6 +51171,333 @@ fn an_incomplete_own_answer_refuses_before_posting_in_real_chrome() {
             .iter()
             .all(|row| row["decision"].is_null()),
         "the board recorded a decision the page refused to post: {open}"
+    );
+}
+
+/// A6 (SPA-22, SPA-21) — the item was settled by another lane while the card
+/// was on screen, and the store is the one that says so.
+///
+/// The two shipped refusal cases stub a `409` at `window.fetch`, which
+/// measures the page's handling of a refusal and nothing about the sentence
+/// the board actually writes. Here nothing is stubbed: `attention resolve`
+/// runs through the binary as the raiser, the browser then posts the answer
+/// it was already holding, and `Store::resolve_attention_with_authorization`
+/// refuses it. What is asserted is the store's own sentence, character for
+/// character, on the card's board-refusal node.
+///
+/// The note is typed FIRST on purpose. A draft is what holds an arriving
+/// projection (`answerInProgress`), so the deck goes on showing the card the
+/// board has already moved past — which is the only way a real board refusal
+/// can be reached from a real browser at all.
+#[test]
+fn a_card_another_lane_resolved_is_refused_by_the_board_in_real_chrome() {
+    let desk = deck_desk("serve-deck-board-gone", "DECKGONE");
+    let id = desk.ids[0].clone();
+    let form = ui::CURRENT_DECIDE;
+    let recommended = format!("{form} {}", ui::RECOMMENDED_CHOICE);
+
+    let note = desk
+        .tab
+        .wait_for_element(&format!("{form} {}", ui::DECK_NOTE))
+        .expect("the note field");
+    note.click().expect("focus the note");
+    note.type_into("hold it").expect("type the note");
+    wait_for_js_true(
+        &desk.tab,
+        &format!("document.querySelector('{form} __DECK_NOTE__').value === 'hold it'"),
+    );
+
+    // Another lane settles it through the binary. The raiser may resolve its
+    // own item, so this is a write the board accepts and not a refusal of
+    // its own.
+    desk.fixture.ok_json(
+        &desk.fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "codex@driver",
+            "--choice",
+            "keep-parked",
+            "--json",
+        ],
+    );
+    let rows = wait_for_notice_rows(&desk.tab, 1, "the other lane's resolution");
+    eprintln!("notice while the card is held: {rows:?}");
+
+    click_control(&desk.tab, &recommended);
+    let refused = format!("{form} {}", ui::refusal("board"));
+    wait_for_js_true(
+        &desk.tab,
+        &format!("Boolean(document.querySelector('{refused}'))"),
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!("document.querySelector('{refused}').textContent")
+        ),
+        format!(
+            "attention {id} was already resolved by codex@driver \
+             — it is history, not a queue entry"
+        ),
+        "the card is not carrying the store's own sentence"
+    );
+
+    let measured = measure(
+        &desk.tab,
+        &format!(
+            "(() => {{ const card = document.querySelector('__CARD__[data-item=\"{id}\"]'); \
+             const controls = [...card.querySelectorAll('.choice, .record')]; \
+             return JSON.stringify({{ \
+             current: document.querySelector('__CURRENT__').dataset.item, \
+             slot: [...document.querySelectorAll('__CARD__')] \
+               .findIndex(row => row.dataset.item === '{id}'), \
+             controls: controls.length, \
+             enabled: controls.every(control => !control.disabled), \
+             state: card.dataset.state ?? null, \
+             busy: card.getAttribute('aria-busy'), \
+             count: document.querySelector('__DECK_COUNT__').textContent, \
+             receipts: document.querySelectorAll('__RECEIPT__').length, \
+             history: document.querySelectorAll('__HISTORY_RECEIPT__').length, \
+             note: card.querySelector('__DECK_NOTE__').value }}); }})()"
+        ),
+        "the card the board refused",
+    );
+    eprintln!("refused by the board: {measured}");
+    assert_eq!(measured["current"], id.as_str(), "{measured}");
+    assert_eq!(
+        measured["slot"], 0,
+        "the refused card lost its place: {measured}"
+    );
+    assert!(
+        measured["controls"].as_i64().unwrap_or_default() > 1,
+        "{measured}"
+    );
+    assert_eq!(
+        measured["enabled"], true,
+        "a refused card cannot be answered at all: {measured}"
+    );
+    assert_eq!(measured["state"], Value::Null, "{measured}");
+    assert_eq!(measured["busy"], Value::Null, "{measured}");
+    assert_eq!(
+        measured["count"], "3",
+        "the deck's remaining count moved on a decision nothing recorded: {measured}"
+    );
+    assert_eq!(measured["receipts"], 0, "{measured}");
+    assert_eq!(measured["history"], 0, "{measured}");
+    assert_eq!(
+        measured["note"], "hold it",
+        "the refusal took the operator's words with it: {measured}"
+    );
+
+    // The board is where it was before the click: the other lane's decision,
+    // and no second one written over it.
+    let settled = settled_row(&desk.fixture, &id);
+    assert_eq!(settled["decision"]["choice"], "keep-parked", "{settled}");
+    assert_eq!(settled["decision"]["by"], "codex@driver", "{settled}");
+    let open = desk.fixture.ok_json(
+        &desk.fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open.as_array().expect("the open rows").len(), 2, "{open}");
+}
+
+/// A7 (SPA-22, SPA-21) — the authored choices were rewritten underneath, and
+/// the refusal names the key that is gone.
+///
+/// The same rule `a_reply_naming_a_choice_the_row_no_longer_carries_is_refused_by_name_over_http`
+/// drives over HTTP, driven here from the card a person is actually looking
+/// at: the rewrite lands through `attention update`, the stale key is
+/// clicked, and the sentence `rust/model.rs`'s composer writes is on the
+/// card. Then the held projection lands and the answers on screen are the
+/// ones that now exist — and one of those records.
+///
+/// A picked verdict is the hold, rather than a typed note: clicking an
+/// authored choice clears the verdict, so the page stops answering the
+/// moment the refusal arrives and the projection it was holding is applied.
+/// A note would hold it for ever and the second half of A7 could not run.
+#[test]
+fn a_stale_choice_is_refused_by_name_and_the_rewritten_keys_record_in_real_chrome() {
+    let desk = deck_desk("serve-deck-stale-choice", "DECKSTALE");
+    let id = desk.ids[0].clone();
+    let form = ui::CURRENT_DECIDE;
+
+    open_custom_answer(&desk.tab, form);
+    click_control(&desk.tab, &format!("{form} input[name=outcome]"));
+    wait_for_js_true(
+        &desk.tab,
+        &format!("document.querySelector('{form} input[name=outcome]').checked"),
+    );
+
+    desk.fixture.ok_json(
+        &desk.fixture.main,
+        &[
+            "attention",
+            "update",
+            &id,
+            "--as",
+            "codex@driver",
+            "--question",
+            "Which seat pays for the hax login: the platform budget, or the lane that needs it?",
+            "--context",
+            "Rewritten by the raiser while this card was open, which is the whole point of the case.",
+            "--choice",
+            "go=Charge it to the platform budget|approve",
+            "--consequence",
+            "go=The seat is bought today and the adapter's live receipt is taken this week.",
+            "--choice",
+            "wait=Wait for a seat to free up|defer",
+            "--consequence",
+            "wait=Nothing is bought and the receipt waits on somebody else's renewal.",
+            "--recommend",
+            "go",
+            "--json",
+        ],
+    );
+    let rows = wait_for_notice_rows(&desk.tab, 1, "the other lane's rewrite");
+    eprintln!("notice while the card is held: {rows:?}");
+
+    // The key the card is still showing, which the row no longer carries.
+    click_control(
+        &desk.tab,
+        &format!("{form} [data-testid=deck-choice-keep-parked]"),
+    );
+    let refused = format!("__CARD__[data-item=\"{id}\"] {}", ui::refusal("board"));
+    wait_for_js_true(
+        &desk.tab,
+        &format!("Boolean(document.querySelector('{refused}'))"),
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!("document.querySelector('{refused}').textContent")
+        ),
+        format!("attention {id} has no choice keep-parked; its choices are go, wait"),
+        "the refusal does not name the key the row no longer carries"
+    );
+    let open = desk.fixture.ok_json(
+        &desk.fixture.main,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(open.as_array().expect("the open rows").len(), 3, "{open}");
+    assert!(
+        open.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["decision"].is_null()),
+        "a refused key settled the row anyway: {open}"
+    );
+
+    // The refreshed card: the keys that now exist, and the stale one gone.
+    wait_for_js_true(
+        &desk.tab,
+        &format!(
+            "(() => {{ const card = document.querySelector('__CARD__[data-item=\"{id}\"]'); \
+             return Boolean(card) \
+             && Boolean(card.querySelector('[data-testid=deck-choice-go]')) \
+             && Boolean(card.querySelector('[data-testid=deck-choice-wait]')) \
+             && !card.querySelector('[data-testid=deck-choice-keep-parked]'); }})()"
+        ),
+    );
+    assert_eq!(
+        js_value(
+            &desk.tab,
+            &format!(
+                "JSON.stringify([...document.querySelectorAll('__CARD__[data-item=\"{id}\"] \
+                 __DECK_CHOICES__')].map(button => button.value))"
+            )
+        ),
+        "[\"go\",\"wait\"]",
+        "the refreshed card is not showing the choices the row now carries"
+    );
+
+    // ...and one of them records, so what was measured is the key and not a
+    // write path the refusal broke.
+    click_control(&desk.tab, &format!("{form} [data-testid=deck-choice-go]"));
+    assert_receipt(&desk.tab, &id, "Charge it to the platform budget");
+    let settled = settled_row(&desk.fixture, &id);
+    assert_eq!(settled["decision"]["choice"], "go", "{settled}");
+    assert_eq!(settled["decision"]["outcome"], "approve", "{settled}");
+    assert_eq!(settled["decision"]["by"], "geoyws", "{settled}");
+}
+
+/// SPA-31 — one quiet keyboard line, and the digits live on the buttons.
+///
+/// The shipped proof was `one_quiet_keys_line_carries_no_kbd_badges_unit`
+/// over the bytes the server used to render, which the SPA retires. This is
+/// the same rule read off the MOUNTED deck: one line, in the quiet register,
+/// naming each key beside what it does; every answer carrying its own digit
+/// in a node of its own; and no `kbd` badge cluster competing with the
+/// answers anywhere on the page.
+#[test]
+fn one_quiet_keys_line_names_the_digits_on_the_answers_in_real_chrome() {
+    let desk = deck_desk("serve-deck-keys-line", "DECKKEYS");
+    let quiet = token(&desk.tab, "--overlay");
+
+    let measured = measure(
+        &desk.tab,
+        "(() => { const lines = [...document.querySelectorAll('__DECK_KEYS__')]; \
+         const line = lines[0]; const style = getComputedStyle(line); \
+         const probe = document.createElement('span'); \
+         probe.style.fontFamily = 'var(--mono)'; document.body.append(probe); \
+         const mono = getComputedStyle(probe).fontFamily; probe.remove(); \
+         const card = document.querySelector('__CURRENT_CARD__'); \
+         const buttons = [...card.querySelectorAll('__DECK_CHOICES__')]; \
+         return JSON.stringify({ \
+         lines: lines.length, \
+         text: line.textContent, \
+         inCard: Boolean(line.closest('__CARD__')), \
+         color: style.color, \
+         fontFamily: style.fontFamily, \
+         mono, \
+         size: parseFloat(style.fontSize), \
+         bodySize: parseFloat(getComputedStyle(document.body).fontSize), \
+         digits: buttons.map(button => \
+           [...button.querySelectorAll('__DECK_DIGIT__')].map(node => node.textContent)), \
+         kbd: document.querySelectorAll('kbd').length}); })()",
+        "the deck's keyboard line",
+    );
+    eprintln!("keys: {measured}");
+    assert_eq!(
+        measured["lines"], 1,
+        "the deck renders more than one keyboard hint line: {measured}"
+    );
+    assert_eq!(
+        measured["inCard"], false,
+        "the keyboard line is inside a card, so every card repeats it: {measured}"
+    );
+    let text = measured["text"].as_str().expect("the line's text");
+    for named in ["1–4 answer", "s skip", "u undo", "c own"] {
+        assert!(
+            text.contains(named),
+            "the keyboard line does not name {named:?}: {measured}"
+        );
+    }
+    assert_eq!(
+        measured["color"],
+        quiet.as_str(),
+        "the keyboard line is not in the quiet register: {measured}"
+    );
+    assert_eq!(
+        measured["fontFamily"], measured["mono"],
+        "the keyboard line is not in the mono stack: {measured}"
+    );
+    assert!(
+        measured["size"].as_f64().unwrap_or_default()
+            < measured["bodySize"].as_f64().unwrap_or_default(),
+        "the keyboard line is not quieter than the page's own text: {measured}"
+    );
+    assert_eq!(
+        measured["kbd"], 0,
+        "a key-badge cluster is competing with the answers: {measured}"
+    );
+    // Each answer carries ITS digit, in its own node, in the order the
+    // keyboard map promises: `1` is the recommendation, and nothing shares.
+    assert_eq!(
+        measured["digits"],
+        json!([["1"], ["2"], ["3"]]),
+        "the digits are not one per answer, on the answer: {measured}"
     );
 }
 
