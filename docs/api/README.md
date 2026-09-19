@@ -199,6 +199,18 @@ board whose sitreps read the store refuses instead of propagating it. A board
 this caller may not read is therefore absent from the listing rather than
 refused inside it, indistinguishable from a board with no sitreps.
 
+The task listings obey it at the store since `t-34f6eed5` (2026-09-19):
+`Store::list_tasks` and `Store::list_tasks_with_claims` drop every row whose
+tags fail the same all-of-tag read test `task show` refuses a named read
+with, exactly as `Store::sprint_tasks` already did. That one filter is what
+`task list`, `/api/v1/board/{project}`, the `/board/{project}` page, the
+context pack and MCP all read through, so none of them can serve a row the
+caller may not see — and neither can any count taken over them: the
+dashboard's `taskCounts` and `totalTasks` and the board index's `tasks` and
+`todo` are tallies of that listing, and a tally over hidden rows reports
+their existence as surely as their titles would. Held by
+`a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http`.
+
 Two refusals are deliberately *not* generic, and both are the product's own
 words rather than the store's state:
 
