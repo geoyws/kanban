@@ -6113,6 +6113,14 @@ impl Store {
     /// `<anything>@<lane>` or when the task it is about carries that lane.
     /// Both routes are one SQL clause, so `limit` bounds the lane's rows and
     /// not a page that was filtered after the fact.
+    ///
+    /// A row whose tags this caller may not read is not in the answer, on the
+    /// same all-of-tag test a named read is refused with, and exactly as
+    /// [`Store::list_tasks`] filters. The filtering is here rather than in
+    /// each caller because every attention listing in the product — `att
+    /// list`, `/api/v1/needs-you`, a task's open items, the hover preview,
+    /// the mounted deck and MCP — reads through this one function, and a
+    /// question, its body and its choices disclose what they are about.
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
@@ -6136,9 +6144,25 @@ impl Store {
         }
         let (where_clause, mut values) =
             self.attention_filter(status, kind, task, tag, lane, include_archived)?;
-        values.push(Box::new(limit));
+        // Under managed enforcement the bound is applied to the rows this
+        // caller may READ, not to the raw rows: a `LIMIT` bound in SQL runs
+        // before the tag test, so a denied row would consume a slot and the
+        // page would come back short with nothing to say it had. Every
+        // caller's over-fetch arithmetic depends on that — the `+1` probes
+        // that detect a next page, `bounded_page`'s `len > limit`, the
+        // preview's find over a bounded read, and the dashboard's
+        // `limit = 1` urgency read, which a denied row would empty. Outside
+        // managed enforcement nothing can be denied, so the direct estate
+        // keeps the SQL bound and reads exactly what it asked for.
+        let enforcing = self.authz.is_enforcing();
+        let bound = if enforcing {
+            String::new()
+        } else {
+            values.push(Box::new(limit));
+            " LIMIT ?".to_owned()
+        };
         let sql = format!(
-            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',priority ASC,created_at ASC,id ASC LIMIT ?"
+            "SELECT * FROM attention{where_clause} ORDER BY status='resolved',priority ASC,created_at ASC,id ASC{bound}"
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
@@ -6147,24 +6171,51 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
+        if enforcing {
+            rows.retain(|row| self.authz.permits_read(&row.tags));
+            // A negative bound is SQLite's "no bound", and stays one here.
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
         Ok(rows)
     }
 
     /// How many attention rows nobody has settled: the dashboard's number,
     /// counted rather than fetched, so a board past the listing's page still
     /// reports what it holds. Same filter as `attention(Some("open"), …)`.
+    ///
+    /// A `COUNT(*)` cannot see tags, and a count taken over rows this caller
+    /// may not see reports their existence as surely as printing their
+    /// titles would. So when enforcement can deny, the number is taken over
+    /// the same rows the listing would hand back — fetched, tagged and
+    /// filtered on the one read test. Outside managed enforcement
+    /// `permits_read` cannot refuse anything, and the direct estate pays
+    /// nothing for a guard that cannot deny: it keeps the SQL count.
     pub fn count_open_attention(&self) -> Result<i64> {
         self.authz.check_read(&[])?;
         let (where_clause, values) =
             self.attention_filter(Some("open"), None, None, None, None, false)?;
+        if !self.authz.is_enforcing() {
+            let refs = values.iter().map(|value| value.as_ref());
+            return self
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM attention{where_clause}"),
+                    params_from_iter(refs),
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
         let refs = values.iter().map(|value| value.as_ref());
-        self.connection
-            .query_row(
-                &format!("SELECT COUNT(*) FROM attention{where_clause}"),
-                params_from_iter(refs),
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        let mut statement = self
+            .connection
+            .prepare(&format!("SELECT * FROM attention{where_clause}"))?;
+        let mut rows = statement
+            .query_map(params_from_iter(refs), attention_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_attention_tags(&self.connection, &mut rows)?;
+        rows.retain(|row| self.authz.permits_read(&row.tags));
+        Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
     }
 
     /// The newest resolved attention rows, decided-first — the web's Recent
@@ -6175,17 +6226,32 @@ impl Store {
     /// decided lately": a board with more resolved rows than the caller's
     /// bound would hand back its oldest decisions. This is the one read that
     /// orders by `resolved_at DESC`.
+    ///
+    /// A row whose tags this caller may not read is not in the answer, on the
+    /// same all-of-tag test a named read is refused with: a decision that was
+    /// taken about a row this caller may not see is still about that row. The
+    /// bound is the READABLE rows', for the reason [`Store::attention`] gives
+    /// — the decisions room over-fetches per board and merges, and a denied
+    /// row spending a scan slot would drop a readable decision off the end.
     pub fn recent_resolved_attention(&self, limit: i64) -> Result<Vec<Attention>> {
         self.authz.check_read(&[])?;
-        let mut statement = self.connection.prepare(
+        let enforcing = self.authz.is_enforcing();
+        let sql = format!(
             "SELECT * FROM attention WHERE status='resolved' AND archived=0 \
-             ORDER BY resolved_at DESC,id ASC LIMIT ?",
-        )?;
+             ORDER BY resolved_at DESC,id ASC{}",
+            if enforcing { "" } else { " LIMIT ?" }
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let bound: &[&dyn rusqlite::ToSql] = if enforcing { &[] } else { &[&limit] };
         let mut rows = statement
-            .query_map([limit], attention_row)?
+            .query_map(bound, attention_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
+        if enforcing {
+            rows.retain(|row| self.authz.permits_read(&row.tags));
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
         Ok(rows)
     }
 
@@ -9604,6 +9670,302 @@ mod tests {
             listed.len(),
             2,
             "the total counts rows this caller may not read"
+        );
+    }
+
+    /// The same finding one surface along: the attention listings, the
+    /// decisions view and the open count hand back only what this caller may
+    /// read (`t-8efced5b`).
+    ///
+    /// Board read plus one tag's read is the authority; `secret` is held on
+    /// neither capability. The row carrying BOTH tags is in the fixture on
+    /// purpose: the read test is all-of-tag, so holding one of a row's two
+    /// tags is not authority over the row, and a filter written as any-of
+    /// would hand it over — question, body and choices together.
+    ///
+    /// The resolved secret row is there for `recent_resolved_attention`: a
+    /// decision taken about a row this caller may not see is still about
+    /// that row. `count_open_attention` is asserted beside the listing
+    /// because it is a `COUNT(*)` that cannot see tags, and a number is a
+    /// disclosure too.
+    ///
+    /// The direct estate is asserted unchanged in the same fixture: outside
+    /// managed enforcement every row is still listed and still counted.
+    #[test]
+    fn managed_attention_listings_and_their_count_exclude_a_tag_denied_row() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "eeeeeeee-7777-4777-8777-777777777777";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-attention-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let secret_open;
+        let secret_resolved;
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible");
+            seed.raise_attention(
+                "the visible question",
+                "decision",
+                "seed",
+                Some("t-visible"),
+                1,
+                &["visible".to_owned()],
+                &DecisionCard::default(),
+            )
+            .expect("raise visible");
+            // More urgent than every readable row, so a SQL `LIMIT` bound
+            // before the tag test would spend the whole page on it.
+            secret_open = seed
+                .raise_attention(
+                    "the secret question",
+                    "decision",
+                    "seed",
+                    None,
+                    0,
+                    &["secret".to_owned()],
+                    &DecisionCard::default(),
+                )
+                .expect("raise secret")
+                .id;
+            for (body, priority) in [
+                ("the second visible question", 2),
+                ("the third visible question", 3),
+            ] {
+                seed.raise_attention(
+                    body,
+                    "decision",
+                    "seed",
+                    None,
+                    priority,
+                    &["visible".to_owned()],
+                    &DecisionCard::default(),
+                )
+                .expect("raise another visible");
+            }
+            seed.raise_attention(
+                "the question carrying both tags",
+                "decision",
+                "seed",
+                None,
+                1,
+                &["visible".to_owned(), "secret".to_owned()],
+                &DecisionCard::default(),
+            )
+            .expect("raise both");
+            secret_resolved = seed
+                .raise_attention(
+                    "the secret decision",
+                    "decision",
+                    "seed",
+                    None,
+                    1,
+                    &["secret".to_owned()],
+                    &DecisionCard::default(),
+                )
+                .expect("raise secret decision")
+                .id;
+            // Decided FIRST, so the unreadable decision below is the newest
+            // one and would take the whole page of a bound applied in SQL.
+            let visible_resolved = seed
+                .raise_attention(
+                    "the visible decision",
+                    "decision",
+                    "seed",
+                    None,
+                    1,
+                    &["visible".to_owned()],
+                    &DecisionCard::default(),
+                )
+                .expect("raise visible decision")
+                .id;
+            seed.resolve_attention(
+                &visible_resolved,
+                "seed",
+                &AttentionAnswer::custom("other", "settled"),
+            )
+            .expect("resolve the visible decision");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            seed.resolve_attention(
+                &secret_resolved,
+                "seed",
+                &AttentionAnswer::custom("other", "settled"),
+            )
+            .expect("resolve the secret decision");
+        }
+
+        let grants = || {
+            authority([
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::BoardTag {
+                        board_id: board.to_owned(),
+                        tag: "visible".to_owned(),
+                    },
+                    Capability::Read,
+                ),
+            ])
+        };
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants(), board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+
+        let open = store
+            .attention(Some("open"), None, None, None, None, 100, false)
+            .expect("att list");
+        assert_eq!(
+            open.iter().map(|row| row.body.as_str()).collect::<Vec<_>>(),
+            [
+                "the visible question",
+                "the second visible question",
+                "the third visible question"
+            ],
+            "the attention listing handed over a row this caller may not read"
+        );
+        assert_eq!(
+            store.count_open_attention().expect("count open attention"),
+            3,
+            "the open count counts rows this caller may not read"
+        );
+
+        // The bound is the READABLE rows'. The denied row is the most urgent
+        // one on the board, so a `LIMIT` bound in SQL — before the tag test —
+        // would spend this page on it and answer nothing, which is what the
+        // dashboard's own `limit = 1` urgency read would then report.
+        assert_eq!(
+            store
+                .attention(Some("open"), None, None, None, None, 1, false)
+                .expect("the urgency read")
+                .iter()
+                .map(|row| row.body.as_str())
+                .collect::<Vec<_>>(),
+            ["the visible question"],
+            "a denied row spent this caller's whole page"
+        );
+        assert_eq!(
+            store
+                .attention(Some("open"), None, None, None, None, 2, false)
+                .expect("a bounded page")
+                .len(),
+            2,
+            "a denied row spent a slot of this caller's page"
+        );
+        let decided = store
+            .recent_resolved_attention(100)
+            .expect("recent decisions");
+        assert_eq!(
+            decided
+                .iter()
+                .map(|row| row.body.as_str())
+                .collect::<Vec<_>>(),
+            ["the visible decision"],
+            "the decisions view handed over a decision about a row this caller may not read"
+        );
+        // The decisions room's scan is bounded per board before the merge, so
+        // the newest decision being unreadable must not cost the readable one
+        // its place in the scan.
+        assert_eq!(
+            store
+                .recent_resolved_attention(1)
+                .expect("the bounded scan")
+                .iter()
+                .map(|row| row.body.as_str())
+                .collect::<Vec<_>>(),
+            ["the visible decision"],
+            "an unreadable decision spent this caller's whole scan"
+        );
+
+        // Naming the row is not a way round the listing: the hover preview's
+        // named read is a `find` over this same bounded listing
+        // (`projection::preview`), so the id it would resolve is absent, and
+        // the tag filter answers the empty listing an unused tag would.
+        let bounded = store
+            .attention(None, None, None, None, None, 500, false)
+            .expect("the preview's bounded listing");
+        assert!(
+            !bounded
+                .iter()
+                .any(|row| row.id == secret_open || row.id == secret_resolved),
+            "a named read of the hidden rows would have resolved"
+        );
+        assert!(
+            store
+                .attention(None, None, None, Some("secret"), None, 100, false)
+                .expect("att list --tag secret")
+                .is_empty(),
+            "the tag filter named the hidden rows"
+        );
+
+        // The direct estate is untouched: the same partial authority sees
+        // every row, because `permits_read` cannot refuse outside managed.
+        let relaxed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Direct, grants(), board.to_owned()),
+        )
+        .expect("open the direct estate");
+        assert_eq!(
+            relaxed
+                .attention(Some("open"), None, None, None, None, 100, false)
+                .expect("att list")
+                .len(),
+            5,
+            "the direct estate stopped listing its own rows"
+        );
+        assert_eq!(
+            relaxed
+                .count_open_attention()
+                .expect("count open attention"),
+            5,
+            "the direct estate stopped counting its own rows"
+        );
+        // Its bound is still the raw one SQL applies: the most urgent row on
+        // the board is the one no managed caller may read, and the direct
+        // estate reads exactly what it asked for.
+        assert_eq!(
+            relaxed
+                .attention(Some("open"), None, None, None, None, 1, false)
+                .expect("the urgency read")
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            [secret_open.as_str()],
+            "the direct estate's own bound changed"
+        );
+        assert_eq!(
+            relaxed
+                .recent_resolved_attention(100)
+                .expect("recent decisions")
+                .len(),
+            2,
+            "the direct estate stopped reporting its own decisions"
+        );
+        assert_eq!(
+            relaxed
+                .recent_resolved_attention(1)
+                .expect("the bounded scan")
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            [secret_resolved.as_str()],
+            "the direct estate's own scan bound changed"
         );
     }
 

@@ -2743,6 +2743,282 @@ fn a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http() {
     );
 }
 
+/// A tag-denied attention row is in no queue, in no decisions listing, in no
+/// preview and in no open count (`t-8efced5b`).
+///
+/// INTEGRATION, at the layer `http`: the real binary, a real managed estate,
+/// the CLI and the serving process running as the same identity. The caller
+/// holds board read plus `tag:visible` read on Alpha, and full ownership of
+/// Beta so the whole-estate listings answer at all rather than refusing
+/// entire.
+///
+/// The attention row is the disclosure the task listing's fix did not cover:
+/// a question, its body and its choices say what they are about. `a-both`
+/// carries both tags, because the read test is all-of-tag and a filter
+/// written as any-of would hand it over.
+///
+/// Every assertion is paired with its positive control — the `visible` row
+/// IS queued, IS previewable and IS counted — so a surface that had simply
+/// broken would fail here too.
+#[test]
+fn a_tag_denied_attention_row_is_in_no_queue_no_decision_and_no_count_over_http() {
+    let estate = ManagedEstate::new("json-tag-attention");
+    let work_a = estate.work_a.clone();
+
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "alpha visible row",
+            "--id",
+            "t-avis",
+            "--tag",
+            "visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+
+    let raise = |body: &str, priority: &str, tags: &[&str]| -> String {
+        let mut args = vec![
+            "attention",
+            "raise",
+            body,
+            "--task",
+            "t-avis",
+            "--kind",
+            "decision",
+            "--priority",
+            priority,
+        ];
+        for tag in tags {
+            args.push("--tag");
+            args.push(tag);
+        }
+        args.extend(["--as", "seed", "--json"]);
+        estate.ok_json(&work_a, &args)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The denied row is the most urgent thing on Alpha. The board index
+    // reads the urgent row with `limit = 1` (`board_summaries`), so a bound
+    // applied before the tag test would hand that single slot to the row
+    // this caller may not read, the filter would empty the page, and Alpha
+    // would rank as though it held nothing urgent at all.
+    let visible = raise("the visible question", "2", &["visible"]);
+    let secret = raise("the secret question", "1", &["secret"]);
+    let both = raise(
+        "the question carrying both tags",
+        "1",
+        &["visible", "secret"],
+    );
+    // The decided row: resolved here, while the estate is still direct and
+    // this caller is still a full owner of it, so what `/api/v1/decided`
+    // withholds below is a real decision and not an unsettled row.
+    let decided_secret = raise("the secret decision", "6", &["secret"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &decided_secret,
+            "--choice",
+            "approve",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let decided_visible = raise("the visible decision", "6", &["visible"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &decided_visible,
+            "--choice",
+            "approve",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+
+    // Beta, which this caller owns outright, holds one `P1`-shaped row: it
+    // is the ruler the board index's urgency order is read against below.
+    let work_b = estate.work_b.clone();
+    estate.ok_json(
+        &work_b,
+        &[
+            "task",
+            "add",
+            "beta row",
+            "--id",
+            "t-brow",
+            "--priority",
+            "3",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+
+    estate.bind_self(
+        "p-visible-only",
+        &[
+            board_scope("read", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+        ],
+    );
+    estate.grant("p-visible-only", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    let hidden = [secret.as_str(), both.as_str(), decided_secret.as_str()];
+    let ids = |rows: &Value, what: &str| -> Vec<String> {
+        rows.as_array()
+            .unwrap_or_else(|| panic!("{what} is not a listing: {rows}"))
+            .iter()
+            .map(|row| {
+                row.get("id")
+                    .or_else(|| row.pointer("/attention/id"))
+                    .unwrap_or_else(|| panic!("{what} row carries no id: {row}"))
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    // 1. `attention list` on the CLI — the surface `kb att list` reads.
+    let listed = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        ids(&listed, "attention list"),
+        vec![visible.clone()],
+        "att list handed over a card this caller may not read: {listed}"
+    );
+
+    // 2. `/api/v1/needs-you`, which reads the same store listing.
+    let queue = server.get_json("/api/v1/needs-you");
+    let queued = ids(&queue["items"], "needs-you");
+    assert_eq!(
+        queued,
+        vec![visible.clone()],
+        "the queue handed over a card this caller may not read: {queue}"
+    );
+    for (card, row) in queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(listed.as_array().unwrap())
+    {
+        agrees_on_shared_keys(
+            &card["attention"],
+            row,
+            &["id", "kind", "status", "priority", "choices", "tags"],
+            "a needs-you card",
+        );
+    }
+
+    // 3. `/api/v1/decided`: a decision taken about a row this caller may not
+    //    read is still about that row.
+    let decided = server.get_json("/api/v1/decided");
+    assert_eq!(
+        ids(&decided["items"], "decided"),
+        vec![decided_visible.clone()],
+        "the decisions listing handed over a decision this caller may not read: {decided}"
+    );
+
+    // 4. The task detail's open items and its count.
+    let detail = server.get_json("/api/v1/task/Alpha/t-avis");
+    let open = detail["openAttention"].as_array().unwrap();
+    assert_eq!(
+        open.len(),
+        1,
+        "the task's open attention counts rows this caller may not read: {detail}"
+    );
+    assert_eq!(
+        open[0]["attention"]["id"].as_str(),
+        Some(visible.as_str()),
+        "the task detail carried the wrong row: {detail}"
+    );
+
+    // 5. The hover preview names a row: the hidden ones answer the one
+    //    non-enumerating refusal, and the readable one answers.
+    for id in hidden {
+        let path = format!("/api/v1/preview/attention/Alpha/{id}");
+        let answer = server.get(&path);
+        assert_eq!(answer.status, 404, "{path}: {}", answer.body);
+        assert_eq!(
+            answer.body, DENIED_JSON,
+            "{path} answered a refusal of its own"
+        );
+    }
+    let preview = server.get_json(&format!("/api/v1/preview/attention/Alpha/{visible}"));
+    assert_eq!(
+        preview["attention"]["id"].as_str(),
+        Some(visible.as_str()),
+        "the preview refused the row this caller MAY read: {preview}"
+    );
+
+    // 6. The board index's aggregate, which is `count_open_attention`.
+    let boards = server.get_json("/api/v1/boards");
+    let alpha = boards["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["board"] == "Alpha")
+        .unwrap_or_else(|| panic!("the index did not report Alpha: {boards}"));
+    assert_eq!(
+        alpha["openAttention"], 1,
+        "the open attention count counts rows this caller may not read: {alpha}"
+    );
+
+    //    …and its ORDER, which is the `limit = 1` urgency read. Alpha's most
+    //    urgent READABLE row is priority 2 and Beta's ruler is 3, so Alpha
+    //    ranks first. A bound applied before the tag test would have spent
+    //    Alpha's single slot on the denied priority-1 row, left the urgency
+    //    read empty, and dropped Alpha behind Beta on its tasks alone.
+    assert_eq!(
+        boards["items"][0]["board"], "Alpha",
+        "the board index ranked Alpha as though its readable urgent row were not there: {boards}"
+    );
+
+    // 7. Nothing the hidden rows carry is anywhere in the listing bodies —
+    //    a body or a question names the row as surely as its id would. The
+    //    task detail is swept on its `openAttention` member rather than
+    //    whole: its event stream still carries the `attention_raised`
+    //    envelopes of rows this caller may not read, which is the separate
+    //    unfixed disclosure and not this listing's.
+    let served = format!("{queue}{decided}{boards}{}", detail["openAttention"]);
+    for needle in [
+        secret.as_str(),
+        both.as_str(),
+        decided_secret.as_str(),
+        "the secret question",
+        "the question carrying both tags",
+        "the secret decision",
+    ] {
+        assert!(
+            !served.contains(needle),
+            "a served body named {needle}, which this caller may not read"
+        );
+    }
+    assert!(
+        served.contains("the visible question") && served.contains("the visible decision"),
+        "the served bodies lost the rows this caller MAY read"
+    );
+}
+
 /// A tag-denied prerequisite, ancestor and child, read through a row the
 /// caller MAY read (`t-3548303e`).
 ///
