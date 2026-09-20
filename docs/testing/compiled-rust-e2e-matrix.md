@@ -299,7 +299,7 @@ became a MUST on 2026-09-18. By layer,
 test at the layer §3 assigns it. WEB-40 moved from `unit` to `chrome` with
 `t-bf255880` wave 1.
 
-## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-57
+## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-58
 
 One row per requirement, on branch `docs/t-eed0a923-spa-spec` at 2026-09-19:
 commit `e3ae94a`. The specification is at `Draft — gate requested 2026-09-19`;
@@ -380,8 +380,9 @@ measures rather than re-pointed at the new one (SPA-51).
 | `SPA-55` | MUST | chrome | `the_card_is_named_by_its_question_in_real_chrome` | `every_field_is_labelled_and_status_is_announced_once_unit` holds the labelling over served bytes today |
 | `SPA-56` | MUST | unit | `the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit` | landed 2026-09-19 over the bundle's own stylesheet: its `:root` block is asserted equal to the served `CSS`'s, no hex is written outside it, and WEB-48/49/50's arithmetic re-runs on the bundle's tokens (the AA pair list is now one `AA_TOKEN_PAIRS` const both proofs read). Not re-run over the bundle yet, because the rules they judge have not moved into it: the `.pill` clause of `overlay_never_sits_on_surface0_unit`, and `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` and `prose_blocks_are_bounded_to_seventy_characters_unit` — those arrive with the deck (`t-1f495a7f`, `t-bf255880`) |
 | `SPA-57` | MUST | unit | `the_document_references_no_third_party_unit` | extended by `t-992e40aa` to sweep the bundle as well as the document |
+| `SPA-58` | MUST | chrome | `an_unknown_board_says_board_not_found_in_real_chrome` | landed 2026-09-20 with `t-208ec763`: `/board/NO-SUCH-BOARD` mounts and reads `Board not found` with no generic failure sentence and no `board-refusal` paragraph, and the known board loaded in the same tab still renders its rows. `an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http` holds the two statuses the state is derived from — the shell is `200` and byte-identical for a known and an unknown name, the projection is `404` with `{"error":"denied or not found"}` — so a shell that became an existence oracle and a projection that stopped refusing fail separately. The row that asked for this measured a `500` on 2026-09-18 at `b98e81e`, before the SPA cutover (`t-bf255880`) deleted the arm that produced it |
 
-57 requirements: 57 MUST, no SHOULD and no MAY. By layer, 43 `chrome`, 6
+58 requirements: 58 MUST, no SHOULD and no MAY. By layer, 44 `chrome`, 6
 `http`, 5 `unit` and 3 `process`. A requirement *preserves* a `WEB-nn` when
 its specification `Source` line says so, which excludes SPA-51 — it retires
 two WEB requirements rather than preserving any: on that rule 42 requirements

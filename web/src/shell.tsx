@@ -17,7 +17,7 @@
 
 import type { ReactElement, ReactNode } from "react";
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { fetchJson } from "./api";
+import { fetchJson, Refused } from "./api";
 import { navigate } from "./router";
 
 /**
@@ -59,6 +59,13 @@ export function useRefreshSignal(): number {
 export interface Projection<T> {
   data: T | null;
   error: string | null;
+  /**
+   * The status the read was refused with, or `null` while it has not been
+   * refused by the server. A page that owes the operator a named state for
+   * one status — `404`, the projection's single non-enumerating refusal —
+   * reads it here rather than parsing the sentence.
+   */
+  status: number | null;
   reload: () => void;
 }
 
@@ -73,6 +80,7 @@ export interface Projection<T> {
 export function useProjection<T>(path: string): Projection<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<number | null>(null);
   const [asked, setAsked] = useState(0);
   const refreshes = useRefreshSignal();
   const reload = useCallback(() => setAsked((count) => count + 1), []);
@@ -84,6 +92,7 @@ export function useProjection<T>(path: string): Projection<T> {
         if (live) {
           setData(rows);
           setError(null);
+          setStatus(null);
         }
       })
       .catch((failure: unknown) => {
@@ -93,6 +102,7 @@ export function useProjection<T>(path: string): Projection<T> {
         // A refused read leaves the rows that are on screen alone: the
         // operator is reading them, and replacing a page with a sentence
         // because one poll failed loses their place.
+        setStatus(failure instanceof Refused ? failure.status : null);
         setError(
           failure instanceof Error
             ? `This page could not be read (${failure.message}).`
@@ -103,7 +113,7 @@ export function useProjection<T>(path: string): Projection<T> {
       live = false;
     };
   }, [path, asked, refreshes]);
-  return { data, error, reload };
+  return { data, error, status, reload };
 }
 
 /** What a page tells the shell about itself. */

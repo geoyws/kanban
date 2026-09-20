@@ -10,7 +10,8 @@
  * A board this principal may not read, one that is retired, and one that
  * does not exist all answer the same way — the projection's single
  * non-enumerating refusal — and so this page says the same sentence for all
- * three (SPA-08).
+ * three (SPA-08): `Board not found`, the words the write arms already use
+ * for the same three reasons, rather than a generic failure (SPA-58).
  */
 
 import type { ReactElement } from "react";
@@ -68,10 +69,23 @@ interface BoardDetail {
 
 export default function BoardPage({ route }: { route: Route }): ReactElement {
   const name = route.params.project ?? "";
-  const { data, error } = useProjection<BoardDetail>(
+  const { data, error, status } = useProjection<BoardDetail>(
     `/api/v1/board/${encodeURIComponent(name)}`,
   );
   const rows = data?.tasks.items ?? [];
+  // The one status that is an answer rather than a fault: the projection's
+  // single non-enumerating refusal (`404`). It is the same sentence the
+  // four POST arms already write for the same three reasons — unknown,
+  // retired, unreadable — so the operator reads "Board not found" instead
+  // of a generic failure carrying a route and a number (SPA-58).
+  if (status === 404) {
+    return (
+      <main id="main" data-page data-route="board" data-testid="app-root">
+        <h1>Board not found</h1>
+        <p data-testid="board-not-found">No board named {name} is readable here.</p>
+      </main>
+    );
+  }
   return (
     <main id="main" data-page data-route="board" data-testid="app-root">
       <h1>{data?.board ?? name}</h1>

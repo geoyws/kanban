@@ -81,6 +81,25 @@ export interface Listing<T> {
 }
 
 /**
+ * A read the server refused, carrying the status it refused with.
+ *
+ * Typed rather than a bare `Error` because one status is a product state
+ * and not a fault: `404` is the projection's single non-enumerating
+ * refusal (`Refusal::DeniedOrNotFound` in `rust/projection.rs`), which a
+ * page renders as a named state instead of as a broken page. Every other
+ * status stays the generic failure it is.
+ */
+export class Refused extends Error {
+  readonly status: number;
+
+  constructor(path: string, status: number) {
+    super(`${path} ${status}`);
+    this.name = "Refused";
+    this.status = status;
+  }
+}
+
+/**
  * Read one projection.
  *
  * Every read in this application goes through here, so there is one place
@@ -93,7 +112,7 @@ export async function fetchJson<T>(path: string): Promise<T> {
     headers: { Accept: "application/json" },
   });
   if (!response.ok) {
-    throw new Error(`${path} ${response.status}`);
+    throw new Refused(path, response.status);
   }
   return (await response.json()) as T;
 }

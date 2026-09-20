@@ -292,21 +292,22 @@ Recorded here because the specification's §8 evidence rows will be read against
 it, and because a contract that quietly diverges from the shipped surface is
 worse than one that names the gap.
 
-- **A named board that is unknown, retired or ambiguous is `500` today on the
-  pages, with detail — closed on the JSON surface by `t-88814b7a`; the page
-  arms still answer `500`.** `board(name)` calls `project_named`, whose error
-  text names the board and, for a retired one, its retirement note
-  (`rust/registry.rs:571`-`rust/registry.rs:581`); `handle` renders that text
-  into a `500`. The shipped test asserts exactly this: `/board/RETIRED`
-  returns `500` and the body contains the retirement note `retire served
-  board` (`serve_hides_retired_boards_from_the_board_index_and_board_route`).
-  The JSON surface does not copy it: `/api/v1/board/{project}` and
-  `/api/v1/task/{project}/{id}` answer `404` with the byte-identical
+- **CLOSED 2026-09-20 (`t-208ec763`): a named board that is unknown, retired
+  or ambiguous was `500` on the pages.** The page arm that produced it is
+  gone. `/board/{project}` no longer opens the board while rendering: since
+  the cutover (`t-bf255880`) it serves the static application shell, `200`
+  and byte-identical for every name, so it is not an existence oracle and
+  has no store error to render. The board's existence is answered only by
+  `/api/v1/board/{project}`, which answers `404` with the byte-identical
   `{"error":"denied or not found"}` for an unknown, retired or ambiguous
-  board and for an absent row, asserted by
-  `the_json_projection_refuses_unknown_retired_and_unauthorized_boards_with_one_body_over_http`.
-  The pages keep their behaviour until the cutover (`t-1f495a7f`) retires
-  them, so this line stays a divergence rather than a closed item.
+  board and for an absent row — the contract this document declares —
+  asserted by
+  `the_json_projection_refuses_unknown_retired_and_unauthorized_boards_with_one_body_over_http`
+  and, on both arms at once, by
+  `an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http`.
+  What the operator reads is the client's not-found state (`SPA-58`,
+  `an_unknown_board_says_board_not_found_in_real_chrome`); the four `POST`
+  arms already answered `404 Board not found` and are unchanged.
 - **kanban sets no security response headers.** The headers the server adds
   are `Content-Type` — `text/html; charset=utf-8` on a page,
   `application/json; charset=utf-8` on a JSON route — plus `Location` on a

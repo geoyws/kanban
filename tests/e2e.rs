@@ -46298,12 +46298,12 @@ fn the_json_projection_never_serialises_a_lease_token_over_http() {
 #[test]
 fn the_json_projection_refuses_unknown_retired_and_unauthorized_boards_with_one_body_over_http() {
     // SPA-08. A refusal that distinguishes "not yours" from "not there" is an
-    // existence oracle, so all of them answer one body. The HTML arm answers
-    // 500 with the store's detailed text for these same three cases
-    // (`serve_hides_retired_boards_from_the_board_index_and_board_route`,
-    // `served_board_pages_fail_closed_on_duplicate_names`); the JSON surface
-    // must not copy it, which is the divergence recorded in
-    // `docs/api/README.md`.
+    // existence oracle, so all of them answer one body. Since the SPA cutover
+    // (`t-bf255880`) this route IS the board's existence answer: `/board/
+    // {project}` serves the static application shell for every name, so the
+    // status below is what the operator's page reads and what
+    // `an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http`
+    // pins on both arms at once.
     let fixture = Fixture::new("json-denial");
     let active = fixture.root.join("active");
     let retired = fixture.root.join("retired");
@@ -46367,6 +46367,136 @@ fn the_json_projection_refuses_unknown_retired_and_unauthorized_boards_with_one_
     assert!(
         !body.contains("rootless") && !body.contains("Alpha"),
         "the refusal enumerated the candidates: {body}"
+    );
+}
+
+/// SPA-58 at the HTTP layer: where a board's existence is answered now.
+///
+/// Before the SPA cutover (`t-bf255880`) `/board/{name}` opened the board
+/// while rendering, so an unknown name reached `project_named` and left as
+/// a `500` carrying the store's sentence. That arm no longer exists: the
+/// route serves the static application shell, byte-identical for every
+/// name, and the board is opened by `/api/v1/board/{project}` — which is
+/// therefore the arm that owes a `404`, and the one the page reads to
+/// decide what to render.
+///
+/// Both halves are asserted in one case on purpose: a shell that started
+/// answering `404`, or a projection that started answering `500`, would
+/// each pass a test that only looked at the other.
+#[test]
+fn an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http() {
+    let fixture = Fixture::new("board-not-found");
+    fixture.ok_json(&fixture.main, &["init", "--name", "KNOWN", "--json"]);
+    let server = spawn_server(&fixture);
+    let port = server.port;
+
+    let (status, unknown_shell) = http_get(port, "/board/NO-SUCH-BOARD");
+    assert_eq!(
+        status, 200,
+        "the mounted route stopped serving the shell: {unknown_shell}"
+    );
+    let (status, known_shell) = http_get(port, "/board/KNOWN");
+    assert_eq!(status, 200, "{known_shell}");
+    // The HTML arm is not an existence oracle: the two documents are the
+    // same bytes, and neither carries the board's name or the state the
+    // client renders from the projection's status.
+    assert_eq!(
+        unknown_shell, known_shell,
+        "the shell differs between a known and an unknown board"
+    );
+    assert!(
+        unknown_shell.contains("data-testid=app-root-shell"),
+        "the unknown board was answered by something other than the shell: {unknown_shell}"
+    );
+    for leak in [
+        "NO-SUCH-BOARD",
+        "KNOWN",
+        "Board not found",
+        "no board named",
+    ] {
+        assert!(
+            !unknown_shell.contains(leak),
+            "the shell carried {leak}: {unknown_shell}"
+        );
+    }
+
+    // The arm that answers for the board answers `404`, in the estate's one
+    // refusal body — the same bytes the write arms and every other
+    // projection refusal use, so the client has one shape to read.
+    let (status, refusal) = http_get(port, "/api/v1/board/NO-SUCH-BOARD");
+    assert_eq!(status, 404, "an unknown board is not a 404: {refusal}");
+    assert_eq!(refusal, JSON_DENIED_OR_NOT_FOUND, "{refusal}");
+
+    // Negative control: the known board still answers, so the 404 above is
+    // the name and not the route.
+    let (status, known) = http_get(port, "/api/v1/board/KNOWN");
+    assert_eq!(status, 200, "{known}");
+    assert!(known.contains("\"board\":\"KNOWN\""), "{known}");
+}
+
+/// SPA-58 where the operator meets it: the page, in a real browser.
+///
+/// The HTTP case above can only prove the status; what the row is about is
+/// what a person sees, and since the cutover that is rendered by the
+/// bundle from the projection's `404`. So the state is read in Chrome —
+/// the heading and the sentence — and the known board is loaded in the
+/// same tab as the control, because a page that showed "Board not found"
+/// for every name would pass the first half alone.
+#[test]
+fn an_unknown_board_says_board_not_found_in_real_chrome() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("board-not-found-chrome");
+    fixture.ok_json(&fixture.main, &["init", "--name", "KNOWN", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["task", "add", "a seeded row", "--as", "geoyws", "--json"],
+    );
+    let server = spawn_server(&fixture);
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "board not found tab");
+
+    tab.navigate_to(&format!("{origin}/board/NO-SUCH-BOARD"))
+        .expect("load an unknown board");
+    tab.wait_until_navigated().expect("initial navigation");
+    wait_for_app_root(&tab, ui::APP_ROOT);
+    tab.wait_for_element("[data-testid=board-not-found]")
+        .expect("the not-found state");
+    let unknown = js_value(&tab, "document.body.innerText");
+    let unknown = unknown.as_str().expect("the page's text");
+    assert!(
+        unknown.contains("Board not found"),
+        "an unknown board is not named as not found: {unknown}"
+    );
+    // The generic failure is what this row exists to remove: a sentence
+    // carrying a route and a status number is not a state an operator can
+    // act on.
+    assert!(
+        !unknown.contains("could not be read"),
+        "the unknown board still shows the generic failure: {unknown}"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelectorAll('[data-testid=board-refusal]').length"
+        ),
+        Value::Number(0.into()),
+        "the not-found state still carries the generic refusal paragraph"
+    );
+
+    tab.navigate_to(&format!("{origin}/board/KNOWN"))
+        .expect("load the known board");
+    tab.wait_until_navigated().expect("control navigation");
+    wait_for_app_root(&tab, ui::APP_ROOT);
+    tab.wait_for_element("[data-testid=board-row]")
+        .expect("the known board's rows");
+    let known = js_value(&tab, "document.body.innerText");
+    let known = known.as_str().expect("the control page's text");
+    assert!(known.contains("a seeded row"), "{known}");
+    assert!(
+        !known.contains("Board not found"),
+        "a board that exists was called not found: {known}"
     );
 }
 

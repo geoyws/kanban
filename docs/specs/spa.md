@@ -2,7 +2,7 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `SPA`. Requirement IDs are `SPA-01` .. `SPA-57`, stable across wording
+- **Slice ID:** `SPA`. Requirement IDs are `SPA-01` .. `SPA-58`, stable across wording
   refinements; numbering is by creation, grouping is by topic.
 - **Baseline:** `2026-09-19` at commit `e3ae94a` on branch `docs/t-eed0a923-spa-spec`. Every
   "today" claim below cites the line that has it, as `<path>:<line>`.
@@ -684,6 +684,22 @@ page from elsewhere.
 *Quality constraints:* this is what keeps the edge's existing `self`-scoped policy applicable
 without kanban sending a policy header of its own.
 
+### A board that cannot be read
+
+**SPA-58** — a board that cannot be read is a named state, not a broken page.
+Strength: MUST · Layer: chrome · Source: `SPA-08`'s single non-enumerating refusal; kb
+`t-208ec763`.
+A route parameterised by a board name answers the application shell for every name — the
+served bytes are byte-identical whether the board exists or not — and the board's existence is
+answered only by its projection. When that projection answers `404`, the page renders the
+not-found state in the words the four write arms already use, `Board not found`, and shows no
+generic failure sentence; any other refusal stays the generic failure it is. The state is the
+same for a board that is unknown, one that is retired and one this principal may not read, so
+the page enumerates nothing `SPA-08` withholds.
+*Failure behaviour:* a page that shows a route and a status number where a state belongs, or a
+shell that answers `404` for an unknown name and so becomes an existence oracle ahead of the
+projection, fails this requirement.
+
 ## 4. Acceptance examples
 
 Given/When/Then in plain prose. Each heading names the requirement IDs it proves.
@@ -992,14 +1008,15 @@ row that must write one.
 | `SPA-55` | MUST | chrome | `the_card_is_named_by_its_question_in_real_chrome` | `every_field_is_labelled_and_status_is_announced_once_unit` holds the labelling over served bytes today |
 | `SPA-56` | MUST | unit | `the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit` | landed 2026-09-19 over the bundle's own stylesheet: its `:root` block is asserted equal to the served `CSS`'s, no hex is written outside it, and WEB-48/49/50's arithmetic re-runs on the bundle's tokens (the AA pair list is now one `AA_TOKEN_PAIRS` const both proofs read). Not re-run over the bundle yet, because the rules they judge have not moved into it: the `.pill` clause of `overlay_never_sits_on_surface0_unit`, and `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` and `prose_blocks_are_bounded_to_seventy_characters_unit` — those arrive with the deck (`t-1f495a7f`, `t-bf255880`) |
 | `SPA-57` | MUST | unit | `the_document_references_no_third_party_unit` | extended by `t-992e40aa` to sweep the bundle as well as the document |
+| `SPA-58` | MUST | chrome | `an_unknown_board_says_board_not_found_in_real_chrome` | landed 2026-09-20 with `t-208ec763`: `/board/NO-SUCH-BOARD` mounts and reads `Board not found` with no generic failure sentence and no `board-refusal` paragraph, and the known board loaded in the same tab still renders its rows. `an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http` holds the two statuses the state is derived from — the shell is `200` and byte-identical for a known and an unknown name, the projection is `404` with `{"error":"denied or not found"}` — so a shell that became an existence oracle and a projection that stopped refusing fail separately. The row that asked for this measured a `500` on 2026-09-18 at `b98e81e`, before the SPA cutover (`t-bf255880`) deleted the arm that produced it |
 
-**Counts.** 57 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 43 `chrome`, 6
+**Counts.** 58 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 44 `chrome`, 6
 `http`, 5 `unit`, 3 `process`. By group: identity 3 (`SPA-01`..`SPA-03`), readiness 2
 (`SPA-04`..`SPA-05`), the JSON projection 8 (`SPA-06`..`SPA-13`), the Needs-you deck 21
 (`SPA-14`..`SPA-34`), the read pages 8 (`SPA-35`..`SPA-42`), decided/plans/subscriptions/sprints
 and deployments 5 (`SPA-43`..`SPA-47`), the live channel 2 (`SPA-48`..`SPA-49`), payload 1
-(`SPA-50`), what is retired 1 (`SPA-51`), and the rendered result keeping ADR-046 6
-(`SPA-52`..`SPA-57`).
+(`SPA-50`), what is retired 1 (`SPA-51`), the rendered result keeping ADR-046 6
+(`SPA-52`..`SPA-57`), and a board that cannot be read 1 (`SPA-58`).
 
 **How the WEB figures below are counted.** A requirement *preserves* a `WEB-nn` when its
 `Source` line says so; `SPA-51` is excluded because it retires two WEB requirements rather than
@@ -1090,4 +1107,15 @@ absent from both the detail and the index).
   a gate, so `docs/api/kanban-web.openapi.yaml` is unchanged; the rule is recorded in
   `docs/api/README.md`. `SPA-08` names
   `a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http`, and
+  `docs/testing/compiled-rust-e2e-matrix.md` carries the same row verbatim.
+- `2026-09-20` — `t-208ec763` added `SPA-58`. The row was raised against a `500` measured on
+  2026-09-18 at `b98e81e`; re-measured at `0611327` the served arm no longer exists — the
+  cutover (`t-bf255880`) made `/board/{project}` the static shell (`200`, byte-identical for
+  every name) and moved the board's existence onto `/api/v1/board/{project}`, which already
+  answered `404` with the contract's `DeniedOrNotFound` body. What was still wrong was the
+  page: it showed the generic `This page could not be read (/api/v1/board/X 404).`. The
+  client now carries a typed refusal (`Refused` in `web/src/api.ts`, its status on
+  `useProjection`) and the board page renders `Board not found`. No route was added and no
+  status changed, so `docs/api/kanban-web.openapi.yaml` is unchanged; the divergence
+  `docs/api/README.md` recorded for these three cases is closed there.
   `docs/testing/compiled-rust-e2e-matrix.md` carries the same row verbatim.
