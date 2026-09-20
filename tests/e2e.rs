@@ -9443,7 +9443,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
             "--as",
             "agent",
             "--to",
-            "driver-2",
+            "@:team/project/driver-2",
             "--summary",
             "resume this",
             "--intent",
@@ -17316,6 +17316,190 @@ done
 }
 
 #[test]
+fn handoff_create_refuses_bare_driver_lanes_but_not_non_lane_identities() {
+    let fixture = Fixture::new("handoff-lane-target-create");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "HANDOFF-LANES", "--json"],
+    );
+
+    for lane in ["driver", "driver-2", "driver-3"] {
+        let refused = fixture.run(
+            &fixture.main,
+            &[
+                "handoff",
+                "create",
+                "--as",
+                "outgoing",
+                "--to",
+                lane,
+                "--summary",
+                "s",
+                "--intent",
+                "i",
+                "--next-action",
+                "n",
+                "--json",
+            ],
+        );
+        let message = refusal_object(&refused);
+        assert_eq!(
+            message,
+            format!(
+                "handoff target {lane} is a bare lane name; pass the full typed actor as --to @:team/project/{lane}"
+            )
+        );
+        assert!(
+            fixture
+                .ok_json(&fixture.main, &["handoff", "list", "--json"])
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a refused bare target wrote a handoff row"
+        );
+    }
+
+    // These are outside /^driver(?:-[1-9][0-9]*)?$/ and therefore retain the
+    // ordinary identity behavior. The fourth value proves the rule is not a
+    // blanket refusal of every untyped addressee.
+    for target in ["driverless", "driver-two", "driver-0", "incoming"] {
+        let created = fixture.ok_json(
+            &fixture.main,
+            &[
+                "handoff",
+                "create",
+                "--as",
+                "outgoing",
+                "--to",
+                target,
+                "--summary",
+                "s",
+                "--intent",
+                "i",
+                "--next-action",
+                "n",
+                "--json",
+            ],
+        );
+        assert_eq!(created["toAgent"], target);
+    }
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["handoff", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn typed_lane_actor_accepts_only_its_matching_legacy_bare_lane_target() {
+    let fixture = Fixture::new("handoff-lane-target-legacy");
+    fixture.ok_json(
+        &fixture.main,
+        &["init", "--name", "HANDOFF-LEGACY", "--json"],
+    );
+    let board = board_path_for_project(&fixture, &fixture.main, "HANDOFF-LEGACY");
+
+    let seed_legacy = |label: &str, target: &str| {
+        let created = fixture.ok_json(
+            &fixture.main,
+            &[
+                "handoff",
+                "create",
+                "--as",
+                "outgoing",
+                "--to",
+                label,
+                "--summary",
+                "legacy row",
+                "--intent",
+                "resume it",
+                "--next-action",
+                "accept it",
+                "--json",
+            ],
+        );
+        let id = created["id"].as_str().unwrap().to_owned();
+        Connection::open(&board)
+            .unwrap()
+            .execute(
+                "UPDATE handoffs SET to_agent=? WHERE id=?",
+                params![target, id],
+            )
+            .unwrap();
+        id
+    };
+
+    let matching = seed_legacy("legacy-matching", "driver-2");
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &matching,
+            "--as",
+            "@:team/project/driver-2",
+            "--json",
+        ],
+    );
+    assert_eq!(accepted["handoff"]["toAgent"], "driver-2");
+    assert_eq!(accepted["handoff"]["acceptedBy"], "@:team/project/driver-2");
+    assert!(accepted["claim"].is_null());
+
+    let wrong_lane = seed_legacy("legacy-wrong-lane", "driver-2");
+    for actor in ["@:team/project/driver-3", "driver-3"] {
+        let refused = fixture.run(
+            &fixture.main,
+            &["handoff", "accept", &wrong_lane, "--as", actor, "--json"],
+        );
+        assert_eq!(
+            refusal_object(&refused),
+            format!("handoff {wrong_lane} targets driver-2, not {actor}")
+        );
+    }
+
+    let typed = seed_legacy("legacy-typed-target", "@:team/project/driver-2");
+    let same_lane_other_actor = fixture.run(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &typed,
+            "--as",
+            "@:other/project/driver-2",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refusal_object(&same_lane_other_actor),
+        format!("handoff {typed} targets @:team/project/driver-2, not @:other/project/driver-2")
+    );
+    let exact = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "accept",
+            &typed,
+            "--as",
+            "@:team/project/driver-2",
+            "--json",
+        ],
+    );
+    assert_eq!(exact["handoff"]["toAgent"], "@:team/project/driver-2");
+    assert_eq!(exact["handoff"]["acceptedBy"], "@:team/project/driver-2");
+
+    let pending = fixture.ok_json(
+        &fixture.main,
+        &["handoff", "list", "--status", "pending", "--json"],
+    );
+    assert_eq!(pending.as_array().unwrap().len(), 1);
+    assert_eq!(pending[0]["id"], wrong_lane);
+    assert_eq!(pending[0]["toAgent"], "driver-2");
+}
+
+#[test]
 fn a_handoff_can_be_about_the_session_rather_than_one_task() {
     let fixture = Fixture::new("session-handoff");
     fixture.ok_json(&fixture.main, &["init", "--name", "SESSION", "--json"]);
@@ -17331,7 +17515,7 @@ fn a_handoff_can_be_about_the_session_rather_than_one_task() {
             "--as",
             "claude@driver-2",
             "--to",
-            "driver-2",
+            "@:team/project/driver-2",
             "--reason",
             "session_end",
             "--summary",
@@ -17355,7 +17539,13 @@ fn a_handoff_can_be_about_the_session_rather_than_one_task() {
     let addressed = fixture.ok_json(
         &fixture.main,
         &[
-            "handoff", "list", "--status", "pending", "--to", "driver-2", "--json",
+            "handoff",
+            "list",
+            "--status",
+            "pending",
+            "--to",
+            "@:team/project/driver-2",
+            "--json",
         ],
     );
     assert_eq!(addressed.as_array().unwrap().len(), 1);
@@ -17366,7 +17556,13 @@ fn a_handoff_can_be_about_the_session_rather_than_one_task() {
         fixture
             .ok_json(
                 &fixture.main,
-                &["handoff", "list", "--to", "driver-1", "--json"]
+                &[
+                    "handoff",
+                    "list",
+                    "--to",
+                    "@:team/project/driver-1",
+                    "--json"
+                ]
             )
             .as_array()
             .unwrap()
@@ -17381,7 +17577,7 @@ fn a_handoff_can_be_about_the_session_rather_than_one_task() {
             "accept",
             session["id"].as_str().unwrap(),
             "--as",
-            "driver-2",
+            "@:team/project/driver-2",
             "--json",
         ],
     );
@@ -17425,7 +17621,7 @@ fn a_handoff_can_be_about_the_session_rather_than_one_task() {
             "--as",
             "a",
             "--to",
-            "driver-2",
+            "@:team/project/driver-2",
             "--summary",
             "s",
             "--intent",
@@ -17547,7 +17743,7 @@ fn session_handoff_requires_an_addressee_but_a_task_handoff_does_not() {
             "--as",
             "claude@driver-2",
             "--to",
-            "driver-2",
+            "@:team/project/driver-2",
             "--summary",
             "s",
             "--intent",
@@ -17557,7 +17753,7 @@ fn session_handoff_requires_an_addressee_but_a_task_handoff_does_not() {
             "--json",
         ],
     );
-    assert_eq!(created["toAgent"], "driver-2");
+    assert_eq!(created["toAgent"], "@:team/project/driver-2");
     assert_eq!(created["status"], "pending");
 
     // A task handoff keeps --to optional: the task is the address.
@@ -17605,7 +17801,7 @@ fn handoff_retire_closes_a_pending_handoff_without_deleting_it() {
             "--as",
             "claude@driver-2",
             "--to",
-            "driver-2",
+            "@:team/project/driver-2",
             "--summary",
             "Phase landed",
             "--intent",
@@ -20402,7 +20598,7 @@ const CAPPED_LISTINGS: &[CappedListing] = &[
                     "--as",
                     "agent",
                     "--to",
-                    "driver-2",
+                    "@:team/project/driver-2",
                     "--summary",
                     &format!("handoff {index}"),
                     "--intent",
@@ -22620,7 +22816,7 @@ fn provenance_flags_round_trip_exactly_and_capture_matches_the_checkout() {
             "--as",
             "worker",
             "--to",
-            "driver-2",
+            "@:team/project/driver-2",
             "--summary",
             "s",
             "--intent",
@@ -25598,7 +25794,7 @@ fn priority_orders_cli_dashboard_and_web_queues_before_age() {
                 "--as",
                 "agent",
                 "--to",
-                "driver-2",
+                "@:team/project/driver-2",
                 "--summary",
                 summary,
                 "--intent",

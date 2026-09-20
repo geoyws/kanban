@@ -41,6 +41,21 @@ Handoffs may name a target agent, but an unnamed target is valid when the next
 compatible agent should pull the work. Lease tokens are authorization material
 and are never stored in handoff prose or model prompts.
 
+**Compatibility amendment (2026-09-20).** A driver lane follows atmux's
+`^driver(?:-[1-9][0-9]*)?$` grammar. New handoffs may not address that lane by
+its bare name: `--to driver-2` is refused with
+`handoff target driver-2 is a bare lane name; pass the full typed actor as --to @:team/project/driver-2`.
+The writer must store the full `@:team/project/lane` actor instead. This is
+specific to driver-lane names; ordinary untyped identities remain supported.
+
+A typed `@:team/project/<lane>` actor may nevertheless accept a pending legacy
+row whose `to_agent` is exactly the same bare final lane segment. Acceptance
+records the full actor in `accepted_by` and does not rewrite `to_agent`. This is
+a one-way read compatibility rule: a wrong typed lane is refused, a stored
+typed target still requires byte-for-byte actor equality, and an untyped actor
+gains no alias. The create rejection and legacy acceptance use one shared
+parser, so the lane grammar cannot drift between the two sides of the cutover.
+
 Repository-local handoff files are not part of the continuity contract.
 
 ## Consequences

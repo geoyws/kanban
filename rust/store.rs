@@ -37,6 +37,49 @@ fn lane_filter(value: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+/// An atmux driver lane, using the canonical pane-name grammar.
+///
+/// 'driver' is the trunk lane. Numbered lanes start at one and have no leading
+/// zero, so lookalikes such as 'driverless', 'driver-two', and 'driver-0' stay
+/// ordinary identities rather than silently becoming lane addresses.
+fn driver_lane_name(value: &str) -> Option<&str> {
+    if value == "driver" {
+        return Some(value);
+    }
+    let suffix = value.strip_prefix("driver-")?;
+    let mut bytes = suffix.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| matches!(first, b'1'..=b'9'))
+        .then_some(())?;
+    bytes.all(|byte| byte.is_ascii_digit()).then_some(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriverLaneAddress<'a> {
+    Bare(&'a str),
+    Typed(&'a str),
+}
+
+/// Parse either a bare driver lane or its full '@:team/project/lane' actor.
+///
+/// This is deliberately the one predicate used by both sides of the handoff
+/// cutover: new writes reject 'Bare', while acceptance grants the narrow
+/// 'Bare(target) <- Typed(actor)' compatibility match for rows already stored.
+fn driver_lane_address(value: &str) -> Option<DriverLaneAddress<'_>> {
+    if let Some(lane) = driver_lane_name(value) {
+        return Some(DriverLaneAddress::Bare(lane));
+    }
+    let mut segments = value.strip_prefix("@:")?.split('/');
+    let team = segments.next()?;
+    let project = segments.next()?;
+    let lane = segments.next()?;
+    if team.is_empty() || project.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    driver_lane_name(lane).map(DriverLaneAddress::Typed)
+}
+
 fn validate_rule_actor(value: &str) -> Result<&str> {
     nonempty(value, "author")
 }
@@ -6882,19 +6925,28 @@ impl Store {
     pub fn create_handoff(&mut self, input: HandoffInput) -> Result<Handoff> {
         validate(&input.reason, &HANDOFF_REASONS, "handoff reason")?;
         validate_priority(Some(input.priority))?;
+        if let Some(DriverLaneAddress::Bare(lane)) =
+            input.to_agent.as_deref().and_then(driver_lane_address)
+        {
+            bail!(
+                "handoff target {lane} is a bare lane name; pass the full typed actor as --to @:team/project/{lane}"
+            );
+        }
         // A session handoff has no task to carry its address, so it must name
-        // the lane meant to pick it up: a targetless one wedges `/session
-        // cont`, which refuses a lane filter that matches several and a schema
-        // that reads null (ADR-008 — the refusal names the fix). A task handoff
-        // is addressed by its task, whose queue takes it, so `--to` stays
-        // optional there.
+        // the actor meant to pick it up: a targetless one wedges '/session
+        // cont', which refuses a target filter that matches several and a
+        // schema that reads null (ADR-008 — the refusal names the fix). A task
+        // handoff is addressed by its task, whose queue takes it, so '--to'
+        // stays optional there.
         if input.task_id.is_none()
             && input
                 .to_agent
                 .as_deref()
                 .is_none_or(|to| to.trim().is_empty())
         {
-            bail!("a session handoff needs an addressee: pass --to LANE (e.g. --to driver-2)");
+            bail!(
+                "a session handoff needs an addressee: pass --to @:team/project/LANE (e.g. --to @:team/project/driver-2)"
+            );
         }
         let transaction = self.begin_write()?;
         // Handoffs carry no tags of their own: board scope, under the lock.
@@ -7038,15 +7090,17 @@ impl Store {
         if handoff.status != "pending" {
             bail!("handoff {id} is {}", handoff.status);
         }
-        if handoff
-            .to_agent
-            .as_ref()
-            .is_some_and(|target| target != &agent)
-        {
-            bail!(
-                "handoff {id} targets {}, not {agent}",
-                handoff.to_agent.unwrap()
+        if let Some(target) = handoff.to_agent.as_deref() {
+            let legacy_lane_match = matches!(
+                (driver_lane_address(target), driver_lane_address(&agent)),
+                (
+                    Some(DriverLaneAddress::Bare(target_lane)),
+                    Some(DriverLaneAddress::Typed(actor_lane))
+                ) if target_lane == actor_lane
             );
+            if target != agent && !legacy_lane_match {
+                bail!("handoff {id} targets {target}, not {agent}");
+            }
         }
         // A session handoff carries no task, so there is nothing to lease and
         // nothing to make claimable. Accepting it is an acknowledgement: it
@@ -9466,7 +9520,7 @@ mod tests {
             from_agent: "actor".to_owned(),
             from_session: None,
             from_model: None,
-            to_agent: Some("driver-2".to_owned()),
+            to_agent: Some("@:team/project/driver-2".to_owned()),
             reason: "manual".to_owned(),
             priority: 3,
             summary: "s".to_owned(),

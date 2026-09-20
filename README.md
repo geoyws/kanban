@@ -275,6 +275,12 @@ kanban handoff accept h-12345678 --as incoming-agent --json
 kanban context t-resume
 ```
 
+When `--to` names a driver lane, use its full typed actor, for example
+`--to @:team/project/driver-2`; new bare `driver` / `driver-N` targets are
+refused. A typed lane actor can still accept a pending legacy row addressed to
+the matching bare lane. The legacy row keeps its literal `toAgent`, while
+`acceptedBy` records the full actor. Other untyped identities are unchanged.
+
 ## Storage and privacy
 
 `kanban init` registers the current workspace in an operator-private registry:
