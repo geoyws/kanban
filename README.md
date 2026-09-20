@@ -1165,6 +1165,37 @@ instead of claiming a restart that never happened; a host whose service
 manager cannot be asked is a failed install, because a skip is a claim about
 the unit and an unreachable manager supports none.
 
+**A release receipt names both halves, or it names nothing.** One release is
+two facts, and each can be true while the other is false:
+
+- the **executable identity** — the `MainPID` exe path the install proof
+  above reads, `/proc/<MainPID>/exe`, and/or its sha256. This says WHICH
+  binary is serving.
+- the **bundle fingerprint** — the `bundle <sha256>` line the INSTALLED
+  executable's `--version` prints, cross-checked against the package
+  manifest's `bundleSha256`. This says WHICH operator UI that binary
+  actually carries. The UI is embedded by `include_bytes!` (ADR-048), so a
+  correct executable path proves nothing about the bytes a browser is
+  served, and a matching manifest proves nothing about the process that
+  came back from the restart.
+
+A receipt carrying one half is not a release receipt: it is half a
+measurement with the other half assumed.
+
+Where the bundle half lives is a deliberate, narrow answer. `deploy finish
+--observed` takes only TYPED artifact identities, and
+`ARTIFACT_IDENTITY_KINDS` (`rust/model.rs`) is exactly two kinds —
+`docker-image-id` and `oci-manifest-digest` (ADR-043 §3). A bundle sha256 is
+neither: it is a digest of an embedded asset table, not of an image or of an
+image manifest, and offering it as either is refused by name. So the bundle
+fingerprint is recorded in the `--receipt` TEXT of the deployment row, beside
+the executable identity, and the typed kinds are NOT extended to hold it.
+That is the boundary, stated so the next reader does not re-derive it:
+adding a third kind is a model change, and nothing in the receipt law asks
+for one — the law asks that both facts be recorded where the surface already
+supports recording them, which for the bundle fingerprint is the receipt
+text.
+
 `hig-release.sh rollback` owes the same proof and now performs it: it restarts
 the unit and proves the release it rolled back to is the one serving, and its
 summary carries the same `serve` measurement.
@@ -1393,15 +1424,27 @@ See the [product requirements](docs/PRD.md),
 ## Development
 
 ```bash
-./web/gate.sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+./scripts/release-gate.sh
 cargo build --release --locked
 ```
 
-Those commands are the mechanical gate. A change to product behaviour has a
-precondition before them: `/quality spec` runs before implementation, and the
+`scripts/release-gate.sh` is the mechanical gate — one command, so the
+documented gate and the enforced gate cannot drift. It runs `web/gate.sh`,
+`cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked --lib` (including the two ignored fixed-descriptor
+remap tests, serially), the pinned `skills/kb` package's own wrapper tests,
+and then every integration target one at a time with `--test-threads=1`,
+ending with `e2e` — because `e2e` drives a real Chrome and must never run
+concurrently with another cargo command. `KANBAN_CHROME` passes through it
+to name that browser on a host whose system Chrome is broken. It goes green
+because the system became true, never because a measurement was loosened:
+too slow means faster or serialized, never sampled, which is why it carries
+no skip, sample or quick flag. Step order and reasons are written out in
+[`docs/testing/compiled-rust-e2e-matrix.md`](docs/testing/compiled-rust-e2e-matrix.md).
+
+A change to product behaviour has a
+precondition before it: `/quality spec` runs before implementation, and the
 specification, tests, code and trace row land in one change — see
 [`AGENTS.md`](AGENTS.md) §"Specification before implementation", the
 conventions in [`docs/specs/README.md`](docs/specs/README.md), and

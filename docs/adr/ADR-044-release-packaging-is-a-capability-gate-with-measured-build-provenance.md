@@ -879,6 +879,42 @@ What no test on `@@mbp` can do is **write** one. The first genuine v2
 measurement this suite cannot stand in for — which is also why the native
 leg's flags, placement and behaviour had to stay byte-for-byte what §1 froze.
 
+## Amendment — 2026-09-20: a receipt names both halves of the release
+
+§2 and §4 measure the artifact; this amendment says what a receipt must name
+once it is installed, because the verification legs above can each be
+satisfied while the served UI is a mystery. A release receipt names BOTH:
+
+1. **the executable identity** — the `MainPID` exe path
+   (`readlink /proc/<MainPID>/exe`, the proof §4's install leg already
+   performs and `serve: {mainPid, exe, exeSource, …}` already records)
+   and/or its sha256. WHICH binary is serving.
+2. **the bundle fingerprint** — the `bundle <sha256>` line the INSTALLED
+   executable's `--version` prints, cross-checked against the package
+   manifest's `bundleSha256` (ADR-048; the field resolved OQ-4 and is
+   additive beside `manifestSha256`). WHICH operator UI that binary
+   carries.
+
+Neither implies the other. The UI is embedded by `include_bytes!`, so a
+correct exe path proves nothing about the bytes a browser receives, and a
+manifest agreeing with itself proves nothing about the process that came
+back from the restart. A receipt carrying one half is half a measurement
+with the other half assumed — exactly the shape of assumed provenance this
+ADR exists to remove.
+
+**Where the bundle half is recorded, and why it is not a typed identity.**
+`deploy finish --observed` accepts only typed artifact identities, and
+`ARTIFACT_IDENTITY_KINDS` (`rust/model.rs`) is exactly two kinds —
+`docker-image-id` and `oci-manifest-digest` (ADR-043 §3). A bundle sha256
+fits NEITHER: it digests an embedded asset table, not an image and not an
+image manifest, and a `finish` offering it as either is refused by name. So
+the bundle fingerprint travels in the deployment row's `--receipt` text,
+beside the executable identity, and the typed kinds are **not** extended to
+hold it. Adding a third kind would be a model change, and the receipt law
+does not ask for one: it asks that both facts be recorded where the surface
+already supports recording them, which for the bundle fingerprint is the
+receipt text rather than `--observed`.
+
 ## References
 
 - `scripts/hig-release.sh` — every bare `:NNN` citation above, at commit `43eb9de`; narrowed from "every citation" on 2026-09-10, when the amendments added citations written in full against the tree below
@@ -887,5 +923,7 @@ leg's flags, placement and behaviour had to stay byte-for-byte what §1 froze.
 - [ADR-039: The release manifest and receipt schema is frozen at formatVersion 1](ADR-039-release-manifest-and-receipt-schema.md) — §2 and §3 move to `formatVersion` 2 here; §1's manifest, §4's identity rule, §5's sequence, §6's refusals and §7's retention are unchanged
 - [ADR-006: Rust runtime and compiled binary E2E](ADR-006-rust-runtime-and-compiled-binary-e2e.md) — why the evidence is a real process
 - [ADR-008: Fail closed on ambiguous and destructive operations](ADR-008-fail-closed-on-ambiguous-and-destructive-operations.md) — the refusal form §3 and §4 follow
+- [ADR-048: The operator UI is a TypeScript SPA embedded in the binary](ADR-048-the-operator-ui-is-a-typescript-spa-embedded-in-the-binary.md) — `bundleSha256` and the `bundle <sha256>` version line the 2026-09-20 amendment's second half reads
+- [ADR-043: Artifact-identity attempts state an unknown build commit](ADR-043-artifact-identity-attempts-state-an-unknown-build-commit.md) — §3's typed identity kinds, the two `ARTIFACT_IDENTITY_KINDS` a bundle sha256 is not
 - `tests/e2e.rs:31954` — the local/remote twin test that keeps the validator edit in both copies
 - Kanban board: epic `e-6cd91fd9`; task `t-51d5505e` (this ADR); decision `a-4741a3c3` (2026-09-10, choice `mbp-path`) on `t-491ebb8e`; rule `r-7af4dd57` (install targets, not build hosts)

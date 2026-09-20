@@ -16,9 +16,10 @@
 #   3. `web/check-reproducible.sh` -- the committed `web/dist` is what this
 #      source builds.
 #
-# The Rust half (`cargo fmt`, `cargo clippy`, `cargo test`) is the repo's
-# serialized gate command and is NOT run from here: this script is the web
-# tree's own gate and stays runnable on its own.
+# The Rust half (`cargo fmt`, `cargo clippy`, `cargo test`) is NOT run from
+# here: `scripts/release-gate.sh` is the repo's serialized gate command, it
+# runs this script as its first and cheapest step, and this script stays
+# runnable on its own as the web tree's own gate.
 set -Eeuo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

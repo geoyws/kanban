@@ -8,6 +8,16 @@
 - Do not add Bun, Node, npm, pnpm, Yarn, or Corepack runtime dependencies.
 - Every release gate must spawn the compiled binary across real process
   boundaries; in-process domain tests do not count as E2E evidence.
+- The gate is one command: `scripts/release-gate.sh`. It is the web gate,
+  `fmt`, `clippy`, the unit suite, the `skills/kb` wrapper tests and every
+  integration target serialized with `-- --test-threads=1`, `e2e` last. Run
+  it rather than a hand-assembled list, and never a bare
+  `cargo test --all-targets`: the browser suite must not run concurrently
+  with another cargo command. `KANBAN_CHROME` names the browser on a host
+  whose system Chrome is broken. It goes green because the system became
+  true, never because a measurement was loosened — too slow means faster or
+  serialized, never sampled. Steps and reasons:
+  [`docs/testing/compiled-rust-e2e-matrix.md`](docs/testing/compiled-rust-e2e-matrix.md).
 - See [ADR-006](docs/adr/ADR-006-rust-runtime-and-compiled-binary-e2e.md).
 
 ## Specification before implementation

@@ -1,28 +1,85 @@
 # Compiled Rust E2E matrix
 
-The full Rust test gate is
-`cargo test --all-targets --all-features --locked`. It runs in-process unit
-tests and all five integration targets: `e2e`, `dispatcher_e2e`,
-`claude_print_adapter_e2e`, `codex_app_server_adapter_e2e`, and
-`codex_queue_adapter_e2e`. The integration targets invoke the relevant
-production `CARGO_BIN_EXE_*` binaries through `std::process::Command`; those
-process-boundary assertions are compiled-process evidence. The command as a
-whole is a unit/integration/process gate, not compiled-process E2E.
-
-The two fixed-descriptor remap unit tests are run serially and in isolation:
+The gate is one command:
 
 ```bash
-cargo test --lib --all-features --locked workspace_adopt_fd_remap_handles_ -- --ignored --test-threads=1
+scripts/release-gate.sh
 ```
 
-They are isolated unit evidence, not compiled-process E2E. The separately
-ignored `serve_render_fixture_child_process` is still exercised: its non-ignored
-parent starts the current unit-test executable with `--exact --ignored`, the
-exact child test name, and the required marker environment.
-That parent/child pair is isolated unit-test-process evidence, not
-production-binary E2E.
+That script IS the gate. Nothing else is, and no list here restates its
+steps: it runs `web/gate.sh` (typecheck, lint, reproducible bundle), then
+`cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked --lib`, the two ignored
+fixed-descriptor remap unit tests serially, the pinned `skills/kb` package's
+own `bash skills/kb/tests/kb-wrapper-tests.sh`, and then every integration
+target one at a time. Read the script for the order and the reasons; what
+follows is only what a reader of this matrix needs to know about the Rust
+half of it.
 
-Coverage for the full all-targets gate is collected with:
+**The integration targets are the eleven in `tests/`**, in the order the
+script runs them — cheapest first, `e2e` last:
+`claude_print_adapter_e2e`, `codex_queue_adapter_e2e`,
+`access_refusals_e2e`, `opencode_adapter_e2e`, `kimi_acp_adapter_e2e`,
+`cursor_worker_adapter_e2e`, `zcode_notify_adapter_e2e`, `dispatcher_e2e`,
+`codex_app_server_adapter_e2e`, `authz_bypass_matrix_e2e`, and `e2e`. Each
+invokes the relevant production `CARGO_BIN_EXE_*` binaries through
+`std::process::Command`; those process-boundary assertions are
+compiled-process evidence. The gate as a whole is a
+unit/integration/process gate, not compiled-process E2E.
+
+**Serialization is a rule, not a preference.** Each target runs as its own
+`cargo test --locked --test TARGET -- --test-threads=1`, and no cargo
+command runs concurrently with another. `tests/e2e.rs` drives a real Chrome
+against a real compiled `kanban serve`; two of those at once contend for
+one browser cache, ephemeral ports and the whole machine, and what that
+produces is a flake that reads like a product bug. A single
+`cargo test --all-targets` is therefore NOT this gate.
+
+**`KANBAN_CHROME`** is passed through by the script and is the first entry
+in the browser discovery order below. It is how a host whose system Chrome
+is broken still runs the real-browser evidence. A value naming a
+non-executable path is refused by the script rather than silently resolving
+to some other browser.
+
+**The standing constraint on all of it:** the gate goes green because the
+system became true, never because a measurement was loosened. Too slow
+means make it faster or serialize it — never sample it. There is no
+`--only`, no `--skip`, no quick mode and no environment variable that turns
+a step off, and adding one would be the loosening this sentence exists to
+forbid.
+
+What the gate does not run, said plainly so a reader does not mistake it
+for sampling: the two `#[ignore = "FINDING t-4b9501b3: …"]` cases in
+`tests/authz_bypass_matrix_e2e.rs` are recorded product findings — a
+whole-estate listing that refuses entire instead of serving the readable
+subset, and write refusals answering `text/html` where the contract
+declares `application/json`. They are open bugs carrying their own board
+rows, not measurements the gate declines to take, and they run green only
+when the product they name is fixed.
+
+Measured once end to end on 2026-09-20 on `@@mbp` (darwin-arm64, M3 Max)
+with `KANBAN_CHROME` pointed at Playwright Chromium: 17 steps green in
+44m10s, of which the `e2e` target is 2338s of 415 serialized cases. That
+is the number to make smaller by making it faster, not by cutting it up.
+
+The two fixed-descriptor remap unit tests are isolated unit evidence, not
+compiled-process E2E; they are `#[ignore]`d and are run serially and in
+isolation by the gate:
+
+```bash
+cargo test --lib --locked workspace_adopt_fd_remap_handles_ -- --ignored --test-threads=1
+```
+
+The separately ignored `serve_render_fixture_child_process` is still
+exercised: its non-ignored parent starts the current unit-test executable
+with `--exact --ignored`, the exact child test name, and the required marker
+environment. That parent/child pair is isolated unit-test-process evidence,
+not production-binary E2E.
+
+Coverage over the whole Rust tree is collected separately — it is a
+measurement, not the gate, and it is the one place `--all-targets` is still
+the right shape because nothing is being proved by it:
 
 ```bash
 rustup run stable cargo llvm-cov --all-targets --all-features --locked --summary-only
@@ -111,6 +168,39 @@ Passing library/unit tests or invoking `rust/main.rs` through an interpreter is
 not E2E evidence. The gate is incomplete until the compiled executable passes
 this matrix on a clean test data directory, including the real-browser path
 above.
+
+## The receipt law: a release receipt names both halves
+
+The gate above proves the tree. A release receipt proves what is SERVING,
+and that is two facts, each of which can be true while the other is false:
+
+- **the executable identity** — the `MainPID` exe path
+  (`readlink /proc/<MainPID>/exe`) and/or its sha256. WHICH binary is
+  serving.
+- **the bundle fingerprint** — the `bundle <sha256>` line the INSTALLED
+  executable's `--version` prints, cross-checked against the package
+  manifest's `bundleSha256`. WHICH operator UI that binary carries.
+
+The operator UI is embedded by `include_bytes!` (ADR-048), so a correct exe
+path proves nothing about the bytes a browser is served, and a manifest
+agreeing with itself proves nothing about the process that came back from
+the restart. A receipt carrying one half is half a measurement with the
+other half assumed.
+
+**The typed-kinds boundary, so nobody re-derives it.** `deploy finish
+--observed` accepts only typed artifact identities, and
+`ARTIFACT_IDENTITY_KINDS` (`rust/model.rs`) is exactly two kinds:
+`docker-image-id` and `oci-manifest-digest` (ADR-043 §3). A bundle sha256
+fits NEITHER — it digests an embedded asset table, not an image and not an
+image manifest — and a `finish` offering it as either is refused by name.
+So the bundle fingerprint is recorded in the deployment row's `--receipt`
+text beside the executable identity, and the typed kinds are NOT extended
+to hold it. A third kind would be a model change; the receipt law asks only
+that both facts be recorded where the surface already supports recording
+them, which for the bundle fingerprint is the receipt text.
+
+Full statement: [ADR-044 §Amendment
+2026-09-20](../adr/ADR-044-release-packaging-is-a-capability-gate-with-measured-build-provenance.md).
 
 ## Requirements trace convention
 
