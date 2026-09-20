@@ -137,6 +137,15 @@ on the specification and on the implementation:
   `docs/adr/ADR-016-kanban-serves-its-own-read-only-ui.md:177`-`:183`) and keep the trusted-edge
   actor: default `OPERATOR_ACTOR` (`geoyws`), or the validated `X-Auth-Request-Email` value under
   opt-in `--actor-header` (`docs/adr/ADR-016-kanban-serves-its-own-read-only-ui.md:94`-`:105`).
+
+**Aggregate authorization addendum (2026-09-20).** The Boards and Needs-you
+JSON routes and CLI dashboard skip a board refused by the typed authorization
+guard rather than refusing their whole response. Those three surfaces return
+only the permitted subset, including an empty success when that subset is
+empty. Their shared policy catches only that typed denial. Corruption, schema,
+SQLite, I/O and every other operational error still fail the listing; a named
+denied board keeps the single non-enumerating `404`. This addendum does not
+change the independently specified behavior of search or other routes.
 - **`/live` is unchanged in kind.** It keeps carrying only revision notices, readiness and
   heartbeats — "no task or attention body, credential, cookie, lease token, or write capability"
   (`docs/adr/ADR-016-kanban-serves-its-own-read-only-ui.md:107`-`:113`) — plus authorized

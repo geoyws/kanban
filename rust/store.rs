@@ -3314,6 +3314,21 @@ impl Store {
         Self::open_as_caller(path)
     }
 
+    /// Open one board for an aggregate estate listing.
+    ///
+    /// The authorization check deliberately runs after the ordinary read open:
+    /// current boards retain their read-only path, while a behind-schema board
+    /// retains its migration path before the same typed decision is applied.
+    /// The repeated current-schema check is in-memory; it performs no SQL.
+    pub(crate) fn open_for_estate_listing_as_caller(path: &Path) -> Result<Option<Self>> {
+        crate::authz::permitted_listing_board(Self::open_for_read_as_caller(path).and_then(
+            |store| {
+                store.authz.check_read(&[])?;
+                Ok(store)
+            },
+        ))
+    }
+
     /// The bulk-read gate on this store's own connection.
     pub(crate) fn require_whole_board_read(&self) -> Result<()> {
         whole_board_read_on(&self.authz, &self.connection)

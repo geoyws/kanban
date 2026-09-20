@@ -22,8 +22,9 @@
 
 use crate::policy::{Capability, ScopeTuple, satisfies};
 use crate::routing::Enforcement;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::collections::HashMap;
+use std::fmt;
 
 /// The one refusal a denied access produces. Byte-identical whether the row is
 /// invisible to the caller or absent from the board, and carrying no tag,
@@ -31,6 +32,36 @@ use std::collections::HashMap;
 /// same generic wording [`crate::policy`] uses for every non-enumerating
 /// denial; there is deliberately no second string.
 const DENIED_OR_NOT_FOUND: &str = "denied or not found";
+
+/// The one typed authorization refusal.
+///
+/// The display text remains the non-enumerating public sentence, while the
+/// type lets whole-estate listings skip only authorization refusals. An I/O,
+/// schema or SQLite error with coincidentally similar text must still abort
+/// the listing.
+#[derive(Debug)]
+pub(crate) struct DeniedOrNotFound;
+
+impl fmt::Display for DeniedOrNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(DENIED_OR_NOT_FOUND)
+    }
+}
+
+impl std::error::Error for DeniedOrNotFound {}
+
+/// Apply the whole-estate listing policy to one board read.
+///
+/// Authorization refusal contributes no row; every other failure propagates.
+/// This is shared by the JSON projections and the CLI dashboard so their
+/// treatment of a denied board cannot drift.
+pub(crate) fn permitted_listing_board<T>(read: Result<T>) -> Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.downcast_ref::<DeniedOrNotFound>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 /// Decide whether a caller may read one row: it must satisfy `read` at
 /// `{board:ID}` and at `{board:ID, tag:SLUG}` for every tag the row carries.
@@ -96,7 +127,7 @@ fn check_scopes(
         },
         capability,
     ) {
-        bail!(DENIED_OR_NOT_FOUND);
+        return Err(DeniedOrNotFound.into());
     }
     for tag in tags {
         if !satisfies(
@@ -107,7 +138,7 @@ fn check_scopes(
             },
             capability,
         ) {
-            bail!(DENIED_OR_NOT_FOUND);
+            return Err(DeniedOrNotFound.into());
         }
     }
     Ok(())

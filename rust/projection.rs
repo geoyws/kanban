@@ -27,8 +27,9 @@ use crate::model::{
 use crate::registry::Registry;
 use crate::serve::{
     DECIDED_ROWS, DECIDED_SCAN, DETAIL_ROWS, LANE_UPDATE_ROWS, OPEN_ATTENTION_ROWS,
-    PREVIEW_BODY_CHARS, SEARCH_LIMIT, excerpt, lane_groups, markdown, project_named, projects,
-    search_receipt, sort_decided_queue, sort_open_queue, task_attention_count,
+    PREVIEW_BODY_CHARS, SEARCH_LIMIT, excerpt, lane_groups, listing_projects, markdown,
+    project_named, projects, search_receipt, sort_decided_queue, sort_open_queue,
+    task_attention_count,
 };
 use crate::store::Store;
 use serde::Serialize;
@@ -64,8 +65,8 @@ const DENIED_OR_NOT_FOUND: &str = "denied or not found";
 impl From<anyhow::Error> for Refusal {
     fn from(error: anyhow::Error) -> Self {
         if error
-            .chain()
-            .any(|cause| cause.to_string().contains(DENIED_OR_NOT_FOUND))
+            .downcast_ref::<crate::authz::DeniedOrNotFound>()
+            .is_some()
         {
             return Self::DeniedOrNotFound;
         }
@@ -325,7 +326,7 @@ pub fn needs_you() -> Projected<Listing<AttentionCard>> {
     let mut items: Vec<(String, Attention)> = Vec::new();
     let mut stores = std::collections::BTreeMap::new();
     let mut truncated = false;
-    for (project, store) in projects()? {
+    for (project, store) in listing_projects()? {
         let mut rows = store.attention(
             Some("open"),
             None,
@@ -390,12 +391,12 @@ fn attention_cards(
 ///
 /// This is the board index's own computation, shared with the page rather than
 /// copied: `boards` (`rust/serve.rs`) renders exactly these rows in exactly
-/// this order. A retired board is not here and neither is one this principal
-/// may not read, because both are absent from `projects`, and absence is the
-/// whole denial (SPA-08).
+/// this order. A retired board is absent from the registry enumeration; a
+/// board this principal may not read is skipped by `listing_projects` through
+/// the shared typed authorization policy (SPA-08).
 pub fn board_summaries() -> Projected<Vec<BoardSummary>> {
     let mut rows = Vec::new();
-    for (project, store) in projects()? {
+    for (project, store) in listing_projects()? {
         let tasks = store.list_tasks(None, None, None, None, false)?;
         let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
         // Counted, not fetched: a page used as a count saturates silently.

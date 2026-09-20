@@ -5962,7 +5962,11 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                     continue;
                 }
             }
-            let store = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
+            let Some(store) =
+                Store::open_for_estate_listing_as_caller(Path::new(&project.board_path))?
+            else {
+                continue;
+            };
             let tasks = store.list_tasks(None, None, None, None, false)?;
             // Counted, not fetched: a listing page passed off as a count told
             // an operator 100 pending handoffs on a board holding 101, with

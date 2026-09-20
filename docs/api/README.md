@@ -191,6 +191,14 @@ single generic denial exists to avoid (`rust/authz.rs:180`-`rust/authz.rs:189`).
 A retired board is absent from `/api/v1/boards` and from its own route
 (`SPA-08`).
 
+The three aggregate surfaces apply that rule board by board: `/api/v1/boards`,
+`/api/v1/needs-you`, and `dashboard --json` omit a board refused by the typed
+authorization guard and compute rows and totals only over the permitted
+subset. Zero permitted boards is an empty successful listing. Only that typed
+refusal is skippable there; corruption, schema, SQLite, I/O and other
+operational failures still fail the whole listing. Other routes, including
+search, retain their separately specified behavior.
+
 `/api/v1/lanes` and the `/lanes` page obey that rule at the store since
 `t-c84850a1` (2026-09-19): `Store::sitreps` takes the same
 `self.authz.check_read(&[])` its sibling reads take — a sitrep carries no
@@ -280,11 +288,12 @@ field by field on shared keys, against `task list`, `task show`, `sitrep list`
 and `attention list --status open`, so a future divergence fails there instead
 of being discovered in the UI.
 
-Two cases in that section are `#[ignore]`d and carry a failing assertion on
-purpose. Each is a divergence named below rather than a test written down to
-the shipped behaviour. A third,
-`the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http`,
-runs: `t-c84850a1` closed the divergence it held.
+One case in that section remains `#[ignore]`d and carries a failing assertion
+on purpose: write refusals answer `text/html` where the contract declares
+JSON. The whole-estate finding is closed by
+`a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`, and
+`the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over_http`
+also runs.
 
 ## Where the served pages do not yet meet this contract
 
@@ -329,16 +338,6 @@ worse than one that names the gap.
   board rather than a "not implemented" that would inventory what is coming.
   `SPA-06`, `SPA-07` and `SPA-09` carry their first evidence from this wave;
   the remaining routes stay owed by the epic.
-- **A whole-estate listing refuses entire rather than serving the readable
-  subset.** Found 2026-09-19 by `t-4b9501b3`. `board_summaries` and
-  `needs_you` iterate every active board and propagate the first refusal, so
-  `/api/v1/boards` and `/api/v1/needs-you` answer `404 denied or not found` to
-  a caller who fully owns one board out of two. The CLI's `dashboard` answers
-  identically, so the two surfaces agree and `SPA-08`'s equivalence holds —
-  but "The denial does not enumerate" above says a caller who asks for a list
-  is *simply not handed* the rows they may not see, and `SPA-06` requires the
-  page's data to arrive. Held by the `#[ignore]`d
-  `a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`.
 - **The four writes refuse in HTML; this contract says they refuse in JSON.**
   Found 2026-09-19 by `t-4b9501b3`. `Refused`, `WriteRejected` and
   `WriteConflict` each declare `application/json; charset=utf-8` with the

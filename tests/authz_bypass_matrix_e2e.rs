@@ -1480,17 +1480,15 @@ fn the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over
         );
     }
 
-    // The whole-estate listings answer the same way the CLI's own
-    // whole-estate listing answers: an estate holding a board this caller
-    // cannot read is refused entire, on both surfaces, with one body. It is
-    // the equivalence that is asserted here; that the contract asks instead
-    // for the readable subset is a separate, named finding
-    // (`a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`).
-    estate.denied(&work_a, &["dashboard", "--json"]);
+    // Whole-estate reads skip the denied board on both surfaces. Named reads
+    // above still refuse it; an enumeration does not announce its presence.
+    let dashboard = estate.ok_json(&work_a, &["dashboard", "--json"]);
+    assert_eq!(dashboard.as_array().unwrap().len(), 1, "{dashboard}");
+    assert_eq!(dashboard[0]["name"], "Alpha", "{dashboard}");
     for path in ["/api/v1/boards", "/api/v1/needs-you"] {
         let answer = server.get(path);
-        assert_eq!(answer.status, 404, "{path}: {}", answer.body);
-        assert_eq!(answer.body, DENIED_JSON, "{path}");
+        assert_eq!(answer.status, 200, "{path}: {}", answer.body);
+        assert!(!answer.body.contains("Beta"), "{path}: {}", answer.body);
     }
 
     // The caller's own board answers, and it answers exactly the rows the
@@ -2482,64 +2480,153 @@ fn the_lanes_route_withholds_the_sitreps_of_a_board_the_caller_may_not_read_over
     );
 }
 
-/// FINDING (`t-4b9501b3`, 2026-09-19): a whole-estate listing refuses
-/// entirely when ANY board is unreadable, rather than serving the readable
-/// ones.
-///
-/// `board_summaries` and `needs_you` iterate every active board and propagate
-/// the first refusal, so `/api/v1/boards` and `/api/v1/needs-you` answer `404
-/// denied or not found` to a caller who fully owns one board out of two. The
-/// CLI's `dashboard` does the same, so the two surfaces agree — but
-/// `docs/api/README.md` ("The denial does not enumerate") says a caller who
-/// asks for a list "is simply not handed the rows they may not see", and
-/// SPA-06 requires the page's data to arrive rather than a refusal.
-///
-/// Ignored, not weakened: the equivalence that DOES hold is asserted in
-/// `the_five_json_routes_enforce_the_same_board_and_tag_authority_as_the_cli_over_http`.
+/// SPA-06 / SPA-08: whole-estate listings serve the permitted subset without
+/// revealing that another registered board was denied.
 #[test]
-#[ignore = "FINDING t-4b9501b3: a whole-estate listing refuses entire instead of serving the readable subset; the fix belongs to projection.rs/serve.rs"]
 fn a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http() {
     let estate = ManagedEstate::new("json-listing-subset");
     let work_a = estate.work_a.clone();
     let work_b = estate.work_b.clone();
-    estate.ok_json(
-        &work_a,
-        &[
-            "task",
-            "add",
-            "alpha row",
-            "--id",
-            "t-avis",
-            "--as",
-            "seed",
-            "--json",
-        ],
-    );
-    estate.ok_json(
-        &work_b,
-        &[
-            "task", "add", "beta row", "--id", "t-bhid", "--as", "seed", "--json",
-        ],
-    );
+    for (work, title, id) in [
+        (&work_a, "alpha permitted row", "t-avis"),
+        (&work_b, "beta hidden row and body", "t-bhid"),
+    ] {
+        estate.ok_json(
+            work,
+            &["task", "add", title, "--id", id, "--as", "seed", "--json"],
+        );
+        estate.ok_json(
+            work,
+            &["attention", "raise", title, "--as", "seed", "--json"],
+        );
+    }
     estate.bind_self("p-alpha-only", &owner_of(&estate.id_a));
     estate.enforce("managed");
     let server = WebServer::start(&estate, &work_a, None);
 
     let boards = server.get_json("/api/v1/boards");
-    let names = boards["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| row["board"].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
+    assert_eq!(boards["returned"], 1, "{boards}");
+    assert_eq!(boards["items"][0]["board"], "Alpha", "{boards}");
+    let queue = server.get_json("/api/v1/needs-you");
+    assert_eq!(queue["returned"], 1, "{queue}");
+    assert_eq!(queue["items"][0]["board"], "Alpha", "{queue}");
+    let dashboard = estate.ok_json(&work_a, &["dashboard", "--json"]);
+    assert_eq!(dashboard.as_array().unwrap().len(), 1, "{dashboard}");
+    assert_eq!(dashboard[0]["name"], "Alpha", "{dashboard}");
+    assert_eq!(dashboard[0]["totalTasks"], 1, "{dashboard}");
+    for listing in [&boards, &queue, &dashboard] {
+        let body = listing.to_string();
+        assert!(
+            !body.contains("Beta") && !body.contains("beta hidden row and body"),
+            "{body}"
+        );
+        assert!(!body.contains("t-bhid"), "{body}");
+    }
+    let named = server.get("/api/v1/board/Beta");
+    assert_eq!((named.status, named.body.as_str()), (404, DENIED_JSON));
+    estate.denied(&work_b, &["task", "list", "--json"]);
+
+    drop(server);
+    let empty = ManagedEstate::new("json-listing-empty");
+    let empty_work = empty.work_a.clone();
+    empty.bind_self("p-no-boards", &[]);
+    empty.enforce("managed");
+    let empty_server = WebServer::start(&empty, &empty_work, None);
+    let empty_boards = empty_server.get_json("/api/v1/boards");
     assert_eq!(
-        names,
-        vec!["Alpha".to_owned()],
-        "the index did not serve the readable board on its own: {boards}"
+        empty_boards["items"],
+        serde_json::json!([]),
+        "{empty_boards}"
     );
-    server.get_json("/api/v1/needs-you");
+    assert_eq!(empty_boards["returned"], 0, "{empty_boards}");
+    let empty_queue = empty_server.get_json("/api/v1/needs-you");
+    assert_eq!(empty_queue["items"], serde_json::json!([]), "{empty_queue}");
+    assert_eq!(empty_queue["returned"], 0, "{empty_queue}");
+    let empty_dashboard = empty.ok_json(&empty_work, &["dashboard", "--json"]);
+    assert_eq!(empty_dashboard, serde_json::json!([]), "{empty_dashboard}");
 }
 
+/// SPA-06 / SPA-08: a denied board remains skippable when its ordinary read
+/// open first has to migrate it. The migration behavior is unchanged; the
+/// typed board-scope decision is applied to the opened store afterwards.
+#[test]
+fn a_schema_behind_denied_board_is_skipped_after_migration() {
+    let estate = ManagedEstate::new("json-listing-schema-behind");
+    let work = estate.work_a.clone();
+    estate.ok_json(
+        &work,
+        &[
+            "attention",
+            "raise",
+            "alpha readable attention",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.bind_self("p-alpha-only-behind", &owner_of(&estate.id_a));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work, None);
+
+    let downgrade_beta = || {
+        Connection::open(&estate.board_b)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE task_models; ALTER TABLE task_claims DROP COLUMN model; PRAGMA user_version=29;",
+            )
+            .unwrap();
+    };
+    let assert_migrated = || {
+        let version: i64 = Connection::open(&estate.board_b)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 30,
+            "the denied board did not keep its migration path"
+        );
+    };
+
+    downgrade_beta();
+    let boards = server.get_json("/api/v1/boards");
+    assert_eq!(boards["items"][0]["board"], "Alpha", "{boards}");
+    assert_eq!(boards["returned"], 1, "{boards}");
+    assert_migrated();
+
+    downgrade_beta();
+    let queue = server.get_json("/api/v1/needs-you");
+    assert_eq!(queue["items"][0]["board"], "Alpha", "{queue}");
+    assert_eq!(queue["returned"], 1, "{queue}");
+    assert_migrated();
+
+    downgrade_beta();
+    let dashboard = estate.ok_json(&work, &["dashboard", "--json"]);
+    assert_eq!(dashboard.as_array().unwrap().len(), 1, "{dashboard}");
+    assert_eq!(dashboard[0]["name"], "Alpha", "{dashboard}");
+    assert_migrated();
+}
+/// SPA-08: only typed authorization refusal is skippable. A corrupt board is
+/// an estate failure on both whole-estate surfaces.
+#[test]
+fn a_whole_estate_listing_propagates_an_operational_board_failure() {
+    let estate = ManagedEstate::new("json-listing-operational-error");
+    let work = estate.work_a.clone();
+    estate.bind_self(
+        "p-both-boards",
+        &[owner_of(&estate.id_a), owner_of(&estate.id_b)].concat(),
+    );
+    estate.enforce("managed");
+    Connection::open(&estate.board_b)
+        .unwrap()
+        .execute_batch("DROP TABLE attention;")
+        .unwrap();
+    let server = WebServer::start(&estate, &work, None);
+    assert_eq!(server.get("/api/v1/boards").status, 500);
+    assert_eq!(server.get("/api/v1/needs-you").status, 500);
+    let dashboard = estate.run(&work, &["dashboard", "--json"]);
+    assert!(!dashboard.status.success(), "a corrupt board was skipped");
+    assert!(!String::from_utf8_lossy(&dashboard.stderr).contains(DENIED));
+}
 /// FINDING (`t-4b9501b3`, 2026-09-19): the four writes refuse in HTML, and
 /// the contract says they refuse in JSON.
 ///
@@ -2602,10 +2689,10 @@ fn the_write_refusals_answer_the_contracts_json_error_body_over_http() {
 ///
 /// INTEGRATION, at the layer `process`/`http`: the real binary, a real
 /// managed estate, the CLI and the serving process running as the same
-/// identity. The caller holds board read plus `tag:visible` read on Alpha,
-/// and full ownership of Beta so the whole-estate `dashboard` answers at all
-/// rather than refusing entire (that refusal is the separate finding
-/// `a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`).
+/// identity. The caller holds board read plus `tag:visible` read on Alpha. It also owns
+/// Beta so this case isolates row-level tag filtering from the aggregate
+/// board-skip policy proved by
+/// `a_whole_estate_listing_serves_the_boards_the_caller_may_read_over_http`.
 ///
 /// `t-aboth` carries both tags. The read test is all-of-tag, so one of two
 /// tags is not authority over the row, and a listing filtered as any-of

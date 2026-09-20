@@ -1175,6 +1175,27 @@ pub(crate) fn projects() -> Result<Vec<(ProjectRecord, Store)>> {
     Ok(out)
 }
 
+/// Every active project whose board this caller may read.
+///
+/// Whole-estate listings use the read-only open and skip only its typed
+/// authorization refusal. Named and write routes keep `projects`, whose
+/// writable stores preserve their existing command behavior.
+pub(crate) fn listing_projects() -> Result<Vec<(ProjectRecord, Store)>> {
+    let registry = Registry::open()?;
+    let mut out = Vec::new();
+    for project in registry.projects_active()? {
+        let path = Path::new(&project.board_path);
+        if !path.exists() {
+            continue;
+        }
+        let Some(store) = Store::open_for_estate_listing_as_caller(path)? else {
+            continue;
+        };
+        out.push((project, store));
+    }
+    Ok(out)
+}
+
 pub(crate) fn project_named(name: &str) -> Result<(ProjectRecord, Store)> {
     let matches = projects()?
         .into_iter()

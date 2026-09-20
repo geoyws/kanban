@@ -136,6 +136,10 @@ paths:
         one route; the deck and the flat list are presentation.
 
         The `limit` reported is the per-board cap the arm passes today, `1000`.
+
+        Boards refused by the typed authorization guard are skipped. Zero
+        permitted boards returns an empty 200 envelope; operational failures
+        still fail the request.
       x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
       x-store-method: Store::attention
       responses:
@@ -218,8 +222,10 @@ paths:
         order is.
 
         A board the principal may not read is absent, and a retired board is
-        absent from this index and from its own route (SPA-08). Absence is the
-        whole denial: no count, no placeholder row, no name.
+        absent from this index and from its own route (SPA-08). Counts and
+        order cover only permitted boards; zero permitted boards is an empty
+        200 envelope. Typed authorization denial alone is skipped; schema,
+        corruption, SQLite, I/O and other operational failures propagate.
       x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13]
       x-store-method: Store::list_tasks, Store::count_open_attention, Store::count_pending_handoffs, Store::attention, Store::handoffs, Store::stale_tasks
       responses:
