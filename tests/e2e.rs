@@ -31715,9 +31715,24 @@ fn a_redelivered_notice_does_not_act_or_render_twice_on_the_deck_in_real_chrome(
     const FRAME: &str = "{type:'notice',key:'n-redelivered',what:'Attention raised',\
                          task:'t-elsewhere',title:'Another lane filed its own task',\
                          board:'ELSEWHERE'}";
-    let deliver = format!("window.__kbLive.deliver({FRAME})");
+    // Both deliveries and the projection observation are one browser task.
+    // A genuine socket refresh may arrive independently; letting CDP calls
+    // interleave with it would attribute that unrelated refresh to the
+    // duplicate frame instead of measuring what `deliver` itself did.
+    let delivered = js_value(
+        &desk.tab,
+        &format!(
+            "JSON.stringify((() => {{ const frame = {FRAME}; const first = window.__kbLive.deliver(frame); const second = window.__kbLive.deliver(frame); return {{first, second, held: {PROJECTION_HELD}}}; }})())"
+        ),
+    );
+    let delivered: Value = serde_json::from_str(
+        delivered
+            .as_str()
+            .expect("the atomic delivery probe did not return JSON"),
+    )
+    .expect("the atomic delivery probe returned invalid JSON");
     assert_eq!(
-        js_value(&desk.tab, &deliver),
+        delivered["first"],
         Value::Bool(true),
         "the deck did not render a frame it had never seen"
     );
@@ -31736,7 +31751,7 @@ fn a_redelivered_notice_does_not_act_or_render_twice_on_the_deck_in_real_chrome(
     );
 
     assert_eq!(
-        js_value(&desk.tab, &deliver),
+        delivered["second"],
         Value::Bool(false),
         "the deck accepted a key it had already rendered"
     );
@@ -31746,8 +31761,7 @@ fn a_redelivered_notice_does_not_act_or_render_twice_on_the_deck_in_real_chrome(
         "a redelivered notice rendered twice"
     );
     assert_eq!(
-        js_value(&desk.tab, PROJECTION_HELD),
-        true,
+        delivered["held"], true,
         "a redelivered notice sent the deck back to the projection"
     );
 
