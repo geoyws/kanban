@@ -2993,13 +2993,19 @@ fn a_tag_denied_attention_row_is_in_no_queue_no_decision_and_no_count_over_http(
         "the board index ranked Alpha as though its readable urgent row were not there: {boards}"
     );
 
-    // 7. Nothing the hidden rows carry is anywhere in the listing bodies —
+    // 7. Nothing the hidden rows carry is anywhere in the served bodies —
     //    a body or a question names the row as surely as its id would. The
-    //    task detail is swept on its `openAttention` member rather than
-    //    whole: its event stream still carries the `attention_raised`
-    //    envelopes of rows this caller may not read, which is the separate
-    //    unfixed disclosure and not this listing's.
-    let served = format!("{queue}{decided}{boards}{}", detail["openAttention"]);
+    //    task detail is swept WHOLE since `t-1de9c707`: its event stream
+    //    used to carry the `attention_raised` and `attention_resolved`
+    //    envelopes of rows this caller may not read, on the task's own
+    //    `visible` tag, so the sweep had to be narrowed to `openAttention`.
+    //    `event_tags` now unions the attention row's own tags in, and the
+    //    whole body is clean.
+    assert!(
+        detail["events"]["returned"].as_u64().unwrap_or(0) > 0,
+        "the task detail served no events at all, so the sweep below proves nothing: {detail}"
+    );
+    let served = format!("{queue}{decided}{boards}{detail}");
     for needle in [
         secret.as_str(),
         both.as_str(),
@@ -3016,6 +3022,13 @@ fn a_tag_denied_attention_row_is_in_no_queue_no_decision_and_no_count_over_http(
     assert!(
         served.contains("the visible question") && served.contains("the visible decision"),
         "the served bodies lost the rows this caller MAY read"
+    );
+    // The positive control on the tail itself: the readable rows' envelopes
+    // are still in the task's events.
+    let tail = detail["events"].to_string();
+    assert!(
+        tail.contains(visible.as_str()) && tail.contains(decided_visible.as_str()),
+        "the event tail lost the attention rows this caller MAY read: {tail}"
     );
 }
 

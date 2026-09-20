@@ -640,7 +640,7 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 /// The tags one EVENT exposes, which is more than the tags its row carries
 /// today.
 ///
-/// Two sets, unioned:
+/// Three sets, unioned:
 ///
 /// 1. the row's **real current tags**, read live from `task_tags` — never from
 ///    the event payload. A row a caller may not see now must not be
@@ -650,6 +650,21 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 ///    names the resulting set in its snapshot, so an event about a retag would
 ///    otherwise hand over the very tag the caller lacks — the row would stay
 ///    invisible while the name of the thing that hid it leaked.
+/// 3. for an event ABOUT an attention row — every such payload names its
+///    subject as `attentionID` — that row's own tags, live from
+///    `attention_tags`, plus the tag sets the payload itself recorded — the
+///    row's set under `tags` on a raise, a resolve and a reopen, and the
+///    superseded set under `previousTags` on an update. The task an item was
+///    raised against is not the item: a `secret` question hung on a
+///    `visible` task carried its id, its kind, its tags and its choices
+///    through every event tail while all the listings withheld the row
+///    itself (`t-1de9c707`). The payload's own record is unioned in for the
+///    same reason the snapshot is: a row that has since been retagged or
+///    removed must not be able to make its own history MORE visible than the
+///    strictest evidence about it. An all-of-tag test over a union is the
+///    intersection of the two rights only while BOTH sets are there, which
+///    is why every attention emitter writes one down rather than only the
+///    two that happened to have a tag argument to hand.
 ///
 /// The union is what the all-of-tag rule is then applied to, so an event is
 /// visible only to a caller who could see the row both as it is and as that
@@ -657,19 +672,35 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 ///
 /// An event whose task has since been removed yields only its snapshot tags:
 /// there is no live row left to read, and the snapshot is the strictest
-/// evidence remaining.
+/// evidence remaining. An event whose attention row is gone yields, the same
+/// way, whatever that payload wrote down about it.
 fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
     let mut tags = match event.task_id.as_deref() {
         Some(id) => task_tags(connection, id)?,
         None => Vec::new(),
     };
-    if let Some(Value::Array(frozen)) = event.payload.pointer("/_semanticV1/tags") {
-        tags.extend(
-            frozen
+    let recorded = |pointer: &str| -> Vec<String> {
+        match event.payload.pointer(pointer) {
+            Some(Value::Array(frozen)) => frozen
                 .iter()
                 .filter_map(|tag| tag.as_str())
-                .map(str::to_owned),
-        );
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    tags.extend(recorded("/_semanticV1/tags"));
+    if let Some(attention_id) = event
+        .payload
+        .pointer("/attentionID")
+        .and_then(Value::as_str)
+    {
+        tags.extend(attention_tags(connection, attention_id)?);
+        // What the raise, the resolve and the reopen wrote down under `tags`
+        // and the update under `previousTags`, so a later retag or removal
+        // cannot loosen the event that recorded it.
+        tags.extend(recorded("/tags"));
+        tags.extend(recorded("/previousTags"));
     }
     tags.sort();
     tags.dedup();
@@ -6574,6 +6605,15 @@ impl Store {
              decision=?,reopened_at=NULL,reopened_by=NULL,reopen_note=NULL WHERE id=?",
             params![now, audit_actor, resolution, decision_json, id],
         )?;
+        // `tags` is the row's tag set AT SETTLEMENT, under the same key the
+        // raise uses, because `event_tags` reads it as this envelope's own
+        // strictest evidence: after an allowed reopen-and-retag the live row
+        // no longer carries the tag that hid it, and without this snapshot
+        // the historical envelope would fall back to the TASK's tags and
+        // reach a caller who could not see the row when it was settled
+        // (`t-1de9c707`). The snapshot begins at this change; envelopes
+        // written before it fall back to the live row's tags, which is
+        // history and accepted as such.
         event(
             &transaction,
             existing.task_id.as_deref(),
@@ -6582,6 +6622,7 @@ impl Store {
             json!({
                 "attentionID": id,
                 "kind": existing.kind,
+                "tags": old_tags,
                 "decision": decision,
                 "previousResolvedAt": existing.resolved_at,
                 "previousResolvedBy": existing.resolved_by,
@@ -6634,6 +6675,10 @@ impl Store {
              decision=NULL WHERE id=?",
             params![now, actor, note, id],
         )?;
+        // `tags` as at the reopen, on the same key and for the same reason
+        // the resolve above records it: the retag that a reopened row then
+        // permits must not loosen the envelope that recorded the row before
+        // it (`t-1de9c707`). The snapshot begins at this change.
         event(
             &transaction,
             existing.task_id.as_deref(),
@@ -6641,6 +6686,7 @@ impl Store {
             Some(&actor),
             json!({
                 "attentionID": id,
+                "tags": old_tags,
                 "resolvedAt": existing.resolved_at,
                 "resolvedBy": existing.resolved_by,
                 "resolution": existing.resolution,
@@ -9967,6 +10013,198 @@ mod tests {
             [secret_resolved.as_str()],
             "the direct estate's own scan bound changed"
         );
+    }
+
+    /// The same finding one surface further along again: the EVENT TAIL of a
+    /// readable task withholds the envelopes of an attention row this caller
+    /// may not read (`t-1de9c707`).
+    ///
+    /// The leak was that `event_tags` read the TASK's tags and the event's
+    /// own `_semanticV1` snapshot, and an attention event's subject is
+    /// neither: a `secret` question raised against a `visible` task produced
+    /// `attention_raised` and `attention_resolved` envelopes carrying the
+    /// row's id, kind, tags and choices, and those sailed through
+    /// `visible_events` on the task's `visible` tag alone. Every event tail
+    /// in the product — `kb ev`, MCP, `/api/v1/task` and watch — reads
+    /// through that one filter.
+    ///
+    /// The control is in the same fixture and on the same task: a `visible`
+    /// attention row's envelopes are still there, so a filter that had simply
+    /// dropped every attention event would fail here. The direct estate is
+    /// asserted unchanged for the same reason it is in the listings fixture.
+    ///
+    /// The secret row is then REOPENED and RETAGGED to `visible` only, which
+    /// the store permits a full-authority caller, so its live `attention_tags`
+    /// no longer carry the tag that hid it. That is the case the live read
+    /// alone cannot answer: an all-of-tag test over a union is the
+    /// intersection of the two rights only while both sets are there, so the
+    /// resolve and the reopen envelopes have to carry their own `tags`
+    /// snapshot or they fall back to the TASK's `visible` and hand over a row
+    /// this caller could not see when those events were written.
+    #[test]
+    fn managed_event_tails_exclude_a_tag_denied_attention_rows_envelopes() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "eeeeeeee-8888-4888-8888-888888888888";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-attention-ev-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+
+        let secret;
+        let visible;
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-visible",
+                "visible row",
+                vec!["visible".to_owned()],
+                vec![],
+            ))
+            .expect("seed visible");
+            let mut raise = |body: &str, tag: &str| {
+                seed.raise_attention(
+                    body,
+                    "decision",
+                    "seed",
+                    Some("t-visible"),
+                    1,
+                    &[tag.to_owned()],
+                    &DecisionCard::default(),
+                )
+                .expect("raise")
+                .id
+            };
+            visible = raise("the visible question", "visible");
+            secret = raise("the secret question", "secret");
+            for id in [&visible, &secret] {
+                seed.resolve_attention(id, "seed", &AttentionAnswer::custom("other", "settled"))
+                    .expect("resolve");
+            }
+            // The retag the fix has to survive: a full-authority caller
+            // reopens the settled secret row and moves it onto `visible`,
+            // so nothing live carries `secret` for it any more. Only the
+            // envelopes' own snapshots still say what it was.
+            seed.reopen_attention(&secret, "seed", "reopened to retag")
+                .expect("reopen the secret row");
+            seed.update_attention(
+                &secret,
+                None,
+                Some(&["visible".to_owned()]),
+                None,
+                false,
+                "seed",
+            )
+            .expect("retag the secret row onto visible");
+            assert_eq!(
+                attention_tags(&seed.connection, &secret).expect("the retagged row's live tags"),
+                vec!["visible".to_owned()],
+                "the fixture did not actually strip the tag that hid the row"
+            );
+        }
+
+        let grants = || {
+            authority([
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::BoardTag {
+                        board_id: board.to_owned(),
+                        tag: "visible".to_owned(),
+                    },
+                    Capability::Read,
+                ),
+            ])
+        };
+        // The subject ids each envelope names, per event kind.
+        let subjects = |store: &Store, kind: &str| -> Vec<String> {
+            store
+                .events(Some("t-visible"), Some(kind), 100, true)
+                .unwrap_or_else(|error| panic!("events {kind}: {error}"))
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .payload
+                        .pointer("/attentionID")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        };
+
+        let store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants(), board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+        // The task itself is readable, so this is the tail of a row this
+        // caller MAY see — the denial has to be per event, not per task.
+        store
+            .require_task("t-visible")
+            .expect("task show t-visible");
+        for kind in ["attention_raised", "attention_resolved"] {
+            assert_eq!(
+                subjects(&store, kind),
+                vec![visible.clone()],
+                "the {kind} tail named an attention row this caller may not read"
+            );
+        }
+        // Only the retagged secret row was reopened and updated, and its
+        // live tags are `visible` now — these two are the envelopes that
+        // survive on their payload snapshot alone.
+        for kind in ["attention_reopened", "attention_updated"] {
+            assert!(
+                subjects(&store, kind).is_empty(),
+                "the {kind} tail survived the retag and named the row this caller may not read"
+            );
+        }
+        // And nothing the hidden row carries is anywhere in the whole tail:
+        // an envelope's body, tags and choices name the row as surely as its
+        // id does.
+        let tail = store
+            .events(Some("t-visible"), None, 100, true)
+            .expect("the task's whole tail")
+            .iter()
+            .map(|event| event.payload.to_string())
+            .collect::<String>();
+        assert!(
+            !tail.contains(secret.as_str()) && !tail.contains("secret"),
+            "the event tail carried the hidden row: {tail}"
+        );
+        assert!(
+            tail.contains(visible.as_str()),
+            "the event tail lost the attention row this caller MAY read: {tail}"
+        );
+
+        // The direct estate is untouched: the same partial authority still
+        // reads every envelope, because `permits_read` cannot refuse outside
+        // managed enforcement.
+        let relaxed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Direct, grants(), board.to_owned()),
+        )
+        .expect("open the direct estate");
+        for kind in ["attention_raised", "attention_resolved"] {
+            assert_eq!(
+                subjects(&relaxed, kind),
+                vec![secret.clone(), visible.clone()],
+                "the direct estate stopped replaying its own {kind} envelopes"
+            );
+        }
+        for kind in ["attention_reopened", "attention_updated"] {
+            assert_eq!(
+                subjects(&relaxed, kind),
+                vec![secret.clone()],
+                "the direct estate stopped replaying its own {kind} envelopes"
+            );
+        }
     }
 
     /// The relations of a READABLE row: a prerequisite the caller may not read
