@@ -493,6 +493,36 @@ Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `u
 | `MODEL-17` | MUST | process | `mcp_schema_exposes_allowed_model_array_and_claim_model_string` | `schema --json` kinds `list`/`list`/`value` for `allowed-model` on `task add`/`task update`/`task list` and `value` for `model`; the MCP tools type it array on `task_add`/`task_update`, string on `task_list`, and `model` string on `claim`/`handoff accept` |
 | `MODEL-18` | MUST | unit | `task_detail_lists_allowed_models_and_the_holders_model_unit` | `rust/serve.rs` `mod tests` reading served bytes: the `allowed models` row present when restricted and absent when not, and the holder's `model` line — no e2e coverage, and none planned for this row |
 
+## Requirements trace — docs/specs/acc.md ACC-01..ACC-17
+
+One row per mandatory requirement at the 2026-09-21 specification baseline. ACC has no
+implementation evidence yet: `PLANNED` is an intended evidence layer, not a passing test, and
+`BLOCKED` means the planned evidence depends on the sole George-owned product decision in
+`docs/specs/acc.md` §7. No future test name, pass, implementation or release is claimed.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `ACC-01` | MUST | process | `PLANNED` | full block plus partial/bounds/answer-key refusals |
+| `ACC-02` | MUST | unit | `PLANNED` | explanation and all three `about` shapes/refusal |
+| `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
+| `ACC-04` | MUST | unit | `PLANNED` | every agreed marker across all three text locations |
+| `ACC-05` | MUST | process | `BLOCKED` | raiser/other/geoyws plus inherited resolved/reopen law; answered-open edit awaits OQ-1 |
+| `ACC-06` | MUST | process | `PLANNED` | missing/no-check/undeclared-key paths plus web answer then web/CLI resolve without a second answer |
+| `ACC-07` | MUST | process | `PLANNED` | persisted answer/correct/time and note agreement |
+| `ACC-08` | MUST | process | `PLANNED` | right/wrong, immutable duplicate and serialized concurrent-answer paths |
+| `ACC-09` | MUST | chrome | `PLANNED` | check-first, one answer, no retry, unlock and miss explanation |
+| `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
+| `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
+| `ACC-12` | MUST | chrome | `PLANNED` | keyboard, pointer, focus, announcement and Undo |
+| `ACC-13` | MUST | process | `PLANNED` | list/MCP/digest/show redaction by state and actor |
+| `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
+| `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
+| `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
+| `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
+
+17 requirements: 17 MUST, no SHOULD or MAY. By planned layer: 3 unit, 9 process, 2 http and
+3 chrome. One row is BLOCKED by the sole material question in `docs/specs/acc.md` §7;
+the remaining sixteen are PLANNED. There is no present implementation evidence.
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
