@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Type};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use uuid::Uuid;
@@ -1856,6 +1857,127 @@ fn require_no_blocking_gates(connection: &Connection, id: &str, caller: GateCall
         "{kind} {id} is gated on work that is not done: {details}. A prerequisite \
          satisfies a gate only at status done: finish it, or drop the edge with \
          `task update <owner> --depends-on ...` or `--clear-dependencies`.{escape}"
+    )
+}
+
+/// The names the board owner answers to when work is parked on him.
+///
+/// [`OPERATOR_ACTOR`] is the real source: he is the one actor who may settle
+/// any attention row, which makes him the one actor a blocked record can be
+/// waiting for. His given name has no source anywhere — measured, not
+/// assumed: no table records that `geoyws` is George. `board_meta` holds the
+/// board's name and its audit chain and nothing else; the registry's `boards`
+/// and `workspace_roots` rows hold paths and timestamps; `principals` are the
+/// *caller's* frozen identity (ADR-038), not the board's owner. So the given
+/// name is a literal, and a deliberately conservative one: capital-G only, so
+/// a lowercase `george` in prose is not a match.
+const OWNER_NAMES: [&str; 2] = [OPERATOR_ACTOR, "George"];
+
+/// The first occurrence of `name` in `text` that names the person, or `None`.
+///
+/// Two exclusions, both measured against how this board spells things.
+///
+/// A match glued into a longer word is a different word: `Georgetown` and
+/// `geoywsMBP` are not the owner, while `George's` and `@geoyws` are.
+///
+/// A match inside an actor, lane or path compound is a machine address, not
+/// the person: the lane spelling `@:geoyws/kanban/driver` names the LANE that
+/// will do the work, and refusing a next action that assigns the step to that
+/// lane is exactly the false refusal this gate must not produce. A separator
+/// touching the match on either side is what distinguishes the two — `:`
+/// before it or `/` on either side — because a compound is a path and a
+/// person is a word.
+fn standalone_match(text: &str, name: &str) -> Option<usize> {
+    const COMPOUND_BEFORE: [char; 2] = [':', '/'];
+    text.match_indices(name)
+        .find(|(at, _)| {
+            let before = text[..*at].chars().next_back();
+            let after = text[at + name.len()..].chars().next();
+            !before.is_some_and(|glyph| glyph.is_alphanumeric() || COMPOUND_BEFORE.contains(&glyph))
+                && !after.is_some_and(|glyph| glyph.is_alphanumeric() || glyph == '/')
+        })
+        .map(|(at, _)| at)
+}
+
+/// The clause of `text` that names the board owner, quotable back at the
+/// caller, or `None` when he is not in it.
+///
+/// The clause rather than the whole field: a refusal that echoes a paragraph
+/// hides which words tripped it, and rewriting exactly those words is the
+/// caller's way out.
+fn owner_clause(text: &str) -> Option<&str> {
+    const BREAKS: [char; 5] = ['.', ';', '!', '?', '\n'];
+    let at = OWNER_NAMES
+        .iter()
+        .filter_map(|name| standalone_match(text, name))
+        .min()?;
+    let start = text[..at].rfind(BREAKS).map_or(0, |break_at| break_at + 1);
+    let end = text[at..]
+        .find(BREAKS)
+        .map_or(text.len(), |break_at| at + break_at);
+    Some(text[start..end].trim())
+}
+
+/// Whether this task is already asking the operator for something.
+///
+/// The in-transaction twin of [`Store::open_attentions`], holding the same
+/// definition of open that [`Store::attention_filter`] builds — this task,
+/// status `open`, hot history only — read through the write scope so a card
+/// raised earlier in the same batch counts.
+fn has_open_attention(connection: &Connection, task_id: &str) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM attention WHERE task_id=? AND status='open' AND archived=0 LIMIT 1",
+            [task_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Refuse a record that parks work on the board owner while nothing on the
+/// row asks him for it (rule `g-74e8d80c`).
+///
+/// Measured twice on one board on 2026-09-17: a lane checkpointed `blocked`
+/// with "George re-logins to bootstrap" as its next action, raised no card,
+/// and the work then waited on a person who was never told while the lane's
+/// queue read empty. The attention card is the only surface that reaches
+/// him, so the write that would strand the work is where the card is
+/// required.
+///
+/// Only the fields that *are* the assignment are read — a blocked
+/// checkpoint's `--next-action` and either record's `--blocker` values: what
+/// happens next, and what stops it. The summary is narrative and routinely
+/// cites him ("per George's 2026-09-01 decision"); reading it would refuse
+/// records that park nothing on anyone, which is the expensive kind of wrong
+/// here. The refusal quotes the clause it matched, so a false positive costs
+/// one rewrite instead of a hunt.
+fn require_owner_has_a_card<'a>(
+    connection: &Connection,
+    task_id: &str,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let Some(phrase) = texts.into_iter().find_map(owner_clause) else {
+        return Ok(());
+    };
+    if has_open_attention(connection, task_id)? {
+        return Ok(());
+    }
+    // A clause carrying its own double quote would close the sentence's
+    // quoted span early and leave the refusal reading as two broken halves,
+    // so the echoed copy carries single quotes instead. The caller still
+    // reads their own words back, and the sentence still holds exactly one
+    // quoted span. Nothing is allocated for the ordinary clause.
+    let phrase = if phrase.contains('"') {
+        Cow::Owned(phrase.replace('"', "'"))
+    } else {
+        Cow::Borrowed(phrase)
+    };
+    bail!(
+        "parking work on the board owner needs a card he can see it on — \"{phrase}\" hands him \
+         the next step while {task_id} has no open attention row — raise it first with \
+         `kb attention raise \"<the ask>\" --as <agent> --kind blocking --task {task_id}`, then \
+         write this again."
     )
 }
 
@@ -5648,7 +5770,17 @@ impl Store {
         // `continue` and `done` both claim work happened; `blocked` is the
         // holder saying it did not, which is exactly the route out of a
         // prerequisite that appeared or reopened mid-lease, so it stays open.
-        if input.state != "blocked" {
+        if input.state == "blocked" {
+            require_owner_has_a_card(
+                &transaction,
+                &input.task_id,
+                input
+                    .blockers
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(input.next_action.as_str())),
+            )?;
+        } else {
             require_no_blocking_gates(&transaction, &input.task_id, GateCaller::Holder)?;
         }
         transaction.execute(
@@ -6795,6 +6927,17 @@ impl Store {
                 bail!("a lease is held over a task, so --lease needs the task id it belongs to")
             }
         };
+        // A handoff has no `blocked` state; its `--blocker` list is where it
+        // says what stops the work, so that list is the half the owner gate
+        // reads. A session handoff names no task, and there is no row for a
+        // card to hang on, so there is nothing to require.
+        if let Some(task_id) = &input.task_id {
+            require_owner_has_a_card(
+                &transaction,
+                task_id,
+                input.blockers.iter().map(String::as_str),
+            )?;
+        }
         let summary = nonempty(&input.summary, "summary")?.to_owned();
         let intent = nonempty(&input.intent, "intent")?.to_owned();
         let next = nonempty(&input.next_action, "next action")?.to_owned();

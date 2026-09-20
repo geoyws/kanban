@@ -419,6 +419,20 @@ it. Reopening returns the item to the open queue without clearing `resolvedAt`,
 the `attention_reopened` event, adds `reopenedAt`, `reopenedBy` and
 `reopenNote`, and the transition is audited.
 
+The card is also the only way to park work on him, so the writes that would
+strand it require one. A `checkpoint --state blocked` whose `--next-action` or
+`--blocker` names the operator — `geoyws`, or `George` — on a task with no open
+attention row is refused, and so is a `handoff create` whose `--blocker` names
+him; the refusal quotes the clause it matched and names the card to raise
+first. Only those fields are read, because they are what a record *assigns*: a
+summary that cites a past decision of his while the next action names a lane is
+an ordinary blocked checkpoint and is written, and so is a next action handing
+the step to a lane ADDRESS that carries his name, like
+`@:geoyws/kanban/driver` — a separator touching the match makes it a path
+rather than a person. Raise the card and the same
+write goes through unchanged. Reasoning:
+[ADR-050](docs/adr/ADR-050-parking-work-on-the-board-owner-requires-an-open-card.md).
+
 ## Working from anywhere
 
 Boards are addressable from any directory, not only from inside the project

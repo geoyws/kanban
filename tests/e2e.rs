@@ -48259,6 +48259,293 @@ fn completion_gates_refuse_further_progress_without_revoking_a_live_lease() {
     assert!(released["claim"].is_null());
 }
 
+/// Rule `g-74e8d80c`, measured twice on one board on 2026-09-17: a lane
+/// stops, names George as the next step, raises no card, and the work waits
+/// on a person who was never told while the lane's queue reads empty. The
+/// write is refused instead, and the refusal quotes the clause that tripped
+/// it and names the card that would reach him.
+#[test]
+fn a_blocked_checkpoint_that_parks_work_on_the_owner_needs_a_card_first() {
+    let fixture = Fixture::new("owner-gate-checkpoint");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OWNERGATE", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Bootstrap the lane",
+            "--id",
+            "t-park",
+            "--json",
+        ],
+    );
+    let token = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-park", "--as", "worker", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let blocked = |fixture: &Fixture, token: &str, next: &str| {
+        fixture.run(
+            &fixture.main,
+            &[
+                "checkpoint",
+                "t-park",
+                "--lease",
+                token,
+                "--as",
+                "worker",
+                "--state",
+                "blocked",
+                "--summary",
+                "The bootstrap needs a live session",
+                "--intent",
+                "Preserve the work for whoever resumes",
+                "--next-action",
+                next,
+                "--json",
+            ],
+        )
+    };
+
+    let refusal = refusal_object(&blocked(&fixture, &token, "George re-logins to bootstrap"));
+    assert!(
+        refusal.contains("\"George re-logins to bootstrap\""),
+        "the refusal must quote the clause it matched: {refusal}"
+    );
+    assert!(
+        refusal.contains("kb attention raise") && refusal.contains("--task t-park"),
+        "the refusal must name the card that reaches him: {refusal}"
+    );
+
+    // A clause that carries its own double quote must not break the sentence
+    // in half: one line, and exactly the two quoted spans the sentence owns --
+    // the echoed clause and the `<the ask>` placeholder.
+    let quoted = refusal_object(&blocked(
+        &fixture,
+        &token,
+        "George runs the \"bootstrap\" script",
+    ));
+    assert!(
+        quoted.contains("\"George runs the 'bootstrap' script\""),
+        "the echoed clause must keep the sentence's own quoting intact: {quoted}"
+    );
+    assert_eq!(quoted.lines().count(), 1, "the refusal split: {quoted}");
+    assert_eq!(
+        quoted.matches('"').count(),
+        4,
+        "the refusal has more quoted spans than it owns: {quoted}"
+    );
+    // Refused means nothing landed: the holder still holds the row, and there
+    // is no checkpoint claiming the work stopped.
+    let task = fixture.ok_json(&fixture.main, &["task", "show", "t-park", "--json"]);
+    assert_eq!(task["status"], "in_progress");
+    assert_eq!(task["claim"]["agentID"], "worker");
+    assert!(
+        fixture.ok_json(&fixture.main, &["context", "t-park", "--json"])["checkpoints"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused checkpoint was persisted"
+    );
+
+    // With the card raised, the same write is the right one and goes through.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Re-login so the lane can bootstrap",
+            "--as",
+            "worker",
+            "--kind",
+            "blocking",
+            "--task",
+            "t-park",
+            "--json",
+        ],
+    );
+    let written = blocked(&fixture, &token, "George re-logins to bootstrap");
+    assert!(
+        written.status.success(),
+        "a blocked checkpoint with an open card was refused: {}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let written: Value = serde_json::from_slice(&written.stdout).unwrap();
+    assert_eq!(written["state"], "blocked");
+    assert_eq!(written["nextAction"], "George re-logins to bootstrap");
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "show", "t-park", "--json"])["status"],
+        "blocked"
+    );
+}
+
+/// The gate reads what a record *assigns*, not what it mentions. A stop that
+/// parks work on nobody, one that cites a past decision of George's while
+/// handing the next step to a lane, and one that hands it to the operator's
+/// own LANE address are all ordinary blocked checkpoints: refusing them would
+/// make the honest record the expensive one to write.
+#[test]
+fn a_blocked_checkpoint_that_assigns_the_owner_nothing_is_written_without_a_card() {
+    let fixture = Fixture::new("owner-gate-false-positive");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OWNERGATE2", "--json"]);
+    for (id, summary, next) in [
+        (
+            "t-nobody",
+            "The upstream crate has not published the fix",
+            "Re-check crates.io on Monday",
+        ),
+        (
+            "t-cites",
+            "Kept the retry path per George's 2026-09-01 decision",
+            "driver-2 runs the suite against the retry path",
+        ),
+        // The lane this board spells `@:geoyws/kanban/driver` is a machine
+        // address, and the next step belonging to that lane is the work being
+        // assigned to a worker -- not parked on a person.
+        (
+            "t-lane",
+            "The suite has not run since the rebase",
+            "@:geoyws/kanban/driver runs the suite",
+        ),
+    ] {
+        fixture.ok_json(&fixture.main, &["task", "add", id, "--id", id, "--json"]);
+        let token = fixture.ok_json(&fixture.main, &["claim", id, "--as", "worker", "--json"])
+            ["leaseToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let written = fixture.run(
+            &fixture.main,
+            &[
+                "checkpoint",
+                id,
+                "--lease",
+                &token,
+                "--as",
+                "worker",
+                "--state",
+                "blocked",
+                "--summary",
+                summary,
+                "--intent",
+                "Preserve the work for whoever resumes",
+                "--next-action",
+                next,
+                "--json",
+            ],
+        );
+        assert!(
+            written.status.success(),
+            "{id} was refused a blocked checkpoint that parks nothing on the owner: {}",
+            String::from_utf8_lossy(&written.stderr)
+        );
+        assert_eq!(
+            fixture.ok_json(&fixture.main, &["task", "show", id, "--json"])["status"],
+            "blocked"
+        );
+    }
+}
+
+/// A handoff has no `blocked` state; its `--blocker` list is where it says
+/// what stops the work, so that is the half the same gate reads.
+#[test]
+fn a_handoff_blocker_that_parks_work_on_the_owner_needs_a_card_first() {
+    let fixture = Fixture::new("owner-gate-handoff");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OWNERGATE3", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Hand the lane over",
+            "--id",
+            "t-hand",
+            "--json",
+        ],
+    );
+    let token = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-hand", "--as", "worker", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let handoff = |fixture: &Fixture, token: &str| {
+        fixture.run(
+            &fixture.main,
+            &[
+                "handoff",
+                "create",
+                "t-hand",
+                "--lease",
+                token,
+                "--as",
+                "worker",
+                "--summary",
+                "The lane is out of session",
+                "--intent",
+                "Whoever picks this up needs the credential",
+                "--next-action",
+                "Resume once the credential is live",
+                "--blocker",
+                "waiting on George for the credential",
+                "--json",
+            ],
+        )
+    };
+
+    let refusal = refusal_object(&handoff(&fixture, &token));
+    assert!(
+        refusal.contains("\"waiting on George for the credential\""),
+        "the refusal must quote the blocker it matched: {refusal}"
+    );
+    assert!(
+        refusal.contains("kb attention raise") && refusal.contains("--task t-hand"),
+        "the refusal must name the card that reaches him: {refusal}"
+    );
+    assert!(
+        fixture
+            .ok_json(
+                &fixture.main,
+                &["handoff", "list", "--task", "t-hand", "--json"]
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused handoff was persisted"
+    );
+
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "The credential expired; only you can refresh it",
+            "--as",
+            "worker",
+            "--kind",
+            "blocking",
+            "--task",
+            "t-hand",
+            "--json",
+        ],
+    );
+    let written = handoff(&fixture, &token);
+    assert!(
+        written.status.success(),
+        "a handoff whose blocker has an open card was refused: {}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let written: Value = serde_json::from_slice(&written.stdout).unwrap();
+    assert_eq!(written["status"], "pending");
+    assert_eq!(
+        written["blockers"][0],
+        "waiting on George for the credential"
+    );
+}
+
 /// Inheritance makes the graph two-edged, so a gate can close a loop the
 /// dependency-only guard cannot see: an epic waiting on a task inside its own
 /// subtree gates that task on itself forever. Both ways of writing that loop
