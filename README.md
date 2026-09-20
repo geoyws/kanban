@@ -1400,6 +1400,13 @@ cargo test --locked
 cargo build --release --locked
 ```
 
+Those commands are the mechanical gate. A change to product behaviour has a
+precondition before them: `/quality spec` runs before implementation, and the
+specification, tests, code and trace row land in one change — see
+[`AGENTS.md`](AGENTS.md) §"Specification before implementation", the
+conventions in [`docs/specs/README.md`](docs/specs/README.md), and
+[ADR-047](docs/adr/ADR-047-kanban-adopts-specification-driven-development.md).
+
 `web/gate.sh` typechecks and lints the operator UI's TypeScript and proves
 the committed `web/dist` bundle is byte-for-byte reproducible from the frozen
 lockfile (`web/check-reproducible.sh`); `cargo build` only embeds those
