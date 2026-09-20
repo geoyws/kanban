@@ -1778,7 +1778,14 @@ pub(crate) fn search_receipt(query: &str) -> Result<crate::model::SearchReceipt>
         results.extend(store.search(&project.name, &options)?);
         boards.push(project.name);
     }
-    results.extend(search::search_rules(&registry.rules(false)?, &options));
+    // Rule text is scoped to the boards this read actually covered: a rule
+    // whose selectors name only some other board never applies here, and
+    // serving its body would be a cross-board read dressed as a rule hit
+    // (ADR-027).
+    results.extend(search::search_rules(
+        &registry.rules_targeting_any(&boards, false)?,
+        &options,
+    ));
     Ok(search::bound_receipt(
         query,
         boards,

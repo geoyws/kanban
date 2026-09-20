@@ -3780,8 +3780,12 @@ fn search_command(args: &Args, query: &str) -> Result<SearchReceipt> {
                 results.extend(store.search(&project.name, &options)?);
                 boards.push(project.name);
             }
+            // Scoped to the boards this pass actually read, for the reason
+            // the single-board path below is scoped: a rule applies to a
+            // board or it does not (ADR-027), and an unreadable or absent
+            // board's rules are not this caller's to read.
             results.extend(search::search_rules(
-                &registry.rules(options.include_archived)?,
+                &registry.rules_targeting_any(&boards, options.include_archived)?,
                 &options,
             ));
             let mut seen = HashSet::new();

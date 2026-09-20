@@ -4127,6 +4127,38 @@ impl Registry {
             .collect())
     }
 
+    /// The rules whose selectors name at least one of `board_names` — the
+    /// multi-board twin of [`Self::rules_targeting_board`].
+    ///
+    /// A rule's tags are applicability selectors (ADR-027), so reading a
+    /// board authorizes reading the rules that apply to it and nothing
+    /// wider: a search across the caller's readable boards must not carry
+    /// rule text whose selectors name only some other board. The seam is
+    /// here rather than at each call site because `selector_tags_apply` is
+    /// private and one predicate cannot disagree with itself.
+    ///
+    /// An empty `board_names` yields no rules: a caller who can read no
+    /// board reads no rule text. Mapping it to `None` would instead admit
+    /// every `ALL` rule, which is the unscoped read this refuses.
+    pub fn rules_targeting_any(
+        &self,
+        board_names: &[String],
+        include_archived: bool,
+    ) -> Result<Vec<Rule>> {
+        if board_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .rules(include_archived)?
+            .into_iter()
+            .filter(|rule| {
+                board_names
+                    .iter()
+                    .any(|name| selector_tags_apply(&rule.tags, Some(name)))
+            })
+            .collect())
+    }
+
     pub fn rule(&self, id: &str) -> Result<Rule> {
         self.connection
             .query_row("SELECT * FROM rules WHERE id=?", [id], rule_row)
@@ -4650,6 +4682,10 @@ mod tests {
     }
 
     fn insert_rule(registry: &Registry, id: &str, archived: i64) {
+        insert_rule_tagged(registry, id, &["ALL"], archived);
+    }
+
+    fn insert_rule_tagged(registry: &Registry, id: &str, tags: &[&str], archived: i64) {
         registry
             .connection
             .execute(
@@ -4662,10 +4698,19 @@ mod tests {
                     archived,
                     1_i64,
                     1_i64,
-                    "[\"ALL\"]",
+                    serde_json::to_string(tags).expect("serialize rule tags"),
                 ],
             )
             .expect("insert rule");
+    }
+
+    fn rule_ids(rules: &Result<Vec<Rule>>) -> Vec<&str> {
+        rules
+            .as_ref()
+            .expect("read scoped rules")
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect()
     }
 
     fn rule_event_seqs(events: &[Event]) -> Vec<i64> {
@@ -4947,6 +4992,58 @@ mod tests {
             None,
             Some("sp-one"),
         ));
+    }
+
+    /// Rule tags are applicability selectors, so the scope of a multi-board
+    /// read is the union of what applies to the boards it read -- never the
+    /// whole registry, and never every `ALL` rule when it read nothing.
+    #[test]
+    fn rules_targeting_any_admits_only_rules_applying_to_a_searched_board() {
+        let registry = test_registry("registry-rule-scope");
+        insert_rule_tagged(&registry, "rule-all", &["ALL"], 0);
+        insert_rule_tagged(&registry, "rule-archived-alpha", &["ONLY:Alpha"], 1);
+        insert_rule_tagged(&registry, "rule-except-alpha", &["ALL", "EXCEPT:Alpha"], 0);
+        insert_rule_tagged(&registry, "rule-only-alpha", &["ONLY:Alpha"], 0);
+        insert_rule_tagged(&registry, "rule-only-beta", &["ONLY:Beta"], 0);
+
+        assert_eq!(
+            rule_ids(&registry.rules_targeting_any(&["Alpha".to_owned()], false)),
+            vec!["rule-all", "rule-only-alpha"],
+        );
+        // `ALL EXCEPT:Alpha` applies to Beta: the exception names the board
+        // it is withheld from, not the board it is granted to.
+        assert_eq!(
+            rule_ids(&registry.rules_targeting_any(&["Beta".to_owned()], false)),
+            vec!["rule-all", "rule-except-alpha", "rule-only-beta"],
+        );
+        assert_eq!(
+            rule_ids(
+                &registry.rules_targeting_any(&["Alpha".to_owned(), "Beta".to_owned()], false)
+            ),
+            vec![
+                "rule-all",
+                "rule-except-alpha",
+                "rule-only-alpha",
+                "rule-only-beta"
+            ],
+        );
+        assert_eq!(
+            rule_ids(&registry.rules_targeting_any(&["Alpha".to_owned()], true)),
+            vec!["rule-all", "rule-archived-alpha", "rule-only-alpha"],
+        );
+        assert!(
+            registry
+                .rules_targeting_any(&[], false)
+                .expect("scope no boards")
+                .is_empty(),
+            "a caller who read no board reads no rule text"
+        );
+        assert!(
+            registry
+                .rules_targeting_any(&[], true)
+                .expect("scope no boards with archived")
+                .is_empty(),
+        );
     }
 
     #[test]

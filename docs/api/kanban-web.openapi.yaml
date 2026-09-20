@@ -562,14 +562,17 @@ paths:
     get:
       operationId: search
       tags: [operations]
-      summary: Hybrid search across every readable board, and the rules.
+      summary: Hybrid search across every readable board, and the rules that apply to them.
       description: |
         The retrieval is `serve::search_receipt` (`rust/serve.rs:1743`), shared
         with the `/search` page rather than reimplemented:
         `Store::search(&board_name, &options)` per readable board
         (`rust/serve.rs:1778`), plus `search::search_rules` over
-        `Registry::rules(false)` (`rust/serve.rs:1781`), bounded by
-        `search::bound_receipt` (`rust/serve.rs:1782`). This route reads that
+        `Registry::rules_targeting_any(&boards, false)`
+        (`rust/serve.rs:1786`) — the rules whose ADR-027 selectors apply to a
+        board this read actually covered, never the whole registry, and none
+        at all when it covered no board — bounded by
+        `search::bound_receipt` (`rust/serve.rs:1789`). This route reads that
         receipt through `projection::search` (`rust/projection.rs:1135`).
 
         `search_receipt` fixes its own `SearchOptions`
@@ -589,7 +592,7 @@ paths:
         recomputed. `limit` is the fixed `30`.
       x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-39]
       x-store-method: Store::search
-      x-registry-method: Registry::rules
+      x-registry-method: Registry::rules_targeting_any
       parameters:
         - name: q
           in: query

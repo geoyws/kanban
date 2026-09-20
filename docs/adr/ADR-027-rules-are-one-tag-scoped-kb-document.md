@@ -96,6 +96,29 @@ Historical board rule tables remain in old board schemas so audit history stays
 readable and older backups remain restorable. They are compatibility history,
 not an active rule source after consolidation.
 
+## Addendum: 2026-09-20 — applicability is the authorization test for rule text
+
+The `t-bf255880` wave-1 security review asked whether a rule's `tags` array is
+also an authorization tag set, of the ADR-033 kind a `tag:<name>` grant names.
+It is not, and this ADR's Decision already answers it: the array expresses
+applicability, and nothing else. There is no second meaning for the same
+field. A caller who may read a board may read the rules that apply to that
+board, because those rules are part of what the board means; a caller who may
+not read the board never reaches them, since every rule read is reached
+through a board-scoped read in the first place. Board read is the whole test.
+
+Two surfaces serve rule text, and both are scoped by applicability: the board
+page's folded rule bodies (`projection::board`, through
+`applicable_rules`/`applicable_rule_summaries`), and a search hit on the rules
+document. The search surfaces were not scoped before 2026-09-20 — the served
+`/api/v1/search` receipt and the CLI's `--all-boards` pass handed
+`search_rules` the whole registry, so a search of board A could return the body
+of a rule whose selectors name ONLY board B. Since `t-e68bb2b9` both read the
+boards they actually searched and scope the candidate rules to the union of
+what applies to them (`Registry::rules_targeting_any`, the multi-board twin of
+the single-board path's `rules_targeting_board`). A search that read no board
+returns no rule text: an empty board set is not a wildcard.
+
 ## References
 
 - [ADR-015](ADR-015-tags-are-a-per-board-master-file.md)

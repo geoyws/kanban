@@ -2743,6 +2743,160 @@ fn a_tag_denied_row_is_in_no_task_listing_and_in_no_count_over_http() {
     );
 }
 
+/// A rule whose selectors name only ANOTHER board is in no search this
+/// caller runs, and the rules that DO apply are still served (`t-e68bb2b9`).
+///
+/// INTEGRATION, at the layer `process`/`http`: the real binary, a real
+/// managed estate, the CLI and the serving process running as the same
+/// identity. Rule tags are applicability selectors (ADR-027), so a board
+/// read authorizes reading the rules that apply to that board — and nothing
+/// wider. Both served rule surfaces are measured: the board page's folded
+/// bodies, and the search hit.
+///
+/// Beta leaves the searched set the one way this estate can drop a board
+/// without tripping `t-4b9501b3`'s entire-refusal: its file is removed, so
+/// every surface buckets it as missing and never opens it. The caller holds
+/// no Beta authority either, so the rule that names only Beta is out of
+/// scope twice over.
+///
+/// Every refusal is paired with its positive control — the Alpha rule IS
+/// found by the same query shape on all three surfaces, and IS folded into
+/// the board projection — so a search that had simply broken would fail
+/// here too.
+#[test]
+fn a_rule_scoped_to_another_board_is_in_no_search_over_http() {
+    let estate = ManagedEstate::new("json-rule-scope");
+    let work_a = estate.work_a.clone();
+
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "alpha row",
+            "--id",
+            "t-avis",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let alpha_rule = estate.ok_json(
+        &work_a,
+        &[
+            "rule",
+            "add",
+            "Alpha rule.\n\nThe needle zappaalpha governs Alpha.",
+            "--board",
+            "Alpha",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let beta_rule = estate.ok_json(
+        &work_a,
+        &[
+            "rule",
+            "add",
+            "Beta rule.\n\nThe needle zappabeta governs Beta and nothing else.",
+            "--board",
+            "Beta",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let alpha_rule_id = alpha_rule["id"].as_str().unwrap().to_owned();
+    let beta_rule_id = beta_rule["id"].as_str().unwrap().to_owned();
+
+    fs::remove_file(&estate.board_b).unwrap();
+    estate.bind_self("p-alpha-owner", &owner_of(&estate.id_a));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // 1. The JSON search route: the query is the other board's needle, so a
+    //    hit could only be its rule body.
+    let hidden = server.get_json("/api/v1/search?q=zappabeta");
+    assert_eq!(
+        hidden["boards"],
+        serde_json::json!(["Alpha"]),
+        "the search did not read exactly the caller's readable board: {hidden}"
+    );
+    assert_rule_absent(
+        &hidden["items"],
+        &beta_rule_id,
+        "zappabeta",
+        "/api/v1/search",
+    );
+    let found = server.get_json("/api/v1/search?q=zappaalpha");
+    assert!(
+        rule_hit(&found["items"], &alpha_rule_id).is_some(),
+        "/api/v1/search withheld the rule that applies to the searched board: {found}"
+    );
+
+    // 2. The CLI, same identity, on its own board and across the estate.
+    for args in [
+        vec!["search", "zappabeta", "--json"],
+        vec!["search", "zappabeta", "--all-boards", "--json"],
+    ] {
+        let receipt = estate.ok_json(&work_a, &args);
+        assert_rule_absent(&receipt["results"], &beta_rule_id, "zappabeta", "the CLI");
+    }
+    for args in [
+        vec!["search", "zappaalpha", "--json"],
+        vec!["search", "zappaalpha", "--all-boards", "--json"],
+    ] {
+        let receipt = estate.ok_json(&work_a, &args);
+        assert!(
+            rule_hit(&receipt["results"], &alpha_rule_id).is_some(),
+            "`kanban {args:?}` withheld the rule that applies to the searched board: {receipt}"
+        );
+    }
+
+    // 3. The other served rule surface: the board projection still folds the
+    //    applicable rule's whole body open, and carries no other board's.
+    let board = server.get("/api/v1/board/Alpha");
+    assert_eq!(board.status, 200, "{}", board.body);
+    assert!(
+        board.body.contains("zappaalpha") && board.body.contains(&alpha_rule_id),
+        "the board projection dropped the rule body that applies to it: {}",
+        board.body
+    );
+    for needle in ["zappabeta", beta_rule_id.as_str()] {
+        assert!(
+            !board.body.contains(needle),
+            "the board projection named {needle}, which applies to another board: {}",
+            board.body
+        );
+    }
+}
+
+/// One rule hit in a search receipt's rows, by rule id.
+fn rule_hit<'a>(rows: &'a Value, rule_id: &str) -> Option<&'a Value> {
+    rows.as_array()
+        .unwrap_or_else(|| panic!("search rows are not an array: {rows}"))
+        .iter()
+        .find(|row| row["sourceKind"] == "rule" && row["sourceId"] == rule_id)
+}
+
+/// No row is that rule, and no row's text carries its needle — a hit that
+/// had been re-titled would still be a disclosure.
+fn assert_rule_absent(rows: &Value, rule_id: &str, needle: &str, surface: &str) {
+    assert!(
+        rule_hit(rows, rule_id).is_none(),
+        "{surface} handed over a rule that applies to no board it read: {rows}"
+    );
+    for row in rows.as_array().unwrap() {
+        for field in ["title", "snippet"] {
+            assert!(
+                !row[field].as_str().unwrap_or_default().contains(needle),
+                "{surface} carried {needle} in a row's {field}: {row}"
+            );
+        }
+    }
+}
+
 /// A tag-denied attention row is in no queue, in no decisions listing, in no
 /// preview and in no open count (`t-8efced5b`).
 ///
