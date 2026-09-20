@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** George
-**Updated:** 2026-09-17
+**Updated:** 2026-09-20
 
 ## Product statement
 
@@ -10,6 +10,14 @@ Kanban is George's private, stateful representation of the projects he is
 working on. It gives humans and compatible agent harnesses one durable place to
 discover work, coordinate atomic ownership, report progress, preserve evidence,
 and transfer work to a replacement agent when context or tokens run low.
+
+The operator's own view of that state is a single-page application. `kb.geoy.ws`
+is a React and TypeScript client that the product ships as part of the one
+executable, and it reads the board through a browser-facing JSON projection of
+the same work state the CLI and the agents use. The decision to build it that
+way is [ADR-048](adr/ADR-048-the-operator-ui-is-a-typescript-spa-embedded-in-the-binary.md)
+and its contracts are [the SPA specification](specs/spa.md); what belongs here
+is only what the operator gets: one application, one work state beneath it.
 
 ## Goals
 
@@ -40,6 +48,12 @@ and transfer work to a replacement agent when context or tokens run low.
 - Arbitrary SQL access for agents.
 - Cross-host replication in the first release.
 - Replacing Git, source documentation, or external customer issue systems.
+- A no-script fallback for the operator UI. Today every decision form posts
+  without JavaScript and the page degrades cleanly; once the UI is one mounted
+  application it does not, and no equivalent is planned. George decided the
+  single-page shape on 2026-09-17 and accepted that loss with it, so it is a
+  chosen consequence rather than something a later reader should discover as a
+  regression.
 
 ## Primary workflows
 
@@ -89,6 +103,11 @@ and picks an outcome. The deck advances to the next card, a one-line receipt
 naming the decision lands in the session history with Undo one key away, the
 count of what is left drops, and the lane that raised the item reads a
 machine-readable verdict instead of a paragraph.
+
+He does this from the phone as readily as from the Mac — a decision answered
+standing up is the point of the surface — and one deck answers for every board
+at once, so seeing what is waiting across the whole portfolio is the same act as
+working through it.
 
 ## Functional requirements
 
@@ -246,8 +265,9 @@ machine-readable verdict instead of a paragraph.
   headline, the context, the authored choices with the recommendation first and
   each choice's consequence beneath its button, the card's one reply field, the
   free-text answer folded until it is asked for, the body folded beneath, then
-  the meta line. The bar reads how many are left. With no script the same page
-  is a plain list of every card, each with a working form.
+  the meta line. The bar reads how many are left. The same cards read as one
+  continuous list when the operator wants the whole queue rather than only the
+  next question.
 - Settle an item in one click as the operator. Reply text, when written, rides
   with whichever choice is clicked and is recorded as that decision's note; the
   free-text answer must carry both a note and an explicit outcome or be
@@ -291,8 +311,8 @@ machine-readable verdict instead of a paragraph.
   [the web UI specification](specs/web-ui.md) and
   [ADR-046](adr/ADR-046-the-web-ui-is-one-designed-system.md): the question is
   the only serif and the largest thing on the page, one motion, a colour means
-  an outcome, nothing is boxed, and the deck is a progressive enhancement over
-  the plain list. ADR-046 stays Proposed until George has reviewed screenshots
+  an outcome, nothing is boxed, and the deck and the full queue are one client
+  wearing that system. ADR-046 stays Proposed until George has reviewed screenshots
   of the restyled deck on the phone and the Mac.
 - Requirements trace: `docs/specs/web-ui.md` §3 states WEB-01..WEB-59 with a
   strength and one evidence layer each, §8 names the test per requirement, and
@@ -387,6 +407,13 @@ A handoff is valid only when:
   ingress, and one received queued message.
 - The aggregate view accurately reports all explicitly registered projects.
 - Process restart and database reopen preserve all task and handoff state.
+- The landing view loads only what it shows: a phone on mobile data must not
+  refetch a megabyte to see one new item. That obligation exists because it was
+  measured rather than assumed — on 2026-09-17 on `hax` the landing page
+  answered in 55 ms carrying 1.32 MB while the attention queue answered in
+  0.35 ms carrying 46 KB, and every live refresh re-sent the whole landing
+  payload. No byte or latency figure is adopted as a target here; `t-bf255880`
+  records the before and after it actually measured.
 
 ## Delivery slices
 
@@ -423,8 +450,10 @@ period.
 
 The production runtime is Rust per ADR-006. A release is ready only when the
 compiled executable passes the current process-boundary E2E matrix and the
-focused atmux CLI adapter contract suite against current data. TypeScript and
-Bun are not production or development dependencies of Kanban.
+focused atmux CLI adapter contract suite against current data. Since the SPA
+decision, TypeScript and Bun are build-time dependencies of the operator UI on
+the build host (ADR-048 records the boundary); the served product still runs
+Rust alone, and nothing Node-shaped runs on a server.
 
 What is shipped is not what is served. The decision room, the pub/sub
 dispatcher, and the harness adapters are shipped and served: the host serves
@@ -439,5 +468,12 @@ contract are in that served commit, while commit `b98e81e` — every read page a
 rows with one pill, sentence meta and borderless tables — is shipped on its
 branch and pending its deploy. ADR-046 stays Proposed either way, until George
 has reviewed screenshots of the restyled deck on the phone and the Mac.
+
+On 2026-09-17 George decided that the operator UI becomes a single-page
+application, recorded as ADR-048 on 2026-09-19 and specified before it was
+built. The rebuild is in delivery: the landing view and the queue are mounted
+and read the JSON projection, the no-script fallback is gone as accepted above,
+and the deck's behaviour is being re-proven on the new client rather than
+assumed to carry over.
 
 See [the historical 2026-08-16 fleet preparation receipt](migrations/atmux-fleet-preparation-2026-08-16.md).
