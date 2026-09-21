@@ -32168,21 +32168,19 @@ fn a_lagging_notice_socket_in_real_chrome_shows_one_summary_not_every_change() {
 fn a_redelivered_notice_does_not_act_or_render_twice_on_the_deck_in_real_chrome() {
     let desk = deck_desk("serve-deck-notice-twice", "DECKTWICE");
     wait_for_live(&desk.tab, "live");
-    // The projection the deck is on, so "acted twice" is observable: a
-    // second delivery that re-read the queue would move this count.
-    hold_projection(&desk.tab);
 
     const FRAME: &str = "{type:'notice',key:'n-redelivered',what:'Attention raised',\
                          task:'t-elsewhere',title:'Another lane filed its own task',\
                          board:'ELSEWHERE'}";
-    // Both deliveries and the projection observation are one browser task.
-    // A genuine socket refresh may arrive independently; letting CDP calls
-    // interleave with it would attribute that unrelated refresh to the
-    // duplicate frame instead of measuring what `deliver` itself did.
+    // Establishing the hold, both deliveries and the projection observation
+    // are ONE browser task. A genuine socket refresh may arrive independently;
+    // holding in a separate CDP call let that unrelated refresh invalidate the
+    // hold before delivery, attributing it to the duplicate frame instead of
+    // measuring what `deliver` itself did.
     let delivered = js_value(
         &desk.tab,
         &format!(
-            "JSON.stringify((() => {{ const frame = {FRAME}; const first = window.__kbLive.deliver(frame); const second = window.__kbLive.deliver(frame); return {{first, second, held: {PROJECTION_HELD}}}; }})())"
+            "JSON.stringify((() => {{ const root = {PROJECTION_ROOT}; root.dataset.generation = 'held'; window.__heldProjection = root.dataset.projection ?? ''; const frame = {FRAME}; const first = window.__kbLive.deliver(frame); const second = window.__kbLive.deliver(frame); return {{first, second, held: {PROJECTION_HELD}}}; }})())"
         ),
     );
     let delivered: Value = serde_json::from_str(
