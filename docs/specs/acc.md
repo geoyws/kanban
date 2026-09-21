@@ -4,11 +4,11 @@
 
 - **Slice ID:** `ACC`. Requirement IDs are `ACC-01` .. `ACC-17`, stable across wording
   refinements; numbering is by creation and grouping is by topic.
-- **Baseline:** `2026-09-21` at commit `233d589` on branch
+- **Baseline:** `2026-09-21` at commit `04a66b1` on branch
   `docs/t-6a3dd1a6-acc-spec`.
-- **Status:** `BLOCKED` on 2026-09-21 by decision card `a-db9de88b`. The preimplementation
-  specification gate found one unresolved answered-but-open edit law in §7. This status authorises neither
-  implementation, rollout nor release.
+- **Status:** `SPEC-READY` on 2026-09-21. An independent `/quality spec` review found five
+  defects; all were closed, and George resolved its sole product blocker as **lock** on decision
+  card `a-db9de88b`. Specification readiness authorises neither implementation, rollout nor release.
 - **Owner (product scope):** George.
 - **Decider (wording of this document):** George.
 - **Sources:**
@@ -26,7 +26,7 @@
   - `docs/adr/ADR-047-kanban-adopts-specification-driven-development.md` — specification
     format, stable IDs, trace and readiness gate.
   - George, 2026-09-20 (walkthrough note 255) — approved adding ACC to the SDD rollout.
-  - `a-db9de88b` on `t-6a3dd1a6` — George's decision card for OQ-1: lock (recommended) or reset.
+  - `a-db9de88b` on `t-6a3dd1a6` — George resolved OQ-1 as **lock** on 2026-09-21.
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 names the planned rows;
   this specification does not claim implementation evidence.
 
@@ -53,8 +53,7 @@ legacy `ACC:` body-block migration; and the `/kb` and `/kb-att` native-field cut
 
 **Boundaries.** Existing board/tag tenancy, actor authentication, attention status transitions,
 decision outcomes, choice key/label bounds, card hotkeys and Undo remain owned by their current
-contracts. ACC inherits those laws rather than restating or weakening them. §7 asks George only
-whether the raiser may rewrite an answered check while its row is still open.
+contracts. ACC inherits those laws rather than restating or weakening them.
 
 **Rollout boundary.** ACC is the one George-approved addition to the ADR-047 rollout. It does not
 make unrelated slices retrospective specifications. Implementation may begin only after this
@@ -115,13 +114,15 @@ never reads this row's finding back.”** No broader classifier or unapproved ma
 
 **ACC-05 — Let only the raiser author or change a check.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` §What the kanban team owns 4;
-`t-1227a592` RULE.
+`t-1227a592` RULE; George's **lock** on `a-db9de88b`.
 The Store accepts check-definition inputs on raise and on update only when the actor is the row's
 `raisedBy`. An update carrying any check-definition input from another lane, a clerk or `geoyws`
 is refused naming the raiser and writes nothing. Resolve accepts only an answer input and can
-never add or change the definition. MCP and web calls inherit the same Store rule. A resolved
+never add or change the definition. MCP and web calls inherit the same Store rule. Once an answer
+is recorded while the row remains open, every check-definition edit is refused; its definition,
+answer/result and unlocked decision choices remain stable until normal resolution. A resolved
 row's card is immutable. Reopen clears its current decision and check result, returns it to open
-and restores raiser update. Only an answered-but-still-open definition rewrite is §7 OQ-1.
+with decision choices locked behind a new answer, and restores raiser update.
 
 ### Answer and resolution
 
@@ -335,9 +336,11 @@ web conflict or CLI refusal after observing the winner. Retry is N/A: there is n
 
 ### A16 — authoring across answer, resolution and reopen (`ACC-05`)
 
-*Given* a resolved checked row, *when* its raiser tries to update its check, *then* the immutable
-card refusal is returned; *when* the row is reopened, *then* current decision/check result clear
-and raiser update is restored. Definition update while answered-but-open is BLOCKED by OQ-1.
+*Given* an answered open row, *when* its raiser tries to rewrite the check, *then* the edit is
+refused and definition, answer/result and unlocked decision choices are unchanged; *given* a
+resolved checked row, *when* its raiser tries the same edit, *then* the immutable-card refusal is
+returned; *when* the row is reopened, *then* current decision/check result clear, decision choices
+lock behind a new answer and raiser update is restored.
 
 ## 5. Contracts and data
 
@@ -348,15 +351,17 @@ and raiser update is restored. Definition update while answered-but-open is BLOC
 - **Data invariants:** a definition is absent or complete; it contains question, two through four
   choices, one declared answer, explanation and `about`; result data contains
   `answered`/`correct`/`answeredAt` consistently or is absent; no check choice has recommendation
-  or outcome semantics. Attempt data is prohibited by the approved one-answer supersession.
+  or outcome semantics. Attempt data is prohibited. An answered open row's check definition and
+  result are immutable until resolution; reopen atomically clears the current decision/result and
+  restores the unanswered open-row state.
 - **Migration:** schema bump at the ADR-045 boundary plus the one-shot, receipt-bearing conversion
   in ACC-16; forward migration only. Rows without a valid leading legacy block are unchanged.
 - **Compatibility:** absent checks remain absent and preserve old read/resolve behaviour; checked
   rows fail closed against old resolvers that omit the answer; redaction is an omission, not a
   renamed or nullable answer field.
 - **Ownership:** the containing board Store owns definition, result and authorization; `raisedBy`
-  owns authoring permission; George owns unresolved product law. Skills and web are projections,
-  not alternate ledgers.
+  owns authoring permission subject to ACC-05's lock. Skills and web are projections, not
+  alternate ledgers.
 - **Events/audit:** the approved sources require persisted result fields and a matching human note
   echo but do not approve a new event type or payload name. Existing write auditing applies; this
   specification deliberately invents none.
@@ -384,14 +389,17 @@ and raiser update is restored. Definition update while answered-but-open is BLOC
 
 ## 7. Open questions
 
-| ID | Question | Owner | Status | Gate it blocks |
-| --- | --- | --- | --- | --- |
-| OQ-1 | Decision card `a-db9de88b` on `t-6a3dd1a6`: while a row is still open but already has a recorded check answer and unlocked decision choices, may its raiser rewrite the check definition? Choices: **lock** (recommended) — refuse the edit and preserve the measurement; or **reset** — allow the edit only while atomically clearing the recorded answer/result and locking the choices again. Resolved rows are immutable; reopen already clears current decision/check result and restores open-row update. | George | open | `SPEC-READY`; ACC-05 and A16 |
+None.
+
+**Resolved question history.** OQ-1 asked whether the raiser may rewrite an answered check while
+the row remains open. George chose **lock** (the recommended choice) on decision card
+`a-db9de88b` for `t-6a3dd1a6` on 2026-09-21: refuse the edit and preserve the definition,
+recorded answer/result and unlocked choices until normal resolution. ACC-05 carries the contract.
 
 ## 8. Verification
 
-The trace of record has one planned row for every mandatory ACC requirement. No test name or pass
-is claimed before implementation; the one `BLOCKED` row depends on §7.
+The trace of record has one planned row for every mandatory ACC requirement. No test name, pass,
+implementation or release is claimed before implementation.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
@@ -399,7 +407,7 @@ is claimed before implementation; the one `BLOCKED` row depends on §7.
 | `ACC-02` | MUST | unit | `PLANNED` | explanation and all three `about` shapes/refusal |
 | `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
 | `ACC-04` | MUST | unit | `PLANNED` | every agreed marker across all three text locations |
-| `ACC-05` | MUST | process | `BLOCKED` | raiser/other/geoyws plus inherited resolved/reopen law; answered-open edit awaits OQ-1 |
+| `ACC-05` | MUST | process | `PLANNED` | raiser/other/geoyws, answered-open lock, resolved immutability and reopen-clear/restore paths |
 | `ACC-06` | MUST | process | `PLANNED` | missing/no-check/undeclared-key paths plus web answer then web/CLI resolve without a second answer |
 | `ACC-07` | MUST | process | `PLANNED` | persisted answer/correct/time and note agreement |
 | `ACC-08` | MUST | process | `PLANNED` | right/wrong, immutable duplicate and serialized concurrent-answer paths |
@@ -416,6 +424,7 @@ is claimed before implementation; the one `BLOCKED` row depends on §7.
 ## 9. Change log
 
 - 2026-09-21 — initial ACC specification drafted from the eight approved board sources; the later
-  approved child rows' one-answer/no-retry contract supersedes the epic draft. Review removed an
-  unapproved semantic classifier, applied later reader redaction and inherited write/lifecycle laws;
-  only answered-but-open raiser rewriting remains blocked for George.
+  approved child rows' one-answer/no-retry contract supersedes the epic draft. Independent review
+  removed an unapproved semantic classifier, applied later reader redaction and inherited write/
+  lifecycle laws. George chose **lock** on `a-db9de88b`; ACC-05 now refuses answered-open edits,
+  closing the sole open question and making the specification `SPEC-READY`.

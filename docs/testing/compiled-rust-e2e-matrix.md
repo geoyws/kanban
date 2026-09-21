@@ -495,10 +495,9 @@ Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `u
 
 ## Requirements trace — docs/specs/acc.md ACC-01..ACC-17
 
-One row per mandatory requirement at the 2026-09-21 specification baseline. ACC has no
-implementation evidence yet: `PLANNED` is an intended evidence layer, not a passing test, and
-`BLOCKED` means the planned evidence depends on the sole George-owned product decision in
-`docs/specs/acc.md` §7. No future test name, pass, implementation or release is claimed.
+One row per mandatory requirement at the 2026-09-21 `SPEC-READY` baseline. ACC has no
+implementation evidence yet: `PLANNED` is an intended evidence layer, not a passing test.
+No future test name, pass, implementation or release is claimed.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
@@ -506,7 +505,7 @@ implementation evidence yet: `PLANNED` is an intended evidence layer, not a pass
 | `ACC-02` | MUST | unit | `PLANNED` | explanation and all three `about` shapes/refusal |
 | `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
 | `ACC-04` | MUST | unit | `PLANNED` | every agreed marker across all three text locations |
-| `ACC-05` | MUST | process | `BLOCKED` | raiser/other/geoyws plus inherited resolved/reopen law; answered-open edit awaits OQ-1 |
+| `ACC-05` | MUST | process | `PLANNED` | raiser/other/geoyws, answered-open lock, resolved immutability and reopen-clear/restore paths |
 | `ACC-06` | MUST | process | `PLANNED` | missing/no-check/undeclared-key paths plus web answer then web/CLI resolve without a second answer |
 | `ACC-07` | MUST | process | `PLANNED` | persisted answer/correct/time and note agreement |
 | `ACC-08` | MUST | process | `PLANNED` | right/wrong, immutable duplicate and serialized concurrent-answer paths |
@@ -521,8 +520,7 @@ implementation evidence yet: `PLANNED` is an intended evidence layer, not a pass
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
 
 17 requirements: 17 MUST, no SHOULD or MAY. By planned layer: 3 unit, 9 process, 2 http and
-3 chrome. One row is BLOCKED by the sole material question in `docs/specs/acc.md` §7;
-the remaining sixteen are PLANNED. There is no present implementation evidence.
+3 chrome. All seventeen rows are PLANNED; there is no present implementation evidence.
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.
