@@ -1303,6 +1303,55 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(text: String) -> rusqlite::
     serde_json::from_str(&text)
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }
+fn attention_check(row: &Row<'_>) -> rusqlite::Result<Option<AttentionCheck>> {
+    let question = row.get::<_, Option<String>>("check_question")?;
+    let choices = row.get::<_, Option<String>>("check_choices")?;
+    let answer = row.get::<_, Option<String>>("check_answer")?;
+    let explanation = row.get::<_, Option<String>>("check_explanation")?;
+    let about = row.get::<_, Option<String>>("check_about")?;
+    let present = [
+        question.is_some(),
+        choices.is_some(),
+        answer.is_some(),
+        explanation.is_some(),
+        about.is_some(),
+    ];
+    if present.iter().all(|value| !value) {
+        return Ok(None);
+    }
+    if let Some(index) = present.iter().position(|value| !value) {
+        let column = [
+            "check_question",
+            "check_choices",
+            "check_answer",
+            "check_explanation",
+            "check_about",
+        ][index];
+        return Err(rusqlite::Error::InvalidColumnType(
+            0,
+            column.into(),
+            Type::Null,
+        ));
+    }
+    let check = AttentionCheck {
+        question: question.expect("presence checked"),
+        choices: parse_json_column(choices.expect("presence checked"))?,
+        answer,
+        explanation,
+        about: about.expect("presence checked"),
+    };
+    check.validate_definition().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        )
+    })?;
+    Ok(Some(check))
+}
 
 fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
@@ -1319,6 +1368,7 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
             Some(text) => parse_json_column(text)?,
             None => default_choice_pair(),
         },
+        check: attention_check(row)?,
         raised_by: row.get("raised_by")?,
         created_at: row.get("created_at")?,
         status: row.get("status")?,
@@ -1337,6 +1387,9 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         archived: row.get::<_, i64>("archived")? != 0,
         tags: Vec::new(),
     })
+}
+fn redact_attention_check(item: &mut Attention) {
+    item.check = item.check.as_ref().map(AttentionCheck::redacted);
 }
 
 fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
@@ -6276,25 +6329,33 @@ impl Store {
         priority: i64,
         tags: &[String],
         card: &DecisionCard,
+        check_input: Option<&AttentionCheckInput>,
     ) -> Result<Attention> {
+        // Authorization is the first observable decision: an unauthorized caller
+        // must not learn which check field or semantic rule its input violates.
+        self.authz.check_write(&[], tags)?;
         validate(kind, &ATTENTION_KINDS, "attention kind")?;
         validate_priority(Some(priority))?;
         let body = nonempty(body, "attention body")?.to_owned();
         let raised_by = nonempty(raised_by, "raised by")?.to_owned();
-        // Before the write lock: a malformed card is refused without taking
-        // it, and the refusal is the same one every other surface reads.
+        // Before the write lock: malformed card/check definitions are refused
+        // without taking it, after authorization has hidden their validators.
         card.validate()?;
+        let check = match check_input {
+            Some(input) => input.parse()?,
+            None => None,
+        };
+        let check = check.as_ref();
         let transaction = self.begin_write()?;
-        // A new attention row has no old tag set; the resulting set is the
-        // tags the caller asked for. Under the mutation lock.
-        self.authz.check_write(&[], tags)?;
+        // A new attention row has no old tag set; authorization above checked
+        // exactly the resulting tags before semantic validation.
         if let Some(id) = task_id {
             require_active_task(&transaction, id)?;
         }
         let now = now_ms();
         let id = format!("a-{}", &Uuid::new_v4().simple().to_string()[..8]);
         transaction.execute(
-            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL)",
+            "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,priority,question,context,choices,decision,check_question,check_choices,check_answer,check_explanation,check_about) VALUES(?,?,?,?,?,?,'open',NULL,NULL,NULL,?,?,?,?,NULL,?,?,?,?,?)",
             params![
                 id,
                 task_id,
@@ -6305,7 +6366,12 @@ impl Store {
                 priority,
                 card.question,
                 card.context,
-                card.choices_json()
+                card.choices_json(),
+                check.map(|value| value.question.as_str()),
+                check.map(|value| serde_json::to_string(&value.choices).expect("check choices serialize")),
+                check.and_then(|value| value.answer.as_deref()),
+                check.and_then(|value| value.explanation.as_deref()),
+                check.map(|value| value.about.as_str()),
             ],
         )?;
         set_attention_tags(&transaction, &id, tags)?;
@@ -6397,7 +6463,27 @@ impl Store {
             // A negative bound is SQLite's "no bound", and stays one here.
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         }
+        for row in &mut rows {
+            redact_attention_check(row);
+        }
         Ok(rows)
+    }
+    /// Read one attention row through the safe broad projection.
+    ///
+    /// No authoritative principal-to-raisedBy binding reaches the Store, so a
+    /// caller-supplied actor string cannot unlock answer material (ACC-13).
+    pub fn show_attention(&self, id: &str) -> Result<Attention> {
+        self.authz.check_read(&[])?;
+        let mut item = self
+            .connection
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?
+            .with_context(|| format!("attention {id} not found"))?;
+        let tags = attention_tags(&self.connection, id)?;
+        self.authz.check_read(&tags)?;
+        item.tags = tags;
+        redact_attention_check(&mut item);
+        Ok(item)
     }
 
     /// How many attention rows nobody has settled: the dashboard's number,
@@ -6472,6 +6558,9 @@ impl Store {
         if enforcing {
             rows.retain(|row| self.authz.permits_read(&row.tags));
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        for row in &mut rows {
+            row.check = row.check.as_ref().map(AttentionCheck::redacted);
         }
         Ok(rows)
     }
@@ -6605,15 +6694,17 @@ impl Store {
         body: Option<&str>,
         tags: Option<&[String]>,
         card: Option<&DecisionCard>,
+        check: Option<&AttentionCheckInput>,
         clear_card: bool,
         actor: &str,
     ) -> Result<Attention> {
         let authored = card.is_some_and(|card| !card.is_empty());
-        if body.is_none() && tags.is_none() && !authored && !clear_card {
+        let authored_check = check.is_some();
+        if body.is_none() && tags.is_none() && !authored && !authored_check && !clear_card {
             bail!(
                 "attention update requires --body/--body-file, --tag, --clear-tags, \
                  --question and --context, --choice with --consequence and --recommend, \
-                 or --clear-card"
+                 a complete --check block, or --clear-card"
             );
         }
         let body = body
@@ -6635,6 +6726,13 @@ impl Store {
         if existing.status != "open" {
             bail!("attention {id} is resolved history; its card cannot be rewritten");
         }
+        if authored_check && actor != existing.raised_by {
+            bail!(
+                "attention {id} check may be changed only by its raiser {}; actor {actor} is not the raiser",
+                existing.raised_by
+            );
+        }
+        let check = check.map(AttentionCheckInput::parse).transpose()?.flatten();
         // The column, not the served row: a row that authored no choices is
         // served as the default pair, and merging that pair in would turn a
         // never-authored row into an authored one on a body-only update.
@@ -6672,14 +6770,29 @@ impl Store {
         .validate()?;
         let mut previous = vec![existing.clone()];
         attach_attention_tags(&transaction, &mut previous)?;
+        let check_choices = check
+            .as_ref()
+            .map(|value| serde_json::to_string(&value.choices).expect("check choices serialize"));
         transaction.execute(
-            "UPDATE attention SET body=?,question=?,context=?,choices=? WHERE id=?",
+            "UPDATE attention SET body=?,question=?,context=?,choices=?, \
+             check_question=COALESCE(?,check_question), \
+             check_choices=COALESCE(?,check_choices), \
+             check_answer=COALESCE(?,check_answer), \
+             check_explanation=COALESCE(?,check_explanation), \
+             check_about=COALESCE(?,check_about) WHERE id=?",
             params![
                 body.unwrap_or(&existing.body),
                 question,
                 context,
                 choices,
-                id
+                check.as_ref().map(|value| value.question.as_str()),
+                check_choices,
+                check.as_ref().and_then(|value| value.answer.as_deref()),
+                check
+                    .as_ref()
+                    .and_then(|value| value.explanation.as_deref()),
+                check.as_ref().map(|value| value.about.as_str()),
+                id,
             ],
         )?;
         if let Some(tags) = tags {
@@ -6694,6 +6807,9 @@ impl Store {
         }
         if authored || clear_card {
             changed.push("card");
+        }
+        if authored_check {
+            changed.push("check");
         }
         event(
             &transaction,
@@ -6720,7 +6836,9 @@ impl Store {
         transaction.commit()?;
         let mut result = vec![result];
         attach_attention_tags(&self.connection, &mut result)?;
-        Ok(result.remove(0))
+        let mut result = result.into_iter().next().expect("one attention row");
+        redact_attention_check(&mut result);
+        Ok(result)
     }
 
     /// Settle an item. The row stays; only its state moves.
@@ -6826,9 +6944,10 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
-        let mut result = vec![result];
-        attach_attention_tags(&self.connection, &mut result)?;
-        Ok(result.remove(0))
+        let mut result = result;
+        attach_attention_tags(&self.connection, std::slice::from_mut(&mut result))?;
+        redact_attention_check(&mut result);
+        Ok(result)
     }
 
     /// Undo a mistaken resolution without erasing who made it or what they
@@ -6887,9 +7006,10 @@ impl Store {
         let result =
             transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
         transaction.commit()?;
-        let mut result = vec![result];
-        attach_attention_tags(&self.connection, &mut result)?;
-        Ok(result.remove(0))
+        let mut result = result;
+        attach_attention_tags(&self.connection, std::slice::from_mut(&mut result))?;
+        redact_attention_check(&mut result);
+        Ok(result)
     }
 
     pub fn handoffs(
@@ -9608,6 +9728,7 @@ mod tests {
                 3,
                 &["beta".to_owned()],
                 &DecisionCard::default(),
+                None,
             )
             .expect("seed attention");
             b.add_note("t-b", "seed", "progress", "a note on the other board")
@@ -9723,14 +9844,45 @@ mod tests {
                 3,
                 &[],
                 &DecisionCard::default(),
+                None,
             ),
             "attention raise",
         );
+        let events_before_malformed_raise: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let malformed = AttentionCheckInput {
+            question: Some("not a question".into()),
+            choices: vec![],
+            answer: None,
+            explanation: None,
+            about: Some("not a subject".into()),
+        };
+        assert_denied(
+            store.raise_attention(
+                "body",
+                "blocking",
+                "actor",
+                None,
+                3,
+                &[],
+                &DecisionCard::default(),
+                Some(&malformed),
+            ),
+            "attention raise malformed check",
+        );
+        let events_after_malformed_raise: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events_after_malformed_raise, events_before_malformed_raise);
         assert_denied(
             store.update_attention(
                 "a-x",
                 None,
                 Some(&["beta".to_owned()]),
+                None,
                 None,
                 false,
                 "actor",
@@ -9981,6 +10133,7 @@ mod tests {
                 1,
                 &["visible".to_owned()],
                 &DecisionCard::default(),
+                None,
             )
             .expect("raise visible");
             // More urgent than every readable row, so a SQL `LIMIT` bound
@@ -9994,6 +10147,7 @@ mod tests {
                     0,
                     &["secret".to_owned()],
                     &DecisionCard::default(),
+                    None,
                 )
                 .expect("raise secret")
                 .id;
@@ -10009,6 +10163,7 @@ mod tests {
                     priority,
                     &["visible".to_owned()],
                     &DecisionCard::default(),
+                    None,
                 )
                 .expect("raise another visible");
             }
@@ -10020,6 +10175,7 @@ mod tests {
                 1,
                 &["visible".to_owned(), "secret".to_owned()],
                 &DecisionCard::default(),
+                None,
             )
             .expect("raise both");
             secret_resolved = seed
@@ -10031,6 +10187,7 @@ mod tests {
                     1,
                     &["secret".to_owned()],
                     &DecisionCard::default(),
+                    None,
                 )
                 .expect("raise secret decision")
                 .id;
@@ -10045,6 +10202,7 @@ mod tests {
                     1,
                     &["visible".to_owned()],
                     &DecisionCard::default(),
+                    None,
                 )
                 .expect("raise visible decision")
                 .id;
@@ -10286,6 +10444,7 @@ mod tests {
                     1,
                     &[tag.to_owned()],
                     &DecisionCard::default(),
+                    None,
                 )
                 .expect("raise")
                 .id
@@ -10306,6 +10465,7 @@ mod tests {
                 &secret,
                 None,
                 Some(&["visible".to_owned()]),
+                None,
                 None,
                 false,
                 "seed",
@@ -10752,6 +10912,7 @@ mod tests {
                 3,
                 &["alpha".to_owned()],
                 &DecisionCard::default(),
+                None,
             )
             .expect("seed attention")
         };
@@ -10785,6 +10946,7 @@ mod tests {
                 &raised.id,
                 Some("rewritten"),
                 Some(&["beta".to_owned()]),
+                None,
                 None,
                 false,
                 "actor",
@@ -10904,6 +11066,7 @@ mod tests {
                 0,
                 &[],
                 &DecisionCard::default(),
+                None,
             )
             .expect("raise web attention");
         let cli_attention = store
@@ -10915,6 +11078,7 @@ mod tests {
                 0,
                 &[],
                 &DecisionCard::default(),
+                None,
             )
             .expect("raise cli attention");
         let forbidden_attention = store
@@ -10926,6 +11090,7 @@ mod tests {
                 0,
                 &[],
                 &DecisionCard::default(),
+                None,
             )
             .expect("raise forbidden attention");
 
@@ -14094,6 +14259,7 @@ mod tests {
                 3,
                 &[],
                 &DecisionCard::default(),
+                None,
             )
             .unwrap();
 
@@ -14644,6 +14810,7 @@ mod tests {
                     6,
                     &[],
                     &DecisionCard::default(),
+                    None,
                 )
                 .expect("raise")
                 .id
@@ -15622,5 +15789,277 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), "denied or not found");
         }
+    }
+    fn native_check(question: &str, answer: &str, explanation: &str) -> AttentionCheck {
+        AttentionCheck::parse(
+            Some(question),
+            &[
+                "store=The Store validates it".to_owned(),
+                "client=The client validates it".to_owned(),
+            ],
+            Some(answer),
+            Some(explanation),
+            Some("rust/store.rs"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+    fn native_check_input(check: &AttentionCheck) -> AttentionCheckInput {
+        AttentionCheckInput {
+            question: Some(check.question.clone()),
+            choices: check
+                .choices
+                .iter()
+                .map(|choice| format!("{}={}", choice.key, choice.label))
+                .collect(),
+            answer: check.answer.clone(),
+            explanation: check.explanation.clone(),
+            about: Some(check.about.clone()),
+        }
+    }
+
+    #[test]
+    fn native_check_store_round_trip_redaction_authorization_and_atomic_update() {
+        let path = board_db_path("native-check-store");
+        let parent = path.parent().unwrap().to_path_buf();
+        let mut store = Store::open(&path).unwrap();
+        store.initialize("checks", "seed").unwrap();
+        let original = native_check(
+            "Where is the check definition validated?",
+            "store",
+            "rust/store.rs validates the complete definition before the write.",
+        );
+        let original_input = native_check_input(&original);
+        fn stored_check(store: &Store, id: &str) -> Option<AttentionCheck> {
+            store
+                .connection
+                .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+                .unwrap()
+                .check
+        }
+        let raised = store
+            .raise_attention(
+                "A decision needs comprehension.",
+                "decision",
+                "claude@driver",
+                None,
+                0,
+                &[],
+                &DecisionCard::default(),
+                Some(&original_input),
+            )
+            .unwrap();
+        assert_eq!(raised.check.as_ref(), Some(&original));
+        assert_eq!(stored_check(&store, &raised.id), Some(original.clone()));
+        let redacted = store.show_attention(&raised.id).unwrap();
+        assert_eq!(redacted.check.as_ref().unwrap().answer, None);
+        assert_eq!(redacted.check.as_ref().unwrap().explanation, None);
+        let listed = store
+            .attention(None, None, None, None, None, 10, false)
+            .unwrap();
+        assert_eq!(listed[0].check.as_ref().unwrap().answer, None);
+        assert_eq!(listed[0].check.as_ref().unwrap().explanation, None);
+
+        let events_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let replacement = native_check(
+            "Which layer owns the definition?",
+            "store",
+            "rust/store.rs owns validation and persistence.",
+        );
+        let replacement_input = native_check_input(&replacement);
+        let malformed_non_raiser = AttentionCheckInput {
+            question: Some("This is not even a complete question".to_owned()),
+            ..Default::default()
+        };
+        let error = store
+            .update_attention(
+                &raised.id,
+                None,
+                None,
+                None,
+                Some(&malformed_non_raiser),
+                false,
+                "geoyws",
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "attention {} check may be changed only by its raiser claude@driver; actor geoyws is not the raiser",
+                raised.id
+            )
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(stored_check(&store, &raised.id), Some(original.clone()));
+
+        store
+            .update_attention(
+                &raised.id,
+                Some("Body-only rewrite."),
+                None,
+                None,
+                None,
+                false,
+                "claude@driver",
+            )
+            .unwrap();
+        assert_eq!(stored_check(&store, &raised.id), Some(original));
+        let replaced = store
+            .update_attention(
+                &raised.id,
+                None,
+                None,
+                None,
+                Some(&replacement_input),
+                false,
+                "claude@driver",
+            )
+            .unwrap();
+        assert_eq!(replaced.check.as_ref().unwrap().answer, None);
+        assert_eq!(replaced.check.as_ref().unwrap().explanation, None);
+        assert_eq!(stored_check(&store, &raised.id), Some(replacement));
+        let stored_choices: String = store
+            .connection
+            .query_row(
+                "SELECT check_choices FROM attention WHERE id=?",
+                [&raised.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_choices=NULL WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        assert!(
+            store
+                .show_attention(&raised.id)
+                .unwrap_err()
+                .to_string()
+                .contains("check_choices")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_choices=? WHERE id=?",
+                params![stored_choices, raised.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_choices='not-json' WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        assert!(
+            store
+                .show_attention(&raised.id)
+                .unwrap_err()
+                .to_string()
+                .contains("expected ident")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_choices=? WHERE id=?",
+                params![
+                    r#"[{"key":"store","label":"Store","outcome":"approve"},{"key":"client","label":"Client"}]"#,
+                    raised.id
+                ],
+            )
+            .unwrap();
+        let unknown = store.show_attention(&raised.id).unwrap_err().to_string();
+        assert!(unknown.contains("outcome"), "{unknown}");
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_choices=? WHERE id=?",
+                params![stored_choices, raised.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_question=NULL WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        let missing_question = store.show_attention(&raised.id).unwrap_err().to_string();
+        assert!(
+            missing_question.contains("check_question"),
+            "{missing_question}"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_question='Which layer owns the definition?' WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_answer='missing' WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        let semantic = store.show_attention(&raised.id).unwrap_err().to_string();
+        assert!(semantic.contains("names no --check-choice"), "{semantic}");
+        let semantic_update = store
+            .update_attention(
+                &raised.id,
+                Some("must not update a semantically corrupt row"),
+                None,
+                None,
+                None,
+                false,
+                "claude@driver",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            semantic_update.contains("names no --check-choice"),
+            "{semantic_update}"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_answer='store' WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_about=NULL WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+        assert!(
+            store
+                .show_attention(&raised.id)
+                .unwrap_err()
+                .to_string()
+                .contains("check_about")
+        );
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -976,6 +976,9 @@ const CONTEXT_MAX: usize = 800;
 const LABEL_MAX: usize = 60;
 const CONSEQUENCE_MAX: usize = 200;
 const KEY_MAX: usize = 32;
+const CHECK_EXPLANATION_MAX: usize = 400;
+const CHECK_ABOUT_RULE: &str = "`about` not matching one of the three subject shapes (a path containing `/` or a file extension; a sigil token `@@host`/`@_tier`; an UPPER_SNAKE flag or `--flag` name) is refused naming the three shapes.";
+const CHECK_DIAGNOSIS_RULE: &str = "The refusal prints the offending token and the rule: a check teaches how the system works; it never reads this row's finding back.";
 
 /// "approve, reject, defer, or other" — the four values, for a refusal that
 /// names them rather than leaving the caller to guess.
@@ -997,6 +1000,293 @@ pub struct AttentionChoice {
     pub outcome: String,
     #[serde(default)]
     pub recommended: bool,
+}
+/// One non-decisional answer offered by an active comprehension check.
+///
+/// It deliberately has neither an outcome nor a recommendation: answering a
+/// check cannot choose or influence the decision card's verdict (ACC-03).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionCheckChoice {
+    pub key: String,
+    pub label: String,
+}
+
+/// The native comprehension-check definition attached to an attention row.
+///
+/// `answer` and `explanation` are optional only at the read boundary, where a
+/// broad projection removes them. Every value accepted for persistence has
+/// both fields; [`AttentionCheck::validate_definition`] enforces that law.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttentionCheck {
+    pub question: String,
+    pub choices: Vec<AttentionCheckChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    pub about: String,
+}
+
+/// Raw five-flag check input, kept unvalidated until the Store has applied
+/// row-level author authorization on update.
+#[derive(Debug, Clone, Default)]
+pub struct AttentionCheckInput {
+    pub question: Option<String>,
+    pub choices: Vec<String>,
+    pub answer: Option<String>,
+    pub explanation: Option<String>,
+    pub about: Option<String>,
+}
+
+impl AttentionCheckInput {
+    pub fn is_empty(&self) -> bool {
+        self.question.is_none()
+            && self.choices.is_empty()
+            && self.answer.is_none()
+            && self.explanation.is_none()
+            && self.about.is_none()
+    }
+
+    pub fn parse(&self) -> Result<Option<AttentionCheck>> {
+        AttentionCheck::parse(
+            self.question.as_deref(),
+            &self.choices,
+            self.answer.as_deref(),
+            self.explanation.as_deref(),
+            self.about.as_deref(),
+        )
+    }
+}
+impl AttentionCheck {
+    /// Parse the five CLI inputs as one all-or-none definition.
+    pub fn parse(
+        question: Option<&str>,
+        choices: &[String],
+        answer: Option<&str>,
+        explanation: Option<&str>,
+        about: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let present = [
+            question.is_some(),
+            !choices.is_empty(),
+            answer.is_some(),
+            explanation.is_some(),
+            about.is_some(),
+        ];
+        if present.iter().all(|value| !value) {
+            return Ok(None);
+        }
+        let names = [
+            "--check",
+            "--check-choice",
+            "--check-answer",
+            "--check-explain",
+            "--check-about",
+        ];
+        let missing = names
+            .iter()
+            .zip(present)
+            .filter_map(|(name, present)| (!present).then_some(*name))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "attention: a check is one complete block; missing {}",
+                missing.join(", ")
+            );
+        }
+        let mut parsed = Vec::with_capacity(choices.len());
+        for token in choices {
+            let Some((key, label)) = token.split_once('=') else {
+                bail!(
+                    "attention: --check-choice {token:?} must read KEY=LABEL, such as \
+                     --check-choice 'store=The Store validates it'"
+                );
+            };
+            parsed.push(AttentionCheckChoice {
+                key: key.trim().to_owned(),
+                label: label.trim().to_owned(),
+            });
+        }
+        let check = Self {
+            question: question.expect("presence checked").trim().to_owned(),
+            choices: parsed,
+            answer: Some(answer.expect("presence checked").trim().to_owned()),
+            explanation: Some(explanation.expect("presence checked").trim().to_owned()),
+            about: about.expect("presence checked").trim().to_owned(),
+        };
+        check.validate_definition()?;
+        Ok(Some(check))
+    }
+
+    /// Validate every persisted definition invariant in one Store-shared rule.
+    pub fn validate_definition(&self) -> Result<()> {
+        bounded(&self.question, "--check", QUESTION_MAX)?;
+        if !self.question.ends_with('?') {
+            bail!("attention: --check must end in '?'");
+        }
+        if !(2..=4).contains(&self.choices.len()) {
+            bail!(
+                "attention: --check-choice requires 2 to 4 choices; {} were given",
+                self.choices.len()
+            );
+        }
+        for (index, choice) in self.choices.iter().enumerate() {
+            valid_key(&choice.key)?;
+            bounded(
+                &choice.label,
+                &format!("--check-choice {} label", choice.key),
+                LABEL_MAX,
+            )?;
+            if choice.label.contains('|') {
+                bail!(
+                    "attention: --check-choice {} label contains '|'; check choices read KEY=LABEL",
+                    choice.key
+                );
+            }
+            if self.choices[..index]
+                .iter()
+                .any(|earlier| earlier.key == choice.key)
+            {
+                bail!(
+                    "attention: --check-choice key {} is given twice; keys must be unique",
+                    choice.key
+                );
+            }
+        }
+        let answer = self
+            .answer
+            .as_deref()
+            .filter(|answer| !answer.is_empty())
+            .context("attention: --check-answer is required")?;
+        if !self.choices.iter().any(|choice| choice.key == answer) {
+            bail!(
+                "attention: --check-answer {answer} names no --check-choice; declared keys are {}",
+                self.choices
+                    .iter()
+                    .map(|choice| choice.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let explanation = self
+            .explanation
+            .as_deref()
+            .context("attention: --check-explain is required")?;
+        bounded(explanation, "--check-explain", CHECK_EXPLANATION_MAX)?;
+        if !valid_check_about(&self.about) {
+            bail!(CHECK_ABOUT_RULE);
+        }
+        for text in std::iter::once(self.question.as_str())
+            .chain(self.choices.iter().map(|choice| choice.label.as_str()))
+            .chain(std::iter::once(explanation))
+        {
+            if let Some(token) = diagnosis_marker(text) {
+                bail!("offending token {token:?}. {CHECK_DIAGNOSIS_RULE}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The safe unanswered projection used by broad lists, MCP and web reads.
+    pub fn redacted(&self) -> Self {
+        Self {
+            question: self.question.clone(),
+            choices: self.choices.clone(),
+            answer: None,
+            explanation: None,
+            about: self.about.clone(),
+        }
+    }
+}
+
+fn valid_check_about(about: &str) -> bool {
+    let path = about.contains('/')
+        || about
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty());
+    let sigil = ["@@", "@_"].iter().any(|prefix| {
+        about.strip_prefix(prefix).is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    });
+    let upper_snake = !about.is_empty()
+        && about.bytes().any(|byte| byte.is_ascii_uppercase())
+        && about
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    let flag = about.strip_prefix("--").is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    });
+    path || sigil || upper_snake || flag
+}
+
+fn diagnosis_marker(text: &str) -> Option<&str> {
+    fn boundary(byte: Option<u8>) -> bool {
+        byte.is_none_or(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    }
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len() {
+        for prefix in [b"sp-".as_slice(), b"a-", b"t-", b"s-", b"e-"] {
+            let end = index + prefix.len() + 8;
+            if end <= bytes.len()
+                && bytes[index..].starts_with(prefix)
+                && bytes[index + prefix.len()..end]
+                    .iter()
+                    .all(u8::is_ascii_hexdigit)
+                && boundary(index.checked_sub(1).map(|at| bytes[at]))
+                && boundary(bytes.get(end).copied())
+            {
+                return text.get(index..end);
+            }
+        }
+        let end = index + 10;
+        if end <= bytes.len()
+            && matches!(
+                &bytes[index..end],
+                [
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'-',
+                    b'0'..=b'9',
+                    b'0'..=b'9',
+                    b'-',
+                    b'0'..=b'9',
+                    b'0'..=b'9'
+                ]
+            )
+            && boundary(index.checked_sub(1).map(|at| bytes[at]))
+            && boundary(bytes.get(end).copied())
+        {
+            return text.get(index..end);
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    for phrase in ["today", "this row", "the sweep", "measured"] {
+        let mut start = 0;
+        while let Some(relative) = lower[start..].find(phrase) {
+            let index = start + relative;
+            let end = index + phrase.len();
+            if boundary(index.checked_sub(1).map(|at| bytes[at]))
+                && boundary(bytes.get(end).copied())
+            {
+                return text.get(index..end);
+            }
+            start = end;
+        }
+    }
+    None
 }
 
 /// What resolving recorded: the key that was picked, its verdict, any note,
@@ -1426,6 +1716,10 @@ pub struct Attention {
     /// [`default_choice_pair`] materialized on read for a row that authored
     /// none. Never empty, and never carries the reserved `custom` key.
     pub choices: Vec<AttentionChoice>,
+    /// Native reusable-system comprehension check. Absent on legacy/no-check
+    /// rows; broad projections remove its answer and explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<AttentionCheck>,
     pub raised_by: String,
     pub created_at: i64,
     pub status: String,
@@ -2278,6 +2572,365 @@ mod tests {
         DecisionCard::parse(question, context, choices, consequences, recommend)
             .expect_err("the card must be refused")
             .to_string()
+    }
+    fn check_choices() -> Vec<String> {
+        vec![
+            "store=The Store enforces the invariant".to_owned(),
+            "client=The client enforces the invariant".to_owned(),
+        ]
+    }
+
+    fn check_refusal(
+        question: Option<&str>,
+        choices: &[String],
+        answer: Option<&str>,
+        explanation: Option<&str>,
+        about: Option<&str>,
+    ) -> String {
+        AttentionCheck::parse(question, choices, answer, explanation, about)
+            .expect_err("the check must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn raw_check_input_reports_presence_without_validating_it() {
+        let empty = AttentionCheckInput::default();
+        assert!(empty.is_empty());
+        assert!(empty.parse().unwrap().is_none());
+        for input in [
+            AttentionCheckInput {
+                question: Some("partial".into()),
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                choices: vec!["a=A".into()],
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                answer: Some("a".into()),
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                explanation: Some("partial".into()),
+                ..Default::default()
+            },
+            AttentionCheckInput {
+                about: Some("rust/store.rs".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!input.is_empty());
+            assert!(input.parse().is_err());
+        }
+    }
+    #[test]
+    fn a_complete_check_round_trips_and_every_partial_shape_names_its_missing_field() {
+        let choices = check_choices();
+        let check = AttentionCheck::parse(
+            Some("Where is this invariant enforced?"),
+            &choices,
+            Some("store"),
+            Some("The Store in rust/store.rs validates it before opening a write."),
+            Some("rust/store.rs"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(check.choices[0].key, "store");
+        assert_eq!(check.answer.as_deref(), Some("store"));
+        assert_eq!(check.about, "rust/store.rs");
+        assert!(
+            AttentionCheck::parse(None, &[], None, None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let cases = [
+            (
+                None,
+                choices.as_slice(),
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs"),
+                "--check",
+            ),
+            (
+                Some("Where is it enforced?"),
+                &[][..],
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs"),
+                "--check-choice",
+            ),
+            (
+                Some("Where is it enforced?"),
+                choices.as_slice(),
+                None,
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs"),
+                "--check-answer",
+            ),
+            (
+                Some("Where is it enforced?"),
+                choices.as_slice(),
+                Some("store"),
+                None,
+                Some("rust/store.rs"),
+                "--check-explain",
+            ),
+            (
+                Some("Where is it enforced?"),
+                choices.as_slice(),
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                None,
+                "--check-about",
+            ),
+        ];
+        for (question, choices, answer, explanation, about, missing) in cases {
+            let error = check_refusal(question, choices, answer, explanation, about);
+            assert!(error.contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn check_bounds_question_shape_and_answer_key_are_refused_by_field() {
+        let choices = check_choices();
+        let over_question = format!("{}?", "q".repeat(160));
+        let over_explanation = "x".repeat(401);
+        for (error, field) in [
+            (
+                check_refusal(
+                    Some(&over_question),
+                    &choices,
+                    Some("store"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced"),
+                    &choices,
+                    Some("store"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced?"),
+                    &choices[..1],
+                    Some("store"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check-choice",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced?"),
+                    &choices,
+                    Some("missing"),
+                    Some("Stored in rust/store.rs."),
+                    Some("rust/store.rs"),
+                ),
+                "--check-answer",
+            ),
+            (
+                check_refusal(
+                    Some("Where is it enforced?"),
+                    &choices,
+                    Some("store"),
+                    Some(&over_explanation),
+                    Some("rust/store.rs"),
+                ),
+                "--check-explain",
+            ),
+        ] {
+            assert!(error.contains(field), "{error}");
+        }
+        let five = (0..5)
+            .map(|n| format!("k{n}=Choice {n}"))
+            .collect::<Vec<_>>();
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &five,
+                Some("k0"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("--check-choice")
+        );
+        let long_key = vec![format!("{}=Long key", "k".repeat(33)), "ok=Okay".into()];
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &long_key,
+                Some("ok"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("choice key")
+        );
+        let long_label = vec![format!("long={}", "l".repeat(61)), "ok=Okay".into()];
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &long_label,
+                Some("ok"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("--check-choice long label")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &["store".into(), "client=Client".into()],
+                Some("client"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("must read KEY=LABEL")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &["store=Store|outcome".into(), "client=Client".into()],
+                Some("client"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("label contains '|'")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &["store=Store".into(), "store=Again".into()],
+                Some("store"),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("given twice")
+        );
+        assert!(
+            check_refusal(
+                Some("Where?"),
+                &choices,
+                Some(""),
+                Some("Stored in rust/store.rs."),
+                Some("rust/store.rs")
+            )
+            .contains("--check-answer")
+        );
+        AttentionCheck::parse(
+            Some("Where?"),
+            &choices,
+            Some("store"),
+            Some("The todayish component is stable."),
+            Some("rust/store.rs"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn check_about_accepts_only_the_three_approved_subject_shapes() {
+        let choices = check_choices();
+        for about in [
+            "rust/store.rs",
+            "store.rs",
+            "@@hax",
+            "@_uat",
+            "DEFAULT_TIER",
+            "--rootless",
+        ] {
+            AttentionCheck::parse(
+                Some("Where is it enforced?"),
+                &choices,
+                Some("store"),
+                Some("The Store component enforces it."),
+                Some(about),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            check_refusal(
+                Some("Where is it enforced?"),
+                &choices,
+                Some("store"),
+                Some("The Store component enforces it."),
+                Some("store module")
+            ),
+            "`about` not matching one of the three subject shapes (a path containing `/` or a file extension; a sigil token `@@host`/`@_tier`; an UPPER_SNAKE flag or `--flag` name) is refused naming the three shapes."
+        );
+    }
+
+    #[test]
+    fn diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule() {
+        let markers = [
+            "a-1234abcd",
+            "t-1234abcd",
+            "s-1234abcd",
+            "e-1234abcd",
+            "sp-1234abcd",
+            "2026-09-21",
+            "today",
+            "this row",
+            "the sweep",
+            "measured",
+        ];
+        for marker in markers {
+            for location in 0..3 {
+                let question = if location == 0 {
+                    format!("How does {marker} work?")
+                } else {
+                    "How does the Store work?".to_owned()
+                };
+                let choices = if location == 1 {
+                    vec![
+                        format!("store=Use {marker}"),
+                        "client=Use the client".to_owned(),
+                    ]
+                } else {
+                    check_choices()
+                };
+                let explanation = if location == 2 {
+                    format!("The Store observed {marker}.")
+                } else {
+                    "The Store component enforces it.".to_owned()
+                };
+                let error = check_refusal(
+                    Some(&question),
+                    &choices,
+                    Some("store"),
+                    Some(&explanation),
+                    Some("rust/store.rs"),
+                );
+                assert!(error.contains(marker), "{error}");
+                assert!(error.contains("The refusal prints the offending token and the rule: a check teaches how the system works; it never reads this row's finding back."), "{error}");
+            }
+        }
+    }
+    #[test]
+    fn check_json_refuses_decisional_and_unknown_fields() {
+        let decisional = serde_json::from_str::<AttentionCheckChoice>(
+            r#"{"key":"store","label":"Store","outcome":"approve"}"#,
+        )
+        .unwrap_err();
+        assert!(decisional.to_string().contains("outcome"));
+        let recommended = serde_json::from_str::<AttentionCheckChoice>(
+            r#"{"key":"store","label":"Store","recommended":true}"#,
+        )
+        .unwrap_err();
+        assert!(recommended.to_string().contains("recommended"));
+        let definition = serde_json::from_str::<AttentionCheck>(
+            r#"{"question":"Where?","choices":[{"key":"a","label":"A"},{"key":"b","label":"B"}],"answer":"a","explanation":"Why.","about":"rust/store.rs","outcome":"approve"}"#,
+        )
+        .unwrap_err();
+        assert!(definition.to_string().contains("outcome"));
     }
 
     #[test]

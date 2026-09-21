@@ -2035,6 +2035,80 @@ DROP TABLE task_claims_old;
 PRAGMA legacy_alter_table=OFF;
 CREATE INDEX idx_task_claims_expiry ON task_claims(expires_at);
 "#;
+/// Native Active Comprehension Check definition (ACC-01..05). The last board
+/// migration uses the established table-rebuild pattern so a rewound
+/// user_version cannot collide with already-present columns. The migration
+/// runner skips this rebuild for a complete v31 shape, preserving check data.
+const BOARD_V31: &str = r#"
+DROP TRIGGER search_attention_ai;
+DROP TRIGGER search_attention_au;
+DROP TRIGGER search_attention_ad;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE attention RENAME TO attention_v30;
+CREATE TABLE attention (
+ id TEXT PRIMARY KEY NOT NULL,
+ task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('blocking','decision','approval','review','risk')),
+ body TEXT NOT NULL, raised_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('open','resolved')),
+ resolved_at INTEGER,resolved_by TEXT,resolution TEXT,
+ reopened_at INTEGER,reopened_by TEXT,reopen_note TEXT,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ priority INTEGER NOT NULL DEFAULT 6 CHECK(priority BETWEEN 0 AND 9),
+ question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 160),
+ context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 800),
+ choices TEXT CHECK(choices IS NULL OR (json_valid(choices) AND json_type(choices)='array'
+   AND json_array_length(choices) BETWEEN 2 AND 4)),
+ decision TEXT CHECK(decision IS NULL OR (json_valid(decision) AND json_type(decision)='object')),
+ check_question TEXT CHECK(check_question IS NULL OR length(check_question) BETWEEN 1 AND 160),
+ check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'
+   AND json_array_length(check_choices) BETWEEN 2 AND 4)),
+ check_answer TEXT,
+ check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),
+ check_about TEXT,
+ CHECK(
+   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL
+    AND check_explanation IS NULL AND check_about IS NULL)
+   OR
+   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL
+    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)
+ ),
+ CHECK(
+   (status='resolved' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NULL)
+   OR
+   (status='open' AND (
+     (resolved_at IS NULL AND resolved_by IS NULL AND resolution IS NULL AND reopened_at IS NULL)
+     OR
+     (resolved_at IS NOT NULL AND resolved_by IS NOT NULL AND reopened_at IS NOT NULL
+      AND reopened_by IS NOT NULL AND reopen_note IS NOT NULL)
+   ))
+ )
+) STRICT;
+INSERT INTO attention(
+ id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision
+)
+SELECT id,task_id,kind,body,raised_by,created_at,status,resolved_at,resolved_by,resolution,
+ reopened_at,reopened_by,reopen_note,archived,priority,question,context,choices,decision
+FROM attention_v30;
+DROP TABLE attention_v30;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_attention_status_created ON attention(status,created_at) WHERE archived=0;
+CREATE INDEX idx_attention_task ON attention(task_id) WHERE archived=0;
+CREATE INDEX idx_attention_status_priority ON attention(status,priority,created_at,id) WHERE archived=0;
+CREATE TRIGGER search_attention_ai AFTER INSERT ON attention BEGIN
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_au AFTER UPDATE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+ INSERT INTO search_documents(source_kind,source_id,task_id,title,body,status,lane,tags,created_at,updated_at,archived)
+ SELECT * FROM search_source_rows WHERE source_kind='attention' AND source_id=new.id;
+END;
+CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
+ DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
+END;
+"#;
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
  root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
@@ -2336,7 +2410,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 30;
+pub const BOARD_SCHEMA_VERSION: usize = 31;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2702,6 +2776,42 @@ pub fn create_backup_target(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+fn board_v31_columns_exist(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare("SELECT name FROM pragma_table_info('attention')")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok([
+        "check_question",
+        "check_choices",
+        "check_answer",
+        "check_explanation",
+        "check_about",
+    ]
+    .iter()
+    .all(|wanted| columns.iter().any(|column| column == wanted)))
+}
+fn board_v31_shape_exists(connection: &Connection) -> Result<bool> {
+    if !board_v31_columns_exist(connection)? {
+        return Ok(false);
+    }
+    let sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='attention'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok([
+        "length(check_question) BETWEEN 1 AND 160",
+        "json_array_length(check_choices) BETWEEN 2 AND 4",
+        "length(check_explanation) BETWEEN 1 AND 400",
+        "check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL",
+        "check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL",
+        "AND check_explanation IS NULL AND check_about IS NULL",
+        "AND check_explanation IS NOT NULL AND check_about IS NOT NULL",
+    ]
+    .iter()
+    .all(|constraint| sql.contains(constraint)))
+}
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
     let mut current: usize = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > migrations.len() {
@@ -2723,7 +2833,23 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
             transaction.commit()?;
             return Ok(());
         }
-        transaction.execute_batch(migrations[current])?;
+        let board_v31_step =
+            migrations.len() == BOARD_SCHEMA_VERSION && current + 1 == BOARD_SCHEMA_VERSION;
+        let v31_columns = board_v31_step && board_v31_columns_exist(&transaction)?;
+        let v31_rewind = v31_columns && board_v31_shape_exists(&transaction)?;
+        if !v31_rewind {
+            if v31_columns {
+                transaction.execute_batch(
+                    "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
+                )?;
+            }
+            transaction.execute_batch(migrations[current])?;
+            if v31_columns {
+                transaction.execute_batch(
+                    "UPDATE attention SET\n                       check_question=(SELECT check_question FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_choices=(SELECT check_choices FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_answer=(SELECT check_answer FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_explanation=(SELECT check_explanation FROM attention_v31_check_backup b WHERE b.id=attention.id),\n                       check_about=(SELECT check_about FROM attention_v31_check_backup b WHERE b.id=attention.id)\n                     WHERE id IN (SELECT id FROM attention_v31_check_backup);\n                     DROP TABLE attention_v31_check_backup;",
+                )?;
+            }
+        }
         transaction.pragma_update(None, "user_version", (current + 1) as i64)?;
         transaction.commit()?;
         current += 1;
@@ -2796,7 +2922,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
-    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30,
+    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4071,6 +4197,81 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn v31_shape_detection_requires_columns_and_constraints() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..30]).expect("migrate through v30");
+        assert!(!board_v31_shape_exists(&connection).expect("inspect v30"));
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v31");
+        assert!(board_v31_shape_exists(&connection).expect("inspect v31"));
+
+        connection
+            .execute_batch(
+                "PRAGMA writable_schema=ON;\n                 UPDATE sqlite_master SET sql = replace(sql, 'length(check_question) BETWEEN 1 AND 160', '1') WHERE type='table' AND name='attention';\n                 PRAGMA writable_schema=OFF;",
+            )
+            .expect("remove a v31 constraint from the schema declaration");
+        assert!(!board_v31_shape_exists(&connection).expect("inspect unconstrained table"));
+    }
+    #[test]
+    fn v31_sqlite_refuses_both_partial_definition_directions() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v31");
+        connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        let insert = |id: &str,
+                      question: Option<&str>,
+                      choices: Option<&str>,
+                      answer: Option<&str>,
+                      explanation: Option<&str>,
+                      about: Option<&str>| {
+            connection.execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,
+                   check_question,check_choices,check_answer,check_explanation,check_about
+                 ) VALUES(?1,'decision','body','raiser',1,'open',0,6,?2,?3,?4,?5,?6)",
+                params![id, question, choices, answer, explanation, about],
+            )
+        };
+        insert("a-none", None, None, None, None, None).unwrap();
+        insert(
+            "a-full",
+            Some("Where is it enforced?"),
+            Some(r#"[{"key":"a","label":"A"},{"key":"b","label":"B"}]"#),
+            Some("a"),
+            Some("The Store enforces it."),
+            Some("rust/store.rs"),
+        )
+        .unwrap();
+        let missing_question = insert(
+            "a-missing-question",
+            None,
+            Some(r#"[{"key":"a","label":"A"},{"key":"b","label":"B"}]"#),
+            Some("a"),
+            Some("The Store enforces it."),
+            Some("rust/store.rs"),
+        )
+        .unwrap_err();
+        assert!(
+            missing_question
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+        let missing_about = insert(
+            "a-missing-about",
+            Some("Where is it enforced?"),
+            Some(r#"[{"key":"a","label":"A"},{"key":"b","label":"B"}]"#),
+            Some("a"),
+            Some("The Store enforces it."),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            missing_about
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+    }
 
     fn index_sql(connection: &Connection, name: &str) -> String {
         connection

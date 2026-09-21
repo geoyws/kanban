@@ -495,17 +495,18 @@ Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `u
 
 ## Requirements trace — docs/specs/acc.md ACC-01..ACC-17
 
-One row per mandatory requirement at the 2026-09-21 `SPEC-READY` baseline. ACC has no
-implementation evidence yet: `PLANNED` is an intended evidence layer, not a passing test.
-No future test name, pass, implementation or release is claimed.
+Definition authoring and schema evidence landed on 2026-09-21 for ACC-01..04, the
+raiser-only authoring half of ACC-05, and the always-redacted show/list portion of ACC-13.
+Answering, resolution, browser, HTTP, digest/reader cutover and legacy body migration remain
+`PLANNED`; no row below claims those later slices.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `ACC-01` | MUST | process | `PLANNED` | full block plus partial/bounds/answer-key refusals |
-| `ACC-02` | MUST | unit | `PLANNED` | explanation and all three `about` shapes/refusal |
-| `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
-| `ACC-04` | MUST | unit | `PLANNED` | every agreed marker across all three text locations |
-| `ACC-05` | MUST | process | `PLANNED` | raiser/other/geoyws, answered-open lock, resolved immutability and reopen-clear/restore paths |
+| `ACC-01` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `a_complete_check_round_trips_and_every_partial_shape_names_its_missing_field`; `check_bounds_question_shape_and_answer_key_are_refused_by_field`; `v31_sqlite_refuses_both_partial_definition_directions` | compiled exact round-trip/rewrite and atomic refusal; unit partial/bound/answer-key matrix; raw SQLite all-NULL/all-non-NULL invariant in both partial directions |
+| `ACC-02` | MUST | unit | `check_about_accepts_only_the_three_approved_subject_shapes` | path/file, host/tier sigil and flag/default shapes plus byte-exact mismatch sentence |
+| `ACC-03` | MUST | unit/process | `check_json_refuses_decisional_and_unknown_fields`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically` | serde refuses outcome, recommended and unknown definition fields; serialized choices never carry them or mutate the decision |
+| `ACC-04` | MUST | unit | `diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule` | every approved marker in question, choice label and explanation with the byte-exact rule sentence; `about` is intentionally outside this marker rule |
+| `ACC-05` | MUST | process | PARTIAL — `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically` | only `raisedBy` may author/update, including no `geoyws` exception; answered-open lock, resolve and reopen behavior remain `PLANNED` in the answer slice |
 | `ACC-06` | MUST | process | `PLANNED` | missing/no-check/undeclared-key paths plus web answer then web/CLI resolve without a second answer |
 | `ACC-07` | MUST | process | `PLANNED` | persisted answer/correct/time and note agreement |
 | `ACC-08` | MUST | process | `PLANNED` | right/wrong, immutable duplicate and serialized concurrent-answer paths |
@@ -513,14 +514,16 @@ No future test name, pass, implementation or release is claimed.
 | `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
 | `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
 | `ACC-12` | MUST | chrome | `PLANNED` | keyboard, pointer, focus, announcement and Undo |
-| `ACC-13` | MUST | process | `PLANNED` | list/MCP/digest/show redaction by state and actor |
+| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser; successful raise may echo only in its same-write receipt; digest/HTTP and post-answer state remain `PLANNED` |
 | `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
 
-17 requirements: 17 MUST, no SHOULD or MAY. By planned layer: 3 unit, 9 process, 2 http and
-3 chrome. All seventeen rows are PLANNED; there is no present implementation evidence.
+17 requirements: 17 MUST, no SHOULD or MAY. ACC-01..04 have definition-slice evidence; ACC-05
+and ACC-13 are explicitly partial; every other incomplete answer/browser/reader/migration slice
+remains `PLANNED`.
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.

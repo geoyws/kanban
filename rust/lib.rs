@@ -208,17 +208,22 @@ Usage:
              [--task ID] [--tag NAME ...] [--json]
              [--question TEXT --context TEXT]
              [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
+             [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
+             [--check-explain TEXT --check-about SUBJECT]
              (a card is 2-4 choices, one --consequence each, exactly one
              --recommend; OUTCOME is approve|reject|defer|other; a row with no
              choices reads as the Approve/Reject pair)
   kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk] [--task ID] [--tag NAME]
              [--lane LANE] [--all] [--limit N]
              [--fields id,kind,status,... | --no-body] [--json]
+  kanban attention show ID [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
              [--question TEXT --context TEXT]
              [--choice KEY=LABEL|OUTCOME ...] [--consequence KEY=TEXT ...] [--recommend KEY]
              [--clear-card]
+             [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
+             [--check-explain TEXT --check-about SUBJECT]
   kanban attention resolve ID --as ACTOR --choice KEY [--note TEXT] [--json]
   kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
              --note TEXT [--json]
@@ -404,10 +409,9 @@ pub(crate) const SUBSCRIPTION_REPEATABLE: [&str; 4] =
 /// collection code is a separate slice.
 pub(crate) const ACCESS_REPEATABLE: [&str; 2] = ["scope", "replaces"];
 
-/// Attention's card flags, list-valued on `raise` and `update` and single
-/// on `resolve` — `--choice` names the authored options in one place and the
-/// one answer in the other (ADR-042 §4).
-pub(crate) const CARD_REPEATABLE: [&str; 2] = ["choice", "consequence"];
+/// Attention's authored list flags. Decision-card choices and consequences,
+/// plus non-decisional check choices, repeat only on raise/update.
+pub(crate) const CARD_REPEATABLE: [&str; 3] = ["choice", "consequence", "check-choice"];
 
 /// The artifact-identity flags, list-valued on the one subcommand each
 /// belongs to: a `deploy start` expects one identity per component role and a
@@ -1307,6 +1311,11 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "choice",
             "consequence",
             "recommend",
+            "check",
+            "check-choice",
+            "check-answer",
+            "check-explain",
+            "check-about",
         ],
         &["text"],
         false,
@@ -1320,6 +1329,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &[],
         true,
     ),
+    ("attention", Some("show"), &[], &["id"], true),
     (
         "attention",
         Some("update"),
@@ -1335,6 +1345,11 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
             "consequence",
             "recommend",
             "clear-card",
+            "check",
+            "check-choice",
+            "check-answer",
+            "check-explain",
+            "check-about",
         ],
         &["id"],
         false,
@@ -2141,6 +2156,17 @@ impl Args {
             &self.many("consequence"),
             self.one("recommend"),
         )
+    }
+    /// Raw native comprehension-check flags. Update defers validation until
+    /// the Store has checked that the caller is the row's raiser.
+    fn attention_check_input(&self) -> AttentionCheckInput {
+        AttentionCheckInput {
+            question: option_string(self, "check"),
+            choices: self.many("check-choice"),
+            answer: option_string(self, "check-answer"),
+            explanation: option_string(self, "check-explain"),
+            about: option_string(self, "check-about"),
+        }
     }
 
     /// `--limit`, refusing a value SQL would read as the opposite of a bound.
@@ -4183,7 +4209,7 @@ const TASK_GATED_FIELDS: [(&str, &str); 3] = [
 ];
 
 /// The keys of one `attention list` row, exactly as a caller sees them.
-const ATTENTION_FIELDS: [&str; 21] = [
+const ATTENTION_FIELDS: [&str; 22] = [
     "id",
     "taskID",
     "kind",
@@ -4191,6 +4217,7 @@ const ATTENTION_FIELDS: [&str; 21] = [
     "question",
     "context",
     "choices",
+    "check",
     "raisedBy",
     "createdAt",
     "status",
@@ -7237,6 +7264,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "attention" && sub == Some("raise") {
         let text = rest.first().context("attention text is required")?;
+        let check_input = args.attention_check_input();
         return print(
             &store.raise_attention(
                 text,
@@ -7246,6 +7274,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 args.priority(6)?,
                 &args.many("tag"),
                 &args.decision_card()?,
+                Some(&check_input),
             )?,
             args.has("json"),
         );
@@ -7269,6 +7298,10 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
         }
         return print(&rows, args.has("json"));
     }
+    if command == "attention" && sub == Some("show") {
+        let id = rest.first().context("attention id is required")?;
+        return print(&store.show_attention(id)?, args.has("json"));
+    }
     if command == "attention" && sub == Some("update") {
         // Each clearing flag is refused beside the flag it undoes: two
         // answers to one question, and the receipt would not say which was
@@ -7286,6 +7319,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 bail!("--{a} and --{b} are mutually exclusive");
             }
         }
+        let check = args.attention_check_input();
         let card = args.decision_card()?;
         let id = rest.first().context("attention id is required")?;
         let body = args.body()?;
@@ -7302,6 +7336,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 body.as_deref(),
                 tags.as_deref(),
                 Some(&card),
+                (!check.is_empty()).then_some(&check),
                 args.has("clear-card"),
                 args.require("as")?,
             )?,
@@ -9621,6 +9656,22 @@ mod tests {
             question: Some("Assign a Claude seat to hax, or drop that receipt?".into()),
             context: Some("A real turn answers HTTP 401 and nobody is waiting on it.".into()),
             choices: crate::model::default_choice_pair(),
+            check: Some(crate::model::AttentionCheck {
+                question: "Where is the invariant enforced?".into(),
+                choices: vec![
+                    crate::model::AttentionCheckChoice {
+                        key: "store".into(),
+                        label: "The Store".into(),
+                    },
+                    crate::model::AttentionCheckChoice {
+                        key: "client".into(),
+                        label: "The client".into(),
+                    },
+                ],
+                answer: Some("store".into()),
+                explanation: Some("rust/store.rs enforces it.".into()),
+                about: "rust/store.rs".into(),
+            }),
             raised_by: "worker@driver-2".into(),
             created_at: 1,
             status: "open".into(),

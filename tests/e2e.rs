@@ -2434,9 +2434,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 30);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 30);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 30);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 31);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 31);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 31);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -3625,7 +3625,9 @@ fn the_v13_search_migration_preserves_v12_knowledge() {
         reopened
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
+            .as_i64()
+            .unwrap()
     );
     assert_eq!(
         reopened
@@ -6538,6 +6540,24 @@ fn compiled_binary_still_migrates_a_board_that_is_behind() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(after, current, "the board was not migrated forward");
+    let rewound = Connection::open(&board).unwrap();
+    rewound
+        .pragma_update(None, "user_version", current - 1)
+        .unwrap();
+    drop(rewound);
+    let listed_after_last_step = fixture.ok_json(
+        &fixture.main,
+        &["task", "list", "--db", board.to_str().unwrap(), "--json"],
+    );
+    assert_eq!(listed_after_last_step[0]["id"], "t-old");
+    let after_last_step: i64 = Connection::open(&board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        after_last_step, current,
+        "the final migration step did not rerun"
+    );
 }
 
 /// Whether mode 0400 actually stops THIS process from writing.
@@ -18438,7 +18458,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        30
+        31
     );
 }
 
@@ -18749,6 +18769,380 @@ fn an_attention_raised_with_choices_round_trips_every_field_through_list_and_jso
     assert_eq!(cleared_event["payload"]["previousQuestion"], CARD[1]);
 }
 
+#[test]
+fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() {
+    let fixture = Fixture::new("native-acc-definition");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ACC", "--json"]);
+    let live_board = board_path_for_project(&fixture, &fixture.main, "ACC");
+    let raised = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Choose after demonstrating the Store boundary.",
+            "--as",
+            "claude@driver",
+            "--check",
+            "Where is the attention check definition validated?",
+            "--check-choice",
+            "store=The Store validates it",
+            "--check-choice",
+            "client=The client validates it",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "SECRET_EXPLANATION rust/store.rs validates the complete definition before writing.",
+            "--check-about",
+            "rust/store.rs",
+            "--json",
+        ],
+    );
+    let id = raised["id"].as_str().unwrap();
+    assert_eq!(
+        raised["check"]["question"],
+        "Where is the attention check definition validated?"
+    );
+    assert_eq!(raised["check"]["answer"], "store");
+    assert_eq!(raised["check"]["choices"].as_array().unwrap().len(), 2);
+    assert!(raised["check"]["choices"][0].get("outcome").is_none());
+    assert!(raised["check"]["choices"][0].get("recommended").is_none());
+
+    let shown = fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]);
+    assert!(shown["check"].get("answer").is_none());
+    assert!(shown["check"].get("explanation").is_none());
+    let listed = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert!(listed[0]["check"].get("answer").is_none());
+    assert!(listed[0]["check"].get("explanation").is_none());
+    let other = fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]);
+    assert_eq!(other, shown);
+    let events = fixture.ok_json(&fixture.main, &["events", "--json"]);
+    assert!(!events.to_string().contains("SECRET_EXPLANATION"));
+
+    let before = shown.clone();
+    let events_before = events.as_array().unwrap().len();
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            id,
+            "--as",
+            "claude@driver",
+            "--check",
+            "Which layer owns the definition?",
+            "--check-choice",
+            "store=The Store owns it",
+            "--check-choice",
+            "client=The client owns it",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "rust/store.rs owns the write invariant.",
+            "--check-about",
+            "not a subject",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(refusal_object(&refused).contains("`about` not matching"));
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]),
+        before
+    );
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        events_before
+    );
+
+    let non_raiser = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            id,
+            "--as",
+            "geoyws",
+            "--check",
+            "malformed and incomplete",
+            "--json",
+        ],
+    );
+    assert!(!non_raiser.status.success());
+    assert!(refusal_object(&non_raiser).contains("raiser claude@driver"));
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        events_before,
+        "malformed non-raiser input wrote an event"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]),
+        before,
+        "malformed non-raiser input changed the row"
+    );
+
+    let rewritten = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            id,
+            "--as",
+            "claude@driver",
+            "--check",
+            "Which layer owns the definition?",
+            "--check-choice",
+            "store=The Store owns it",
+            "--check-choice",
+            "client=The client owns it",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "SECRET_RECEIPT rust/store.rs owns the write invariant.",
+            "--check-about",
+            "rust/store.rs",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        rewritten["check"]["question"],
+        "Which layer owns the definition?"
+    );
+    assert!(rewritten["check"].get("answer").is_none());
+    assert!(rewritten["check"].get("explanation").is_none());
+    let rewritten_shown = fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]);
+    assert_eq!(rewritten_shown["check"], rewritten["check"]);
+    let stored_definition: (String, String) = Connection::open(&live_board)
+        .unwrap()
+        .query_row(
+            "SELECT check_answer,check_explanation FROM attention WHERE id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_definition.0, "store");
+    assert!(stored_definition.1.contains("SECRET_RECEIPT"));
+    assert!(
+        !fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .to_string()
+            .contains("SECRET_RECEIPT")
+    );
+
+    let backup = fixture.root.join("acc-backup");
+    let receipt = fixture.ok_json(
+        &fixture.main,
+        &["backup", "--output", backup.to_str().unwrap(), "--json"],
+    );
+    let board = receipt["boards"].as_array().unwrap()[0].as_str().unwrap();
+    let backed_up = fixture.ok_json(
+        &fixture.main,
+        &["attention", "show", id, "--db", board, "--json"],
+    );
+    assert_eq!(backed_up["check"], rewritten_shown["check"]);
+    let backed_definition: (String, String) = Connection::open(board)
+        .unwrap()
+        .query_row(
+            "SELECT check_answer,check_explanation FROM attention WHERE id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(backed_definition, stored_definition);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            id,
+            "--as",
+            "claude@driver",
+            "--body",
+            "Mutation after the backup.",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "restore",
+            "--from",
+            backup.to_str().unwrap(),
+            "--force",
+            "--as",
+            "tester",
+            "--json",
+        ],
+    );
+    let restored = fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]);
+    assert_eq!(restored["check"], rewritten_shown["check"]);
+    assert_eq!(restored["body"], rewritten_shown["body"]);
+    let restored_definition: (String, String) = Connection::open(&live_board)
+        .unwrap()
+        .query_row(
+            "SELECT check_answer,check_explanation FROM attention WHERE id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(restored_definition, stored_definition);
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert!(resolved["check"].get("answer").is_none());
+    assert!(resolved["check"].get("explanation").is_none());
+    assert!(!resolved.to_string().contains("SECRET_RECEIPT"));
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            id,
+            "--as",
+            "geoyws",
+            "--note",
+            "Undo for redaction proof.",
+            "--json",
+        ],
+    );
+    assert!(reopened["check"].get("answer").is_none());
+    assert!(reopened["check"].get("explanation").is_none());
+    assert!(!reopened.to_string().contains("SECRET_RECEIPT"));
+}
+#[test]
+fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
+    let fixture = Fixture::new("native-acc-migration");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ACC-MIGRATE", "--json"]);
+    let old = raise_carded(&fixture, "An existing no-check row.", "claude@driver", &[]);
+    let board = board_path_for_project(&fixture, &fixture.main, "ACC-MIGRATE");
+    {
+        let connection = Connection::open(&board).unwrap();
+        let mut sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='attention'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for declaration in [
+            " check_question TEXT CHECK(check_question IS NULL OR length(check_question) BETWEEN 1 AND 160),\n",
+            " check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'\n   AND json_array_length(check_choices) BETWEEN 2 AND 4)),\n",
+            " check_answer TEXT,\n",
+            " check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),\n",
+            " check_about TEXT,\n",
+            " CHECK(\n   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL\n    AND check_explanation IS NULL AND check_about IS NULL)\n   OR\n   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL\n    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)\n ),\n",
+        ] {
+            let without = sql.replace(declaration, "");
+            assert_ne!(without, sql, "missing v31 declaration: {declaration}");
+            sql = without;
+        }
+        connection
+            .pragma_update(None, "writable_schema", true)
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sqlite_master SET sql=? WHERE type='table' AND name='attention'",
+                [sql],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 30).unwrap();
+        connection
+            .pragma_update(None, "writable_schema", false)
+            .unwrap();
+    }
+    let first = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(first[0]["id"], old["id"]);
+    assert!(first[0].get("check").is_none());
+    let second = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(
+        second, first,
+        "opening an already migrated board must be stable"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
+        31
+    );
+    let checked = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "A check must survive a rewound version.",
+            "--as",
+            "claude@driver",
+            "--check",
+            "Where does schema migration run?",
+            "--check-choice",
+            "db=The database module",
+            "--check-choice",
+            "ui=The browser module",
+            "--check-answer",
+            "db",
+            "--check-explain",
+            "SECRET_RERUN rust/db.rs owns the migration ladder.",
+            "--check-about",
+            "rust/db.rs",
+            "--json",
+        ],
+    );
+    let checked_id = checked["id"].as_str().unwrap();
+    {
+        let connection = Connection::open(&board).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA writable_schema=ON;\n                 UPDATE sqlite_master SET sql=replace(sql,\n                   'length(check_question) BETWEEN 1 AND 160',\n                   'length(check_question) BETWEEN 1 AND 159')\n                 WHERE type='table' AND name='attention';\n                 PRAGMA user_version=30;\n                 PRAGMA writable_schema=OFF;",
+            )
+            .unwrap();
+    }
+    let rerun = fixture.ok_json(&fixture.main, &["attention", "show", checked_id, "--json"]);
+    assert!(rerun["check"].get("answer").is_none());
+    assert!(rerun["check"].get("explanation").is_none());
+    let rerun_definition: (String, String) = Connection::open(&board)
+        .unwrap()
+        .query_row(
+            "SELECT check_answer,check_explanation FROM attention WHERE id=?",
+            [checked_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rerun_definition.0, "db");
+    assert!(rerun_definition.1.contains("SECRET_RERUN"));
+    let attention_sql: String = Connection::open(&board)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='attention'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(attention_sql.contains("length(check_question) BETWEEN 1 AND 160"));
+    assert!(attention_sql.contains("json_array_length(check_choices) BETWEEN 2 AND 4"));
+    assert!(attention_sql.contains("length(check_explanation) BETWEEN 1 AND 400"));
+    assert!(
+        attention_sql
+            .contains("check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL")
+    );
+    assert!(attention_sql.contains(
+        "check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL"
+    ));
+}
 #[test]
 fn an_attention_raised_without_choices_reads_as_the_default_approve_reject_pair_with_no_recommendation()
  {
@@ -19346,6 +19740,20 @@ fn a_resolved_item_refuses_every_card_flag() {
             "--recommend",
             "assign",
         ],
+        vec![
+            "--check",
+            "Where is the definition validated?",
+            "--check-choice",
+            "store=The Store validates it",
+            "--check-choice",
+            "client=The client validates it",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "rust/store.rs validates it.",
+            "--check-about",
+            "rust/store.rs",
+        ],
         vec!["--clear-card"],
         vec!["--body", "A rewritten body."],
     ] {
@@ -19565,7 +19973,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        30
+        31
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -19731,23 +20139,38 @@ fn the_schema_publishes_the_card_flags_with_the_right_kinds() {
 
     for name in ["attention raise", "attention update"] {
         let operation = operation(name);
-        for listed in ["choice", "consequence"] {
+        for listed in ["choice", "consequence", "check-choice"] {
             assert_eq!(
                 flag(&operation, listed).unwrap_or_else(|| panic!("{name} has no --{listed}"))["kind"],
                 "list",
                 "{name} --{listed}"
             );
         }
-        for valued in ["question", "context", "recommend"] {
+        for valued in [
+            "question",
+            "context",
+            "recommend",
+            "check",
+            "check-answer",
+            "check-explain",
+            "check-about",
+        ] {
             assert_eq!(flag(&operation, valued).unwrap()["kind"], "value");
         }
         assert!(
             flag(&operation, "outcome").is_none(),
             "{name} must not offer --outcome"
         );
+        assert!(flag(&operation, "check-outcome").is_none());
+        assert!(flag(&operation, "check-recommend").is_none());
     }
     let update = operation("attention update");
     assert_eq!(flag(&update, "clear-card").unwrap()["kind"], "boolean");
+    let show = operation("attention show");
+    assert!(
+        flag(&show, "as").is_none(),
+        "show cannot authenticate a caller-supplied actor"
+    );
 
     let resolve = operation("attention resolve");
     assert_eq!(
@@ -19828,21 +20251,36 @@ fn the_mcp_attention_tools_mirror_every_card_flag_one_to_one() {
 
     for name in ["attention_raise", "attention_update"] {
         let properties = tool(name)["inputSchema"]["properties"].clone();
-        for listed in ["choice", "consequence"] {
+        for listed in ["choice", "consequence", "check-choice"] {
             assert_eq!(
                 properties[listed]["type"], "array",
                 "{name} {listed} must accept the list the CLI repeats"
             );
             assert_eq!(properties[listed]["items"]["type"], "string");
         }
-        for valued in ["question", "context", "recommend"] {
+        for valued in [
+            "question",
+            "context",
+            "recommend",
+            "check",
+            "check-answer",
+            "check-explain",
+            "check-about",
+        ] {
             assert_eq!(properties[valued]["type"], "string", "{name} {valued}");
         }
         assert!(properties.get("outcome").is_none(), "{name} outcome");
+        assert!(properties.get("check-outcome").is_none());
+        assert!(properties.get("check-recommend").is_none());
     }
     assert_eq!(
         tool("attention_update")["inputSchema"]["properties"]["clear-card"]["type"],
         "boolean"
+    );
+    let show = tool("attention_show")["inputSchema"]["properties"].clone();
+    assert!(
+        show.get("as").is_none(),
+        "MCP show must not offer spoofable actor input"
     );
     let resolve = tool("attention_resolve")["inputSchema"]["properties"].clone();
     assert_eq!(resolve["choice"]["type"], "string");

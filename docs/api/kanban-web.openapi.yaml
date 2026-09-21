@@ -1308,6 +1308,34 @@ components:
         consequence: { type: string, description: "What happens if it is picked, including its cost." }
         outcome: { type: string }
         recommended: { type: boolean }
+    AttentionCheckChoice:
+      type: object
+      additionalProperties: false
+      required: [key, label]
+      description: A non-decisional comprehension-check choice; it has no outcome or recommendation.
+      properties:
+        key: { type: string }
+        label: { type: string }
+
+    RedactedAttentionCheck:
+      type: object
+      additionalProperties: false
+      required: [question, choices, about]
+      description: |
+        The aggregate HTTP projection of an unanswered native check (ACC-13).
+        Every read uses this redacted shape, including a read by the raiser. The
+        answer key and explanation are omitted server-side and have no properties
+        in this schema; clients cannot request or infer them here. The same-write
+        CLI/MCP raise-receipt exception is not an aggregate HTTP read and is not
+        modelled by this projection.
+      properties:
+        question: { type: string, maxLength: 160 }
+        choices:
+          type: array
+          minItems: 2
+          maxItems: 4
+          items: { $ref: "#/components/schemas/AttentionCheckChoice" }
+        about: { type: string }
 
     AttentionDecision:
       type: object
@@ -1342,6 +1370,13 @@ components:
             What the raiser authored, or `default_choice_pair`
             (`rust/model.rs:926`) materialized on read for a row that authored
             none. Never empty, and never carries the reserved `custom` key.
+        check:
+          allOf: [{ $ref: "#/components/schemas/RedactedAttentionCheck" }]
+          description: |
+            Present only when the row carries a native check. Before answer
+            recording, every aggregate HTTP read exposes question, choices and
+            about only, including for the raiser; answer and explanation are
+            absent from response bytes.
         raisedBy: { type: string }
         createdAt: { $ref: "#/components/schemas/EpochMillis" }
         status: { type: string }

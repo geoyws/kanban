@@ -373,6 +373,15 @@ closes an item without a verdict; a row that authored no choices is served as
 the `approve`/`reject` default pair with no recommendation, and the body stays
 what it always was — the long form
 ([ADR-042](docs/adr/ADR-042-attention-items-are-decision-cards-with-authored-choices.md)).
+A raiser may also attach one native Active Comprehension Check as five atomic
+inputs: `--check`, two to four repeatable `--check-choice KEY=LABEL` values,
+`--check-answer`, `--check-explain`, and `--check-about`. Check choices
+have no outcome or recommendation and cannot affect `decision.outcome`. Only
+the exact `raisedBy` actor may replace a check while the row is open;
+`geoyws` has no authoring exception. Before an answer is recorded, every later
+`attention list` and `attention show` read omits the answer and explanation,
+including the raiser's show; `--as` is self-declared, not authentication. Only
+the successful same-write raise receipt may echo the complete definition.
 Attention rows carry the same registered subsystem vocabulary as tasks:
 
 ```bash
@@ -384,6 +393,12 @@ kb att raise "Review the deployed queuer" --as codex@driver --kind review --tag 
   --choice "ship-first=Ship it and review after the release|defer" \
   --consequence "ship-first=The release goes out unreviewed and a task is filed to review it on 2026-09-12." \
   --recommend review-now
+kb att raise "Choose after demonstrating the Store boundary." --as codex@driver \
+  --check "Where is the check definition validated?" \
+  --check-choice "store=The Store validates it" --check-choice "client=The client validates it" \
+  --check-answer store --check-explain "rust/store.rs validates it before writing." \
+  --check-about rust/store.rs
+kb att show a-12345678 --json
 kb att list --status open --tag queuer
 kb att update a-12345678 --body "Corrected request." --as codex@driver
 kb att update a-12345678 --tag queuer --tag infra --as codex@driver

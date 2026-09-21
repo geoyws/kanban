@@ -2568,6 +2568,10 @@ fn a_schema_behind_denied_board_is_skipped_after_migration() {
     estate.enforce("managed");
     let server = WebServer::start(&estate, &work, None);
 
+    let current_version: i64 = Connection::open(&estate.board_a)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     let downgrade_beta = || {
         Connection::open(&estate.board_b)
             .unwrap()
@@ -2582,7 +2586,7 @@ fn a_schema_behind_denied_board_is_skipped_after_migration() {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 30,
+            version, current_version,
             "the denied board did not keep its migration path"
         );
     };

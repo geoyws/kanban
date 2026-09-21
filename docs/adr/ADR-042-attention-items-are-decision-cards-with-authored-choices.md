@@ -848,12 +848,31 @@ through a real stdio `Session`.
 
 Phase 3's two real-Chrome cases are named in §6.
 
+## 2026-09-21 amendment: native comprehension-check definition
+
+Board schema 31 adds an optional native Active Comprehension Check beside the decision
+card. Its complete definition is `question`, two to four `{key,label}` choices, one
+declared answer key, an explanation, and an `about` subject. It is a separate
+non-decisional structure: its choices have neither `outcome` nor `recommended`, and
+nothing in it writes `decision.outcome`.
+
+The five CLI inputs are atomic on `attention raise` and `attention update`: `--check`,
+repeatable `--check-choice KEY=LABEL`, `--check-answer`, `--check-explain`, and
+`--check-about`. Existing rows remain no-check rows. Only the exact raiser may replace
+the definition on an open row; the operator has no exception. Before answer recording, every
+later list, show, MCP, digest and HTTP read omits answer and explanation for every actor,
+including the raiser. The successful same-write raise receipt alone may echo the complete
+definition. This always-redact decision supersedes the earlier raiser-full show design: `--as`
+is self-declared, `AuthzContext` has no principal-to-`raisedBy` binding, and George chose safe
+omission rather than adding a principal binding or token. Result recording, resolution gating
+and answered-row locking remain governed by `docs/specs/acc.md` and are not implemented here.
+
 ## References
 
 - `rust/model.rs:807`, `rust/model.rs:814`, `rust/model.rs:818` — `OPERATOR_ACTOR`
   and the two closed sets `ATTENTION_OUTCOMES` joins
-- `rust/model.rs:822`–`rust/model.rs:841` — the `Attention` struct the four fields
-  are added to
+- `rust/model.rs` `Attention`, `AttentionCheck` and `AttentionCheckChoice` — the
+  serialized decision-card row and its optional native check definition
 - `rust/store.rs:1037` — `attention_row`, where the default pair is materialized
 - `rust/store.rs:4878`, `rust/store.rs:4901`, `rust/store.rs:4910` —
   `raise_attention`, its INSERT and its event payload

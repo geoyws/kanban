@@ -2283,6 +2283,7 @@ mod tests {
                 0,
                 &["ops".to_owned(), "release".to_owned()],
                 &DecisionCard::default(),
+                None,
             )
             .expect("raise attention");
         store
@@ -3813,6 +3814,7 @@ mod tests {
                         0,
                         &[],
                         &DecisionCard::default(),
+                        None,
                     )
                     .expect("raise an open item");
                 if board == "atmux" {
@@ -5357,6 +5359,7 @@ mod tests {
                         0,
                         &[AUTHZ_TAG.to_owned()],
                         &DecisionCard::default(),
+                        None,
                     )
                     .expect("raise an open item")
                     .id

@@ -589,6 +589,7 @@ mod tests {
             question: None,
             context: None,
             choices: crate::model::default_choice_pair(),
+            check: None,
             raised_by: "codex@driver".to_owned(),
             created_at: 3,
             status: "open".to_owned(),

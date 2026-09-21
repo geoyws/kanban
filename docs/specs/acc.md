@@ -27,8 +27,11 @@
     format, stable IDs, trace and readiness gate.
   - George, 2026-09-20 (walkthrough note 255) — approved adding ACC to the SDD rollout.
   - `a-db9de88b` on `t-6a3dd1a6` — George resolved OQ-1 as **lock** on 2026-09-21.
-- **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 names the planned rows;
-  this specification does not claim implementation evidence.
+  - George, 2026-09-21 (scope decision recorded on `t-cbaff421`) — every later pre-answer
+    read redacts answer and explanation, including the raiser's own show; the successful raise
+    receipt alone may echo the just-authored definition.
+- **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 carries one row per
+  requirement and names implementation evidence only after it lands.
 
 ## 2. Purpose and scope
 
@@ -192,15 +195,16 @@ region, and lock/unlock and pass/miss feedback are not conveyed by colour alone.
 
 ### Reads, redaction and compatibility
 
-**ACC-13 — Project the check with surface-specific redaction.**
-Strength: MUST · Layer: process · Source: `e-5c8f7735` §Reads; `t-cbaff421` PERSISTENCE;
-`t-94076221`.
-For an authorized unanswered row, `att list --json`, MCP and the digest carry only the question,
-choices and `about`; both explanation and answer are absent. The raiser's own
-`att show`/`att show --json` may carry the complete definition. The browser projection obeys
-ACC-10. After the answer is recorded, permitted reads may carry explanation, answer and the
-stored result fields from ACC-07. Redaction removes fields rather than substituting a guessable
-placeholder.
+**ACC-13 — Redact every pre-answer read projection.**
+Strength: MUST · Layer: process · Source: `e-5c8f7735` §Reads; `t-cbaff421` PERSISTENCE and
+George's 2026-09-21 scope decision; `t-94076221`.
+For an authorized unanswered row, every show, list, MCP, digest and HTTP read projection carries
+only the question, choices and `about`; explanation and answer are absent even when the reader is
+the raiser. The successful `attention raise` write receipt may echo the complete definition to
+the author in that same response, but no later read inherits that exception. The browser
+projection obeys ACC-10. After the answer is recorded, permitted reads may carry explanation,
+answer and the stored result fields from ACC-07. Redaction removes fields rather than substituting
+a guessable placeholder.
 
 **ACC-14 — Inherit tenancy and tag visibility without an ACC bypass.**
 Strength: MUST · Layer: http · Source: rollout brief; existing Store authorization boundary.
@@ -242,8 +246,8 @@ answer.
 three in-bound choices, an answer naming one choice, a 400-character explanation naming the
 component and `about=src/store.rs`,
 *when* `attention raise` writes it,
-*then* the raiser's full `att show --json` round-trips the definition and no recommendation or
-outcome exists on the check or its choices.
+*then* that successful same-write receipt may echo the complete definition, no recommendation or
+outcome exists on the check or its choices, and a later `att show --json` omits answer and explanation.
 
 ### A2 — partial, bounds and answer mismatch (`ACC-01`, `ACC-02`)
 
@@ -307,12 +311,13 @@ the same key and reads the row, *then* the authorized actor reaches the shared S
 the unauthorized actor receives the existing non-enumerating denial, learns no check metadata
 and writes no result or event.
 
-### A12 — reader redaction and raiser view (`ACC-13`)
+### A12 — every pre-answer reader is redacted (`ACC-13`)
 
-*Given* an unanswered checked row, *when* authorized list JSON, MCP, digest and raiser's own show
-are read, *then* list/MCP/digest carry only question, choices and `about`, while raiser's show
-carries the full definition; neither list/MCP/digest explanation nor answer exists; *when* the
-answer is recorded, *then* permitted reads may carry explanation, answer and stored result.
+*Given* an unanswered checked row, *when* authorized list JSON, MCP, digest, HTTP and any actor's
+own show — including the raiser's — are read, *then* each carries only question, choices and
+`about`; explanation and answer fields do not exist. The successful raise write receipt is the
+only pre-answer response allowed to echo the complete definition. *When* the answer is recorded,
+*then* permitted reads may carry explanation, answer and stored result.
 
 ### A13 — native skill cutover (`ACC-15`)
 
@@ -359,6 +364,10 @@ lock behind a new answer and raiser update is restored.
 - **Compatibility:** absent checks remain absent and preserve old read/resolve behaviour; checked
   rows fail closed against old resolvers that omit the answer; redaction is an omission, not a
   renamed or nullable answer field.
+- **Read projection:** before answer recording, every show, list, MCP, digest and HTTP read omits
+  answer and explanation for every actor, including `raisedBy`. A successful raise receipt is a
+  same-write acknowledgement, not a later read, and is the sole allowed pre-answer full-definition
+  echo.
 - **Ownership:** the containing board Store owns definition, result and authorization; `raisedBy`
   owns authoring permission subject to ACC-05's lock. Skills and web are projections, not
   alternate ledgers.
@@ -373,16 +382,18 @@ lock behind a new answer and raiser update is restored.
   answers serialize; exactly one first answer persists and every loser is refused unchanged.
 - **Accessibility:** ACC-12 requires labelled controls, keyboard/pointer equivalence, announced
   state/explanation and non-colour-only feedback while preserving the existing hotkeys.
-- **Privacy:** check contents inherit row tenancy and tag visibility. The answer is product-sensitive
-  assessment data and is minimized per ACC-10/13; no new retention period is invented.
+- **Privacy:** check contents inherit row tenancy and tag visibility. The answer and explanation
+  are product-sensitive assessment data: before answer recording every read surface omits both for
+  every actor, including the raiser; only the successful same-write raise receipt may echo them.
+  No new retention period is invented.
 - **Security — ASVS applicability:** OWASP ASVS **5.0.0** is selected as verification guidance,
   not a certification claim. **V2.2.1** and **V2.2.2** apply to bounded/structural validation at a
   trusted service layer (ACC-01/02/04); **V8.3.1** applies because authorization must be enforced
   by the trusted Store rather than browser controls (ACC-05/14); **V14.2.6** applies because HTML,
-  JSON and browser assets must disclose only the minimum data and never the pre-answer key
-  (ACC-10/13). Authentication, cryptography and session-management chapters add no ACC-specific
-  contract because this slice inherits the existing trusted-edge identity and creates no secret,
-  credential or session mechanism.
+  JSON, show/list, MCP, digest and HTTP reads must disclose only the minimum data and never the
+  pre-answer key or explanation to any actor (ACC-10/13). Authentication, cryptography and session-
+  management chapters add no ACC-specific contract because this slice inherits the existing
+  trusted-edge identity and creates no secret, credential or session mechanism.
 - **Operability:** migration records one receipt per board; native result fields support reporting
   pass/miss/none by `about`; invalid legacy content is reported rather than half-written.
 - **Performance:** no performance or latency target was approved, so none is specified.
@@ -395,11 +406,17 @@ None.
 the row remains open. George chose **lock** (the recommended choice) on decision card
 `a-db9de88b` for `t-6a3dd1a6` on 2026-09-21: refuse the edit and preserve the definition,
 recorded answer/result and unlocked choices until normal resolution. ACC-05 carries the contract.
+**Resolved projection history.** ACC-13 and A12 originally allowed the raiser's later `att show`
+to return the full unanswered definition. That requirement was superseded on 2026-09-21 because
+`--as` is self-declared and `AuthzContext` carries no authoritative principal-to-`raisedBy`
+binding. George chose safe redaction on every later show/read instead of adding a principal
+binding or token. The successful raise response remains a same-write receipt and may echo what
+its author just supplied.
 
 ## 8. Verification
 
-The trace of record has one planned row for every mandatory ACC requirement. No test name, pass,
-implementation or release is claimed before implementation.
+The trace of record has one row for every mandatory ACC requirement. A row names implementation
+evidence only after it lands; incomplete requirements remain explicitly `PARTIAL` or `PLANNED`.
 
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
@@ -415,7 +432,7 @@ implementation or release is claimed before implementation.
 | `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
 | `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
 | `ACC-12` | MUST | chrome | `PLANNED` | keyboard, pointer, focus, announcement and Undo |
-| `ACC-13` | MUST | process | `PLANNED` | list/MCP/digest/show redaction by state and actor |
+| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | always-redacted pre-answer show/list and mutation receipts landed; digest/HTTP and post-answer state remain planned |
 | `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
@@ -428,3 +445,7 @@ implementation or release is claimed before implementation.
   removed an unapproved semantic classifier, applied later reader redaction and inherited write/
   lifecycle laws. George chose **lock** on `a-db9de88b`; ACC-05 now refuses answered-open edits,
   closing the sole open question and making the specification `SPEC-READY`.
+- 2026-09-21 — George superseded raiser-full pre-answer show with always-redact reads. The
+  discarded design relied on self-declared `--as` while `AuthzContext` had no principal binding;
+  he chose safe omission rather than adding a binding/token. ACC-13, A1, A12 and the data/security/
+  trace contracts now preserve only the same-write raise-receipt exception.

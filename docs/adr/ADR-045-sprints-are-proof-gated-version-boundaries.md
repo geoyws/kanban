@@ -210,6 +210,18 @@ the bound deployment. Abandon records its note, and attachment changes record
 old and new sprint ids. `audit verify` covers the resulting chain. `sprint list`
 and `show` are reads and write nothing.
 
+### 2026-09-21 schema-boundary addendum
+
+The ACC definition slice advances the append-only board ladder from 30 to 31. `BOARD_V31`
+rebuilds `attention` with nullable `check_question`, `check_choices`, `check_answer`,
+`check_explanation`, and `check_about`; old rows copy across as no-check rows. A table-level
+constraint permits only all five NULL or all five non-NULL, and the question/explanation bounds
+and bounded JSON-array shape follow existing SQLite conventions. The Store remains the semantic
+authority for keys, subjects and diagnosis rules so refusals name their fix. A complete v31
+shape reopens as a no-op; if all five live columns exist but the constraint shape is stale, the
+repair rebuild copies all five check values through a transaction before restoring the canonical
+constraints. A pre-31 binary continues to refuse a newer board at the existing version gate.
+
 ## Consequences
 
 - `COMMANDS` includes the `sprint` command with seven subcommands and the
