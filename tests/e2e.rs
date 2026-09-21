@@ -7697,8 +7697,12 @@ fn compiled_binary_refuses_unknown_flags_instead_of_writing_to_the_wrong_board()
     let version = String::from_utf8_lossy(&version.stdout);
     let lines: Vec<&str> = version.lines().collect();
     assert!(lines[0].contains("kanban"), "version output: {version}");
+    let supported =
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
+            .as_i64()
+            .unwrap();
     assert!(
-        lines[0].contains("board schema 30"),
+        lines[0].contains(&format!("board schema {supported}")),
         "version output: {version}"
     );
     assert!(
@@ -11750,6 +11754,18 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "--json",
         ],
     );
+    let attention = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Read-only schema probe decision.",
+            "--as",
+            "schema@e2e",
+            "--json",
+        ],
+    );
+    let attention_id = attention["id"].as_str().unwrap().to_owned();
     let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
         .as_str()
         .unwrap()
@@ -11766,6 +11782,7 @@ fn the_schema_describes_the_real_surface_and_read_only_really_is() {
             "task show" => vec!["task", "show", "t-1"],
             "handoff list" => vec!["handoff", "list"],
             "attention list" => vec!["attention", "list"],
+            "attention show" => vec!["attention", "show", &attention_id],
             "tag list" => vec!["tag", "list"],
             "rule list" => vec!["rule", "list"],
             "rule show" => vec!["rule", "show", &rule_id],
@@ -22651,7 +22668,9 @@ fn the_v10_sitrep_rename_preserves_v9_rows_and_their_trail() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
+            .as_i64()
+            .unwrap()
     );
     assert_eq!(
         connection
@@ -25223,8 +25242,11 @@ fn workspace_adopt_compiled_process_refuses_source_symlink_traversal_fk_audit_an
 
     let newer = external_source_board(&fixture, "newer", "Alpha");
     let newer_connection = Connection::open(&newer).unwrap();
+    let source_version: i64 = newer_connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     newer_connection
-        .pragma_update(None, "user_version", 31_i64)
+        .pragma_update(None, "user_version", source_version + 1)
         .unwrap();
     drop(newer_connection);
 
@@ -55535,7 +55557,9 @@ fn a_v29_board_gains_task_models_and_claim_model_and_existing_claims_read_null()
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        30
+        fixture.ok_json(&fixture.main, &["doctor", "--json"])["supportedBoardSchemaVersion"]
+            .as_i64()
+            .unwrap()
     );
     // The table, its index, and the column are all there.
     assert_eq!(
