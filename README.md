@@ -405,8 +405,8 @@ kb att update a-12345678 --tag queuer --tag infra --as codex@driver
 kb att update a-12345678 --clear-tags --as codex@driver
 kb att update a-12345678 --clear-card --as codex@driver
 kb att resolve a-12345678 --as geoyws --choice review-now
+kb att resolve a-12345678 --as geoyws --choice review-now --check-answered store
 kb att resolve a-12345678 --as geoyws --choice custom --outcome defer --note "After the aix pin lands."
-kb att reopen a-12345678 --as geoyws --note "Resolved the wrong item."
 ```
 
 Several tags describe several touched subsystems. An agent may correct the body,
@@ -439,6 +439,16 @@ it. Reopening returns the item to the open queue without clearing `resolvedAt`,
 `resolvedBy` or `resolution`; it clears `decision` from the row and keeps it in
 the `attention_reopened` event, adds `reopenedAt`, `reopenedBy` and
 `reopenNote`, and the transition is audited.
+
+A row carrying a check settles only through it: `attention resolve` on an
+unanswered check is refused with the check's question and nothing is written,
+while `--check-answered KEY` records the one answer as data — `check.answered`,
+`check.correct` and `check.answeredAt` — and appends the human echo
+`ACC: pass` or `ACC: miss on <key>` to the resolution. A key the check did not
+declare is refused before any write, a row with no check refuses the flag by
+name, and a second answer never replaces the first. After the answer is
+recorded, `attention show` reveals the answer and explanation; a reopen clears
+the recorded result with the decision, so the next resolution answers again.
 
 The card is also the only way to park work on him, so the writes that would
 strand it require one. A `checkpoint --state blocked` whose `--next-action` or

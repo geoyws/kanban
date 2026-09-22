@@ -1323,7 +1323,7 @@ components:
       required: [question, choices, about]
       description: |
         The aggregate HTTP projection of an unanswered native check (ACC-13).
-        Every read uses this redacted shape, including a read by the raiser. The
+        Every pre-answer read uses this redacted shape, including a read by the raiser. The
         answer key and explanation are omitted server-side and have no properties
         in this schema; clients cannot request or infer them here. The same-write
         CLI/MCP raise-receipt exception is not an aggregate HTTP read and is not
@@ -1336,6 +1336,38 @@ components:
           maxItems: 4
           items: { $ref: "#/components/schemas/AttentionCheckChoice" }
         about: { type: string }
+
+    AnsweredAttentionCheck:
+      type: object
+      additionalProperties: false
+      required: [question, choices, about, answer, explanation, answered, correct, answeredAt]
+      description: |
+        The aggregate HTTP projection of a check whose one answer is recorded
+        (ACC-07/ACC-13): the full definition plus the result triple. A resolve
+        records the answer, and a reopen returns the row to the redacted shape
+        by clearing the result with the decision.
+      properties:
+        question: { type: string, maxLength: 160 }
+        choices:
+          type: array
+          minItems: 2
+          maxItems: 4
+          items: { $ref: "#/components/schemas/AttentionCheckChoice" }
+        about: { type: string }
+        answer:
+          type: string
+          description: The definition's own answer key, revealed only once an answer stands.
+        explanation:
+          type: string
+          maxLength: 400
+        answered:
+          type: string
+          description: The one submitted choice key.
+        correct:
+          type: boolean
+          description: Whether the submitted key is the definition's answer.
+        answeredAt: { $ref: "#/components/schemas/EpochMillis" }
+
 
     AttentionDecision:
       type: object
@@ -1371,12 +1403,16 @@ components:
             (`rust/model.rs:926`) materialized on read for a row that authored
             none. Never empty, and never carries the reserved `custom` key.
         check:
-          allOf: [{ $ref: "#/components/schemas/RedactedAttentionCheck" }]
+          oneOf:
+            - $ref: "#/components/schemas/RedactedAttentionCheck"
+            - $ref: "#/components/schemas/AnsweredAttentionCheck"
           description: |
             Present only when the row carries a native check. Before answer
             recording, every aggregate HTTP read exposes question, choices and
             about only, including for the raiser; answer and explanation are
-            absent from response bytes.
+            absent from response bytes. Once the one answer is recorded the
+            projection carries the full definition and result triple, and a
+            reopen returns the row to the redacted shape.
         raisedBy: { type: string }
         createdAt: { $ref: "#/components/schemas/EpochMillis" }
         status: { type: string }

@@ -1017,6 +1017,12 @@ pub struct AttentionCheckChoice {
 /// `answer` and `explanation` are optional only at the read boundary, where a
 /// broad projection removes them. Every value accepted for persistence has
 /// both fields; [`AttentionCheck::validate_definition`] enforces that law.
+///
+/// `answered`, `correct` and `answered_at` are the one recorded answer
+/// (ACC-07/ACC-08): absent until someone answers, all-or-none thereafter,
+/// never written by a definition edit. Their presence is also the read
+/// boundary's switch — an answered check may reveal `answer` and
+/// `explanation`, an unanswered one never does (ACC-13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttentionCheck {
@@ -1027,6 +1033,19 @@ pub struct AttentionCheck {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
     pub about: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correct: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<i64>,
+}
+
+impl AttentionCheck {
+    /// Whether the one answer this check accepts has been recorded.
+    pub fn is_answered(&self) -> bool {
+        self.answered.is_some()
+    }
 }
 
 /// Raw five-flag check input, kept unvalidated until the Store has applied
@@ -1115,6 +1134,10 @@ impl AttentionCheck {
             answer: Some(answer.expect("presence checked").trim().to_owned()),
             explanation: Some(explanation.expect("presence checked").trim().to_owned()),
             about: about.expect("presence checked").trim().to_owned(),
+            // A definition never carries a result; only answering writes one.
+            answered: None,
+            correct: None,
+            answered_at: None,
         };
         check.validate_definition()?;
         Ok(Some(check))
@@ -1190,6 +1213,10 @@ impl AttentionCheck {
     }
 
     /// The safe unanswered projection used by broad lists, MCP and web reads.
+    ///
+    /// It removes the result triple as well: `redacted` is the pre-answer
+    /// projection, and a check that has been answered is served whole by the
+    /// caller instead of passing through here (ACC-13).
     pub fn redacted(&self) -> Self {
         Self {
             question: self.question.clone(),
@@ -1197,6 +1224,9 @@ impl AttentionCheck {
             answer: None,
             explanation: None,
             about: self.about.clone(),
+            answered: None,
+            correct: None,
+            answered_at: None,
         }
     }
 }

@@ -424,10 +424,10 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-02` | MUST | unit | `PLANNED` | explanation and all three `about` shapes/refusal |
 | `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
 | `ACC-04` | MUST | unit | `PLANNED` | every agreed marker across all three text locations |
-| `ACC-05` | MUST | process | `PLANNED` | raiser/other/geoyws, answered-open lock, resolved immutability and reopen-clear/restore paths |
-| `ACC-06` | MUST | process | `PLANNED` | missing/no-check/undeclared-key paths plus web answer then web/CLI resolve without a second answer |
-| `ACC-07` | MUST | process | `PLANNED` | persisted answer/correct/time and note agreement |
-| `ACC-08` | MUST | process | `PLANNED` | right/wrong, immutable duplicate and serialized concurrent-answer paths |
+| `ACC-05` | MUST | process | `answered_check_locks_definition_and_a_later_resolve_reuses_it`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | raiser-only authoring and resolved immutability landed 2026-09-21; answered-open lock and reopen-clear/restore landed 2026-09-22 |
+| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | missing/no-check/undeclared-key paths plus a recorded answer letting a later resolve settle with no second flag; the web-answer half lands with ACC-11 |
+| `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | persisted answer/correct/time, note agreement, v32 all-or-none columns |
+| `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | right/wrong paths and immutable duplicate; serialized concurrent answers land with the ACC-11 endpoint |
 | `ACC-09` | MUST | chrome | `PLANNED` | check-first, one answer, no retry, unlock and miss explanation |
 | `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
 | `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
@@ -449,3 +449,11 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
   discarded design relied on self-declared `--as` while `AuthzContext` had no principal binding;
   he chose safe omission rather than adding a binding/token. ACC-13, A1, A12 and the data/security/
   trace contracts now preserve only the same-write raise-receipt exception.
+
+- 2026-09-22 — the answer slice landed: `attention resolve --check-answered` records the one
+  answer as v32 columns (`check.answered`, `check.correct`, `check.answeredAt`), a checked row
+  refuses a bare resolve naming its question, an already-recorded answer settles later
+  resolves, reopen clears the result with the decision, and the answered-open definition lock
+  from ACC-05 took effect. Requirement wording is unchanged; only §8 trace rows gained
+  evidence. The v31 rebuild guard in the migration ladder was pinned to the v31 step — it had
+  hardcoded "last migration" and would have silently skipped every later migration.

@@ -224,7 +224,8 @@ Usage:
              [--clear-card]
              [--check QUESTION --check-choice KEY=LABEL ... --check-answer KEY]
              [--check-explain TEXT --check-about SUBJECT]
-  kanban attention resolve ID --as ACTOR --choice KEY [--note TEXT] [--json]
+  kanban attention resolve ID --as ACTOR --choice KEY [--note TEXT] [--check-answered KEY]
+             [--json]
   kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
              --note TEXT [--json]
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
@@ -1357,7 +1358,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
     (
         "attention",
         Some("resolve"),
-        &["as", "note", "choice", "outcome"],
+        &["as", "note", "choice", "outcome", "check-answered"],
         &["id"],
         false,
     ),
@@ -7354,6 +7355,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                     outcome: args.one("outcome"),
                     note: args.one("note"),
                 },
+                args.one("check-answered"),
             )?,
             args.has("json"),
         );
@@ -9671,6 +9673,9 @@ mod tests {
                 answer: Some("store".into()),
                 explanation: Some("rust/store.rs enforces it.".into()),
                 about: "rust/store.rs".into(),
+                answered: None,
+                correct: None,
+                answered_at: None,
             }),
             raised_by: "worker@driver-2".into(),
             created_at: 1,

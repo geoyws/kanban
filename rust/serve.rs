@@ -927,7 +927,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
             page("Board not found", "<h1>Board not found</h1>"),
         ));
     };
-    if let Err(error) = store.resolve_attention_from_trusted_edge(id, &actor, &answer) {
+    if let Err(error) = store.resolve_attention_from_trusted_edge(id, &actor, &answer, None) {
         return Ok(WebResponse::Html(
             409,
             page(
@@ -3850,6 +3850,7 @@ mod tests {
                         outcome: None,
                         note: None,
                     },
+                    None,
                 )
                 .expect("settle an atmux row");
         }
@@ -5616,6 +5617,7 @@ mod tests {
                     &board.attention[index],
                     &actor,
                     &AttentionAnswer::custom("other", "done"),
+                    None,
                 )
                 .expect_err("a header value must not grant a scope the principal lacks");
             assert_eq!(
@@ -5645,6 +5647,7 @@ mod tests {
                 board.attention.last().expect("a spare row"),
                 "ifca-sso",
                 &AttentionAnswer::custom("other", "done"),
+                None,
             )
             .expect("the principal's own authority permits this write");
         assert_eq!(
@@ -5688,6 +5691,7 @@ mod tests {
                     &board.attention[0],
                     &actor,
                     &AttentionAnswer::custom("other", "done"),
+                    None,
                 )
                 .expect_err("same-origin must not authorize a principal holding nothing")
                 .to_string(),
@@ -5701,6 +5705,7 @@ mod tests {
                     &board.attention[0],
                     &actor,
                     &AttentionAnswer::custom("other", "done"),
+                    None,
                 )
                 .expect_err("same-origin must not authorize past the tag scope")
                 .to_string(),
@@ -5746,6 +5751,7 @@ mod tests {
                 &board.attention[0],
                 &actor,
                 &AttentionAnswer::custom("other", "done"),
+                None,
             )
             .expect("the principal holds this row");
         assert_eq!(
@@ -5773,6 +5779,7 @@ mod tests {
                     &board.attention[1],
                     &actor,
                     &AttentionAnswer::custom("other", "done"),
+                    None,
                 )
                 .expect_err("an audit identity cannot authorize anything")
                 .to_string(),
@@ -5786,6 +5793,7 @@ mod tests {
                 &board.attention[1],
                 "other@edge.test",
                 &AttentionAnswer::custom("other", "done"),
+                None,
             )
             .expect("the principal holds this row");
         assert_eq!(

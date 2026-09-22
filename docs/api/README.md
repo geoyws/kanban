@@ -55,10 +55,14 @@ here claims a shipped behaviour except where it cites the line that ships it.
   `.servedVersion` and `SearchResult.taskID` carry
   `skip_serializing_if = "Option::is_none"`, so they are missing from the
   object rather than `null`. Everything else that is optional is `nullable`.
-- **`Attention.check` is optional and redacted on broad HTTP reads.** The
-  OpenAPI source of truth models it as `RedactedAttentionCheck`: before an
-  answer, only `question`, ordered `choices` and `about` are present; answer
-  and explanation are absent even for the raiser. A no-check row omits `check`.
+- **`Attention.check` is optional and redacted while unanswered.** The
+  OpenAPI source of truth models it as `RedactedAttentionCheck` before an
+  answer — only `question`, ordered `choices` and `about` are present; answer
+  and explanation are absent even for the raiser — and as
+  `AnsweredAttentionCheck` once the one answer is recorded, which adds the
+  definition's answer, the explanation and the `answered`/`correct`/
+  `answeredAt` result. A no-check row omits `check`, and a reopen returns the
+  row to the redacted shape.
   The same-write CLI/MCP raise-receipt exception is a write acknowledgement,
   not a GET projection, and is deliberately not modelled by this HTTP schema.
 

@@ -2109,9 +2109,33 @@ CREATE TRIGGER search_attention_ad AFTER DELETE ON attention BEGIN
  DELETE FROM search_documents WHERE source_kind='attention' AND source_id=old.id;
 END;
 "#;
+
+/// The recorded check answer (ACC-07): three columns that are absent or
+/// complete together, and only ever on a row that carries a definition.
+/// v32 does not rebuild the table — plain ALTERs plus triggers carry the
+/// all-or-none law the v31 table CHECK cannot express after the fact.
+const BOARD_V32: &str = r#"
+ALTER TABLE attention ADD COLUMN check_answered TEXT;
+ALTER TABLE attention ADD COLUMN check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1));
+ALTER TABLE attention ADD COLUMN check_answered_at INTEGER;
+CREATE TRIGGER attention_check_result_insert_all_or_none AFTER INSERT ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+CREATE TRIGGER attention_check_result_update_all_or_none AFTER UPDATE OF check_question, check_choices, check_answer, check_explanation, check_about, check_answered, check_correct, check_answered_at ON attention
+WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
+ OR (NEW.check_answered IS NULL) <> (NEW.check_answered_at IS NULL)
+ OR (NEW.check_answered IS NOT NULL AND NEW.check_question IS NULL)
+BEGIN
+ SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
+END;
+"#;
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
- root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT NOT NULL UNIQUE,
+ root_path TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,board_path TEXT UNIQUE,
  created_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL
 ) STRICT;
 "#;
@@ -2410,7 +2434,7 @@ CREATE TABLE proofs (
 ) STRICT;
 "#;
 
-pub const BOARD_SCHEMA_VERSION: usize = 31;
+pub const BOARD_SCHEMA_VERSION: usize = 32;
 pub const REGISTRY_SCHEMA_VERSION: usize = 14;
 
 /// Create `dir` and any missing ancestors, each mode 0700.
@@ -2812,6 +2836,25 @@ fn board_v31_shape_exists(connection: &Connection) -> Result<bool> {
     .iter()
     .all(|constraint| sql.contains(constraint)))
 }
+
+fn board_v32_result_shape_exists(connection: &Connection) -> Result<bool> {
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('attention')")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let has = |name: &str| columns.iter().any(|column| column == name);
+    if !(has("check_answered") && has("check_correct") && has("check_answered_at")) {
+        return Ok(false);
+    }
+    let triggers: usize = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+         AND name IN ('attention_check_result_insert_all_or_none',\
+                      'attention_check_result_update_all_or_none')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(triggers == 2)
+}
 fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
     let mut current: usize = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > migrations.len() {
@@ -2833,11 +2876,18 @@ fn migrate(connection: &mut Connection, migrations: &[&str]) -> Result<()> {
             transaction.commit()?;
             return Ok(());
         }
-        let board_v31_step =
-            migrations.len() == BOARD_SCHEMA_VERSION && current + 1 == BOARD_SCHEMA_VERSION;
+        // The rebuild guard belongs to the v31 step alone (index 30), never
+        // to "whatever migration is last": a later version must not inherit
+        // the rewind skip just by existing.
+        let board_v31_step = current + 1 == 31;
         let v31_columns = board_v31_step && board_v31_columns_exist(&transaction)?;
         let v31_rewind = v31_columns && board_v31_shape_exists(&transaction)?;
-        if !v31_rewind {
+        // The v32 ALTERs cannot re-run against columns that already stand,
+        // so a board rewound past its own physical v32 shape skips the step
+        // instead of failing on a duplicate column.
+        let board_v32_step = current + 1 == 32;
+        let v32_stands = board_v32_step && board_v32_result_shape_exists(&transaction)?;
+        if !v31_rewind && !v32_stands {
             if v31_columns {
                 transaction.execute_batch(
                     "CREATE TEMP TABLE attention_v31_check_backup AS\n                     SELECT id,check_question,check_choices,check_answer,check_explanation,check_about\n                     FROM attention;",
@@ -2922,7 +2972,7 @@ const BOARD_MIGRATIONS: &[&str] = &[
     BOARD_V1, BOARD_V2, BOARD_V3, BOARD_V4, BOARD_V5, BOARD_V6, BOARD_V7, BOARD_V8, BOARD_V9,
     BOARD_V10, BOARD_V11, BOARD_V12, BOARD_V13, BOARD_V14, BOARD_V15, BOARD_V16, BOARD_V17,
     BOARD_V18, BOARD_V19, BOARD_V20, BOARD_V21, BOARD_V22, BOARD_V23, BOARD_V24, BOARD_V25,
-    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31,
+    BOARD_V26, BOARD_V27, BOARD_V28, BOARD_V29, BOARD_V30, BOARD_V31, BOARD_V32,
 ];
 
 /// Columns `BOARD_V1`'s `tasks` table declares that every later schema still
@@ -4273,12 +4323,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v32_result_columns_are_absent_complete_and_defined() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v32");
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority,
+                   check_question,check_choices,check_answer,check_explanation,check_about
+                 ) VALUES('a-full','decision','body','raiser',1,'open',0,6,
+                   'Where is it enforced?',
+                   '[{\"key\":\"a\",\"label\":\"A\"},{\"key\":\"b\",\"label\":\"B\"}]',
+                   'a','The Store enforces it.','rust/store.rs')",
+                [],
+            )
+            .expect("insert a defined row");
+        connection
+            .execute(
+                "INSERT INTO attention(
+                   id,kind,body,raised_by,created_at,status,archived,priority
+                 ) VALUES('a-none','decision','body','raiser',1,'open',0,6)",
+                [],
+            )
+            .expect("insert an undefined row");
+        let partial = connection
+            .execute(
+                "UPDATE attention SET check_answered='a' WHERE id='a-full'",
+                [],
+            )
+            .expect_err("a partial triple is corruption");
+        assert!(
+            partial
+                .to_string()
+                .contains("attention check result must be absent or complete"),
+            "{partial}"
+        );
+        let orphan = connection
+            .execute(
+                "UPDATE attention SET check_answered='a',check_correct=0,check_answered_at=1 \
+                 WHERE id='a-none'",
+                [],
+            )
+            .expect_err("a result without a definition is corruption");
+        assert!(
+            orphan
+                .to_string()
+                .contains("attention check result must be absent or complete"),
+            "{orphan}"
+        );
+        connection
+            .execute(
+                "UPDATE attention SET check_answered='a',check_correct=1,check_answered_at=1 \
+                 WHERE id='a-full'",
+                [],
+            )
+            .expect("a complete triple on a defined row stands");
+        let stored: (Option<String>, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT check_answered,check_correct,check_answered_at FROM attention \
+                 WHERE id='a-full'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (Some("a".into()), Some(1), Some(1)));
+        // A later definition write cannot strand the standing result on an
+        // undefined row: the trigger's OF list covers the definition
+        // columns too.
+        let stranded = connection
+            .execute(
+                "UPDATE attention SET check_question=NULL,check_choices=NULL,check_answer=NULL,\
+                 check_explanation=NULL,check_about=NULL WHERE id='a-full'",
+                [],
+            )
+            .expect_err("clearing the definition under a result is corruption");
+        assert!(
+            stranded
+                .to_string()
+                .contains("attention check result must be absent or complete"),
+            "{stranded}"
+        );
+    }
+
     fn index_sql(connection: &Connection, name: &str) -> String {
         connection
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
-                [name],
-                |row| row.get::<_, String>(0),
+                &format!("SELECT sql FROM sqlite_master WHERE type='index' AND name='{name}'"),
+                [],
+                |row| row.get(0),
             )
             .unwrap()
     }

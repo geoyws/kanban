@@ -497,7 +497,9 @@ Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `u
 
 Definition authoring and schema evidence landed on 2026-09-21 for ACC-01..04, the
 raiser-only authoring half of ACC-05, and the always-redacted show/list portion of ACC-13.
-Answering, resolution, browser, HTTP, digest/reader cutover and legacy body migration remain
+The answer slice landed on 2026-09-22 for the resolve half of ACC-05 (answered-open lock and
+reopen-clear) and all of ACC-06/07/08 at the CLI/store layer, including the v32 result
+columns. Browser, HTTP, digest/reader cutover and legacy body migration remain
 `PLANNED`; no row below claims those later slices.
 
 | Requirement | Strength | Layer | Existing test | Note |
@@ -506,23 +508,23 @@ Answering, resolution, browser, HTTP, digest/reader cutover and legacy body migr
 | `ACC-02` | MUST | unit | `check_about_accepts_only_the_three_approved_subject_shapes` | path/file, host/tier sigil and flag/default shapes plus byte-exact mismatch sentence |
 | `ACC-03` | MUST | unit/process | `check_json_refuses_decisional_and_unknown_fields`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically` | serde refuses outcome, recommended and unknown definition fields; serialized choices never carry them or mutate the decision |
 | `ACC-04` | MUST | unit | `diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule` | every approved marker in question, choice label and explanation with the byte-exact rule sentence; `about` is intentionally outside this marker rule |
-| `ACC-05` | MUST | process | PARTIAL — `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically` | only `raisedBy` may author/update, including no `geoyws` exception; answered-open lock, resolve and reopen behavior remain `PLANNED` in the answer slice |
-| `ACC-06` | MUST | process | `PLANNED` | missing/no-check/undeclared-key paths plus web answer then web/CLI resolve without a second answer |
-| `ACC-07` | MUST | process | `PLANNED` | persisted answer/correct/time and note agreement |
-| `ACC-08` | MUST | process | `PLANNED` | right/wrong, immutable duplicate and serialized concurrent-answer paths |
+| `ACC-05` | MUST | process | `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | only `raisedBy` may author/update, including no `geoyws` exception; the answered-open lock refuses a raiser rewrite while the answer stands; reopen clears decision and check result together and restores raiser update |
+| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | a checked row refuses a bare resolve naming its question and writes nothing; the web-recorded (store-seeded) answer lets a later resolve settle with no second flag; a no-check row refuses `--check-answered` by name and otherwise resolves as before; the browser POST half lands with ACC-11 |
+| `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | declared key records `answered`/`correct`/`answeredAt` as columns the v32 triggers keep absent-or-complete on a defined check; the `ACC: pass` / `ACC: miss on <key>` echo agrees with the stored fields and the `attention_resolved` payload; an undeclared key is refused before any write |
+| `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one right or wrong declared answer resolves with its result and echo; a second `--check-answered` after any recorded answer is refused unchanged; no attempts counter or retry path exists in the surface; concurrent submissions serialize behind the same Store transaction and the HTTP half lands with ACC-11 |
 | `ACC-09` | MUST | chrome | `PLANNED` | check-first, one answer, no retry, unlock and miss explanation |
 | `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
 | `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
 | `ACC-12` | MUST | chrome | `PLANNED` | keyboard, pointer, focus, announcement and Undo |
-| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser; successful raise may echo only in its same-write receipt; digest/HTTP and post-answer state remain `PLANNED` |
+| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser; successful raise may echo only in its same-write receipt; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; digest/HTTP halves remain `PLANNED` |
 | `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
 
-17 requirements: 17 MUST, no SHOULD or MAY. ACC-01..04 have definition-slice evidence; ACC-05
-and ACC-13 are explicitly partial; every other incomplete answer/browser/reader/migration slice
-remains `PLANNED`.
+17 requirements: 17 MUST, no SHOULD or MAY. ACC-01..08 carry definition- and answer-slice
+evidence (ACC-05 and ACC-13 remain partial pending the browser halves); every other
+browser/reader/migration slice remains `PLANNED`.
 
 ## Watch coverage note
 

@@ -2434,9 +2434,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 31);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 31);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 31);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 32);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 32);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 32);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -18475,7 +18475,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        31
+        32
     );
 }
 
@@ -19010,7 +19010,10 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
         )
         .unwrap();
     assert_eq!(restored_definition, stored_definition);
-    let resolved = fixture.ok_json(
+    // ACC-06: the checked row settles only through its check. The answer is
+    // `store`, so this resolve both records it and reveals the definition
+    // the moment the answer stands.
+    let refused_without_answer = fixture.run(
         &fixture.main,
         &[
             "attention",
@@ -19023,9 +19026,55 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
             "--json",
         ],
     );
-    assert!(resolved["check"].get("answer").is_none());
-    assert!(resolved["check"].get("explanation").is_none());
-    assert!(!resolved.to_string().contains("SECRET_RECEIPT"));
+    assert!(!refused_without_answer.status.success());
+    let refusal = refusal_object(&refused_without_answer);
+    assert!(
+        refusal.contains("Which layer owns the definition?"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("--check-answered"), "{refusal}");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check-answered",
+            "store",
+            "--json",
+        ],
+    );
+    assert_eq!(resolved["check"]["answered"], "store");
+    assert_eq!(resolved["check"]["correct"], true);
+    assert!(resolved["check"]["answeredAt"].as_i64().is_some());
+    assert_eq!(resolved["check"]["answer"], "store");
+    assert!(
+        resolved["check"]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("SECRET_RECEIPT")
+    );
+    assert!(
+        resolved["resolution"]
+            .as_str()
+            .unwrap()
+            .contains("ACC: pass")
+    );
+    // The reveal is a read law, not a receipt fluke.
+    let shown_after = fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]);
+    assert_eq!(shown_after["check"]["answer"], "store");
+    assert!(
+        shown_after["check"]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("SECRET_RECEIPT")
+    );
+    // ACC-05: reopen clears the recorded result with the decision, so the
+    // read redacts again and the next resolution answers again.
     let reopened = fixture.ok_json(
         &fixture.main,
         &[
@@ -19041,7 +19090,26 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
     );
     assert!(reopened["check"].get("answer").is_none());
     assert!(reopened["check"].get("explanation").is_none());
+    assert!(reopened["check"].get("answered").is_none());
     assert!(!reopened.to_string().contains("SECRET_RECEIPT"));
+    let refused_again = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert!(!refused_again.status.success());
+    assert!(
+        refusal_object(&refused_again).contains("--check-answered"),
+        "a reopened row asks again"
+    );
 }
 #[test]
 fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
@@ -19055,7 +19123,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='attention'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
             .unwrap();
         for declaration in [
@@ -19063,7 +19131,9 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
             " check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'\n   AND json_array_length(check_choices) BETWEEN 2 AND 4)),\n",
             " check_answer TEXT,\n",
             " check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),\n",
-            " check_about TEXT,\n",
+            // v32's ALTERs land on the check_about line, so a simulated
+            // v30 board strips definition and result columns together.
+            " check_about TEXT, check_answered TEXT, check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)), check_answered_at INTEGER,\n",
             " CHECK(\n   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL\n    AND check_explanation IS NULL AND check_about IS NULL)\n   OR\n   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL\n    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)\n ),\n",
         ] {
             let without = sql.replace(declaration, "");
@@ -19094,7 +19164,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        31
+        32
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -19159,6 +19229,244 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     assert!(attention_sql.contains(
         "check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL"
     ));
+}
+#[test]
+fn resolve_records_the_native_check_answer_as_data_across_the_three_paths() {
+    let fixture = Fixture::new("native-acc-answer-cli");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ACC-ANSWER", "--json"]);
+    let board = board_path_for_project(&fixture, &fixture.main, "ACC-ANSWER");
+    let checked = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Three resolve paths, one recorded answer each.",
+            "--as",
+            "claude@driver",
+            "--check",
+            "Where does the one check answer live after a resolve?",
+            "--check-choice",
+            "fields=Stored fields on the attention row",
+            "--check-choice",
+            "notes=Note text on the resolution",
+            "--check-answer",
+            "fields",
+            "--check-explain",
+            "SECRET_JOURNEY rust/store.rs records answered, correct and answeredAt as columns.",
+            "--check-about",
+            "rust/store.rs",
+            "--json",
+        ],
+    );
+    let checked_id = checked["id"].as_str().unwrap();
+    let events_before = fixture
+        .ok_json(&fixture.main, &["events", "--json"])
+        .as_array()
+        .unwrap()
+        .len();
+
+    // Path one: no answer, no resolution — the refusal names the question.
+    let bare = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            checked_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert!(!bare.status.success());
+    let bare_refusal = refusal_object(&bare);
+    assert!(
+        bare_refusal.contains("Where does the one check answer live after a resolve?"),
+        "{bare_refusal}"
+    );
+    assert!(bare_refusal.contains("--check-answered"), "{bare_refusal}");
+    let still_open = fixture.ok_json(&fixture.main, &["attention", "show", checked_id, "--json"]);
+    assert_eq!(still_open["status"], "open");
+    assert!(still_open["check"].get("answer").is_none());
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        events_before,
+        "a refused resolve must write no event"
+    );
+
+    // An undeclared key is refused before any result or resolution write.
+    let undeclared = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            checked_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check-answered",
+            "nope",
+            "--json",
+        ],
+    );
+    assert!(!undeclared.status.success());
+    assert!(
+        refusal_object(&undeclared).contains("names no --check-choice"),
+        "undeclared key refused by name"
+    );
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        events_before
+    );
+
+    // Path two: a wrong declared key resolves and records the miss.
+    let miss = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            checked_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check-answered",
+            "notes",
+            "--json",
+        ],
+    );
+    assert_eq!(miss["status"], "resolved");
+    assert_eq!(miss["check"]["answered"], "notes");
+    assert_eq!(miss["check"]["correct"], false);
+    assert!(miss["check"]["answeredAt"].as_i64().is_some());
+    assert_eq!(miss["check"]["answer"], "fields");
+    assert!(
+        miss["check"]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("SECRET_JOURNEY")
+    );
+    assert!(
+        miss["resolution"]
+            .as_str()
+            .unwrap()
+            .contains("ACC: miss on notes"),
+        "the note echo agrees with the stored fields"
+    );
+    let resolved_events = fixture.ok_json(&fixture.main, &["events", "--json"]);
+    let resolved_event = resolved_events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "attention_resolved")
+        .unwrap();
+    assert_eq!(
+        resolved_event["payload"]["checkResult"]["answered"],
+        "notes"
+    );
+    assert_eq!(resolved_event["payload"]["checkResult"]["correct"], false);
+    assert!(
+        !resolved_events.to_string().contains("SECRET_JOURNEY"),
+        "the event ledger never carries the explanation"
+    );
+    // The miss survives a reopen: the answer is recorded once, never retried,
+    // and the reopen clears it with the decision.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            checked_id,
+            "--as",
+            "geoyws",
+            "--note",
+            "Journey continues.",
+            "--json",
+        ],
+    );
+
+    // Path three: the right key records the pass.
+    let pass = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            checked_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check-answered",
+            "fields",
+            "--json",
+        ],
+    );
+    assert_eq!(pass["check"]["answered"], "fields");
+    assert_eq!(pass["check"]["correct"], true);
+    assert!(
+        pass["resolution"].as_str().unwrap().contains("ACC: pass"),
+        "the note echo agrees with the stored fields"
+    );
+    // The stored columns agree with the served projection.
+    let stored: (Option<String>, Option<i64>) = Connection::open(&board)
+        .unwrap()
+        .query_row(
+            "SELECT check_answered,check_correct FROM attention WHERE id=?",
+            [checked_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (Some("fields".into()), Some(1)));
+
+    // A row with no check refuses the flag by name and resolves as before.
+    let plain = raise_carded(&fixture, "An ordinary card.", "claude@driver", &[]);
+    let plain_id = plain["id"].as_str().unwrap();
+    let flagged = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            plain_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check-answered",
+            "fields",
+            "--json",
+        ],
+    );
+    assert!(!flagged.status.success());
+    let flagged_refusal = refusal_object(&flagged);
+    assert!(
+        flagged_refusal.contains("carries no comprehension check"),
+        "{flagged_refusal}"
+    );
+    let plain_resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            plain_id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert_eq!(plain_resolved["status"], "resolved");
+    assert!(plain_resolved.get("check").is_none());
 }
 #[test]
 fn an_attention_raised_without_choices_reads_as_the_default_approve_reject_pair_with_no_recommendation()
@@ -19990,7 +20298,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        31
+        32
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());

@@ -1316,6 +1316,31 @@ fn attention_check(row: &Row<'_>) -> rusqlite::Result<Option<AttentionCheck>> {
         explanation.is_some(),
         about.is_some(),
     ];
+    // The recorded answer is absent or complete, and only ever on a complete
+    // definition; a partial triple or an orphaned one is corruption the v32
+    // triggers refuse on write and this reader refuses on sight rather than
+    // serving half a result (ACC-07).
+    let answered = row.get::<_, Option<String>>("check_answered")?;
+    let correct = row.get::<_, Option<i64>>("check_correct")?;
+    let answered_at = row.get::<_, Option<i64>>("check_answered_at")?;
+    let result_present = [answered.is_some(), correct.is_some(), answered_at.is_some()];
+    if result_present.iter().any(|value| *value) {
+        if !present.iter().all(|value| *value) {
+            return Err(rusqlite::Error::InvalidColumnType(
+                0,
+                "check_question".into(),
+                Type::Null,
+            ));
+        }
+        if let Some(index) = result_present.iter().position(|value| !value) {
+            let column = ["check_answered", "check_correct", "check_answered_at"][index];
+            return Err(rusqlite::Error::InvalidColumnType(
+                0,
+                column.into(),
+                Type::Null,
+            ));
+        }
+    }
     if present.iter().all(|value| !value) {
         return Ok(None);
     }
@@ -1339,6 +1364,9 @@ fn attention_check(row: &Row<'_>) -> rusqlite::Result<Option<AttentionCheck>> {
         answer,
         explanation,
         about: about.expect("presence checked"),
+        answered,
+        correct: correct.map(|value| value != 0),
+        answered_at,
     };
     check.validate_definition().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1388,8 +1416,63 @@ fn attention_row(row: &Row<'_>) -> rusqlite::Result<Attention> {
         tags: Vec::new(),
     })
 }
+/// Serve the check an actor may see: whole once its one answer is recorded,
+/// redacted to question, choices and `about` until then (ACC-13).
 fn redact_attention_check(item: &mut Attention) {
-    item.check = item.check.as_ref().map(AttentionCheck::redacted);
+    item.check = item.check.as_ref().map(|check| {
+        if check.is_answered() {
+            check.clone()
+        } else {
+            check.redacted()
+        }
+    });
+}
+
+/// Record the one answer a check accepts, inside the caller's open write
+/// transaction (ACC-07/ACC-08). The key must name a declared choice; the
+/// write is the all-or-none triple the v32 triggers police. Returns whether
+/// the submitted key is the definition's answer, for the human echo.
+fn record_check_answer(
+    transaction: &Connection,
+    id: &str,
+    check: &AttentionCheck,
+    key: &str,
+    now: i64,
+) -> Result<bool> {
+    if !check.choices.iter().any(|choice| choice.key == key) {
+        bail!(
+            "attention: --check-answered {key} names no --check-choice; declared keys are {}",
+            check
+                .choices
+                .iter()
+                .map(|choice| choice.key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let correct = check.answer.as_deref() == Some(key);
+    transaction.execute(
+        "UPDATE attention SET check_answered=?,check_correct=?,check_answered_at=? WHERE id=?",
+        params![key, i64::from(correct), now, id],
+    )?;
+    Ok(correct)
+}
+
+/// The result triple as the event ledger records it, or null where no answer
+/// stands. Never carries the explanation or the definition's own answer key
+/// beyond what a recorded answer already implies.
+fn check_result_json(check: Option<&AttentionCheck>) -> Value {
+    let Some(check) = check else {
+        return Value::Null;
+    };
+    let Some(answered) = check.answered.as_deref() else {
+        return Value::Null;
+    };
+    json!({
+        "answered": answered,
+        "correct": check.correct,
+        "answeredAt": check.answered_at,
+    })
 }
 
 fn handoff_row(row: &Row<'_>) -> rusqlite::Result<Handoff> {
@@ -6560,7 +6643,7 @@ impl Store {
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         }
         for row in &mut rows {
-            row.check = row.check.as_ref().map(AttentionCheck::redacted);
+            redact_attention_check(row);
         }
         Ok(rows)
     }
@@ -6732,6 +6815,21 @@ impl Store {
                 existing.raised_by
             );
         }
+        // ACC-05, George's lock on a-db9de88b: once the one answer is
+        // recorded the definition is stable, even for its raiser, until the
+        // row resolves; a reopen clears the recorded answer and restores
+        // raiser update.
+        if authored_check
+            && existing
+                .check
+                .as_ref()
+                .is_some_and(AttentionCheck::is_answered)
+        {
+            bail!(
+                "attention {id} check is locked while its one answer is recorded — resolve the \
+                 row and reopen it to clear the recorded answer and restore raiser update"
+            );
+        }
         let check = check.map(AttentionCheckInput::parse).transpose()?.flatten();
         // The column, not the served row: a row that authored no choices is
         // served as the default pair, and merging that pair in would turn a
@@ -6847,8 +6945,9 @@ impl Store {
         id: &str,
         actor: &str,
         answer: &AttentionAnswer<'_>,
+        check_answered: Option<&str>,
     ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(id, actor, actor, answer, false)
+        self.resolve_attention_with_authorization(id, actor, actor, answer, check_answered, false)
     }
 
     /// Settle an item from the trusted web edge.
@@ -6860,8 +6959,9 @@ impl Store {
         id: &str,
         actor: &str,
         answer: &AttentionAnswer<'_>,
+        check_answered: Option<&str>,
     ) -> Result<Attention> {
-        self.resolve_attention_with_authorization(id, actor, actor, answer, true)
+        self.resolve_attention_with_authorization(id, actor, actor, answer, check_answered, true)
     }
 
     fn resolve_attention_with_authorization(
@@ -6870,6 +6970,7 @@ impl Store {
         authorization_actor: &str,
         audit_actor: &str,
         answer: &AttentionAnswer<'_>,
+        check_answered: Option<&str>,
         trusted_edge: bool,
     ) -> Result<Attention> {
         let authorization_actor = nonempty(authorization_actor, "actor")?.to_owned();
@@ -6902,11 +7003,63 @@ impl Store {
             );
         }
         let now = now_ms();
+        // ACC-06: a checked row settles only through its check. The gate runs
+        // before the decision is composed, so a refusal leaves the row, its
+        // result columns and the event history untouched.
+        let mut check_echo = None;
+        let mut recorded = None;
+        match existing.check.as_ref() {
+            None => {
+                if let Some(key) = check_answered {
+                    bail!(
+                        "attention {id} carries no comprehension check; --check-answered {key} \
+                         applies only to a row that carries one"
+                    );
+                }
+            }
+            Some(check) if check.is_answered() => {
+                if let Some(key) = check_answered {
+                    bail!(
+                        "attention {id} already records its check answer {}; a check accepts \
+                         exactly one answer, so --check-answered {key} cannot be supplied again",
+                        check.answered.as_deref().unwrap_or("key")
+                    );
+                }
+            }
+            Some(check) => {
+                let Some(key) = check_answered else {
+                    bail!(
+                        "attention {id} carries a comprehension check that must be answered \
+                         before it resolves: \"{}\" — answer it with --check-answered KEY \
+                         (declared keys: {})",
+                        check.question,
+                        check
+                            .choices
+                            .iter()
+                            .map(|choice| choice.key.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                };
+                let correct = record_check_answer(&transaction, id, check, key, now)?;
+                recorded = Some((key, correct));
+                check_echo = Some(if correct {
+                    "ACC: pass".to_owned()
+                } else {
+                    format!("ACC: miss on {key}")
+                });
+            }
+        }
         // The composer lives here and nowhere else, so no caller can produce
         // a different trail and `resolution` is derived rather than passed
         // (ADR-042 §3). `existing.choices` is the served card, so a row that
         // authored none is answered through the default pair.
-        let (decision, resolution) = answer.decide(id, &existing.choices, &audit_actor, now)?;
+        let (decision, mut resolution) = answer.decide(id, &existing.choices, &audit_actor, now)?;
+        // The human line that agrees with the stored fields (ACC-07).
+        if let Some(echo) = check_echo {
+            resolution.push('\n');
+            resolution.push_str(&echo);
+        }
         let decision_json = serde_json::to_string(&decision)?;
         transaction.execute(
             "UPDATE attention SET status='resolved',resolved_at=?,resolved_by=?,resolution=?,\
@@ -6939,6 +7092,14 @@ impl Store {
                 "reopenedAt": existing.reopened_at,
                 "reopenedBy": existing.reopened_by,
                 "reopenNote": existing.reopen_note,
+                "checkResult": match recorded {
+                    Some((key, correct)) => json!({
+                        "answered": key,
+                        "correct": correct,
+                        "answeredAt": now,
+                    }),
+                    None => check_result_json(existing.check.as_ref()),
+                },
             }),
         )?;
         let result =
@@ -6978,10 +7139,14 @@ impl Store {
         // contract is what is true now, and an open item has no decision.
         // The event below is the hash-chained copy, so nothing is lost
         // (ADR-042 §3). `resolved_at`, `resolved_by` and `resolution` stay
-        // where BOARD_V17's CHECK requires them.
+        // where BOARD_V17's CHECK requires them. The check result leaves with
+        // it (ACC-05): a reopened row is unanswered again, its choices lock
+        // behind a new answer, and the definition may not change while any
+        // recorded answer stands.
         transaction.execute(
             "UPDATE attention SET status='open',reopened_at=?,reopened_by=?,reopen_note=?,\
-             decision=NULL WHERE id=?",
+             decision=NULL,check_answered=NULL,check_correct=NULL,check_answered_at=NULL \
+             WHERE id=?",
             params![now, actor, note, id],
         )?;
         // `tags` as at the reopen, on the same key and for the same reason
@@ -7001,6 +7166,7 @@ impl Store {
                 "resolution": existing.resolution,
                 "decision": existing.decision,
                 "note": note,
+                "checkResult": check_result_json(existing.check.as_ref()),
             }),
         )?;
         let result =
@@ -9890,7 +10056,12 @@ mod tests {
             "attention update",
         );
         assert_denied(
-            store.resolve_attention("a-x", "actor", &AttentionAnswer::custom("other", "done")),
+            store.resolve_attention(
+                "a-x",
+                "actor",
+                &AttentionAnswer::custom("other", "done"),
+                None,
+            ),
             "attention resolve",
         );
         assert_denied(
@@ -10210,6 +10381,7 @@ mod tests {
                 &visible_resolved,
                 "seed",
                 &AttentionAnswer::custom("other", "settled"),
+                None,
             )
             .expect("resolve the visible decision");
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -10217,6 +10389,7 @@ mod tests {
                 &secret_resolved,
                 "seed",
                 &AttentionAnswer::custom("other", "settled"),
+                None,
             )
             .expect("resolve the secret decision");
         }
@@ -10452,8 +10625,13 @@ mod tests {
             visible = raise("the visible question", "visible");
             secret = raise("the secret question", "secret");
             for id in [&visible, &secret] {
-                seed.resolve_attention(id, "seed", &AttentionAnswer::custom("other", "settled"))
-                    .expect("resolve");
+                seed.resolve_attention(
+                    id,
+                    "seed",
+                    &AttentionAnswer::custom("other", "settled"),
+                    None,
+                )
+                .expect("resolve");
             }
             // The retag the fix has to survive: a full-authority caller
             // reopens the settled secret row and moves it onto `visible`,
@@ -11099,6 +11277,7 @@ mod tests {
                 &web_attention.id,
                 "ifca-sso",
                 &AttentionAnswer::custom("other", "done"),
+                None,
             )
             .expect("trusted edge resolution");
         assert_eq!(resolved.resolved_by.as_deref(), Some("ifca-sso"));
@@ -11114,6 +11293,7 @@ mod tests {
                 &cli_attention.id,
                 "ifca-sso",
                 &AttentionAnswer::custom("other", "done"),
+                None,
             )
             .expect("ordinary cli resolution");
         assert_eq!(cli_resolved.resolved_by.as_deref(), Some("ifca-sso"));
@@ -11129,6 +11309,7 @@ mod tests {
                 &forbidden_attention.id,
                 "ifca-sso",
                 &AttentionAnswer::custom("other", "not allowed"),
+                None,
             )
             .expect_err("CLI resolve must still reject a non-geoyws, non-raiser actor")
             .to_string();
@@ -16059,6 +16240,125 @@ mod tests {
                 .to_string()
                 .contains("check_about")
         );
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn answered_check_locks_definition_and_a_later_resolve_reuses_it() {
+        let path = board_db_path("native-check-answer");
+        let parent = path.parent().unwrap().to_path_buf();
+        let mut store = Store::open(&path).unwrap();
+        store.initialize("answers", "seed").unwrap();
+        let original = native_check(
+            "Where is the one check answer recorded?",
+            "store",
+            "rust/store.rs records the answer inside the caller's write transaction.",
+        );
+        let raised = store
+            .raise_attention(
+                "A decision needs comprehension.",
+                "decision",
+                "claude@driver",
+                None,
+                0,
+                &[],
+                &DecisionCard::default(),
+                Some(&native_check_input(&original)),
+            )
+            .unwrap();
+        // The web card's write path records the one answer while the row is
+        // open; the projection invariant says the Store column set is the
+        // only shape, so seeding it directly is the same state.
+        store
+            .connection
+            .execute(
+                "UPDATE attention SET check_answered='store',check_correct=1,check_answered_at=99 \
+                 WHERE id=?",
+                [&raised.id],
+            )
+            .unwrap();
+
+        // ACC-05: the definition is locked while the answer stands, even for
+        // the raiser.
+        let locked = store
+            .update_attention(
+                &raised.id,
+                None,
+                None,
+                None,
+                Some(&native_check_input(&native_check(
+                    "Rewritten while answered?",
+                    "store",
+                    "rust/store.rs must refuse this.",
+                ))),
+                false,
+                "claude@driver",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(locked.contains("check is locked"), "{locked}");
+
+        // ACC-08: no second answer, from anyone.
+        let second = store
+            .resolve_attention(
+                &raised.id,
+                OPERATOR_ACTOR,
+                &AttentionAnswer::custom("other", "settled"),
+                Some("client"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(second.contains("exactly one answer"), "{second}");
+
+        // ACC-06: the recorded answer satisfies the gate; nothing is asked
+        // twice and the stored result is preserved verbatim.
+        let resolved = store
+            .resolve_attention(
+                &raised.id,
+                OPERATOR_ACTOR,
+                &AttentionAnswer::custom("other", "settled"),
+                None,
+            )
+            .unwrap();
+        let check = resolved.check.as_ref().unwrap();
+        assert_eq!(check.answered.as_deref(), Some("store"));
+        assert_eq!(check.correct, Some(true));
+        assert_eq!(check.answered_at, Some(99));
+        // Post-answer reads reveal the definition's own answer.
+        assert_eq!(check.answer.as_deref(), Some("store"));
+        assert!(check.explanation.is_some());
+        assert!(
+            !resolved.resolution.as_deref().unwrap().contains("ACC:"),
+            "an answer recorded earlier carries no echo on a later resolve"
+        );
+
+        // ACC-05 reopen: the result clears with the decision, the read
+        // redacts again, and raiser update is restored.
+        let reopened = store
+            .reopen_attention(&raised.id, OPERATOR_ACTOR, "clear the answer")
+            .unwrap();
+        let redacted = reopened.check.as_ref().unwrap();
+        assert!(redacted.answered.is_none());
+        assert!(redacted.correct.is_none());
+        assert!(redacted.answered_at.is_none());
+        assert!(redacted.answer.is_none());
+        assert!(redacted.explanation.is_none());
+        store
+            .update_attention(
+                &raised.id,
+                None,
+                None,
+                None,
+                Some(&native_check_input(&native_check(
+                    "Rewritten after reopen?",
+                    "store",
+                    "rust/store.rs owns the write invariant.",
+                ))),
+                false,
+                "claude@driver",
+            )
+            .unwrap();
         drop(store);
         fs::remove_dir_all(parent).unwrap();
     }
