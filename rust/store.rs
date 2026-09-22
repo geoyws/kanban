@@ -16653,4 +16653,97 @@ mod tests {
         drop(store);
         fs::remove_dir_all(parent).unwrap();
     }
+
+    #[test]
+    fn attention_check_update_is_raiser_only_across_the_three_actors() {
+        let path = board_db_path("native-check-raiser-only");
+        let parent = path.parent().unwrap().to_path_buf();
+        let mut store = Store::open(&path).unwrap();
+        store.initialize("raiser-only", "seed").unwrap();
+        let original = native_check(
+            "Where is the check definition validated?",
+            "store",
+            "rust/store.rs validates the complete definition before the write.",
+        );
+        let raised = store
+            .raise_attention(
+                "A decision needs comprehension.",
+                "decision",
+                "claude@driver",
+                None,
+                0,
+                &[],
+                &DecisionCard::default(),
+                Some(&native_check_input(&original)),
+            )
+            .unwrap();
+        fn stored_check(store: &Store, id: &str) -> Option<AttentionCheck> {
+            store
+                .connection
+                .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+                .unwrap()
+                .check
+        }
+        let events_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        // The raiser rewrites its own definition.
+        let replacement = native_check(
+            "Which layer owns the definition?",
+            "store",
+            "rust/store.rs owns validation and persistence.",
+        );
+        store
+            .update_attention(
+                &raised.id,
+                None,
+                None,
+                None,
+                Some(&native_check_input(&replacement)),
+                false,
+                "claude@driver",
+            )
+            .unwrap();
+        assert_eq!(stored_check(&store, &raised.id), Some(replacement.clone()));
+        // Another lane and the operator are refused naming the raiser, and
+        // neither refusal writes.
+        for actor in ["claude@driver-2", OPERATOR_ACTOR] {
+            let error = store
+                .update_attention(
+                    &raised.id,
+                    None,
+                    None,
+                    None,
+                    Some(&native_check_input(&native_check(
+                        "Rewritten by another actor?",
+                        "store",
+                        "rust/store.rs must refuse this.",
+                    ))),
+                    false,
+                    actor,
+                )
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "attention {} check may be changed only by its raiser claude@driver; actor {actor} is not the raiser",
+                    raised.id
+                )
+            );
+            assert_eq!(stored_check(&store, &raised.id), Some(replacement.clone()));
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            events_before + 1,
+            "only the raiser rewrite wrote an event"
+        );
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
+    }
 }

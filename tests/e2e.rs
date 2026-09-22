@@ -18905,6 +18905,75 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
         "malformed non-raiser input changed the row"
     );
 
+    // ACC-05: another lane is refused the same way, naming the raiser, and
+    // writes nothing either.
+    let other_lane = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "update",
+            id,
+            "--as",
+            "somebody@driver-2",
+            "--check",
+            "malformed and incomplete",
+            "--json",
+        ],
+    );
+    assert!(!other_lane.status.success());
+    assert!(refusal_object(&other_lane).contains("raiser claude@driver"));
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        events_before,
+        "another lane's check input wrote an event"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]),
+        before,
+        "another lane's check input changed the row"
+    );
+
+    // ACC-05: resolve takes only --check-answered, never a check definition.
+    // A definition flag on resolve is refused before any write.
+    let resolve_definition = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check",
+            "Which layer owns the definition?",
+            "--json",
+        ],
+    );
+    assert!(!resolve_definition.status.success());
+    assert!(
+        refusal_object(&resolve_definition).contains("unknown flag --check"),
+        "resolve must not accept a check definition"
+    );
+    assert_eq!(
+        fixture
+            .ok_json(&fixture.main, &["events", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        events_before,
+        "a resolve carrying a definition wrote an event"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["attention", "show", id, "--json"]),
+        before,
+        "a resolve carrying a definition changed the row"
+    );
+
     let rewritten = fixture.ok_json(
         &fixture.main,
         &[
