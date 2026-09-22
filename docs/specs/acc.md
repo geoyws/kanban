@@ -2,13 +2,17 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `ACC`. Requirement IDs are `ACC-01` .. `ACC-17`, stable across wording
+- **Slice ID:** `ACC`. Requirement IDs are `ACC-01` .. `ACC-19`, stable across wording
   refinements; numbering is by creation and grouping is by topic.
 - **Baseline:** `2026-09-21` at commit `04a66b1` on branch
   `docs/t-6a3dd1a6-acc-spec`.
 - **Status:** `SPEC-READY` on 2026-09-21. An independent `/quality spec` review found five
   defects; all were closed, and George resolved its sole product blocker as **lock** on decision
   card `a-db9de88b`. Specification readiness authorises neither implementation, rollout nor release.
+- **Status (delta 2026-09-23):** `SPEC-READY` for ACC-18/ACC-19. An independent reviewer
+  verified the delta against the SDD §1 exit criteria (findings F1–F4 raised and closed, §8
+  single-row-per-requirement restored). Specification readiness authorises neither
+  implementation, rollout nor release.
 - **Owner (product scope):** George.
 - **Decider (wording of this document):** George.
 - **Sources:**
@@ -52,7 +56,8 @@ records the answer as data and never exposes its answer key to the browser in ad
 **In scope.** The native check block on `attention raise` and `attention update`;
 `attention resolve --check-answered`; its Store invariants and persisted result; list, show,
 MCP and digest projections; `POST /attention/{project}/{id}/check`; the mounted decision card;
-legacy `ACC:` body-block migration; and the `/kb` and `/kb-att` native-field cutover.
+legacy `ACC:` body-block migration; the `/kb` and `/kb-att` native-field cutover;
+`attention list --check-report` and one aggregate summary block on `/decided`.
 
 **Boundaries.** Existing board/tag tenancy, actor authentication, attention status transitions,
 decision outcomes, choice key/label bounds, card hotkeys and Undo remain owned by their current
@@ -63,13 +68,15 @@ make unrelated slices retrospective specifications. Implementation may begin onl
 specification reaches `SPEC-READY`; release and deployment remain separate later gates.
 
 **Non-goals.**
-
 - ACC does not diagnose an incident, test recall of arbitrary row prose, ask for row status, next
   action, owner or decision choice, merely restate an answer, recommend a decision, select an
   outcome or replace the decision card. These describe the intended reusable-system teaching
   purpose; only ACC-02's subject shapes and ACC-04's short marker list are Store refusals.
 - ACC does not define a performance, latency, availability or retention target.
 - ACC does not duplicate existing board/tag authorization rules.
+- The miss-rate report is never a leaderboard and never scores raisers: its groups key on
+  `about` alone and carry no actor, raiser, answer-key, explanation or choice-label column
+  (ACC-18, ACC-19).
 
 ## 3. Requirements
 
@@ -238,6 +245,63 @@ fabricating an empty or partial block. An older client that sends no check input
 an older client cannot bypass a check because ACC-06 refuses checked-row resolution without the
 answer.
 
+### Miss-rate report
+
+**ACC-18 — Report resolved check results by subject from the CLI.**
+Strength: MUST · Layer: process · Source: `t-b6bfaf40` requesting body; the operator aggregate
+read in §2 Users / actors.
+`attention list --check-report [--all] [--all-boards] [--limit N] [--json]` (spelled `kb att
+list --check-report …` through the skill alias; `att` aliases `attention` at
+`rust/lib.rs:304`) reads only resolved rows that carry a native check with a recorded answer —
+the `answered`/`correct` result fields from ACC-07 (`rust/model.rs:1043`-`:1049`) — and groups
+them by `about`. Rows without a check and rows without a recorded answer contribute nothing.
+Each group carries `about`, the answered count, the correct (pass) count, the missed count and
+the miss rate (missed ÷ answered, whole-percent integer truncated toward zero); groups sort worst first — miss rate
+descending, then missed descending, then `about` ascending. The group key is `about` alone:
+no raiser, actor, answer-key, explanation or choice-label column exists in either shape. The
+table prints the five columns in order `about`, `answered`, `correct`, `missed`, `miss-rate`;
+`--json` returns an array of `{about, answered, correct, missed, missRate}` objects and nothing
+else. `--status` beside `--check-report` is refused naming the conflict, because the report
+fixes status to resolved; the remaining row filters (`--kind`, `--task`, `--tag`, `--lane`
+from the `attention list` flag table at `rust/lib.rs:1324`-`:1332`) still narrow the resolved
+set, and the row-shape flags (`--fields`, `--no-body`) are refused beside `--check-report`
+naming the report's fixed columns. The listing is capped like every listing (ADR-037): the
+default bound is 100 groups through the same `bounded_page` helper `attention list` uses
+(`rust/lib.rs:7286`), fetching one group past the bound; more groups than the default with no
+`--limit` refuses with the listing sentence — `found more than 100 check subjects and no
+--limit was given — a page cut at the default would read as the whole; pass --limit N, above
+100 to see more or exactly 100 to take the first 100 knowingly` (template at
+`rust/lib.rs:2241`-`:2245`) — and an explicit `--limit` returns the first N groups in
+worst-first order silently with exit zero (`rust/lib.rs:2234`-`:2235`). A `--limit` below 0
+or above the 1000000 ceiling is refused by the existing limit law (`rust/lib.rs:2198`,
+`rust/lib.rs:2203`-`:2207`). `--all` keeps its `attention list` meaning of including archived
+rows (`rust/lib.rs:7294`); beside `--all-boards` it additionally includes retired boards, as
+the search listing does. `--all-boards` fans out through the registry exactly as the search
+listing does: a read-only registry open, active boards unless `--all` (`rust/lib.rs:3780`
+-`:3787`), board selectors refused beside it (`rust/lib.rs:3711`-`:3714`), and unreadable or
+missing boards reported rather than silently skipped (`rust/lib.rs:3794`-`:3800`). A board
+with no resolved checked rows prints the header with zero groups (an empty array under
+`--json`) and exits zero.
+
+**ACC-19 — Summarize resolved check results in one block on /decided.**
+Strength: MUST · Layer: chrome · Source: `t-b6bfaf40` requesting body.
+The `/decided` page carries exactly one compact block above the decision rows, aggregated by
+the same by-`about` grouping as ACC-18 from the page's own already-read items — the merged
+`DecidedListing` rows from `projection::decided()` (`rust/projection.rs:605`-`:623`), which
+are `Store::recent_resolved_attention` rows (`rust/store.rs:6626`) cut to `DECIDED_ROWS`
+(`rust/serve.rs:82`) on the `["decided"]` route (`rust/serve.rs:514`-`:515`). No new page, no
+new route and no new Store read exist. The block's sentence is byte-exact in shape: `Checks:
+N answered, M missed — worst: <about> (x/y)` where N is the answered resolved checks among
+the page's items, M the missed subset, and `<about> (x/y)` the worst group under ACC-18's
+order with its missed (x) and answered (y) counts. The worst `about` links to that subject's
+rows on the page through their `#d-<id>` anchors (row headings carry `id="d-<id>"` at
+`web/src/pages/decided.tsx:164`); the block root carries `data-testid="decided-check-summary"`
+and the sentence node carries `data-testid="decided-check-summary-text"`. When the page holds
+no resolved checked rows the block is omitted and the existing empty page
+(`data-testid="decided-empty"` at `web/src/pages/decided.tsx:139`) reads unchanged. The block
+carries post-answer aggregate data only — `about` strings and counts; it never carries answer
+keys, explanations, choice labels or raiser identity, and redaction otherwise follows ACC-13.
+
 ## 4. Acceptance examples
 
 ### A1 — valid full block (`ACC-01`, `ACC-02`, `ACC-03`, `ACC-05`)
@@ -347,11 +411,42 @@ resolved checked row, *when* its raiser tries the same edit, *then* the immutabl
 returned; *when* the row is reopened, *then* current decision/check result clear, decision choices
 lock behind a new answer and raiser update is restored.
 
+### A17 — miss-rate report from the CLI (`ACC-18`)
+
+*Given* a board holding resolved checks across three subjects — `src/store.rs` with 5 answered
+and 4 missed, `@@hax` with 4 answered and 1 missed, `FAST_FLAG` with 3 answered and none
+missed — *when* `kb att list --check-report` runs, *then* three groups print worst first with
+miss rates 80, 25 and 0, and `--json` returns the same three objects with exactly the keys
+`about`, `answered`, `correct`, `missed` and `missRate` and no raiser, actor, answer-key,
+explanation or choice-label field. *When* `--limit 2` is passed, *then* only the first two
+groups print with exit zero; *when* `--limit -1` or `--limit 1000001` is passed, *then* the
+existing limit refusal is returned; *when* more than 100 subjects exist and no `--limit` is
+given, *then* the listing refuses naming `--limit`. *Given* a board with no resolved checked
+rows, *when* the report runs, *then* the table prints its header with zero groups (an empty
+array under `--json`) and exits zero.
+*Given* a subject with 6 answered and 1 missed, *when* the report runs, *then* its miss rate
+prints 16, pinning truncation toward zero. *Given* the A17 board, *when* `--status open` is
+passed beside `--check-report`, *then* the run is refused naming the conflict; *when* `--kind`
+narrows the resolved set, *then* only matching rows aggregate; *when* `--fields` or `--no-body`
+is passed beside `--check-report`, *then* the run is refused naming the report's fixed columns.
+
+### A18 — miss-rate block on /decided (`ACC-19`)
+
+*Given* the A17 board, whose twelve answered resolved checks (five missed) all fit the page's
+newest-20 cut, *when* real Chrome loads `/decided`, *then* exactly one block with
+`data-testid="decided-check-summary"` reads `Checks: 12 answered, 5 missed — worst:
+src/store.rs (4/5)`, the worst subject links to its `#d-<id>` rows, and no answer key,
+explanation, choice label or raiser name occurs in the block. *Given* a board with no
+resolved checked rows, *when* `/decided` loads, *then* the block is omitted while the
+existing empty page reads unchanged.
+
 ## 5. Contracts and data
 
-- **Interface version or schema:** CLI adds the five definition inputs and
-  `attention resolve --check-answered KEY`; MCP exposes their typed equivalents; HTTP adds
-  `POST /attention/{project}/{id}/check` to the repository's pinned OpenAPI document. OpenAPI is
+- **Interface version or schema:** CLI adds the five definition inputs,
+  `attention resolve --check-answered KEY` and `attention list --check-report [--all]
+  [--all-boards] [--limit N] [--json]`; MCP exposes their typed equivalents; HTTP adds
+  `POST /attention/{project}/{id}/check` to the repository's pinned OpenAPI document. `/decided`
+  gains one summary block on its existing route with no new endpoint. OpenAPI is
   applicable because this is an HTTP operation; it is not a substitute for CLI/MCP schemas.
 - **Data invariants:** a definition is absent or complete; it contains question, two through four
   choices, one declared answer, explanation and `about`; result data contains
@@ -402,6 +497,10 @@ lock behind a new answer and raiser update is restored.
 
 None.
 
+**Non-goal, not a question.** A leaderboard and per-raiser scoring are excluded by §2 and
+carried by ACC-18 and ACC-19: the report groups by `about` alone and has no actor or raiser
+dimension to score. Nothing here asks who is behind, so nothing blocks on it.
+
 **Resolved question history.** OQ-1 asked whether the raiser may rewrite an answered check while
 the row remains open. George chose **lock** (the recommended choice) on decision card
 `a-db9de88b` for `t-6a3dd1a6` on 2026-09-21: refuse the edit and preserve the definition,
@@ -437,6 +536,8 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
+| `ACC-18` | MUST | process | `PLANNED` | planned: `att_list_check_report_groups_worst_first_with_adr037_caps` — A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; no e2e coverage |
+| `ACC-19` | MUST | chrome | `PLANNED` | planned: `decided_page_carries_one_check_summary_block` — A18 sentence shape, row links, test ids and omission on empty; no e2e coverage |
 
 ## 9. Change log
 
@@ -465,3 +566,12 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
   answer, explanation and result fields. Requirement wording is unchanged; only §8 trace
   rows gained evidence. The route joined ADR-016's write allowlist as its one later
   addition, documented in the pinned OpenAPI.
+
+- 2026-09-23 — ACC-18 (CLI miss-rate report) and ACC-19 (`/decided` summary block) appended
+  at the end of the creation sequence for `t-b6bfaf40`, the ADR-047 §6 edited-slice path for
+  specified-before-implementation: read-only aggregates over the resolved check result fields,
+  no new tables and no wording change to ACC-01..17. Leaderboard and per-raiser scoring are
+  recorded as non-goals in §2 and §7.
+Review fixes the same day: miss rate pinned to truncation toward zero with an A17 1/6 case;
+A17 extended to the status-conflict, row-filter and shape-flag refusals; §2 teaching-purpose
+and no-target bullets restored verbatim beside the leaderboard bullet.
