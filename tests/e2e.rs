@@ -56899,3 +56899,560 @@ fn generated_surface_publishes_complaint_without_new_tool() {
         ]
     );
 }
+
+/// Raise one checked row and resolve it with the given check key, returning
+/// its id. The definition texts avoid every agreed diagnosis marker so the
+/// rows settle; the explanation carries a sentinel the report must never
+/// print.
+fn raise_resolved_check(
+    fixture: &Fixture,
+    cwd: &std::path::Path,
+    body: &str,
+    about: &str,
+    kind: Option<&str>,
+    answered_key: &str,
+) -> String {
+    let mut raise = vec![
+        "attention".to_owned(),
+        "raise".to_owned(),
+        body.to_owned(),
+        "--as".to_owned(),
+        "claude@driver".to_owned(),
+    ];
+    if let Some(kind) = kind {
+        raise.push("--kind".to_owned());
+        raise.push(kind.to_owned());
+    }
+    raise.extend(
+        [
+            "--check",
+            "Where does the one check answer live after a resolve?",
+            "--check-choice",
+            "alpha=Alpha option",
+            "--check-choice",
+            "beta=Beta option",
+            "--check-answer",
+            "alpha",
+            "--check-explain",
+            "REPORT_SENTINEL rust/store.rs records answered, correct and answeredAt as columns.",
+            "--check-about",
+            about,
+            "--json",
+        ]
+        .iter()
+        .map(|flag| flag.to_string()),
+    );
+    let raised = fixture.ok_json(cwd, &raise.iter().map(String::as_str).collect::<Vec<_>>());
+    let id = raised["id"].as_str().unwrap().to_owned();
+    fixture.ok_json(
+        cwd,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--check-answered",
+            answered_key,
+            "--json",
+        ],
+    );
+    id
+}
+
+#[test]
+fn att_list_check_report_groups_worst_first_with_adr037_caps() {
+    let fixture = Fixture::new("check-report");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ACCRPT", "--json"]);
+    // (about, resolved rows, correct answers, kind).
+    for (about, total, correct, kind) in [
+        ("src/store.rs", 5, 1, None),
+        ("@@hax", 4, 3, None),
+        ("FAST_FLAG", 3, 3, Some("risk")),
+        ("src/trunc.rs", 6, 5, None),
+    ] {
+        for index in 0..total {
+            raise_resolved_check(
+                &fixture,
+                &fixture.main,
+                &format!("Comprehension for {about} row {index}."),
+                about,
+                kind,
+                if index < correct { "alpha" } else { "beta" },
+            );
+        }
+    }
+    // An open checked row and resolved/open rows with no check contribute
+    // nothing to the report.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Still waiting on its answer.",
+            "--as",
+            "claude@driver",
+            "--check",
+            "Where does the one check answer live after a resolve?",
+            "--check-choice",
+            "alpha=Alpha option",
+            "--check-choice",
+            "beta=Beta option",
+            "--check-answer",
+            "alpha",
+            "--check-explain",
+            "REPORT_SENTINEL rust/store.rs records the open row.",
+            "--check-about",
+            "src/open.rs",
+            "--json",
+        ],
+    );
+    let plain = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "No check rides along.",
+            "--as",
+            "claude@driver",
+            "--json",
+        ],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            plain["id"].as_str().unwrap(),
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+
+    // The table prints the five fixed columns worst first: 80, 25, 16, 0.
+    let table = fixture.run(&fixture.main, &["attention", "list", "--check-report"]);
+    assert!(table.status.success());
+    let stdout = String::from_utf8_lossy(&table.stdout);
+    assert_eq!(
+        stdout.as_ref(),
+        "about answered correct missed miss-rate\n\
+         src/store.rs 5 1 4 80\n\
+         @@hax 4 3 1 25\n\
+         src/trunc.rs 6 5 1 16\n\
+         FAST_FLAG 3 3 0 0\n",
+        "the report table: {stdout}"
+    );
+    assert!(
+        !stdout.contains("REPORT_SENTINEL"),
+        "the table carries aggregate data only: {stdout}"
+    );
+
+    // `--json` returns the same groups with exactly the five keys — no
+    // raiser, actor, answer-key, explanation or choice-label field.
+    let report = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--check-report", "--json"],
+    );
+    let groups = report.as_array().expect("the report groups");
+    assert_eq!(
+        report,
+        json!([
+            {"about": "src/store.rs", "answered": 5, "correct": 1, "missed": 4, "missRate": 80},
+            {"about": "@@hax", "answered": 4, "correct": 3, "missed": 1, "missRate": 25},
+            {"about": "src/trunc.rs", "answered": 6, "correct": 5, "missed": 1, "missRate": 16},
+            {"about": "FAST_FLAG", "answered": 3, "correct": 3, "missed": 0, "missRate": 0},
+        ])
+    );
+    for group in groups {
+        let mut keys = group
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["about", "answered", "correct", "missRate", "missed"]);
+    }
+    assert!(
+        !report.to_string().contains("REPORT_SENTINEL"),
+        "the JSON report carries aggregate data only"
+    );
+
+    // `--limit 2` keeps the first two groups in worst-first order, exit zero.
+    let two = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--limit",
+            "2",
+            "--json",
+        ],
+    );
+    assert_eq!(two.as_array().unwrap().len(), 2);
+    assert_eq!(two[0]["about"], "src/store.rs");
+    assert_eq!(two[1]["about"], "@@hax");
+
+    // The existing limit law refuses a negative or over-ceiling `--limit`.
+    for limit in ["-1", "1000001"] {
+        let refused = fixture.run(
+            &fixture.main,
+            &[
+                "attention",
+                "list",
+                "--check-report",
+                "--limit",
+                limit,
+                "--json",
+            ],
+        );
+        assert!(
+            refusal_object(&refused).contains("--limit"),
+            "limit {limit} must meet the existing limit refusal"
+        );
+    }
+
+    // `--status` is refused naming the conflict: the report fixes status to
+    // resolved. `--kind` still narrows the resolved set.
+    let status = refusal_object(&fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--status",
+            "open",
+            "--json",
+        ],
+    ));
+    assert!(status.contains("--status"), "{status}");
+    assert!(status.contains("--check-report"), "{status}");
+    let risk = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--kind",
+            "risk",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        risk,
+        json!([
+            {"about": "FAST_FLAG", "answered": 3, "correct": 3, "missed": 0, "missRate": 0},
+        ])
+    );
+
+    // The row-shape flags are refused naming the report's fixed columns.
+    for shape in [["--fields", "id"], ["--no-body", ""]] {
+        let mut args = vec!["attention", "list", "--check-report", shape[0]];
+        if !shape[1].is_empty() {
+            args.push(shape[1]);
+        }
+        args.push("--json");
+        let refused = refusal_object(&fixture.run(&fixture.main, &args));
+        assert!(refused.contains(shape[0]), "{refused}");
+        assert!(
+            refused.contains("about, answered, correct, missed, miss-rate"),
+            "{refused}"
+        );
+    }
+
+    // Past 100 subjects with no `--limit`, the listing refuses naming it
+    // (ADR-037); an explicit `--limit` takes the first N worst-first,
+    // silently with exit zero.
+    for index in 0..101 {
+        raise_resolved_check(
+            &fixture,
+            &fixture.main,
+            &format!("Bench comprehension row {index}."),
+            &format!("bench/{index}.rs"),
+            None,
+            "beta",
+        );
+    }
+    let capped = fixture.run(&fixture.main, &["attention", "list", "--check-report"]);
+    assert!(!capped.status.success());
+    let message = String::from_utf8_lossy(&capped.stderr).into_owned();
+    assert!(
+        message.contains("found more than 100 check subjects"),
+        "{message}"
+    );
+    assert!(message.contains("--limit"), "{message}");
+    let all = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--limit",
+            "200",
+            "--json",
+        ],
+    );
+    assert_eq!(all.as_array().unwrap().len(), 105);
+    let hundred = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--limit",
+            "100",
+            "--json",
+        ],
+    );
+    assert_eq!(hundred.as_array().unwrap().len(), 100);
+
+    // A board with no resolved checked rows prints its header with zero
+    // groups — an empty array under `--json` — and exits zero.
+    let vacant = Fixture::new("check-report-empty");
+    vacant.ok_json(&vacant.main, &["init", "--name", "VACANT", "--json"]);
+    let header = vacant.run(&vacant.main, &["attention", "list", "--check-report"]);
+    assert!(header.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&header.stdout).as_ref(),
+        "about answered correct missed miss-rate\n"
+    );
+    assert_eq!(
+        vacant.ok_json(
+            &vacant.main,
+            &["attention", "list", "--check-report", "--json"]
+        ),
+        json!([])
+    );
+}
+
+#[test]
+fn decided_page_carries_one_check_summary_block() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("decided-check-summary");
+    fixture.ok_json(&fixture.main, &["init", "--name", "DECIDED", "--json"]);
+    // Twelve answered resolved checks, five missed: src/store.rs is worst
+    // at 4/5, then @@hax at 1/4, then FAST_FLAG at 0/3.
+    let mut store_ids = Vec::new();
+    for (about, total, correct) in [("src/store.rs", 5, 1), ("@@hax", 4, 3), ("FAST_FLAG", 3, 3)] {
+        for index in 0..total {
+            store_ids.push((
+                about,
+                raise_resolved_check(
+                    &fixture,
+                    &fixture.main,
+                    &format!("Decided comprehension for {about} row {index}."),
+                    about,
+                    None,
+                    if index < correct { "alpha" } else { "beta" },
+                ),
+            ));
+        }
+    }
+    let newest_store_id = store_ids
+        .iter()
+        .rev()
+        .find(|(about, _)| *about == "src/store.rs")
+        .map(|(_, id)| id.clone())
+        .expect("a worst-subject row");
+
+    // The projection carries the summary beside the page's own rows.
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let (status, body) = http_get(server.port, "/api/v1/decided");
+    assert_eq!(status, 200, "{body}");
+    let room: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("/api/v1/decided is not JSON: {error}\n{body}"));
+    assert_eq!(
+        room["checkSummary"],
+        json!({
+            "answered": 12,
+            "missed": 5,
+            "worst": {
+                "about": "src/store.rs",
+                "answered": 5,
+                "missed": 4,
+                "rowId": newest_store_id,
+            },
+        }),
+        "the decided projection summary: {body}"
+    );
+
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = opened_tab(&chrome, "decided check summary tab");
+    tab.set_extra_http_headers(std::collections::HashMap::from([(
+        "X-Auth-Request-Email",
+        "geoyws",
+    )]))
+    .expect("set the trusted edge actor header");
+    tab.navigate_to(&format!("{origin}decided"))
+        .expect("load Recent decisions");
+    tab.wait_until_navigated().expect("decided navigation");
+    wait_for_mounted_page(&tab, "[data-testid=\"decided-check-summary\"]");
+
+    // Exactly one block, with the byte-exact sentence shape.
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelectorAll('[data-testid=\"decided-check-summary\"]').length"
+        ),
+        json!(1),
+        "the page carries exactly one check summary block"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-testid=\"decided-check-summary-text\"]').textContent"
+        ),
+        json!("Checks: 12 answered, 5 missed — worst: src/store.rs (4/5)"),
+        "the block sentence"
+    );
+    // The worst subject links to its rows through their `#d-<id>` anchors.
+    assert_eq!(
+        js_value(
+            &tab,
+            "document.querySelector('[data-testid=\"decided-check-summary-text\"] a').getAttribute('href')"
+        ),
+        json!(format!("#d-{newest_store_id}")),
+        "the worst subject links to its newest row"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('article.decided[data-item=\"{newest_store_id}\"] h2').id"
+            )
+        ),
+        json!(format!("d-{newest_store_id}")),
+        "the linked anchor is the row's own heading"
+    );
+    // The block carries aggregate data only: no answer key, explanation,
+    // choice label or raiser name occurs in it.
+    let block = js_value(
+        &tab,
+        "document.querySelector('[data-testid=\"decided-check-summary\"]').innerHTML",
+    )
+    .as_str()
+    .unwrap()
+    .to_owned();
+    for leaked in [
+        "REPORT_SENTINEL",
+        "Alpha option",
+        "Beta option",
+        "claude@driver",
+        ">alpha<",
+        ">beta<",
+    ] {
+        assert!(!block.contains(leaked), "the block leaks {leaked}: {block}");
+    }
+    let _ = tab.close(true);
+
+    // With no resolved checked rows the block is omitted while the empty
+    // page reads unchanged.
+    let vacant = Fixture::new("decided-check-summary-empty");
+    vacant.ok_json(&vacant.main, &["init", "--name", "BARE", "--json"]);
+    let bare = spawn_server_with_actor_header(&vacant, Some("X-Auth-Request-Email"));
+    let bare_origin = bare.origin();
+    let bare_tab = opened_tab(&chrome, "decided check summary empty tab");
+    bare_tab
+        .set_extra_http_headers(std::collections::HashMap::from([(
+            "X-Auth-Request-Email",
+            "geoyws",
+        )]))
+        .expect("set the trusted edge actor header");
+    bare_tab
+        .navigate_to(&format!("{bare_origin}decided"))
+        .expect("load Recent decisions");
+    bare_tab.wait_until_navigated().expect("decided navigation");
+    wait_for_mounted_page(&bare_tab, "[data-testid=\"decided-empty\"]");
+    assert_eq!(
+        js_value(
+            &bare_tab,
+            "document.querySelector('[data-testid=\"decided-empty\"]').textContent"
+        ),
+        json!("Nothing decided yet.")
+    );
+    assert_eq!(
+        js_value(
+            &bare_tab,
+            "document.querySelector('[data-testid=\"decided-check-summary\"]')"
+        ),
+        Value::Null,
+        "no summary block on a page with no resolved checked rows"
+    );
+    let _ = bare_tab.close(true);
+}
+
+#[test]
+fn att_list_check_report_fans_out_across_boards() {
+    let fixture = Fixture::new("check-report-boards");
+    fixture.ok_json(&fixture.main, &["init", "--name", "RPTA", "--json"]);
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "RPTB", "--json"]);
+    raise_resolved_check(
+        &fixture,
+        &fixture.main,
+        "First board comprehension.",
+        "src/store.rs",
+        None,
+        "beta",
+    );
+    raise_resolved_check(
+        &fixture,
+        &fixture.worktree,
+        "Second board comprehension.",
+        "@@hax",
+        None,
+        "alpha",
+    );
+    // A plain report stays on its own board.
+    let single = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--check-report", "--json"],
+    );
+    assert_eq!(
+        single,
+        json!([
+            {"about": "src/store.rs", "answered": 1, "correct": 0, "missed": 1, "missRate": 100},
+        ])
+    );
+    // `--all-boards` merges every readable board's resolved checked rows
+    // through the same grouping, worst first.
+    let merged = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--all-boards",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        merged,
+        json!([
+            {"about": "src/store.rs", "answered": 1, "correct": 0, "missed": 1, "missRate": 100},
+            {"about": "@@hax", "answered": 1, "correct": 1, "missed": 0, "missRate": 0},
+        ])
+    );
+    // A board selector beside `--all-boards` is refused, as the search
+    // listing refuses it.
+    let refused = refusal_object(&fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--check-report",
+            "--all-boards",
+            "--project",
+            "RPTA",
+            "--json",
+        ],
+    ));
+    assert!(refused.contains("--all-boards"), "{refused}");
+}

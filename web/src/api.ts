@@ -64,6 +64,32 @@ export interface Check {
 }
 
 /**
+ * The worst check subject on the `/decided` page (ACC-19,
+ * `projection::CheckSummaryWorst`). Post-answer aggregate data only —
+ * `about` strings and counts; never answer keys, explanations, choice
+ * labels or raiser identity.
+ */
+export interface CheckSummaryWorst {
+  about: string;
+  answered: number;
+  missed: number;
+  rowId: string;
+}
+
+/**
+ * The one `/decided` summary block's data (ACC-19,
+ * `projection::CheckSummary`): answered/missed totals over the page's own
+ * items plus the worst group under the same ordering `attention list
+ * --check-report` uses. Absent when the page holds no resolved checked
+ * rows, and the page omits the block then.
+ */
+export interface CheckSummary {
+  answered: number;
+  missed: number;
+  worst: CheckSummaryWorst;
+}
+
+/**
  * What settling one item recorded (`rust/model.rs`'s `AttentionDecision`).
  * `null` while the item is open: a reopen clears it from the row and keeps
  * it in the ledger (ADR-042 §3).

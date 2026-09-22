@@ -179,6 +179,15 @@ paths:
         merged list's length, not an inference from the row count (ADR-037 §1).
         The per-board `200` scan is a second bound and is reported as
         `scanLimit` so a reader can tell the two apart.
+
+        `checkSummary` is the one `/decided` summary block's data (ACC-19):
+        answered/missed totals over the page's own items plus the worst
+        `about` group under the same ordering `attention list --check-report`
+        uses (`Store::aggregate_check_report`), with the newest row id
+        carrying that subject for the block's `#d-<id>` link. Post-answer
+        aggregate data only — `about` strings and counts; never answer keys,
+        explanations, choice labels or raiser identity. Absent when the page
+        holds no resolved checked rows, and the page omits the block then.
       x-requirement: [SPA-06, SPA-07, SPA-08, SPA-13, SPA-43]
       x-store-method: Store::recent_resolved_attention
       responses:
@@ -199,6 +208,9 @@ paths:
                         type: integer
                         description: Rows read per board before the merge, `DECIDED_SCAN` (`rust/serve.rs:86`).
                         example: 200
+                      checkSummary:
+                        allOf: [{ $ref: "#/components/schemas/CheckSummary" }]
+                        description: The one summary block's data (ACC-19). Absent when the page holds no resolved checked rows.
         "403": { $ref: "#/components/responses/Refused" }
         "405": { $ref: "#/components/responses/MethodNotAllowed" }
         "500": { $ref: "#/components/responses/ServerError" }
@@ -1538,6 +1550,36 @@ components:
         id: { type: string }
         taskType: { type: string }
         title: { type: string }
+
+    CheckSummary:
+      type: object
+      description: |
+        The one `/decided` summary block's data (ACC-19,
+        `projection::CheckSummary`). Answered/missed totals over the page's
+        own items plus the worst `about` group under the same ordering
+        `attention list --check-report` uses. Post-answer aggregate data
+        only — `about` strings and counts; never answer keys, explanations,
+        choice labels or raiser identity.
+      required: [answered, missed, worst]
+      additionalProperties: false
+      properties:
+        answered: { type: integer, minimum: 0 }
+        missed: { type: integer, minimum: 0 }
+        worst: { $ref: "#/components/schemas/CheckSummaryWorst" }
+
+    CheckSummaryWorst:
+      type: object
+      description: |
+        The worst check subject on the `/decided` page
+        (`projection::CheckSummaryWorst`). `rowId` is the newest page row
+        carrying that subject, whose heading carries `#d-<id>`.
+      required: [about, answered, missed, rowId]
+      additionalProperties: false
+      properties:
+        about: { type: string }
+        answered: { type: integer, minimum: 0 }
+        missed: { type: integer, minimum: 0 }
+        rowId: { type: string }
 
     BoardTask:
       type: object

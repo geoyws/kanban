@@ -593,6 +593,38 @@ pub struct DecidedListing {
     #[serde(flatten)]
     listing: Listing<AttentionCard>,
     scan_limit: i64,
+    /// Post-answer check aggregates for the one `/decided` summary block
+    /// (ACC-19), computed from the page's own items through the shared
+    /// [`Store::aggregate_check_report`] grouping — no new page, no new
+    /// route and no new Store read. Absent when the page holds no resolved
+    /// checked rows, and the page omits the block then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_summary: Option<CheckSummary>,
+}
+
+/// The `/decided` summary block's data: answered/missed totals over the
+/// page's items plus the worst group under ACC-18's order, with the newest
+/// row id carrying that subject for the block's `#d-<id>` link.
+///
+/// Post-answer aggregate data only — `about` strings and counts; never
+/// answer keys, explanations, choice labels or raiser identity.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckSummary {
+    answered: i64,
+    missed: i64,
+    worst: CheckSummaryWorst,
+}
+
+/// The worst check subject on the `/decided` page, and the row the block
+/// links it to.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckSummaryWorst {
+    about: String,
+    answered: i64,
+    missed: i64,
+    row_id: String,
 }
 
 /// What was decided, newest first, across every readable board.
@@ -617,9 +649,46 @@ pub fn decided() -> Projected<DecidedListing> {
     // merged list's, and `truncated` is the observation that the merge held
     // more rows than the cut kept.
     let cards = attention_cards(items, &stores);
+    let listing = Listing::capped(cards, DECIDED_ROWS);
+    // The summary reads the page's own items — the merged rows after the
+    // cut above — through the same grouping the CLI report uses, so the
+    // block and `attention list --check-report` cannot disagree.
+    let check_summary = decided_check_summary(&listing.items);
     Ok(DecidedListing {
-        listing: Listing::capped(cards, DECIDED_ROWS),
+        listing,
         scan_limit: DECIDED_SCAN,
+        check_summary,
+    })
+}
+
+/// The `/decided` summary block's data over the page's own cards (ACC-19).
+///
+/// Totals and the worst group come from the shared
+/// [`Store::aggregate_check_report`] order; the link target is the newest
+/// page row carrying the worst subject, whose heading carries `#d-<id>`.
+fn decided_check_summary(cards: &[AttentionCard]) -> Option<CheckSummary> {
+    let groups = Store::aggregate_check_report(cards.iter().map(|card| &card.attention));
+    let worst = groups.first()?;
+    let row_id = cards
+        .iter()
+        .find(|card| {
+            card.attention
+                .check
+                .as_ref()
+                .is_some_and(|check| check.about == worst.about)
+        })?
+        .attention
+        .id
+        .clone();
+    Some(CheckSummary {
+        answered: groups.iter().map(|group| group.answered).sum(),
+        missed: groups.iter().map(|group| group.missed).sum(),
+        worst: CheckSummaryWorst {
+            about: worst.about.clone(),
+            answered: worst.answered,
+            missed: worst.missed,
+            row_id,
+        },
     })
 }
 

@@ -6648,6 +6648,71 @@ impl Store {
         Ok(rows)
     }
 
+    /// Group resolved answered checks by `about`, worst first (ACC-18/ACC-19).
+    ///
+    /// The one grouping both surfaces share, so the CLI report and the
+    /// `/decided` block cannot disagree about which subject is worst: the
+    /// CLI feeds it the resolved rows its filters selected, and the decided
+    /// projection feeds it the page's own already-read items — no new Store
+    /// read on either side beyond the rows each surface already holds.
+    ///
+    /// Only resolved rows carrying a native check with a recorded answer
+    /// contribute; rows without a check and rows without an answer are
+    /// skipped, never fabricated into a group. Each group's miss rate is
+    /// `missed * 100 / answered`, a whole-percent integer truncated toward
+    /// zero, and groups sort worst first — miss rate descending, then missed
+    /// descending, then `about` ascending. The key is `about` alone: no
+    /// raiser, actor, answer-key, explanation or choice-label column exists,
+    /// so the report is never a leaderboard and never scores raisers.
+    pub fn aggregate_check_report<'a>(
+        items: impl IntoIterator<Item = &'a Attention>,
+    ) -> Vec<CheckReportGroup> {
+        let mut counts: std::collections::BTreeMap<&str, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for item in items {
+            if item.status != "resolved" {
+                continue;
+            }
+            let Some(check) = item.check.as_ref() else {
+                continue;
+            };
+            // The v32 triggers keep the result triple absent-or-complete, so
+            // either field implies the answer stands; both are still required
+            // here rather than trusted.
+            let (Some(_), Some(correct)) = (check.answered.as_ref(), check.correct) else {
+                continue;
+            };
+            let entry = counts.entry(check.about.as_str()).or_insert((0, 0));
+            entry.0 += 1;
+            if correct {
+                entry.1 += 1;
+            }
+        }
+        let mut groups = counts
+            .into_iter()
+            .map(|(about, (answered, correct))| {
+                let missed = answered - correct;
+                CheckReportGroup {
+                    about: about.to_owned(),
+                    answered,
+                    correct,
+                    missed,
+                    // Non-negative operands, so integer division truncates
+                    // toward zero as ACC-18 requires.
+                    miss_rate: missed * 100 / answered,
+                }
+            })
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            right
+                .miss_rate
+                .cmp(&left.miss_rate)
+                .then_with(|| right.missed.cmp(&left.missed))
+                .then_with(|| left.about.cmp(&right.about))
+        });
+        groups
+    }
+
     /// How many workable rows are waiting on a prerequisite: the dashboard's
     /// number, and a count rather than a filter.
     ///
@@ -16080,6 +16145,141 @@ mod tests {
             explanation: check.explanation.clone(),
             about: Some(check.about.clone()),
         }
+    }
+
+    #[test]
+    fn aggregate_check_report_groups_worst_first_with_truncation_and_skips() {
+        let path = board_db_path("native-check-report-aggregate");
+        let parent = path.parent().unwrap().to_path_buf();
+        let mut store = Store::open(&path).unwrap();
+        store.initialize("checks", "seed").unwrap();
+        fn about_check(about: &str) -> AttentionCheckInput {
+            let check = AttentionCheck::parse(
+                Some("Which layer records the one check answer?"),
+                &[
+                    "store=The Store validates it".to_owned(),
+                    "client=The client validates it".to_owned(),
+                ],
+                Some("store"),
+                Some("rust/store.rs records answered, correct and answeredAt as columns."),
+                Some(about),
+            )
+            .unwrap()
+            .unwrap();
+            native_check_input(&check)
+        }
+        // (about, resolved rows, correct answers).
+        for (about, total, correct) in [
+            ("src/store.rs", 5, 1),
+            ("b-big.rs", 4, 2),
+            ("a-small.rs", 2, 1),
+            ("a-tie.rs", 2, 1),
+            ("b-tie.rs", 2, 1),
+            ("@@hax", 4, 3),
+            ("src/trunc.rs", 6, 5),
+            ("FAST_FLAG", 3, 3),
+        ] {
+            for index in 0..total {
+                let input = about_check(about);
+                let raised = store
+                    .raise_attention(
+                        &format!("Comprehension for {about} row {index}."),
+                        "decision",
+                        "claude@driver",
+                        None,
+                        0,
+                        &[],
+                        &DecisionCard::default(),
+                        Some(&input),
+                    )
+                    .unwrap();
+                let key = if index < correct { "store" } else { "client" };
+                store
+                    .resolve_attention(
+                        &raised.id,
+                        "geoyws",
+                        &AttentionAnswer {
+                            choice: Some("approve"),
+                            outcome: None,
+                            note: None,
+                        },
+                        Some(key),
+                    )
+                    .unwrap();
+            }
+        }
+        // An open checked row, a resolved row with no check and an open row
+        // with no check contribute nothing.
+        let open_input = about_check("src/open.rs");
+        store
+            .raise_attention(
+                "Still waiting on its answer.",
+                "decision",
+                "claude@driver",
+                None,
+                0,
+                &[],
+                &DecisionCard::default(),
+                Some(&open_input),
+            )
+            .unwrap();
+        let plain = store
+            .raise_attention(
+                "No check rides along.",
+                "decision",
+                "claude@driver",
+                None,
+                0,
+                &[],
+                &DecisionCard::default(),
+                None,
+            )
+            .unwrap();
+        store
+            .resolve_attention(
+                &plain.id,
+                "geoyws",
+                &AttentionAnswer {
+                    choice: Some("approve"),
+                    outcome: None,
+                    note: None,
+                },
+                None,
+            )
+            .unwrap();
+        let rows = store
+            .attention(None, None, None, None, None, 100_000, true)
+            .unwrap();
+        let groups = Store::aggregate_check_report(&rows);
+        let shape = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.about.as_str(),
+                    group.answered,
+                    group.correct,
+                    group.missed,
+                    group.miss_rate,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                ("src/store.rs", 5, 1, 4, 80),
+                ("b-big.rs", 4, 2, 2, 50),
+                ("a-small.rs", 2, 1, 1, 50),
+                ("a-tie.rs", 2, 1, 1, 50),
+                ("b-tie.rs", 2, 1, 1, 50),
+                ("@@hax", 4, 3, 1, 25),
+                // 1/6 misses at 16.66…%, pinning truncation toward zero.
+                ("src/trunc.rs", 6, 5, 1, 16),
+                ("FAST_FLAG", 3, 3, 0, 0),
+            ]
+        );
+        let none: Vec<Attention> = Vec::new();
+        assert!(Store::aggregate_check_report(&none).is_empty());
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

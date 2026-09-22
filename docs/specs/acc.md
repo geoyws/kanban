@@ -536,8 +536,8 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
-| `ACC-18` | MUST | process | `PLANNED` | planned: `att_list_check_report_groups_worst_first_with_adr037_caps` — A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; no e2e coverage |
-| `ACC-19` | MUST | chrome | `PLANNED` | planned: `decided_page_carries_one_check_summary_block` — A18 sentence shape, row links, test ids and omission on empty; no e2e coverage |
+| `ACC-18` | MUST | process | `att_list_check_report_groups_worst_first_with_adr037_caps`; `att_list_check_report_fans_out_across_boards`; `aggregate_check_report_groups_worst_first_with_truncation_and_skips` | A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; registry fan-out with the board-selector refusal; store-level worst-first, truncation and skip unit |
+| `ACC-19` | MUST | chrome | `decided_page_carries_one_check_summary_block` | A18 sentence shape, row links, test ids and omission on empty, plus the `/api/v1/decided` `checkSummary` projection beside the page's rows |
 
 ## 9. Change log
 

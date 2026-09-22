@@ -1239,6 +1239,23 @@ impl AttentionCheck {
     }
 }
 
+/// One `about` subject's resolved check results (ACC-18/ACC-19).
+///
+/// The group key is `about` alone: no raiser, actor, answer-key, explanation
+/// or choice-label column exists in either shape. `miss_rate` is the
+/// whole-percent integer `missed * 100 / answered`, truncated toward zero.
+/// Serialized `camelCase`, so the CLI `--json` shape carries `missRate`
+/// while the human table beside it heads the same column `miss-rate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckReportGroup {
+    pub about: String,
+    pub answered: i64,
+    pub correct: i64,
+    pub missed: i64,
+    pub miss_rate: i64,
+}
+
 fn valid_check_about(about: &str) -> bool {
     let path = about.contains('/')
         || about

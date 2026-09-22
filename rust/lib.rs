@@ -216,6 +216,10 @@ Usage:
   kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk|complaint] [--task ID] [--tag NAME]
              [--lane LANE] [--all] [--limit N]
              [--fields id,kind,status,... | --no-body] [--json]
+  kanban attention list --check-report [--kind blocking|decision|approval|review|risk|complaint] [--task ID] [--tag NAME]
+             [--lane LANE] [--all] [--all-boards] [--limit N] [--json]
+             (resolved answered checks grouped by --check-about subject, worst
+             first; --status, --fields and --no-body are refused beside it)
   kanban attention show ID [--json]
   kanban attention update ID --as ACTOR [--body TEXT | --body-file PATH]
              [--tag NAME ... | --clear-tags] [--json]
@@ -337,7 +341,7 @@ unchanged by that notice.
 
 SQLite is authoritative. Generated TODO files are read-only projections."#;
 
-pub(crate) const BOOLEAN: [&str; 35] = [
+pub(crate) const BOOLEAN: [&str; 36] = [
     "help",
     "json",
     "version",
@@ -366,6 +370,7 @@ pub(crate) const BOOLEAN: [&str; 35] = [
     "all",
     "full",
     "all-boards",
+    "check-report",
     "registry",
     "follow",
     "no-body",
@@ -1325,7 +1330,17 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         "attention",
         Some("list"),
         &[
-            "status", "kind", "task", "tag", "lane", "limit", "fields", "no-body", "all",
+            "status",
+            "kind",
+            "task",
+            "tag",
+            "lane",
+            "limit",
+            "fields",
+            "no-body",
+            "all",
+            "check-report",
+            "all-boards",
         ],
         &[],
         true,
@@ -3714,6 +3729,119 @@ fn reject_all_boards_selector(args: &Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `attention list --check-report` (ACC-18): resolved answered checks grouped
+/// by `about`, worst first, through the shared [`Store::aggregate_check_report`]
+/// the `/decided` block reads from the same method.
+///
+/// The report fixes its rows to resolved: `--status` is refused naming the
+/// conflict, and the row-shape flags (`--fields`, `--no-body`) are refused
+/// naming the report's fixed columns. The remaining row filters (`--kind`,
+/// `--task`, `--tag`, `--lane`) still narrow the resolved set, `--all`
+/// keeps its listing meaning of including archived rows, and `--all-boards`
+/// fans out through the registry exactly as the search listing does.
+fn attention_check_report(args: &Args, store: &Store) -> Result<()> {
+    if args.one("status").is_some() {
+        bail!(
+            "--status cannot be combined with --check-report: the report reads only resolved rows"
+        );
+    }
+    if args.one("fields").is_some() {
+        bail!(
+            "--fields cannot be combined with --check-report: the report prints the fixed \
+             columns about, answered, correct, missed, miss-rate"
+        );
+    }
+    if args.has("no-body") {
+        bail!(
+            "--no-body cannot be combined with --check-report: the report prints the fixed \
+             columns about, answered, correct, missed, miss-rate"
+        );
+    }
+    let mut items = Vec::new();
+    if args.has("all-boards") {
+        reject_all_boards_selector(args)?;
+        let registry = Registry::open_readonly()?;
+        let projects = if args.has("all") {
+            registry.projects()?
+        } else {
+            registry.projects_active()?
+        };
+        let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
+        for project in &projects {
+            match survey_board(&project.board_path) {
+                SurveyBoard::Readable => {}
+                SurveyBoard::Unreadable(reason) => {
+                    unreadable.push(format!("{} ({reason})", project.name));
+                    continue;
+                }
+                SurveyBoard::Missing => {
+                    missing.push(project.name.clone());
+                    continue;
+                }
+            }
+            let board = Store::open_for_read_as_caller(Path::new(&project.board_path))?;
+            items.extend(check_report_rows(&board, args)?);
+        }
+        // Reported rather than silently skipped, as the search listing
+        // carries them in its receipt: stdout stays the report's fixed
+        // shape, so the notice goes to stderr.
+        for name in &missing {
+            eprintln!("check-report: board {name} is missing and was not read");
+        }
+        for entry in &unreadable {
+            eprintln!("check-report: board {entry} could not be read and was skipped");
+        }
+    } else {
+        items.extend(check_report_rows(store, args)?);
+    }
+    // The cap is on groups, as every listing's cap is on its own rows
+    // (ADR-037): one group past the default is fetched, and an explicit
+    // `--limit` returns the first N groups in worst-first order silently
+    // with exit zero. The existing limit law refuses a negative or
+    // over-ceiling `--limit` before the fetch runs.
+    let groups = args.bounded_page(100, "check subjects", |fetch| {
+        Ok(Store::aggregate_check_report(&items)
+            .into_iter()
+            .take(usize::try_from(fetch).unwrap_or(usize::MAX))
+            .collect::<Vec<_>>())
+    })?;
+    if args.has("json") {
+        return print(&groups, true);
+    }
+    emit(&render_check_report(&groups))
+}
+
+/// The resolved rows one board contributes to `--check-report`: status fixed
+/// to resolved, the remaining row filters and the archived meaning of
+/// `--all` inherited from `attention list`. Read whole — groups, not rows,
+/// are the capped unit, and a capped row read would silently shrink them.
+fn check_report_rows(store: &Store, args: &Args) -> Result<Vec<Attention>> {
+    store.attention(
+        Some("resolved"),
+        args.one("kind"),
+        args.one("task"),
+        args.one("tag"),
+        args.one("lane"),
+        LIMIT_CEILING,
+        args.has("all"),
+    )
+}
+
+/// The human `--check-report` table: the five fixed columns in spec order,
+/// header included, so a board with no resolved checked rows still prints
+/// its header with zero groups.
+fn render_check_report(groups: &[CheckReportGroup]) -> String {
+    let mut out = String::from("about answered correct missed miss-rate");
+    for group in groups {
+        out.push_str(&format!(
+            "\n{} {} {} {} {}",
+            group.about, group.answered, group.correct, group.missed, group.miss_rate
+        ));
+    }
+    out
 }
 
 fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
@@ -7279,6 +7407,9 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             )?,
             args.has("json"),
         );
+    }
+    if command == "attention" && sub == Some("list") && args.has("check-report") {
+        return attention_check_report(&args, &store);
     }
     if command == "attention" && sub == Some("list") {
         let keep = projection(&args, &ATTENTION_FIELDS, &[])?;

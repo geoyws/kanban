@@ -20,7 +20,7 @@
 
 import type { ReactElement } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Attention, Card, Listing } from "../api";
+import type { Attention, Card, CheckSummary, Listing } from "../api";
 import { postReopen } from "../api";
 import { Priority } from "../card";
 import { ago, cardQuestion } from "../format";
@@ -30,6 +30,8 @@ import { Link, useProjection } from "../shell";
 /** The decisions room's envelope: the merge, plus the per-board scan. */
 interface Decided extends Listing<Card> {
   scanLimit: number;
+  /** The one check summary block's data (ACC-19); absent on an empty page. */
+  checkSummary?: CheckSummary | null;
 }
 
 /** The reserved key a free-text answer is recorded under. */
@@ -144,6 +146,22 @@ export default function DecidedPage({ route }: { route: Route }): ReactElement {
           <p className="count" data-testid="decided-count">
             Newest {items.length} shown. Undoing one puts it back on Needs you.
           </p>
+          {data?.checkSummary == null ? null : (
+            <section
+              className="check-summary"
+              data-testid="decided-check-summary"
+              aria-label="Check results by subject"
+            >
+              <p data-testid="decided-check-summary-text">
+                Checks: {data.checkSummary.answered} answered,{" "}
+                {data.checkSummary.missed} missed — worst:{" "}
+                <a href={`#d-${data.checkSummary.worst.rowId}`}>
+                  {data.checkSummary.worst.about}
+                </a>{" "}
+                ({data.checkSummary.worst.missed}/{data.checkSummary.worst.answered})
+              </p>
+            </section>
+          )}
           {items.map((card) => {
             const item = card.attention;
             const outcome = item.decision?.outcome ?? "other";

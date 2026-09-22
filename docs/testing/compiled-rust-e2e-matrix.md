@@ -493,14 +493,16 @@ Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `u
 | `MODEL-17` | MUST | process | `mcp_schema_exposes_allowed_model_array_and_claim_model_string` | `schema --json` kinds `list`/`list`/`value` for `allowed-model` on `task add`/`task update`/`task list` and `value` for `model`; the MCP tools type it array on `task_add`/`task_update`, string on `task_list`, and `model` string on `claim`/`handoff accept` |
 | `MODEL-18` | MUST | unit | `task_detail_lists_allowed_models_and_the_holders_model_unit` | `rust/serve.rs` `mod tests` reading served bytes: the `allowed models` row present when restricted and absent when not, and the holder's `model` line — no e2e coverage, and none planned for this row |
 
-## Requirements trace — docs/specs/acc.md ACC-01..ACC-17
+## Requirements trace — docs/specs/acc.md ACC-01..ACC-19
 
 Definition authoring and schema evidence landed on 2026-09-21 for ACC-01..04, the
 raiser-only authoring half of ACC-05, and the always-redacted show/list portion of ACC-13.
 The answer slice landed on 2026-09-22 for the resolve half of ACC-05 (answered-open lock and
 reopen-clear) and all of ACC-06/07/08 at the CLI/store layer, including the v32 result
 columns. The web card landed later on 2026-09-22 for ACC-09..12, including the shared POST
-endpoint and the source-redaction sweep. Digest/reader cutover and legacy body migration
+endpoint and the source-redaction sweep. The miss-rate report landed on 2026-09-23 for
+ACC-18/ACC-19: the CLI `--check-report` and the one `/decided` summary block, both grouped
+by the shared `Store::aggregate_check_report`. Digest/reader cutover and legacy body migration
 remain `PLANNED`; no row below claims those later slices.
 
 | Requirement | Strength | Layer | Existing test | Note |
@@ -522,10 +524,12 @@ remain `PLANNED`; no row below claims those later slices.
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
+| `ACC-18` | MUST | process | `att_list_check_report_groups_worst_first_with_adr037_caps`; `att_list_check_report_fans_out_across_boards`; `aggregate_check_report_groups_worst_first_with_truncation_and_skips` | A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; registry fan-out with the board-selector refusal; store-level worst-first, truncation and skip unit |
+| `ACC-19` | MUST | chrome | `decided_page_carries_one_check_summary_block` | A18 sentence shape, row links, test ids and omission on empty, plus the `/api/v1/decided` `checkSummary` projection beside the page's rows |
 
-17 requirements: 17 MUST, no SHOULD or MAY. ACC-01..12 carry definition-, answer- and
+19 requirements: 19 MUST, no SHOULD or MAY. ACC-01..12 carry definition-, answer- and
 web-card-slice evidence (ACC-05 and ACC-13 remain partial pending their remaining halves);
-every reader/migration slice remains `PLANNED`.
+ACC-18/ACC-19 carry the miss-rate report evidence; every reader/migration slice remains `PLANNED`.
 
 ## Requirements trace — docs/specs/complaint.md COMPLAINT-01..COMPLAINT-07
 
