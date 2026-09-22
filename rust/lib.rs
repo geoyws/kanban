@@ -203,7 +203,7 @@ Usage:
   kanban rule export --board NAME ... --as ACTOR [--output PATH] [--json]
   kanban rule import PATH --as ACTOR [--json]
   kanban rule consolidate --as ACTOR [--json]
-  kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk]
+  kanban attention raise TEXT --as AGENT [--kind blocking|decision|approval|review|risk|complaint]
              [--priority P0|P1|P2|0-9]
              [--task ID] [--tag NAME ...] [--json]
              [--question TEXT --context TEXT]
@@ -213,7 +213,7 @@ Usage:
              (a card is 2-4 choices, one --consequence each, exactly one
              --recommend; OUTCOME is approve|reject|defer|other; a row with no
              choices reads as the Approve/Reject pair)
-  kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk] [--task ID] [--tag NAME]
+  kanban attention list [--status open|resolved] [--kind blocking|decision|approval|review|risk|complaint] [--task ID] [--tag NAME]
              [--lane LANE] [--all] [--limit N]
              [--fields id,kind,status,... | --no-body] [--json]
   kanban attention show ID [--json]

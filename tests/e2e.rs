@@ -2434,9 +2434,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 32);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 32);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 32);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 33);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 33);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 33);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -18475,7 +18475,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        32
+        33
     );
 }
 
@@ -19131,9 +19131,13 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
             " check_choices TEXT CHECK(check_choices IS NULL OR (json_valid(check_choices) AND json_type(check_choices)='array'\n   AND json_array_length(check_choices) BETWEEN 2 AND 4)),\n",
             " check_answer TEXT,\n",
             " check_explanation TEXT CHECK(check_explanation IS NULL OR length(check_explanation) BETWEEN 1 AND 400),\n",
-            // v32's ALTERs land on the check_about line, so a simulated
-            // v30 board strips definition and result columns together.
-            " check_about TEXT, check_answered TEXT, check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)), check_answered_at INTEGER,\n",
+            // v33 rebuilds the table, so definition and result columns stand
+            // on their own lines now (v32's ALTERs had landed them on the
+            // check_about line); a simulated v30 board strips all eight.
+            " check_about TEXT,\n",
+            " check_answered TEXT,\n",
+            " check_correct INTEGER CHECK(check_correct IS NULL OR check_correct IN (0,1)),\n",
+            " check_answered_at INTEGER,\n",
             " CHECK(\n   (check_question IS NULL AND check_choices IS NULL AND check_answer IS NULL\n    AND check_explanation IS NULL AND check_about IS NULL)\n   OR\n   (check_question IS NOT NULL AND check_choices IS NOT NULL AND check_answer IS NOT NULL\n    AND check_explanation IS NOT NULL AND check_about IS NOT NULL)\n ),\n",
         ] {
             let without = sql.replace(declaration, "");
@@ -19164,7 +19168,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        32
+        33
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -20298,7 +20302,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        32
+        33
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -56246,5 +56250,579 @@ fn mcp_schema_exposes_allowed_model_array_and_claim_model_string() {
              pass --model with one of them to claim it"
         ),
         "{refused}"
+    );
+}
+
+/// COMPLAINT-01: the sixth kind raises, lists and shows through the existing
+/// attention verbs, with no new table, verb or adapter.
+#[test]
+fn complaint_kind_raise_list_show_round_trip() {
+    let fixture = Fixture::new("complaint-round-trip");
+    fixture.ok_json(&fixture.main, &["init", "--name", "COMPLAINT", "--json"]);
+    let raised = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "returns arrive broken",
+            "--as",
+            "lane@driver-2",
+            "--kind",
+            "complaint",
+            "--json",
+        ],
+    );
+    assert_eq!(raised["kind"], "complaint");
+    assert_eq!(raised["status"], "open");
+    assert_eq!(raised["raisedBy"], "lane@driver-2");
+    let id = raised["id"].as_str().unwrap().to_owned();
+
+    let shown = fixture.ok_json(&fixture.main, &["attention", "show", &id, "--json"]);
+    assert_eq!(shown, raised);
+
+    let filtered = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--kind", "complaint", "--json"],
+    );
+    assert_eq!(filtered.as_array().unwrap().len(), 1);
+    assert_eq!(filtered[0], raised);
+
+    // The unfiltered listing carries the complaint alongside the other kinds,
+    // and each kind filter still selects only its own rows.
+    let blocking = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "the manual contradicts the field set",
+            "--as",
+            "lane@driver-2",
+            "--kind",
+            "blocking",
+            "--json",
+        ],
+    );
+    let listed = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    let blocking_only = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--kind", "blocking", "--json"],
+    );
+    assert_eq!(blocking_only.as_array().unwrap().len(), 1);
+    assert_eq!(blocking_only[0]["id"], blocking["id"]);
+
+    // The raise wrote the same envelope as every other kind, with the new
+    // value as the only difference.
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_raised", "--json"],
+    );
+    let complaint_event = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["payload"]["attentionID"] == json!(id))
+        .expect("the complaint raise left no attention_raised event");
+    assert_eq!(complaint_event["payload"]["kind"], "complaint");
+}
+
+/// COMPLAINT-02: the five legacy kinds behave exactly as before the sixth
+/// landed — same flags, same sentences, same JSON keys, same events.
+#[test]
+fn five_legacy_kinds_unchanged_after_complaint_lands() {
+    let fixture = Fixture::new("legacy-kinds");
+    fixture.ok_json(&fixture.main, &["init", "--name", "LEGACY", "--json"]);
+    let mut raised = Vec::new();
+    for kind in ["blocking", "decision", "approval", "review", "risk"] {
+        let row = fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                &format!("a {kind} item"),
+                "--as",
+                "lane@driver-2",
+                "--kind",
+                kind,
+                "--json",
+            ],
+        );
+        assert_eq!(row["kind"], kind);
+        assert_eq!(row["status"], "open");
+        raised.push(row);
+    }
+    for row in &raised {
+        let kind = row["kind"].as_str().unwrap();
+        let filtered = fixture.ok_json(
+            &fixture.main,
+            &["attention", "list", "--kind", kind, "--json"],
+        );
+        assert_eq!(filtered.as_array().unwrap().len(), 1);
+        assert_eq!(filtered[0]["id"], row["id"]);
+        let shown = fixture.ok_json(
+            &fixture.main,
+            &["attention", "show", row["id"].as_str().unwrap(), "--json"],
+        );
+        assert_eq!(shown, *row);
+    }
+    // Resolving and reopening a legacy row still settles and restores it.
+    let id = raised[0]["id"].as_str().unwrap().to_owned();
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "lane@driver-2",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            &id,
+            "--as",
+            "lane@driver-2",
+            "--note",
+            "still needs George",
+            "--json",
+        ],
+    );
+    assert_eq!(reopened["status"], "open");
+}
+
+/// COMPLAINT-03: an unknown kind is refused with the sentence naming all six
+/// values, and the refusal writes nothing — no row, no event.
+#[test]
+fn unknown_attention_kind_refusal_names_all_six() {
+    let fixture = Fixture::new("complaint-refusal");
+    fixture.ok_json(&fixture.main, &["init", "--name", "REFUSAL", "--json"]);
+    let before = attention_and_chain(&fixture);
+    let expected = "invalid attention kind grievance; expected blocking, decision, approval, review, risk, or complaint";
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &["raise", "x", "--as", "lane@driver-2", "--kind", "grievance"]
+        ),
+        expected
+    );
+    assert_eq!(
+        attention_refusal(&fixture, &["list", "--kind", "grievance"]),
+        expected
+    );
+    assert_eq!(
+        attention_and_chain(&fixture),
+        before,
+        "a refused kind wrote a row or an event"
+    );
+}
+
+/// COMPLAINT-04: a V32 board seeded with one open row of each legacy kind
+/// migrates forward losslessly, accepts a fresh complaint, and re-opens
+/// without migrating anything further.
+#[test]
+fn complaint_migration_carries_five_kind_board_forward() {
+    let fixture = Fixture::new("complaint-migration");
+    fixture.ok_json(&fixture.main, &["init", "--name", "MIGRATE", "--json"]);
+    let mut seeded = Vec::new();
+    for kind in ["blocking", "decision", "approval", "review", "risk"] {
+        seeded.push(fixture.ok_json(
+            &fixture.main,
+            &[
+                "attention",
+                "raise",
+                &format!("seeded {kind} body"),
+                "--as",
+                "lane@driver-2",
+                "--kind",
+                kind,
+                "--json",
+            ],
+        ));
+    }
+    let board = board_path_for_project(&fixture, &fixture.main, "MIGRATE");
+    // Rewind the declaration to the V32 five-kind CHECK without touching any
+    // row, and lower user_version: the next open must migrate forward. The
+    // V32 text is derived from the live declaration rather than restated, so
+    // this fixture cannot drift from the CHECK the ladder actually ships.
+    {
+        let connection = Connection::open(&board).unwrap();
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='attention'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("'complaint'"),
+            "expected the migrated declaration"
+        );
+        let v32 = sql.replace(",'complaint'", "").replacen(
+            "CREATE TABLE attention (",
+            "CREATE TABLE attention_v32_rewind (",
+            1,
+        );
+        assert!(!v32.contains("complaint"), "the rewind left the new value");
+        assert!(
+            v32.starts_with("CREATE TABLE attention_v32_rewind ("),
+            "the rewind did not retarget the declaration"
+        );
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('attention') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let list = columns.join(",");
+        // The rename carries the table's triggers and indexes to the old name
+        // and the drop takes them, so their declarations are read back first
+        // and re-created after: the rewound board is a whole V32 shape, not a
+        // table the V33 step cannot open.
+        let attached: Vec<String> = connection
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='attention' AND sql IS NOT NULL AND type != 'table' ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let restore = attached.join(";");
+        // The swap builds aside and drops the live table rather than renaming
+        // it: a rename rewrites every stored reference to the old name — the
+        // view's attention arm and `attention_tags`' foreign key — while the
+        // aside name has no referrers to rewrite. The rename pragma is set as
+        // its own statement, which is the form this connection honours, so
+        // the final rename back to `attention` neither rewrites nor validates
+        // references: the view and the foreign key keep naming `attention`
+        // and land on the rebuilt table untouched.
+        connection
+            .execute_batch("PRAGMA legacy_alter_table=ON;")
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "{v32};\
+                 INSERT INTO attention_v32_rewind({list}) SELECT {list} FROM attention;\
+                 DROP TABLE attention;\
+                 ALTER TABLE attention_v32_rewind RENAME TO attention;\
+                 {restore};"
+            ))
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA legacy_alter_table=OFF;PRAGMA user_version=32;")
+            .unwrap();
+        let stale: Vec<(String, String)> = connection
+            .prepare("SELECT type, name FROM sqlite_master WHERE sql LIKE '%attention_v32_rewind%'")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(stale.is_empty(), "rewind left stale references: {stale:?}");
+    }
+    let listed = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 5);
+    for row in &seeded {
+        let kind = row["kind"].as_str().unwrap();
+        let filtered = fixture.ok_json(
+            &fixture.main,
+            &["attention", "list", "--kind", kind, "--json"],
+        );
+        assert_eq!(filtered.as_array().unwrap().len(), 1);
+        for key in ["kind", "body", "raisedBy", "status", "createdAt"] {
+            assert_eq!(filtered[0][key], row[key], "{kind} lost {key} in migration");
+        }
+    }
+    let migrated: i64 = Connection::open(&board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(migrated, 33, "the board did not migrate forward");
+
+    // The migrated board takes a fresh complaint, and only under its kind.
+    let complaint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "a fresh complaint",
+            "--as",
+            "lane@driver-2",
+            "--kind",
+            "complaint",
+            "--json",
+        ],
+    );
+    assert_eq!(complaint["kind"], "complaint");
+    let complaints = fixture.ok_json(
+        &fixture.main,
+        &["attention", "list", "--kind", "complaint", "--json"],
+    );
+    assert_eq!(complaints.as_array().unwrap().len(), 1);
+    assert_eq!(complaints[0]["id"], complaint["id"]);
+
+    // Re-opening migrates nothing further and changes nothing.
+    let first = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    let second = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert_eq!(first, second);
+    let again: i64 = Connection::open(&board)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(again, 33);
+}
+
+/// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any
+/// other kind — including the raise/resolve asymmetry.
+#[test]
+fn complaint_resolve_reopen_matches_other_kinds() {
+    let fixture = Fixture::new("complaint-settle");
+    fixture.ok_json(&fixture.main, &["init", "--name", "SETTLE", "--json"]);
+    let raised = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "returns arrive broken",
+            "--as",
+            "lane@driver-2",
+            "--kind",
+            "complaint",
+            "--json",
+        ],
+    );
+    let id = raised["id"].as_str().unwrap().to_owned();
+    let before = attention_and_chain(&fixture);
+
+    // A third party who is neither the operator nor the raiser is refused,
+    // and the row stays open with no new event.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "resolve",
+                &id,
+                "--as",
+                "claude/driver-3",
+                "--choice",
+                "approve",
+                "--note",
+                "Probe"
+            ]
+        ),
+        format!(
+            "attention {id} was raised by lane@driver-2; only geoyws or that same raiser may resolve it — \
+             use attention update to correct it without closing George's queue"
+        )
+    );
+    assert_eq!(attention_and_chain(&fixture), before);
+
+    // The raiser settles it through the same composed decision.
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &id,
+            "--as",
+            "lane@driver-2",
+            "--choice",
+            "approve",
+            "--note",
+            "confirmed with the vendor",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["resolvedBy"], "lane@driver-2");
+    assert_eq!(settled["decision"]["choice"], "approve");
+    assert_eq!(settled["decision"]["outcome"], "approve");
+    let resolved_events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_resolved", "--json"],
+    );
+    assert_eq!(resolved_events.as_array().unwrap().len(), 1);
+    assert_eq!(resolved_events[0]["payload"]["kind"], "complaint");
+
+    // Settling twice is refused: the row is history, not a queue entry.
+    assert_eq!(
+        attention_refusal(
+            &fixture,
+            &[
+                "resolve",
+                &id,
+                "--as",
+                "lane@driver-2",
+                "--choice",
+                "approve"
+            ]
+        ),
+        format!(
+            "attention {id} was already resolved by lane@driver-2 — it is history, not a queue entry"
+        )
+    );
+
+    // The operator reopens it like any other kind.
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            &id,
+            "--as",
+            "geoyws",
+            "--note",
+            "the vendor answered; re-check",
+            "--json",
+        ],
+    );
+    assert_eq!(reopened["status"], "open");
+    assert_eq!(reopened["reopenedBy"], "geoyws");
+    let reopened_events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_reopened", "--json"],
+    );
+    assert_eq!(reopened_events.as_array().unwrap().len(), 1);
+    // The reopened envelope keeps its baseline keys — no kind field — and
+    // still names the row it reopened and who had settled it.
+    assert_eq!(reopened_events[0]["payload"]["attentionID"], json!(id));
+    assert_eq!(reopened_events[0]["payload"]["resolvedBy"], "lane@driver-2");
+}
+
+/// COMPLAINT-06: a complaint row carries exactly the keys a legacy row
+/// carries — the new kind value changes no JSON shape.
+#[test]
+fn complaint_json_keys_match_legacy_kind_shapes() {
+    let fixture = Fixture::new("complaint-keys");
+    fixture.ok_json(&fixture.main, &["init", "--name", "KEYS", "--json"]);
+    let complaint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "returns arrive broken",
+            "--as",
+            "lane@driver-2",
+            "--kind",
+            "complaint",
+            "--json",
+        ],
+    );
+    let blocking = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "the manual contradicts the field set",
+            "--as",
+            "lane@driver-2",
+            "--kind",
+            "blocking",
+            "--json",
+        ],
+    );
+    let keys = |value: &Value| {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort_unstable();
+        keys
+    };
+    assert_eq!(keys(&complaint), keys(&blocking));
+    let shown_complaint = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "show",
+            complaint["id"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    let shown_blocking = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "show",
+            blocking["id"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(keys(&shown_complaint), keys(&shown_blocking));
+    let events = fixture.ok_json(
+        &fixture.main,
+        &["events", "--kind", "attention_raised", "--json"],
+    );
+    let payloads: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| &event["payload"])
+        .collect();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(keys(payloads[0]), keys(payloads[1]));
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| payload["kind"] == "complaint")
+    );
+    assert!(payloads.iter().any(|payload| payload["kind"] == "blocking"));
+}
+
+/// COMPLAINT-07: `schema --json` publishes the sixth value on both `--kind`
+/// flags, and the operation set gains no tool and renames none.
+#[test]
+fn generated_surface_publishes_complaint_without_new_tool() {
+    let fixture = Fixture::new("complaint-schema");
+    let schema = fixture.ok_json(&fixture.main, &["schema", "--json"]);
+    let operations = schema["operations"].as_array().unwrap();
+    let operation = |name: &str| -> Value {
+        operations
+            .iter()
+            .find(|operation| operation["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no {name} operation"))
+            .clone()
+    };
+    let kinds = |name: &str| -> Value {
+        operation(name)["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|flag| flag["name"] == json!("kind"))
+            .unwrap_or_else(|| panic!("{name} has no --kind"))
+            .get("values")
+            .unwrap_or_else(|| panic!("{name} --kind publishes no values"))
+            .clone()
+    };
+    let expected = json!([
+        "blocking",
+        "decision",
+        "approval",
+        "review",
+        "risk",
+        "complaint"
+    ]);
+    assert_eq!(kinds("attention raise"), expected);
+    assert_eq!(kinds("attention list"), expected);
+    let attention: Vec<&str> = operations
+        .iter()
+        .filter_map(|operation| operation["name"].as_str())
+        .filter(|name| name.starts_with("attention "))
+        .collect();
+    assert_eq!(
+        attention,
+        [
+            "attention raise",
+            "attention list",
+            "attention show",
+            "attention update",
+            "attention resolve",
+            "attention reopen"
+        ]
     );
 }

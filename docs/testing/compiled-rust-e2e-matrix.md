@@ -527,6 +527,32 @@ remain `PLANNED`; no row below claims those later slices.
 web-card-slice evidence (ACC-05 and ACC-13 remain partial pending their remaining halves);
 every reader/migration slice remains `PLANNED`.
 
+## Requirements trace — docs/specs/complaint.md COMPLAINT-01..COMPLAINT-07
+
+The sixth attention kind landed with the specification on branch
+`wt-t-366502cb-spec-1790092721`, where the specification is at `SPEC-READY
+2026-09-23`. Every test these rows name exists in that build, enumerated with
+`cargo test --locked --test e2e -- --list`. `Layer` uses the specification's
+own vocabulary, where `process` is a compiled-binary process-boundary exchange
+in `tests/e2e.rs` with no HTTP and no browser. Of the 7 requirements — all
+`MUST` — 7 are proved at `process`, and none carries browser evidence: the
+slice changes no served markup, so there is no browser surface to drive, and
+each row says `no e2e coverage` plainly.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `COMPLAINT-01` | MUST | process | `complaint_kind_raise_list_show_round_trip` | no e2e coverage |
+| `COMPLAINT-02` | MUST | process | `five_legacy_kinds_unchanged_after_complaint_lands` | no e2e coverage |
+| `COMPLAINT-03` | MUST | process | `unknown_attention_kind_refusal_names_all_six` | no e2e coverage |
+| `COMPLAINT-04` | MUST | process | `complaint_migration_carries_five_kind_board_forward` | no e2e coverage |
+| `COMPLAINT-05` | MUST | process | `complaint_resolve_reopen_matches_other_kinds` | no e2e coverage |
+| `COMPLAINT-06` | MUST | process | `complaint_json_keys_match_legacy_kind_shapes` | no e2e coverage |
+| `COMPLAINT-07` | MUST | process | `generated_surface_publishes_complaint_without_new_tool` | no e2e coverage |
+
+7 requirements: 7 MUST, no SHOULD or MAY. The sixth kind raises, lists, shows,
+resolves, reopens and migrates through the existing attention machinery; the
+board schema stands at 33.
+
 ## Watch coverage note
 
 - The watch slice is coverage-driven, not count-driven.

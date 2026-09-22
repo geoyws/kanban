@@ -930,7 +930,14 @@ pub const OPERATOR_ACTOR: &str = "geoyws";
 /// Deliberately no `info`: a note that does not need anyone is a note, and
 /// `task note` already holds those. Everything here is something only the
 /// operator can retire.
-pub const ATTENTION_KINDS: [&str; 5] = ["blocking", "decision", "approval", "review", "risk"];
+pub const ATTENTION_KINDS: [&str; 6] = [
+    "blocking",
+    "decision",
+    "approval",
+    "review",
+    "risk",
+    "complaint",
+];
 
 /// The statuses an attention row may hold. `resolved` is history — reopened
 /// rather than deleted — so a resolved row is closed until reopened.
