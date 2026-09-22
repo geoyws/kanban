@@ -848,6 +848,37 @@ through a real stdio `Session`.
 
 Phase 3's two real-Chrome cases are named in §6.
 
+## 2026-09-23 amendment: the check is part of the card; one recorded answer, never withheld
+
+The native check the 2026-09-21 amendment added beside the decision card is part
+of the card, not a gate in front of it: the check is asked first and informs
+the decision, and once the server holds the one recorded answer the existing
+decision controls become operable — a miss shows the explanation above them and
+neither re-hides nor offers retry (ACC-09).
+
+One recorded answer, no retry loop, no attempts counter (t-d7e6af5f). A wrong
+declared key records `correct=false` and resolves; a right key records
+`correct=true` and does the same (ACC-07, ACC-08). The first accepted answer is
+immutable, and every later identical or different submission is refused without
+replacing the answer, result, decision or event history (ACC-08). This
+expressly supersedes the retry wording in e-5c8f7735's first draft, which the
+later one-answer/no-retry behaviour in t-d7e6af5f already superseded in
+`docs/specs/acc.md`. e-bef5dd2a owns what the check teaches — reusable
+codebase/system understanding, the `about` subject, the diagnosis refusal and
+raiser-only authoring; e-5c8f7735's ledger block, reads and rollout boundary
+stand except for that first-draft retry wording.
+
+The human line stays: resolving a checked row appends the note echo `ACC: pass`
+or `ACC: miss on <key>`, which agrees with the stored fields
+(`rust/store.rs:7046`–`rust/store.rs:7050`). Readers and skills cut over to the
+native field and the legacy `ACC:` body-block reader is retired: a row with no
+native check is shown with no check, never silently given a generated one
+(ACC-15). The one-shot conversion of open rows whose bodies start with a legacy
+block is `scripts/migrate-acc-body-blocks.sh`, run once per board, which strips
+the block and writes the five native inputs through the same `attention update`
+path the raiser would use — rows with no block are byte-for-byte unchanged, and
+invalid legacy prose is reported, never half-written (ACC-16).
+
 ## 2026-09-21 amendment: native comprehension-check definition
 
 Board schema 31 adds an optional native Active Comprehension Check beside the decision
