@@ -30230,6 +30230,201 @@ fn a_reply_typed_while_a_refresh_is_in_flight_is_not_discarded() {
     assert_eq!(row["decision"]["note"], typed, "{row}");
 }
 
+#[test]
+fn the_check_card_answers_before_the_decision_and_never_leaks_the_key() {
+    browser_loopback_reservation_supported()
+        .expect("reserve loopback port for browser-backed server tests");
+    let fixture = Fixture::new("serve-check-card");
+    fixture.ok_json(&fixture.main, &["init", "--name", "CHECKCARD", "--json"]);
+    let keyboard = raise_carded(
+        &fixture,
+        "Answer the check by keyboard, wrongly, and decide after the miss.",
+        "codex@driver",
+        &[
+            "--kind",
+            "decision",
+            "--priority",
+            "1",
+            "--check",
+            "Which layer records the one check answer?",
+            "--check-choice",
+            "store=The Store column set",
+            "--check-choice",
+            "client=The browser DOM",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "SECRET_KEYBOARD rust/store.rs records the answer inside the write.",
+            "--check-about",
+            "rust/store.rs",
+        ],
+    );
+    let keyboard_id = keyboard["id"].as_str().unwrap();
+    let pointer = raise_carded(
+        &fixture,
+        "Answer the check by pointer, rightly, and decide after the pass.",
+        "codex@driver-2",
+        &[
+            "--kind",
+            "decision",
+            "--priority",
+            "6",
+            "--check",
+            "What does the projection omit before the answer?",
+            "--check-choice",
+            "fields=The answer and explanation fields",
+            "--check-choice",
+            "notes=Nothing is omitted",
+            "--check-answer",
+            "fields",
+            "--check-explain",
+            "SECRET_POINTER the server omits both fields from every pre-answer read.",
+            "--check-about",
+            "rust/projection.rs",
+        ],
+    );
+    let pointer_id = pointer["id"].as_str().unwrap();
+    let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
+    let origin = server.origin();
+    let chrome = launch_browser(chrome_binary());
+    let tab = decision_tab(&chrome, &origin);
+
+    // ACC-10: before any answer, neither sentinel reaches the browser, and
+    // the check projection carries no answer, explanation or result at all.
+    let page = js_value(&tab, "document.documentElement.outerHTML")
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!page.contains("SECRET_KEYBOARD"), "{page}");
+    assert!(!page.contains("SECRET_POINTER"), "{page}");
+    let probe = opened_tab(&chrome, "projection probe");
+    probe
+        .navigate_to(&format!("{origin}api/v1/needs-you"))
+        .expect("load the projection");
+    probe.wait_until_navigated().expect("projection navigation");
+    let projection = js_value(&probe, "document.body.textContent")
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!projection.contains("SECRET_KEYBOARD"), "{projection}");
+    assert!(!projection.contains("SECRET_POINTER"), "{projection}");
+    assert!(!projection.contains("\"answer\":"), "{projection}");
+    assert!(!projection.contains("\"explanation\":"), "{projection}");
+    assert!(!projection.contains("\"answered\":"), "{projection}");
+    let _ = probe.close(true);
+
+    // ACC-09: the check is first, the decision present but inert.
+    tab.wait_for_element(&ui::card(keyboard_id))
+        .expect("the keyboard card")
+        .focus()
+        .expect("focus the keyboard card");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{} [data-testid=deck-check-about]').textContent",
+                ui::card(keyboard_id)
+            )
+        ),
+        "rust/store.rs"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{} fieldset.decide-controls').disabled",
+                ui::card(keyboard_id)
+            )
+        ),
+        true,
+        "the decision must be inert until the check is answered"
+    );
+
+    // ACC-12: the digit answers the CHECK, not the inert decision. `2` is
+    // the declared-but-wrong key.
+    tab.press_key("2").expect("press 2 to answer the check");
+    tab.wait_for_element(&format!(
+        "{card} [data-check-result=miss]",
+        card = ui::card(keyboard_id)
+    ))
+    .expect("the recorded miss");
+    assert!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{} [data-testid=deck-check-explain]').textContent",
+                ui::card(keyboard_id)
+            )
+        )
+        .as_str()
+        .unwrap()
+        .contains("SECRET_KEYBOARD"),
+        "a miss shows the explanation after the answer stands"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelector('{} fieldset.decide-controls').disabled",
+                ui::card(keyboard_id)
+            )
+        ),
+        false,
+        "the miss unlocks the decision; it never withholds it"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "Boolean(document.querySelector('{} [data-testid=deck-check]'))",
+                ui::card(keyboard_id)
+            )
+        ),
+        false,
+        "there is no retry: the check form is gone"
+    );
+
+    // The unlocked decision works by the same keyboard path.
+    tab.wait_for_element(&format!("{} button.choice", ui::card(keyboard_id)))
+        .expect("an unlocked choice")
+        .focus()
+        .expect("focus the unlocked choice");
+    tab.press_key("1").expect("press 1 to decide");
+    assert_receipt(&tab, keyboard_id, "Approve - proceed");
+
+    // The pointer path on the other card: click the right check answer.
+    tab.press_key("s").expect("skip to the pointer card");
+    tab.wait_for_element(&ui::card(pointer_id))
+        .expect("the pointer card")
+        .focus()
+        .expect("focus the pointer card");
+    tab.wait_for_element(&format!(
+        "{card} [data-testid=deck-check-choice-fields]",
+        card = ui::card(pointer_id)
+    ))
+    .expect("the right check answer")
+    .click()
+    .expect("click the check answer");
+    tab.wait_for_element(&format!(
+        "{card} [data-check-result=pass]",
+        card = ui::card(pointer_id)
+    ))
+    .expect("the recorded pass");
+    tab.wait_for_element(&format!("{} button.choice", ui::card(pointer_id)))
+        .expect("the unlocked choice")
+        .click()
+        .expect("decide by pointer");
+    assert_receipt(&tab, pointer_id, "Approve - proceed");
+
+    // The results read back through the compiled CLI (ACC-07).
+    let miss = fixture.ok_json(&fixture.main, &["attention", "show", keyboard_id, "--json"]);
+    assert_eq!(miss["check"]["answered"], "client");
+    assert_eq!(miss["check"]["correct"], false);
+    let pass = fixture.ok_json(&fixture.main, &["attention", "show", pointer_id, "--json"]);
+    assert_eq!(pass["check"]["answered"], "fields");
+    assert_eq!(pass["check"]["correct"], true);
+}
+
 /// A click on an incomplete free-text answer says what is missing, puts the
 /// cursor on it, and settles nothing -- and the verdict it asks for can be
 /// taken back.

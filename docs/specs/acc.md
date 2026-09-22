@@ -428,10 +428,10 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | missing/no-check/undeclared-key paths plus a recorded answer letting a later resolve settle with no second flag; the web-answer half lands with ACC-11 |
 | `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | persisted answer/correct/time, note agreement, v32 all-or-none columns |
 | `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | right/wrong paths and immutable duplicate; serialized concurrent answers land with the ACC-11 endpoint |
-| `ACC-09` | MUST | chrome | `PLANNED` | check-first, one answer, no retry, unlock and miss explanation |
-| `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
-| `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
-| `ACC-12` | MUST | chrome | `PLANNED` | keyboard, pointer, focus, announcement and Undo |
+| `ACC-09` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | check-first card with inert decision, one answer, unlock and miss explanation |
+| `ACC-10` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | page and projection sentinel sweep; reveal only post-answer |
+| `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
+| `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | always-redacted pre-answer show/list and mutation receipts landed; digest/HTTP and post-answer state remain planned |
 | `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
@@ -457,3 +457,11 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
   from ACC-05 took effect. Requirement wording is unchanged; only §8 trace rows gained
   evidence. The v31 rebuild guard in the migration ladder was pinned to the v31 step — it had
   hardcoded "last migration" and would have silently skipped every later migration.
+
+- 2026-09-22 — the web card slice landed: the deck renders the check before an inert
+  decision (a disabled fieldset, never a withheld click), `POST /attention/{project}/{id}/check`
+  records the one answer through the same Store operation the CLI's `--check-answered`
+  resolve uses, and a real-Chrome journey sweeps the pre-answer page and projection for the
+  answer, explanation and result fields. Requirement wording is unchanged; only §8 trace
+  rows gained evidence. The route joined ADR-016's write allowlist as its one later
+  addition, documented in the pinned OpenAPI.

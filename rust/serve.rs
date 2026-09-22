@@ -697,6 +697,7 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
         parts.as_slice(),
         ["attention", _, _, "reply"]
             | ["attention", _, _, "reopen"]
+            | ["attention", _, _, "check"]
             | ["plan", _, _, "open"]
             | ["subscription", _, _, "pause" | "resume"]
     ) {
@@ -867,6 +868,48 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
     let [_, project, id, _] = parts.as_slice() else {
         unreachable!("the route shape was checked above")
     };
+    // The check answer is its own write (ACC-11): one key, through the same
+    // Store operation the CLI's `--check-answered` resolve uses, settling
+    // nothing — the row stays open for the decision the answer unlocks.
+    if parts[3] == "check" {
+        let key = strict_form_value(body, "key")
+            .ok()
+            .flatten()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let Some(key) = key else {
+            return Ok(WebResponse::Html(
+                400,
+                page(
+                    "Check answer incomplete",
+                    "<h1>Check answer incomplete</h1><p class=error>Pick one of the check's \
+                     answers.</p>",
+                ),
+            ));
+        };
+        let Ok((_, mut store)) = project_named(project) else {
+            return Ok(WebResponse::Html(
+                404,
+                page("Board not found", "<h1>Board not found</h1>"),
+            ));
+        };
+        if let Err(error) = store.answer_attention_check_from_trusted_edge(id, &actor, &key) {
+            return Ok(WebResponse::Html(
+                409,
+                page(
+                    "Check answer not recorded",
+                    &format!(
+                        "<h1>Check answer not recorded</h1><p class=error>{}</p>",
+                        escape(&error.to_string())
+                    ),
+                ),
+            ));
+        }
+        return Ok(WebResponse::Redirect(format!(
+            "/?checked={}",
+            url_encode(id)
+        )));
+    }
     let (Ok(decision), Ok(outcome), Ok(reply)) = (
         strict_form_value(body, "decision"),
         strict_form_value(body, "outcome"),
@@ -2838,6 +2881,11 @@ mod tests {
             "td.n",
             "th.n",
             ".sprint-version",
+            // `.check .subject` joined with the ACC card: the check's
+            // subject is a path, flag or tier a reader matches character by
+            // character against the codebase — the same job `.sprint-version`
+            // does against a deploy receipt (WEB-05).
+            ".subject",
         ];
         for selector in css_selectors_declaring("var(--mono)") {
             let landed = selector.split_whitespace().last().unwrap_or(&selector);
@@ -3742,7 +3790,8 @@ mod tests {
         assert_eq!(
             verbs,
             "[\"attention\", _, _, \"reply\"] | [\"attention\", _, _, \"reopen\"] \
-             | [\"plan\", _, _, \"open\"] | [\"subscription\", _, _, \"pause\" | \"resume\"]",
+             | [\"attention\", _, _, \"check\"] | [\"plan\", _, _, \"open\"] \
+             | [\"subscription\", _, _, \"pause\" | \"resume\"]",
             "the write surface moved"
         );
     }

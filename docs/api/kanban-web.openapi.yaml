@@ -20,7 +20,7 @@ info:
   version: 1.0.0
   description: |
     The read-only JSON projection the embedded operator SPA reads, plus the
-    four writes it may make.
+    form writes it may make.
 
     This document is the answer to `docs/specs/spa.md` §7 OQ-3 — *"What are the
     JSON routes called, and how are they versioned?"* — which SPA-06
@@ -68,7 +68,7 @@ info:
     5. **The version in the path is a compatibility boundary, not a release
        number.** Additive fields do not bump it; a removed or renamed field
        does, and lands under `/api/v2`. See `docs/api/README.md`.
-    6. **The four writes do not move.** They keep their current paths, their
+    6. **The form writes do not move.** They keep their current paths, their
        form encoding and their field names (SPA-10), because moving them would
        be a fifth change to the write surface disguised as a rename.
     7. **The bundle's own bytes are not API.** The app shell is served at
@@ -801,6 +801,66 @@ paths:
                   description: |
                     The note. Optional beside an authored choice; required
                     beside `custom`.
+      responses:
+        "303": { $ref: "#/components/responses/WriteRecorded" }
+        "400": { $ref: "#/components/responses/WriteRejected" }
+        "403": { $ref: "#/components/responses/Refused" }
+        "404": { $ref: "#/components/responses/DeniedOrNotFound" }
+        "409": { $ref: "#/components/responses/WriteConflict" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /attention/{project}/{id}/check:
+    post:
+      operationId: answerAttentionCheck
+      tags: [writes]
+      summary: Answer an open item's comprehension check without settling it.
+      description: |
+        `rust/serve.rs`'s `post` router, beside the reply route.
+
+        **Preconditions, in the order the handler checks them.**
+
+        1. The path is on the allowlist, or `404`.
+        2. `same_origin(request)`, or `403` (SPA-11) — the same guard the
+           reply route applies.
+        3. The actor resolves (`ServeConfig::actor_for_write`), or `400`.
+        4. The body is present and at most `MAX_REPLY_BYTES`, read to exactly
+           the declared length, or `400`.
+        5. `key` is present and non-blank, or `400` with the route's own
+           sentence.
+        6. The board resolves, or `404`.
+        7. `Store::answer_attention_check_from_trusted_edge` accepts it, or
+           `409` with the store's own sentence. The operation is the same
+           `record_check_answer` law the CLI's `--check-answered` resolve
+           uses (ACC-11): there is no second answer behaviour. A row with no
+           check, an already-answered check, an undeclared key or a resolved
+           row is refused; the row stays open.
+
+        On success: `303` to `/?checked={id}`. Nothing is settled — the
+        decision the answer unlocks is a separate `reply`.
+
+        The pre-answer projection this route's page was rendered from omits
+        `answer` and `explanation` (ACC-10); the post-answer projection a
+        refresh then reads may carry both (ACC-13).
+      x-requirement: [SPA-11, ACC-11]
+      x-store-method: Store::answer_attention_check_from_trusted_edge
+      parameters:
+        - $ref: "#/components/parameters/Project"
+        - $ref: "#/components/parameters/AttentionId"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  description: |
+                    One of the check's declared choice keys. A key the check
+                    does not declare is refused by name before any result is
+                    written (ACC-07).
+                  example: store
       responses:
         "303": { $ref: "#/components/responses/WriteRecorded" }
         "400": { $ref: "#/components/responses/WriteRejected" }

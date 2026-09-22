@@ -449,6 +449,11 @@ declare is refused before any write, a row with no check refuses the flag by
 name, and a second answer never replaces the first. After the answer is
 recorded, `attention show` reveals the answer and explanation; a reopen clears
 the recorded result with the decision, so the next resolution answers again.
+On the web card, the check sits between the body and the decision it gates:
+the decision controls stay inert behind a disabled fieldset until
+`POST /attention/{project}/{id}/check` records the one answer, a miss shows
+the explanation above the unlocked choices, and neither the answer nor the
+explanation is in any pre-answer response byte.
 
 The card is also the only way to park work on him, so the writes that would
 strand it require one. A `checkpoint --state blocked` whose `--next-action` or

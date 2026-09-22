@@ -372,6 +372,64 @@ legend {
 .alternative .consequence {
   margin-top: 0.3rem;
 }
+.check {
+  margin: 1.2rem 0 0;
+}
+.check .subject {
+  display: inline-block;
+  margin: 0 0 0.5rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--subtext);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+.check h3 {
+  max-width: 70ch;
+  margin: 0 0 0.7rem;
+  font-size: 1rem;
+}
+.check-choice {
+  display: block;
+  width: 100%;
+  margin: 0.4rem 0 0;
+  padding: 0.7rem 0.9rem;
+  text-align: left;
+  white-space: normal;
+  background: var(--surface0);
+  color: var(--text);
+}
+.check-choice .key {
+  display: inline-block;
+  min-width: 1.4em;
+  margin-right: 0.5em;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+.check.answered {
+  margin: 1.2rem 0 0;
+  padding: 0.7rem 0.9rem;
+  background: var(--surface0);
+}
+.check-result {
+  margin: 0;
+  font-weight: 600;
+}
+.check-explain {
+  max-width: 70ch;
+  margin: 0.4rem 0 0;
+  color: var(--subtext);
+}
+fieldset.decide-controls {
+  margin: 0;
+}
+fieldset.decide-controls:disabled .choice,
+fieldset.decide-controls:disabled .consequence,
+fieldset.decide-controls:disabled textarea {
+  opacity: 0.55;
+}
 .reply {
   margin-top: 1rem;
 }

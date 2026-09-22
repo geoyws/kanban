@@ -1,7 +1,7 @@
 # The operator web API
 
 `kanban-web.openapi.yaml` is the contract for the JSON projection the embedded
-operator SPA reads, and for the four writes it may make. This file says how to
+operator SPA reads, and for the form writes it may make. This file says how to
 read it, what it deliberately does not cover, and — in the appendix — which
 OWASP ASVS requirements were applied to it and which were excluded and why.
 
@@ -141,6 +141,10 @@ number**. It does not move when the product does.
   form encoding and their field names are pinned by `SPA-10` and ADR-016's
   allowlist. They are outside `/api/v1` precisely so that versioning the read
   surface can never be mistaken for permission to reshape the write surface.
+  The comprehension-check answer `POST /attention/{project}/{id}/check`
+  (ACC-11) is the one later addition to the same allowlist: same guard, same
+  form encoding, same refusal shapes as the four, one field (`key`), and it
+  settles nothing — the reply it unlocks is a separate write.
 
 ## Listing bounds
 

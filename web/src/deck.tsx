@@ -1,7 +1,7 @@
 import type { ReactElement } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Card, Choice, WriteResult } from "./api";
-import { fetchNeedsYou, postDecision, postReopen } from "./api";
+import { fetchNeedsYou, postCheckAnswer, postDecision, postReopen } from "./api";
 import {
   type CardState,
   DecisionCard,
@@ -114,6 +114,11 @@ export function Deck({ layout = "deck" }: { layout?: DeckLayout } = {}): ReactEl
   const [drafts, setDrafts] = useState<Drafts>({});
   const [customOpen, setCustomOpen] = useState<Record<string, boolean>>({});
   const [sending, setSending] = useState<Record<string, Sending>>({});
+  // A check answer in flight, by card. Deliberately NOT `sending`: that map
+  // is the decision-advance path — a card in it leaves the queue — while a
+  // check answer must keep its card current and in place (the row stays
+  // open; only its lock state changes).
+  const [checking, setChecking] = useState<Record<string, boolean>>({});
   const [refusals, setRefusals] = useState<
     Record<string, { incomplete: string | null; board: string | null }>
   >({});
@@ -529,6 +534,73 @@ export function Deck({ layout = "deck" }: { layout?: DeckLayout } = {}): ReactEl
     [answer, clearVerdict, sending],
   );
 
+  /**
+   * Answer the check on one card (ACC-09/ACC-11). The card does not leave
+   * the queue — the row stays open for the decision the answer unlocks — so
+   * the receipt is the refetched projection re-rendering the card with its
+   * result and, on a miss, the explanation above the unlocked choices. No
+   * retry, no re-hiding: the answer is recorded, pass or miss (ACC-08).
+   */
+  const onCheck = useCallback(
+    async (card: Card, key: string) => {
+      const id = card.attention.id;
+      if (sending[id] !== undefined || checking[id] === true) {
+        return;
+      }
+      setChecking((previous) => ({ ...previous, [id]: true }));
+      let result: WriteResult;
+      try {
+        result = await postCheckAnswer(card.board, id, key);
+      } catch {
+        result = { recorded: false, refusal: null, status: 0 };
+      }
+      setChecking((previous) => {
+        const { [id]: _gone, ...rest } = previous;
+        return rest;
+      });
+      if (result.recorded) {
+        ownChanges.current.set(card.board, Date.now());
+        // The reveal must land on THIS card even when another card holds a
+        // draft: `refresh` would hold the whole projection for it (SPA-16
+        // protects a composing card, and this row was locked — it was not
+        // composing). So the answer applies its own row and nothing else;
+        // the socket's next tick brings the rest.
+        try {
+          const incoming = await fetchNeedsYou();
+          setCards((previous) =>
+            previous === null
+              ? previous
+              : previous.map((row) => {
+                  if (row.attention.id !== id) {
+                    return row;
+                  }
+                  const fresh = incoming.find((each) => each.attention.id === id);
+                  return fresh === undefined ? row : fresh;
+                }),
+          );
+        } catch {
+          /* the socket will deliver the projection */
+        }
+        // Focus moves to what the answer produced: the explanation on a
+        // miss, the first unlocked choice otherwise (ACC-12).
+        window.setTimeout(() => {
+          const node = nodes.current[id];
+          node?.querySelector<HTMLElement>(".check-explain, button.choice")?.focus();
+        }, 0);
+        return;
+      }
+      setRefusal(id, {
+        board:
+          result.status === 0
+            ? "The check answer did not reach the board. Try again."
+            : (result.refusal ??
+              `The board refused this check answer (${result.status}).`),
+      });
+      window.setTimeout(() => nodes.current[id]?.focus(), 0);
+    },
+    [checking, sending, setRefusal],
+  );
+
   const onCustom = useCallback(
     (card: Card) => {
       const id = card.attention.id;
@@ -732,8 +804,13 @@ export function Deck({ layout = "deck" }: { layout?: DeckLayout } = {}): ReactEl
         if (acting.querySelector("input[name=outcome]:checked") !== null) {
           return;
         }
-        const choices = acting.querySelectorAll<HTMLButtonElement>("button.choice");
-        const choice = choices[digit];
+        // An unanswered check owns the digits (ACC-12): they answer the
+        // check, and the decision controls stay inert behind their disabled
+        // fieldset until the server holds the answer.
+        const pending =
+          acting.querySelector<HTMLButtonElement>("button.check-choice") !== null;
+        const selector = pending ? "button.check-choice" : "button.choice";
+        const choice = acting.querySelectorAll<HTMLButtonElement>(selector)[digit];
         if (choice !== undefined) {
           event.preventDefault();
           choice.click();
@@ -922,6 +999,7 @@ export function Deck({ layout = "deck" }: { layout?: DeckLayout } = {}): ReactEl
                   onCustomOpen: (item, open) =>
                     setCustomOpen((previous) => ({ ...previous, [item]: open })),
                   onChoice,
+                  onCheck,
                   onCustom,
                 }}
               />

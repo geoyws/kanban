@@ -109,6 +109,7 @@ pub const SUBSCRIPTION_PROTOCOL_VERSION: i64 = 1;
 /// can select a built-in kind before that kind has occurred on a new board.
 pub const BOARD_EVENT_KINDS: &[&str] = &[
     "archive_swept",
+    "attention_check_answered",
     "attention_raised",
     "attention_reopened",
     "attention_resolved",

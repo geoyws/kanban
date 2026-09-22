@@ -7178,6 +7178,89 @@ impl Store {
         Ok(result)
     }
 
+    /// Record the one answer to a row's check without settling it — the web
+    /// card's write (ACC-11), through the same `record_check_answer` law the
+    /// CLI's `--check-answered` resolve uses, so no second answer behaviour
+    /// can exist. The row stays open; a later resolve finds the recorded
+    /// answer and asks nothing twice (ACC-06).
+    pub(crate) fn answer_attention_check_from_trusted_edge(
+        &mut self,
+        id: &str,
+        actor: &str,
+        key: &str,
+    ) -> Result<Attention> {
+        self.answer_check_with_authorization(id, actor, actor, key, true)
+    }
+
+    fn answer_check_with_authorization(
+        &mut self,
+        id: &str,
+        authorization_actor: &str,
+        audit_actor: &str,
+        key: &str,
+        trusted_edge: bool,
+    ) -> Result<Attention> {
+        let authorization_actor = nonempty(authorization_actor, "actor")?.to_owned();
+        let audit_actor = nonempty(audit_actor, "actor")?.to_owned();
+        let key = nonempty(key, "key")?.to_owned();
+        let transaction = self.begin_write()?;
+        // Answering does not retag: old and resulting tag sets are the row's.
+        let old_tags = attention_tags(&transaction, id)?;
+        self.authz.check_write(&old_tags, &old_tags)?;
+        let existing = transaction
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?
+            .with_context(|| format!("attention {id} not found"))?;
+        if existing.status != "open" {
+            bail!(
+                "attention {id} was already resolved by {} — its check cannot be answered now",
+                existing.resolved_by.unwrap_or_else(|| "someone".into())
+            );
+        }
+        if !trusted_edge
+            && authorization_actor != OPERATOR_ACTOR
+            && authorization_actor != existing.raised_by
+        {
+            bail!(
+                "attention {id} was raised by {}; only {OPERATOR_ACTOR} or that same raiser may \
+                 answer its check",
+                existing.raised_by
+            );
+        }
+        let Some(check) = existing.check.as_ref() else {
+            bail!("attention {id} carries no comprehension check; there is nothing to answer");
+        };
+        if check.is_answered() {
+            bail!(
+                "attention {id} already records its check answer {}; a check accepts exactly \
+                 one answer",
+                check.answered.as_deref().unwrap_or("key")
+            );
+        }
+        let now = now_ms();
+        record_check_answer(&transaction, id, check, &key, now)?;
+        event(
+            &transaction,
+            existing.task_id.as_deref(),
+            "attention_check_answered",
+            Some(&audit_actor),
+            json!({
+                "attentionID": id,
+                "tags": old_tags,
+                "answered": key,
+                "correct": check.answer.as_deref() == Some(key.as_str()),
+                "answeredAt": now,
+            }),
+        )?;
+        let result =
+            transaction.query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)?;
+        transaction.commit()?;
+        let mut result = result;
+        attach_attention_tags(&self.connection, std::slice::from_mut(&mut result))?;
+        redact_attention_check(&mut result);
+        Ok(result)
+    }
+
     pub fn handoffs(
         &self,
         task: Option<&str>,
@@ -16268,16 +16351,24 @@ mod tests {
             )
             .unwrap();
         // The web card's write path records the one answer while the row is
-        // open; the projection invariant says the Store column set is the
-        // only shape, so seeding it directly is the same state.
-        store
-            .connection
-            .execute(
-                "UPDATE attention SET check_answered='store',check_correct=1,check_answered_at=99 \
-                 WHERE id=?",
-                [&raised.id],
-            )
+        // open, through the same Store operation the route calls (ACC-11).
+        let answered = store
+            .answer_attention_check_from_trusted_edge(&raised.id, OPERATOR_ACTOR, "store")
             .unwrap();
+        assert_eq!(
+            answered.check.as_ref().unwrap().answered.as_deref(),
+            Some("store")
+        );
+        assert_eq!(answered.check.as_ref().unwrap().correct, Some(true));
+        // The row is still open: the answer unlocks the decision, it does not
+        // settle anything.
+        assert_eq!(answered.status, "open");
+        // A second answer through the same operation is refused unchanged.
+        let again = store
+            .answer_attention_check_from_trusted_edge(&raised.id, OPERATOR_ACTOR, "client")
+            .unwrap_err()
+            .to_string();
+        assert!(again.contains("exactly one answer"), "{again}");
 
         // ACC-05: the definition is locked while the answer stands, even for
         // the raiser.
@@ -16324,7 +16415,7 @@ mod tests {
         let check = resolved.check.as_ref().unwrap();
         assert_eq!(check.answered.as_deref(), Some("store"));
         assert_eq!(check.correct, Some(true));
-        assert_eq!(check.answered_at, Some(99));
+        assert!(check.answered_at.is_some());
         // Post-answer reads reveal the definition's own answer.
         assert_eq!(check.answer.as_deref(), Some("store"));
         assert!(check.explanation.is_some());

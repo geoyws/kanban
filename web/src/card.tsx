@@ -44,6 +44,8 @@ export interface CardHandlers {
   onClear: (id: string) => void;
   onCustomOpen: (id: string, open: boolean) => void;
   onChoice: (card: Card, choice: Choice) => void;
+  /** Answer the card's comprehension check (ACC-11): one key, one write. */
+  onCheck: (card: Card, key: string) => void;
   onCustom: (card: Card) => void;
 }
 
@@ -210,7 +212,7 @@ export function DecisionCard({
     state.incomplete !== null && state.draft.outcome === null
       ? refusalId("incomplete")
       : undefined;
-  // The card is focusable on purpose: the deck puts focus on it so `1`-`4`
+  const locked = item.check !== undefined && item.check.answered === undefined;
   // decide without a click first, which is the whole keyboard path.
   // biome-ignore-start lint/a11y/noNoninteractiveTabindex: the deck focuses the card so the digits decide
   return (
@@ -268,6 +270,68 @@ export function DecisionCard({
           />
         </div>
       </details>
+      {/* The comprehension check sits between the facts and the decision it
+          gates (ACC-09): the reader holds the body, meets the one question
+          that names the reusable fact, and only then reaches choices that
+          can submit. Pre-answer the projection carries no `answer` and no
+          `explanation` at all, so nothing here can leak them (ACC-10). */}
+      {item.check === undefined ? null : item.check.answered === undefined ? (
+        <form
+          className="check"
+          data-testid="deck-check"
+          method="post"
+          action={`/attention/${encodeURIComponent(card.board)}/${encodeURIComponent(item.id)}/check`}
+          onSubmit={(event) => {
+            event.preventDefault();
+          }}
+          aria-labelledby={`check-q-${item.id}`}
+        >
+          <p className="subject" data-testid="deck-check-about">
+            {item.check.about}
+          </p>
+          <h3 id={`check-q-${item.id}`}>{item.check.question}</h3>
+          {item.check.choices.map((choice, index) => (
+            <button
+              type="submit"
+              className="check-choice"
+              name="key"
+              value={choice.key}
+              data-label={choice.label}
+              data-testid={`deck-check-choice-${choice.key}`}
+              key={choice.key}
+              onClick={(event) => {
+                event.preventDefault();
+                handlers.onCheck(card, choice.key);
+              }}
+            >
+              <span className="key" data-testid="deck-digit">
+                {index + 1}
+              </span>
+              {choice.label}
+            </button>
+          ))}
+        </form>
+      ) : (
+        <section
+          className="check answered"
+          data-testid="deck-check-result"
+          aria-live="polite"
+        >
+          <p
+            className="check-result"
+            data-check-result={item.check.correct === true ? "pass" : "miss"}
+          >
+            {item.check.correct === true
+              ? "Check answered — pass."
+              : `Check answered — miss on ${item.check.answered}.`}
+          </p>
+          {item.check.explanation === undefined ? null : (
+            <p className="check-explain" data-testid="deck-check-explain">
+              {item.check.explanation}
+            </p>
+          )}
+        </section>
+      )}
       <form
         className="decide"
         data-testid="deck-panel"
@@ -278,111 +342,123 @@ export function DecisionCard({
           handlers.onCustom(card);
         }}
       >
-        {recommended === null ? null : (
-          <fieldset className="recommended" data-testid="deck-recommended">
-            <legend>Recommended</legend>
-            <Answer
-              card={card}
-              choice={recommended}
-              digit={1}
-              sending={state.sending}
-              onChoice={handlers.onChoice}
-            />
-          </fieldset>
-        )}
-        {alternatives.length === 0 ? null : (
-          <div className="alternatives" data-testid="deck-answers">
-            {alternatives.map((choice, index) => (
-              <div className="alternative" key={choice.key}>
-                <Answer
-                  card={card}
-                  choice={choice}
-                  digit={index + (recommended === null ? 1 : 2)}
-                  sending={state.sending}
-                  onChoice={handlers.onChoice}
-                />
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="reply">
-          <label htmlFor={`answer-${item.id}`}>Add a note</label>
-          <textarea
-            id={`answer-${item.id}`}
-            name="reply"
-            maxLength={MAX_REPLY}
-            data-testid="deck-note"
-            value={state.draft.note}
-            onChange={(event) => handlers.onNote(item.id, event.target.value)}
-            {...(describe !== undefined && state.draft.outcome !== null
-              ? { "aria-describedby": describe }
-              : {})}
-          />
-        </div>
-        <details
-          className="custom"
-          data-custom
-          data-testid="deck-custom"
-          open={state.customOpen}
-          onToggle={(event) =>
-            handlers.onCustomOpen(item.id, (event.target as HTMLDetailsElement).open)
-          }
-        >
-          <summary>Answer in my own words</summary>
-          <fieldset className="outcomes">
-            <legend>recorded as</legend>
-            <div className="picks">
-              {OUTCOMES.map((outcome) => (
-                <label key={outcome} htmlFor={`outcome-${item.id}-${outcome}`}>
-                  <input
-                    type="radio"
-                    id={`outcome-${item.id}-${outcome}`}
-                    name="outcome"
-                    data-testid={`deck-outcome-${outcome}`}
-                    value={outcome}
-                    checked={state.draft.outcome === outcome}
-                    onChange={() => handlers.onOutcome(item.id, outcome)}
-                    {...(describe === undefined
-                      ? {}
-                      : { "aria-describedby": describe })}
+        {/* ACC-09: the decision is present but inert until the server has
+            the check answer. `disabled` on the fieldset is the whole law —
+            it cannot submit by keyboard, pointer or form association — and
+            the hint says why in words rather than leaving a grey control to
+            explain itself (ACC-12). */}
+        <fieldset className="decide-controls" disabled={locked}>
+          {recommended === null ? null : (
+            <fieldset className="recommended" data-testid="deck-recommended">
+              <legend>Recommended</legend>
+              <Answer
+                card={card}
+                choice={recommended}
+                digit={1}
+                sending={state.sending}
+                onChoice={handlers.onChoice}
+              />
+            </fieldset>
+          )}
+          {alternatives.length === 0 ? null : (
+            <div className="alternatives" data-testid="deck-answers">
+              {alternatives.map((choice, index) => (
+                <div className="alternative" key={choice.key}>
+                  <Answer
+                    card={card}
+                    choice={choice}
+                    digit={index + (recommended === null ? 1 : 2)}
+                    sending={state.sending}
+                    onChoice={handlers.onChoice}
                   />
-                  {outcome}
-                </label>
+                </div>
               ))}
             </div>
-          </fieldset>
-          <div className="actions">
-            <button
-              type="submit"
-              className="record"
-              name="decision"
-              value="custom"
-              data-testid="deck-record"
-              {...(state.sending !== null && state.sending.pressed === "custom"
-                ? { "data-pressed": "" }
+          )}
+          <div className="reply">
+            <label htmlFor={`answer-${item.id}`}>Add a note</label>
+            <textarea
+              id={`answer-${item.id}`}
+              name="reply"
+              maxLength={MAX_REPLY}
+              data-testid="deck-note"
+              value={state.draft.note}
+              onChange={(event) => handlers.onNote(item.id, event.target.value)}
+              {...(describe !== undefined && state.draft.outcome !== null
+                ? { "aria-describedby": describe }
                 : {})}
-            >
-              {state.sending !== null && state.sending.pressed === "custom"
-                ? state.sending.still
-                  ? "Still sending…"
-                  : "Sending…"
-                : "Record my answer"}
-            </button>
-            <button
-              type="button"
-              className="clear"
-              data-clear
-              data-testid="deck-clear"
-              hidden={state.draft.outcome === null}
-              onClick={() => handlers.onClear(item.id)}
-            >
-              Clear verdict
-            </button>
-            <p className="hint" data-hint data-testid="deck-hint" hidden={ready}>
-              Pick a verdict and write your reply above.
-            </p>
+            />
           </div>
-        </details>
+          <details
+            className="custom"
+            data-custom
+            data-testid="deck-custom"
+            open={state.customOpen}
+            onToggle={(event) =>
+              handlers.onCustomOpen(item.id, (event.target as HTMLDetailsElement).open)
+            }
+          >
+            <summary>Answer in my own words</summary>
+            <fieldset className="outcomes">
+              <legend>recorded as</legend>
+              <div className="picks">
+                {OUTCOMES.map((outcome) => (
+                  <label key={outcome} htmlFor={`outcome-${item.id}-${outcome}`}>
+                    <input
+                      type="radio"
+                      id={`outcome-${item.id}-${outcome}`}
+                      name="outcome"
+                      data-testid={`deck-outcome-${outcome}`}
+                      value={outcome}
+                      checked={state.draft.outcome === outcome}
+                      onChange={() => handlers.onOutcome(item.id, outcome)}
+                      {...(describe === undefined
+                        ? {}
+                        : { "aria-describedby": describe })}
+                    />
+                    {outcome}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+            <div className="actions">
+              <button
+                type="submit"
+                className="record"
+                name="decision"
+                value="custom"
+                data-testid="deck-record"
+                {...(state.sending !== null && state.sending.pressed === "custom"
+                  ? { "data-pressed": "" }
+                  : {})}
+              >
+                {state.sending !== null && state.sending.pressed === "custom"
+                  ? state.sending.still
+                    ? "Still sending…"
+                    : "Sending…"
+                  : "Record my answer"}
+              </button>
+              <button
+                type="button"
+                className="clear"
+                data-clear
+                data-testid="deck-clear"
+                hidden={state.draft.outcome === null}
+                onClick={() => handlers.onClear(item.id)}
+              >
+                Clear verdict
+              </button>
+              <p className="hint" data-hint data-testid="deck-hint" hidden={ready}>
+                Pick a verdict and write your reply above.
+              </p>
+            </div>
+          </details>
+          {locked ? (
+            <p className="hint" data-testid="deck-locked">
+              These choices unlock once the check above is answered.
+            </p>
+          ) : null}
+        </fieldset>
         {state.incomplete === null ? null : (
           <p className="error" data-refusal="incomplete" id={refusalId("incomplete")}>
             {state.incomplete}

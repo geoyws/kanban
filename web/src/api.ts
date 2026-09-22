@@ -36,6 +36,31 @@ export interface Attention {
   /** The composed sentence a row settled with before decisions were kept. */
   resolution?: string | null;
   decision?: Decision | null;
+  /** Native comprehension check (ACC); absent on rows that carry none. */
+  check?: Check;
+}
+
+/** One non-decisional check answer (ACC-03): no outcome, no recommendation. */
+export interface CheckChoice {
+  key: string;
+  label: string;
+}
+
+/**
+ * The native check as the projection serves it. Before the answer is
+ * recorded, `answer` and `explanation` are absent from the projection bytes
+ * entirely (ACC-10); once the one answer stands, both arrive with the result
+ * triple, and a reopen returns the row to the redacted shape.
+ */
+export interface Check {
+  question: string;
+  choices: CheckChoice[];
+  about: string;
+  answer?: string;
+  explanation?: string;
+  answered?: string;
+  correct?: boolean;
+  answeredAt?: number;
 }
 
 /**
@@ -174,6 +199,21 @@ export function postDecision(
   return postForm(
     `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/reply`,
     body,
+  );
+}
+
+/**
+ * Answer one card's comprehension check (ACC-11). One key, one write; the
+ * row stays open and the decision it unlocks is a separate reply.
+ */
+export function postCheckAnswer(
+  board: string,
+  id: string,
+  key: string,
+): Promise<WriteResult> {
+  return postForm(
+    `/attention/${encodeURIComponent(board)}/${encodeURIComponent(id)}/check`,
+    new URLSearchParams({ key }),
   );
 }
 

@@ -499,8 +499,9 @@ Definition authoring and schema evidence landed on 2026-09-21 for ACC-01..04, th
 raiser-only authoring half of ACC-05, and the always-redacted show/list portion of ACC-13.
 The answer slice landed on 2026-09-22 for the resolve half of ACC-05 (answered-open lock and
 reopen-clear) and all of ACC-06/07/08 at the CLI/store layer, including the v32 result
-columns. Browser, HTTP, digest/reader cutover and legacy body migration remain
-`PLANNED`; no row below claims those later slices.
+columns. The web card landed later on 2026-09-22 for ACC-09..12, including the shared POST
+endpoint and the source-redaction sweep. Digest/reader cutover and legacy body migration
+remain `PLANNED`; no row below claims those later slices.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
@@ -509,22 +510,22 @@ columns. Browser, HTTP, digest/reader cutover and legacy body migration remain
 | `ACC-03` | MUST | unit/process | `check_json_refuses_decisional_and_unknown_fields`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically` | serde refuses outcome, recommended and unknown definition fields; serialized choices never carry them or mutate the decision |
 | `ACC-04` | MUST | unit | `diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule` | every approved marker in question, choice label and explanation with the byte-exact rule sentence; `about` is intentionally outside this marker rule |
 | `ACC-05` | MUST | process | `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | only `raisedBy` may author/update, including no `geoyws` exception; the answered-open lock refuses a raiser rewrite while the answer stands; reopen clears decision and check result together and restores raiser update |
-| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | a checked row refuses a bare resolve naming its question and writes nothing; the web-recorded (store-seeded) answer lets a later resolve settle with no second flag; a no-check row refuses `--check-answered` by name and otherwise resolves as before; the browser POST half lands with ACC-11 |
+| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | a checked row refuses a bare resolve naming its question and writes nothing; the web-recorded answer lets a later resolve settle with no second flag; a no-check row refuses `--check-answered` by name and otherwise resolves as before |
 | `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | declared key records `answered`/`correct`/`answeredAt` as columns the v32 triggers keep absent-or-complete on a defined check; the `ACC: pass` / `ACC: miss on <key>` echo agrees with the stored fields and the `attention_resolved` payload; an undeclared key is refused before any write |
-| `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one right or wrong declared answer resolves with its result and echo; a second `--check-answered` after any recorded answer is refused unchanged; no attempts counter or retry path exists in the surface; concurrent submissions serialize behind the same Store transaction and the HTTP half lands with ACC-11 |
-| `ACC-09` | MUST | chrome | `PLANNED` | check-first, one answer, no retry, unlock and miss explanation |
-| `ACC-10` | MUST | chrome | `PLANNED` | HTML/JSON/script/bundle sentinel sweep |
-| `ACC-11` | MUST | http | `PLANNED` | shared POST, first-writer success and loser conflict/refusal |
-| `ACC-12` | MUST | chrome | `PLANNED` | keyboard, pointer, focus, announcement and Undo |
-| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser; successful raise may echo only in its same-write receipt; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; digest/HTTP halves remain `PLANNED` |
+| `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one right or wrong declared answer resolves with its result and echo; a second `--check-answered` after any recorded answer is refused unchanged; no attempts counter or retry path exists in the surface; concurrent submissions serialize behind the same Store transaction |
+| `ACC-09` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | check first with the `about` chip, decision inert behind a disabled fieldset until the server holds the answer, one answer with no retry control, a miss shows the explanation above the unlocked choices |
+| `ACC-10` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | pre-answer sweep of the rendered page and the `/api/v1/needs-you` projection: no sentinel, no `answer`, no `explanation`, no `answered` field anywhere in the bytes; the reveal arrives only with the post-answer projection |
+| `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | the POST carries one key through the same Store operation the CLI resolve uses; the recorded answer then settles a later resolve with no second flag; the loser-of-two-submissions conflict half is exercised at store level by the one-answer refusal and remains browser-unexercised by design (one tab, one answer) |
+| `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | digits answer the check pre-unlock and the decision after it, keyboard and pointer paths both decide, focus lands on the produced explanation/choice, pass and miss read as words with colour behind them, and Undo keeps working on the decided rows |
+| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest half remains `PLANNED` |
 | `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
 | `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
 | `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
 
-17 requirements: 17 MUST, no SHOULD or MAY. ACC-01..08 carry definition- and answer-slice
-evidence (ACC-05 and ACC-13 remain partial pending the browser halves); every other
-browser/reader/migration slice remains `PLANNED`.
+17 requirements: 17 MUST, no SHOULD or MAY. ACC-01..12 carry definition-, answer- and
+web-card-slice evidence (ACC-05 and ACC-13 remain partial pending their remaining halves);
+every reader/migration slice remains `PLANNED`.
 
 ## Watch coverage note
 
