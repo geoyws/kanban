@@ -101,6 +101,7 @@ if [[ ! -f skills/kb/SKILL.md ]]; then
         git submodule update --init skills/kb
 fi
 run 'kb skill wrapper tests' bash skills/kb/tests/kb-wrapper-tests.sh
+run 'migrate ACC body blocks' bash scripts/migrate-acc-body-blocks.test.sh
 
 # Cheapest target first, `e2e` last: it is the long one and the only one
 # that drives a browser.
