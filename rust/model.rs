@@ -2953,6 +2953,71 @@ mod tests {
         }
     }
     #[test]
+    fn diagnosis_markers_respect_case_and_word_boundaries() {
+        let choices = check_choices();
+        // The four phrases refuse case-insensitively in every text location;
+        // the row-ID scan also accepts uppercase hexadecimal digits.
+        for marker in [
+            "TODAY",
+            "Today",
+            "MEASURED",
+            "Measured",
+            "THIS ROW",
+            "The Sweep",
+            "t-1234ABcd",
+        ] {
+            for location in 0..3 {
+                let question = if location == 0 {
+                    format!("How does {marker} behave?")
+                } else {
+                    "How does the Store behave?".to_owned()
+                };
+                let choices = if location == 1 {
+                    vec![
+                        format!("store=Use {marker}"),
+                        "client=Use the client".to_owned(),
+                    ]
+                } else {
+                    choices.clone()
+                };
+                let explanation = if location == 2 {
+                    format!("The Store observed {marker}.")
+                } else {
+                    "The Store component enforces it.".to_owned()
+                };
+                let error = check_refusal(
+                    Some(&question),
+                    &choices,
+                    Some("store"),
+                    Some(&explanation),
+                    Some("rust/store.rs"),
+                );
+                assert!(error.contains(marker), "{error}");
+                assert!(error.contains("The refusal prints the offending token and the rule: a check teaches how the system works; it never reads this row's finding back."), "{error}");
+            }
+        }
+        // Word-bounded means bounded: near-misses teach instead of reciting.
+        for clean in [
+            "How does todayish versioning behave?",
+            "How does atoday behave?",
+            "How is measuredly scoped?",
+            "How does xa-1234abcd behave?",
+            "How does a-1234abc behave?",
+            "What shipped in 2026-09-211?",
+            "What shipped in 12026-09-21?",
+        ] {
+            AttentionCheck::parse(
+                Some(clean),
+                &choices,
+                Some("store"),
+                Some("The Store component enforces it."),
+                Some("rust/store.rs"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn check_json_refuses_decisional_and_unknown_fields() {
         let decisional = serde_json::from_str::<AttentionCheckChoice>(
             r#"{"key":"store","label":"Store","outcome":"approve"}"#,

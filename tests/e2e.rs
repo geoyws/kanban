@@ -19112,6 +19112,79 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
     );
 }
 #[test]
+fn native_check_refuses_a_diagnosis_shaped_raise_then_accepts_the_rewrite() {
+    let fixture = Fixture::new("native-acc-diagnosis");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ACC-DIAG", "--json"]);
+    // A typed row ID in the question is a finding read back, not teaching.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Choose after demonstrating the Store boundary.",
+            "--as",
+            "claude@driver",
+            "--check",
+            "How does t-1234abcd behave?",
+            "--check-choice",
+            "store=The Store validates it",
+            "--check-choice",
+            "client=The client validates it",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "The Store component enforces it.",
+            "--check-about",
+            "rust/store.rs",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    let refusal = refusal_object(&refused);
+    assert!(refusal.contains("t-1234abcd"), "{refusal}");
+    assert!(
+        refusal.contains(
+            "a check teaches how the system works; it never reads this row's finding back."
+        ),
+        "{refusal}"
+    );
+    let listed = fixture.ok_json(&fixture.main, &["attention", "list", "--json"]);
+    assert!(
+        listed.as_array().unwrap().is_empty(),
+        "a refused diagnosis-shaped raise still wrote: {listed}"
+    );
+    // The same raise rewritten to teach the system rule is accepted.
+    let raised = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "raise",
+            "Choose after demonstrating the Store boundary.",
+            "--as",
+            "claude@driver",
+            "--check",
+            "Where is the attention check definition validated?",
+            "--check-choice",
+            "store=The Store validates it",
+            "--check-choice",
+            "client=The client validates it",
+            "--check-answer",
+            "store",
+            "--check-explain",
+            "The Store component enforces it.",
+            "--check-about",
+            "rust/store.rs",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        raised["check"]["question"],
+        "Where is the attention check definition validated?"
+    );
+    assert_eq!(raised["check"]["about"], "rust/store.rs");
+}
+
+#[test]
 fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     let fixture = Fixture::new("native-acc-migration");
     fixture.ok_json(&fixture.main, &["init", "--name", "ACC-MIGRATE", "--json"]);

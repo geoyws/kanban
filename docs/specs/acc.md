@@ -421,9 +421,9 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | Requirement | Strength | Layer | Test name | Note |
 | --- | --- | --- | --- | --- |
 | `ACC-01` | MUST | process | `PLANNED` | full block plus partial/bounds/answer-key refusals |
-| `ACC-02` | MUST | unit | `PLANNED` | explanation and all three `about` shapes/refusal |
+| `ACC-02` | MUST | unit | `check_about_accepts_only_the_three_approved_subject_shapes` | path/file, host/tier sigil and flag/default shapes plus byte-exact mismatch sentence |
 | `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
-| `ACC-04` | MUST | unit | `PLANNED` | every agreed marker across all three text locations |
+| `ACC-04` | MUST | unit | `diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule`; `diagnosis_markers_respect_case_and_word_boundaries`; `native_check_refuses_a_diagnosis_shaped_raise_then_accepts_the_rewrite` | every approved marker in question, choice label and explanation with the byte-exact rule sentence; case/word-boundary edges plus the compiled raise-refuse-then-rewrite e2e; `about` is intentionally outside this marker rule |
 | `ACC-05` | MUST | process | `answered_check_locks_definition_and_a_later_resolve_reuses_it`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | raiser-only authoring and resolved immutability landed 2026-09-21; answered-open lock and reopen-clear/restore landed 2026-09-22 |
 | `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | missing/no-check/undeclared-key paths plus a recorded answer letting a later resolve settle with no second flag; the web-answer half lands with ACC-11 |
 | `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | persisted answer/correct/time, note agreement, v32 all-or-none columns |
