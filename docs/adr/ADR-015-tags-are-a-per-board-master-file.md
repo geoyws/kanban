@@ -65,8 +65,8 @@ why it is declared repeatable rather than last-one-wins.
 
 **Filtering by an unregistered tag is refused rather than answered.** An empty
 list reads as "nothing is tagged that", which is exactly how a typo becomes a
-wrong answer somebody acts on. `task list --tag infr` says the tag is not in the
-master file and suggests `infra`.
+wrong answer somebody acts on. `task list --tag unum/infr` says the tag is not in the
+master file and suggests `unum/infra`.
 
 **Retiring a tag rows still carry is refused, and says how many.** `--force`
 strips it from them, and the event records the count. An operator gets the
@@ -97,7 +97,7 @@ of the system it touches. Nothing about routing changed, so no existing board
 behaves differently — the migration adds two tables and attaches to nothing.
 
 `task list --tag` is the read this exists for. It composes with `--status`, so
-`--status todo --tag queuer` is "open queuer work", which previously required
+`--status todo --tag unum/queuer` is "open queuer work", which previously required
 reading titles.
 
 `attach_tags` is one query for a whole result set rather than one per row: a
@@ -118,6 +118,17 @@ the question waits for a board where flat has actually failed.
 Also not decided: **renaming a tag.** Retire-and-reattach works and is explicit;
 a rename would need to decide whether the old name stays readable in the event
 trail, and nothing yet needs it.
+
+## Correction note: 2026-09-23 — tags are `<estate>/<subsystem>`
+
+The bare subsystem names in the examples and prose above (`infr`, `infra`,
+`queuer`, `askie`) predate the slash-namespace rule and should be read as
+`<estate>/<subsystem>` — `unum/infra` and `unum/queuer` on the Unum board that
+frames this ADR, `geoyws/<subsystem>` where no estate applies (map rule
+`r-98ff7ad2`). The two `--tag` examples have been corrected in place; all other
+bare spellings above are historical. A mistyped tag is migrated with
+`tag rename`, which did not exist when the "renaming a tag" question below was
+left open.
 
 ## References
 
