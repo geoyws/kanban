@@ -6727,21 +6727,42 @@ impl Store {
     /// every other dashboard number leaves it out.
     pub fn count_gated_tasks(&self) -> Result<i64> {
         self.authz.check_read(&[])?;
-        self.connection
-            .query_row(
-                "WITH RECURSIVE gated(id) AS (\
-                     SELECT dependency.task_id FROM task_dependencies dependency \
-                     JOIN tasks prerequisite ON prerequisite.id=dependency.depends_on \
-                     WHERE prerequisite.status<>'done' \
-                     UNION \
-                     SELECT child.id FROM gated JOIN tasks child ON child.parent_id=gated.id\
-                 ) \
-                 SELECT COUNT(*) FROM tasks t JOIN gated ON gated.id=t.id \
-                 WHERE t.archived=0 AND t.type=? AND t.status NOT IN ('done','cancelled')",
-                [CLAIMABLE_TYPE],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        if !self.authz.is_enforcing() {
+            return self
+                .connection
+                .query_row(
+                    "WITH RECURSIVE gated(id) AS (\
+                         SELECT dependency.task_id FROM task_dependencies dependency \
+                         JOIN tasks prerequisite ON prerequisite.id=dependency.depends_on \
+                         WHERE prerequisite.status<>'done' \
+                         UNION \
+                         SELECT child.id FROM gated JOIN tasks child ON child.parent_id=gated.id\
+                     ) \
+                     SELECT COUNT(*) FROM tasks t JOIN gated ON gated.id=t.id \
+                     WHERE t.archived=0 AND t.type=? AND t.status NOT IN ('done','cancelled')",
+                    [CLAIMABLE_TYPE],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
+        let mut statement = self.connection.prepare(
+            "WITH RECURSIVE gated(id) AS (\
+                 SELECT dependency.task_id FROM task_dependencies dependency \
+                 JOIN tasks prerequisite ON prerequisite.id=dependency.depends_on \
+                 WHERE prerequisite.status<>'done' \
+                 UNION \
+                 SELECT child.id FROM gated JOIN tasks child ON child.parent_id=gated.id\
+             ) \
+             SELECT t.* FROM tasks t JOIN gated ON gated.id=t.id \
+             WHERE t.archived=0 AND t.type=? AND t.status NOT IN ('done','cancelled')",
+        )?;
+        let mut rows = statement
+            .query_map([CLAIMABLE_TYPE], task_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_tags(&self.connection, rows.iter_mut())?;
+        rows.retain(|task| self.authz.permits_read(&task.tags));
+        Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
     }
 
     /// The listing's WHERE clause and its bound values, shared with the count
@@ -8021,12 +8042,18 @@ impl Store {
                )
              ORDER BY t.priority,t.created_at,t.id",
         )?;
-        let rows = statement
+        let mut rows = statement
             .query_map([now], |row| {
                 let heartbeat: Option<i64> = row.get("claim_heartbeat")?;
                 Ok((task_row(row)?, heartbeat))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        attach_tags(
+            &self.connection,
+            rows.iter_mut().map(|(task, _)| task),
+        )?;
+        rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
         let mut out = Vec::new();
         for (task, heartbeat) in rows {
             let budget = task.stale_minutes.unwrap_or_default();
@@ -11787,6 +11814,111 @@ mod tests {
         assert_eq!(store.count_gated_tasks().unwrap(), 0);
     }
 
+    #[test]
+    fn managed_stale_tasks_exclude_a_tag_denied_claim_without_changing_direct_results() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "eeeeeeee-8888-4888-8888-888888888888";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-stale-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            for (id, tags) in [
+                ("t-visible-stale", Vec::new()),
+                ("t-secret-stale", vec!["secret".to_owned()]),
+            ] {
+                seed.add_task(task_input(id, id, tags, vec![]))
+                    .expect("seed stale task");
+                seed.update_task(
+                    id,
+                    UpdateTask {
+                        stale_minutes: Some(Some(0)),
+                        ..Default::default()
+                    },
+                    "seed",
+                )
+                .expect("set stale budget");
+                seed.claim(Some(id), claim_options("driver"))
+                    .expect("claim stale task");
+            }
+            seed.connection
+                .execute(
+                    "UPDATE task_claims SET heartbeat_at=0,expires_at=?",
+                    [i64::MAX],
+                )
+                .expect("age claim heartbeats");
+            let mut direct = seed
+                .stale_tasks()
+                .expect("direct stale list")
+                .into_iter()
+                .map(|row| row.task.id)
+                .collect::<Vec<_>>();
+            direct.sort();
+            assert_eq!(direct, ["t-secret-stale", "t-visible-stale"]);
+        }
+
+        let grants = authority([(ScopeTuple::Board {
+            board_id: board.to_owned(),
+        }, Capability::Read)]);
+        let managed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+        let ids = managed
+            .stale_tasks()
+            .expect("managed stale list")
+            .into_iter()
+            .map(|row| row.task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["t-visible-stale"]);
+    }
+
+    #[test]
+    fn managed_gated_count_excludes_a_tag_denied_task_without_changing_direct_count() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "eeeeeeee-9999-4999-8999-999999999999";
+        let dir = std::env::temp_dir().join(format!("kanban-tag-gated-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input("t-prerequisite", "prerequisite", vec![], vec![]))
+                .expect("seed prerequisite");
+            seed.add_task(task_input("t-visible-gated", "visible", vec![], vec![]))
+                .expect("seed visible gated task");
+            seed.add_task(task_input(
+                "t-secret-gated",
+                "secret",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret gated task");
+            for id in ["t-visible-gated", "t-secret-gated"] {
+                seed.update_task(id, dependency_update(&["t-prerequisite"]), "seed")
+                    .expect("gate task");
+            }
+            assert_eq!(seed.count_gated_tasks().expect("direct gated count"), 2);
+        }
+
+        let grants = authority([(ScopeTuple::Board {
+            board_id: board.to_owned(),
+        }, Capability::Read)]);
+        let managed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+        assert_eq!(managed.count_gated_tasks().expect("managed gated count"), 1);
+    }
     #[test]
     fn dispatcher_open_does_not_sweep_unrelated_expired_task_claims() {
         let dispatcher_path = expired_claim_board("dispatcher-open-preserves-expired-claim");
