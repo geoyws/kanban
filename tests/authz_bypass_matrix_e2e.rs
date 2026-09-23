@@ -3866,19 +3866,43 @@ fn stale_surfaces_hide_a_tag_denied_claim_and_preserve_authorized_counts() {
     estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
     for args in [
         vec![
-            "task", "add", "visible stale", "--id", "t-visible-stale", "--stale-minutes", "0",
-            "--as", "seed", "--json",
+            "task",
+            "add",
+            "visible stale",
+            "--id",
+            "t-visible-stale",
+            "--stale-minutes",
+            "0",
+            "--as",
+            "seed",
+            "--json",
         ],
         vec![
-            "task", "add", "secret stale", "--id", "t-secret-stale", "--stale-minutes", "0",
-            "--tag", "secret", "--as", "seed", "--json",
+            "task",
+            "add",
+            "secret stale",
+            "--id",
+            "t-secret-stale",
+            "--stale-minutes",
+            "0",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
         ],
     ] {
         estate.ok_json(&work_a, &args);
     }
     estate.ok_json(
         &work_a,
-        &["claim", "t-visible-stale", "--as", "visible-driver", "--json"],
+        &[
+            "claim",
+            "t-visible-stale",
+            "--as",
+            "visible-driver",
+            "--json",
+        ],
     );
     estate.ok_json(
         &work_a,
@@ -3936,8 +3960,14 @@ fn stale_surfaces_hide_a_tag_denied_claim_and_preserve_authorized_counts() {
     let authorized_stale = estate.ok_json(&work_a, &["stale", "--json"]);
     let authorized_dashboard = estate.ok_json(&work_a, &["dashboard", "--json"]);
     let authorized_projection = server.get_json("/api/v1/boards");
-    assert_eq!(authorized_stale.as_array().unwrap().len(), direct_stale.as_array().unwrap().len());
-    assert_eq!(authorized_dashboard[0]["staleTasks"], direct_dashboard[0]["staleTasks"]);
+    assert_eq!(
+        authorized_stale.as_array().unwrap().len(),
+        direct_stale.as_array().unwrap().len()
+    );
+    assert_eq!(
+        authorized_dashboard[0]["staleTasks"],
+        direct_dashboard[0]["staleTasks"]
+    );
     let authorized_projection_stale = authorized_projection["items"]
         .as_array()
         .unwrap()
@@ -3956,20 +3986,47 @@ fn gated_dashboard_count_hides_a_tag_denied_task_and_preserves_authorized_count(
     estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
     estate.ok_json(
         &work_a,
-        &["task", "add", "prerequisite", "--id", "t-prerequisite", "--as", "seed", "--json"],
-    );
-    estate.ok_json(
-        &work_a,
         &[
-            "task", "add", "visible gated", "--id", "t-visible-gated", "--depends-on",
-            "t-prerequisite", "--as", "seed", "--json",
+            "task",
+            "add",
+            "prerequisite",
+            "--id",
+            "t-prerequisite",
+            "--as",
+            "seed",
+            "--json",
         ],
     );
     estate.ok_json(
         &work_a,
         &[
-            "task", "add", "secret gated", "--id", "t-secret-gated", "--depends-on",
-            "t-prerequisite", "--tag", "secret", "--as", "seed", "--json",
+            "task",
+            "add",
+            "visible gated",
+            "--id",
+            "t-visible-gated",
+            "--depends-on",
+            "t-prerequisite",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "secret gated",
+            "--id",
+            "t-secret-gated",
+            "--depends-on",
+            "t-prerequisite",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
         ],
     );
 
@@ -3996,15 +4053,29 @@ fn attention_list_already_hides_a_tag_denied_row_and_preserves_authorized_count(
     estate.ok_json(
         &work_a,
         &[
-            "attention", "raise", "visible question", "--kind", "decision", "--as", "seed",
+            "attention",
+            "raise",
+            "visible question",
+            "--kind",
+            "decision",
+            "--as",
+            "seed",
             "--json",
         ],
     );
     estate.ok_json(
         &work_a,
         &[
-            "attention", "raise", "secret question", "--kind", "decision", "--tag", "secret",
-            "--as", "seed", "--json",
+            "attention",
+            "raise",
+            "secret question",
+            "--kind",
+            "decision",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
         ],
     );
 
@@ -4021,5 +4092,8 @@ fn attention_list_already_hides_a_tag_denied_row_and_preserves_authorized_count(
         &[tag_scope("read", &estate.id_a, "secret")],
     );
     let authorized = estate.ok_json(&work_a, &["attention", "list", "--json"]);
-    assert_eq!(authorized.as_array().unwrap().len(), direct.as_array().unwrap().len());
+    assert_eq!(
+        authorized.as_array().unwrap().len(),
+        direct.as_array().unwrap().len()
+    );
 }

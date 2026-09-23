@@ -8049,10 +8049,7 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        attach_tags(
-            &self.connection,
-            rows.iter_mut().map(|(task, _)| task),
-        )?;
+        attach_tags(&self.connection, rows.iter_mut().map(|(task, _)| task))?;
         rows.retain(|(task, _)| self.authz.permits_read(&task.tags));
         let mut out = Vec::new();
         for (task, heartbeat) in rows {
@@ -11861,9 +11858,12 @@ mod tests {
             assert_eq!(direct, ["t-secret-stale", "t-visible-stale"]);
         }
 
-        let grants = authority([(ScopeTuple::Board {
-            board_id: board.to_owned(),
-        }, Capability::Read)]);
+        let grants = authority([(
+            ScopeTuple::Board {
+                board_id: board.to_owned(),
+            },
+            Capability::Read,
+        )]);
         let managed = Store::open_with_authz(
             &path,
             AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
@@ -11909,9 +11909,12 @@ mod tests {
             assert_eq!(seed.count_gated_tasks().expect("direct gated count"), 2);
         }
 
-        let grants = authority([(ScopeTuple::Board {
-            board_id: board.to_owned(),
-        }, Capability::Read)]);
+        let grants = authority([(
+            ScopeTuple::Board {
+                board_id: board.to_owned(),
+            },
+            Capability::Read,
+        )]);
         let managed = Store::open_with_authz(
             &path,
             AuthzContext::new(Enforcement::Managed, grants, board.to_owned()),
