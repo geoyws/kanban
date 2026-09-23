@@ -352,15 +352,12 @@ worse than one that names the gap.
   board rather than a "not implemented" that would inventory what is coming.
   `SPA-06`, `SPA-07` and `SPA-09` carry their first evidence from this wave;
   the remaining routes stay owed by the epic.
-- **The four writes refuse in HTML; this contract says they refuse in JSON.**
-  Found 2026-09-19 by `t-4b9501b3`. `Refused`, `WriteRejected` and
-  `WriteConflict` each declare `application/json; charset=utf-8` with the
-  `Error` schema, and all four `POST` operations reference them; the server
-  renders a `text/html` page for every one, carrying the same sentence inside
-  the markup. The browser deck depends on that page — it parses the response
-  and reads `.error` — so this one may well be the document's to fix rather
-  than the server's, but it is a divergence either way. Held by the
-  `#[ignore]`d `the_write_refusals_answer_the_contracts_json_error_body_over_http`.
+- **CLOSED 2026-09-23 (`t-97d8d0b9`): the four writes refused in HTML while this contract said JSON.**
+  Found 2026-09-19 by `t-4b9501b3`. Resolved as a contract correction, not a behaviour change:
+  the five form `POST` operations' `400`/`403`/`409` now declare `text/html; charset=utf-8`
+  inline with the sentence in `<p class=error>`, while the shared `Refused`, `WriteRejected`
+  and `WriteConflict` components stay JSON for the `/api/v1` surface. Held by
+  `the_write_refusals_answer_the_contracts_html_error_paragraph_over_http`, un-`#[ignore]`d.
 
 ---
 

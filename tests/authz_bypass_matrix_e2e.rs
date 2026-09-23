@@ -2631,24 +2631,25 @@ fn a_whole_estate_listing_propagates_an_operational_board_failure() {
     assert!(!dashboard.status.success(), "a corrupt board was skipped");
     assert!(!String::from_utf8_lossy(&dashboard.stderr).contains(DENIED));
 }
-/// FINDING (`t-4b9501b3`, 2026-09-19): the four writes refuse in HTML, and
-/// the contract says they refuse in JSON.
+/// The form POSTs refuse on a page, and the contract now says so
+/// (`t-97d8d0b9`, resolving the `t-4b9501b3` finding of 2026-09-19).
 ///
-/// `#/components/responses/Refused`, `WriteRejected` and `WriteConflict` each
-/// declare `application/json; charset=utf-8` with the `Error` schema, and
-/// every one of the four POST operations references them. The server answers
-/// a rendered `text/html` page for all three, which is the shipped behaviour
-/// the browser deck depends on (it parses the page and reads `.error`), so
-/// the divergence may well be the document's to fix rather than the server's
-/// — but it is a divergence either way, and it is not among the ones
-/// `docs/api/README.md` records.
+/// The finding was a contract error, not a behaviour one: the writes outside
+/// `/api/v1` are form POSTs whose only consumer is
+/// `web/src/api.ts`'s `postForm`, which sends no `Accept`, parses the reply
+/// as HTML and reads the product's own sentence out of `<p class=error>`.
+/// The document declared `application/json` for them by reusing the JSON
+/// surface's `Refused`, `WriteRejected` and `WriteConflict`; each of those
+/// operations now declares `text/html; charset=utf-8` inline, and the shared
+/// components stay JSON for the `/api/v1` reads that really answer JSON.
 ///
-/// Ignored, not weakened: the shipped shape is asserted in
+/// So this case asserts the contract as corrected: the refusal is a page,
+/// served as HTML, carrying the sentence in the element the browser reads.
+/// The board-level proof that all five writes refuse at all is
 /// `the_four_web_writes_are_refused_without_identity_and_across_origins_over_http`.
 #[test]
-#[ignore = "FINDING t-4b9501b3: the write refusals answer text/html; the contract declares application/json"]
-fn the_write_refusals_answer_the_contracts_json_error_body_over_http() {
-    let estate = ManagedEstate::new("json-write-shape");
+fn the_write_refusals_answer_the_contracts_html_error_paragraph_over_http() {
+    let estate = ManagedEstate::new("html-write-shape");
     let work_a = estate.work_a.clone();
     let raised = estate.ok_json(
         &work_a,
@@ -2675,16 +2676,17 @@ fn the_write_refusals_answer_the_contracts_json_error_body_over_http() {
     );
     assert_eq!(cross.status, 403);
     assert!(
-        cross
-            .head
-            .contains("Content-Type: application/json; charset=utf-8"),
+        cross.head.contains("Content-Type: text/html; charset=utf-8"),
         "the same-origin refusal answered as {}",
         cross.head
     );
-    assert_eq!(
-        cross.body,
-        format!("{{\"error\":\"{NOT_FROM_THIS_SITE}\"}}"),
-        "the same-origin refusal is not the contract's Error body"
+    assert!(
+        cross
+            .body
+            .contains(&format!("<p class=error>{NOT_FROM_THIS_SITE}</p>")),
+        "the refusal does not carry the product's sentence in the element \
+         `web/src/api.ts` reads: {}",
+        cross.body
     );
 }
 
