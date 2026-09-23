@@ -1114,6 +1114,15 @@ ul.children li > a {
 .pill.status-defer {
   color: var(--yellow);
 }
+.tag-chip {
+  white-space: nowrap;
+}
+.tag-chip .tag-estate {
+  opacity: 0.75;
+}
+.tag-chip .tag-sub {
+  font-weight: 700;
+}
 .count {
   color: var(--subtext);
   font-size: 0.8125rem;

@@ -28588,13 +28588,30 @@ fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
     fixture.ok_json(&fixture.main, &["init", "--name", "CARDORDER", "--json"]);
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "ifca/aix-chat", "--as", "fixture-agent", "--json"],
+        &[
+            "tag",
+            "add",
+            "ifca/aix-chat",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
     );
     let carded = raise_carded(
         &fixture,
         "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
         "codex@driver",
-        &card_args(&["--kind", "blocking", "--priority", "0", "--tag", "ifca/aix-chat"], &CARD),
+        &card_args(
+            &[
+                "--kind",
+                "blocking",
+                "--priority",
+                "0",
+                "--tag",
+                "ifca/aix-chat",
+            ],
+            &CARD,
+        ),
     );
     let id = carded["id"].as_str().expect("the raised id").to_owned();
     let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
@@ -28655,9 +28672,7 @@ fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
     assert_eq!(
         js_value(
             &tab,
-            &format!(
-                "document.querySelectorAll('[data-item=\"{id}\"] .tag-chip').length"
-            ),
+            &format!("document.querySelectorAll('[data-item=\"{id}\"] .tag-chip').length"),
         ),
         1,
         "the eyebrow renders one chip per tag"
@@ -28668,12 +28683,18 @@ fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
         "the chip carries the full slash spelling"
     );
     assert_eq!(
-        js_value(&tab, &format!("({chip}).querySelector('.tag-estate').textContent.trim()")),
+        js_value(
+            &tab,
+            &format!("({chip}).querySelector('.tag-estate').textContent.trim()")
+        ),
         "ifca",
         "the dimmed prefix is the estate"
     );
     assert_eq!(
-        js_value(&tab, &format!("({chip}).querySelector('.tag-sub').textContent.trim()")),
+        js_value(
+            &tab,
+            &format!("({chip}).querySelector('.tag-sub').textContent.trim()")
+        ),
         "aix-chat",
         "the bold half is the subsystem"
     );
@@ -55481,7 +55502,14 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     let (fixture, _deployment) = rows_fixture("serve-rows-a11", "ROWSA11");
     fixture.ok_json(
         &fixture.main,
-        &["tag", "add", "ifca/aix-chat", "--as", "fixture-agent", "--json"],
+        &[
+            "tag",
+            "add",
+            "ifca/aix-chat",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
     );
     fixture.ok_json(
         &fixture.main,
@@ -55640,12 +55668,18 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
                 "the chip carries the full slash spelling"
             );
             assert_eq!(
-                js_value(&tab, &format!("({chip}).querySelector('.tag-estate').textContent.trim()")),
+                js_value(
+                    &tab,
+                    &format!("({chip}).querySelector('.tag-estate').textContent.trim()")
+                ),
                 "ifca",
                 "the dimmed prefix is the estate"
             );
             assert_eq!(
-                js_value(&tab, &format!("({chip}).querySelector('.tag-sub').textContent.trim()")),
+                js_value(
+                    &tab,
+                    &format!("({chip}).querySelector('.tag-sub').textContent.trim()")
+                ),
                 "aix-chat",
                 "the bold half is the subsystem"
             );

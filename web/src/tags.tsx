@@ -36,7 +36,7 @@ export function TagChips({ tags }: { tags: readonly string[] }): ReactElement | 
     <>
       {", tagged "}
       {tags.map((tag, at) => (
-        <span key={`${tag}-${at}`}>
+        <span key={tag}>
           {at === 0 ? null : ", "}
           <TagChip tag={tag} />
         </span>
