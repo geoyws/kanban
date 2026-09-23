@@ -119,6 +119,14 @@ what applies to them (`Registry::rules_targeting_any`, the multi-board twin of
 the single-board path's `rules_targeting_board`). A search that read no board
 returns no rule text: an empty board set is not a wildcard.
 
+## Addendum: 2026-09-23 — subsystem selectors are `<estate>/<subsystem>`
+
+The bare `aix` mention in Context and the lowercase-subsystem selector family in
+Decision predate the slash-namespace rule: subsystem tags are
+`<estate>/<subsystem>` (`geoyws/<subsystem>` where no estate applies; map rule
+`r-98ff7ad2`). Historical rows and prose above keep their original spelling. A
+mistyped tag is migrated with `tag rename`.
+
 ## References
 
 - [ADR-015](ADR-015-tags-are-a-per-board-master-file.md)

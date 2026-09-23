@@ -26,7 +26,7 @@ creating a second global tag registry.
 ## Decision
 
 A project or global rule may carry zero or more task-tag selectors, exposed as
-repeatable `--tag NAME` and serialized as `taskTags`. Zero preserves today's
+repeatable `--tag <estate>/<subsystem>` and serialized as `taskTags`. Zero preserves today's
 meaning: the rule applies to every task inside its board scope. Several task
 tags are an OR set: a rule matches when the addressed task carries at least one
 of them.
@@ -68,6 +68,14 @@ small active rule set.
 A canonical tag spelling now carries cross-board semantic weight. That is
 intentional but does not guarantee identical descriptions; operators should
 reuse a name only for the same subsystem concept.
+
+## Correction note: 2026-09-23 — task-tag selectors are `<estate>/<subsystem>`
+
+The old `--tag` syntax line and the bare `aix` / `px` subsystem names above predate
+the slash-namespace rule: task-tag selectors are `<estate>/<subsystem>`
+(`geoyws/<subsystem>` where no estate applies; map rule `r-98ff7ad2`), and the
+syntax line has been corrected in place. All other bare spellings above are
+historical. A mistyped tag is migrated with `tag rename`.
 
 ## References
 
