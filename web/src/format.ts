@@ -92,8 +92,3 @@ export function aOrAn(word: string): string {
 export function stamp(ms: number): string {
   return `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")}Z`;
 }
-
-/** `rust/serve.rs`'s `tag_list`: what a row is about, as a trailing clause. */
-export function tagSentence(tags: readonly string[]): string {
-  return tags.length === 0 ? "" : `, tagged ${tags.join(", ")}`;
-}

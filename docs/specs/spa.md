@@ -705,6 +705,42 @@ the page enumerates nothing `SPA-08` withholds.
 shell that answers `404` for an unknown name and so becomes an existence oracle ahead of the
 projection, fails this requirement.
 
+### Tag namespaces read as chips
+
+**SPA-59** — tags render as chips with the estate dimmed and the subsystem bold.
+Strength: MUST · Layer: chrome · Source: tag-namespace sweep `t-f46a2b8a`.
+Every `, tagged …` clause the bundle renders — the deck eyebrow (`web/src/card.tsx`), the
+board rows and rule summaries (`web/src/pages/board.tsx`), the plan rows (`plans.tsx`), the
+search results (`search.tsx`), and the task header and attention rows (`task.tsx`) — renders
+one `.tag-chip` per tag through the shared `TagChips` helper (`web/src/tags.tsx`): the estate
+prefix in `.tag-estate` dimmed, the subsystem in `.tag-sub` bold, and the full slash spelling
+in `data-tag`. A tag with no slash renders whole and bold — there is no prefix to dim. The
+styling adds no colour token, no hex literal, no radius and no border, so SPA-56's arithmetic
+is untouched.
+*Failure behaviour:* a joined plain-text tag list, or a chip that drops either half of the
+namespace, fails this requirement.
+
+**SPA-60** — a tag carried in a URL is percent-encoded or a query parameter.
+Strength: MUST · Layer: chrome · Source: tag-namespace sweep `t-f46a2b8a`.
+No route carries a tag as a bare path segment: a value that may contain `/` and is placed in a
+path is percent-encoded (`ifca/aix-chat` travels as `ifca%2Faix-chat`) and decoded once by the
+router, or it travels as a query parameter, as the search query already does (`/search?q=`).
+Recon 2026-09-23: no route carries a tag today — the Boards index lists counts and no tags, and
+the router names no tag parameter — so this requirement pins the rule prospectively. Every
+board, task, sprint and deployment link already encodes its segments with `encodeURIComponent`,
+which is the mechanism this rule names.
+*Failure behaviour:* an address bar holding a bare `estate/subsystem` as two segments where one
+value belongs, or a router that decodes it twice or not at all, fails this requirement.
+
+**SPA-61** — prose renders the slash spelling.
+Strength: MUST · Layer: chrome · Source: tag-namespace sweep `t-f46a2b8a`; rule `r-98ff7ad2`.
+Running prose renders a namespaced tag as `estate/subsystem` (`ifca/aix-chat`), never the
+hyphen form: the subscription sentence's `tagged …` clause (`web/src/pages/subscriptions.tsx`),
+the chips' text and `data-tag` (SPA-59), and any error or count copy that names a tag. The
+hyphen form (`geoyws-orchestration`) is superseded wherever this slice writes.
+*Failure behaviour:* a rendered tag reading `estate-subsystem` with a hyphen where the namespace
+rule writes a slash fails this requirement.
+
 ## 4. Acceptance examples
 
 Given/When/Then in plain prose. Each heading names the requirement IDs it proves.
@@ -848,6 +884,30 @@ script execution disabled,
 measured for the current `/` — recorded as a comparison against that baseline, with no byte
 target asserted — and the scriptless load renders only the shell, which is the retirement of
 WEB-56 and WEB-58 this specification records rather than a defect.
+
+### A15 — tag chips (SPA-59)
+
+*Given* a board with a row tagged `ifca/aix-chat`,
+*when* George opens that board's page in real Chrome,
+*then* the row's meta sentence ends in one `.tag-chip` whose `.tag-estate` reads `ifca`,
+whose `.tag-sub` reads `aix-chat` in a bold weight with the estate dimmed beside it, whose
+`data-tag` is the full `ifca/aix-chat`, and whose chip never wraps mid-tag; the same chip
+shape ends the deck eyebrow, the plan rows, the search results and the task header.
+
+### A16 — a slash in the address (SPA-60)
+
+*Given* a task whose id contains `/`, `?` and `#`,
+*when* George follows its board-page link in real Chrome,
+*then* the address bar carries each of those characters percent-encoded
+(`t-mobile%2Fopaque%3F%23`), the router decodes the one segment back to the one id, and the
+task page mounts; no tag or id ever travels as two bare segments.
+
+### A17 — prose keeps the slash (SPA-61)
+
+*Given* a subscription narrowed to the tag `ifca/aix-chat`,
+*when* George reads its sentence on `/subscriptions` in real Chrome,
+*then* the clause reads `tagged ifca/aix-chat` with a slash, and the same slash spelling is
+what every chip's text and `data-tag` carry — nowhere does the hyphen form appear.
 
 ### Categories deliberately not exercised here, and why
 
@@ -1014,14 +1074,18 @@ row that must write one.
 | `SPA-56` | MUST | unit | `the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit` | landed 2026-09-19 over the bundle's own stylesheet: its `:root` block is asserted equal to the served `CSS`'s, no hex is written outside it, and WEB-48/49/50's arithmetic re-runs on the bundle's tokens (the AA pair list is now one `AA_TOKEN_PAIRS` const both proofs read). Not re-run over the bundle yet, because the rules they judge have not moved into it: the `.pill` clause of `overlay_never_sits_on_surface0_unit`, and `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` and `prose_blocks_are_bounded_to_seventy_characters_unit` — those arrive with the deck (`t-1f495a7f`, `t-bf255880`) |
 | `SPA-57` | MUST | unit | `the_document_references_no_third_party_unit` | extended by `t-992e40aa` to sweep the bundle as well as the document |
 | `SPA-58` | MUST | chrome | `an_unknown_board_says_board_not_found_in_real_chrome` | landed 2026-09-20 with `t-208ec763`: `/board/NO-SUCH-BOARD` mounts and reads `Board not found` with no generic failure sentence and no `board-refusal` paragraph, and the known board loaded in the same tab still renders its rows. `an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http` holds the two statuses the state is derived from — the shell is `200` and byte-identical for a known and an unknown name, the projection is `404` with `{"error":"denied or not found"}` — so a shell that became an existence oracle and a projection that stopped refusing fail separately. The row that asked for this measured a `500` on 2026-09-18 at `b98e81e`, before the SPA cutover (`t-bf255880`) deleted the arm that produced it |
+| `SPA-59` | MUST | chrome | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: seeds `t-rows-namespaced` tagged `ifca/aix-chat` and asserts exactly one `.tag-chip` on its row, `data-tag` the full slash spelling, `.tag-estate` reading `ifca` at computed opacity `0.75`, `.tag-sub` reading `aix-chat` at computed weight `700`. `the_card_reads_in_the_adr_042_order_in_real_chrome` asserts the same chip split on the deck eyebrow. |
+| `SPA-60` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | the journey proves percent-encoded navigation generally — it follows the opaque id as `/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23` and the task page mounts. No route carries a tag yet (recon 2026-09-23: the Boards index lists no tags, the router names no tag parameter), so the rule is prospective and this case is its standing encoding proof, not a tag-URL assertion. |
+| `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
 
-**Counts.** 58 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 44 `chrome`, 6
+**Counts.** 61 requirements, all `MUST`, no `SHOULD` and no `MAY`. By layer: 47 `chrome`, 6
 `http`, 5 `unit`, 3 `process`. By group: identity 3 (`SPA-01`..`SPA-03`), readiness 2
 (`SPA-04`..`SPA-05`), the JSON projection 8 (`SPA-06`..`SPA-13`), the Needs-you deck 21
 (`SPA-14`..`SPA-34`), the read pages 8 (`SPA-35`..`SPA-42`), decided/plans/subscriptions/sprints
 and deployments 5 (`SPA-43`..`SPA-47`), the live channel 2 (`SPA-48`..`SPA-49`), payload 1
 (`SPA-50`), what is retired 1 (`SPA-51`), the rendered result keeping ADR-046 6
-(`SPA-52`..`SPA-57`), and a board that cannot be read 1 (`SPA-58`).
+(`SPA-52`..`SPA-57`), a board that cannot be read 1 (`SPA-58`), and tag namespaces 3
+(`SPA-59`..`SPA-61`).
 
 **How the WEB figures below are counted.** A requirement *preserves* a `WEB-nn` when its
 `Source` line says so; `SPA-51` is excluded because it retires two WEB requirements rather than
@@ -1124,3 +1188,12 @@ absent from both the detail and the index).
   status changed, so `docs/api/kanban-web.openapi.yaml` is unchanged; the divergence
   `docs/api/README.md` recorded for these three cases is closed there.
   `docs/testing/compiled-rust-e2e-matrix.md` carries the same row verbatim.
+- `2026-09-23` — `t-f46a2b8a` added `SPA-59`..`SPA-61` (tag namespaces). Recon: tags render
+  at `tagSentence` in `web/src/format.ts` (serving `board.tsx` ×2, `plans.tsx`, `search.tsx`,
+  `task.tsx` ×2) and inline in the deck eyebrow (`web/src/card.tsx`); no tag list exists on the
+  Boards page and no route carries a tag, so `SPA-60` pins its rule prospectively. All seven
+  sites now render the shared `TagChips` helper (`web/src/tags.tsx`), and the dead string
+  helper is deleted. Spelling throughout is the slash form per rule `r-98ff7ad2` — the brief's
+  hyphen form is superseded here. §8 names the three carrier cases and A15–A17 prove one
+  requirement each.
+  `docs/testing/compiled-rust-e2e-matrix.md` carries the same rows verbatim.

@@ -14,9 +14,10 @@
 
 import type { ReactElement } from "react";
 import type { Attention } from "../api";
-import { ago, aOrAn, cardQuestion, stamp, statusLabel, tagSentence } from "../format";
+import { ago, aOrAn, cardQuestion, stamp, statusLabel } from "../format";
 import type { Route } from "../router";
 import { useProjection } from "../shell";
+import { TagChips } from "../tags";
 
 /** `rust/model.rs`'s `Task`, as the projection serialises it. */
 export interface Task {
@@ -232,7 +233,7 @@ export default function TaskPage({ route }: { route: Route }): ReactElement {
         </span>
         {" at "}
         <Priority priority={task.priority} level={task.priorityLevel} />
-        {tagSentence(task.tags)}
+        <TagChips tags={task.tags} />
         {", filed as "}
         <code>{task.id}</code>
       </p>
@@ -403,7 +404,7 @@ function AttentionRow({
       <p className="meta">
         {`${aOrAn(kind)} ${kind} ask, raised by ${item.raisedBy} ${ago(item.createdAt)} at `}
         <Priority priority={item.priority} level={item.priorityLevel} />
-        {tagSentence(item.tags)}
+        <TagChips tags={item.tags} />
         {item.taskID === null || item.taskID === undefined ? null : (
           <>
             {", about "}

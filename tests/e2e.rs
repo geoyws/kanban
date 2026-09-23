@@ -28586,11 +28586,15 @@ fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
         .expect("reserve loopback port for browser-backed server tests");
     let fixture = Fixture::new("serve-card-order");
     fixture.ok_json(&fixture.main, &["init", "--name", "CARDORDER", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "ifca/aix-chat", "--as", "fixture-agent", "--json"],
+    );
     let carded = raise_carded(
         &fixture,
         "PARKED - until an account is assigned to @@hax. The long form, unchanged.",
         "codex@driver",
-        &card_args(&["--kind", "blocking", "--priority", "0"], &CARD),
+        &card_args(&["--kind", "blocking", "--priority", "0", "--tag", "ifca/aix-chat"], &CARD),
     );
     let id = carded["id"].as_str().expect("the raised id").to_owned();
     let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
@@ -28642,6 +28646,97 @@ fn the_card_reads_in_the_adr_042_order_in_real_chrome() {
         ),
         "Record my answer",
         "the own-words submit has to say what pressing it does"
+    );
+    // `drop(server)` closes the test once every assertion below has run.
+    // SPA-59 -- the eyebrow's tag clause is one chip per tag, not a joined
+    // string: the estate dimmed, the subsystem bold, the full slash spelling
+    // on the chip itself.
+    let chip = format!("document.querySelector('[data-item=\"{id}\"] .tag-chip')");
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!(
+                "document.querySelectorAll('[data-item=\"{id}\"] .tag-chip').length"
+            ),
+        ),
+        1,
+        "the eyebrow renders one chip per tag"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("({chip}).getAttribute('data-tag')")),
+        "ifca/aix-chat",
+        "the chip carries the full slash spelling"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("({chip}).querySelector('.tag-estate').textContent.trim()")),
+        "ifca",
+        "the dimmed prefix is the estate"
+    );
+    assert_eq!(
+        js_value(&tab, &format!("({chip}).querySelector('.tag-sub').textContent.trim()")),
+        "aix-chat",
+        "the bold half is the subsystem"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("getComputedStyle(({chip}).querySelector('.tag-estate')).opacity"),
+        ),
+        "0.75",
+        "the estate is dimmed"
+    );
+    assert_eq!(
+        js_value(
+            &tab,
+            &format!("getComputedStyle(({chip}).querySelector('.tag-sub')).fontWeight"),
+        ),
+        "700",
+        "the subsystem is bold"
+    );
+    // SPA-61 -- running prose keeps the slash spelling too: the subscription
+    // sentence names the tag exactly as the chip does, never hyphenated.
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "subscription",
+            "add",
+            "--id",
+            "sub-order-tags",
+            "--kind",
+            "task_added",
+            "--tag",
+            "ifca/aix-chat",
+            "--consumer",
+            "cardorder.fixture",
+            "--action",
+            "deliver-exact-row",
+            "--timeout-ms",
+            "30000",
+            "--max-retries",
+            "3",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "geoyws",
+            "--json",
+        ],
+    );
+    go(&tab, &origin, "/subscriptions");
+    wait_for_mounted_page(&tab, "[data-subscription=\"sub-order-tags\"]");
+    let sentence = js_value(
+        &tab,
+        "document.querySelector('[data-subscription=\"sub-order-tags\"]').textContent",
+    );
+    let sentence = sentence.as_str().expect("the subscription row's text");
+    assert!(
+        sentence.contains("tagged ifca/aix-chat"),
+        "the subscription sentence keeps the slash spelling: {sentence}"
+    );
+    assert!(
+        !sentence.contains("ifca-aix-chat"),
+        "the hyphen form is superseded: {sentence}"
     );
     drop(server);
 }
@@ -55384,6 +55479,31 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
     browser_loopback_reservation_supported()
         .expect("reserve loopback port for browser-backed server tests");
     let (fixture, _deployment) = rows_fixture("serve-rows-a11", "ROWSA11");
+    fixture.ok_json(
+        &fixture.main,
+        &["tag", "add", "ifca/aix-chat", "--as", "fixture-agent", "--json"],
+    );
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "The row tagged by namespace",
+            "--id",
+            "t-rows-namespaced",
+            "--type",
+            "task",
+            "--status",
+            "todo",
+            "--priority",
+            "P2",
+            "--tag",
+            "ifca/aix-chat",
+            "--as",
+            "fixture-agent",
+            "--json",
+        ],
+    );
     let server = spawn_server_with_actor_header(&fixture, Some("X-Auth-Request-Email"));
     let origin = server.origin();
     let chrome = launch_browser(chrome_binary());
@@ -55501,6 +55621,49 @@ fn read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome() {
             assert_eq!(
                 p0["radius"], "0px",
                 "the priority is rounded, so it is a pill again: {measured}"
+            );
+            // SPA-59 -- the namespaced row's tag clause is one chip per tag:
+            // the estate dimmed, the subsystem bold, the full slash spelling
+            // on the chip itself.
+            let chip = "document.querySelector('[data-task=t-rows-namespaced] .tag-chip')";
+            assert_eq!(
+                js_value(
+                    &tab,
+                    "document.querySelectorAll('[data-task=t-rows-namespaced] .tag-chip').length",
+                ),
+                1,
+                "the namespaced row renders one chip per tag: {measured}"
+            );
+            assert_eq!(
+                js_value(&tab, &format!("({chip}).getAttribute('data-tag')")),
+                "ifca/aix-chat",
+                "the chip carries the full slash spelling"
+            );
+            assert_eq!(
+                js_value(&tab, &format!("({chip}).querySelector('.tag-estate').textContent.trim()")),
+                "ifca",
+                "the dimmed prefix is the estate"
+            );
+            assert_eq!(
+                js_value(&tab, &format!("({chip}).querySelector('.tag-sub').textContent.trim()")),
+                "aix-chat",
+                "the bold half is the subsystem"
+            );
+            assert_eq!(
+                js_value(
+                    &tab,
+                    &format!("getComputedStyle(({chip}).querySelector('.tag-estate')).opacity"),
+                ),
+                "0.75",
+                "the estate is dimmed"
+            );
+            assert_eq!(
+                js_value(
+                    &tab,
+                    &format!("getComputedStyle(({chip}).querySelector('.tag-sub')).fontWeight"),
+                ),
+                "700",
+                "the subsystem is bold"
             );
         }
         let tables = measure(&tab, TABLE_SWEEP, "the table sweep");
