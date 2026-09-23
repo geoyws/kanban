@@ -17,9 +17,10 @@
 import type { ReactElement } from "react";
 import type { Listing } from "../api";
 import { Priority } from "../card";
-import { aOrAn, statusLabel, tagSentence } from "../format";
+import { aOrAn, statusLabel } from "../format";
 import type { Route } from "../router";
 import { Link, useProjection } from "../shell";
+import { TagChips } from "../tags";
 
 /** `rust/model.rs`'s `TASK_STATUSES`: the pipeline, in its own order. */
 const STATUSES = [
@@ -117,7 +118,7 @@ export default function BoardPage({ route }: { route: Route }): ReactElement {
                 <details className="rule" key={rule.id} data-rule={rule.id}>
                   <summary>
                     <code>{rule.id}</code> {rule.headline}
-                    {tagSentence(rule.tags)}
+                    <TagChips tags={rule.tags} />
                   </summary>
                   <pre>{rule.body}</pre>
                 </details>
@@ -156,7 +157,7 @@ export default function BoardPage({ route }: { route: Route }): ReactElement {
                         {task.lane === null || task.lane === undefined
                           ? null
                           : `, in lane ${task.lane}`}
-                        {tagSentence(task.tags)}
+                        <TagChips tags={task.tags} />
                         {openAttention === 0 ? null : (
                           <>
                             , with{" "}

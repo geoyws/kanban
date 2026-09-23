@@ -298,7 +298,7 @@ became a MUST on 2026-09-18. By layer,
 test at the layer §3 assigns it. WEB-40 moved from `unit` to `chrome` with
 `t-bf255880` wave 1.
 
-## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-58
+## Requirements trace — `docs/specs/spa.md` SPA-01..SPA-61
 
 One row per requirement, on branch `docs/t-eed0a923-spa-spec` at 2026-09-19:
 commit `e3ae94a`. The specification is at `Draft — gate requested 2026-09-19`;
@@ -380,8 +380,11 @@ measures rather than re-pointed at the new one (SPA-51).
 | `SPA-56` | MUST | unit | `the_bundle_stylesheet_keeps_the_token_block_and_its_contrast_unit` | landed 2026-09-19 over the bundle's own stylesheet: its `:root` block is asserted equal to the served `CSS`'s, no hex is written outside it, and WEB-48/49/50's arithmetic re-runs on the bundle's tokens (the AA pair list is now one `AA_TOKEN_PAIRS` const both proofs read). Not re-run over the bundle yet, because the rules they judge have not moved into it: the `.pill` clause of `overlay_never_sits_on_surface0_unit`, and `no_heading_or_link_carries_a_glyph_prefix_unit`, `the_type_scale_is_declared_and_nothing_is_tracked_out_unit`, `the_stylesheet_names_one_serif_and_reserves_mono_for_code_unit` and `prose_blocks_are_bounded_to_seventy_characters_unit` — those arrive with the deck (`t-1f495a7f`, `t-bf255880`) |
 | `SPA-57` | MUST | unit | `the_document_references_no_third_party_unit` | extended by `t-992e40aa` to sweep the bundle as well as the document |
 | `SPA-58` | MUST | chrome | `an_unknown_board_says_board_not_found_in_real_chrome` | landed 2026-09-20 with `t-208ec763`: `/board/NO-SUCH-BOARD` mounts and reads `Board not found` with no generic failure sentence and no `board-refusal` paragraph, and the known board loaded in the same tab still renders its rows. `an_unknown_board_answers_a_404_projection_under_a_200_shell_over_http` holds the two statuses the state is derived from — the shell is `200` and byte-identical for a known and an unknown name, the projection is `404` with `{"error":"denied or not found"}` — so a shell that became an existence oracle and a projection that stopped refusing fail separately. The row that asked for this measured a `500` on 2026-09-18 at `b98e81e`, before the SPA cutover (`t-bf255880`) deleted the arm that produced it |
+| `SPA-59` | MUST | chrome | `read_pages_are_rows_with_one_pill_and_a_mono_priority_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: seeds `t-rows-namespaced` tagged `ifca/aix-chat` and asserts exactly one `.tag-chip` on its row, `data-tag` the full slash spelling, `.tag-estate` reading `ifca` at computed opacity `0.75`, `.tag-sub` reading `aix-chat` at computed weight `700`. `the_card_reads_in_the_adr_042_order_in_real_chrome` asserts the same chip split on the deck eyebrow. |
+| `SPA-60` | MUST | chrome | `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records` | the journey proves percent-encoded navigation generally — it follows the opaque id as `/task/MOBILE-JOURNEY/t-mobile%2Fopaque%3F%23` and the task page mounts. No route carries a tag yet (recon 2026-09-23: the Boards index lists no tags, the router names no tag parameter), so the rule is prospective and this case is its standing encoding proof, not a tag-URL assertion. |
+| `SPA-61` | MUST | chrome | `the_card_reads_in_the_adr_042_order_in_real_chrome` | landed 2026-09-23 with `t-f46a2b8a`: raises the card tagged `ifca/aix-chat`, asserts the eyebrow chip's `data-tag` is the slash spelling, then seeds `sub-order-tags` on the same tag and asserts the `/subscriptions` row's sentence contains `tagged ifca/aix-chat` and nowhere contains `ifca-aix-chat` — the hyphen form is superseded. |
 
-58 requirements: 58 MUST, no SHOULD and no MAY. By layer, 44 `chrome`, 6
+61 requirements: 61 MUST, no SHOULD and no MAY. By layer, 47 `chrome`, 6
 `http`, 5 `unit` and 3 `process`. A requirement *preserves* a `WEB-nn` when
 its specification `Source` line says so, which excludes SPA-51 — it retires
 two WEB requirements rather than preserving any: on that rule 42 requirements

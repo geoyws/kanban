@@ -1421,6 +1421,22 @@ ul.children li > a {
   color: var(--yellow);
 }
 
+/* A tag chip names its namespace without shouting it: the estate prefix is
+   dimmed by weight of ink rather than by a new colour — no hex here, so the
+   token block SPA-56 pins is untouched — and the subsystem carries the bold
+   the row's title already uses. The chip never wraps mid-tag (SPA-59). */
+.tag-chip {
+  white-space: nowrap;
+}
+
+.tag-chip .tag-estate {
+  opacity: 0.75;
+}
+
+.tag-chip .tag-sub {
+  font-weight: 700;
+}
+
 .count {
   color: var(--subtext);
   font-size: 0.8125rem;

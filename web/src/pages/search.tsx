@@ -14,10 +14,11 @@
  */
 
 import type { ReactElement } from "react";
-import { aOrAn, tagSentence } from "../format";
+import { aOrAn } from "../format";
 import type { Route } from "../router";
 import { navigate } from "../router";
 import { useProjection } from "../shell";
+import { TagChips } from "../tags";
 
 /** `rust/model.rs`'s `SearchResult`, as the projection serialises it. */
 interface SearchResult {
@@ -145,7 +146,7 @@ function Results({ page }: { page: SearchPage }) {
               {result.lane === null || result.lane === undefined
                 ? ""
                 : `, in lane ${result.lane}`}
-              {tagSentence(result.tags)}
+              <TagChips tags={result.tags} />
             </p>
             <p className="body">{result.snippet}</p>
             <p className="citation">

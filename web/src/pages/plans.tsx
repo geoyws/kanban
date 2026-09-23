@@ -3,10 +3,11 @@ import { useState } from "react";
 import type { Listing } from "../api";
 import { postForm } from "../api";
 import { Priority } from "../card";
-import { ago, statusLabel, tagSentence } from "../format";
+import { ago, statusLabel } from "../format";
 import type { Route } from "../router";
 import { navigate } from "../router";
 import { useProjection } from "../shell";
+import { TagChips } from "../tags";
 import { AppLink, PageState } from "./sprints";
 
 /**
@@ -92,7 +93,7 @@ function PlanArticle({
         </a>{" "}
         as <code>{plan.id}</code> at{" "}
         <Priority priority={plan.priority} level={plan.priorityLevel} />
-        {tagSentence(plan.tags)}
+        <TagChips tags={plan.tags} />
       </p>
       {card.children.length === 0 ? null : (
         <>

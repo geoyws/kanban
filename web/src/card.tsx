@@ -1,6 +1,7 @@
 import type { ReactElement } from "react";
 import type { Card, Choice } from "./api";
 import { ago, cardQuestion } from "./format";
+import { TagChips } from "./tags";
 
 /**
  * One decision card, in the order ADR-042 §5 fixes and the deck renders:
@@ -244,7 +245,7 @@ export function DecisionCard({
         {`, ${ago(item.createdAt)} · `}
         <Priority priority={item.priority} level={item.priorityLevel} />
         <TaskSentence card={card} />
-        {item.tags.length === 0 ? null : `, tagged ${item.tags.join(", ")}`}
+        <TagChips tags={item.tags} />
       </p>
       <h2 id={`q-${item.id}`}>{cardQuestion(item.question, item.body)}</h2>
       {/* The context and the long form come before the answers in DOM and
