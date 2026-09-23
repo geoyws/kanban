@@ -2676,7 +2676,9 @@ fn the_write_refusals_answer_the_contracts_html_error_paragraph_over_http() {
     );
     assert_eq!(cross.status, 403);
     assert!(
-        cross.head.contains("Content-Type: text/html; charset=utf-8"),
+        cross
+            .head
+            .contains("Content-Type: text/html; charset=utf-8"),
         "the same-origin refusal answered as {}",
         cross.head
     );
