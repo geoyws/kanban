@@ -815,10 +815,75 @@ paths:
                     beside `custom`.
       responses:
         "303": { $ref: "#/components/responses/WriteRecorded" }
-        "400": { $ref: "#/components/responses/WriteRejected" }
-        "403": { $ref: "#/components/responses/Refused" }
+        "400":
+          description: |
+            The request was wrong — no choice named, a body that was empty or
+            over `MAX_REPLY_BYTES` (4096), a body that was not UTF-8, a
+            malformed form encoding, a free-text answer missing its verdict or
+            its words, or an actor header that failed validation. The row is
+            untouched, and the refusal names what is missing so supplying it
+            and submitting again works without a reload (SPA-19).
+
+            **This is a form POST, so the refusal is a page.** The body is the
+            one refusal document `page` renders (`rust/serve.rs:2024`), and the
+            sentence is the text of its `<p class=error>` — the element
+            `web/src/api.ts`'s `postForm` parses out to put the route's own
+            words under the control that was pressed. The headings are the
+            route's own: `Choice required`
+            (`rust/serve.rs:993`-`rust/serve.rs:998`), `Answer incomplete`
+            (`rust/serve.rs:940`-`rust/serve.rs:954`), `Invalid actor`
+            (`rust/serve.rs:721`-`rust/serve.rs:730`). The one exception is a
+            malformed form encoding, which answers `<h1>Invalid reply</h1>`
+            with no `<p class=error>` at all
+            (`rust/serve.rs:918`-`rust/serve.rs:921`); `postForm` then has only
+            the status to report. The JSON `Error` body is the `/api/v1`
+            surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Choice required</h1><p class=error>Pick one of the item's choices, or write your own answer.</p>"
+        "403":
+          description: |
+            **The action did not come from this site.** The same-origin gate
+            refused: `Origin`'s authority did not equal `Host`, or one of the
+            two headers was absent (`rust/serve.rs:709`-`rust/serve.rs:716`).
+            The board is unchanged — no event, no decision, no status
+            transition — and a JSON-shaped request body does not exempt a
+            write from the gate (SPA-11).
+
+            The sentence is the product's own, copied verbatim from
+            `rust/serve.rs:714`.
+
+            **This is a form POST, so the refusal is a page.** The body is the
+            one refusal document `page` renders (`rust/serve.rs:2024`), and the
+            sentence is the text of its `<p class=error>` — the element
+            `web/src/api.ts`'s `postForm` parses out to put the product's own
+            words under the control that was pressed. The JSON `Error` body is
+            the `/api/v1` surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Request refused</h1><p class=error>The action did not come from this site.</p>"
         "404": { $ref: "#/components/responses/DeniedOrNotFound" }
-        "409": { $ref: "#/components/responses/WriteConflict" }
+        "409":
+          description: |
+            The board refused. The row was already resolved, the choice key is
+            one the row no longer carries, or the store declined for its own
+            reason. The store's sentence is returned as written — these
+            refusals name the row's own state to the one operator who raised
+            it and is authorised to see it, which is not an enumeration of
+            anything they could not already read.
+
+            **This is a form POST, so the refusal is a page.** The store's
+            sentence is the text of the `<p class=error>` under
+            `<h1>Decision not recorded</h1>`
+            (`rust/serve.rs:974`-`rust/serve.rs:983`), which is the element
+            `web/src/api.ts`'s `postForm` parses out. The JSON `Error` body is
+            the `/api/v1` surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Decision not recorded</h1><p class=error>that item is already resolved</p>"
         "500": { $ref: "#/components/responses/ServerError" }
 
   /attention/{project}/{id}/check:
@@ -875,10 +940,67 @@ paths:
                   example: store
       responses:
         "303": { $ref: "#/components/responses/WriteRecorded" }
-        "400": { $ref: "#/components/responses/WriteRejected" }
-        "403": { $ref: "#/components/responses/Refused" }
+        "400":
+          description: |
+            The request was wrong — no `key` named, a body that was empty or
+            over `MAX_REPLY_BYTES` (4096), a body that was not UTF-8, a
+            malformed form encoding, or an actor header that failed
+            validation. The row is untouched, and the refusal names what is
+            missing so supplying it and submitting again works without a
+            reload (SPA-19).
+
+            **This is a form POST, so the refusal is a page.** The body is the
+            one refusal document `page` renders (`rust/serve.rs:2024`), and the
+            sentence is the text of its `<p class=error>` — the element
+            `web/src/api.ts`'s `postForm` parses out to put the route's own
+            words under the control that was pressed. The route's heading for
+            a missing key is `Check answer incomplete`
+            (`rust/serve.rs:880`-`rust/serve.rs:888`); a failed actor header is
+            `Invalid actor` (`rust/serve.rs:721`-`rust/serve.rs:730`). The JSON
+            `Error` body is the `/api/v1` surface's shape, and this route is
+            not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Check answer incomplete</h1><p class=error>Pick one of the check's answers.</p>"
+        "403":
+          description: |
+            **The action did not come from this site.** The same-origin gate
+            refused, exactly as on `reply` — it is the one gate, applied
+            before the actor resolves and before any board is opened
+            (`rust/serve.rs:709`-`rust/serve.rs:716`). The board is unchanged
+            (SPA-11).
+
+            The sentence is the product's own, copied verbatim from
+            `rust/serve.rs:714`.
+
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` in the document `page` renders
+            (`rust/serve.rs:2024`), which is the element `web/src/api.ts`'s
+            `postForm` parses out. The JSON `Error` body is the `/api/v1`
+            surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Request refused</h1><p class=error>The action did not come from this site.</p>"
         "404": { $ref: "#/components/responses/DeniedOrNotFound" }
-        "409": { $ref: "#/components/responses/WriteConflict" }
+        "409":
+          description: |
+            The check was not answered. The row carries no check, the check is
+            already answered, the key is one it does not declare (ACC-07), or
+            the row is resolved. The store's sentence is returned as written,
+            and the row stays open.
+
+            **This is a form POST, so the refusal is a page.** The store's
+            sentence is the text of the `<p class=error>` under
+            `<h1>Check answer not recorded</h1>`
+            (`rust/serve.rs:897`-`rust/serve.rs:906`), which is the element
+            `web/src/api.ts`'s `postForm` parses out. The JSON `Error` body is
+            the `/api/v1` surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Check answer not recorded</h1><p class=error>that check is already answered</p>"
         "500": { $ref: "#/components/responses/ServerError" }
 
   /attention/{project}/{id}/reopen:
@@ -918,9 +1040,43 @@ paths:
             enum: ["/decided"]
       responses:
         "303": { $ref: "#/components/responses/WriteRecorded" }
-        "403": { $ref: "#/components/responses/Refused" }
+        "403":
+          description: |
+            **The action did not come from this site.** The same-origin gate
+            refused, exactly as on `reply` — one gate, applied before the
+            actor resolves and before any board is opened
+            (`rust/serve.rs:709`-`rust/serve.rs:716`). The decision stands
+            undisturbed (SPA-11).
+
+            The sentence is the product's own, copied verbatim from
+            `rust/serve.rs:714`.
+
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` in the document `page` renders
+            (`rust/serve.rs:2024`), which is the element `web/src/api.ts`'s
+            `postForm` parses out. The JSON `Error` body is the `/api/v1`
+            surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Request refused</h1><p class=error>The action did not come from this site.</p>"
         "404": { $ref: "#/components/responses/DeniedOrNotFound" }
-        "409": { $ref: "#/components/responses/WriteConflict" }
+        "409":
+          description: |
+            Not reopened. The row was never decided, or the store declined for
+            its own reason. Its sentence is returned as written and the
+            hash-chained ledger is untouched.
+
+            **This is a form POST, so the refusal is a page.** The store's
+            sentence is the text of the `<p class=error>` under
+            `<h1>Not reopened</h1>` (`rust/serve.rs:825`-`rust/serve.rs:835`),
+            which is the element `web/src/api.ts`'s `postForm` parses out. The
+            JSON `Error` body is the `/api/v1` surface's shape, and this route
+            is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Not reopened</h1><p class=error>that item is not resolved</p>"
         "500": { $ref: "#/components/responses/ServerError" }
 
   /plan/{project}/{id}/open:
@@ -947,16 +1103,43 @@ paths:
         - $ref: "#/components/parameters/TaskId"
       responses:
         "303": { $ref: "#/components/responses/WriteRecorded" }
-        "403": { $ref: "#/components/responses/Refused" }
+        "403":
+          description: |
+            **The action did not come from this site.** The same-origin gate
+            refused, exactly as on `reply` — one gate, applied before the
+            actor resolves and before the task list is read
+            (`rust/serve.rs:709`-`rust/serve.rs:716`). The epic is still a
+            draft (SPA-11).
+
+            The sentence is the product's own, copied verbatim from
+            `rust/serve.rs:714`.
+
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` in the document `page` renders
+            (`rust/serve.rs:2024`), which is the element `web/src/api.ts`'s
+            `postForm` parses out. The JSON `Error` body is the `/api/v1`
+            surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Request refused</h1><p class=error>The action did not come from this site.</p>"
         "404": { $ref: "#/components/responses/DeniedOrNotFound" }
         "409":
           description: |
             Not opened. Either the row is not an existing draft epic — the
             server's own sentence is `Only an existing draft epic can be opened
-            here.` (`rust/serve.rs:532`) — or `Store::move_task` refused.
+            here.` (`rust/serve.rs:749`) — or `Store::move_task` refused and
+            its sentence is returned as written (`rust/serve.rs:759`).
+
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` under `<h1>Plan not opened</h1>`
+            in the document `page` renders (`rust/serve.rs:2024`), which is the
+            element `web/src/api.ts`'s `postForm` parses out. The JSON `Error`
+            body is the `/api/v1` surface's shape, and this route is not on it.
           content:
-            application/json; charset=utf-8:
-              schema: { $ref: "#/components/schemas/Error" }
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Plan not opened</h1><p class=error>Only an existing draft epic can be opened here.</p>"
         "500": { $ref: "#/components/responses/ServerError" }
 
   /subscription/{project}/{id}/{verb}:
@@ -1004,13 +1187,42 @@ paths:
             enum: [all]
       responses:
         "303": { $ref: "#/components/responses/WriteRecorded" }
-        "403": { $ref: "#/components/responses/Refused" }
+        "403":
+          description: |
+            **The action did not come from this site.** The same-origin gate
+            refused, exactly as on `reply` — one gate, applied before the
+            actor resolves and before the subscription is read
+            (`rust/serve.rs:709`-`rust/serve.rs:716`). The row's paused state
+            and `pausedAt` are unchanged (SPA-11).
+
+            The sentence is the product's own, copied verbatim from
+            `rust/serve.rs:714`.
+
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` in the document `page` renders
+            (`rust/serve.rs:2024`), which is the element `web/src/api.ts`'s
+            `postForm` parses out. The JSON `Error` body is the `/api/v1`
+            surface's shape, and this route is not on it.
+          content:
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Request refused</h1><p class=error>The action did not come from this site.</p>"
         "404": { $ref: "#/components/responses/DeniedOrNotFound" }
         "409":
-          description: Unchanged. The store refused; its sentence is the generic refusal here.
+          description: |
+            Unchanged. The store refused; its sentence is the generic refusal
+            here.
+
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` under
+            `<h1>Subscription unchanged</h1>`
+            (`rust/serve.rs:790`-`rust/serve.rs:800`), which is the element
+            `web/src/api.ts`'s `postForm` parses out. The JSON `Error` body is
+            the `/api/v1` surface's shape, and this route is not on it.
           content:
-            application/json; charset=utf-8:
-              schema: { $ref: "#/components/schemas/Error" }
+            text/html; charset=utf-8:
+              schema: { type: string }
+              example: "<h1>Subscription unchanged</h1><p class=error>denied or not found</p>"
         "500": { $ref: "#/components/responses/ServerError" }
 
   # ------------------------------------------------------------------ bundle
