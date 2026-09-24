@@ -635,7 +635,11 @@ authorized attaches work as before.
 *Removal never loosens a tag: a removed task's events authorize against
 *the task's last-known tags from its `task_removed` snapshots plus each
 *event's own snapshot, so the tails and the index agree instead of the
-*index dropping what the tails serve.
+*index dropping what the tails serve. `events --task` on the gone row is
+refused for every caller, a holder of the tag included, because the row the
+filter would authorize against is gone; `watch --task` and `subscription
+add` naming a removed task authorize against the same last-known tags and
+fail closed when no removal record names the id.
 
 ### A23 — a removed task's linked rows stay tag-gated on every surface (`ACC-14`)
 
@@ -755,7 +759,16 @@ scope, *when* it addresses a `secret` task id and a never-created one on
 `task move`, `task update`, `task remove`, `claim`, `events --task` and
 `deploy show`, *then* each pair fails with the same exit code and
 byte-identical stderr carrying the existing non-enumerating denial, and
-nothing is recorded. *When* it filters `sitrep list --task`, `handoff list
+nothing is recorded. *Given* a managed caller holding board write only,
+*when* it addresses a leased `secret` task and a never-created one on
+`heartbeat` and `release`, a `secret` candidate or parent epic and a
+never-created one on `sprint plan`, a denied deployment attempt and a
+never-started one on `deploy finish`, `deploy abandon` and `deploy start
+--retry-of`, and a removed `secret` task and a never-created one on `watch
+--task` and `subscription add --subject`, *then* each pair likewise fails
+with the same exit code and byte-identical stderr carrying the denial, and
+nothing is recorded — while the lease holder's own heartbeat and release
+still move the lease. *When* it filters `sitrep list --task`, `handoff list
 --task` or `attention list --task` by either id, *then* each pair succeeds
 with byte-identical stdout handing over no row: a sitrep, handoff,
 subscription or attention row naming a task is listed only for a caller who
@@ -870,7 +883,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe`; `watch::tests::a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows`; `watch::tests::a_one_shot_watch_behind_denied_rows_reports_progress_not_silence`; `watch::tests::an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id`; `managed_pages_fill_past_denied_rows_with_a_true_truncation_probe`; `watch::tests::a_limit_1_follow_poll_advances_by_the_scan_floor_over_denied_rows`; `watch::tests::a_one_shot_watch_behind_denied_rows_reports_progress_not_silence`; `watch::tests::an_unenforced_one_shot_watch_stays_silent_behind_rejected_rows`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`; `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`; `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -1166,3 +1179,19 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   — each byte-identical to a never-created id under enforcement, with notes
   and checkpoints already gated past `require_task_authorized` and
   `has_open_attention` left as the internal write-path boolean it is.
+
+- 2026-09-25 — ACC-14 residual-oracle evidence landed (`t-565de30e`):
+  `residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement`
+  addresses a leased `secret` task and a never-created one on `heartbeat` and
+  `release`, a `secret` candidate or parent epic and a never-created one on
+  `sprint plan`, a denied deployment attempt and a never-started one on
+  `deploy finish`, `deploy abandon` and `deploy start --retry-of`, and a
+  removed `secret` task and a never-created one on `watch --task` and
+  `subscription add --subject`, as a caller holding board write only: each
+  pair answers the existing non-enumerating denial with the same exit code
+  and byte-identical stderr, and nothing is recorded, while the lease
+  holder's own heartbeat and release still move the lease (A28). The landing
+  fixed the leaks as bugs and corrected two wordings: `events --task` on a
+  removed row is refused for every caller, holder included, because the row
+  the filter would authorize against is gone (A22) — and the attach test now
+  also pairs `task update --depends-on` (A21).
