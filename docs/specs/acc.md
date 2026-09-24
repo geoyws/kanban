@@ -13,11 +13,12 @@
   verified the delta against the SDD §1 exit criteria (findings F1–F4 raised and closed, §8
   single-row-per-requirement restored). Specification readiness authorises neither
   implementation, rollout nor release.
-- **Status (delta 2026-09-24):** owner-authorised scope change on board task `t-1aa9f553`
-  (George, 2026-09-24, chose "Ledger + skills"): ACC-06, ACC-15 and ACC-17 superseded in place,
-  ACC-20 and ACC-21 appended. Drafted with the implementation on branch
-  `wt/t-1aa9f553-ledger` from base `f7cc09f`; the independent `/quality spec` review of this
-  delta is pending, and readiness authorises neither rollout nor release.
+- **Status (delta 2026-09-24):** `SPEC-READY` for the owner-authorised ACC-06/ACC-15/ACC-17
+  supersession and ACC-20/ACC-21 (George's choice "Ledger + skills", recorded in the body of
+  board row `t-1aa9f553` (2026-09-24)); an independent `/quality spec` review (2026-09-25)
+  raised findings F1–F9 and closed the blocking three. Drafted with the implementation on branch
+  `wt/t-1aa9f553-ledger` from base `f7cc09f`. Specification readiness authorises neither
+  implementation, rollout nor release.
 - **Owner (product scope):** George.
 - **Decider (wording of this document):** George.
 - **Sources:**
@@ -39,7 +40,9 @@
   - George, 2026-09-21 (scope decision recorded on `t-cbaff421`) — every later pre-answer
     read redacts answer and explanation, including the raiser's own show; the successful raise
     receipt alone may echo the just-authored definition.
-  - George, 2026-09-24 (scope decision on `t-1aa9f553`, "Ledger + skills") — `/kb-att` clears
+  - George's choice "Ledger + skills", recorded in the body of board row `t-1aa9f553`
+    (2026-09-24) — verbatim: "Owner-authorised scope change to docs/specs/acc.md (George chose
+    'Ledger + skills' in session 2026-09-24)" — `/kb-att` clears
     attention rows with no check quiz in the way; checks move to a separate `/kb-acc` run when he
     has time, and every answer there says right or wrong, gives the correct choice and the
     explanation, for a pass as much as a miss ("ACC doesn't even correct me atm if i was wrong
@@ -50,7 +53,7 @@
 
 ## 2. Purpose and scope
 
-**Intended outcome.** Before George makes a durable decision, the decision card asks one
+**Intended outcome.** The decision card asks, before George decides on the web and separately through `/kb-acc` otherwise, one
 raiser-authored question that demonstrates the reusable system fact the decision depends on,
 records the answer as data and never exposes its answer key to the browser in advance.
 
@@ -164,8 +167,8 @@ check is refused by name. A row with no check and no answer input resolves exact
 --check-answered KEY` is required for a row carrying an unanswered check. Omitting it refuses
 resolution and prints the check question; the row stays open and no decision, check result or
 event is written." That gate put a quiz in front of every decision George clears through
-`/kb-att`. He chose, on 2026-09-24 (`t-1aa9f553`, "Ledger + skills"), to clear decisions
-without it and answer checks separately through `/kb-acc`; the answer is still recorded exactly
+`/kb-att`. He chose ("Ledger + skills", recorded in the body of board row `t-1aa9f553`,
+2026-09-24) to clear decisions without it and answer checks separately through `/kb-acc`; the answer is still recorded exactly
 once, now possibly after resolution (ACC-20).
 
 **ACC-07 — Validate and persist the submitted answer as data.**
@@ -248,8 +251,10 @@ unchecked, known and unknown rows.
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
 before answer. `/kb-att` resolves attention rows without asking the check, which stays pending
-(ACC-06). `/kb-acc` finds pending checks on open and resolved rows, asks each one and records the
-answer through `attention check` (ACC-21), then shows the verdict, the correct choice and the
+(ACC-06). `/kb-acc` finds pending checks on open and resolved rows — rows whose
+`attention list --json` projection carries a `check` with no `answered` field, read under the
+ADR-037 listing cap with an explicit `--limit` — asks each one and records the answer through
+`attention check` (ACC-21), then shows the verdict, the correct choice and the
 explanation from its receipt.
 `/kb` authors the five native inputs. The legacy body-block reader and clerk synthesis are
 removed: a row with no native check is shown with no check and reported as drafting debt, never
@@ -450,8 +455,14 @@ only pre-answer response allowed to echo the complete definition. *When* the ans
 ### A13 — native skill cutover (`ACC-15`)
 
 *Given* one native checked row and one row containing only legacy/free prose, *when* `/kb-att`
-builds its digest, *then* it asks only the native check first and never synthesizes a check from
-either row's context or body.
+builds its digest and resolves the checked row, *then* it asks no check, the check stays pending,
+and neither row gets a synthesized check; *when* `/kb-acc` runs, *then* it asks the pending native
+check, records it through `attention check` and shows the verdict, the correct choice and the
+explanation.
+
+*Superseded 2026-09-24.* The example this replaces read: "*Given* one native checked row and one
+row containing only legacy/free prose, *when* `/kb-att` builds its digest, *then* it asks only the
+native check first and never synthesizes a check from either row's context or body." See ACC-15.
 
 ### A14 — migration and no-check compatibility (`ACC-16`, `ACC-17`)
 
@@ -509,15 +520,20 @@ existing empty page reads unchanged.
 *Given* a checked row whose answer is `fields` (label `Stored fields on the attention row`)
 resolved with no `--check-answered`, *when* `attention check ID --as geoyws --key notes --json`
 runs, *then* the receipt reads `status=resolved`, `answered=notes`, `correct=false`,
-`answer=fields` and carries the explanation, and the ledger records `attention_check_answered`
+`answer=fields` and carries the explanation, and the audit ledger records the answer and result
 without the explanation; *when* either key is submitted again, *then* it is refused and the board
-and audit chain are unchanged. *When* the row is reopened and `attention check ID --as geoyws
+and audit chain are unchanged. *Given* another pending check on the same row shape, *when*
+`attention check ID --as geoyws --key notes` runs without `--json`, *then* stdout is exactly
+`ACC: miss on notes`, `answer: fields — Stored fields on the attention row` and
+`why: <explanation>` on three lines. *When* the row is reopened and `attention check ID --as geoyws
 --key fields` runs without `--json`, *then* stdout is exactly `ACC: pass`, `answer: fields —
 Stored fields on the attention row` and `why: <explanation>` on three lines and the row is open.
-*Given* an open checked row, *when* its raiser answers it, *then* it stays open and a later bare
-resolve reuses the result with no echo. *When* the row has no check, the key is undeclared, or
-the actor is neither `geoyws` nor the raiser, *then* the command is refused naming why and
-nothing changes.
+*Given* a resolved row with a pending check, *when* an authorized browser posts a declared key to
+`POST /attention/{project}/{id}/check`, *then* it returns 303, the result is recorded once and
+status and resolution are unchanged. *Given* an open checked row, *when* its raiser answers it,
+*then* it stays open and a later bare resolve reuses the result with no echo. *When* the row has
+no check, the key is undeclared, or the actor is neither `geoyws` nor the raiser, *then* the
+command is refused naming why and nothing changes.
 
 ## 5. Contracts and data
 
@@ -593,11 +609,17 @@ binding or token. The successful raise response remains a same-write receipt and
 its author just supplied.
 **Resolved scope history.** ACC-06 originally refused to resolve a checked row without its
 answer, and the Store refused to answer a check on a resolved row. George chose "Ledger + skills"
-on 2026-09-24 (`t-1aa9f553`): resolve no longer waits for the check, the one answer is accepted
-open or resolved (ACC-20), and the CLI gained `attention check` (ACC-21) so `/kb-acc` can ask
-checks apart from `/kb-att` and correct every answer. ACC-06, ACC-15, ACC-17 and A6 carry dated
-`Superseded` paragraphs quoting the replaced wording. The web card's check-before-decision order
-(ACC-09) is unchanged.
+(recorded in the body of board row `t-1aa9f553`, 2026-09-24): resolve no longer waits for the
+check, the one answer is accepted open or resolved (ACC-20), and the CLI gained
+`attention check` (ACC-21) so `/kb-acc` can ask checks apart from `/kb-att` and correct every
+answer. ACC-06, ACC-15, ACC-17, A6 and A13 carry dated `Superseded` paragraphs quoting the
+replaced wording. The web card's check-before-decision order (ACC-09) is unchanged.
+
+**Ordering note (2026-09-24 delta).** The spec delta landed in the same commit as its
+implementation (`8a0796b`, which also touched `rust/lib.rs`, `rust/store.rs`, `rust/serve.rs` and
+`tests/e2e.rs`), ahead of any `SPEC-READY` review; §1's rollout boundary says implementation may
+begin only after the specification reaches `SPEC-READY`. Recorded as a process deviation for
+George; it is not a behaviour question and blocks no specification gate.
 
 ## 8. Verification
 
@@ -618,15 +640,15 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-10` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | page and projection sentinel sweep; reveal only post-answer |
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
-| `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update` | always-redacted pre-answer show/list and mutation receipts landed; digest/HTTP and post-answer state remain planned |
-| `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation |
-| `ACC-15` | MUST | process | `PLANNED` | native digest/skills and no synthesis |
-| `ACC-16` | MUST | process | `PLANNED` | schema migration, rerun and invalid legacy block |
-| `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
+| `ACC-13` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | always-redacted pre-answer show/list and mutation receipts, including the raiser's own reads, through the shared Store redaction (`rust/store.rs:1421`) that MCP and web reads inherit; the HTTP projection sweep pins the same omission in the browser bytes; post-answer reads carry answer, explanation and result, and reopen redacts again; the digest half is cut over outside this repo (external evidence: board row `t-94076221`, geoyws skills-root `dec6b96` via dotfiles `136b196`) |
+| `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation: no test addresses a checked row as an unauthorized actor; missing is A11 — the same-key POST plus read asserting the existing non-enumerating denial with no check metadata |
+| `ACC-15` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | the in-tree half is the `attention check` verb that `/kb-acc` answers through; the skill cutover itself is external evidence (board row `t-94076221`: geoyws skills-root `dec6b96` via dotfiles `136b196`; board row `t-80d5900f`: IFCA estate pin `pai-root 222aa6cfb` -> skills-root `f817cef` -> kb-skill `e994bf4` with a consumer test) — not verifiable from this tree |
+| `ACC-16` | MUST | process | `scripts/migrate-acc-body-blocks.test.sh` (gate-wired at `scripts/release-gate.sh:104`); `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | the one-shot script converts a valid leading legacy block once per board with an operator receipt, strips the block, leaves no-block/already-native/resolved rows byte-for-byte, reports invalid prose for hand migration, and migrates nothing on re-run; the schema test pins the v30 native columns advancing without inventing a check |
+| `ACC-17` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check`; `att_list_check_report_groups_worst_first_with_adr037_caps` | a no-check row refuses `--check-answered` by name and otherwise resolves as before, and refuses `attention check` as carrying no check; a bare resolve — the older-client path — settles a checked row leaving the check pending and answerable; a pre-existing no-check row survives migration unchanged; no-check rows contribute nothing to the report |
 | `ACC-18` | MUST | process | `att_list_check_report_groups_worst_first_with_adr037_caps`; `att_list_check_report_fans_out_across_boards`; `aggregate_check_report_groups_worst_first_with_truncation_and_skips` | A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; registry fan-out with the board-selector refusal; store-level worst-first, truncation and skip unit |
 | `ACC-19` | MUST | chrome | `decided_page_carries_one_check_summary_block` | A18 sentence shape, row links, test ids and omission on empty, plus the `/api/v1/decided` `checkSummary` projection beside the page's rows |
 | `ACC-20` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one answer on a resolved row and on an open row, status/resolution unchanged; identical and different second answers refused with board and audit chain unchanged; reopen clears and the check answers again |
-| `ACC-21` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | compiled `attention check` JSON receipt with answer, explanation and result; byte-exact three-line text receipt on a pass; raiser allowed, non-raiser non-`geoyws` refused naming the raiser, no-check and undeclared-key refusals |
+| `ACC-21` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | compiled `attention check` JSON receipt with answer, explanation and result; byte-exact three-line text receipt on a pass and on a miss (A19); raiser allowed, non-raiser non-`geoyws` refused naming the raiser, no-check and undeclared-key refusals |
 
 ## 9. Change log
 
@@ -665,10 +687,10 @@ Review fixes the same day: miss rate pinned to truncation toward zero with an A1
 A17 extended to the status-conflict, row-filter and shape-flag refusals; §2 teaching-purpose
 and no-target bullets restored verbatim beside the leaderboard bullet.
 
-- 2026-09-24 — owner-authorised scope change for `t-1aa9f553` (George, "Ledger + skills"):
-  ACC-06 no longer refuses a bare resolve of a checked row, the check stays pending; ACC-15 moves
-  the check out of `/kb-att` into `/kb-acc`; ACC-17's older-client clause follows ACC-06; A6 is
-  rewritten. Each carries a dated `Superseded` paragraph quoting its old wording. ACC-20 (one
-  answer, open or resolved) and ACC-21 (the CLI `attention check` verb and its teaching receipt)
-  are appended at the end of the creation sequence with A19. ACC-09's web check-before-decision
-  card is unchanged.
+- 2026-09-24 — owner-authorised scope change (George's choice "Ledger + skills", recorded in the
+  body of board row `t-1aa9f553` (2026-09-24)): ACC-06 no longer refuses a bare resolve of a
+  checked row, the check stays pending; ACC-15 moves the check out of `/kb-att` into `/kb-acc`;
+  ACC-17's older-client clause follows ACC-06; A6 and A13 are rewritten. Each carries a dated
+  `Superseded` paragraph quoting its old wording. ACC-20 (one answer, open or resolved) and
+  ACC-21 (the CLI `attention check` verb and its teaching receipt) are appended at the end of the
+  creation sequence with A19. ACC-09's web check-before-decision card is unchanged.

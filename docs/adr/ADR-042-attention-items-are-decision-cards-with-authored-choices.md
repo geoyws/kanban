@@ -850,7 +850,7 @@ Phase 3's two real-Chrome cases are named in §6.
 
 ## 2026-09-24 amendment: resolve does not wait for the check; answer it later, once
 
-George chose "Ledger + skills" on 2026-09-24 (board task `t-1aa9f553`): he clears
+George's choice "Ledger + skills", recorded in the body of board row `t-1aa9f553` (2026-09-24): he clears
 decisions through `/kb-att` with no check quiz in the way, and answers checks
 separately through `/kb-acc` when he has time, where every answer must say right
 or wrong, give the correct choice and give the explanation — for a pass as much
@@ -861,7 +861,7 @@ ACC-20 and ACC-21 appended):
 1. `attention resolve` on a row with an unanswered check and no `--check-answered`
    settles the row. No result and no `ACC:` echo is written; the check stays
    pending, redacted on every read, and answerable later. `--check-answered KEY`
-   stays optional and records the answer before the row resolves, as before.
+   becomes optional for a checked row and, when supplied, still records the answer before the row resolves.
 2. The one answer is accepted whether the row is open or resolved. Recording it
    changes neither status, decision nor resolution text, and is not a card edit:
    the definition stays immutable on a resolved row. A second answer, an

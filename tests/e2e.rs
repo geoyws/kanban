@@ -19673,6 +19673,32 @@ fn attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits() {
     }
     assert_eq!(attention_and_chain(&fixture), before);
 
+    // The text receipt teaches on a miss too: the verdict names the submitted
+    // key, then the correct key with its label, then the explanation.
+    let miss_row = raise_checked("Miss teaches in text.");
+    let miss_teaches = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "check",
+            &miss_row,
+            "--as",
+            "geoyws",
+            "--key",
+            "notes",
+        ],
+    );
+    assert!(
+        miss_teaches.status.success(),
+        "{}",
+        String::from_utf8_lossy(&miss_teaches.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&miss_teaches.stdout),
+        "ACC: miss on notes\nanswer: fields — Stored fields on the attention row\nwhy: SECRET_TEACH \
+         rust/store.rs records answered, correct and answeredAt as columns.\n"
+    );
+
     // (e) Reopen clears the result; the check is answerable again, and the
     // human receipt teaches on a pass too.
     let reopened = fixture.ok_json(
