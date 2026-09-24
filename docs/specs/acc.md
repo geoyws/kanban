@@ -257,7 +257,17 @@ unchecked, known and unknown rows.
   is removed. Refusals past the guard keep their sentences; unmanaged boards
   keep the plain `not found` messages. Requirement wording is unchanged: this
   restores the indistinguishability for known and unknown rows it already
-  states.
+  states. Follow-up the same day: the same collapse reaches every task route
+  that names a row — one authorized helper (`require_task_authorized`, with
+  the still-active variant for mutations) serves the events history gate,
+  move, remove, patch-metadata, update, story signoff and advance, sprint
+  attach and detach, a named claim, and the `notes` and `checkpoints` reads;
+  task-filtered attention, sitrep and handoff listings proceed for an unknown
+  task exactly as they do for a denied one (`require_task_filter`); and an
+  absent deployment answers the same denial as a denied subject's attempt.
+  `add_note` still returns its just-written receipt without re-gating, so an
+  authorized-at-board-scope write is never an error after commit. Writes that
+  merely reference a task keep their behaviour.
 
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
@@ -560,6 +570,20 @@ answers a readable row's check with an undeclared key, *then* the refusal
 names the key rather than collapsing into the denial; *when* no enforcement
 applies, *then* an unknown id keeps its plain `not found` message.
 
+### A21 — denied and unknown task ids answer identically on task routes (`ACC-14`)
+
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* it addresses a `secret` task id and a never-created one on
+`task move`, `task update`, `task remove`, `claim`, `events --task` and
+`deploy show`, *then* each pair fails with the same exit code and
+byte-identical stderr carrying the existing non-enumerating denial, and
+nothing is recorded. *When* it filters `attention list --task` by either id,
+*then* both succeed alike. `notes`, `checkpoints` and a named `claim` have
+no standalone CLI read — every command reaches them only past `require_task`
+— so a store-level case pins the same denial for both ids there. *When* no
+enforcement applies, *then* an unknown task keeps its plain `not found`
+message.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -666,7 +690,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | always-redacted pre-answer show/list and mutation receipts, including the raiser's own reads, through the shared Store redaction (`rust/store.rs:1421`) that MCP and web reads inherit; the HTTP projection sweep pins the same omission in the browser bytes; post-answer reads carry answer, explanation and result, and reopen redacts again; the digest half is cut over outside this repo (external evidence: board row `t-94076221`, geoyws skills-root `dec6b96` via dotfiles `136b196`) |
-| `ACC-14` | MUST | http + process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages |
+| `ACC-14` | MUST | http + process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `denied_and_unknown_task_ids_answer_identically_on_task_routes`; `store::tests::managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages; every task route that names a row (task move/update/remove, claim, events --task, deploy show) refuses a denied and a never-created task id with identical stderr and exit code, and a task-filtered listing succeeds for both alike; notes, checkpoints and a named claim carry the same denial at store level |
 | `ACC-15` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | the in-tree half is the `attention check` verb that `/kb-acc` answers through; the skill cutover itself is external evidence (board row `t-94076221`: geoyws skills-root `dec6b96` via dotfiles `136b196`; board row `t-80d5900f`: IFCA estate pin `pai-root 222aa6cfb` -> skills-root `f817cef` -> kb-skill `e994bf4` with a consumer test) — not verifiable from this tree |
 | `ACC-16` | MUST | process | `scripts/migrate-acc-body-blocks.test.sh` (gate-wired at `scripts/release-gate.sh:104`); `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | the one-shot script converts a valid leading legacy block once per board with an operator receipt, strips the block, leaves no-block/already-native/resolved rows byte-for-byte, reports invalid prose for hand migration, and migrates nothing on re-run; the schema test pins the v30 native columns advancing without inventing a check |
 | `ACC-17` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check`; `att_list_check_report_groups_worst_first_with_adr037_caps` | a no-check row refuses `--check-answered` by name and otherwise resolves as before, and refuses `attention check` as carrying no check; a bare resolve — the older-client path — settles a checked row leaving the check pending and answerable; a pre-existing no-check row survives migration unchanged; no-check rows contribute nothing to the report |
