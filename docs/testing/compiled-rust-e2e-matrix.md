@@ -42,6 +42,23 @@ is broken still runs the real-browser evidence. A value naming a
 non-executable path is refused by the script rather than silently resolving
 to some other browser.
 
+**Run it on Linux, in a container, holding a gate slot.** Kanban deploys to
+Linux, so a gate receipt comes from Linux: on the MacBook Pro that is
+
+```bash
+scripts/container-gate.sh WORKTREE
+```
+
+which runs this same script unchanged inside the image
+`scripts/container-gate.Dockerfile` builds, with the clean candidate
+checkout mounted read-only, and prints the candidate SHA and image ID for
+the receipt. It holds one of the host's medic `gate-slot` slots for as long
+as the container runs, so parallel lanes queue instead of overloading the
+machine. `--loop TARGET TEST --iterations N` runs one test N times to
+measure a flake; that count is investigation, never gate evidence. The first
+Linux runs (2026-09-24, `t-a3928b36`) found a test no macOS gate had ever
+compiled and a delivery race macOS never showed, which is the reason.
+
 **The standing constraint on all of it:** the gate goes green because the
 system became true, never because a measurement was loosened. Too slow
 means make it faster or serialize it — never sample it. There is no
