@@ -1091,6 +1091,36 @@ fn task_linked_row_visible(
     }
 }
 
+/// One task row read through the caller's read authorization (ACC-14): the
+/// row's tags first, then the deny-preserving absent mapping, so under
+/// managed enforcement an unknown id answers exactly like a denied one.
+/// Outside enforcement the guard cannot deny and the plain `not found`
+/// stays. This is the helper every named task read and every task mutation's
+/// existence check goes through; internal traversals of related rows keep
+/// the raw `require_task` below.
+fn require_task_authorized(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Task> {
+    authz.check_read(&task_tags(connection, id)?)?;
+    absent_as_denied(get_task(connection, id)?, "task", id, authz)
+}
+
+/// The still-active variant for mutations: the same authorization, plus the
+/// archived-history refusal the raw `require_active_task` carries.
+fn require_active_task_authorized(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Task> {
+    let task = require_task_authorized(connection, id, authz)?;
+    if task.archived {
+        bail!("task {id} is archived history and cannot be changed");
+    }
+    Ok(task)
+}
+
 /// A task filter on a listing (ACC-14): under managed enforcement an unknown
 /// or removed task filters exactly like a denied one — the listing proceeds
 /// and each row passes [`task_linked_row_visible`], which withholds every
@@ -5283,10 +5313,9 @@ impl Store {
         if let Some(id) = task {
             // A NAMED row: the caller asked about this task's history, so the
             // answer is the single generic denial before the row is opened —
-            // `require_task` below would otherwise say `task <id> not found`
-            // for a row that exists and is merely invisible.
-            self.authz.check_read(&task_tags(&self.connection, id)?)?;
-            require_task(&self.connection, id)?;
+            // `require_task_authorized` answers it for a row that exists and
+            // is merely invisible and for one that was never created alike.
+            require_task_authorized(&self.connection, id, &self.authz)?;
         }
         let mut sql = String::from("SELECT * FROM events WHERE 1=1");
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -5965,10 +5994,8 @@ impl Store {
         // then gate on them. An absent row yields no tags, so a caller without
         // board scope still receives the generic denial, never a difference
         // between "invisible" and "absent" — and under managed enforcement a
-        // caller WITH board scope does too, via `absent_as_denied` below.
-        let tags = task_tags(&self.connection, id)?;
-        self.authz.check_read(&tags)?;
-        let mut one = absent_as_denied(get_task(&self.connection, id)?, "task", id, &self.authz)?;
+        // caller WITH board scope does too, via `require_task_authorized`.
+        let mut one = require_task_authorized(&self.connection, id, &self.authz)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
         attach_allowed_models(&self.connection, std::iter::once(&mut one))?;
         apply_lapsed_leases(&self.connection, std::iter::once(&mut one))?;
@@ -6294,7 +6321,7 @@ impl Store {
         // does not retag, so the old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let current = require_active_task(&transaction, id)?;
+        let current = require_active_task_authorized(&transaction, id, &self.authz)?;
         // A story's status column is a projection of its gate, not a field the
         // caller owns. Writing it directly leaves the row asserting one thing
         // and its gate another — and a direct move to `done` stamps
@@ -6374,7 +6401,7 @@ impl Store {
         // row, so the resulting tag set is empty.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &[])?;
-        let task = require_active_task(&transaction, id)?;
+        let task = require_active_task_authorized(&transaction, id, &self.authz)?;
         let seized = require_free_lease(&transaction, id, &actor, force, "remove")?;
         // Children have no ON DELETE CASCADE, so the raw foreign-key failure is
         // the only signal the operator would otherwise get. Name the children.
@@ -6434,7 +6461,7 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let current = require_active_task(&transaction, id)?;
+        let current = require_active_task_authorized(&transaction, id, &self.authz)?;
         let mut metadata = current.metadata.as_object().cloned().unwrap_or_default();
         let object = patch
             .as_object()
@@ -6474,7 +6501,7 @@ impl Store {
         let old_tags = task_tags(&transaction, id)?;
         let resulting_tags = input.tags.clone().unwrap_or_else(|| old_tags.clone());
         self.authz.check_write(&old_tags, &resulting_tags)?;
-        let current = require_active_task(&transaction, id)?;
+        let current = require_active_task_authorized(&transaction, id, &self.authz)?;
         let previous_parent = current.parent_id.clone();
         let parent = input.parent_id.unwrap_or(current.parent_id);
         if let Some(parent_id) = &parent {
@@ -6740,7 +6767,7 @@ impl Store {
         let task = if let Some(id) = id {
             let tags = task_tags(&transaction, id)?;
             self.authz.check_write(&tags, &tags)?;
-            let task = require_active_task(&transaction, id)?;
+            let task = require_active_task_authorized(&transaction, id, &self.authz)?;
             if let Some(required_sprint) = sprint_filter.as_deref() {
                 let attached: Option<String> = transaction
                     .query_row(
@@ -7015,12 +7042,24 @@ impl Store {
             json!({"kind":kind}),
         )?;
         transaction.commit()?;
-        self.notes(id, 1)?.pop().context("note was not created")
+        // The receipt is the row this write just committed, re-read directly
+        // rather than through `notes`: that gate answers the task's tags, and
+        // reaching it here would turn an authorized-at-board-scope write into
+        // an error after it was recorded (L2 owns what a write against a
+        // denied task may do; this receipt changes none of it).
+        self.connection
+            .query_row(
+                "SELECT * FROM task_notes WHERE task_id=? ORDER BY seq DESC LIMIT 1",
+                [id],
+                note_row,
+            )
+            .optional()?
+            .context("note was not created")
     }
 
     pub fn notes(&self, id: &str, limit: i64) -> Result<Vec<TaskNote>> {
         self.authz.check_read(&[])?;
-        let task = require_task(&self.connection, id)?;
+        let task = require_task_authorized(&self.connection, id, &self.authz)?;
         let cold = if task.archived { "" } else { " AND archived=0" };
         let sql = format!(
             "SELECT * FROM (SELECT * FROM task_notes WHERE task_id=?{cold} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
@@ -7034,7 +7073,7 @@ impl Store {
 
     pub fn checkpoints(&self, id: &str, limit: i64) -> Result<Vec<Checkpoint>> {
         self.authz.check_read(&[])?;
-        let task = require_task(&self.connection, id)?;
+        let task = require_task_authorized(&self.connection, id, &self.authz)?;
         let cold = if task.archived { "" } else { " AND archived=0" };
         let sql = format!(
             "SELECT * FROM (SELECT * FROM checkpoints WHERE task_id=?{cold} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
@@ -9115,7 +9154,7 @@ impl Store {
         // retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let story = require_active_task(&transaction, id)?;
+        let story = require_active_task_authorized(&transaction, id, &self.authz)?;
         require_story_type(id, &story.task_type, "takes signoff")?;
         if story.metadata.get("workflowStatus").and_then(Value::as_str) != Some("review") {
             bail!("story signoff is only valid in review");
@@ -9180,7 +9219,7 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = task_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let story = require_active_task(&transaction, id)?;
+        let story = require_active_task_authorized(&transaction, id, &self.authz)?;
         require_story_type(id, &story.task_type, "advances")?;
         let current = story
             .metadata
@@ -9834,14 +9873,11 @@ impl Store {
     /// caller may have no authority over.
     pub fn require_deployment(&self, id: &str) -> Result<DeploymentAttempt> {
         self.authz.check_read(&[])?;
-        let attempt = absent_as_denied(
-            self.connection
-                .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
-                .optional()?,
-            "deployment",
-            id,
-            &self.authz,
-        )?;
+        let row = self
+            .connection
+            .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
+            .optional()?;
+        let attempt = absent_as_denied(row, "deployment", id, &self.authz)?;
         self.authz
             .check_read(&self.deployment_subject_tags(&attempt)?)?;
         Ok(attempt)
@@ -10692,7 +10728,7 @@ impl Store {
         let transaction = self.begin_write()?;
         let root_tags = task_tags(&transaction, task_id)?;
         self.authz.check_write(&root_tags, &root_tags)?;
-        require_active_task(&transaction, task_id)?;
+        require_active_task_authorized(&transaction, task_id, &self.authz)?;
         require_attachable_sprint_on(&transaction, sprint_id)?;
         // The subtree, breadth-first so the receipt reads parent-first; the
         // seen-set terminates a malformed parent cycle the way the gate's
@@ -10797,7 +10833,7 @@ impl Store {
         let transaction = self.begin_write()?;
         let root_tags = task_tags(&transaction, task_id)?;
         self.authz.check_write(&root_tags, &root_tags)?;
-        require_active_task(&transaction, task_id)?;
+        require_active_task_authorized(&transaction, task_id, &self.authz)?;
         let old_sprint_id: Option<String> = transaction
             .query_row(
                 "SELECT sprint_id FROM task_sprints WHERE task_id=?",
@@ -17648,6 +17684,88 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), "denied or not found");
         }
+    }
+
+    /// ACC-14 at store level: `notes`, `checkpoints` and a named `claim`
+    /// answer a same-board tag-denied task and a never-created one with the
+    /// identical generic denial. These three reads have no standalone CLI
+    /// surface — every command reaches them only past `require_task`, which
+    /// already denies both alike — so they are pinned here rather than at
+    /// the process boundary. Outside enforcement the plain `not found`
+    /// stays.
+    #[test]
+    fn managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "ffffffff-1111-4111-8111-111111111111";
+        let dir = std::env::temp_dir().join(format!("kanban-task-reads-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.add_tag("visible", None, Some("seed")).expect("tag");
+            seed.add_tag("secret", None, Some("seed")).expect("tag");
+            seed.add_task(task_input(
+                "t-secret",
+                "secret row",
+                vec!["secret".to_owned()],
+                vec![],
+            ))
+            .expect("seed secret task");
+            seed.add_note("t-secret", "seed", "progress", "a secret note")
+                .expect("seed note");
+        }
+        let grants = || {
+            authority([
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::BoardTag {
+                        board_id: board.to_owned(),
+                        tag: "visible".to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Write,
+                ),
+                (
+                    ScopeTuple::BoardTag {
+                        board_id: board.to_owned(),
+                        tag: "visible".to_owned(),
+                    },
+                    Capability::Write,
+                ),
+            ])
+        };
+        let mut store = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants(), board.to_owned()),
+        )
+        .expect("open under partial tag authority");
+        for id in ["t-secret", "t-never-created"] {
+            assert_denied(store.notes(id, 10), &format!("notes of {id}"));
+            assert_denied(store.checkpoints(id, 10), &format!("checkpoints of {id}"));
+            assert_denied(
+                store.claim(Some(id), claim_options("agent")),
+                &format!("claim of {id}"),
+            );
+        }
+        let direct = Store::open(&path).expect("open the direct estate");
+        assert_eq!(
+            direct.notes("t-never-created", 10).unwrap_err().to_string(),
+            "task t-never-created not found",
+            "the direct estate lost its plain message"
+        );
     }
 
     /// One corrupt deployment link must not fail the whole listing (ACC-14):
