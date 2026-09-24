@@ -578,9 +578,13 @@ fn snippet(document: &Document, query_words: &[String]) -> String {
 /// sprints are board-only rows; neither carries board tags, so its containing
 /// scope is the whole authorization check.
 ///
-/// A document whose task no longer exists is a stale index entry with no
-/// source row left to authorize against, so it yields the tag that can never
-/// be satisfied — it is dropped rather than trusted.
+/// A NON-EVENT document whose task no longer exists is a stale index entry
+/// with no source row left to authorize against, so it yields the tag that
+/// can never be satisfied — it is dropped rather than trusted. Event
+/// documents are the exception: the event row outlives the task, and the
+/// tails authorize it against the task's last-known removal tags, so the
+/// index does the same through `cached_event_authorization_tags` rather
+/// than dropping what the tails serve.
 fn document_row_tags(
     connection: &Connection,
     document: &Document,
