@@ -54604,7 +54604,7 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
             "--parent",
             "e-routes",
             "--tag",
-            "sweep",
+            "geoyws/sweep",
             "--body",
             "The seeded task's body, written out at the width a raiser writes \
              it so that a narrow screen has something to wrap.",
@@ -54708,7 +54708,7 @@ fn no_route_overflows_sideways_at_three_widths_in_real_chrome() {
             "--current-status",
             "in_progress",
             "--tag",
-            "sweep",
+            "geoyws/sweep",
             "--consumer",
             "codex.queue",
             "--action",
