@@ -8479,7 +8479,32 @@ impl Store {
             transaction.commit()?;
             return Ok((updated, None));
         };
-        let task = require_task(&transaction, &task_id)?;
+        // A removed task's handoffs keep the orphaned id (BOARD_V34), so a
+        // missing row is accepted as an acknowledgement exactly like the
+        // session branch above: there is no claimable task left to lease and
+        // leaving the handoff pending would rediscover it on every lane
+        // resume. The event keeps the orphaned id, so it is emitted through
+        // the removed-task snapshot fallback rather than as a session event.
+        let task = match get_task(&transaction, &task_id)? {
+            Some(task) => task,
+            None => {
+                transaction.execute("UPDATE handoffs SET status='accepted',accepted_at=?,accepted_by=?,accepted_session=? WHERE id=? AND status='pending'",params![now,agent,session,id])?;
+                event(
+                    &transaction,
+                    Some(&task_id),
+                    "handoff_accepted",
+                    Some(&agent),
+                    json!({"handoffID":id,"acknowledged":true,"taskRemoved":true}),
+                )?;
+                let updated = transaction.query_row(
+                    "SELECT * FROM handoffs WHERE id=?",
+                    [id],
+                    handoff_row,
+                )?;
+                transaction.commit()?;
+                return Ok((updated, None));
+            }
+        };
         // Once work has been blocked or settled, accepting an older brief is
         // acknowledgement rather than ownership transfer. There is no
         // claimable task to protect, and leaving the handoff pending forever
@@ -9060,6 +9085,13 @@ impl Store {
         }))
     }
 
+    /// Whether the task row is still there, through no authorization: the
+    /// accept receipt uses it to fall back to board-scope rule summaries for
+    /// an orphaned handoff, exactly like a session acknowledgement.
+    pub(crate) fn task_row_exists(&self, id: &str) -> Result<bool> {
+        Ok(get_task(&self.connection, id)?.is_some())
+    }
+
     /// Read the task's authorized rule selectors in one board snapshot.
     /// Claim and handoff call this after their mutation commits.
     pub fn task_rule_selectors(&self, task_id: &str) -> Result<(HashSet<String>, Option<String>)> {
@@ -9123,6 +9155,40 @@ impl Store {
     pub fn foreign_key_violations(&self) -> Result<Vec<String>> {
         self.authz.check_read(&[])?;
         crate::db::foreign_key_violations(&self.connection)
+    }
+
+    /// Links naming a task that is neither live nor removed, as `doctor`
+    /// reports them. Since `BOARD_V34` the sitrep, handoff, deployment and
+    /// attention links carry no foreign key, so `foreign_key_check` has
+    /// nothing to say about them — yet a non-null `task_id` with no `tasks`
+    /// row and no `task_removed` record is corruption all the same: a partial
+    /// restore, an adopted snapshot or a hand edit can leave one behind, and
+    /// no writer path creates one. Board scope, in the `foreign_key_check`
+    /// shape: the descriptions name tables and row ids, which is diagnostic
+    /// rather than row content, and a caller with no board read gets none of
+    /// it. A removed task's rows are not orphans — their id has a removal
+    /// record — and taskless rows are not orphans either: they name no task.
+    pub fn orphaned_task_links(&self) -> Result<Vec<String>> {
+        self.authz.check_read(&[])?;
+        let mut out = Vec::new();
+        for table in ["sitreps", "handoffs", "deployments", "attention"] {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT id,task_id FROM {table} WHERE task_id IS NOT NULL \
+                 AND task_id NOT IN (SELECT id FROM tasks) \
+                 AND NOT EXISTS (SELECT 1 FROM events WHERE kind='task_removed' AND task_id={table}.task_id) \
+                 ORDER BY id"
+            ))?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, task_id) = row?;
+                out.push(format!(
+                    "{table} row {id} references missing task {task_id}"
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// Tasks stamped after the moment they are read.
@@ -9405,6 +9471,11 @@ impl Store {
 
     /// Keep only the attempts this caller may see, by each attempt's subject
     /// task. Filtered rather than refused: this is an enumeration.
+    ///
+    /// A row whose subject has neither a live task nor a removal record hides
+    /// just that row (fail closed): a partial restore or hand edit can leave
+    /// such a link behind, and one corrupt row must not deny the whole
+    /// listing — the same per-row contract `task_linked_row_visible` keeps.
     fn visible_deployments(
         &self,
         attempts: Vec<DeploymentAttempt>,
@@ -9415,10 +9486,18 @@ impl Store {
         }
         let mut out = Vec::with_capacity(attempts.len());
         for attempt in attempts {
-            if self
-                .authz
-                .permits_read(&self.deployment_subject_tags(&attempt)?)
-            {
+            let tags = match self.deployment_subject_tags(&attempt) {
+                Ok(tags) => tags,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::authz::DeniedOrNotFound>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if self.authz.permits_read(&tags) {
                 out.push(attempt);
             }
         }
@@ -10361,9 +10440,11 @@ impl Store {
         let handoffs = transaction.execute(
             "UPDATE handoffs SET archived=1 WHERE archived=0 AND status<>'pending' AND ( \
                task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
-               (task_id IS NULL AND COALESCE(accepted_at,created_at)<=?) \
+               (task_id IS NULL AND COALESCE(accepted_at,created_at)<=?) OR \
+               (task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks) \
+                AND COALESCE(accepted_at,created_at)<=?) \
              )",
-            [cutoff_at],
+            params![cutoff_at, cutoff_at],
         )? as i64;
         let attention = transaction.execute(
             "UPDATE attention SET archived=1 WHERE archived=0 AND status='resolved' AND ( \
@@ -10393,9 +10474,11 @@ impl Store {
         let events = transaction.execute(
             "UPDATE events SET archived=1 WHERE archived=0 AND ( \
                task_id IN (SELECT id FROM tasks WHERE archived=1) OR \
-               (task_id IS NULL AND created_at<=?) \
+               (task_id IS NULL AND created_at<=?) OR \
+               (task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks) \
+                AND created_at<=?) \
              )",
-            [cutoff_at],
+            params![cutoff_at, cutoff_at],
         )? as i64;
 
         let report = ArchiveReport {
@@ -17333,6 +17416,82 @@ mod tests {
             direct.notes("t-never-created", 10).unwrap_err().to_string(),
             "task t-never-created not found",
             "the direct estate lost its plain message"
+        );
+    }
+
+    /// One deployment linked to an absent task with no removal record hides
+    /// just that row under enforcement instead of failing the whole listing
+    /// (ACC-14): the listing is an enumeration, so a per-row denial filters
+    /// exactly like `task_linked_row_visible` — while `doctor` still reports
+    /// the dangling link, since `foreign_key_check` has no FK left to check.
+    #[test]
+    fn managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it() {
+        use crate::policy::{Capability, ScopeTuple, authority};
+        use crate::routing::Enforcement;
+
+        let board = "ffffffff-3333-4333-8333-333333333333";
+        let dir = std::env::temp_dir().join(format!("kanban-orphan-deploy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create board dir");
+        let path = dir.join(format!("{board}.db"));
+        {
+            let mut seed = Store::open(&path).expect("open seed board");
+            seed.initialize("board", "seed").expect("init");
+            seed.connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at)
+                       VALUES('d-healthy',NULL,'kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-healthy',1,1);
+                     INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at)
+                       VALUES('d-orphan','t-vanished','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-orphan',2,2);",
+                )
+                .expect("seed the deployments");
+        }
+        let grants = || {
+            authority([
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Read,
+                ),
+                (
+                    ScopeTuple::Board {
+                        board_id: board.to_owned(),
+                    },
+                    Capability::Write,
+                ),
+            ])
+        };
+        let managed = Store::open_with_authz(
+            &path,
+            AuthzContext::new(Enforcement::Managed, grants(), board.to_owned()),
+        )
+        .expect("open under board authority");
+        let listed = managed
+            .deployments(None, None, false, 100)
+            .expect("one corrupt row must not fail the listing");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|attempt| attempt.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d-healthy"],
+            "the listing served or dropped the wrong rows: {:?}",
+            listed.iter().map(|attempt| &attempt.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            managed.orphaned_task_links().expect("doctor check"),
+            vec!["deployments row d-orphan references missing task t-vanished".to_owned()],
+            "doctor did not report the dangling task link"
+        );
+        let direct = Store::open(&path).expect("open the direct estate");
+        assert_eq!(
+            direct
+                .deployments(None, None, false, 100)
+                .expect("direct listing")
+                .len(),
+            2,
+            "the direct estate hid a row it must keep visible"
         );
     }
     fn native_check(question: &str, answer: &str, explanation: &str) -> AttentionCheck {
