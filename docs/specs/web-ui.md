@@ -8,8 +8,9 @@
 - **Baseline:** 2026-09-17 at commit `56e6b24` on branch `docs/t-b349fa14-spec`. Every "today"
   claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `SPEC-READY` on 2026-09-17 (independent gate by a reviewer applying the SDD §1
-  exit criteria; OQ-2 and OQ-4 in §7 gate ADR-046's acceptance, not this specification's
-  testability). Product readiness is not claimed by this stamp.
+  exit criteria; OQ-2 and OQ-4 in §7 gated ADR-046's acceptance — both closed 2026-09-20 in
+  attention a-e02c9116 — not this specification's testability). Product readiness is not
+  claimed by this stamp.
 - **Owner (product scope):** George. He alone resolves scope, colour, wording and whether a
   declined option is reinstated.
 - **Decider (wording of this document and of ADR-046):** codex@driver.
@@ -525,9 +526,9 @@ Strength: MUST · Layer: unit · Source: WCAG 2.2 SC 1.4.11.
 The focus ring is ≥ 3:1 against both desk surfaces (`--focus` on `--base` 9.17, on `--mantle`
 9.81), and the recommended answer's fill is ≥ 3:1 against the page (`--green` on `--base`
 11.03, `--red` 7.08, `--yellow` 12.91, `--blue` 7.79). The one hairline and the alternative
-answers' `--surface0` fill are separators and grounds, not the boundary that identifies a
 control — the control is identified by its label text, which passes WEB-48 — so 3:1 is not
-asserted on them; §7 OQ-2 carries this to George.
+asserted on them; §7 OQ-2 carried this to George, and closed with ADR-046's acceptance in
+a-e02c9116 with the borderless design standing.
 
 **WEB-51** — focus is always visible.
 Strength: MUST · Layer: chrome · Source: WCAG 2.2 SC 2.4.7, 2.4.11; plan §Color (focus ring).
@@ -850,6 +851,9 @@ future comparison, not a budget, and only George may make it one.
 
 ## 7. Open questions
 
+*All four questions are closed (OQ-1 resolved, OQ-2 closed by acceptance, OQ-3 declined, OQ-4
+resolved); the entries below are history.*
+
 **OQ-1 — `--overlay`'s hex versus the plan's own AA claim.** *Status:* **RESOLVED**
 2026-09-17 by codex@driver under George's standing instruction "use SDD to do the UI/UX using
 best practices" (2026-09-17). *Gate:* none; this question no longer blocks `SPEC-READY`.
@@ -860,12 +864,15 @@ plan's own stated rule. The rule wins: `--overlay` is Catppuccin Mocha `overlay2
 `overlay1` `#7f849c` reaches only 4.44:1. George may overrule by a later note, in which case
 WEB-08, WEB-48 and WEB-49 change together; until then this is decided, not pending.
 
-**OQ-2 — borderless answers under SC 1.4.11.** *Status:* Open. *Owner:* George. *Gate:*
-ADR-046 acceptance. The plan removes every outline but the focus ring, so an alternative answer
-is identified by its `--surface0` fill (1.3:1 against `--base`) and its label (5.4:1 - 9.9:1).
-WEB-50 asserts 3:1 only where the plan's own design makes a boundary load-bearing. A stricter
-reading of SC 1.4.11 would want a 3:1 boundary on the alternatives, which would reintroduce an
-outline the plan deliberately removed. Recorded rather than decided.
+**OQ-2 — borderless answers under SC 1.4.11.** *Status:* **CLOSED BY ACCEPTANCE**
+(a-e02c9116, 2026-09-20). *Owner:* George. *Gate:* ADR-046 acceptance — now met. The plan
+removes every outline but the focus ring, so an alternative answer is identified by its
+`--surface0` fill (1.3:1 against `--base`) and its label (5.4:1 - 9.9:1). WEB-50 asserts 3:1
+only where the plan's own design makes a boundary load-bearing. A stricter reading of SC 1.4.11
+would want a 3:1 boundary on the alternatives, which would reintroduce an outline the plan
+deliberately removed. The ADR's acceptance clause named this as the question left for George at
+acceptance; he accepted ADR-046 as written in a-e02c9116, so the borderless design stands
+(WEB-50 unchanged). George may reopen it.
 
 **OQ-3 — Tailwind.** *Status:* **DECLINED** (decision recorded in ADR-046 §3; George may
 overrule). *Owner:* George. George suggested Tailwind for the revamp. It is declined because it
@@ -876,9 +883,11 @@ whole UI is two `&'static str` constants compiled into the binary (`rust/serve.r
 utility-class framework would also be a second vocabulary beside the design tokens this slice
 makes normative. If George overrules, ADR-046, this specification and the matrix change together.
 
-**OQ-4 — ADR-046 acceptance.** *Status:* Open. *Owner:* George. *Gate:* ADR-046 moving from
-Proposed to Accepted. The decision stands as Proposed until George reviews screenshots of the
-restyled deck on the phone and the Mac.
+**OQ-4 — ADR-046 acceptance.** *Status:* **RESOLVED** (a-e02c9116, 2026-09-20). *Owner:*
+George. *Gate:* ADR-046 moving from Proposed to Accepted — now Accepted. The decision stood as
+Proposed until George reviewed the responsive deck on phone and Mac: he sent the first version
+back as squished on iPad/phone in a-dd7be9ba (2026-09-18), the responsive fix t-534f29f6
+followed, and he accepted the re-ask in a-e02c9116 (choice `accept`, outcome approve).
 
 ## 8. Verification
 

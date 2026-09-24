@@ -1,6 +1,6 @@
 # ADR-046: The web UI is one designed system: the question is the hero, surfaces not boxes, one motion
 
-**Status:** Proposed
+**Status:** Accepted (2026-09-20, George, attention a-e02c9116)
 **Date:** 2026-09-17
 **Deciders:** codex@driver wrote this; George owns it. He commissioned the revamp in four
 sentences on 2026-09-17 — "revamp the design philosophy please for the web"; "use SDD to do the
@@ -254,10 +254,16 @@ together. A visual change that contradicts a principle or a token is a supersess
 with its own status line — not an edit to the stylesheet. A change that only implements what is
 already stated here updates the spec's evidence column and nothing else.
 
-**Acceptance.** This ADR stays **Proposed** until George has seen screenshots of the restyled
-deck on the phone and on the Mac (`docs/specs/web-ui.md` §7 OQ-4). One open question remains for
+**Acceptance.** This ADR stood **Proposed** until George had seen screenshots of the restyled
+deck on the phone and on the Mac (`docs/specs/web-ui.md` §7 OQ-4). One open question remained for
 him there: OQ-2, the SC 1.4.11 reading of borderless alternatives. OQ-1 (`--overlay`'s hex) and
-OQ-3 (Tailwind) are resolved here, in §2 and §3, and he may overrule either by a later note.
+OQ-3 (Tailwind) were resolved in §2 and §3, and he may overrule either by a later note.
++
+*Met 2026-09-20.* George reviewed the responsive deck on phone and Mac and accepted it in
+attention a-e02c9116 (choice `accept`, outcome approve). He had sent the first version back as
+squished on iPad/phone in a-dd7be9ba (2026-09-18); the responsive fix t-534f29f6 followed, and
+a-e02c9116 was the re-ask. OQ-2 closed with the same acceptance: the borderless design stands,
+and George may reopen it.
 
 ## References
 

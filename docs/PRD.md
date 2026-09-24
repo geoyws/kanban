@@ -312,8 +312,9 @@ working through it.
   [ADR-046](adr/ADR-046-the-web-ui-is-one-designed-system.md): the question is
   the only serif and the largest thing on the page, one motion, a colour means
   an outcome, nothing is boxed, and the deck and the full queue are one client
-  wearing that system. ADR-046 stays Proposed until George has reviewed screenshots
-  of the restyled deck on the phone and the Mac.
+  wearing that system. ADR-046 is Accepted (2026-09-20, George, attention a-e02c9116): he
+  reviewed the responsive deck on phone and Mac after sending the first version back in
+  a-dd7be9ba.
 - Requirements trace: `docs/specs/web-ui.md` §3 states WEB-01..WEB-59 with a
   strength and one evidence layer each, §8 names the test per requirement, and
   [the compiled Rust E2E matrix](testing/compiled-rust-e2e-matrix.md) maps each
@@ -466,8 +467,8 @@ receipt was dropped with its authentication attention `a-347ff24c`. The web
 design system is half served: the deck, its shell and its accessibility
 contract are in that served commit, while commit `b98e81e` — every read page as
 rows with one pill, sentence meta and borderless tables — is shipped on its
-branch and pending its deploy. ADR-046 stays Proposed either way, until George
-has reviewed screenshots of the restyled deck on the phone and the Mac.
+branch and pending its deploy. ADR-046 is Accepted (2026-09-20, George, attention a-e02c9116)
+regardless; what is pending here is the deploy, not the decision.
 
 On 2026-09-17 George decided that the operator UI becomes a single-page
 application, recorded as ADR-048 on 2026-09-19 and specified before it was
