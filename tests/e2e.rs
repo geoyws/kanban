@@ -42548,7 +42548,7 @@ fn hig_release_script_install_writes_no_activation_receipt_when_the_proof_fails(
 /// this installs to. So this one takes the seam away and puts a real process
 /// behind the proof - the very `kanban` executable retained inside the release
 /// - and lets the installer read the real link and the real 200 for it. Linux
-/// only: macOS has no /proc, which is why the seam exists at all.
+///   only: macOS has no /proc, which is why the seam exists at all.
 #[cfg(target_os = "linux")]
 #[test]
 fn hig_release_script_install_proves_the_served_exe_through_proc_on_linux() {
