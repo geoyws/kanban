@@ -881,6 +881,54 @@ fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContex
     }
 }
 
+/// Refuse a task id that names a live row or any prior use of the id (ACC-14
+/// A26): removed ids are never reused, because the sitrep, handoff,
+/// deployment and attention rows that outlive a removal keep the orphaned id
+/// and would otherwise re-parent under the new row's tags.
+///
+/// A live id answers `task {id} already exists`; an id with a `task_removed`
+/// record — or any event history at all — answers `task {id} was removed and
+/// its id cannot be reused`, replacing the raw `UNIQUE constraint failed`.
+/// Under enforcement both answers are read-gated first, so a caller who
+/// cannot read the id's tags (the live tags, or the removal union for a
+/// removed id) gets the generic denial exactly like a never-created id,
+/// while a caller who can read keeps the plain message. Outside enforcement
+/// the guard cannot deny and the plain message stays.
+pub(crate) fn refuse_reused_task_id(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<()> {
+    if get_task(connection, id)?.is_some() {
+        if authz.is_enforcing() {
+            authz.check_read(&task_tags(connection, id)?)?;
+        }
+        bail!("task {id} already exists");
+    }
+    match removed_task_tag_union_oracle(connection, id)? {
+        Some(union) => {
+            if authz.is_enforcing() {
+                authz.check_read(&union)?;
+            }
+            bail!("task {id} was removed and its id cannot be reused");
+        }
+        None => {
+            let used: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE task_id=?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if !used {
+                return Ok(());
+            }
+            if authz.is_enforcing() {
+                return Err(crate::authz::DeniedOrNotFound.into());
+            }
+            bail!("task {id} was removed and its id cannot be reused");
+        }
+    }
+}
+
 /// One task row read through the caller's read authorization (ACC-14): the
 /// row's tags first, then the deny-preserving absent mapping, so under
 /// managed enforcement an unknown id answers exactly like a denied one.
@@ -5400,6 +5448,12 @@ impl Store {
         self.authz.check_read(&[])
     }
 
+    /// This store's authorization context, for the import path's id-reuse
+    /// refusal — the only other writer that takes caller-chosen task ids.
+    pub(crate) fn authz(&self) -> &AuthzContext {
+        &self.authz
+    }
+
     /// Whether this board has ever recorded an event of this kind. A kind is
     /// vocabulary, not a row, so board scope is the whole check.
     pub fn event_kind_exists(&self, kind: &str) -> Result<bool> {
@@ -5506,6 +5560,11 @@ impl Store {
         // A new row has no old tag set; the resulting set is what the caller
         // asked for. Under the mutation lock.
         self.authz.check_write(&[], &input.tags)?;
+        // A removed id is never reused: its surviving linked rows would
+        // re-parent under the new row's tags. Refused before the INSERT, so
+        // a live id answers `already exists` instead of the raw UNIQUE
+        // failure, read-gated under enforcement like every other by-id path.
+        refuse_reused_task_id(&transaction, &id, &self.authz)?;
         let now = now_ms();
         if let Some(parent) = &input.parent_id {
             // A child names its parent: authorized against the parent's own

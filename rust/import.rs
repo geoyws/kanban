@@ -1,6 +1,6 @@
 use crate::model::{TASK_STATUSES, TASK_TYPES};
 use crate::registry::now_ms;
-use crate::store::{Store, event, live_claims};
+use crate::store::{Store, event, live_claims, refuse_reused_task_id};
 use anyhow::{Context, Result, bail};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -447,6 +447,9 @@ fn normalize_and_insert(
             }
         }
     }
+    // Cloned before the transaction opens: the write scope borrows the
+    // connection mutably, and the reuse refusal below needs the context.
+    let authz = store.authz().clone();
     let transaction = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -514,6 +517,13 @@ fn normalize_and_insert(
     }
 
     for input in &inputs {
+        // A removed id is never reused, here no less than on `task add`: the
+        // surviving linked rows would re-parent under the imported row. Live
+        // ids keep their `--reconcile` upsert; only an id with no live row
+        // but a removal record or any event history is refused.
+        if !existing.contains(&input.id) {
+            refuse_reused_task_id(&transaction, &input.id, &authz)?;
+        }
         if !TASK_TYPES.contains(&input.task_type.as_str())
             || !TASK_STATUSES.contains(&input.status.as_str())
         {

@@ -7854,3 +7854,198 @@ fn residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement
         ],
     );
 }
+
+/// ACC-14 id-reuse contract, at the layer `process`: a removed task's id is
+/// never reusable, and probing one answers exactly like probing a live denied
+/// id.
+///
+/// The fixture tags two tasks `secret`, posts a sitrep carrying a unique
+/// token on `t-sec`, and removes `t-sec`. The caller holds board read and
+/// untagged write only — the `task add --id` precondition. Re-adding `t-sec`
+/// and re-adding the still-live `t-sec-live` then answer with the same exit
+/// code and byte-identical stderr carrying the one generic denial, and the
+/// caller sees the sitrep on no listing. Granting the same principal `secret`
+/// read shows the row survived: gating, not deletion.
+#[test]
+fn removed_task_ids_are_never_reused_and_probe_like_live_denied_ids() {
+    let estate = ManagedEstate::new("acc14-id-reuse");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    for (id, title) in [
+        ("t-sec", "the reuse secret task"),
+        ("t-sec-live", "the live secret task"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--tag", "secret", "--as", "seed", "--json",
+            ],
+        );
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "sitrep",
+            "post",
+            "quorumidreuse body on the removed secret task",
+            "--as",
+            "seed",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/id-reuse-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--task",
+            "t-sec",
+            "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-sec", "--as", "seed"]);
+
+    estate.bind_self(
+        "p-id-reuse",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+
+    let removed = estate.run(
+        &work_a,
+        &[
+            "task", "add", "probe", "--id", "t-sec", "--as", "probe", "--json",
+        ],
+    );
+    let live = estate.run(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "probe",
+            "--id",
+            "t-sec-live",
+            "--as",
+            "probe",
+            "--json",
+        ],
+    );
+    for (output, what) in [
+        (&removed, "re-adding a removed secret id"),
+        (&live, "re-adding a live secret id"),
+    ] {
+        assert!(
+            !output.status.success(),
+            "{what} succeeded but must be refused\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    assert_eq!(
+        removed.status.code(),
+        live.status.code(),
+        "re-adding a removed id exits differently from re-adding a live denied one"
+    );
+    assert_eq!(
+        removed.stderr, live.stderr,
+        "re-adding a removed id answers differently from re-adding a live denied one"
+    );
+    assert!(
+        String::from_utf8_lossy(&removed.stderr).contains(DENIED),
+        "re-add refusal is not the generic denial: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+
+    for args in [
+        vec!["sitrep", "list", "--json"],
+        vec!["sitrep", "list", "--task", "t-sec", "--json"],
+    ] {
+        let listing = estate.ok(&work_a, &args);
+        assert!(
+            !listing.contains("quorumidreuse"),
+            "`kanban {args:?}` handed over a removed task's sitrep after a refused re-add: {listing}"
+        );
+    }
+
+    estate.grant(
+        "p-id-reuse",
+        &[
+            tag_scope("read", &estate.id_a, "secret"),
+            tag_scope("write", &estate.id_a, "secret"),
+        ],
+    );
+    let owner = estate.ok(&work_a, &["sitrep", "list", "--task", "t-sec", "--json"]);
+    assert!(
+        owner.contains("quorumidreuse"),
+        "the refused re-add destroyed the row it must only gate: {owner}"
+    );
+}
+
+/// ACC-14 id-reuse contract where no guard can deny: re-adding a removed id
+/// and re-adding a live id are plain, stable refusals — never the raw
+/// `UNIQUE constraint failed`, never the generic denial.
+#[test]
+fn reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny() {
+    let estate = ManagedEstate::new("acc14-id-reuse-direct");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(
+        &work_a,
+        &[
+            "task", "add", "live", "--id", "t-live", "--as", "seed", "--json",
+        ],
+    );
+    let live = estate.run(
+        &work_a,
+        &[
+            "task", "add", "again", "--id", "t-live", "--as", "seed", "--json",
+        ],
+    );
+    assert!(
+        !live.status.success(),
+        "re-adding a live id succeeded but must be refused"
+    );
+    let live_stderr = String::from_utf8_lossy(&live.stderr).into_owned();
+    assert!(
+        live_stderr.contains("task t-live already exists"),
+        "re-adding a live id lost its plain refusal: {live_stderr}"
+    );
+    assert!(
+        !live_stderr.contains(DENIED),
+        "re-adding a live id answers a denial where no guard can deny: {live_stderr}"
+    );
+    assert!(
+        !live_stderr.contains("UNIQUE constraint failed"),
+        "re-adding a live id leaks the raw constraint: {live_stderr}"
+    );
+
+    estate.ok_json(
+        &work_a,
+        &[
+            "task", "add", "gone", "--id", "t-gone", "--as", "seed", "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-gone", "--as", "seed"]);
+    let gone = estate.run(
+        &work_a,
+        &[
+            "task", "add", "again", "--id", "t-gone", "--as", "seed", "--json",
+        ],
+    );
+    assert!(
+        !gone.status.success(),
+        "re-adding a removed id succeeded but must be refused"
+    );
+    let gone_stderr = String::from_utf8_lossy(&gone.stderr).into_owned();
+    assert!(
+        gone_stderr.contains("task t-gone was removed and its id cannot be reused"),
+        "re-adding a removed id lost its plain refusal: {gone_stderr}"
+    );
+    assert!(
+        !gone_stderr.contains(DENIED),
+        "re-adding a removed id answers a denial where no guard can deny: {gone_stderr}"
+    );
+}
