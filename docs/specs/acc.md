@@ -570,6 +570,21 @@ query serves the anchor with byte-identical `lexicalScore` and `score`, and the 
 appears in neither receipt. On an unenforced board the same query is unaffected by design:
 every row is readable there, so the divisor is still taken over the whole match set.
 
+### A22 — a removed task's trail stays tag-gated on every tail (`ACC-14`)
+
+*Given* an untagged task whose body edit leaves a unique token in a
+*`task_updated.previousBody` while its snapshot still reads `tags: []`,
+*when* the task is tagged `secret` and then removed, *then* a managed
+*caller holding only board read sees the token on no tail — not in
+*board-wide `events`, not in `events --task`, not in a `watch` batch, not
+*in served `/api/v1/search`, and served `/api/v1/task/{project}/{id}`
+*answers the one generic denial for the gone row — while the same caller
+*granted `secret` read still reads the token in `events`, in `watch` and
+*in served search alike. Removal never loosens a tag: a removed task's
+*events authorize against the task's last-known tags from its
+*`task_removed` snapshots plus each event's own snapshot, so the tails and
+*the index agree instead of the index dropping what the tails serve.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
@@ -676,7 +691,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | always-redacted pre-answer show/list and mutation receipts, including the raiser's own reads, through the shared Store redaction (`rust/store.rs:1421`) that MCP and web reads inherit; the HTTP projection sweep pins the same omission in the browser bytes; post-answer reads carry answer, explanation and result, and reopen redacts again; the digest half is cut over outside this repo (external evidence: board row `t-94076221`, geoyws skills-root `dec6b96` via dotfiles `136b196`) |
-| `ACC-14` | MUST | http/process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `search_scores_are_a_function_of_permitted_documents_only` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages; a tag-denied document moves no permitted hit's served `lexicalScore` or `score` (A21) |
+| `ACC-14` | MUST | http/process | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http`; `denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface`; `search_scores_are_a_function_of_permitted_documents_only`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail_over_http` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing; every by-id surface (web check/reply/reopen POSTs; CLI attention show/resolve/reopen/check and task show) answers a denied id and a never-created id byte-identically under a managed principal, past-guard refusals keep their sentences, and unmanaged boards keep plain not-found messages; a tag-denied document moves no permitted hit's served `lexicalScore` or `score` (A21); a removed task's events stay tag-gated on every tail and in search for readers without the tag, and stay readable to a holder of it (A22) |
 | `ACC-15` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | the in-tree half is the `attention check` verb that `/kb-acc` answers through; the skill cutover itself is external evidence (board row `t-94076221`: geoyws skills-root `dec6b96` via dotfiles `136b196`; board row `t-80d5900f`: IFCA estate pin `pai-root 222aa6cfb` -> skills-root `f817cef` -> kb-skill `e994bf4` with a consumer test) — not verifiable from this tree |
 | `ACC-16` | MUST | process | `scripts/migrate-acc-body-blocks.test.sh` (gate-wired at `scripts/release-gate.sh:104`); `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | the one-shot script converts a valid leading legacy block once per board with an operator receipt, strips the block, leaves no-block/already-native/resolved rows byte-for-byte, reports invalid prose for hand migration, and migrates nothing on re-run; the schema test pins the v30 native columns advancing without inventing a check |
 | `ACC-17` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check`; `att_list_check_report_groups_worst_first_with_adr037_caps` | a no-check row refuses `--check-answered` by name and otherwise resolves as before, and refuses `attention check` as carrying no check; a bare resolve — the older-client path — settles a checked row leaving the check pending and answerable; a pre-existing no-check row survives migration unchanged; no-check rows contribute nothing to the report |
@@ -757,3 +772,19 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   SELECT with the removed-task and removed-attention STALE rules unchanged. On unenforced
   boards no filter is passed, so scores and order are exactly what the unfiltered code
   produced.
+
+- 2026-09-25 — ACC-14 removed-task tail evidence landed (`t-bd66208d`):
+  `a_removed_tasks_trail_stays_tag_gated_on_every_tail_over_http` tags a
+  task `secret` after a body edit and then removes it: a caller holding only
+  board read sees the pre-tag `previousBody` draft on no tail — board-wide
+  `events`, `events --task`, a `watch` batch, served `/api/v1/search` —
+  while the same caller granted `secret` read keeps the trail on each of
+  them (A22). The landing fixed the leak as a bug; requirement wording is
+  unchanged. The stale-task rule lived only in the search event path, while
+  the tails authorized a removed task's events against the empty tag set of
+  the missing row plus each event's own snapshot, so a pre-tag event stayed
+  readable to any board reader. A removed task's events are now authorized
+  against the task's last-known tags — the union of its `task_removed`
+  snapshots — plus each event's own snapshot, in the tails and in the
+  index alike; a removed task with no removal record still fails closed
+  with the stale-entry tag.

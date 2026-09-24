@@ -4520,6 +4520,145 @@ fn a_removed_tasks_pre_tag_event_is_in_no_search_over_http() {
     }
 }
 
+/// ACC-14 over HTTP and the CLI, removed-task tails: every event of a task
+/// that was tagged and then removed stays tag-gated on each tail that serves
+/// it, and the tails agree with search.
+///
+/// INTEGRATION, at the layers `http` and `process`: the real binary, a real
+/// managed estate, the CLI and the serving process running as the same
+/// identity. The caller holds only board read on Alpha — no tag scope at
+/// all — and full ownership of Beta so the whole-estate reads answer.
+///
+/// The fixture creates a task untagged, edits its body so a `task_updated`
+/// event carries the draft in `previousBody` while its snapshot still reads
+/// `tags: []`, tags the task `secret`, then removes it. The `events` rows
+/// survive the delete, and the removal trigger re-inserts their index
+/// documents, so the pre-tag event is reachable through every tail. The
+/// draft token appears nowhere else on either board, so its absence proves
+/// each tail withheld the event rather than merely ranking it below
+/// something.
+///
+/// The denied half reads board-wide `events`, `events --task`, one `watch`
+/// batch and served `/api/v1/search`: none carries the token. Served
+/// `/api/v1/task/Alpha/t-evttail` answers the one generic denial for the
+/// gone row. The served websocket `/live` notices read through the same
+/// `events_since_filtered` the `watch` CLI exercises, and this harness
+/// speaks no websocket, so the CLI batch covers that path.
+///
+/// The owner half grants that same principal `secret` read and reads again:
+/// `events`, `watch` and served search all carry the token. A fix that
+/// simply hid every removed-task event would fail here, so what is proved
+/// is gating, not hiding.
+#[test]
+fn a_removed_tasks_trail_stays_tag_gated_on_every_tail_over_http() {
+    let estate = ManagedEstate::new("acc14-removed-task-tails");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "removed tail",
+            "--id",
+            "t-evttail",
+            "--body",
+            "draft cinderquorum notes",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-evttail",
+            "--body",
+            "final wording",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-evttail",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-evttail", "--as", "seed"]);
+
+    estate.bind_self("p-tail-reader", &[board_scope("read", &estate.id_a)]);
+    estate.grant("p-tail-reader", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // The denied half: no tail carries the removed task's pre-tag draft.
+    let events = estate.ok(&work_a, &["events", "--json"]);
+    assert!(
+        !events.contains("cinderquorum"),
+        "board-wide events handed over a removed task's pre-tag draft: {events}"
+    );
+    let watched = estate.ok(&work_a, &["watch", "--json"]);
+    assert!(
+        !watched.contains("cinderquorum"),
+        "watch handed over a removed task's pre-tag draft: {watched}"
+    );
+    let named = estate.run(&work_a, &["events", "--task", "t-evttail", "--json"]);
+    assert!(
+        !named.status.success(),
+        "events --task on a removed task should fail, not serve its trail"
+    );
+    let named_stderr = String::from_utf8_lossy(&named.stderr).into_owned();
+    assert!(
+        !named_stderr.contains("cinderquorum"),
+        "events --task leaked the removed task's draft in its refusal: {named_stderr}"
+    );
+    let search = server.get_json("/api/v1/search?q=cinderquorum");
+    assert!(
+        search["items"].as_array().unwrap().is_empty(),
+        "served search handed over a removed task's pre-tag event: {search}"
+    );
+    let detail = server.get("/api/v1/task/Alpha/t-evttail");
+    assert_eq!(
+        (detail.status, detail.body.as_str()),
+        (404, DENIED_JSON),
+        "the gone task's trail route answered something other than the generic denial"
+    );
+
+    // The owner half: the same principal with `secret` read keeps the trail
+    // on every tail, so the rule gates rather than hides.
+    estate.grant(
+        "p-tail-reader",
+        &[tag_scope("read", &estate.id_a, "secret")],
+    );
+    let events = estate.ok(&work_a, &["events", "--json"]);
+    assert!(
+        events.contains("cinderquorum"),
+        "the tag holder lost the removed task's audit trail in events: {events}"
+    );
+    let watched = estate.ok(&work_a, &["watch", "--json"]);
+    assert!(
+        watched.contains("cinderquorum"),
+        "the tag holder lost the removed task's audit trail in watch: {watched}"
+    );
+    let search = server.get_json("/api/v1/search?q=cinderquorum");
+    assert!(
+        !search["items"].as_array().unwrap().is_empty()
+            && search.to_string().contains("cinderquorum"),
+        "the tag holder lost the removed task's audit trail in served search: {search}"
+    );
+}
+
 /// ACC-14 over HTTP and the CLI, every by-id surface: a tag-denied id and a
 /// never-created id answer byte-identically on each web attention POST route
 /// (check, reply/decision, reopen) and on CLI `attention show`, `attention
