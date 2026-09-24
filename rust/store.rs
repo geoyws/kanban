@@ -4335,12 +4335,24 @@ impl Store {
             .as_deref()
             .map(|value| nonempty(value, "subscription subject task id").map(str::to_owned))
             .transpose()?;
-        if let Some(subject) = subject_task_id.as_deref()
-            && !watch_subject_exists_on(&transaction, subject)?
-        {
-            bail!(
-                "subscription subject task {subject} not found in current or historical board state"
-            );
+        if let Some(subject) = subject_task_id.as_deref() {
+            // A subscription names the task its deliveries are about: a
+            // caller who cannot read that task must not subscribe to its
+            // events, nor learn it exists — so its live tags are checked
+            // here, and an unknown subject answers as denied. A subject that
+            // survives only in history carries no live tags (tasks delete
+            // cascades them), so history keeps its existing existence check.
+            let tags = task_tags(&transaction, subject)?;
+            self.authz.check_read(&tags)?;
+            self.authz.check_write(&tags, &tags)?;
+            if !watch_subject_exists_on(&transaction, subject)? {
+                if self.authz.is_enforcing() {
+                    return Err(crate::authz::DeniedOrNotFound.into());
+                }
+                bail!(
+                    "subscription subject task {subject} not found in current or historical board state"
+                );
+            }
         }
 
         let mut relations = Vec::new();
@@ -4352,7 +4364,15 @@ impl Store {
             if target.trim().is_empty() || target != target.trim() {
                 bail!("subscription relation target is required");
             }
+            // A relation names a task its deliveries filter on: same gate as
+            // the subject, with the same collapse for an unknown target.
+            let target_tags = task_tags(&transaction, target)?;
+            self.authz.check_read(&target_tags)?;
+            self.authz.check_write(&target_tags, &target_tags)?;
             if !watch_relation_target_exists_on(&transaction, kind, target)? {
+                if self.authz.is_enforcing() {
+                    return Err(crate::authz::DeniedOrNotFound.into());
+                }
                 bail!(
                     "subscription relation target {kind}:{target} not found in current or historical board state"
                 );
@@ -5512,7 +5532,10 @@ impl Store {
         refuse_reused_task_id(&transaction, &id, &self.authz)?;
         let now = now_ms();
         if let Some(parent) = &input.parent_id {
-            let parent = require_task(&transaction, parent)?;
+            // A child names its parent: authorized against the parent's own
+            // tags — read as well as write — with an absent id answering as
+            // denied, before the row exists.
+            let parent = authorize_task_attach(&transaction, &self.authz, parent)?;
             require_valid_nesting(&id, &input.task_type, &parent)?;
         }
         transaction.execute(
@@ -5520,7 +5543,8 @@ impl Store {
             params![id,input.task_type,input.parent_id,title,input.body,input.assignee,input.lane,input.deliverable,input.stale_minutes,input.driver_only as i64,input.status,input.priority,now,now,if input.status == "done" { Some(now) } else { None },input.metadata.to_string()],
         )?;
         for dependency in input.dependencies {
-            require_task(&transaction, &dependency)?;
+            // A dependency names its prerequisite: same gate as the parent.
+            authorize_task_attach(&transaction, &self.authz, &dependency)?;
             if dependency == id {
                 bail!("task cannot depend on itself");
             }
@@ -6096,7 +6120,17 @@ impl Store {
         let previous_parent = current.parent_id.clone();
         let parent = input.parent_id.unwrap_or(current.parent_id);
         if let Some(parent_id) = &parent {
-            let parent_task = require_task(&transaction, parent_id)?;
+            // Only a CHANGED edge is authorized against the other row: the
+            // unchanged parent was authorized when the edge was written, and
+            // a caller who may edit this row must not lose that to a parent
+            // it cannot see. A new edge names its parent, so that row's own
+            // tags are checked — read as well as write — with an absent id
+            // answering as denied.
+            let parent_task = if parent != previous_parent {
+                authorize_task_attach(&transaction, &self.authz, parent_id)?
+            } else {
+                require_task(&transaction, parent_id)?
+            };
             require_valid_nesting(id, &current.task_type, &parent_task)?;
             let mut cursor = Some(parent_id.clone());
             let mut seen = std::collections::HashSet::from([id.to_owned()]);
@@ -6148,7 +6182,8 @@ impl Store {
                 }
             }
             for dependency in &unique {
-                require_task(&transaction, dependency)?;
+                // Replaced edges are new links: same gate as the parent.
+                authorize_task_attach(&transaction, &self.authz, dependency)?;
                 if dependency == id {
                     bail!("task cannot depend on itself");
                 }
@@ -6624,11 +6659,12 @@ impl Store {
     pub fn checkpoint(&mut self, input: CheckpointInput) -> Result<Checkpoint> {
         validate(&input.state, &CHECKPOINT_STATES, "checkpoint state")?;
         let transaction = self.begin_write()?;
-        // Checkpoints carry no tags of their own: board scope, under the lock.
-        self.authz.check_write(&[], &[])?;
+        // Checkpoints carry no tags of their own, so they are authorized
+        // against the task they attach to — read as well as write — before
+        // the lease is even looked at, and an absent id answers as denied.
+        let prior_status = authorize_task_attach(&transaction, &self.authz, &input.task_id)?.status;
         let now = now_ms();
         let claim = require_lease(&transaction, &input.task_id, &input.lease_token, now)?;
-        let prior_status = require_task(&transaction, &input.task_id)?.status;
         if claim.agent_id != input.author {
             bail!("lease belongs to {}, not {}", claim.agent_id, input.author);
         }
@@ -8287,7 +8323,10 @@ impl Store {
             );
         }
         let transaction = self.begin_write()?;
-        // Handoffs carry no tags of their own: board scope, under the lock.
+        // Handoffs carry no tags of their own: board scope, under the lock. A
+        // task handoff additionally attaches to its task, so that row's own
+        // tags are checked — read as well as write — before the lease is
+        // looked at, with an absent id answering as denied.
         self.authz.check_write(&[], &[])?;
         for blocker in &input.blockers {
             reject_secret_shaped_text(blocker, "handoff blocker")?;
@@ -8299,7 +8338,9 @@ impl Store {
         let prior_status = input
             .task_id
             .as_deref()
-            .map(|task_id| require_task(&transaction, task_id).map(|task| task.status))
+            .map(|task_id| {
+                authorize_task_attach(&transaction, &self.authz, task_id).map(|task| task.status)
+            })
             .transpose()?;
         // A task and a lease travel together: a lease exists only over a task,
         // and handing a task over without one would let any caller move work
@@ -9282,13 +9323,14 @@ impl Store {
         let url = nonempty(&input.url, "url")?.to_owned();
         let actor = nonempty(&input.actor, "actor")?.to_owned();
         let transaction = self.begin_write()?;
-        let subject_tags = match input.task_id.as_deref() {
-            Some(task_id) => task_tags(&transaction, task_id)?,
-            None => Vec::new(),
-        };
-        self.authz.check_write(&subject_tags, &subject_tags)?;
+        // A deployment names the task it proves: authorized against that
+        // task's own tags — read as well as write, because the attempt is a
+        // projection of the task and listings withhold unreadable subjects —
+        // with an absent id answering as denied.
         if let Some(task_id) = input.task_id.as_deref() {
-            require_task(&transaction, task_id)?;
+            authorize_task_attach(&transaction, &self.authz, task_id)?;
+        } else {
+            self.authz.check_write(&[], &[])?;
         }
         let deployment_target_version = if let Some(sprint_id) = input.sprint_id.as_deref() {
             let sprint = require_sprint_on(&transaction, sprint_id)?;

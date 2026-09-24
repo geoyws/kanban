@@ -274,6 +274,19 @@ unchecked, known and unknown rows.
   restores the authorize-as-the-containing-row rule for the replacement the
   whole-row delete had silently left.
 
+- 2026-09-25 — every write that links a row to a task (`add_note`,
+  `raise_attention` with `--task`, `post_sitrep` with `--task`, `checkpoint`,
+  `create_handoff` with a task, the parent and dependency edges on task add
+  and update, subscription subjects and relations, `start_deployment` with
+  `--task`) is authorized against that task's own tags at both read and write
+  (`authorize_task_attach` in `rust/store.rs`), with an absent id answering
+  the same `DeniedOrNotFound` error the denied path uses when enforcement is
+  managed — so success no longer confirms a tag-denied row exists, and a
+  refusal writes nothing. A lanewide sitrep, a session handoff and a taskless
+  deployment keep their existing board scope. Requirement wording is unchanged:
+  this restores the authorize-as-the-containing-row rule the tag-checked
+  writes (claim, sprint attachment, deployment finish) already applied.
+
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
 `lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
@@ -561,13 +574,17 @@ every row is readable there, so the divisor is still taken over the whole match 
 
 ### A21 — task-attach writes inherit the task's tags (`ACC-14`)
 
-*Given* a managed caller holding board read and write but no `secret` tag scope, *when* it
-attaches a note, an `attention raise --task` or a `sitrep post --task` to a `secret` task,
-*then* each write is refused with the existing non-enumerating denial — byte-identical in
-exit code and stderr to the same write naming a never-created id — and nothing is recorded:
-an owner re-read shows each task-scoped ledger holding only its birth event, with no
-attention row and no sitrep created. *When* no enforcement applies, *then* an unknown id
-keeps its plain `not found` message and authorized attaches work as before.
+*Given* a managed caller holding board read and write but no `secret` tag
+scope, *when* it attaches to a `secret` task through `note`, `attention raise
+--task`, `sitrep post --task`, `checkpoint`, `handoff create` with a task,
+`task add --parent` or `--depends-on`, `task update --parent` or `--depends-on`,
+`subscription add --subject` or `--relation`, or `deploy start --task`, *then*
+each write is refused with the existing non-enumerating denial — byte-identical
+in exit code and stderr to the same write naming a never-created id — and nothing
+is recorded: an owner re-read shows each task-scoped ledger holding only its birth
+event, the phantom children absent, and no subscription created. *When* no
+enforcement applies, *then* an unknown id keeps its plain `not found` message and
+authorized attaches work as before.
 
 ### A22 — a removed task's trail stays tag-gated on every tail (`ACC-14`)
 
@@ -626,7 +643,7 @@ not, through `task add` and through import, because the rows that outlive a
 removal keep the orphaned id and would otherwise re-parent under the new
 row's tags.
 
-### A2X — a dependency replacement keeps the edges the caller cannot read (`ACC-14`)
+### A25 — a dependency replacement keeps the edges the caller cannot read (`ACC-14`)
 
 *Given* the owner gates a `visible` task `t-visible` on a `secret` task
 `t-secret`, *when* a managed caller holding board read and write but no
@@ -740,7 +757,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | shared POST through the one Store operation; the serialized-loser half is held by the store-level one-answer refusal |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | keyboard and pointer equivalence, digit ownership, focus move, worded pass/miss, Undo preserved |
 | `ACC-13` | MUST | process | PARTIAL — `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser, and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest projection half stays unproven — no digest test in the tree (t-0382c937, 2026-09-29) |
-| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
+| `ACC-14` | MUST | process | `checked_row_stays_non_enumerating_to_an_unauthorized_actor`; `search_scores_are_a_function_of_permitted_documents_only`; `note_attention_raise_and_sitrep_refuse_a_tag_denied_task_like_an_unknown_id`; `a_removed_tasks_trail_stays_tag_gated_on_every_tail`; `removed_task_links_stay_tag_gated_on_every_listing_search_and_lane`; `an_orphaned_handoff_stays_deniable_yet_acceptable_and_archivable`; `removed_task_ids_are_never_reused_and_probe_like_live_denied_ids`; `reusing_a_task_id_is_refused_with_a_plain_message_where_no_guard_can_deny`; `compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it`; `compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it`; `store::tests::managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`; `schema_36_keeps_task_links_without_foreign_keys`; `schema_36_backfills_pre_v36_nulled_links_from_creation_events`; `task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id` | same-key check post, show and answering resolve on another board's checked row all receive the generic denial with no question, choice, answer, explanation or `about` anywhere, and the check stays unanswered with no result afterwards; a tag-denied document moves no permitted hit's served `lexicalScore` or `score`; A11's HTTP half stays unexercised (t-2e2ea981, t-e9c0127a); note, attention raise `--task` and sitrep post `--task` answer a denied id and a never-created id byte-identically under a managed principal, record nothing, and keep plain not-found messages unmanaged (t-d2fd604a, A21); a removed task's trail stays tag-gated on board-wide `events`, `watch --follow` and `search`, and `events --task` on the gone row refuses exactly like a never-created id (t-bd66208d, A22); a removed secret task keeps its sitrep, handoff, attention row and deployment attempt gated on its removal tags across every listing, search, lane-filtered sitreps, watch and every by-id surface while taskless rows stay readable (t-2cffbe08, A23); an orphaned handoff stays deniable yet acceptable without a lease, archivable, and doctor-healthy; a removed id and a live denied id probe identically on `task add --id`, with plain refusals where no guard can deny (t-2cffbe08, A24) |
 | `ACC-15` | MUST | process | SUPERSEDED 2026-09-24 | Ledger + skills scope change (`t-1aa9f553`): the native-cutover wording is replaced; live behaviour is ACC-20/ACC-21 |
 | `ACC-16` | MUST | process | `migrate-acc-body-blocks.sh` + `migrate-acc-body-blocks.test.sh`, wired at `scripts/release-gate.sh:93`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | one-shot conversion of valid legacy `ACC:` blocks with operator receipt; rows without a block byte-for-byte unchanged; rerun migrates nothing; invalid prose reported for hand migration (t-0382c937, 2026-09-29) |
 | `ACC-17` | MUST | process | SUPERSEDED 2026-09-24 | resolve-no-longer-waits (`t-1aa9f553`); live behaviour is ACC-06/ACC-20 |
@@ -912,7 +929,7 @@ and no-target bullets restored verbatim beside the leaderboard bullet.
   gate the owner set; the write still succeeds, because refusing would confirm
   a hidden edge exists. The receipt and the listing still withhold the kept
   edges while the gate keeps honouring every edge — pinned by
-  `dependency_replacement_keeps_a_tag_denied_prerequisite` (A2X). The parent
+  `dependency_replacement_keeps_a_tag_denied_prerequisite` (A25). The parent
   edge needs no such treatment — the row's own `parentID` carries it, so a
   replacement drops an edge the caller already sees — and subscription
   relations are create-only, with each target gated at add and no rewrite
