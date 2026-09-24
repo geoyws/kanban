@@ -4519,3 +4519,332 @@ fn a_removed_tasks_pre_tag_event_is_in_no_search_over_http() {
         );
     }
 }
+
+/// ACC-14 over HTTP and the CLI, every by-id surface: a tag-denied id and a
+/// never-created id answer byte-identically on each web attention POST route
+/// (check, reply/decision, reopen) and on CLI `attention show`, `attention
+/// resolve`, `attention reopen`, `attention check` and `task show`.
+///
+/// INTEGRATION, at the layers `http` and `process`: the real binary, a real
+/// managed estate, the CLI and the serving process running as the same
+/// identity. The caller holds board read AND write plus `tag:visible` at both
+/// capabilities on Alpha — write as well, so every denial below is the ROW's
+/// and not the guard's blanket refusal of a principal who can write nothing.
+///
+/// The fixture raises one `secret` decision row (open, no check), one
+/// `secret` checked row with a known key, one `visible` checked row (the
+/// control that proves a past-guard refusal still names its reason), and one
+/// `secret` task. The unknown ids `att-never-raised` and `t-never-created`
+/// were never raised or added. Refusals past the guard — no check, already
+/// answered, undeclared key, not the raiser — keep the store's own sentence,
+/// and the unmanaged estate keeps its plain `not found` message.
+#[test]
+fn denied_and_unknown_ids_answer_identically_on_every_by_id_attention_surface() {
+    let estate = ManagedEstate::new("acc14-by-id-oracle");
+    let work_a = estate.work_a.clone();
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    // Unmanaged first: where no guard can deny, an unknown id keeps its plain
+    // message. This fix must not change that UX.
+    let plain = estate.run(&work_a, &["attention", "show", "att-never-raised"]);
+    assert!(
+        !plain.status.success(),
+        "an unknown show should fail unmanaged"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+    assert!(
+        plain_stderr.contains("attention att-never-raised not found"),
+        "unmanaged show lost its plain message: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(DENIED),
+        "unmanaged show answers a denial where no guard can deny: {plain_stderr}"
+    );
+    let secret_task = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the oracle secret task",
+            "--id",
+            "t-oracle-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let secret = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "the oracle secret body",
+            "--kind",
+            "decision",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let raise_checked = |body: &str, tag: &str, key_a: &str, key_b: &str| -> String {
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--kind",
+                "decision",
+                "--tag",
+                tag,
+                "--check",
+                "Oracle check question quorum?",
+                "--check-choice",
+                &format!("{key_a}=First label"),
+                "--check-choice",
+                &format!("{key_b}=Second label"),
+                "--check-answer",
+                key_a,
+                "--check-explain",
+                "Oracle check explanation quorum",
+                "--check-about",
+                "rust/store.rs",
+                "--as",
+                "seed",
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let checked = raise_checked(
+        "the oracle secret check body",
+        "secret",
+        "okey-alpha",
+        "okey-beta",
+    );
+    let visible = raise_checked(
+        "the oracle visible check body",
+        "visible",
+        "vkey-alpha",
+        "vkey-beta",
+    );
+    estate.bind_self(
+        "p-oracle",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            tag_scope("write", &estate.id_a, "visible"),
+        ],
+    );
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+    // 1. Each web attention POST route: the denied id and the never-created
+    //    id answer byte-for-byte the same status and body — the existing
+    //    non-enumerating denial — and neither body names the row.
+    for (denied_path, unknown_path, body, what) in [
+        (
+            format!("/attention/Alpha/{checked}/check"),
+            "/attention/Alpha/att-never-raised/check".to_owned(),
+            "key=okey-alpha",
+            "check",
+        ),
+        (
+            format!("/attention/Alpha/{secret}/reply"),
+            "/attention/Alpha/att-never-raised/reply".to_owned(),
+            "decision=custom&outcome=other&reply=done",
+            "reply",
+        ),
+        (
+            format!("/attention/Alpha/{secret}/reopen"),
+            "/attention/Alpha/att-never-raised/reopen".to_owned(),
+            "",
+            "reopen",
+        ),
+    ] {
+        let denied_post = server.post(&denied_path, &[], body);
+        let unknown_post = server.post(&unknown_path, &[], body);
+        assert_eq!(
+            (denied_post.status, denied_post.body.as_str()),
+            (unknown_post.status, unknown_post.body.as_str()),
+            "the {what} POST distinguishes a denied row from an unknown id"
+        );
+        assert!(
+            denied_post.body.contains(DENIED),
+            "the {what} POST did not answer the non-enumerating denial: {}",
+            denied_post.body
+        );
+        for needle in [
+            &secret,
+            &checked,
+            "the oracle secret body",
+            "the oracle secret check body",
+        ] {
+            assert!(
+                !denied_post.body.contains(needle) && !unknown_post.body.contains(needle),
+                "the {what} POST refusal named {needle}, which this caller may not read"
+            );
+        }
+    }
+    // 2. Each CLI by-id surface: the denied id and the never-created id exit
+    //    with the same code and byte-identical stderr — the generic denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["attention", "show", &secret],
+        &["attention", "show", "att-never-raised"],
+        "attention show",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "resolve",
+            &secret,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        &[
+            "attention",
+            "resolve",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        "attention resolve",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "reopen",
+            &secret,
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        &[
+            "attention",
+            "reopen",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        "attention reopen",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "check",
+            &checked,
+            "--as",
+            "seed",
+            "--key",
+            "okey-alpha",
+        ],
+        &[
+            "attention",
+            "check",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--key",
+            "okey-alpha",
+        ],
+        "attention check",
+    );
+    assert_cli_identical(
+        &["task", "show", &secret_task],
+        &["task", "show", "t-never-created"],
+        "task show",
+    );
+    // 3. A refusal past the guard keeps the store's own sentence: an
+    //    undeclared key on the VISIBLE row is refused by name, not as denied.
+    let named = estate.run(
+        &work_a,
+        &[
+            "attention",
+            "check",
+            &visible,
+            "--as",
+            "seed",
+            "--key",
+            "no-such-key",
+        ],
+    );
+    assert!(!named.status.success(), "an undeclared key should fail");
+    let named_stderr = String::from_utf8_lossy(&named.stderr).into_owned();
+    assert!(
+        named_stderr.contains("names no --check-choice"),
+        "the past-guard refusal lost its sentence: {named_stderr}"
+    );
+    assert!(
+        !named_stderr.contains(DENIED),
+        "the past-guard refusal collapsed into the generic denial: {named_stderr}"
+    );
+    // 4. The control path works: the visible row's correct key records, so
+    //    the denials above came from the guard and not a broken route.
+    let recorded = estate.run(
+        &work_a,
+        &[
+            "attention",
+            "check",
+            &visible,
+            "--as",
+            "seed",
+            "--key",
+            "vkey-alpha",
+        ],
+    );
+    assert!(
+        recorded.status.success(),
+        "the control check answer should record: {}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+}

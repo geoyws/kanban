@@ -681,6 +681,21 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+/// An absent row under managed enforcement answers the same generic denial a
+/// denied row answers, so a tag-denied id and a never-created id are
+/// indistinguishable (ACC-14). The by-id lookups below all read the row's
+/// tags first, which are empty for an absent row, so a caller holding board
+/// scope would otherwise get `not found` for the unknown id beside `denied
+/// or not found` for the denied one. Outside enforcement the guard cannot
+/// deny, so the plain `not found` message stays exactly as it was.
+fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContext) -> Result<T> {
+    match row {
+        Some(row) => Ok(row),
+        None if authz.is_enforcing() => Err(crate::authz::DeniedOrNotFound.into()),
+        None => Err(anyhow::anyhow!("{kind} {id} not found")),
+    }
+}
+
 /// The tags one EVENT exposes, which is more than the tags its row carries
 /// today.
 ///
@@ -5027,10 +5042,11 @@ impl Store {
         // All-of-tag check BEFORE the row is opened: read the row's tags first,
         // then gate on them. An absent row yields no tags, so a caller without
         // board scope still receives the generic denial, never a difference
-        // between "invisible" and "absent".
+        // between "invisible" and "absent" — and under managed enforcement a
+        // caller WITH board scope does too, via `absent_as_denied` below.
         let tags = task_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
-        let mut one = require_task(&self.connection, id)?;
+        let mut one = absent_as_denied(get_task(&self.connection, id)?, "task", id, &self.authz)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
         attach_allowed_models(&self.connection, std::iter::once(&mut one))?;
         apply_lapsed_leases(&self.connection, std::iter::once(&mut one))?;
@@ -6622,11 +6638,11 @@ impl Store {
     /// caller-supplied actor string cannot unlock answer material (ACC-13).
     pub fn show_attention(&self, id: &str) -> Result<Attention> {
         self.authz.check_read(&[])?;
-        let mut item = self
+        let row = self
             .connection
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let mut item = absent_as_denied(row, "attention", id, &self.authz)?;
         let tags = attention_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
         item.tags = tags;
@@ -6953,10 +6969,10 @@ impl Store {
             .map(|tags| tags.to_vec())
             .unwrap_or_else(|| old_tags.clone());
         self.authz.check_write(&old_tags, &resulting_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         if existing.status != "open" {
             bail!("attention {id} is resolved history; its card cannot be rewritten");
         }
@@ -7131,10 +7147,10 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         // Resolving twice would overwrite who settled it and when, which is
         // the part of the record worth keeping.
         if existing.status != "open" {
@@ -7262,10 +7278,10 @@ impl Store {
         // not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         if existing.status != "resolved" {
             bail!("attention {id} is already open; there is no resolution to reopen");
         }
@@ -7364,10 +7380,10 @@ impl Store {
         // Answering does not retag: old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         if !trusted_edge
             && authorization_actor != OPERATOR_ACTOR
             && authorization_actor != existing.raised_by

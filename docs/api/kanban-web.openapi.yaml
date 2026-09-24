@@ -830,12 +830,12 @@ paths:
             `web/src/api.ts`'s `postForm` parses out to put the route's own
             words under the control that was pressed. The headings are the
             route's own: `Choice required`
-            (`rust/serve.rs:993`-`rust/serve.rs:998`), `Answer incomplete`
-            (`rust/serve.rs:940`-`rust/serve.rs:954`), `Invalid actor`
+            (`rust/serve.rs:1000`-`rust/serve.rs:1006`), `Answer incomplete`
+            (`rust/serve.rs:947`-`rust/serve.rs:961`), `Invalid actor`
             (`rust/serve.rs:721`-`rust/serve.rs:730`). The one exception is a
             malformed form encoding, which answers `<h1>Invalid reply</h1>`
             with no `<p class=error>` at all
-            (`rust/serve.rs:918`-`rust/serve.rs:921`); `postForm` then has only
+            (`rust/serve.rs:925`-`rust/serve.rs:928`); `postForm` then has only
             the status to report. The JSON `Error` body is the `/api/v1`
             surface's shape, and this route is not on it.
           content:
@@ -872,12 +872,15 @@ paths:
             reason. The store's sentence is returned as written — these
             refusals name the row's own state to the one operator who raised
             it and is authorised to see it, which is not an enumeration of
-            anything they could not already read.
+            anything they could not already read — except an unknown id and a
+            row the caller may not read, which both answer
+            `<p class=error>denied or not found</p>` at this same status, so
+            the two are indistinguishable (ACC-14).
 
             **This is a form POST, so the refusal is a page.** The store's
             sentence is the text of the `<p class=error>` under
             `<h1>Decision not recorded</h1>`
-            (`rust/serve.rs:974`-`rust/serve.rs:983`), which is the element
+            (`rust/serve.rs:980`-`rust/serve.rs:991`), which is the element
             `web/src/api.ts`'s `postForm` parses out. The JSON `Error` body is
             the `/api/v1` surface's shape, and this route is not on it.
           content:
@@ -1001,7 +1004,7 @@ paths:
             **This is a form POST, so the refusal is a page.** The sentence is
             the text of the `<p class=error>` under
             `<h1>Check answer not recorded</h1>`
-            (`rust/serve.rs:896`-`rust/serve.rs:928`), which is the element
+            (`rust/serve.rs:896`-`rust/serve.rs:914`), which is the element
             `web/src/api.ts`'s `postForm` parses out. The JSON `Error` body is
             the `/api/v1` surface's shape, and this route is not on it.
           content:
@@ -1072,7 +1075,10 @@ paths:
           description: |
             Not reopened. The row was never decided, or the store declined for
             its own reason. Its sentence is returned as written and the
-            hash-chained ledger is untouched.
+            hash-chained ledger is untouched — except an unknown id and a row
+            the caller may not read, which both answer
+            `<p class=error>denied or not found</p>` at this same status, so
+            the two are indistinguishable (ACC-14).
 
             **This is a form POST, so the refusal is a page.** The store's
             sentence is the text of the `<p class=error>` under
