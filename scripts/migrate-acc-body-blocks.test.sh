@@ -22,7 +22,10 @@ export KANBAN_DATA_DIR="$WORK/data"
 
 pass=0
 fail=0
-export KB_BIN="$here/target/debug/kanban"
+# The binary `cargo build` just produced, wherever Cargo put it: a caller that
+# sets CARGO_TARGET_DIR (the containerised gate does) builds there, and a
+# fixed `target/debug` would run a stale binary from some other build.
+export KB_BIN="${CARGO_TARGET_DIR:-$here/target}/debug/kanban"
 KB="$KB_BIN"
 assert() {
   local label="$1"; shift
