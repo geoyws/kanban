@@ -24697,7 +24697,7 @@ fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
     assert!(!refused.status.success(), "a spaced id was filed");
     assert_eq!(
         refusal_object(&refused),
-        "invalid task id \"bogus id!\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+        "invalid task id \"bogus id!\": expected t-<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
         "wrong repair for a misshaped id"
     );
     // A wrong-kind prefix: an epic id filed as a task, and a task id filed
@@ -24723,7 +24723,7 @@ fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
     );
     assert_eq!(
         refusal_object(&epic_as_task),
-        "invalid task id \"e-1234abcd\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+        "invalid task id \"e-1234abcd\": expected t-<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
         "wrong repair for a wrong-kind prefix"
     );
     let task_as_epic = fixture.run(
@@ -24749,14 +24749,45 @@ fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
     );
     assert_eq!(
         refusal_object(&task_as_epic),
-        "invalid epic id \"t-1234abcd\": expected e-<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+        "invalid epic id \"t-1234abcd\": expected e-<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
         "wrong repair for a wrong-kind prefix"
     );
-    // Every refusal above wrote nothing: the board is still empty.
+    // Every refusal above wrote nothing: the board is still empty, and no
+    // refusal appended an event — the trail still holds only the init row.
     assert_eq!(
         fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
         json!([]),
         "a refused id must leave the board empty"
+    );
+    let kinds = fixture
+        .ok_json(&fixture.main, &["events", "--json"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec!["board_initialized"],
+        "a refusal appended an event: {kinds:?}"
+    );
+    // The same id offered as a `transact` `task_add` item rolls the batch
+    // back with the same sentence: the check lives in the store, which every
+    // surface reaches.
+    let envelope = transact_results(
+        &fixture,
+        &fixture.main,
+        &[
+            serde_json::json!({ "name": "task_add", "arguments": {"title": "title", "id": "bogus id!"} }),
+        ],
+    );
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["rolledBack"], true, "{envelope}");
+    assert!(
+        envelope["results"][0]["error"].as_str().is_some_and(
+            |error| error.contains("invalid task id \"bogus id!\": expected t-<suffix>")
+        ),
+        "{envelope}"
     );
     // A well-formed explicit id is accepted: the deterministic `t-<8 hex>`
     // a watcher derives to make filing idempotent.

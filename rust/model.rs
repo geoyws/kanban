@@ -963,17 +963,17 @@ pub const SPRINT_STATUSES: [&str; 4] = ["planned", "current", "closed", "abandon
 ///
 /// The generator mints `{e|s|t}-<8 lowercase hex>` (`Store::add_task_in_sprint`),
 /// and the search index recognises exactly that generated shape
-/// (`canonical_generated_id_query` in `rust/search.rs`); rows already on
-/// boards also carry word suffixes (`t-ui-2`, `e-ui`, `e-q4`), so the accepted
-/// suffix is wider than generated hex: 1-63 lowercase letters, digits, dot,
-/// underscore, or hyphen, at most 64 characters total. Everything else —
-/// whitespace, control characters, shell metacharacters (`bogus id!`, and
-/// `?`/`#`/`/` with them), uppercase, an empty suffix, and a prefix that does
-/// not match the kind — is refused with the expected shape, before the first
-/// write, so the CLI, `transact` batches and MCP share the one refusal.
-/// Opaque ids already on boards (`t-mobile/opaque?#`) keep reading back —
-/// reads never check the shape, and legacy rows arrive through the atmux
-/// import, which writes by direct SQL and is not validated.
+/// (`canonical_generated_id_query` in `rust/search.rs`); the word suffixes
+/// already on boards (e.g. `e-q4`, documented in `skills/kb/SKILL.md:584`)
+/// widen it beyond generated hex: 1-62 lowercase letters, digits, dot,
+/// underscore, or hyphen, at most 64 characters total with the kind prefix.
+/// Everything else — whitespace, control characters, shell metacharacters
+/// (`bogus id!`, and `?`/`#`/`/` with them), uppercase, an empty suffix, and
+/// a prefix that does not match the kind — is refused with the expected
+/// shape, before the first write, so the CLI, `transact` batches and MCP
+/// share the one refusal. Opaque ids a legacy import can carry (e.g. the
+/// fixture `t-mobile/opaque?#`) keep reading back — reads never check the
+/// shape, and the atmux import writes by direct SQL and is not validated.
 pub fn task_id(value: &str, task_type: &str) -> Result<String> {
     let prefix = match task_type {
         "epic" => "e-",
@@ -988,7 +988,7 @@ pub fn task_id(value: &str, task_type: &str) -> Result<String> {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'z' | b'.' | b'_' | b'-'))
     {
         bail!(
-            "invalid {task_type} id {value:?}: expected {prefix}<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)"
+            "invalid {task_type} id {value:?}: expected {prefix}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)"
         );
     }
     Ok(value.to_owned())
@@ -2685,7 +2685,7 @@ mod tests {
             assert_eq!(
                 error,
                 format!(
-                    "invalid {kind} id {bad:?}: expected {}<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
+                    "invalid {kind} id {bad:?}: expected {}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
                     match kind {
                         "epic" => "e-",
                         "story" => "s-",

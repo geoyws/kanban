@@ -1,10 +1,11 @@
-# Specification: `tag add` registers only namespaced tags, refused with the board's estate (slice CLI)
+# Specification: `tag add` registers only namespaced tags, refused with the board's estate (slice CLI); `task add --id` accepts only the kind's id shape
 
 ## 1. Identity and baseline
 
 - **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-06`, stable across wording
   refinements; numbering is by creation, grouping is by topic. `CLI-06` was
-  appended 2026-09-25 under board row `t-6148c0ba` (see the change log).
+  appended 2026-09-25 under board row `t-6148c0ba` (see the change log); its baseline
+  is commit `869f5cb` on `wt/t-6148c0ba-idshape`.
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `DRAFT` (written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
@@ -52,7 +53,8 @@
 **Intended outcome.** A tag registered after this slice always says whose subsystem it names:
 `kanban tag add` refuses a bare name with the sentence that builds the namespaced form from
 the board's own estate, so the master file can never again grow a second vocabulary of
-unowned subsystems beside the namespaced one.
+unowned subsystems beside the namespaced one. A row filed with an explicit id always
+carries the kind's own id shape, so ids stay safe as unquoted shell and URL tokens.
 
 **Users / actors.**
 
@@ -158,21 +160,23 @@ register into it.
 ### Explicit row identities
 
 **CLI-06** — `task add --id` validates the id against the kind's own shape.
-Strength: `MUST` · Layer: `process` · Source: board row `t-6148c0ba`; ADR-008.
+Strength: `MUST` · Layer: `process` · Source: board row `t-6148c0ba`; CLI-06 awaits
+George's admission in `a-6db93847`; ADR-008. Its status stays `DRAFT`.
 `kanban task add TITLE --id ID` where `ID` is not the kind's own shape exits
 non-zero and writes nothing — no row, no event — with
-`invalid {kind} id "{id}": expected {prefix}<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)`,
+`invalid {kind} id "{id}": expected {prefix}<suffix> with 1-62 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)`,
 where `{kind}` is `task`, `epic` or `story` and `{prefix}` its `t-`, `e-` or
-`s-`. The shape is the generator's (`{e|s|t}-<8 lowercase hex>`,
-`Store::add_task_in_sprint`) widened to the legacy words already on boards
-(`t-ui-2`, `e-ui`, `e-q4`): there is no second id vocabulary — `task_id` in
+`s-` — `{id}` is the offered id quoted and escaped (a tab renders as `\t`, a quote
+as `\"`). The shape is the generator's (`{e|s|t}-<8 lowercase hex>`,
+`Store::add_task_in_sprint`, `rust/store.rs:4923-4936` at that baseline) widened to
+the word suffixes already on boards (e.g. `e-q4`, documented in
+`skills/kb/SKILL.md:584`): there is no second id vocabulary — `task_id` in
 `rust/model.rs`, beside `sprint_id`, is the one check, and the refusal runs
-before the write transaction opens, so the CLI, `transact` batches and MCP
-share it. Opaque ids already on boards (`t-mobile/opaque?#`) keep reading
-back — reads never check the shape, and legacy rows arrive through the atmux
-import, which writes by direct SQL and is not validated. A well-formed
-explicit id (`t-<8 hex>`) is accepted unchanged, and a duplicate is still
-refused by the primary key as before.
+before the write transaction opens, so the CLI, `transact` batches and MCP share
+it. Opaque ids a legacy import can carry (e.g. the fixture `t-mobile/opaque?#`)
+keep reading back — reads never check the shape, and the atmux import writes by
+direct SQL and is not validated. A well-formed explicit id (`t-<8 hex>`) is
+accepted unchanged, and a duplicate is still refused by the primary key as before.
 
 ## 4. Acceptance examples
 
@@ -245,18 +249,23 @@ concurrency and idempotency (unchanged `add_tag` behaviour at
 
 *Given* a board,
 *when* `kanban task add "title" --id "bogus id!" --as X --status draft --json` runs,
-*then* it exits non-zero writing nothing (`task list` stays empty) with `invalid task id
-"bogus id!": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore,
-or hyphen (at most 64 characters total)`; `--id e-1234abcd` on a task and `--id
-t-1234abcd` on an epic are refused the same way, each naming its own prefix; `--id
-t-1234abcd` on a task exits zero and reads back; and repeating it is refused by the
-primary key (`UNIQUE constraint failed`), as before.
+*then* it exits non-zero writing nothing (`task list` stays empty, `events` holds only
+`board_initialized`) with `invalid task id "bogus id!": expected t-<suffix> with 1-62
+lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)`;
+the same id offered as a `transact` `task_add` item rolls the batch back (`rolledBack:
+true`) with the same sentence; `--id e-1234abcd` on a task and `--id t-1234abcd` on an
+epic are refused the same way, each naming its own prefix, as are `--id t-UPPER`,
+`--id t-` and a `t-` id longer than 64 characters, while a 64-character `t-` id is
+accepted (pinned in-process by `a_task_id_has_one_shape_per_kind`); `--id t-1234abcd`
+on a task exits zero returning the row with id `t-1234abcd`; and repeating it is refused
+by the primary key (`UNIQUE constraint failed`), as before.
 
 ## 5. Contracts and data
 
 - **Interface version or schema:** the CLI grammar is unchanged (`rust/lib.rs:189` for
-  `tag add`; `task add` already carries `[--id ID]`): only the refusal set grows, by the
-  two sentences `CLI-01` and `CLI-03` quote and the one sentence `CLI-06` quotes.
+  `tag add`; `task add` already carries `[--id ID]` at `rust/lib.rs:129`): only the
+  refusal set grows, by the two sentences `CLI-01` and `CLI-03` quote and the one
+  sentence `CLI-06` quotes.
   `--json` refusals keep the error-object shape (an object holding only `error`).
 - **Data invariants:** a refused registration writes nothing: no `tags` row, no `tag_added`
   event, no registry touch; a refused `task add` writes nothing: no row, no event.
@@ -268,7 +277,10 @@ primary key (`UNIQUE constraint failed`), as before.
   legacy exports still land.
 - **Compatibility:** an older caller offering a bare name to `tag add` is refused where it
   used to succeed — that is the slice. Every other caller spelling (namespaced add, attach,
-  filter, rename, remove) behaves exactly as at the baseline.
+  filter, rename, remove) behaves exactly as at the baseline. Since `CLI-06`, an older
+  caller passing `task add --id` outside the kind's shape (a bare `rm`, `b-1`, a wrong-kind
+  prefix such as a `t-` epic, uppercase, whitespace or shell metacharacters) is refused
+  where it used to succeed; rows already filed under such ids are untouched.
 - **Ownership:** each board owns its master file (ADR-015); the map is product vocabulary
   owned by George, compiled in beside `rust/store.rs:409`.
 
@@ -281,6 +293,8 @@ primary key (`UNIQUE constraint failed`), as before.
   caller-supplied or caller-addressed.
 - **Security:** the refusal is fail-closed per ADR-008 (non-zero exit, nothing written);
   no authorization posture changes — any writer may still register, exactly as today.
+  `CLI-06` keeps whitespace, control characters and shell metacharacters out of new row
+  ids; the refusal is fail-closed per ADR-008.
 - **Operability:** the sentence is the repair: it names the exact command form to run.
 - **Performance:** an observation, not a budget: the check is two string scans against a
   match table; no measurement is owed and none is claimed.
@@ -300,7 +314,7 @@ primary key (`UNIQUE constraint failed`), as before.
 | `CLI-03` | MUST | process | `tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only` | asserts the estate list is carried and no single `estate/name` is suggested. no e2e coverage |
 | `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, attaches, reads back. no e2e coverage |
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
-| `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence and an empty listing; `t-1234abcd` accepted; the duplicate refused by the primary key. The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. no e2e coverage |
+| `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence, an empty listing and `board_initialized` as the only event; the same id as a `transact` `task_add` item rolls back with the same sentence; `t-1234abcd` accepted; the duplicate refused by the primary key. The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the rejected separators, the length bound and the empty suffix. Reads of an opaque, SQL-seeded id stay proven by `mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records`. no e2e coverage |
 
 ## 9. Change log
 

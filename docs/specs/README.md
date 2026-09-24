@@ -29,10 +29,11 @@ updated if its test name moved.
 Nothing is specified retroactively: shipped behaviour acquires requirement IDs only when a slice
 next touches it, and then only for the part the slice touches (ADR-047 §6). The rollout was
 `WEB` and `SPA` and nothing else; slice `CLI` (`docs/specs/cli.md`, the `tag add` namespace
-refusal, since extended by `CLI-06`, the `task add --id` shape refusal under board row
-`t-6148c0ba`) joined under George's approval in attention `a-3990a3e3` on 2026-09-24 —
+refusal) joined under George's approval in attention `a-3990a3e3` on 2026-09-24 —
 `t-7f596f45` is the child row of rollout epic `e-c0852fe7` carrying the work — with the chip
-rendering landing as a `WEB-60` delta in the same change. Adding a further slice needs a board
+rendering landing as a `WEB-60` delta in the same change. `CLI-06` (the `task add --id`
+shape refusal, board row `t-6148c0ba`) is specified but awaits George's admission in
+attention `a-6db93847`. Adding a further slice needs a board
 row under epic `e-c0852fe7` with George's approval, not a reading of the ADR (ADR-047 §7).
 
 ## The rules
