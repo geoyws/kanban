@@ -24473,7 +24473,89 @@ fn tag_add_refuses_a_bare_name_with_the_boards_mapped_estate() {
             json!([]),
             "a refused registration must leave the master file empty on {board}"
         );
+        let kinds = fixture
+            .ok_json(&fixture.main, &["events", "--limit", "50", "--json"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !kinds.contains(&"tag_added".to_owned()),
+            "a refused registration must append no event on {board}: {kinds:?}"
+        );
     }
+    // A7 — the shape and estate checks run before the namespace check, with
+    // their own baseline sentences, on the mapped board too.
+    let shaped = Fixture::new("tag-namespace-shape-first");
+    shaped.ok_json(&shaped.main, &["init", "--name", "prjx", "--json"]);
+    for (name, sentence) in [
+        (
+            "Assistant",
+            "tag Assistant is not a usable name: lowercase letters, digits and inner \
+             hyphens only, so one concept cannot arrive under two spellings",
+        ),
+        (
+            "ifac/assistant",
+            "tag ifac/assistant names estate ifac, which is not registered: a namespaced tag \
+             is filed under one of ifca, unum, geoyws, so one subsystem cannot arrive under \
+             two owners",
+        ),
+    ] {
+        let refused = shaped.run(&shaped.main, &["tag", "add", name, "--json"]);
+        assert!(!refused.status.success(), "a malformed tag was registered");
+        let message = refusal_object(&refused);
+        assert_eq!(message, sentence, "wrong baseline sentence for {name}");
+        assert!(
+            !message.contains("not namespaced"),
+            "the shape check must not speak of namespaces: {message}"
+        );
+    }
+    assert_eq!(
+        shaped.ok_json(&shaped.main, &["tag", "list", "--json"]),
+        json!([]),
+        "a refused registration must leave the master file empty"
+    );
+}
+
+/// CLI-01 — a batched bare registration is refused against the batch's
+/// board, not the cwd's. An item argv carries no board selector
+/// (`plan_transact` refuses one), so resolving the board from the workspace
+/// would name the wrong estate — or bail on a retired cwd board that has
+/// nothing to do with the batch.
+#[test]
+fn tag_add_in_transact_refuses_against_the_batch_board_not_the_cwd() {
+    let fixture = Fixture::new("tag-namespace-transact");
+    fixture.ok_json(&fixture.main, &["init", "--name", "prjx", "--json"]);
+    fixture.ok_json(&fixture.worktree, &["init", "--name", "kanban", "--json"]);
+    let items = serde_json::to_string(&[serde_json::json!({
+        "name": "tag_add",
+        "arguments": {"name": "assistant"},
+    })])
+    .unwrap();
+    // From the geoyws board's own checkout, against the ifca board.
+    let batch = fixture.run(
+        &fixture.worktree,
+        &["transact", "--project", "prjx", "--items", &items, "--json"],
+    );
+    assert!(!batch.status.success(), "a batched bare tag was registered");
+    let stdout = String::from_utf8_lossy(&batch.stdout).to_string();
+    assert!(
+        stdout.contains("not namespaced: use ifca/assistant"),
+        "the refusal named the wrong board's estate: {stdout}"
+    );
+    assert!(
+        !stdout.contains("geoyws/assistant"),
+        "the refusal named the cwd board's estate: {stdout}"
+    );
+    assert_eq!(
+        fixture.ok_json(
+            &fixture.main,
+            &["tag", "list", "--project", "prjx", "--json"]
+        ),
+        json!([]),
+        "a refused batch must land nothing on the batch board"
+    );
 }
 
 /// CLI-03 — an unmapped board is refused with the estate list and no single
@@ -24615,7 +24697,7 @@ fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
     assert!(!refused.status.success(), "a spaced id was filed");
     assert_eq!(
         refusal_object(&refused),
-        "invalid task id \"bogus id!\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+        "invalid task id \"bogus id!\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
         "wrong repair for a misshaped id"
     );
     // A wrong-kind prefix: an epic id filed as a task, and a task id filed
@@ -24641,7 +24723,7 @@ fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
     );
     assert_eq!(
         refusal_object(&epic_as_task),
-        "invalid task id \"e-1234abcd\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+        "invalid task id \"e-1234abcd\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
         "wrong repair for a wrong-kind prefix"
     );
     let task_as_epic = fixture.run(
@@ -24667,7 +24749,7 @@ fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
     );
     assert_eq!(
         refusal_object(&task_as_epic),
-        "invalid epic id \"t-1234abcd\": expected e-<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+        "invalid epic id \"t-1234abcd\": expected e-<suffix> with 1-63 lowercase letters, digits, dot, underscore, or hyphen (at most 64 characters total)",
         "wrong repair for a wrong-kind prefix"
     );
     // Every refusal above wrote nothing: the board is still empty.
@@ -33673,19 +33755,41 @@ fn mobile_read_navigation_journey_in_real_chrome_reaches_seeded_records() {
             "--json",
         ],
     );
+    // The opaque id is a legacy row, not a new registration: ids carrying
+    // URL-reserved characters arrive through the atmux import, which writes by
+    // direct SQL and is not validated, so the fixture seeds it the same way —
+    // `task add` would refuse it (CLI-06). Reads never check the shape, which
+    // is what lets this journey prove the served pages percent-encode the id.
     let opaque_task_id = "t-mobile/opaque?#";
+    Connection::open(board_path_for_project(&fixture, &fixture.main, "MOBILE-JOURNEY"))
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks(id,type,parent_id,title,body,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                opaque_task_id,
+                "task",
+                Option::<String>::None,
+                "Opaque ID sprint task",
+                Option::<String>::None,
+                "todo",
+                6,
+                1_700_000_000_000_i64,
+                1_700_000_000_000_i64,
+                Option::<i64>::None,
+                "{}",
+            ],
+        )
+        .unwrap();
     fixture.ok_json(
         &fixture.main,
         &[
-            "task",
-            "add",
-            "Opaque ID sprint task",
-            "--id",
-            opaque_task_id,
-            "--status",
-            "todo",
-            "--sprint",
+            "sprint",
+            "plan",
             "sp-mobile-current",
+            "--body",
+            "Deliver the **mobile sprint page** safely.",
+            "--candidate",
+            opaque_task_id,
             "--as",
             "fixture-agent",
             "--json",

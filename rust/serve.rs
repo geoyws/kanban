@@ -2480,27 +2480,39 @@ mod tests {
             .close_sprint(&closed.id, Some(&proof.id), None, None, "geoyws")
             .expect("close sprint on proof");
 
-        let opaque = store
-            .add_task(AddTask {
-                id: Some("t-render/opaque?#".to_owned()),
-                task_type: "task".to_owned(),
-                parent_id: None,
-                title: "Opaque <task>".to_owned(),
-                body: None,
-                assignee: None,
-                lane: None,
-                deliverable: None,
-                stale_minutes: None,
-                driver_only: false,
-                status: "todo".to_owned(),
-                priority: 2,
-                dependencies: vec![],
-                metadata: serde_json::json!({}),
-                actor: Some("geoyws".to_owned()),
-                tags: vec!["release".to_owned()],
-                allowed_models: vec![],
-            })
-            .expect("add opaque sprint task");
+        // The opaque id is a legacy row, not a new registration: ids carrying
+        // URL-reserved characters arrive through the atmux import, which writes
+        // by direct SQL and is not validated, so the fixture seeds it the same
+        // way — `task add` would refuse it (CLI-06). Reads never check the
+        // shape, which is what lets this fixture prove the served page
+        // percent-encodes the id.
+        let opaque_id = "t-render/opaque?#".to_owned();
+        store
+            .connection
+            .execute(
+                "INSERT INTO tasks(id,type,parent_id,title,body,status,priority,created_at,updated_at,completed_at,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    opaque_id,
+                    "task",
+                    Option::<String>::None,
+                    "Opaque <task>",
+                    Option::<String>::None,
+                    "todo",
+                    2,
+                    1_700_000_000_000_i64,
+                    1_700_000_000_000_i64,
+                    Option::<i64>::None,
+                    "{}",
+                ],
+            )
+            .expect("seed opaque sprint task");
+        store
+            .connection
+            .execute(
+                "INSERT INTO task_tags(task_id,tag) VALUES(?,?)",
+                rusqlite::params![opaque_id, "release"],
+            )
+            .expect("tag opaque sprint task");
         let current_sprint = store
             .create_sprint(NewSprint {
                 id: Some("sp-render-current".to_owned()),
@@ -2516,7 +2528,7 @@ mod tests {
             .plan_sprint(
                 &current_sprint.id,
                 "Current **goal** and criteria.",
-                std::slice::from_ref(&opaque.id),
+                std::slice::from_ref(&opaque_id),
                 None,
                 false,
                 "geoyws",
