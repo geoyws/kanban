@@ -8322,18 +8322,19 @@ fn compiled_binary_installs_as_kb_and_resolves_command_aliases() {
     );
 
     // Sub-aliases apply only where the second positional is a subcommand. A
-    // task genuinely called `rm` must not be rewritten into a removal.
+    // task id can never collide with one: ids carry their kind prefix
+    // (`t-` here), so the second positional of `n` still reads as the row.
     kb_json(
         &fixture.main,
-        &["t", "new", "edge case", "--id", "rm", "--json"],
+        &["t", "new", "edge case", "--id", "t-rm", "--json"],
     );
     kb_json(
         &fixture.main,
-        &["n", "rm", "note on task rm", "--as", "geoyws", "--json"],
+        &["n", "t-rm", "note on task t-rm", "--as", "geoyws", "--json"],
     );
     assert_eq!(
-        kb_json(&fixture.main, &["t", "cat", "rm", "--json"])["id"],
-        "rm"
+        kb_json(&fixture.main, &["t", "cat", "t-rm", "--json"])["id"],
+        "t-rm"
     );
 
     // Aliases are an exact-match table, so an unlisted one stays unknown
@@ -9451,7 +9452,7 @@ fn compiled_binary_bounds_priority_without_rewriting_history() {
                 "add",
                 "symbolic",
                 "--id",
-                &format!("t-{symbol}"),
+                &format!("t-{}", symbol.to_lowercase()),
                 "--priority",
                 symbol,
                 "--json",
@@ -10172,7 +10173,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             "add",
             "in the second snapshot",
             "--id",
-            "b-1",
+            "t-b1",
             "--json",
         ],
     );
@@ -10189,7 +10190,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             "add",
             "after the second snapshot",
             "--id",
-            "b-2",
+            "t-b2",
             "--json",
         ],
     );
@@ -10259,7 +10260,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             &[
                 "task",
                 "show",
-                "b-2",
+                "t-b2",
                 "--db",
                 copy.to_str().unwrap(),
                 "--json"
@@ -10274,7 +10275,7 @@ fn compiled_binary_rescues_a_board_file_the_registry_no_longer_lists() {
             &[
                 "task",
                 "show",
-                "b-1",
+                "t-b1",
                 "--db",
                 bee_board.to_str().unwrap(),
                 "--json",
@@ -11965,10 +11966,10 @@ fn compiled_binary_events_after_before_archive_and_schema_match() {
     fixture.ok_json(&fixture.main, &["init", "--name", "EVENTS", "--json"]);
 
     for (id, title) in [
-        ("e-1", "first event"),
-        ("e-2", "second event"),
-        ("e-3", "third event"),
-        ("e-4", "fourth event"),
+        ("t-1", "first event"),
+        ("t-2", "second event"),
+        ("t-3", "third event"),
+        ("t-4", "fourth event"),
     ] {
         fixture.ok_json(&fixture.main, &["task", "add", title, "--id", id, "--json"]);
     }
@@ -24583,6 +24584,141 @@ fn tag_filters_refuse_unknown_names_exactly_as_before() {
         "{message}"
     );
     assert!(!message.contains("not namespaced"), "{message}");
+}
+
+/// CLI-06 — `task add --id` validates the id against the board's own id
+/// shape for the kind being created and refuses anything else with the
+/// expected shape, writing nothing. A well-formed explicit id keeps working
+/// (the watcher's idempotent `t-<8 hex>`), and a duplicate is still refused
+/// by the primary key as before.
+#[test]
+fn task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape() {
+    let fixture = Fixture::new("task-id-shape");
+    fixture.ok_json(&fixture.main, &["init", "--name", "IDSHAPE", "--json"]);
+    // `bogus id!`: whitespace and `!` are outside the shape, and the refusal
+    // names the shape the id should have had.
+    let refused = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "bogus id!",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success(), "a spaced id was filed");
+    assert_eq!(
+        refusal_object(&refused),
+        "invalid task id \"bogus id!\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+        "wrong repair for a misshaped id"
+    );
+    // A wrong-kind prefix: an epic id filed as a task, and a task id filed
+    // as an epic. Both name the kind's own prefix.
+    let epic_as_task = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "e-1234abcd",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(
+        !epic_as_task.status.success(),
+        "an epic id was filed as a task"
+    );
+    assert_eq!(
+        refusal_object(&epic_as_task),
+        "invalid task id \"e-1234abcd\": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+        "wrong repair for a wrong-kind prefix"
+    );
+    let task_as_epic = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "plan",
+            "--id",
+            "t-1234abcd",
+            "--type",
+            "epic",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(
+        !task_as_epic.status.success(),
+        "a task id was filed as an epic"
+    );
+    assert_eq!(
+        refusal_object(&task_as_epic),
+        "invalid epic id \"t-1234abcd\": expected e-<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+        "wrong repair for a wrong-kind prefix"
+    );
+    // Every refusal above wrote nothing: the board is still empty.
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["task", "list", "--json"]),
+        json!([]),
+        "a refused id must leave the board empty"
+    );
+    // A well-formed explicit id is accepted: the deterministic `t-<8 hex>`
+    // a watcher derives to make filing idempotent.
+    let created = fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "t-1234abcd",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert_eq!(created["id"], "t-1234abcd");
+    // The duplicate is still refused as before, by the primary key.
+    let duplicate = fixture.run(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "title",
+            "--id",
+            "t-1234abcd",
+            "--as",
+            "X",
+            "--status",
+            "draft",
+            "--json",
+        ],
+    );
+    assert!(
+        !duplicate.status.success(),
+        "a duplicate id was filed twice"
+    );
+    assert!(
+        refusal_object(&duplicate).contains("UNIQUE constraint failed"),
+        "the duplicate must still be refused as before: {}",
+        String::from_utf8_lossy(&duplicate.stdout)
+    );
 }
 
 #[test]

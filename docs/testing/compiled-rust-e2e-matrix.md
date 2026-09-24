@@ -585,15 +585,17 @@ each row says `no e2e coverage` plainly.
 resolves, reopens and migrates through the existing attention machinery; the
 board schema stands at 33.
 
-## Requirements trace — docs/specs/cli.md CLI-01..CLI-05
+## Requirements trace — docs/specs/cli.md CLI-01..CLI-06
 
-`tag add` registers only namespaced tags, refused with the board's estate, on branch
-`wt/t-7f596f45-tagns` at 2026-09-25. Every test these rows name exists in that build,
+`tag add` registers only namespaced tags, refused with the board's estate, and `task add
+--id` is refused unless it is the kind's own shape, on branch `wt/t-7f596f45-tagns` at
+2026-09-25 for `CLI-01`..`CLI-05` and on branch `wt/t-6148c0ba-idshape` at 2026-09-25 for
+`CLI-06` (board row `t-6148c0ba`). Every test these rows name exists in that build,
 enumerated with `cargo test --locked --lib -- --list` (unit rows) and
 `cargo test --locked --test e2e -- --list` (process rows). `Layer` uses the specification's
 own vocabulary, where `unit` is an in-process Rust `#[test]` and `process` is a
 compiled-binary process-boundary exchange in `tests/e2e.rs` with no HTTP and no browser.
-Of the 5 requirements — all `MUST` — 4 are proved at `process` and 1 at `unit`, and none
+Of the 6 requirements — all `MUST` — 5 are proved at `process` and 1 at `unit`, and none
 carries browser evidence: the slice changes no served markup (the chip half is `WEB-60`
 above), so each row says `no e2e coverage` plainly.
 
@@ -604,9 +606,11 @@ above), so each row says `no e2e coverage` plainly.
 | `CLI-03` | MUST | process | `tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only` | asserts the estate list is carried and no single `estate/name` is suggested. no e2e coverage |
 | `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, lists, attaches. no e2e coverage |
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
+| `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence and an empty listing; `t-1234abcd` accepted; the duplicate refused by the primary key. The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the reserved suffixes, the length bound and the empty suffix. no e2e coverage |
 
-5 requirements: 5 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
-legacy tags already registered stay registered and migrate with `tag rename`.
+6 requirements: 6 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
+legacy tags already registered stay registered and migrate with `tag rename`; rows keep
+their ids and a refused `task add` writes no row and no event.
 
 ## Watch coverage note
 

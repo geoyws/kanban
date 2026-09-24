@@ -3373,7 +3373,7 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
             "add",
             "secret epic",
             "--id",
-            "t-epic",
+            "e-epic",
             "--type",
             "epic",
             "--tag",
@@ -3406,13 +3406,13 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
             "add",
             "visible row",
             "--id",
-            "t-visible",
+            "s-visible",
             "--type",
             "story",
             "--tag",
             "geoyws/visible",
             "--parent",
-            "t-epic",
+            "e-epic",
             "--depends-on",
             "t-secret",
             "--depends-on",
@@ -3437,7 +3437,7 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
                 "--tag",
                 tag,
                 "--parent",
-                "t-visible",
+                "s-visible",
                 "--as",
                 "seed",
                 "--json",
@@ -3459,20 +3459,20 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
     let server = WebServer::start(&estate, &work_a, None);
 
     /// Every string only an unreadable row carries. Ids are deliberately
-    /// absent: `t-secret` is the gate's own answer and `t-epic` is on the
+    /// absent: `t-secret` is the gate's own answer and `e-epic` is on the
     /// readable row's `parentID` already.
     const HIDDEN_PROSE: [&str; 3] = ["secret prerequisite", "secret epic", "secret child"];
 
     // The control: each hidden row is refused by name, and the row whose
     // relations are read is not.
-    for hidden in ["t-secret", "t-epic", "t-child"] {
+    for hidden in ["t-secret", "e-epic", "t-child"] {
         estate.denied(&work_a, &["task", "show", hidden, "--json"]);
     }
-    estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    estate.ok_json(&work_a, &["task", "show", "s-visible", "--json"]);
 
     // 1. `task show`: the denied prerequisite is out of `dependencies` and
     //    its title is out of `blockingGates`, which still names it.
-    let shown = estate.ok_json(&work_a, &["task", "show", "t-visible", "--json"]);
+    let shown = estate.ok_json(&work_a, &["task", "show", "s-visible", "--json"]);
     let dependency_ids = |value: &Value| {
         value["dependencies"]
             .as_array()
@@ -3517,7 +3517,7 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
     // 2. `context`: it ANSWERS for the readable row whose epic is denied —
     //    before this fix the chain walk refused the whole packet — and the
     //    chain stops at the boundary rather than gaining a hole.
-    let packet = estate.ok_json(&work_a, &["context", "t-visible", "--json"]);
+    let packet = estate.ok_json(&work_a, &["context", "s-visible", "--json"]);
     assert!(
         packet["ancestors"].as_array().unwrap().is_empty(),
         "the context packet named the denied epic: {packet}"
@@ -3540,7 +3540,7 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
             .iter()
             .map(|row| row["id"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>(),
-        vec!["t-visible".to_owned()],
+        vec!["s-visible".to_owned()],
         "the readable run of the chain must survive: {leaf_packet}"
     );
 
@@ -3551,7 +3551,7 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["id"] == "t-visible")
+        .find(|row| row["id"] == "s-visible")
         .unwrap_or_else(|| panic!("the listing dropped the readable row: {listed}"));
     assert_eq!(
         row["dependencies"],
@@ -3566,14 +3566,14 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
 
     // 4. No surface carries the prose of a row this caller may not read —
     //    the CLI's own rendered packet included.
-    let rendered = estate.ok(&work_a, &["context", "t-visible"]);
+    let rendered = estate.ok(&work_a, &["context", "s-visible"]);
     for surface in [
         listed.to_string(),
         shown.to_string(),
         packet.to_string(),
         rendered,
-        server.get("/task/Alpha/t-visible").body,
-        server.get_json("/api/v1/task/Alpha/t-visible").to_string(),
+        server.get("/task/Alpha/s-visible").body,
+        server.get_json("/api/v1/task/Alpha/s-visible").to_string(),
     ] {
         for needle in HIDDEN_PROSE {
             assert!(
@@ -3596,8 +3596,8 @@ fn a_tag_denied_prerequisite_keeps_its_gate_and_loses_its_title_over_http() {
     assert_eq!(
         stderr.trim(),
         "Error: task t-leaf is gated on work that is not done: t-open is todo \
-         (declared on ancestor t-visible); t-secret is todo (declared on ancestor \
-         t-visible). A prerequisite satisfies a gate only at status done: finish it, \
+         (declared on ancestor s-visible); t-secret is todo (declared on ancestor \
+         s-visible). A prerequisite satisfies a gate only at status done: finish it, \
          or drop the edge with `task update <owner> --depends-on ...` or \
          `--clear-dependencies`.",
         "the gate refusal wording changed"

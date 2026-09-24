@@ -958,6 +958,45 @@ pub const ATTENTION_OUTCOMES: [&str; 4] = ["approve", "reject", "defer", "other"
 /// which is why the rewrite verbs refuse them by name.
 pub const SPRINT_STATUSES: [&str; 4] = ["planned", "current", "closed", "abandoned"];
 
+/// Validate an explicit task-row identity against the board's own id shape
+/// for the kind being created.
+///
+/// The generator mints `{e|s|t}-<8 lowercase hex>` (`Store::add_task_in_sprint`),
+/// and the search index recognises exactly that generated shape
+/// (`canonical_generated_id_query` in `rust/search.rs`); rows already on
+/// boards also carry word suffixes (`t-ui-2`, `e-ui`, `e-q4`) and the
+/// URL-reserved suffixes the served pages percent-encode
+/// (`t-mobile/opaque?#`, covered in `tests/e2e.rs`), so the accepted suffix
+/// is wider than generated hex: 1-63 lowercase letters, digits, dot,
+/// underscore, hyphen, slash, question mark, or hash, at most 64 characters
+/// total. Everything else — whitespace, control characters, the remaining
+/// shell metacharacters (`bogus id!`), uppercase, an empty suffix, and a
+/// prefix that does not match the kind — is refused with the expected shape,
+/// before the first write, so the CLI, `transact` batches and MCP share the
+/// one refusal.
+pub fn task_id(value: &str, task_type: &str) -> Result<String> {
+    let prefix = match task_type {
+        "epic" => "e-",
+        "story" => "s-",
+        _ => "t-",
+    };
+    let suffix = value.strip_prefix(prefix).unwrap_or("");
+    if value.len() > 64
+        || suffix.is_empty()
+        || !suffix.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9' | b'a'..=b'z' | b'.' | b'_' | b'-' | b'/' | b'?' | b'#'
+            )
+        })
+    {
+        bail!(
+            "invalid {task_type} id {value:?}: expected {prefix}<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)"
+        );
+    }
+    Ok(value.to_owned())
+}
+
 /// Validate the durable sprint identity shared by sprint rows and rule scopes.
 pub fn sprint_id(value: &str) -> Result<String> {
     if value.len() > 64
@@ -2600,6 +2639,62 @@ mod tests {
             vec!["Astra".to_owned(), "blender".to_owned()]
         );
         assert!(validate_model_names(&["has space".to_owned()]).is_err());
+    }
+
+    /// The board's own id shape per kind: generated hex, legacy words, and
+    /// the URL-reserved suffixes the served pages percent-encode — refused
+    /// with the expected shape otherwise. The process test proves the CLI
+    /// refusal end to end; this pins the boundaries it does not enumerate
+    /// (case, the reserved suffixes, the length bound, the empty suffix).
+    #[test]
+    fn a_task_id_has_one_shape_per_kind() {
+        for (kind, good) in [
+            ("task", "t-1234abcd"),
+            ("task", "t-ui-2"),
+            ("task", "t-mobile/opaque?#"),
+            ("epic", "e-1234abcd"),
+            ("epic", "e-ui"),
+            ("epic", "e-q4"),
+            ("story", "s-1234abcd"),
+            ("story", "s-parent"),
+            ("task", &format!("t-{}", "a".repeat(62))),
+        ] {
+            assert_eq!(task_id(good, kind).unwrap(), good, "{kind} {good} refused");
+        }
+        for (kind, bad) in [
+            ("task", "bogus id!"),
+            ("task", "t-has space"),
+            ("task", "t-has\ttab"),
+            ("task", "t-line\nbreak"),
+            ("task", "t-bang!"),
+            ("task", "t-dollar$"),
+            ("task", "t-UPPER"),
+            ("task", "t-"),
+            ("task", "t"),
+            ("task", ""),
+            ("task", "e-1234abcd"),
+            ("task", "s-1234abcd"),
+            ("task", "sp-1234abcd"),
+            ("task", "b-1"),
+            ("task", "rm"),
+            ("epic", "t-1234abcd"),
+            ("story", "t-1234abcd"),
+            ("task", &format!("t-{}", "a".repeat(63))),
+        ] {
+            let error = task_id(bad, kind).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "invalid {kind} id {bad:?}: expected {}<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)",
+                    match kind {
+                        "epic" => "e-",
+                        "story" => "s-",
+                        _ => "t-",
+                    }
+                ),
+                "{kind} {bad} was accepted or refused with the wrong sentence"
+            );
+        }
     }
 
     /// One well-formed pair of tokens, which every refusal case breaks in

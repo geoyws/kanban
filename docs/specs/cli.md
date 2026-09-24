@@ -2,8 +2,9 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-05`, stable across wording
-  refinements; numbering is by creation, grouping is by topic.
+- **Slice ID:** `CLI`. Requirement IDs are `CLI-01` .. `CLI-06`, stable across wording
+  refinements; numbering is by creation, grouping is by topic. `CLI-06` was
+  appended 2026-09-25 under board row `t-6148c0ba` (see the change log).
 - **Baseline:** `2026-09-25` at commit `57d26432e4e9aabed78792c44b990f66c6cdcc5c` on branch
   `wt/t-7f596f45-tagns`. Every "today" claim below cites the line that has it, as `<path>:<line>`.
 - **Status:** `DRAFT` (written 2026-09-25 by the `t-7f596f45` lane writer before implementation,
@@ -59,7 +60,8 @@ unowned subsystems beside the namespaced one.
   CLI), or `transact` batches (whose items run the same dispatch).
 
 **In scope.** The `tag add` registration command and its refusal; the compile-time
-board-to-estate map it reads; the unchanged `--tag` filter refusals it is held against.
+board-to-estate map it reads; the unchanged `--tag` filter refusals it is held against;
+and, since `CLI-06`, the `task add --id` shape refusal with the one id check it reads.
 
 **Boundaries.** The `--tag` filter paths (`task list`, `attention list`, rule task-tag
 validation) are touched only as the behaviour that must not move (`CLI-05`) — they are owned
@@ -145,6 +147,24 @@ registered on any active board{suggestion}` on rules. A bare unknown name on a f
 NOT rewritten to the `CLI-01`/`CLI-03` sentence: filters read the vocabulary, they do not
 register into it.
 
+### Explicit row identities
+
+**CLI-06** — `task add --id` validates the id against the kind's own shape.
+Strength: `MUST` · Layer: `process` · Source: board row `t-6148c0ba`; ADR-008.
+`kanban task add TITLE --id ID` where `ID` is not the kind's own shape exits
+non-zero and writes nothing — no row, no event — with
+`invalid {kind} id "{id}": expected {prefix}<suffix> with 1-63 lowercase letters, digits, dot, underscore, hyphen, slash, question mark, or hash (at most 64 characters total)`,
+where `{kind}` is `task`, `epic` or `story` and `{prefix}` its `t-`, `e-` or
+`s-`. The shape is the generator's (`{e|s|t}-<8 lowercase hex>`,
+`Store::add_task_in_sprint`) widened to the legacy words already on boards
+(`t-ui-2`, `e-ui`, `e-q4`) and the URL-reserved suffixes the served pages
+percent-encode (`t-mobile/opaque?#`, covered in `tests/e2e.rs`): there is no
+second id vocabulary — `task_id` in `rust/model.rs`, beside `sprint_id`, is
+the one check, and the refusal runs before the write transaction opens, so
+the CLI, `transact` batches and MCP share it. A well-formed explicit id
+(`t-<8 hex>`) is accepted unchanged, and a duplicate is still refused by the
+primary key as before.
+
 ## 4. Acceptance examples
 
 ### A1 (`CLI-01`)
@@ -187,16 +207,31 @@ active board` on the rule), and none carries `not namespaced`.
 `scratch`,
 *then* it answers `ifca`, `ifca`, `geoyws`, `geoyws`, `unum`, `unum` and no estate.
 
+### A6 (`CLI-06`)
+
+*Given* a board,
+*when* `kanban task add "title" --id "bogus id!" --as X --status draft --json` runs,
+*then* it exits non-zero writing nothing (`task list` stays empty) with `invalid task id
+"bogus id!": expected t-<suffix> with 1-63 lowercase letters, digits, dot, underscore,
+hyphen, slash, question mark, or hash (at most 64 characters total)`; `--id e-1234abcd`
+on a task and `--id t-1234abcd` on an epic are refused the same way, each naming its
+own prefix; `--id t-1234abcd` on a task exits zero and reads back; and repeating it is
+refused by the primary key (`UNIQUE constraint failed`), as before.
+
 ## 5. Contracts and data
 
-- **Interface version or schema:** the CLI grammar is unchanged (`rust/lib.rs:189`):
-  `kanban tag add NAME [--description TEXT] [--as ACTOR] [--json]`. Only the refusal set
-  grows by the two sentences `CLI-01` and `CLI-03` quote. `--json` refusals keep the
-  error-object shape (an object holding only `error`).
+- **Interface version or schema:** the CLI grammar is unchanged (`rust/lib.rs:189` for
+  `tag add`; `task add` already carries `[--id ID]`): only the refusal set grows, by the
+  two sentences `CLI-01` and `CLI-03` quote and the one sentence `CLI-06` quotes.
+  `--json` refusals keep the error-object shape (an object holding only `error`).
 - **Data invariants:** a refused registration writes nothing: no `tags` row, no `tag_added`
-  event, no registry touch. What is registered is what `validate_tag_name` shapes, as today.
+  event, no registry touch; a refused `task add` writes nothing: no row, no event.
+  What is registered is what `validate_tag_name` shapes, as today; what is filed is what
+  `task_id` shapes.
 - **Migration:** none. Bare legacy tags already registered stay registered, attachable and
-  filterable; they migrate with `tag rename`, which is unchanged.
+  filterable; they migrate with `tag rename`, which is unchanged. Rows already on boards
+  keep their ids — reads never check the shape — and imports write rows directly, so
+  legacy exports still land.
 - **Compatibility:** an older caller offering a bare name to `tag add` is refused where it
   used to succeed — that is the slice. Every other caller spelling (namespaced add, attach,
   filter, rename, remove) behaves exactly as at the baseline.
@@ -229,8 +264,11 @@ None.
 | `CLI-03` | MUST | process | `tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only` | asserts the estate list is carried and no single `estate/name` is suggested. no e2e coverage |
 | `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, lists, attaches. no e2e coverage |
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
+| `CLI-06` | MUST | process | `task_add_refuses_a_misshaped_id_with_the_kinds_expected_shape` | `bogus id!` and both wrong-kind directions refused with the exact sentence and an empty listing; `t-1234abcd` accepted; the duplicate refused by the primary key. The boundary unit test `a_task_id_has_one_shape_per_kind` pins case, the reserved suffixes, the length bound and the empty suffix. no e2e coverage |
 
 ## 9. Change log
 
 - `2026-09-25` — slice created with `CLI-01`..`CLI-05` (board rows `t-7f596f45`, `t-fb600b26`;
   approved by George in `a-3990a3e3` on 2026-09-24).
+- `2026-09-25` — `CLI-06` appended: `task add --id` is refused unless it is the kind's own
+  shape (board row `t-6148c0ba`).
