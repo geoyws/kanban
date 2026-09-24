@@ -4097,3 +4097,328 @@ fn attention_list_already_hides_a_tag_denied_row_and_preserves_authorized_count(
         direct.as_array().unwrap().len()
     );
 }
+
+/// ACC-14 over HTTP, A11's unauthorized half: a CHECKED row the caller may
+/// not read shows no check metadata on any served read, and its check-answer
+/// POST is indistinguishable from a POST to an id that was never raised.
+///
+/// INTEGRATION, at the layer `http`: the real binary, a real managed estate,
+/// the CLI and the serving process running as the same identity. The caller
+/// holds board read AND write plus `tag:visible` at both capabilities on
+/// Alpha — write as well, so the POST denial below is the ROW's and not the
+/// guard's blanket refusal of a principal who can write nothing — and full
+/// ownership of Beta so the whole-estate routes answer at all.
+///
+/// The fixture raises two checked rows: one `visible` (the control) and one
+/// `secret` (the denied row), each with unique question, choice keys and
+/// labels, answer key, explanation and `about` sentinels. The denied actor
+/// then reads every JSON route the existing tests sweep and finds neither
+/// the row nor any of its five check sentinels, while the control row's
+/// question IS served (so a broken fixture fails here instead of passing
+/// silently); POSTs the secret row's CORRECT check key and gets byte-for-byte
+/// the same status and body as the same POST to an id that was never raised;
+/// and re-reads as an authorized actor (after a `secret` read grant) to find
+/// the check still unanswered, its question, choices and `about` visible and
+/// its answer and explanation still redacted (ACC-13).
+#[test]
+fn a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http() {
+    let estate = ManagedEstate::new("acc14-check-http");
+    let work_a = estate.work_a.clone();
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "acc14 task",
+            "--id",
+            "t-acc14",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    // One sentinel per check field per row. Nothing here is shaped like a
+    // diagnosis marker or a row id, and the two rows share no substring the
+    // sweep could confuse.
+    let raise = |body: &str,
+                 tag: &str,
+                 question: &str,
+                 key_a: &str,
+                 key_b: &str,
+                 answer: &str,
+                 explain: &str,
+                 about: &str|
+     -> String {
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--task",
+                "t-acc14",
+                "--kind",
+                "decision",
+                "--tag",
+                tag,
+                "--check",
+                question,
+                "--check-choice",
+                &format!("{key_a}=First label {key_a}"),
+                "--check-choice",
+                &format!("{key_b}=Second label {key_b}"),
+                "--check-answer",
+                answer,
+                "--check-explain",
+                explain,
+                "--check-about",
+                about,
+                "--as",
+                "seed",
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let visible = raise(
+        "the acc14 visible body",
+        "visible",
+        "Acc14 visible check question zebraquorum?",
+        "vkey-alpha",
+        "vkey-beta",
+        "vkey-alpha",
+        "Acc14 visible check explanation orchardquorum",
+        "rust/store.rs",
+    );
+    let secret = raise(
+        "the acc14 secret body",
+        "secret",
+        "Acc14 secret check question quartzquorum?",
+        "skey-alpha",
+        "skey-beta",
+        "skey-alpha",
+        "Acc14 secret check explanation fjordquorum",
+        "rust/serve.rs",
+    );
+    // Every needle that must be nowhere in any denied-actor body: the row
+    // id, its body, and one sentinel per check field (question, choice keys
+    // and labels, answer key, explanation, about).
+    let needles = [
+        secret.as_str(),
+        "the acc14 secret body",
+        "Acc14 secret check question quartzquorum?",
+        "skey-alpha",
+        "skey-beta",
+        "First label skey-alpha",
+        "Second label skey-beta",
+        "Acc14 secret check explanation fjordquorum",
+        "rust/serve.rs",
+    ];
+
+    estate.bind_self(
+        "p-acc14",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            tag_scope("write", &estate.id_a, "visible"),
+        ],
+    );
+    estate.grant("p-acc14", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // 1. The CLI listing — the surface `kb att list` reads — hands over only
+    //    the control row.
+    let listed = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--status", "open", "--json"],
+    );
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec![visible.clone()],
+        "att list handed over a checked card this caller may not read: {listed}"
+    );
+
+    // 2. Every served JSON read that could carry the row: the queue, the
+    //    decisions, the whole-estate index, the board, the task (with its
+    //    event tail) and the search over the task. The preview is asserted
+    //    separately below because a denied row answers 404 there, not 200.
+    let queue = server.get_json("/api/v1/needs-you");
+    let decided = server.get_json("/api/v1/decided");
+    let boards = server.get_json("/api/v1/boards");
+    let board = server.get_json("/api/v1/board/Alpha");
+    let detail = server.get_json("/api/v1/task/Alpha/t-acc14");
+    let search = server.get_json("/api/v1/search?q=t-acc14");
+    let queued = queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["attention"]["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued,
+        vec![visible.clone()],
+        "the queue handed over a checked card this caller may not read: {queue}"
+    );
+    assert_eq!(
+        detail["openAttention"].as_array().unwrap().len(),
+        1,
+        "the task detail counts a checked row this caller may not read: {detail}"
+    );
+    assert_eq!(
+        detail["openAttention"][0]["attention"]["id"].as_str(),
+        Some(visible.as_str()),
+        "the task detail carried the wrong checked row: {detail}"
+    );
+    // The control row's check IS served, redacted per ACC-13: question,
+    // choices and about present, answer and explanation absent. If the
+    // fixture failed to raise a check at all, this — not a passing sweep —
+    // is what fails.
+    let control = &queue["items"][0]["attention"]["check"];
+    assert_eq!(
+        control["question"].as_str(),
+        Some("Acc14 visible check question zebraquorum?"),
+        "the served control card lost its check question: {queue}"
+    );
+    assert_eq!(
+        control["about"].as_str(),
+        Some("rust/store.rs"),
+        "the served control card lost its check about: {queue}"
+    );
+    assert!(
+        control.get("answer").is_none() && control.get("explanation").is_none(),
+        "the served control card carries its answer or explanation pre-answer: {queue}"
+    );
+    // The task detail served an event tail at all, so the sweep below proves
+    // something about the ledger and not about an empty page.
+    assert!(
+        detail["events"]["returned"].as_u64().unwrap_or(0) > 0,
+        "the task detail served no events at all, so the sweep below proves nothing: {detail}"
+    );
+    let served = format!("{queue}{decided}{boards}{board}{detail}{search}");
+
+    for needle in needles {
+        assert!(
+            !served.contains(needle),
+            "a served body named {needle}, which this caller may not read"
+        );
+    }
+    assert!(
+        served.contains("Acc14 visible check question zebraquorum?")
+            && served.contains(visible.as_str()),
+        "the served bodies lost the checked row this caller MAY read"
+    );
+
+    // 3. The hover preview: the denied row answers the one non-enumerating
+    //    refusal, and the control row answers.
+    let preview_denied = server.get(&format!("/api/v1/preview/attention/Alpha/{secret}"));
+    assert_eq!(preview_denied.status, 404, "{}", preview_denied.body);
+    assert_eq!(
+        preview_denied.body, DENIED_JSON,
+        "the preview answered a refusal of its own for a checked row"
+    );
+    let preview = server.get_json(&format!("/api/v1/preview/attention/Alpha/{visible}"));
+    assert_eq!(
+        preview["attention"]["id"].as_str(),
+        Some(visible.as_str()),
+        "the preview refused the checked row this caller MAY read: {preview}"
+    );
+
+    // 4. A11's unauthorized half: POSTing the denied row's CORRECT check key
+    //    answers byte-for-byte what the same POST to an id that was never
+    //    raised answers — the existing non-enumerating denial — and neither
+    //    body names the row or any of its check metadata.
+    let denied_post = server.post(
+        &format!("/attention/Alpha/{secret}/check"),
+        &[],
+        "key=skey-alpha",
+    );
+    let unknown_post = server.post(
+        "/attention/Alpha/att-never-raised/check",
+        &[],
+        "key=skey-alpha",
+    );
+    assert_eq!(
+        (denied_post.status, denied_post.body.as_str()),
+        (unknown_post.status, unknown_post.body.as_str()),
+        "the check POST distinguishes a denied checked row from an unknown id"
+    );
+    assert!(
+        denied_post.body.contains(DENIED),
+        "the check POST did not answer the existing non-enumerating denial: {}",
+        denied_post.body
+    );
+    for needle in needles {
+        assert!(
+            !denied_post.body.contains(needle) && !unknown_post.body.contains(needle),
+            "a check POST refusal named {needle}, which this caller may not read"
+        );
+    }
+
+    // 5. The denied POST recorded nothing: as an authorized actor the check
+    //    is still unanswered, its question, choices and about are served,
+    //    and its answer and explanation stay redacted.
+    estate.grant("p-acc14", &[tag_scope("read", &estate.id_a, "secret")]);
+    let shown = estate.ok_json(&work_a, &["attention", "show", &secret, "--json"]);
+    assert_eq!(shown["id"].as_str(), Some(secret.as_str()), "{shown}");
+    assert!(
+        shown["check"]["answered"].is_null(),
+        "the denied check POST recorded an answer: {shown}"
+    );
+    assert_eq!(
+        shown["check"]["question"].as_str(),
+        Some("Acc14 secret check question quartzquorum?"),
+        "the authorized re-read lost the denied row's check: {shown}"
+    );
+    assert!(
+        shown["check"].get("answer").is_none() && shown["check"].get("explanation").is_none(),
+        "the authorized pre-answer re-read carries the answer or explanation: {shown}"
+    );
+    let preview_now = server.get_json(&format!("/api/v1/preview/attention/Alpha/{secret}"));
+    assert_eq!(
+        preview_now["attention"]["check"]["question"].as_str(),
+        Some("Acc14 secret check question quartzquorum?"),
+        "the authorized preview lost the denied row's check: {preview_now}"
+    );
+    assert!(
+        preview_now["attention"]["check"].get("answer").is_none()
+            && preview_now["attention"]["check"]
+                .get("explanation")
+                .is_none(),
+        "the authorized preview carries the answer or explanation pre-answer: {preview_now}"
+    );
+
+    // 6. The authorized half of A11 on the same route: the control row's
+    //    correct key records through the shared operation and redirects to
+    //    the card, proving the POST path the denial above came from works.
+    let recorded = server.post(
+        &format!("/attention/Alpha/{visible}/check"),
+        &[],
+        "key=vkey-alpha",
+    );
+    assert_eq!(recorded.status, 303, "{}", recorded.body);
+    assert!(
+        recorded
+            .head
+            .contains(&format!("Location: /?checked={visible}")),
+        "the recorded check POST did not land on its card: {}",
+        recorded.head
+    );
+    let answered = estate.ok_json(&work_a, &["attention", "show", &visible, "--json"]);
+    assert_eq!(
+        answered["check"]["answered"].as_str(),
+        Some("vkey-alpha"),
+        "the authorized check POST recorded nothing: {answered}"
+    );
+}

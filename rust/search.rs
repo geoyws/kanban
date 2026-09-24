@@ -412,6 +412,15 @@ fn snippet(document: &Document, query_words: &[String]) -> String {
 /// source row left to authorize against, so it yields the tag that can never
 /// be satisfied — it is dropped rather than trusted.
 fn document_row_tags(connection: &Connection, document: &Document) -> Result<Vec<String>> {
+    // An event document is authorized as the event it indexes, not as its
+    // task: an event ABOUT an attention row carries that row's id, kind,
+    // tags and choices in the indexed payload, so the task's tags alone
+    // would hand a denied row to any caller who can read the task (ACC-14).
+    // [`crate::store::event_authorization_tags`] reads the same union the
+    // event tails filter on.
+    if document.source_kind == "event" {
+        return crate::store::event_authorization_tags(connection, &document.source_id);
+    }
     let mut tags = Vec::new();
     if let Some(task_id) = document.task_id.as_deref() {
         let exists: i64 =
@@ -448,7 +457,7 @@ fn document_row_tags(connection: &Connection, document: &Document) -> Result<Vec
 /// `ScopeTuple::from_atoms` will not build a `tag:` from it), so no grant can
 /// name it and no caller can satisfy it. A document pointing at a row that no
 /// longer exists is therefore always dropped.
-const STALE_INDEX_TAG: &str = "*";
+pub(crate) const STALE_INDEX_TAG: &str = "*";
 
 /// Rank and materialise search hits.
 ///

@@ -906,12 +906,15 @@ paths:
            sentence.
         6. The board resolves, or `404`.
         7. `Store::answer_attention_check_from_trusted_edge` accepts it, or
-           `409` with the store's own sentence. The operation is the same
-           `record_check_answer` law the CLI's `--check-answered` resolve and
-           `attention check` verb use (ACC-11, ACC-21): there is no second
-           answer behaviour. A row with no check, an already-answered check or
-           an undeclared key is refused. An open or a resolved row is accepted
-           (ACC-20); its status is unchanged either way.
+           `409`. The operation is the same `record_check_answer` law the
+           CLI's `--check-answered` resolve and `attention check` verb use
+           (ACC-11, ACC-21): there is no second answer behaviour. A row with
+           no check, an already-answered check or an undeclared key is refused
+           with the store's own sentence. An unknown id and a row the caller
+           may not read both answer the generic non-enumerating denial at
+           this same status, so the two are indistinguishable (ACC-14). An
+           open or a resolved row is accepted (ACC-20); its status is
+           unchanged either way.
 
         On success: `303` to `/?checked={id}`. Nothing is settled — on an
         open row the decision the answer unlocks is a separate `reply`.
@@ -919,7 +922,7 @@ paths:
         The pre-answer projection this route's page was rendered from omits
         `answer` and `explanation` (ACC-10); the post-answer projection a
         refresh then reads may carry both (ACC-13).
-      x-requirement: [SPA-11, ACC-11, ACC-20]
+      x-requirement: [SPA-11, ACC-11, ACC-14, ACC-20]
       x-store-method: Store::answer_attention_check_from_trusted_edge
       parameters:
         - $ref: "#/components/parameters/Project"
@@ -990,12 +993,15 @@ paths:
             The check was not answered. The row carries no check, the check is
             already answered, or the key is one it does not declare (ACC-07).
             A resolved row is not refused for being resolved (ACC-20). The
-            store's sentence is returned as written, and the row is unchanged.
+            store's sentence is returned as written, and the row is unchanged —
+            except an unknown id and a row the caller may not read, which both
+            answer `<p class=error>denied or not found</p>` at this same
+            status, so the two are indistinguishable (ACC-14).
 
-            **This is a form POST, so the refusal is a page.** The store's
-            sentence is the text of the `<p class=error>` under
+            **This is a form POST, so the refusal is a page.** The sentence is
+            the text of the `<p class=error>` under
             `<h1>Check answer not recorded</h1>`
-            (`rust/serve.rs:897`-`rust/serve.rs:906`), which is the element
+            (`rust/serve.rs:896`-`rust/serve.rs:928`), which is the element
             `web/src/api.ts`'s `postForm` parses out. The JSON `Error` body is
             the `/api/v1` surface's shape, and this route is not on it.
           content:

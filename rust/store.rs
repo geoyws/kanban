@@ -718,7 +718,7 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 /// there is no live row left to read, and the snapshot is the strictest
 /// evidence remaining. An event whose attention row is gone yields, the same
 /// way, whatever that payload wrote down about it.
-fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
+pub(crate) fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
     let mut tags = match event.task_id.as_deref() {
         Some(id) => task_tags(connection, id)?,
         None => Vec::new(),
@@ -749,6 +749,56 @@ fn event_tags(connection: &Connection, event: &Event) -> Result<Vec<String>> {
     tags.sort();
     tags.dedup();
     Ok(tags)
+}
+
+/// The authorization tags of one indexed EVENT document (`search.rs`): the
+/// same [`event_tags`] union the event tails filter on, read live from the
+/// source tables rather than from the index's projected copy. An event ABOUT
+/// an attention row names that row under `attentionID` and records its tags
+/// in the payload, so authorizing the document against only its task's tags
+/// hands the row's id, kind, tags and choices to a caller every listing
+/// withholds it from (ACC-14).
+///
+/// A document whose event is gone (a stale index entry) or whose `source_id`
+/// is not an event sequence yields the tag that can never be satisfied, so
+/// it is dropped rather than trusted — the same stale-entry rule
+/// [`crate::search::STALE_INDEX_TAG`] states.
+pub(crate) fn event_authorization_tags(
+    connection: &Connection,
+    source_id: &str,
+) -> Result<Vec<String>> {
+    let seq: i64 = match source_id.parse() {
+        Ok(seq) => seq,
+        Err(_) => return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]),
+    };
+    let row: Option<(Option<String>, String)> = connection
+        .query_row(
+            "SELECT task_id, payload FROM events WHERE seq=?",
+            [seq],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((task_id, payload)) = row else {
+        return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
+    };
+    // Fail closed: a payload the store cannot parse is an error, not an
+    // untagged event.
+    let payload: Value = serde_json::from_str(&payload)
+        .with_context(|| format!("event {seq} carries a payload that is not JSON"))?;
+    event_tags(
+        connection,
+        &Event {
+            seq,
+            task_id,
+            kind: String::new(),
+            actor: None,
+            payload,
+            created_at: 0,
+            archived: false,
+            prev_hash: None,
+            event_hash: None,
+        },
+    )
 }
 
 /// Every tag this board has on a row or in its own tag registry.

@@ -894,6 +894,27 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
             ));
         };
         if let Err(error) = store.answer_attention_check_from_trusted_edge(id, &actor, &key) {
+            // ACC-14: answering names a row, so an unknown id and a row this
+            // caller may not read answer the same refusal. The store's
+            // `attention {id} not found` echoes the caller's own id back, and
+            // serving it beside `denied or not found` would let the pair
+            // confirm a denied row exists, so both collapse to the existing
+            // non-enumerating denial at the same status. Every other refusal
+            // — no check, already answered, undeclared key — reaches a caller
+            // the guard already let past the row, so those keep the store's
+            // own sentence.
+            let message = error.to_string();
+            if message == format!("attention {id} not found")
+                || message.contains("denied or not found")
+            {
+                return Ok(WebResponse::Html(
+                    409,
+                    page(
+                        "Check answer not recorded",
+                        "<h1>Check answer not recorded</h1><p class=error>denied or not found</p>",
+                    ),
+                ));
+            }
             return Ok(WebResponse::Html(
                 409,
                 page(
