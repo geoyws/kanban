@@ -463,7 +463,7 @@ On `/boards` and `/deployments`, every `th` and `td` computes a total border wid
 `0px`, that `1px` is the row separator in `--surface0`, and every numeric cell computes
 `text-align: right` with the `--mono` family.
 
-**WEB-60** — a namespaced tag reads as a chip with the estate dimmed.
+**WEB-60** — the bundle carries the chip's style and markers.
 Strength: MUST · Layer: unit · Source: board rows `t-7f596f45`, `t-fb600b26`; George,
 2026-09-24, attention `a-3990a3e3` (the chip half of the one-change approval); tag-namespace
 sweep `t-f46a2b8a` (SPA-59 holds the browser half).
@@ -472,12 +472,11 @@ deleted the served `CSS` const — declares `.tag-chip` with `white-space:nowrap
 .tag-estate` with `opacity:0.75`, and `.tag-chip .tag-sub` with `font-weight:700`; those three
 rules declare no colour token, no hex literal, no radius and no border, so SPA-56's arithmetic
 is untouched. The embedded script carries the chip markers (`tag-chip`, `tag-estate`,
-`tag-sub`, `data-tag`), so every `, tagged …` clause renders one `.tag-chip` per tag with the
-full slash spelling in `data-tag`: the estate prefix dimmed, the subsystem bold. A tag with no
-slash renders whole and bold — there is no prefix to dim — so bare legacy tags render as
-before.
-*Failure behaviour:* a joined plain-text tag list, or a chip that drops either half of the
-namespace, fails this requirement.
+`tag-sub`, `data-tag`). Rendering per clause — one `.tag-chip` per tag with the full slash
+spelling in `data-tag`, the estate prefix dimmed and the subsystem bold, and a slash-free
+tag rendered whole and bold — is SPA-59's, not this requirement's.
+*Failure behaviour:* a stylesheet that drops a chip rule or restyles it outside the three
+declarations, or a script that drops a marker, fails this requirement.
 
 ### Responsiveness
 
@@ -788,16 +787,13 @@ at 60 px, and the note field is still at 716–785 — inside the viewport and a
 816. Without the restore the same scenario reports both positions at 0 and the note at
 1130–1199, off the screen.
 
-**A17 — a namespaced tag reads as a chip with the estate dimmed (WEB-60).**
+**A17 — the bundle carries the chip's style and markers (WEB-60).**
 *Given* the shipped bundle,
 *when* its stylesheet bytes are read,
 *then* `.tag-chip` declares `white-space:nowrap`, `.tag-chip .tag-estate` declares
 `opacity:0.75`, `.tag-chip .tag-sub` declares `font-weight:700`, and none of the three rules
 declares a colour token, a hex literal, a radius or a border; *and when* its script bytes are
-read, *then* they carry `tag-chip`, `tag-estate`, `tag-sub` and `data-tag`, so every
-`, tagged …` clause renders one `.tag-chip` per tag with the full slash spelling in
-`data-tag` — the estate prefix dimmed, the subsystem bold — while a slash-free tag renders
-whole and bold.
+read, *then* they carry `tag-chip`, `tag-estate`, `tag-sub` and `data-tag`.
 
 **Categories deliberately not exercised here.** Unauthenticated access, session handling and
 CSRF-token design are the edge's and are already proven where they live: kanban implements no

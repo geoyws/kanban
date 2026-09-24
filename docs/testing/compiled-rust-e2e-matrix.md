@@ -599,10 +599,10 @@ above), so each row says `no e2e coverage` plainly.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
-| `CLI-01` | MUST | process | `tag_add_refuses_a_bare_name_with_the_boards_mapped_estate` | table-driven over `prjx`/`ifca`, `kanban`/`geoyws`, `memberx`/`unum` and `unum-ledger`/`unum`; asserts the exact sentence and an empty master file. no e2e coverage |
+| `CLI-01` | MUST | process | `tag_add_refuses_a_bare_name_with_the_boards_mapped_estate`; `tag_add_in_transact_refuses_against_the_batch_board_not_the_cwd` | table-driven over `prjx`/`ifca`, `kanban`/`geoyws`, `memberx`/`unum` and `unum-ledger`/`unum`; asserts the exact sentence, an empty `tag list` and no `tag_added` event; the batch case runs `transact --project prjx` from the `kanban` checkout and asserts the `ifca` repair with `rolledBack: true`. no e2e coverage |
 | `CLI-02` | MUST | unit | `estate_for_board_maps_each_named_board_to_its_estate` | every named board plus the `unum*` rule, unmapped names, and the slashed-name exemption. no e2e coverage |
 | `CLI-03` | MUST | process | `tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only` | asserts the estate list is carried and no single `estate/name` is suggested. no e2e coverage |
-| `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, lists, attaches. no e2e coverage |
+| `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, attaches, reads back. no e2e coverage |
 | `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
 
 5 requirements: 5 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
