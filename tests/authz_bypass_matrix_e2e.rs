@@ -5502,8 +5502,8 @@ fn denied_and_unknown_task_ids_answer_identically_on_task_routes() {
 /// INTEGRATION, at the layer `process`: the real binary against a real
 /// managed estate. Covers `note`, `attention raise --task`, `sitrep post
 /// --task`, `checkpoint`, `handoff create` with a task, `task add --parent` /
-/// `--depends-on`, `task update --parent`, `subscription add --subject` /
-/// `--relation`, and `deploy start --task`.
+/// `--depends-on`, `task update --parent` / `--depends-on`, `subscription
+/// add --subject` / `--relation`, and `deploy start --task`.
 #[test]
 fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
     fn sitrep_on_task(task: &str) -> Vec<&str> {
@@ -5831,7 +5831,27 @@ fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
         ],
         "task update --parent",
     );
-    // The subject is addressed `task:ID`, exactly as the usage line spells it.
+    assert_write_identical(
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--depends-on",
+            "t-attach-secret",
+            "--as",
+            "probe",
+        ],
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--depends-on",
+            "t-never-created",
+            "--as",
+            "probe",
+        ],
+        "task update --depends-on",
+    );
     assert_write_identical(
         &subscription_on_subject("task:t-attach-secret"),
         &subscription_on_subject("task:t-never-created"),
@@ -5887,4 +5907,629 @@ fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
     // to the secret task, so the denials above came from the tag and not a
     // broken write path.
     estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
+}
+
+/// ACC-14 residual oracles: heartbeat and release, sprint plan candidates and
+/// parent epics, deploy finish/abandon/retry-of, and removed-task watch and
+/// subscription subjects.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Principal P holds board write only. A `secret` story is
+/// leased to the seed holder, a `secret` epic stands by, two deployments prove
+/// the secret story, and a second `secret` story is removed. P addresses each
+/// denied id beside a never-created id: the same exit code and byte-identical
+/// stderr carrying the existing non-enumerating denial, with nothing written.
+/// The removed-then-denied id answers identically on `watch --task` and
+/// `subscription add --subject`. Unmanaged boards keep their plain messages,
+/// and the holder's own heartbeat, release, watch, subscription, sprint plan
+/// and deploy finish/abandon still work.
+#[test]
+fn residual_lease_sprint_and_deployment_ids_answer_identically_under_enforcement() {
+    fn subscription_on_subject(task: &str) -> Vec<&str> {
+        vec![
+            "subscription",
+            "add",
+            "--consumer",
+            "residual-consumer",
+            "--action",
+            "residual-action",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "probe",
+            "--subject",
+            task,
+            "--json",
+        ]
+    }
+    fn deploy_start_commit() -> &'static str {
+        "0123456789abcdef0123456789abcdef01234567"
+    }
+    let estate = ManagedEstate::new("acc14-residual-oracle");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual visible task",
+            "--id",
+            "t-resid-visible",
+            "--type",
+            "story",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual secret task",
+            "--id",
+            "t-resid-secret",
+            "--type",
+            "task",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual secret epic",
+            "--id",
+            "e-resid-secret",
+            "--type",
+            "epic",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the residual removed task",
+            "--id",
+            "t-resid-gone",
+            "--type",
+            "story",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "sprint",
+            "new",
+            "Residual sprint",
+            "--id",
+            "sp-resid",
+            "--target-version",
+            "9.9.0",
+            "--start",
+            "0",
+            "--end",
+            "4102444800000",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    let lease = estate.ok_json(
+        &work_a,
+        &["claim", "t-resid-secret", "--as", "seed", "--json"],
+    )["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut deployments = Vec::new();
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let started = estate.ok_json(
+            &work_a,
+            &[
+                "deploy",
+                "start",
+                "--repo",
+                "kanban",
+                "--commit",
+                deploy_start_commit(),
+                "--tier",
+                "@_bdt",
+                "--environment",
+                "branch-dev-testing",
+                "--host",
+                "geoywsMBP",
+                "--url",
+                "http://localhost:9999",
+                "--task",
+                "t-resid-secret",
+                "--as",
+                "seed",
+                "--json",
+            ],
+        );
+        deployments.push(started["id"].as_str().unwrap().to_owned());
+        tokens.push(started["capabilityToken"].as_str().unwrap().to_owned());
+    }
+    estate.ok(&work_a, &["task", "remove", "t-resid-gone", "--as", "seed"]);
+    for (args, plain, what) in [
+        (
+            vec!["heartbeat", "t-never-created", "--lease", "lease-bogus"],
+            "has no active lease",
+            "heartbeat",
+        ),
+        (
+            vec!["release", "t-never-created", "--lease", "lease-bogus"],
+            "has no active lease",
+            "release",
+        ),
+        (
+            vec![
+                "sprint",
+                "plan",
+                "sp-resid",
+                "--body",
+                "residual probe",
+                "--candidate",
+                "t-never-created",
+                "--as",
+                "seed",
+            ],
+            "task t-never-created not found",
+            "sprint plan --candidate",
+        ),
+        (
+            vec![
+                "sprint",
+                "plan",
+                "sp-resid",
+                "--body",
+                "residual probe",
+                "--parent-epic",
+                "t-never-created",
+                "--as",
+                "seed",
+            ],
+            "task t-never-created not found",
+            "sprint plan --parent-epic",
+        ),
+        (
+            vec![
+                "deploy",
+                "finish",
+                "d-never-started",
+                "--token",
+                "token-bogus",
+                "--result",
+                "failed",
+                "--phase",
+                "build",
+                "--receipt",
+                "residual probe",
+                "--as",
+                "seed",
+            ],
+            "deployment d-never-started not found",
+            "deploy finish",
+        ),
+        (
+            vec![
+                "deploy",
+                "abandon",
+                "d-never-started",
+                "--as",
+                "seed",
+                "--note",
+                "residual probe",
+                "--token",
+                "token-bogus",
+            ],
+            "deployment d-never-started not found",
+            "deploy abandon",
+        ),
+        (
+            vec![
+                "deploy",
+                "start",
+                "--repo",
+                "kanban",
+                "--commit",
+                deploy_start_commit(),
+                "--tier",
+                "@_bdt",
+                "--environment",
+                "branch-dev-testing",
+                "--host",
+                "geoywsMBP",
+                "--url",
+                "http://localhost:9999",
+                "--retry-of",
+                "d-never-started",
+                "--as",
+                "seed",
+                "--json",
+            ],
+            "deployment d-never-started not found",
+            "deploy start --retry-of",
+        ),
+        (
+            vec!["watch", "--task", "t-never-created", "--json"],
+            "not present in this board or its event history",
+            "watch --task",
+        ),
+    ] {
+        let output = estate.run(&work_a, &args);
+        assert!(!output.status.success(), "{what} should fail unmanaged");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains(plain),
+            "{what} lost its plain unmanaged message: {stderr}"
+        );
+        assert!(
+            !stderr.contains(DENIED),
+            "{what} answers a denial where no guard can deny: {stderr}"
+        );
+    }
+    let plain_subscription = estate.run(&work_a, &subscription_on_subject("task:t-never-created"));
+    assert!(
+        !plain_subscription.status.success(),
+        "subscription add should fail unmanaged"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain_subscription.stderr).into_owned();
+    assert!(
+        plain_stderr.contains("not found in current or historical board state"),
+        "subscription add lost its plain unmanaged message: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(DENIED),
+        "subscription add answers a denial where no guard can deny: {plain_stderr}"
+    );
+    estate.bind_self("p-residual", &[board_scope("write", &estate.id_a)]);
+    estate.enforce("managed");
+    // Each denied id answers exactly like the never-created one: the same
+    // exit code, byte-identical stderr, and the generic denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert!(
+            !unknown.status.success(),
+            "{what} with an unknown id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["heartbeat", "t-resid-secret", "--lease", "lease-bogus"],
+        &["heartbeat", "t-never-created", "--lease", "lease-bogus"],
+        "heartbeat",
+    );
+    assert_cli_identical(
+        &["release", "t-resid-secret", "--lease", "lease-bogus"],
+        &["release", "t-never-created", "--lease", "lease-bogus"],
+        "release",
+    );
+    assert_cli_identical(
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--candidate",
+            "t-resid-secret",
+            "--as",
+            "seed",
+        ],
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--candidate",
+            "t-never-created",
+            "--as",
+            "seed",
+        ],
+        "sprint plan --candidate",
+    );
+    assert_cli_identical(
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--parent-epic",
+            "e-resid-secret",
+            "--as",
+            "seed",
+        ],
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual probe",
+            "--parent-epic",
+            "t-never-created",
+            "--as",
+            "seed",
+        ],
+        "sprint plan --parent-epic",
+    );
+    assert_cli_identical(
+        &[
+            "deploy",
+            "finish",
+            &deployments[0],
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "residual probe",
+            "--as",
+            "seed",
+        ],
+        &[
+            "deploy",
+            "finish",
+            "d-never-started",
+            "--token",
+            "token-bogus",
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "residual probe",
+            "--as",
+            "seed",
+        ],
+        "deploy finish",
+    );
+    assert_cli_identical(
+        &[
+            "deploy",
+            "abandon",
+            &deployments[0],
+            "--as",
+            "seed",
+            "--note",
+            "residual probe",
+            "--token",
+            "token-bogus",
+        ],
+        &[
+            "deploy",
+            "abandon",
+            "d-never-started",
+            "--as",
+            "seed",
+            "--note",
+            "residual probe",
+            "--token",
+            "token-bogus",
+        ],
+        "deploy abandon",
+    );
+    assert_cli_identical(
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            deploy_start_commit(),
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--retry-of",
+            &deployments[0],
+            "--as",
+            "seed",
+            "--json",
+        ],
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            deploy_start_commit(),
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--retry-of",
+            "d-never-started",
+            "--as",
+            "seed",
+            "--json",
+        ],
+        "deploy start --retry-of",
+    );
+    assert_cli_identical(
+        &["watch", "--task", "t-resid-gone", "--json"],
+        &["watch", "--task", "t-never-created", "--json"],
+        "watch --task on a removed task",
+    );
+    assert_cli_identical(
+        &subscription_on_subject("task:t-resid-gone"),
+        &subscription_on_subject("task:t-never-created"),
+        "subscription add --subject on a removed task",
+    );
+    // Nothing was written. As the board owner the same caller re-reads every
+    // row the refused commands could have touched.
+    estate.grant("p-residual", &owner_of(&estate.id_a));
+    let shown = estate.ok_json(&work_a, &["task", "show", "t-resid-secret", "--json"]);
+    assert_eq!(
+        shown["claim"]["agentID"].as_str(),
+        Some("seed"),
+        "a refused heartbeat or release moved the lease: {shown}"
+    );
+    let ledger = estate.ok(
+        &work_a,
+        &["events", "--task", "t-resid-secret", "--all", "--json"],
+    );
+    for marker in [
+        "task_sprint_changed",
+        "claim_released",
+        "deployment_finished",
+        "deployment_abandoned",
+    ] {
+        assert!(
+            !ledger.contains(marker),
+            "a refused command wrote {marker}: {ledger}"
+        );
+    }
+    assert!(
+        ledger.contains("task_added"),
+        "the secret task lost its birth event: {ledger}"
+    );
+    let listed = estate.ok_json(&work_a, &["deploy", "list", "--json"]);
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        2,
+        "a refused retry started a deployment: {listed}"
+    );
+    let subscriptions = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        subscriptions.as_array().unwrap().is_empty(),
+        "a refused subscription was created: {subscriptions}"
+    );
+    let gone = estate.run(&work_a, &["task", "show", "t-resid-gone", "--json"]);
+    assert!(
+        !gone.status.success(),
+        "a refused command restored the removed task"
+    );
+    // The control paths work: the holder's own heartbeat and release still
+    // move the lease, the owner still watches the removed task's history,
+    // subscribes to it, plans the sprint and finishes the deployments — so
+    // the denials above came from the tag and not a broken path.
+    estate.ok(
+        &work_a,
+        &["heartbeat", "t-resid-secret", "--lease", &lease, "--json"],
+    );
+    estate.ok(&work_a, &["release", "t-resid-secret", "--lease", &lease]);
+    let released = estate.ok_json(&work_a, &["task", "show", "t-resid-secret", "--json"]);
+    assert!(
+        released["claim"].is_null(),
+        "the holder's release kept the lease: {released}"
+    );
+    assert_eq!(
+        released["status"].as_str(),
+        Some("todo"),
+        "the holder's release kept the status: {released}"
+    );
+    estate.ok(&work_a, &["watch", "--task", "t-resid-gone", "--json"]);
+    estate.ok_json(&work_a, &subscription_on_subject("task:t-resid-gone"));
+    let subscriptions = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert_eq!(
+        subscriptions.as_array().unwrap().len(),
+        1,
+        "the owner's subscription to the removed task was not created: {subscriptions}"
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "sprint",
+            "plan",
+            "sp-resid",
+            "--body",
+            "residual control",
+            "--candidate",
+            "t-resid-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "finish",
+            &deployments[0],
+            "--token",
+            &tokens[0],
+            "--result",
+            "failed",
+            "--phase",
+            "build",
+            "--receipt",
+            "residual control",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "abandon",
+            &deployments[1],
+            "--as",
+            "seed",
+            "--note",
+            "residual control",
+            "--token",
+            &tokens[1],
+            "--json",
+        ],
+    );
 }

@@ -769,34 +769,63 @@ impl SearchTagCache {
         if let Some(cached) = self.removed_task_tags.get(id) {
             return Ok(cached.clone());
         }
-        let mut statement = connection.prepare(
-            "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq ASC",
-        )?;
-        let payloads = statement
-            .query_map([id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let found = !payloads.is_empty();
-        let mut union = Vec::new();
-        for payload in &payloads {
-            // Fail closed: an unreadable removal record is an error, never
-            // an untagged task.
-            let value: Value = serde_json::from_str(payload).with_context(|| {
-                format!("task {id} carries a task_removed payload that is not JSON")
-            })?;
-            if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
-                union.extend(
-                    frozen
-                        .iter()
-                        .filter_map(|tag| tag.as_str())
-                        .map(str::to_owned),
-                );
-            }
-        }
-        union.sort();
-        union.dedup();
-        let answer = found.then_some(union);
+        let answer = removed_task_tag_union_oracle(connection, id)?;
         self.removed_task_tags.insert(id.to_owned(), answer.clone());
         Ok(answer)
+    }
+}
+
+/// The last-known tag evidence for a task row that no longer exists: the
+/// union of the `_semanticV1.tags` snapshots frozen into EVERY
+/// `task_removed` event naming the id, or `None` when no removal record names
+/// it at all. The uncached read behind
+/// [`SearchTagCache::removed_task_final_tags`], for authorization paths that
+/// hold no per-request cache. Same union, same fail-closed JSON rule — see
+/// that method for why the union (not the latest) is what gates.
+fn removed_task_tag_union_oracle(connection: &Connection, id: &str) -> Result<Option<Vec<String>>> {
+    let mut statement = connection.prepare(
+        "SELECT payload FROM events WHERE task_id=?1 AND kind='task_removed' ORDER BY seq ASC",
+    )?;
+    let payloads = statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let found = !payloads.is_empty();
+    let mut union = Vec::new();
+    for payload in &payloads {
+        // Fail closed: an unreadable removal record is an error, never
+        // an untagged task.
+        let value: Value = serde_json::from_str(payload).with_context(|| {
+            format!("task {id} carries a task_removed payload that is not JSON")
+        })?;
+        if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
+            union.extend(
+                frozen
+                    .iter()
+                    .filter_map(|tag| tag.as_str())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    union.sort();
+    union.dedup();
+    Ok(found.then_some(union))
+}
+
+/// The tags an ABSENT task id authorizes against (ACC-14): a deleted row
+/// carries no live tags, so the id gates on its last-known removal union,
+/// and fails closed — the generic denial under enforcement — when no removal
+/// record names it at all. Outside enforcement the guard cannot deny, so the
+/// empty set authorizes exactly like a live untagged row and the caller's
+/// existing plain message stays.
+fn absent_task_tags_oracle(
+    connection: &Connection,
+    id: &str,
+    authz: &AuthzContext,
+) -> Result<Vec<String>> {
+    match removed_task_tag_union_oracle(connection, id)? {
+        Some(tags) => Ok(tags),
+        None if authz.is_enforcing() => Err(crate::authz::DeniedOrNotFound.into()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -3896,11 +3925,17 @@ impl Store {
         if let Some(subject) = subject_task_id.as_deref() {
             // A subscription names the task its deliveries are about: a
             // caller who cannot read that task must not subscribe to its
-            // events, nor learn it exists — so its live tags are checked
-            // here, and an unknown subject answers as denied. A subject that
+            // events, nor learn it exists — so its tags are checked here,
+            // and an unknown subject answers as denied. A subject that
             // survives only in history carries no live tags (tasks delete
-            // cascades them), so history keeps its existing existence check.
-            let tags = task_tags(&transaction, subject)?;
+            // cascades them), so that case gates on its last-known removal
+            // tags and fails closed when no removal record names it —
+            // otherwise a removed secret task subscribes on empty tags.
+            let tags = if get_task(&transaction, subject)?.is_some() {
+                task_tags(&transaction, subject)?
+            } else {
+                absent_task_tags_oracle(&transaction, subject, &self.authz)?
+            };
             self.authz.check_read(&tags)?;
             self.authz.check_write(&tags, &tags)?;
             if !watch_subject_exists_on(&transaction, subject)? {
@@ -3923,8 +3958,13 @@ impl Store {
                 bail!("subscription relation target is required");
             }
             // A relation names a task its deliveries filter on: same gate as
-            // the subject, with the same collapse for an unknown target.
-            let target_tags = task_tags(&transaction, target)?;
+            // the subject, with the same collapse for an unknown target — and
+            // the same removal-history gate when the row is gone.
+            let target_tags = if get_task(&transaction, target)?.is_some() {
+                task_tags(&transaction, target)?
+            } else {
+                absent_task_tags_oracle(&transaction, target, &self.authz)?
+            };
             self.authz.check_read(&target_tags)?;
             self.authz.check_write(&target_tags, &target_tags)?;
             if !watch_relation_target_exists_on(&transaction, kind, target)? {
@@ -5147,10 +5187,22 @@ impl Store {
     /// Checked against the named task's REAL tags, so `watch --task T` on an
     /// invisible row answers `denied or not found` rather than confirming that
     /// T exists. A task that survives only in event history has no live tag
-    /// row, so that case falls back to board scope.
+    /// row, so that case authorizes against its last-known removal tags and
+    /// fails closed when no removal record names it: under enforcement a
+    /// removed-denied id, a live-denied id and a never-created id answer the
+    /// one generic denial, instead of the empty stream beside `not present`.
     pub fn watch_subject_exists(&self, id: &str) -> Result<bool> {
-        self.authz.check_read(&task_tags(&self.connection, id)?)?;
-        watch_subject_exists_on(&self.connection, id)
+        if get_task(&self.connection, id)?.is_some() {
+            self.authz.check_read(&task_tags(&self.connection, id)?)?;
+        } else {
+            self.authz
+                .check_read(&absent_task_tags_oracle(&self.connection, id, &self.authz)?)?;
+        }
+        let exists = watch_subject_exists_on(&self.connection, id)?;
+        if !exists && self.authz.is_enforcing() {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(exists)
     }
 
     /// Relation predicates accept current task identities and exact targets
@@ -5158,10 +5210,21 @@ impl Store {
     /// parents and dependencies remain replayable.
     ///
     /// Same rule as [`Store::watch_subject_exists`]: the relation target is a
-    /// task id, so it is checked against that task's real tags.
+    /// task id, so it is checked against that task's real tags — or its
+    /// last-known removal tags when the row is gone — with nothing unnamed
+    /// answering `false` under enforcement.
     pub fn watch_relation_target_exists(&self, kind: &str, id: &str) -> Result<bool> {
-        self.authz.check_read(&task_tags(&self.connection, id)?)?;
-        watch_relation_target_exists_on(&self.connection, kind, id)
+        if get_task(&self.connection, id)?.is_some() {
+            self.authz.check_read(&task_tags(&self.connection, id)?)?;
+        } else {
+            self.authz
+                .check_read(&absent_task_tags_oracle(&self.connection, id, &self.authz)?)?;
+        }
+        let exists = watch_relation_target_exists_on(&self.connection, kind, id)?;
+        if !exists && self.authz.is_enforcing() {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(exists)
     }
 
     pub fn initialize(&mut self, name: &str, actor: &str) -> Result<()> {
@@ -6157,8 +6220,15 @@ impl Store {
             bail!("lease must be at least 1000ms");
         }
         let transaction = self.begin_write()?;
-        // Board scope, under the lock: a heartbeat moves a claim row.
+        // Board scope, under the lock, then the task itself — but only where a
+        // guard can deny: a heartbeat on a tag-denied task answers the same
+        // denial as an unknown id, before `require_lease` can name the holder
+        // or the expiry. Outside enforcement the plain `has no active lease`
+        // stays exactly as it was.
         self.authz.check_write(&[], &[])?;
+        if self.authz.is_enforcing() {
+            require_active_task_authorized(&transaction, id, &self.authz)?;
+        }
         let now = now_ms();
         let claim = require_lease(&transaction, id, token, now)?;
         // A live lease is never revoked by a gate, but renewing one asserts
@@ -6201,8 +6271,13 @@ impl Store {
 
     pub fn release(&mut self, id: &str, token: &str, keep_status: bool) -> Result<()> {
         let transaction = self.begin_write()?;
-        // Board scope, under the lock: a release drops a claim row.
+        // Board scope, under the lock, then the task itself — but only where a
+        // guard can deny, for the same reason as `heartbeat` above: outside
+        // enforcement the plain `has no active lease` stays exactly as it was.
         self.authz.check_write(&[], &[])?;
+        if self.authz.is_enforcing() {
+            require_active_task_authorized(&transaction, id, &self.authz)?;
+        }
         let claim = require_lease(&transaction, id, token, now_ms())?;
         transaction.execute("DELETE FROM task_claims WHERE task_id=?", [id])?;
         if !keep_status {
@@ -8708,15 +8783,11 @@ impl Store {
             None
         };
         if let Some(retry_of) = input.retry_of.as_deref() {
-            let status: Option<String> = transaction
-                .query_row(
-                    "SELECT status FROM deployments WHERE id=?",
-                    [retry_of],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let status = status.with_context(|| format!("deployment {retry_of} not found"))?;
-            if status == "started" {
+            // Authorized like a finish: a denied prior attempt answers the
+            // generic denial, an unknown id the same, instead of `not found`
+            // beside the prior's live status.
+            let prior = Self::require_deployment_authorized(&transaction, retry_of, &self.authz)?;
+            if prior.status == "started" {
                 bail!("deployment {retry_of} is still started and cannot be retried");
             }
         }
@@ -8820,6 +8891,34 @@ impl Store {
         let attempt = absent_as_denied(row, "deployment", id, &self.authz)?;
         self.authz
             .check_read(&self.deployment_subject_tags(&attempt)?)?;
+        Ok(attempt)
+    }
+
+    /// The write-side deployment gate (ACC-14): board-scope write BEFORE the
+    /// row is read, so an unauthorized caller gets the generic denial rather
+    /// than `deployment <id> not found`, then the attempt's subject task at
+    /// write, because finishing, abandoning or retrying an attempt writes the
+    /// projection of work the caller may have no authority over. An absent id
+    /// answers the generic denial under enforcement through
+    /// `absent_as_denied` — `deployment {id} not found` word for word outside
+    /// it — so a denied attempt and a never-started one are indistinguishable.
+    /// Takes the connection so a write path reads inside its own
+    /// `BEGIN IMMEDIATE`. The read-side twin is [`Store::require_deployment`].
+    fn require_deployment_authorized(
+        connection: &Connection,
+        id: &str,
+        authz: &AuthzContext,
+    ) -> Result<DeploymentAttempt> {
+        authz.check_write(&[], &[])?;
+        let row = connection
+            .query_row("SELECT * FROM deployments WHERE id=?", [id], deployment_row)
+            .optional()?;
+        let attempt = absent_as_denied(row, "deployment", id, authz)?;
+        let subject_tags = match attempt.task_id.as_deref() {
+            Some(task_id) => task_tags(connection, task_id)?,
+            None => Vec::new(),
+        };
+        authz.check_write(&subject_tags, &subject_tags)?;
         Ok(attempt)
     }
 
@@ -8952,9 +9051,9 @@ impl Store {
             bail!("a succeeded deployment requires --phase verification");
         }
         let transaction = self.begin_write()?;
-        self.authz.check_write(&[], &[])?;
-        let subject_tags = deployment_subject_tags_on(&transaction, &input.id)?;
-        self.authz.check_write(&subject_tags, &subject_tags)?;
+        // The gate reads the row first: a denied attempt answers the generic
+        // denial, an unknown id the same, before the `not found` below.
+        Self::require_deployment_authorized(&transaction, &input.id, &self.authz)?;
         let current: (String, String, String, String, Option<String>, Option<String>, Option<String>) = transaction
             .query_row(
                 "SELECT status,capability_token,identity_mode,commit_sha,expected_artifacts,sprint_id,target_version FROM deployments WHERE id=?",
@@ -9080,9 +9179,9 @@ impl Store {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "abandon note")?.to_owned();
         let transaction = self.begin_write()?;
-        self.authz.check_write(&[], &[])?;
-        let subject_tags = deployment_subject_tags_on(&transaction, id)?;
-        self.authz.check_write(&subject_tags, &subject_tags)?;
+        // Same gate as `finish_deployment`: the denied attempt and the unknown
+        // id answer identically, before the `not found` below.
+        Self::require_deployment_authorized(&transaction, id, &self.authz)?;
         let (status, capability, task_id, updated_at): (String, String, Option<String>, i64) =
             transaction
                 .query_row(
@@ -9191,9 +9290,16 @@ impl Store {
         }
         let mut scope = candidates.to_vec();
         if let Some(parent) = parent_epic {
+            // Authorized before it is opened: a tag-denied epic answers the
+            // same denial as an unknown id, instead of `not found` from the
+            // raw lookup below. `attach_scope_on` keeps its raw lookup: its
+            // other callers (`add_task_in_sprint`, `update_task`) pass ids
+            // already authorized in their own paths — a fresh row and the row
+            // being edited — so authorizing inside it would only newly refuse
+            // a write-only creator, while every root here is authorized next.
+            let task = require_active_task_authorized(&transaction, parent, &self.authz)?;
             let parent_tags = task_tags(&transaction, parent)?;
             self.authz.check_write(&parent_tags, &parent_tags)?;
-            let task = require_active_task(&transaction, parent)?;
             if task.task_type != "epic" {
                 bail!(
                     "sprint plan --parent-epic requires an epic, but {parent} is a {}",
@@ -9222,6 +9328,9 @@ impl Store {
         let now = now_ms();
         let mut attached = Vec::new();
         for root in &scope {
+            // Same gate as the parent above, per root: the denied id answers
+            // as denied before `attach_scope_on` can answer `not found`.
+            require_active_task_authorized(&transaction, root, &self.authz)?;
             let root_tags = task_tags(&transaction, root)?;
             self.authz.check_write(&root_tags, &root_tags)?;
             attached.extend(attach_scope_on(&transaction, root, id, &actor, now)?);
