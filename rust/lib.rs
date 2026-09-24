@@ -6388,11 +6388,13 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             // note on a task that is gone, or work stamped in the future whose
             // lease no sweep will ever retire.
             let orphans = store.foreign_key_violations()?;
+            let task_links = store.orphaned_task_links()?;
             let future = store.future_dated_tasks()?;
             let search_index = store.search_health()?;
             let audit = store.audit()?;
             healthy &= check == vec!["ok"]
                 && orphans.is_empty()
+                && task_links.is_empty()
                 && future.is_empty()
                 && search_index.healthy
                 && audit.healthy;
@@ -6406,6 +6408,7 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             );
             value.insert("integrity".into(), json!(check));
             value.insert("orphanedRows".into(), json!(orphans));
+            value.insert("orphanedTaskLinks".into(), json!(task_links));
             value.insert("futureDatedTasks".into(), json!(future));
             value.insert("searchIndex".into(), json!(search_index));
             value.insert("audit".into(), json!(audit));
@@ -7306,16 +7309,17 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
                 git,
             },
         )?;
-        let rules = effective_rule_summaries(
-            &args,
-            &store,
-            claim
-                .as_ref()
-                .map(|claim| claim.task_id.as_str())
-                .or(handoff.task_id.as_deref()),
-            None,
-            None,
-        )?;
+        // An orphaned handoff names a removed task: rule summaries fall back
+        // to board scope exactly like a session acknowledgement, instead of
+        // refusing on the missing row. Only a task with no row at all takes
+        // the fallback — a live task keeps its selectors — and a lookup
+        // failure keeps the old refusal by resolving to `true`.
+        let rule_task = claim
+            .as_ref()
+            .map(|claim| claim.task_id.as_str())
+            .or(handoff.task_id.as_deref())
+            .filter(|id| store.task_row_exists(id).unwrap_or(true));
+        let rules = effective_rule_summaries(&args, &store, rule_task, None, None)?;
         return print(
             &json!({"handoff":handoff,"claim":claim,"rules":rules}),
             args.has("json"),

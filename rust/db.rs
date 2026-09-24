@@ -2263,19 +2263,23 @@ END;
 ///
 /// Nothing relies on the dropped FK action. `remove_task` names blocking
 /// children itself (the `parent_id` FK stays), the row writers validate the
-/// task before linking, and `doctor`'s `foreign_key_check` has one fewer FK
-/// to check rather than a new violation. `NULL` once again means only what
-/// the writers put there: a session handoff, a lanewide sitrep, a taskless
-/// deployment, an untagged attention row — each board scope, as before.
+/// task before linking, and `doctor` reports dangling task links on these
+/// four tables through the new `orphaned_task_links` check rather than
+/// `foreign_key_check`, which has one fewer FK to check. `NULL` once again
+/// means only what the writers put there: a session handoff, a lanewide
+/// sitrep, a taskless deployment, an untagged attention row — each board
+/// scope, as before.
 ///
 /// SQLite cannot drop a FK in place, so each table is rebuilt on the
 /// `BOARD_V24`/`BOARD_V33` precedent: drop the attached triggers, rename
 /// aside, recreate byte-identical apart from the `task_id` column, copy every
 /// row back naming every column, drop the old table, recreate indexes and
 /// triggers. `search_source_rows` and `search_deployment_event_rows` resolve
-/// by name and are left alone under `PRAGMA legacy_alter_table`. Existing
-/// rows already nulled by an old removal stay NULL: the task they named is
-/// gone and no migration may invent the link back.
+/// by name and are left alone under `PRAGMA legacy_alter_table`. Rows already
+/// nulled by an older removal recover their link from their creation event —
+/// each one records the row id against the task — but only when that event's
+/// task has a `task_removed` record and no live row, so session handoffs,
+/// lanewide sitreps and taskless deployments stay NULL.
 const BOARD_V34: &str = r#"
 DROP TRIGGER search_sitreps_ai;
 DROP TRIGGER search_sitreps_au;
@@ -2528,6 +2532,62 @@ WHEN (NEW.check_answered IS NULL) <> (NEW.check_correct IS NULL)
 BEGIN
  SELECT RAISE(ABORT, 'attention check result must be absent or complete on a defined check');
 END;
+UPDATE sitreps SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='sitrep_posted' AND json_extract(e.payload,'$.sitrepID')=sitreps.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='sitrep_posted' AND json_extract(e.payload,'$.sitrepID')=sitreps.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE handoffs SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='handoff_created' AND json_extract(e.payload,'$.handoffID')=handoffs.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='handoff_created' AND json_extract(e.payload,'$.handoffID')=handoffs.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE deployments SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='deployment_started' AND json_extract(e.payload,'$.deploymentID')=deployments.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='deployment_started' AND json_extract(e.payload,'$.deploymentID')=deployments.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
+UPDATE attention SET task_id=(
+ SELECT e.task_id FROM events e
+ WHERE e.kind='attention_raised' AND json_extract(e.payload,'$.attentionID')=attention.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+ ORDER BY e.seq LIMIT 1
+) WHERE task_id IS NULL AND EXISTS(
+ SELECT 1 FROM events e
+ WHERE e.kind='attention_raised' AND json_extract(e.payload,'$.attentionID')=attention.id
+ AND e.task_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM events r WHERE r.kind='task_removed' AND r.task_id=e.task_id)
+ AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=e.task_id)
+);
 "#;
 const REGISTRY_V1: &str = r#"
 CREATE TABLE workspaces (
@@ -4913,6 +4973,163 @@ mod tests {
         // Re-running the ladder over the migrated shape is stable.
         migrate(&mut connection, BOARD_MIGRATIONS).expect("re-run the ladder");
         assert_eq!(schema_version(&connection).unwrap(), BOARD_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_34_backfills_pre_v34_nulled_links_from_creation_events() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        migrate(&mut connection, &BOARD_MIGRATIONS[..33]).expect("migrate through v33");
+        connection
+            .execute(
+                "INSERT INTO tasks(id,type,title,status,created_at,updated_at) \
+                 VALUES('t-old','task','removed task','todo',1,1)",
+                [],
+            )
+            .expect("seed the removed task");
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-old','driver-1','t-old','seed','old sitrep',2)",
+                [],
+            )
+            .expect("seed the linked sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-old','t-old','manual','pending','seed','old summary','old intent','old next',3)",
+                [],
+            )
+            .expect("seed the linked handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                 VALUES('a-old','t-old','decision','old question','seed',4,'open')",
+                [],
+            )
+            .expect("seed the linked attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-old','t-old','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-old',5,5)",
+                [],
+            )
+            .expect("seed the linked deployment");
+        // Genuinely taskless rows, which must stay NULL: a session handoff, a
+        // lanewide sitrep, a taskless deployment and an untagged attention row.
+        connection
+            .execute(
+                "INSERT INTO sitreps(id,lane,task_id,author,body,created_at) \
+                 VALUES('sr-lane','driver-1',NULL,'seed','lanewide sitrep',6)",
+                [],
+            )
+            .expect("seed the lanewide sitrep");
+        connection
+            .execute(
+                "INSERT INTO handoffs(id,task_id,reason,status,from_agent,summary,intent,next_action,created_at) \
+                 VALUES('h-session',NULL,'manual','pending','seed','session summary','session intent','session next',7)",
+                [],
+            )
+            .expect("seed the session handoff");
+        connection
+            .execute(
+                "INSERT INTO attention(id,task_id,kind,body,raised_by,created_at,status) \
+                 VALUES('a-free',NULL,'decision','untagged question','seed',8,'open')",
+                [],
+            )
+            .expect("seed the untagged attention row");
+        connection
+            .execute(
+                "INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at) \
+                 VALUES('d-free',NULL,'kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','seed','token-free',9,9)",
+                [],
+            )
+            .expect("seed the taskless deployment");
+        // The creation events the writers left behind, each naming its row id
+        // against the task — with taskless rows recording no task.
+        for (kind, task, payload) in [
+            ("sitrep_posted", Some("t-old"), r#"{"sitrepID":"sr-old"}"#),
+            ("handoff_created", Some("t-old"), r#"{"handoffID":"h-old"}"#),
+            (
+                "attention_raised",
+                Some("t-old"),
+                r#"{"attentionID":"a-old"}"#,
+            ),
+            (
+                "deployment_started",
+                Some("t-old"),
+                r#"{"deploymentID":"d-old"}"#,
+            ),
+            ("sitrep_posted", None, r#"{"sitrepID":"sr-lane"}"#),
+            ("handoff_created", None, r#"{"handoffID":"h-session"}"#),
+            ("attention_raised", None, r#"{"attentionID":"a-free"}"#),
+            ("deployment_started", None, r#"{"deploymentID":"d-free"}"#),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO events(task_id,kind,actor,payload,created_at) VALUES(?,?,?,?,?)",
+                    rusqlite::params![task, kind, "seed", payload, 10],
+                )
+                .expect("seed the creation event");
+        }
+        connection
+            .execute(
+                "INSERT INTO events(task_id,kind,actor,payload,created_at) \
+                 VALUES('t-old','task_removed','seed','{}',11)",
+                [],
+            )
+            .expect("seed the removal record");
+        // The pre-V34 removal itself: the foreign key nulls every link.
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        connection
+            .execute("DELETE FROM tasks WHERE id='t-old'", [])
+            .expect("remove the linked task");
+        for id_value in ["sr-old", "h-old", "a-old", "d-old"] {
+            let table = if id_value.starts_with("sr-") {
+                "sitreps"
+            } else if id_value.starts_with("h-") {
+                "handoffs"
+            } else if id_value.starts_with("a-") {
+                "attention"
+            } else {
+                "deployments"
+            };
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the nulled link");
+            assert_eq!(link, None, "{table} kept its link on a pre-v34 removal");
+        }
+        migrate(&mut connection, BOARD_MIGRATIONS).expect("migrate through v34");
+        // Exactly the rows whose creation event names the removed task recover
+        // their link; the genuinely taskless rows stay NULL.
+        for (table, id_value, expected) in [
+            ("sitreps", "sr-old", Some("t-old")),
+            ("handoffs", "h-old", Some("t-old")),
+            ("attention", "a-old", Some("t-old")),
+            ("deployments", "d-old", Some("t-old")),
+            ("sitreps", "sr-lane", None),
+            ("handoffs", "h-session", None),
+            ("attention", "a-free", None),
+            ("deployments", "d-free", None),
+        ] {
+            let link: Option<String> = connection
+                .query_row(
+                    &format!("SELECT task_id FROM {table} WHERE id='{id_value}'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read the migrated link");
+            assert_eq!(
+                link.as_deref(),
+                expected,
+                "{table} row {id_value} backfilled to the wrong link"
+            );
+        }
     }
 
     fn index_sql(connection: &Connection, name: &str) -> String {

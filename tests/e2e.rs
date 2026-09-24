@@ -57945,3 +57945,190 @@ fn att_list_check_report_fans_out_across_boards() {
     ));
     assert!(refused.contains("--all-boards"), "{refused}");
 }
+
+#[test]
+fn compiled_binary_accepts_a_handoff_on_a_removed_task_and_archives_it() {
+    let fixture = Fixture::new("handoff-accept-orphan");
+    fixture.ok_json(&fixture.main, &["init", "--name", "Orphan", "--json"]);
+    fixture.ok_json(
+        &fixture.main,
+        &[
+            "task",
+            "add",
+            "Doomed work",
+            "--id",
+            "t-doomed",
+            "--as",
+            "owner",
+            "--json",
+        ],
+    );
+    let claim = fixture.ok_json(
+        &fixture.main,
+        &["claim", "t-doomed", "--as", "owner", "--json"],
+    );
+    let handoff = fixture.ok_json(
+        &fixture.main,
+        &[
+            "handoff",
+            "create",
+            "t-doomed",
+            "--lease",
+            claim["leaseToken"].as_str().unwrap(),
+            "--as",
+            "owner",
+            "--summary",
+            "doomed summary",
+            "--intent",
+            "doomed intent",
+            "--next-action",
+            "doomed next",
+            "--reason",
+            "manual",
+            "--json",
+        ],
+    );
+    let handoff_id = handoff["id"].as_str().unwrap().to_owned();
+    let removed = fixture.run(
+        &fixture.main,
+        &["task", "remove", "t-doomed", "--as", "owner"],
+    );
+    assert!(
+        removed.status.success(),
+        "removing the handoff's task failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    // The owner accepts the orphaned handoff as an acknowledgement: it
+    // succeeds, and no lease is minted on the missing task.
+    let accepted = fixture.ok_json(
+        &fixture.main,
+        &["handoff", "accept", &handoff_id, "--as", "owner", "--json"],
+    );
+    assert_eq!(accepted["handoff"]["status"], "accepted");
+    assert_eq!(
+        accepted["handoff"]["acceptedBy"],
+        json!("owner"),
+        "the acknowledgement lost its acceptor: {accepted}"
+    );
+    assert_eq!(
+        accepted["claim"],
+        Value::Null,
+        "accepting a removed task minted a lease on a missing task: {accepted}"
+    );
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let claims: i64 = Connection::open(&board)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM task_claims", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(claims, 0, "accepting a removed task left a lease behind");
+    // Once old, the archive sweep files the orphaned acknowledgement away.
+    Connection::open(&board)
+        .unwrap()
+        .execute(
+            "UPDATE handoffs SET created_at=1,accepted_at=1 WHERE id=?",
+            [&handoff_id],
+        )
+        .unwrap();
+    let swept = fixture.ok_json(
+        &fixture.main,
+        &[
+            "archive",
+            "--older-than-days",
+            "1",
+            "--as",
+            "system@archive",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        swept["handoffs"], 1,
+        "the sweep left the orphan pending: {swept}"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["handoff", "list", "--json"]),
+        json!([])
+    );
+    let all = fixture.ok_json(&fixture.main, &["handoff", "list", "--all", "--json"]);
+    assert_eq!(all[0]["id"], json!(handoff_id));
+    assert_eq!(all[0]["archived"], true);
+}
+
+#[test]
+fn compiled_binary_hides_an_orphan_deployment_and_doctor_reports_it() {
+    let fixture = Fixture::new("orphan-deployment");
+    fixture.ok_json(&fixture.main, &["init", "--name", "OrphanDeploy", "--json"]);
+    let healthy = fixture.ok_json(
+        &fixture.main,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--as",
+            "owner",
+            "--json",
+        ],
+    );
+    let healthy_id = healthy["id"].as_str().unwrap().to_owned();
+    let board = fixture.ok_json(&fixture.main, &["workspace", "list", "--json"])[0]["boardPath"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A partial restore leaves a deployment naming a task with neither a live
+    // row nor a removal record — a link no writer path creates.
+    Connection::open(&board)
+        .unwrap()
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO deployments(id,task_id,repo,commit_sha,tier,environment,host,url,status,actor,capability_token,created_at,updated_at)
+               VALUES('d-orphan','t-vanished','kanban','0123456789abcdef0123456789abcdef01234567','@_bdt','branch-dev-testing','geoywsMBP','http://localhost:9999','started','owner','token-orphan',1,1);",
+        )
+        .unwrap();
+    // Outside enforcement every row stays visible, so the listing succeeds
+    // and still shows both attempts; hiding the orphan under enforcement is
+    // pinned at store level by
+    // `managed_deployment_listing_hides_an_orphan_link_and_doctor_reports_it`.
+    let listed = fixture.ok_json(&fixture.main, &["deploy", "list", "--json"]);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == healthy_id),
+        "the listing lost its healthy attempt beside the orphan: {listed}"
+    );
+    assert!(
+        listed.to_string().contains("t-vanished"),
+        "the direct estate hid a row it must keep visible: {listed}"
+    );
+    // Doctor reports the dangling link and refuses to certify the board.
+    let checked = fixture.run(&fixture.main, &["doctor", "--json"]);
+    assert!(
+        !checked.status.success(),
+        "doctor certified a board with a dangling task link"
+    );
+    let report: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let links = report["projects"][0]["orphanedTaskLinks"].clone();
+    assert!(
+        links
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap()
+                == "deployments row d-orphan references missing task t-vanished"),
+        "doctor did not report the dangling task link: {links}"
+    );
+}
