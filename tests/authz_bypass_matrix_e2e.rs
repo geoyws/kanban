@@ -5930,6 +5930,497 @@ fn task_linked_rows_withhold_a_tag_denied_task_on_every_listing() {
         "a refused pause or resume moved the secret subscription: {secret_shown}"
     );
 }
+
+/// ACC-14, attention by-id reads through the linked task: a managed caller
+/// holding board read and write but no `secret` scope must answer an untagged
+/// attention row raised on a `secret` task exactly like a never-created id on
+/// `attention show`, `resolve`, `reopen` and `check` plus the matching web
+/// POSTs — the same exit code and byte-identical stderr carrying the existing
+/// non-enumerating denial, with nothing recorded — while the owner still runs
+/// every one of those operations.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Sibling of
+/// `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`, which pins
+/// the listings; this one pins the by-id paths that used to check only the
+/// row's own tags.
+#[test]
+fn attention_by_id_withholds_rows_on_a_tag_denied_task() {
+    let estate = ManagedEstate::new("acc14-attention-byid-task");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    for (id, title) in [
+        ("t-byid-secret", "the by-id secret task"),
+        ("t-byid-visible", "the by-id visible task"),
+    ] {
+        let mut args = vec!["task", "add", title, "--id", id, "--as", "seed"];
+        if id == "t-byid-secret" {
+            args.extend_from_slice(&["--tag", "secret"]);
+        }
+        args.push("--json");
+        estate.ok_json(&work_a, &args);
+    }
+    let raise = |body: &str, task: &str| -> String {
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                body,
+                "--kind",
+                "decision",
+                "--as",
+                "seed",
+                "--task",
+                task,
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // Four untagged rows on the secret task, one per operation under test, so
+    // a refusal on one cannot consume the state another needs.
+    let show_row = raise("by-id secret show body", "t-byid-secret");
+    let resolve_row = raise("by-id secret resolve body", "t-byid-secret");
+    let reopen_row = raise("by-id secret reopen body", "t-byid-secret");
+    let check_row = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "raise",
+            "by-id secret check body",
+            "--kind",
+            "decision",
+            "--task",
+            "t-byid-secret",
+            "--check",
+            "By-id check question quorum?",
+            "--check-choice",
+            "bkey-alpha=First label",
+            "--check-choice",
+            "bkey-beta=Second label",
+            "--check-answer",
+            "bkey-alpha",
+            "--check-explain",
+            "By-id check explanation quorum",
+            "--check-about",
+            "rust/store.rs",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The control row lives on the visible task, so P's denials below prove a
+    // guard and not a broken route.
+    let visible_row = raise("by-id visible show body", "t-byid-visible");
+    // The owner settles the reopen row while still direct, so P's reopen
+    // meets a resolved row it may not read.
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &reopen_row,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+            "--json",
+        ],
+    );
+    estate.bind_self(
+        "p-byid-task",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+    // 1. Each web attention POST route: the denied row and the never-created
+    //    id answer byte-for-byte the same status and body — the existing
+    //    non-enumerating denial — and neither body names the row.
+    for (denied_path, unknown_path, body, what) in [
+        (
+            format!("/attention/Alpha/{check_row}/check"),
+            "/attention/Alpha/att-never-raised/check".to_owned(),
+            "key=bkey-alpha",
+            "check",
+        ),
+        (
+            format!("/attention/Alpha/{resolve_row}/reply"),
+            "/attention/Alpha/att-never-raised/reply".to_owned(),
+            "decision=custom&outcome=other&reply=done",
+            "reply",
+        ),
+        (
+            format!("/attention/Alpha/{reopen_row}/reopen"),
+            "/attention/Alpha/att-never-raised/reopen".to_owned(),
+            "",
+            "reopen",
+        ),
+    ] {
+        let denied_post = server.post(&denied_path, &[], body);
+        let unknown_post = server.post(&unknown_path, &[], body);
+        assert_eq!(
+            (denied_post.status, denied_post.body.as_str()),
+            (unknown_post.status, unknown_post.body.as_str()),
+            "the {what} POST distinguishes a denied row from an unknown id"
+        );
+        assert!(
+            denied_post.body.contains(DENIED),
+            "the {what} POST did not answer the non-enumerating denial: {}",
+            denied_post.body
+        );
+        for needle in [&show_row, &resolve_row, &reopen_row, &check_row] {
+            assert!(
+                !denied_post.body.contains(needle) && !unknown_post.body.contains(needle),
+                "the {what} POST refusal named {needle}, which this caller may not read"
+            );
+        }
+    }
+    drop(server);
+    // 2. Each CLI by-id surface: the denied row and the never-created id exit
+    //    with the same code and byte-identical stderr — the generic denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied row succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied row and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied row and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["attention", "show", &show_row],
+        &["attention", "show", "att-never-raised"],
+        "attention show",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "resolve",
+            &resolve_row,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        &[
+            "attention",
+            "resolve",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+        ],
+        "attention resolve",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "reopen",
+            &reopen_row,
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        &[
+            "attention",
+            "reopen",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--note",
+            "undo probe",
+        ],
+        "attention reopen",
+    );
+    assert_cli_identical(
+        &[
+            "attention",
+            "check",
+            &check_row,
+            "--as",
+            "seed",
+            "--key",
+            "bkey-alpha",
+        ],
+        &[
+            "attention",
+            "check",
+            "att-never-raised",
+            "--as",
+            "seed",
+            "--key",
+            "bkey-alpha",
+        ],
+        "attention check",
+    );
+    // 3. The control row stays readable, so the refusals above came from the
+    //    task gate and not a broken route.
+    let control = estate.ok_json(&work_a, &["attention", "show", &visible_row, "--json"]);
+    assert_eq!(
+        control["id"].as_str(),
+        Some(visible_row.as_str()),
+        "the visible row lost its read: {control}"
+    );
+    // 4. The owner still runs every operation, which also proves the refused
+    //    writes recorded nothing: a recorded resolve would meet "already
+    //    resolved", a recorded reopen an open row, a recorded check "exactly
+    //    one answer".
+    estate.enforce("direct");
+    let owned = estate.ok_json(&work_a, &["attention", "show", &show_row, "--json"]);
+    assert_eq!(
+        owned["status"].as_str(),
+        Some("open"),
+        "the owner lost the denied show row: {owned}"
+    );
+    let settled = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "resolve",
+            &resolve_row,
+            "--as",
+            "seed",
+            "--choice",
+            "custom",
+            "--outcome",
+            "other",
+            "--note",
+            "done",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        settled["status"].as_str(),
+        Some("resolved"),
+        "the owner lost the denied resolve row: {settled}"
+    );
+    let undone = estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "reopen",
+            &reopen_row,
+            "--as",
+            "seed",
+            "--note",
+            "owner undo",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        undone["status"].as_str(),
+        Some("open"),
+        "the owner lost the denied reopen row: {undone}"
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "attention",
+            "check",
+            &check_row,
+            "--as",
+            "seed",
+            "--key",
+            "bkey-alpha",
+            "--json",
+        ],
+    );
+}
+
+/// ACC-14, subscription relation targets on read: the owner adds a
+/// subscription with no subject and `--relation parent:t-secret`, which the
+/// add path already gates like a subject. A managed caller holding board read
+/// and write but no `secret` scope must not see it in `subscription list`,
+/// and `show`, `pause` and `resume` must answer it exactly like a
+/// never-created id — the same exit code and byte-identical stderr carrying
+/// the existing non-enumerating denial, with nothing recorded — while the
+/// owner still sees it.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Sibling of
+/// `task_linked_rows_withhold_a_tag_denied_task_on_every_listing`, which pins
+/// subject-gated subscriptions; this one pins the relation-target half the
+/// read paths used to skip.
+#[test]
+fn subscription_relation_targets_withhold_a_tag_denied_task_on_read() {
+    let estate = ManagedEstate::new("acc14-subscription-relation");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    for (id, title) in [
+        ("t-rel-secret", "the relation secret task"),
+        ("t-rel-visible", "the relation visible task"),
+    ] {
+        let mut args = vec!["task", "add", title, "--id", id, "--as", "seed"];
+        if id == "t-rel-secret" {
+            args.extend_from_slice(&["--tag", "secret"]);
+        }
+        args.push("--json");
+        estate.ok_json(&work_a, &args);
+    }
+    // The owner subscribes with no subject, filtering only on the relation —
+    // the shape whose target the read paths used to ignore — once against the
+    // secret task and once against the visible control task.
+    let add_relation = |consumer: &str, target: &str| {
+        estate.ok_json(
+            &work_a,
+            &[
+                "subscription",
+                "add",
+                "--consumer",
+                consumer,
+                "--action",
+                "relation-action",
+                "--timeout-ms",
+                "100",
+                "--max-retries",
+                "1",
+                "--rate-per-minute",
+                "60",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "seed",
+                "--relation",
+                target,
+                "--json",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let secret_sub = add_relation("rel-secret-consumer", "parent:t-rel-secret");
+    let visible_sub = add_relation("rel-visible-consumer", "parent:t-rel-visible");
+    assert_ne!(secret_sub, visible_sub, "the two seeds collided on one row");
+    estate.bind_self(
+        "p-rel-sub",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. The list carries the visible subscription and no trace of the secret
+    //    one — neither its consumer nor its relation target.
+    let listed = estate.run(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        listed.status.success(),
+        "subscription list should succeed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let body = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        body.contains("rel-visible-consumer"),
+        "subscription list withheld the visible row, so an empty answer proves nothing: {body}"
+    );
+    assert!(
+        !body.contains("rel-secret-consumer") && !body.contains("t-rel-secret"),
+        "subscription list served the denied relation target: {body}"
+    );
+    // 2. The by-id surfaces answer the denied subscription exactly like a
+    //    never-created one — the same exit code and byte-identical stderr
+    //    carrying the generic denial — and record nothing.
+    let assert_by_id_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_by_id_identical(
+        &["subscription", "show", &secret_sub, "--json"],
+        &["subscription", "show", "sub-never-created", "--json"],
+        "subscription show",
+    );
+    assert_by_id_identical(
+        &["subscription", "pause", &secret_sub, "--as", "seed"],
+        &["subscription", "pause", "sub-never-created", "--as", "seed"],
+        "subscription pause",
+    );
+    assert_by_id_identical(
+        &["subscription", "resume", &secret_sub, "--as", "seed"],
+        &[
+            "subscription",
+            "resume",
+            "sub-never-created",
+            "--as",
+            "seed",
+        ],
+        "subscription resume",
+    );
+    // 3. The owner still sees the subscription untouched, so the refusals
+    //    above came from the relation gate and not from missing rows — and
+    //    the refused pause and resume recorded nothing.
+    estate.enforce("direct");
+    let owned = estate.ok(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        owned.contains("rel-secret-consumer") && owned.contains("t-rel-secret"),
+        "the owner lost the secret subscription: {owned}"
+    );
+    let secret_shown = estate.ok_json(&work_a, &["subscription", "show", &secret_sub, "--json"]);
+    assert_eq!(
+        secret_shown["status"].as_str(),
+        Some("active"),
+        "a refused pause or resume moved the secret subscription: {secret_shown}"
+    );
+    let visible_shown = estate.ok_json(&work_a, &["subscription", "show", &visible_sub, "--json"]);
+    assert_eq!(
+        visible_shown["consumerID"].as_str(),
+        Some("rel-visible-consumer"),
+        "the visible subscription lost its row: {visible_shown}"
+    );
+}
 // ---------------------------------------------------------------------------
 // Task-attach writes: no board-write-only path may touch an unreadable task.
 // ---------------------------------------------------------------------------
