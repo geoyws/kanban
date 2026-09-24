@@ -897,7 +897,10 @@ fn authorize_task_attach(connection: &Connection, authz: &AuthzContext, id: &str
 /// the task's surviving rows. `Some(vec![])` means the task was removed while
 /// carrying no tag, which authorizes exactly like a live untagged task;
 /// `None` (no removal record: a partial restore, a hand edit) fails closed
-/// at the caller.
+/// at the caller. A removal payload that carries no tags ARRAY at
+/// `_semanticV1.tags` — missing, null or a non-array — is a malformed record
+/// and fails closed with [`crate::search::STALE_INDEX_TAG`], which no grant
+/// satisfies; only an explicitly empty array yields `Some(vec![])`.
 pub(crate) fn removed_task_tag_union(
     connection: &Connection,
     id: &str,
@@ -916,13 +919,19 @@ pub(crate) fn removed_task_tag_union(
         let value: Value = serde_json::from_str(payload).with_context(|| {
             format!("task {id} carries a task_removed payload that is not JSON")
         })?;
-        if let Some(Value::Array(frozen)) = value.pointer("/_semanticV1/tags") {
-            union.extend(
-                frozen
-                    .iter()
-                    .filter_map(|tag| tag.as_str())
-                    .map(str::to_owned),
-            );
+        match value.pointer("/_semanticV1/tags") {
+            Some(Value::Array(frozen)) => {
+                union.extend(
+                    frozen
+                        .iter()
+                        .filter_map(|tag| tag.as_str())
+                        .map(str::to_owned),
+                );
+            }
+            // Every writer freezes the tags, so a record naming no tags array
+            // is legacy or hand-restored: it must not authorize as an
+            // untagged removal.
+            _ => return Ok(Some(vec![crate::search::STALE_INDEX_TAG.to_owned()])),
         }
     }
     union.sort();
@@ -1254,6 +1263,57 @@ fn removed_task_snapshot(
         "priorStatus": prior_status,
         "currentStatus": current_status,
     }))
+}
+
+/// One attention row opened BY ID through the task it was raised against
+/// (ACC-14): the absent mapping first, so an unknown id answers the generic
+/// denial under enforcement, then `task_linked_row_visible` on the row's
+/// `task_id`, with a hidden row answering that same denial. The row's own-tag
+/// check stays at the call site — show reads it after this returns, the
+/// mutations wrote it before the row was opened — so listings, search and
+/// every by-id path agree on an untagged row hung on a denied task. A denied
+/// row and an unknown id are then byte-identical on every surface.
+fn require_attention_visible(
+    connection: &Connection,
+    authz: &AuthzContext,
+    row: Option<Attention>,
+    id: &str,
+) -> Result<Attention> {
+    let existing = absent_as_denied(row, "attention", id, authz)?;
+    if !task_linked_row_visible(connection, authz, existing.task_id.as_deref())? {
+        return Err(crate::authz::DeniedOrNotFound.into());
+    }
+    Ok(existing)
+}
+
+/// Visibility of a subscription: the subject AND every relation target
+/// (ACC-14). A relation names a task its deliveries filter on — the add path
+/// already gates each target like the subject — so list, show and pause
+/// apply the same `task_linked_row_visible` test to the subject and to the id
+/// after the colon of every `KIND:ID` relation. A relation with no colon
+/// names no task and contributes nothing; an unparsable suffix simply fails
+/// its own visibility test. Outside enforcement every subscription stays
+/// visible, as before.
+fn subscription_visible(
+    connection: &Connection,
+    authz: &AuthzContext,
+    row: &Subscription,
+) -> Result<bool> {
+    if !task_linked_row_visible(connection, authz, row.subject_task_id.as_deref())? {
+        return Ok(false);
+    }
+    for relation in &row.relations {
+        let Some((_, target)) = relation.split_once(':') else {
+            continue;
+        };
+        if target.is_empty() {
+            continue;
+        }
+        if !task_linked_row_visible(connection, authz, Some(target))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The tags one EVENT exposes, which is more than the tags its row carries
@@ -4668,14 +4728,12 @@ impl Store {
             id,
             &self.authz,
         )?;
-        // A subscription names the task its deliveries are about: a caller
-        // who cannot read that task learns neither the row nor whether the id
-        // exists — the denied id answers exactly like a never-created one.
-        if !task_linked_row_visible(
-            &self.connection,
-            &self.authz,
-            row.subject_task_id.as_deref(),
-        )? {
+        // A subscription names the task its deliveries are about — the subject
+        // and every relation target, which the add path already gates alike:
+        // a caller who cannot read any one of them learns neither the row nor
+        // whether the id exists — the denied id answers exactly like a
+        // never-created one.
+        if !subscription_visible(&self.connection, &self.authz, &row)? {
             return Err(crate::authz::DeniedOrNotFound.into());
         }
         Ok(row)
@@ -4715,21 +4773,18 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        // A subscription names the task its deliveries are about, so under
-        // managed enforcement each row passes `task_linked_row_visible`: a
-        // caller who cannot read the subject task never learns the
-        // subscription exists. There is no SQL bound here to move, only the
-        // filter. Outside enforcement every row stays visible.
+        // A subscription names the task its deliveries are about — the subject
+        // and every relation target — so under managed enforcement each row
+        // passes `subscription_visible`: a caller who cannot read any one of
+        // those tasks never learns the subscription exists. There is no SQL
+        // bound here to move, only the filter. Outside enforcement every row
+        // stays visible.
         if !self.authz.is_enforcing() {
             return Ok(rows);
         }
         let mut visible = Vec::with_capacity(rows.len());
         for row in rows {
-            if task_linked_row_visible(
-                &self.connection,
-                &self.authz,
-                row.subject_task_id.as_deref(),
-            )? {
+            if subscription_visible(&self.connection, &self.authz, &row)? {
                 visible.push(row);
             }
         }
@@ -4759,15 +4814,12 @@ impl Store {
             id,
             &self.authz,
         )?;
-        // The row names the task its deliveries are about: pausing or resuming
-        // a subscription on a task the caller cannot read is refused with the
-        // generic denial rather than confirming the id exists — the denied id
-        // answers exactly like a never-created one, and nothing is recorded.
-        if !task_linked_row_visible(
-            &transaction,
-            &self.authz,
-            current.subject_task_id.as_deref(),
-        )? {
+        // The row names the tasks its deliveries are about — the subject and
+        // every relation target: pausing or resuming a subscription on a task
+        // the caller cannot read is refused with the generic denial rather
+        // than confirming the id exists — the denied id answers exactly like
+        // a never-created one, and nothing is recorded.
+        if !subscription_visible(&transaction, &self.authz, &current)? {
             return Err(crate::authz::DeniedOrNotFound.into());
         }
         let desired = if paused { "paused" } else { "active" };
@@ -7884,7 +7936,7 @@ impl Store {
             .connection
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?;
-        let mut item = absent_as_denied(row, "attention", id, &self.authz)?;
+        let mut item = require_attention_visible(&self.connection, &self.authz, row, id)?;
         let tags = attention_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate it on
@@ -8188,7 +8240,7 @@ impl Store {
         let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?;
-        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // rewrite on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not rewritable as board scope.
@@ -8407,7 +8459,7 @@ impl Store {
         let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?;
-        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // settlement on the task's last-known removal tags as well, so a
         // secret task's untagged rows are not settleable as board scope.
@@ -8601,7 +8653,7 @@ impl Store {
         let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?;
-        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // reopen on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not reopenable as board scope.
@@ -8686,7 +8738,7 @@ impl Store {
         let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?;
-        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
+        let existing = require_attention_visible(&transaction, &self.authz, row, id)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // answer on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not answerable as board scope.
@@ -15944,6 +15996,54 @@ mod tests {
             !store
                 .watch_relation_target_exists("parent", "s-never-existed")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn removed_task_tag_union_fails_closed_when_a_snapshot_names_no_tags_array() {
+        let store = test_store("removed-union-missing-tags");
+        let append = |id: &str, payload: &str| {
+            crate::audit::append_board_event(
+                &store.connection,
+                Some(id),
+                "task_removed",
+                "test",
+                payload,
+                1,
+            )
+            .unwrap();
+        };
+        // A removal record with no `_semanticV1.tags` array — missing, null
+        // or a non-array — is malformed and fails closed with the stale-entry
+        // tag, never as an untagged removal; only an explicitly empty array
+        // records "removed while carrying no tag".
+        append("t-missing", r#"{"_semanticV1":{}}"#);
+        append("t-null", r#"{"_semanticV1":{"tags":null}}"#);
+        append("t-scalar", r#"{"_semanticV1":{"tags":"secret"}}"#);
+        append("t-empty", r#"{"_semanticV1":{"tags":[]}}"#);
+        append("t-tagged", r#"{"_semanticV1":{"tags":["secret"]}}"#);
+        let stale = vec![crate::search::STALE_INDEX_TAG.to_owned()];
+        for id in ["t-missing", "t-null", "t-scalar"] {
+            assert_eq!(
+                removed_task_tag_union(&store.connection, id).unwrap(),
+                Some(stale.clone()),
+                "{id} names no tags array and must fail closed",
+            );
+        }
+        assert_eq!(
+            removed_task_tag_union(&store.connection, "t-empty").unwrap(),
+            Some(Vec::new()),
+            "an explicitly empty array stays an untagged removal",
+        );
+        assert_eq!(
+            removed_task_tag_union(&store.connection, "t-tagged").unwrap(),
+            Some(vec!["secret".to_owned()]),
+            "a well-formed snapshot keeps its union",
+        );
+        assert_eq!(
+            removed_task_tag_union(&store.connection, "t-never-removed").unwrap(),
+            None,
+            "no removal record stays no record",
         );
     }
 
