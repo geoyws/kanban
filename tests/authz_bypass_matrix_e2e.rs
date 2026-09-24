@@ -5093,3 +5093,232 @@ fn search_scores_and_order_are_a_function_of_permitted_documents_only() {
         "the anchors' result order moved when a denied document appeared: {before} vs {after}"
     );
 }
+
+/// ACC-14 over the CLI, every task route that names a row: a tag-denied task
+/// id and a never-created one answer with identical stderr and exit code on
+/// `task move`, `task update`, `task remove`, `claim`, `events --task` and
+/// `deploy show`, and a task-filtered listing (`attention list --task`)
+/// succeeds for both alike — the unknown filter proceeds exactly as the
+/// denied one does. `notes` and `checkpoints` have no standalone CLI read —
+/// every command reaches them only past `require_task`, which already denies
+/// both alike — so they are pinned at store level instead
+/// (`managed_notes_checkpoints_and_named_claim_deny_denied_and_unknown_tasks_identically`).
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate, running as the same identity the grants were bound for.
+/// The caller holds board read AND write on Alpha and no tag scope at all,
+/// so every denial below is the ROW's and not the guard's blanket refusal of
+/// a principal who can write nothing. The fixture holds one `secret` task
+/// (with a deployment started against it before enforcement, so the attempt
+/// is a projection of a denied subject) and one untagged control task. The
+/// unknown ids `t-never-created` and `dep-never-started` were never added or
+/// started. Outside enforcement an unknown task keeps its plain `not found`
+/// message.
+#[test]
+fn denied_and_unknown_task_ids_answer_identically_on_task_routes() {
+    let estate = ManagedEstate::new("acc14-task-routes");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    let visible = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the oracle visible task",
+            "--id",
+            "t-oracle-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let secret = estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the oracle secret task",
+            "--id",
+            "t-oracle-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attempt = estate.ok_json(
+        &work_a,
+        &[
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_bdt",
+            "--environment",
+            "branch-dev-testing",
+            "--host",
+            "geoywsMBP",
+            "--url",
+            "http://localhost:9999",
+            "--task",
+            &secret,
+            "--as",
+            "seed",
+            "--json",
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Unmanaged first: where no guard can deny, an unknown task keeps its
+    // plain message. This fix must not change that UX.
+    let plain = estate.run(
+        &work_a,
+        &["task", "move", "t-never-created", "todo", "--as", "seed"],
+    );
+    assert!(
+        !plain.status.success(),
+        "an unknown move should fail unmanaged"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+    assert!(
+        plain_stderr.contains("task t-never-created not found"),
+        "unmanaged move lost its plain message: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains(DENIED),
+        "unmanaged move answers a denial where no guard can deny: {plain_stderr}"
+    );
+    estate.bind_self(
+        "p-oracle-tasks",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. Every task mutation and named task read: the denied id and the
+    //    never-created id fail with the same code and byte-identical stderr —
+    //    the existing non-enumerating denial.
+    let assert_cli_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_cli_identical(
+        &["task", "move", &secret, "todo", "--as", "seed"],
+        &["task", "move", "t-never-created", "todo", "--as", "seed"],
+        "task move",
+    );
+    assert_cli_identical(
+        &[
+            "task",
+            "update",
+            &secret,
+            "--title",
+            "oracle rename",
+            "--as",
+            "seed",
+        ],
+        &[
+            "task",
+            "update",
+            "t-never-created",
+            "--title",
+            "oracle rename",
+            "--as",
+            "seed",
+        ],
+        "task update",
+    );
+    assert_cli_identical(
+        &["task", "remove", &secret, "--as", "seed"],
+        &["task", "remove", "t-never-created", "--as", "seed"],
+        "task remove",
+    );
+    assert_cli_identical(
+        &["claim", &secret, "--as", "seed"],
+        &["claim", "t-never-created", "--as", "seed"],
+        "claim",
+    );
+    assert_cli_identical(
+        &["events", "--task", &secret],
+        &["events", "--task", "t-never-created"],
+        "events --task",
+    );
+    assert_cli_identical(
+        &["deploy", "show", &attempt],
+        &["deploy", "show", "dep-never-started"],
+        "deploy show",
+    );
+    // 2. A task-filtered listing succeeds for both alike: the unknown filter
+    //    proceeds exactly as the denied one does, tag-filtered per row.
+    for task in [secret.as_str(), "t-never-created"] {
+        let listed = estate.run(&work_a, &["attention", "list", "--task", task, "--json"]);
+        assert!(
+            listed.status.success(),
+            "attention list --task {} should succeed: {}",
+            task,
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        assert!(
+            listed.stderr.is_empty(),
+            "attention list --task {} wrote to stderr: {}",
+            task,
+            String::from_utf8_lossy(&listed.stderr)
+        );
+    }
+    // 3. The control paths work: the visible task's history reads and its
+    //    filtered listing answers, so the denials above came from the guard
+    //    and not a broken route.
+    let history = estate.ok(&work_a, &["events", "--task", &visible]);
+    assert!(
+        history.contains(&visible),
+        "the control task's history lost its rows: {history}"
+    );
+    let control = estate.ok_json(
+        &work_a,
+        &["attention", "list", "--task", &visible, "--json"],
+    );
+    assert_eq!(
+        control.as_array().unwrap().len(),
+        0,
+        "the control listing should be empty, not failed: {control}"
+    );
+    // 4. Nothing was removed: with enforcement lifted the refused remove's
+    //    target still shows, so the denials above recorded nothing.
+    estate.enforce("direct");
+    let survived = estate.ok_json(&work_a, &["task", "show", &secret, "--json"]);
+    assert_eq!(
+        survived["id"].as_str(),
+        Some(secret.as_str()),
+        "a refused remove moved a row: {survived}"
+    );
+}
