@@ -855,11 +855,11 @@ fn attention_tags(connection: &Connection, id: &str) -> Result<Vec<String>> {
 
 /// An absent row under managed enforcement answers the same generic denial a
 /// denied row answers, so a tag-denied id and a never-created id are
-/// indistinguishable. The attach lookups below all read the row's tags first,
-/// which are empty for an absent row, so a caller holding board scope would
-/// otherwise get `not found` for the unknown id beside `denied or not found`
-/// for the denied one. Outside enforcement the guard cannot deny, so the
-/// plain `not found` message stays exactly as it was.
+/// indistinguishable (ACC-14). The by-id lookups below all read the row's
+/// tags first, which are empty for an absent row, so a caller holding board
+/// scope would otherwise get `not found` for the unknown id beside `denied
+/// or not found` for the denied one. Outside enforcement the guard cannot
+/// deny, so the plain `not found` message stays exactly as it was.
 fn absent_as_denied<T>(row: Option<T>, kind: &str, id: &str, authz: &AuthzContext) -> Result<T> {
     match row {
         Some(row) => Ok(row),
@@ -5964,10 +5964,11 @@ impl Store {
         // All-of-tag check BEFORE the row is opened: read the row's tags first,
         // then gate on them. An absent row yields no tags, so a caller without
         // board scope still receives the generic denial, never a difference
-        // between "invisible" and "absent".
+        // between "invisible" and "absent" — and under managed enforcement a
+        // caller WITH board scope does too, via `absent_as_denied` below.
         let tags = task_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
-        let mut one = require_task(&self.connection, id)?;
+        let mut one = absent_as_denied(get_task(&self.connection, id)?, "task", id, &self.authz)?;
         attach_tags(&self.connection, std::iter::once(&mut one))?;
         attach_allowed_models(&self.connection, std::iter::once(&mut one))?;
         apply_lapsed_leases(&self.connection, std::iter::once(&mut one))?;
@@ -7736,14 +7737,11 @@ impl Store {
     /// caller-supplied actor string cannot unlock answer material (ACC-13).
     pub fn show_attention(&self, id: &str) -> Result<Attention> {
         self.authz.check_read(&[])?;
-        let mut item = absent_as_denied(
-            self.connection
-                .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-                .optional()?,
-            "attention",
-            id,
-            &self.authz,
-        )?;
+        let row = self
+            .connection
+            .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
+            .optional()?;
+        let mut item = absent_as_denied(row, "attention", id, &self.authz)?;
         let tags = attention_tags(&self.connection, id)?;
         self.authz.check_read(&tags)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate it on
@@ -8044,10 +8042,10 @@ impl Store {
             .map(|tags| tags.to_vec())
             .unwrap_or_else(|| old_tags.clone());
         self.authz.check_write(&old_tags, &resulting_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // rewrite on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not rewritable as board scope.
@@ -8263,10 +8261,10 @@ impl Store {
         // does not retag, so old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // settlement on the task's last-known removal tags as well, so a
         // secret task's untagged rows are not settleable as board scope.
@@ -8457,10 +8455,10 @@ impl Store {
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
         reject_secret_shaped_text(&note, "reopen note")?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // reopen on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not reopenable as board scope.
@@ -8542,10 +8540,10 @@ impl Store {
         // Answering does not retag: old and resulting tag sets are the row's.
         let old_tags = attention_tags(&transaction, id)?;
         self.authz.check_write(&old_tags, &old_tags)?;
-        let existing = transaction
+        let row = transaction
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
-            .optional()?
-            .with_context(|| format!("attention {id} not found"))?;
+            .optional()?;
+        let existing = absent_as_denied(row, "attention", id, &self.authz)?;
         // A row orphaned by a removal keeps the id (BOARD_V36): gate the
         // answer on the task's last-known removal tags as well, so a secret
         // task's untagged rows are not answerable as board scope.
