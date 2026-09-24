@@ -2491,7 +2491,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
         &[
             "tag",
             "add",
-            "handoff",
+            "geoyws/handoff",
             "--description",
             "handoff lifecycle",
             "--as",
@@ -2508,7 +2508,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
             "--as",
             "geoyws",
             "--tag",
-            "handoff",
+            "geoyws/handoff",
             "--json",
         ],
     );
@@ -2524,7 +2524,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
                 "--id",
                 &task_id,
                 "--tag",
-                "handoff",
+                "geoyws/handoff",
                 "--json",
             ],
         );
@@ -2580,7 +2580,7 @@ fn blocked_and_terminal_task_handoffs_can_be_acknowledged_without_a_claim() {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|tag| tag == "handoff")),
+                    .any(|tag| tag == "geoyws/handoff")),
             "task-scoped rules were lost when no claim was minted"
         );
         assert_eq!(
@@ -10620,7 +10620,7 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
         &[
             "tag",
             "add",
-            "scheduler",
+            "geoyws/scheduler",
             "--description",
             "queue selection",
             "--as",
@@ -10642,7 +10642,7 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
             "--priority",
             "1",
             "--tag",
-            "scheduler",
+            "geoyws/scheduler",
             "--json",
         ],
     );
@@ -10764,7 +10764,7 @@ fn compiled_binary_refuses_two_requests_dressed_as_one() {
         .iter()
         .find(|task| task["id"] == "t-first")
         .unwrap();
-    assert_eq!(dependency["tags"], json!(["scheduler"]));
+    assert_eq!(dependency["tags"], json!(["geoyws/scheduler"]));
 }
 
 #[test]
