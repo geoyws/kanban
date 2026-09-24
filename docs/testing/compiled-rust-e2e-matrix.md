@@ -529,7 +529,7 @@ pending — and landed ACC-20/ACC-21: one answer accepted open or resolved, and 
 `attention check` verb with its teaching receipt. The legacy body migration landed as
 `scripts/migrate-acc-body-blocks.sh` with its gate-wired self-test (`scripts/release-gate.sh:104`);
 the reader/skill cutover landed outside this repo and is cited below as external evidence (board
-rows `t-94076221`, `t-80d5900f`). Only the ACC-14 tenancy-isolation test remains `PLANNED`.
+rows `t-94076221`, `t-80d5900f`). The ACC-14 tenancy-isolation test landed on 2026-09-25.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
@@ -546,7 +546,7 @@ rows `t-94076221`, `t-80d5900f`). Only the ACC-14 tenancy-isolation test remains
 | `ACC-11` | MUST | http | `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | the POST carries one key through the same Store operation the CLI resolve uses; the recorded answer then settles a later resolve with no second flag; the loser-of-two-submissions conflict half is exercised at store level by the one-answer refusal and remains browser-unexercised by design (one tab, one answer) |
 | `ACC-12` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | digits answer the check pre-unlock and the decision after it, keyboard and pointer paths both decide, focus lands on the produced explanation/choice, pass and miss read as words with colour behind them, and Undo keeps working on the decided rows |
 | `ACC-13` | MUST | process | `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `the_check_card_answers_before_the_decision_and_never_leaks_the_key`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | every pre-answer show/list and mutation receipt omits answer/explanation even for the raiser — the shared Store redaction (`rust/store.rs:1421`) that MCP and web reads inherit — and the HTTP projection sweep pins the same omission in the browser bytes; after the answer is recorded show/list carry answer, explanation and result, and a reopen redacts again; the digest half is cut over outside this repo (external evidence: board row `t-94076221`, geoyws skills-root `dec6b96` via dotfiles `136b196`) |
-| `ACC-14` | MUST | http | `PLANNED` | non-enumerating tenancy/tag isolation: no test addresses a checked row as an unauthorized actor; missing is A11 — the same-key POST plus read asserting the existing non-enumerating denial with no check metadata |
+| `ACC-14` | MUST | http | `a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_over_http` | tag-denied checked row shows no id or check metadata on any HTTP read; the check POST answers the existing non-enumerating denial byte-identically for denied and unknown ids and records nothing |
 | `ACC-15` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | the in-tree half is the `attention check` verb that `/kb-acc` answers through; the skill cutover itself is external evidence (board row `t-94076221`: geoyws skills-root `dec6b96` via dotfiles `136b196`; board row `t-80d5900f`: IFCA estate pin `pai-root 222aa6cfb` -> skills-root `f817cef` -> kb-skill `e994bf4` with a consumer test) — not verifiable from this tree |
 | `ACC-16` | MUST | process | `scripts/migrate-acc-body-blocks.test.sh` (gate-wired at `scripts/release-gate.sh:104`); `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check` | the one-shot script converts a valid leading legacy block once per board with an operator receipt, strips the block, leaves no-block/already-native/resolved rows byte-for-byte, reports invalid prose for hand migration, and migrates nothing on re-run; the schema test pins the v30 native columns advancing without inventing a check |
 | `ACC-17` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `schema_30_migrates_once_to_native_check_columns_without_inventing_a_check`; `att_list_check_report_groups_worst_first_with_adr037_caps` | a no-check row refuses `--check-answered` by name and otherwise resolves as before, and refuses `attention check` as carrying no check; a bare resolve — the older-client path — settles a checked row leaving the check pending and answerable; a pre-existing no-check row survives migration unchanged; no-check rows contribute nothing to the report |
@@ -560,7 +560,7 @@ web-card-slice evidence (ACC-05 remains partial pending its remaining half);
 ACC-13 carries the redaction evidence with the digest half cited as external cutover;
 ACC-15/ACC-16/ACC-17 carry the cutover, migration and compatibility evidence;
 ACC-18/ACC-19 carry the miss-rate report evidence; ACC-20/ACC-21 carry the deferred-answer and
-CLI check-verb evidence; only ACC-14 remains `PLANNED`.
+CLI check-verb evidence; ACC-14 carries the tenancy-isolation evidence.
 
 ## Requirements trace — docs/specs/complaint.md COMPLAINT-01..COMPLAINT-07
 

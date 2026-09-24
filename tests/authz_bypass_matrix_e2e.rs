@@ -4422,3 +4422,100 @@ fn a_tag_denied_checked_row_shows_no_check_metadata_and_answers_no_check_post_ov
         "the authorized check POST recorded nothing: {answered}"
     );
 }
+
+/// ACC-14 over HTTP, stale-index half: an event document whose task was
+/// removed stays dropped, even when the event predates the tag that would
+/// have hidden it.
+///
+/// INTEGRATION, at the layer `http`: the real binary, a real managed estate,
+/// the CLI and the serving process running as the same identity. The caller
+/// holds only board read on Alpha — no tag scope at all — and full ownership
+/// of Beta so the whole-estate search answers.
+///
+/// The fixture creates a task untagged, edits its body so a `task_updated`
+/// event carries the draft in `previousBody` while its snapshot still reads
+/// `tags: []`, tags the task `secret`, then removes it. The `events` rows
+/// survive the delete and the removal trigger re-inserts their index
+/// documents, so without the stale-task check the pre-tag event authorizes
+/// against an empty tag set and any board reader recovers the draft through
+/// search. The draft token appears nowhere else in either board, so an empty
+/// answer proves the event document was dropped rather than merely ranked
+/// below something.
+#[test]
+fn a_removed_tasks_pre_tag_event_is_in_no_search_over_http() {
+    let estate = ManagedEstate::new("acc14-removed-task-search");
+    let work_a = estate.work_a.clone();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "removed task",
+            "--id",
+            "t-removed",
+            "--body",
+            "draft harborquorum notes",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-removed",
+            "--body",
+            "final wording",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "update",
+            "t-removed",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.ok(&work_a, &["task", "remove", "t-removed", "--as", "seed"]);
+
+    estate.bind_self("p-removed-reader", &[board_scope("read", &estate.id_a)]);
+    estate.grant("p-removed-reader", &owner_of(&estate.id_b));
+    estate.enforce("managed");
+    let server = WebServer::start(&estate, &work_a, None);
+
+    // The served search names no hit at all: the only document holding the
+    // token is the pre-tag `task_updated` event of a task that no longer
+    // exists.
+    let search = server.get_json("/api/v1/search?q=harborquorum");
+    assert_eq!(
+        search["boards"],
+        serde_json::json!(["Alpha", "Beta"]),
+        "the search did not read exactly the caller's estate: {search}"
+    );
+    assert!(
+        search["items"].as_array().unwrap().is_empty(),
+        "the search handed over a removed task's pre-tag event: {search}"
+    );
+    // The CLI reads the same store path under the same identity.
+    for args in [
+        vec!["search", "harborquorum", "--json"],
+        vec!["search", "harborquorum", "--all-boards", "--json"],
+    ] {
+        let receipt = estate.ok_json(&work_a, &args);
+        assert!(
+            receipt["results"].as_array().unwrap().is_empty(),
+            "`kanban {args:?}` handed over a removed task's pre-tag event: {receipt}"
+        );
+    }
+}

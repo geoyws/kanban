@@ -439,6 +439,18 @@ fn document_row_tags(connection: &Connection, document: &Document) -> Result<Vec
         );
     }
     if document.source_kind == "attention" {
+        // Defence in depth: the delete trigger removes the document with the
+        // row, so no route reaches this today, but a stale index entry (a
+        // partial restore, a rebuilt migration) must not authorize against
+        // the empty tag set of a row that no longer exists.
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM attention WHERE id=?",
+            [document.source_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(vec![STALE_INDEX_TAG.to_owned()]);
+        }
         let mut statement = connection
             .prepare("SELECT tag FROM attention_tags WHERE attention_id=? ORDER BY tag")?;
         tags.extend(

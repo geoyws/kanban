@@ -781,6 +781,21 @@ pub(crate) fn event_authorization_tags(
     let Some((task_id, payload)) = row else {
         return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
     };
+    // The index outlives the row: the removal trigger re-inserts every event
+    // document tied to the deleted task, whose live tags are gone with it.
+    // An event written before the task was tagged then authorizes against
+    // nothing but its own snapshot, so the document is stale and stays
+    // dropped — the same existence rule the task branch of `document_row_tags`
+    // applies.
+    if let Some(task_id) = task_id.as_deref() {
+        let exists: i64 =
+            connection.query_row("SELECT COUNT(*) FROM tasks WHERE id=?", [task_id], |row| {
+                row.get(0)
+            })?;
+        if exists == 0 {
+            return Ok(vec![crate::search::STALE_INDEX_TAG.to_owned()]);
+        }
+    }
     // Fail closed: a payload the store cannot parse is an error, not an
     // untagged event.
     let payload: Value = serde_json::from_str(&payload)
