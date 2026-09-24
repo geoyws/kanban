@@ -847,10 +847,11 @@ fn require_active_task_authorized(
 
 /// A task filter on a listing (ACC-14): under managed enforcement an unknown
 /// task filters exactly like a denied one — the listing proceeds and each
-/// row is tag-filtered — so the two are indistinguishable. A denied task
-/// already proceeds today (the existence check below never consulted tags),
-/// so only the unknown id changes, and only under enforcement: outside it
-/// the plain `not found` stays.
+/// row passes `task_linked_row_visible`, which withholds every row linked to
+/// a task the caller cannot read — so the two are indistinguishable. A denied
+/// task already proceeds today (the existence check below never consulted
+/// tags), so only the unknown id changes, and only under enforcement:
+/// outside it the plain `not found` stays.
 fn require_task_filter(connection: &Connection, id: &str, authz: &AuthzContext) -> Result<()> {
     if get_task(connection, id)?.is_some() {
         return Ok(());
@@ -859,6 +860,45 @@ fn require_task_filter(connection: &Connection, id: &str, authz: &AuthzContext) 
         return Ok(());
     }
     Err(anyhow::anyhow!("task {id} not found"))
+}
+
+/// Visibility of a row LINKED to a task — a sitrep, a handoff, a subscription
+/// or an attention row naming a task (ACC-14).
+///
+/// Under managed enforcement the row is visible only when the caller can read
+/// the task it points at: a live task authorizes against `task_tags`, a
+/// removed task against the union of its `task_removed` snapshots, and a
+/// removed task with no removal record fails closed — there is no tag set
+/// left to satisfy, so the row stays hidden. A row naming no task keeps board
+/// scope, which the caller already checked. Outside enforcement nothing can
+/// be denied and every row stays visible, so the direct estate keeps its rows.
+///
+/// This is the per-row half of `require_task_filter`'s contract: the `--task`
+/// filter lets an unknown id proceed exactly like a denied one BECAUSE every
+/// row the listing could hand back passes through this test. Attention rows
+/// additionally keep their own-tag check at the call site, matching
+/// `document_row_tags` in search.rs, so listings and search agree.
+fn task_linked_row_visible(
+    connection: &Connection,
+    authz: &AuthzContext,
+    task_id: Option<&str>,
+    cache: &mut SearchTagCache,
+) -> Result<bool> {
+    if !authz.is_enforcing() {
+        return Ok(true);
+    }
+    let Some(task_id) = task_id else {
+        return Ok(true);
+    };
+    if cache.task_exists(connection, task_id)? {
+        return Ok(authz.permits_read(&cache.task_tags(connection, task_id)?));
+    }
+    match cache.removed_task_final_tags(connection, task_id)? {
+        Some(tags) => Ok(authz.permits_read(&tags)),
+        // No removal record names the task: fail closed — a task with no live
+        // row and no last-known tags authorizes against nothing.
+        None => Ok(false),
+    }
 }
 
 /// Authorize linking a new row to a task — a note, an attention row, a
@@ -4052,14 +4092,31 @@ impl Store {
 
     pub fn require_subscription(&self, id: &str) -> Result<Subscription> {
         self.authz.check_read(&[])?;
-        self.connection
-            .query_row(
-                "SELECT * FROM subscriptions WHERE id=?",
-                [id],
-                subscription_row,
-            )
-            .optional()?
-            .with_context(|| format!("subscription {id} not found"))
+        let row = absent_as_denied(
+            self.connection
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [id],
+                    subscription_row,
+                )
+                .optional()?,
+            "subscription",
+            id,
+            &self.authz,
+        )?;
+        // A subscription names the task its deliveries are about: a caller
+        // who cannot read that task learns neither the row nor whether the id
+        // exists — the denied id answers exactly like a never-created one.
+        let mut cache = SearchTagCache::default();
+        if !task_linked_row_visible(
+            &self.connection,
+            &self.authz,
+            row.subject_task_id.as_deref(),
+            &mut cache,
+        )? {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
+        Ok(row)
     }
 
     pub fn subscriptions(
@@ -4089,13 +4146,34 @@ impl Store {
         }
         sql.push_str(" ORDER BY created_at,id");
         let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params_from_iter(values.iter().map(|value| value.as_ref())),
-            subscription_row,
-        );
-        rows?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let rows = statement
+            .query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                subscription_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // A subscription names the task its deliveries are about, so under
+        // managed enforcement each row passes `task_linked_row_visible`: a
+        // caller who cannot read the subject task never learns the
+        // subscription exists. There is no SQL bound here to move, only the
+        // filter. Outside enforcement every row stays visible.
+        if !self.authz.is_enforcing() {
+            return Ok(rows);
+        }
+        let mut cache = SearchTagCache::default();
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if task_linked_row_visible(
+                &self.connection,
+                &self.authz,
+                row.subject_task_id.as_deref(),
+                &mut cache,
+            )? {
+                visible.push(row);
+            }
+        }
+        Ok(visible)
     }
 
     /// Every subscription's derived position on this board — including which
@@ -4202,14 +4280,31 @@ impl Store {
         // Under the mutation lock: a concurrent write cannot slip between this
         // check and the UPDATE below.
         self.authz.check_write(&[], &[])?;
-        let current = transaction
-            .query_row(
-                "SELECT * FROM subscriptions WHERE id=?",
-                [id],
-                subscription_row,
-            )
-            .optional()?
-            .with_context(|| format!("subscription {id} not found"))?;
+        let current = absent_as_denied(
+            transaction
+                .query_row(
+                    "SELECT * FROM subscriptions WHERE id=?",
+                    [id],
+                    subscription_row,
+                )
+                .optional()?,
+            "subscription",
+            id,
+            &self.authz,
+        )?;
+        // The row names the task its deliveries are about: pausing or resuming
+        // a subscription on a task the caller cannot read is refused with the
+        // generic denial rather than confirming the id exists — the denied id
+        // answers exactly like a never-created one, and nothing is recorded.
+        let mut cache = SearchTagCache::default();
+        if !task_linked_row_visible(
+            &transaction,
+            &self.authz,
+            current.subject_task_id.as_deref(),
+            &mut cache,
+        )? {
+            return Err(crate::authz::DeniedOrNotFound.into());
+        }
         let desired = if paused { "paused" } else { "active" };
         if current.status == desired {
             transaction.commit()?;
@@ -6721,12 +6816,14 @@ impl Store {
     /// true now", and the newest update is the answer. Archived rows are
     /// excluded by default and readable on request — hidden, never gone.
     ///
-    /// Board scope is the whole check: a sitrep carries no tags, so there is
-    /// no per-row filter to apply and `&[]` is the entire subject. The guard
-    /// lives here rather than at each caller because `serve::lane_groups`
-    /// reaches this method with a store it opened for a board the caller may
-    /// never have been granted (`t-c84850a1`); with the check at the source
-    /// both the CLI and `/api/v1/lanes` are refused by construction.
+    /// Board scope is the first check; the per-row check follows in the body:
+    /// a sitrep names its task, so under managed enforcement each row passes
+    /// `task_linked_row_visible` and a caller who cannot read the task never
+    /// sees the row — its body, branch or worktree. The guard lives here
+    /// rather than at each caller because `serve::lane_groups` reaches this
+    /// method with a store it opened for a board the caller may never have
+    /// been granted (`t-c84850a1`); with the check at the source both the CLI
+    /// and `/api/v1/lanes` are refused by construction.
     pub fn sitreps(
         &self,
         lane: Option<&str>,
@@ -6756,16 +6853,44 @@ impl Store {
         } else {
             format!(" WHERE {}", clauses.join(" AND "))
         };
-        values.push(Box::new(limit));
+        // Under managed enforcement the bound is applied to the rows this
+        // caller may READ, not to the raw rows: a `LIMIT` bound in SQL runs
+        // before the tag test, so a denied row would consume a slot and the
+        // page would come back short with nothing to say it had. Outside
+        // managed enforcement nothing can be denied, so the direct estate
+        // keeps the SQL bound and reads exactly what it asked for.
+        let enforcing = self.authz.is_enforcing();
+        if !enforcing {
+            values.push(Box::new(limit));
+        }
         let sql = format!(
-            "SELECT * FROM sitreps{where_clause} ORDER BY created_at DESC, id DESC LIMIT ?"
+            "SELECT * FROM sitreps{where_clause} ORDER BY created_at DESC, id DESC{}",
+            if enforcing { "" } else { " LIMIT ?" }
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let rows = statement
             .query_map(params_from_iter(refs), sitrep_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if !enforcing {
+            return Ok(rows);
+        }
+        let mut cache = SearchTagCache::default();
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if task_linked_row_visible(
+                &self.connection,
+                &self.authz,
+                row.task_id.as_deref(),
+                &mut cache,
+            )? {
+                visible.push(row);
+            }
+        }
+        // A negative bound is SQLite's "no bound", and stays one here.
+        visible.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(visible)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6914,7 +7039,24 @@ impl Store {
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
         if enforcing {
-            rows.retain(|row| self.authz.permits_read(&row.tags));
+            // Both halves of `document_row_tags`: the row's own tags AND the
+            // tags of the task it was raised against, so listings and search
+            // agree on an untagged row hung on a denied task.
+            let mut cache = SearchTagCache::default();
+            let mut visible = Vec::with_capacity(rows.len());
+            for row in rows {
+                if self.authz.permits_read(&row.tags)
+                    && task_linked_row_visible(
+                        &self.connection,
+                        &self.authz,
+                        row.task_id.as_deref(),
+                        &mut cache,
+                    )?
+                {
+                    visible.push(row);
+                }
+            }
+            rows = visible;
             // A negative bound is SQLite's "no bound", and stays one here.
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         }
@@ -6976,8 +7118,23 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
-        rows.retain(|row| self.authz.permits_read(&row.tags));
-        Ok(i64::try_from(rows.len()).unwrap_or(i64::MAX))
+        // Both halves of `document_row_tags`: the row's own tags AND the tags
+        // of the task it was raised against.
+        let mut cache = SearchTagCache::default();
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if self.authz.permits_read(&row.tags)
+                && task_linked_row_visible(
+                    &self.connection,
+                    &self.authz,
+                    row.task_id.as_deref(),
+                    &mut cache,
+                )?
+            {
+                visible.push(row);
+            }
+        }
+        Ok(i64::try_from(visible.len()).unwrap_or(i64::MAX))
     }
 
     /// The newest resolved attention rows, decided-first — the web's Recent
@@ -7011,7 +7168,24 @@ impl Store {
         drop(statement);
         attach_attention_tags(&self.connection, &mut rows)?;
         if enforcing {
-            rows.retain(|row| self.authz.permits_read(&row.tags));
+            // Both halves of `document_row_tags`: the row's own tags AND the
+            // tags of the task the row was raised against, so the decisions
+            // room and search agree on a resolved row hung on a denied task.
+            let mut cache = SearchTagCache::default();
+            let mut visible = Vec::with_capacity(rows.len());
+            for row in rows {
+                if self.authz.permits_read(&row.tags)
+                    && task_linked_row_visible(
+                        &self.connection,
+                        &self.authz,
+                        row.task_id.as_deref(),
+                        &mut cache,
+                    )?
+                {
+                    visible.push(row);
+                }
+            }
+            rows = visible;
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         }
         for row in &mut rows {
@@ -7735,33 +7909,93 @@ impl Store {
             require_task_filter(&self.connection, id, &self.authz)?;
         }
         let (where_clause, mut values) = handoff_filter(task, status, to_agent, include_archived);
-        values.push(Box::new(limit));
+        // Under managed enforcement the bound is applied to the rows this
+        // caller may READ, not to the raw rows: a handoff names its task, so
+        // each row passes `task_linked_row_visible` and a `LIMIT` bound in SQL
+        // would let a denied row consume a slot. Outside managed enforcement
+        // nothing can be denied, so the direct estate keeps the SQL bound.
+        let enforcing = self.authz.is_enforcing();
+        if !enforcing {
+            values.push(Box::new(limit));
+        }
         let sql = format!(
-            "SELECT * FROM handoffs{where_clause} ORDER BY status!='pending',priority ASC,created_at ASC,id ASC LIMIT ?"
+            "SELECT * FROM handoffs{where_clause} ORDER BY status!='pending',priority ASC,created_at ASC,id ASC{}",
+            if enforcing { "" } else { " LIMIT ?" }
         );
         let refs = values.iter().map(|value| value.as_ref());
         let mut statement = self.connection.prepare(&sql)?;
-        statement
+        let rows = statement
             .query_map(params_from_iter(refs), handoff_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if !enforcing {
+            return Ok(rows);
+        }
+        let mut cache = SearchTagCache::default();
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            if task_linked_row_visible(
+                &self.connection,
+                &self.authz,
+                row.task_id.as_deref(),
+                &mut cache,
+            )? {
+                visible.push(row);
+            }
+        }
+        // A negative bound is SQLite's "no bound", and stays one here.
+        visible.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(visible)
     }
 
     /// How many handoffs nobody has accepted or cancelled: the dashboard's
     /// number, counted rather than fetched, so a board past the listing's
     /// page still reports what it holds. Same filter as
     /// `handoffs(None, Some("pending"), None, …)`.
+    ///
+    /// A `COUNT(*)` cannot see tags, and a count taken over rows this caller
+    /// may not see reports their existence as surely as printing their
+    /// summaries would. So when enforcement can deny, the number is taken over
+    /// the same rows the listing would hand back — fetched and filtered on
+    /// `task_linked_row_visible`. Outside managed enforcement the direct
+    /// estate keeps the SQL count.
     pub fn count_pending_handoffs(&self) -> Result<i64> {
         self.authz.check_read(&[])?;
         let (where_clause, values) = handoff_filter(None, Some("pending"), None, false);
+        if !self.authz.is_enforcing() {
+            let refs = values.iter().map(|value| value.as_ref());
+            return self
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM handoffs{where_clause}"),
+                    params_from_iter(refs),
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
         let refs = values.iter().map(|value| value.as_ref());
-        self.connection
-            .query_row(
-                &format!("SELECT COUNT(*) FROM handoffs{where_clause}"),
-                params_from_iter(refs),
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        let mut statement = self
+            .connection
+            .prepare(&format!("SELECT task_id FROM handoffs{where_clause}"))?;
+        let task_ids = statement
+            .query_map(params_from_iter(refs), |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut cache = SearchTagCache::default();
+        let mut count = 0i64;
+        for task_id in &task_ids {
+            if task_linked_row_visible(
+                &self.connection,
+                &self.authz,
+                task_id.as_deref(),
+                &mut cache,
+            )? {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn create_handoff(&mut self, input: HandoffInput) -> Result<Handoff> {
@@ -7921,10 +8155,17 @@ impl Store {
             let tags = task_tags(&transaction, &task_id)?;
             self.authz.check_write(&tags, &tags)?;
         }
-        let handoff = transaction
-            .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
-            .optional()?
-            .with_context(|| format!("handoff {id} not found"))?;
+        // An unknown id answers the generic denial under enforcement rather
+        // than `not found`, so a handoff on a denied task and a never-created
+        // id are indistinguishable.
+        let handoff = absent_as_denied(
+            transaction
+                .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
+                .optional()?,
+            "handoff",
+            id,
+            &self.authz,
+        )?;
         if handoff.status == "retired" {
             bail!(
                 "handoff {id} was retired by {} at {} (epoch ms); a retired handoff is closed history, not work to accept",
@@ -8086,12 +8327,29 @@ impl Store {
         let actor = nonempty(actor, "actor")?.to_owned();
         let note = nonempty(note, "retire note")?.to_owned();
         let transaction = self.begin_write()?;
-        // Board scope, under the lock.
+        // Board scope, under the lock — then the handoff's task, the way
+        // `accept_handoff` authorizes it: a pending handoff on a task the
+        // caller cannot write is refused with the generic denial rather than
+        // handing over the full row. A session handoff names no task, so
+        // board scope is the whole check there.
         self.authz.check_write(&[], &[])?;
-        let existing = transaction
-            .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
-            .optional()?
-            .with_context(|| format!("handoff {id} not found"))?;
+        let subject: Option<Option<String>> = transaction
+            .query_row("SELECT task_id FROM handoffs WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(Some(task_id)) = subject {
+            let tags = task_tags(&transaction, &task_id)?;
+            self.authz.check_write(&tags, &tags)?;
+        }
+        let existing = absent_as_denied(
+            transaction
+                .query_row("SELECT * FROM handoffs WHERE id=?", [id], handoff_row)
+                .optional()?,
+            "handoff",
+            id,
+            &self.authz,
+        )?;
         if existing.status == "retired" {
             bail!(
                 "handoff {id} is already retired by {}",

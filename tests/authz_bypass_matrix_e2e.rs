@@ -5489,6 +5489,447 @@ fn denied_and_unknown_task_ids_answer_identically_on_task_routes() {
         "a refused remove moved a row: {survived}"
     );
 }
+
+/// ACC-14, task-linked rows: a sitrep, a handoff, an untagged attention row or
+/// a subscription naming a `secret` task is visible only to a caller who can
+/// read that task — on every listing, on `/api/v1/lanes`, and on
+/// `handoff retire` — while a denied task id and a never-created id answer
+/// byte-identically everywhere.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. The owner seeds rows on a `secret` task and on a visible
+/// task; principal P holds board read and write but no `secret` scope, so the
+/// visible rows are the positive control: P sees those, never the secret
+/// ones, and the owner still sees all of them.
+#[test]
+fn task_linked_rows_withhold_a_tag_denied_task_on_every_listing() {
+    let estate = ManagedEstate::new("acc14-task-linked-rows");
+    let work_a = estate.work_a.clone();
+    let repo = work_a.to_string_lossy().into_owned();
+    estate.ok_json(&work_a, &["tag", "add", "secret", "--as", "seed", "--json"]);
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the linked secret task",
+            "--id",
+            "t-linked-secret",
+            "--tag",
+            "secret",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    // The control task carries no tag, so principal P — board read and write,
+    // no `secret` scope — reads it and its rows: P's listings are non-empty
+    // by construction, and an answer that hid everything could not pass.
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the linked visible task",
+            "--id",
+            "t-linked-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    // The owner seeds one row of each kind on each task, all carrying a
+    // marker no other row carries, so "no trace" is a string search.
+    for task in ["t-linked-secret", "t-linked-visible"] {
+        let marker = task.strip_prefix("t-linked-").unwrap().to_owned();
+        let sitrep_args = vec![
+            "sitrep".to_owned(),
+            "post".to_owned(),
+            format!("linked {marker} sitrep body"),
+            "--as".to_owned(),
+            "seed".to_owned(),
+            "--lane".to_owned(),
+            "driver-1".to_owned(),
+            "--repo".to_owned(),
+            repo.clone(),
+            "--branch".to_owned(),
+            "main".to_owned(),
+            "--head".to_owned(),
+            SEED_HEAD.to_owned(),
+            "--dirty".to_owned(),
+            "clean".to_owned(),
+            "--task".to_owned(),
+            task.to_owned(),
+            "--json".to_owned(),
+        ];
+        let sitrep_refs: Vec<&str> = sitrep_args.iter().map(String::as_str).collect();
+        estate.ok_json(&work_a, &sitrep_refs);
+        let token =
+            estate.ok_json(&work_a, &["claim", task, "--as", "seed", "--json"])["leaseToken"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        estate.ok_json(
+            &work_a,
+            &[
+                "handoff",
+                "create",
+                task,
+                "--lease",
+                &token,
+                "--as",
+                "seed",
+                "--summary",
+                &format!("linked {marker} handoff summary"),
+                "--intent",
+                &format!("linked {marker} handoff intent"),
+                "--next-action",
+                &format!("linked {marker} handoff next"),
+                "--repo",
+                &repo,
+                "--branch",
+                "main",
+                "--head",
+                SEED_HEAD,
+                "--dirty",
+                "clean",
+                "--json",
+            ],
+        );
+        estate.ok_json(
+            &work_a,
+            &[
+                "attention",
+                "raise",
+                &format!("linked {marker} attention question"),
+                "--kind",
+                "decision",
+                "--as",
+                "seed",
+                "--task",
+                task,
+                "--json",
+            ],
+        );
+        estate.ok_json(
+            &work_a,
+            &[
+                "subscription",
+                "add",
+                "--consumer",
+                &format!("linked-{marker}-consumer"),
+                "--action",
+                "linked-action",
+                "--timeout-ms",
+                "100",
+                "--max-retries",
+                "1",
+                "--rate-per-minute",
+                "60",
+                "--max-concurrency",
+                "1",
+                "--as",
+                "seed",
+                "--subject",
+                &format!("task:{task}"),
+                "--json",
+            ],
+        );
+    }
+    let secret_handoff = estate
+        .ok_json(
+            &work_a,
+            &["handoff", "list", "--task", "t-linked-secret", "--json"],
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["status"] == "pending")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seeded_subs = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    let sub_id = |consumer: &str| {
+        seeded_subs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["consumerID"] == consumer)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let secret_sub = sub_id("linked-secret-consumer");
+    let visible_sub = sub_id("linked-visible-consumer");
+    assert_ne!(secret_sub, visible_sub, "the two seeds collided on one row");
+    estate.bind_self(
+        "p-linked-rows",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+        ],
+    );
+    estate.enforce("managed");
+    // 1. The `--task` listings succeed for both ids alike and hand over
+    //    nothing: the denied filter withholds exactly what the unknown filter
+    //    cannot match.
+    for (base, what) in [
+        (&["sitrep", "list", "--task"][..], "sitrep list --task"),
+        (&["handoff", "list", "--task"][..], "handoff list --task"),
+        (
+            &["attention", "list", "--task"][..],
+            "attention list --task",
+        ),
+    ] {
+        let mut denied_args = base.to_vec();
+        denied_args.extend_from_slice(&["t-linked-secret", "--json"]);
+        let mut unknown_args = base.to_vec();
+        unknown_args.extend_from_slice(&["t-never-created", "--json"]);
+        let denied = estate.run(&work_a, &denied_args);
+        let unknown = estate.run(&work_a, &unknown_args);
+        assert!(
+            denied.status.success(),
+            "{what} with a denied id should succeed: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        assert!(
+            unknown.status.success(),
+            "{what} with an unknown id should succeed: {}",
+            String::from_utf8_lossy(&unknown.stderr)
+        );
+        assert_eq!(
+            denied.stdout, unknown.stdout,
+            "{what} output differs between a denied id and an unknown id"
+        );
+        assert!(
+            denied.stderr.is_empty() && unknown.stderr.is_empty(),
+            "{what} wrote to stderr: {} / {}",
+            String::from_utf8_lossy(&denied.stderr),
+            String::from_utf8_lossy(&unknown.stderr)
+        );
+        let rows: Value = serde_json::from_slice(&denied.stdout).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            0,
+            "{what} with the denied id handed over a row the caller may not read: {rows}"
+        );
+    }
+    // 2. The unfiltered listings carry the visible rows and no trace of the
+    //    secret ones — neither their markers nor their task id.
+    for (args, visible_marker, what) in [
+        (
+            &["sitrep", "list", "--json"][..],
+            "linked visible sitrep body",
+            "sitrep list",
+        ),
+        (
+            &["handoff", "list", "--json"][..],
+            "linked visible handoff summary",
+            "handoff list",
+        ),
+        (
+            &["attention", "list", "--json"][..],
+            "linked visible attention question",
+            "attention list",
+        ),
+        (
+            &["subscription", "list", "--all", "--json"][..],
+            "linked-visible-consumer",
+            "subscription list",
+        ),
+    ] {
+        let listed = estate.run(&work_a, args);
+        assert!(
+            listed.status.success(),
+            "{what} should succeed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let body = String::from_utf8_lossy(&listed.stdout).into_owned();
+        assert!(
+            body.contains(visible_marker),
+            "{what} withheld the visible row, so an empty answer proves nothing: {body}"
+        );
+        assert!(
+            !body.contains("t-linked-secret"),
+            "{what} served a row on the denied task: {body}"
+        );
+    }
+    let unfiltered = estate.ok(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        !unfiltered.contains("linked secret"),
+        "subscription list served the secret subject: {unfiltered}"
+    );
+    // 3. `handoff retire` answers the denied handoff exactly like an unknown
+    //    one — the same exit code and byte-identical stderr — and records
+    //    nothing.
+    let denied_retire = estate.run(
+        &work_a,
+        &[
+            "handoff",
+            "retire",
+            &secret_handoff,
+            "--as",
+            "seed",
+            "--note",
+            "linked probe",
+        ],
+    );
+    let unknown_retire = estate.run(
+        &work_a,
+        &[
+            "handoff",
+            "retire",
+            "h-never-created",
+            "--as",
+            "seed",
+            "--note",
+            "linked probe",
+        ],
+    );
+    assert!(
+        !denied_retire.status.success(),
+        "retiring a handoff on the denied task succeeded but must be refused"
+    );
+    assert_eq!(
+        denied_retire.status.code(),
+        unknown_retire.status.code(),
+        "handoff retire exit codes differ between a denied handoff and an unknown one"
+    );
+    assert_eq!(
+        denied_retire.stderr, unknown_retire.stderr,
+        "handoff retire stderr differs between a denied handoff and an unknown one"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_retire.stderr).contains(DENIED),
+        "handoff retire did not answer the non-enumerating denial: {}",
+        String::from_utf8_lossy(&denied_retire.stderr)
+    );
+    // 4. The by-id surfaces on a linked row answer the denied id exactly like
+    //    a never-created one — the same exit code and byte-identical stderr
+    //    carrying the generic denial — and record nothing.
+    let assert_by_id_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_by_id_identical(
+        &["subscription", "show", &secret_sub, "--json"],
+        &["subscription", "show", "sub-never-created", "--json"],
+        "subscription show",
+    );
+    assert_by_id_identical(
+        &["subscription", "pause", &secret_sub, "--as", "seed"],
+        &["subscription", "pause", "sub-never-created", "--as", "seed"],
+        "subscription pause",
+    );
+    assert_by_id_identical(
+        &["subscription", "resume", &secret_sub, "--as", "seed"],
+        &[
+            "subscription",
+            "resume",
+            "sub-never-created",
+            "--as",
+            "seed",
+        ],
+        "subscription resume",
+    );
+    assert_by_id_identical(
+        &["handoff", "accept", &secret_handoff, "--as", "seed"],
+        &["handoff", "accept", "h-never-created", "--as", "seed"],
+        "handoff accept",
+    );
+    // The visible subscription stays readable and pausable, so the refusals
+    // above came from the task gate and not a broken route.
+    let visible_shown = estate.ok_json(&work_a, &["subscription", "show", &visible_sub, "--json"]);
+    assert_eq!(
+        visible_shown["consumerID"].as_str(),
+        Some("linked-visible-consumer"),
+        "the visible subscription lost its row: {visible_shown}"
+    );
+    // 5. `/api/v1/lanes` serves the visible sitrep and no trace of the secret
+    //    one.
+    let server = WebServer::start(&estate, &work_a, None);
+    let lanes = server.get_json("/api/v1/lanes");
+    let served = lanes.to_string();
+    assert!(
+        served.contains("linked visible sitrep body"),
+        "/api/v1/lanes withheld the visible sitrep: {lanes}"
+    );
+    assert!(
+        !served.contains("linked secret sitrep body") && !served.contains("t-linked-secret"),
+        "/api/v1/lanes served the denied task's sitrep: {lanes}"
+    );
+    drop(server);
+    // 6. The owner still sees every row, so the denials above came from the
+    //    guard and not from missing rows — and the refused writes recorded
+    //    nothing.
+    estate.enforce("direct");
+    for (args, secret_marker, what) in [
+        (
+            &["sitrep", "list", "--task", "t-linked-secret", "--json"][..],
+            "linked secret sitrep body",
+            "sitrep list --task",
+        ),
+        (
+            &["handoff", "list", "--task", "t-linked-secret", "--json"][..],
+            "linked secret handoff summary",
+            "handoff list --task",
+        ),
+        (
+            &["attention", "list", "--task", "t-linked-secret", "--json"][..],
+            "linked secret attention question",
+            "attention list --task",
+        ),
+    ] {
+        let owned = estate.ok(&work_a, args);
+        assert!(
+            owned.contains(secret_marker),
+            "the owner lost {what} on the secret task: {owned}"
+        );
+    }
+    let owned_subs = estate.ok(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        owned_subs.contains("t-linked-secret"),
+        "the owner lost the secret subscription: {owned_subs}"
+    );
+    let handoffs = estate.ok_json(
+        &work_a,
+        &["handoff", "list", "--task", "t-linked-secret", "--json"],
+    );
+    assert!(
+        handoffs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == secret_handoff && row["status"] == "pending"),
+        "the refused retire moved a row: {handoffs}"
+    );
+    let secret_shown = estate.ok_json(&work_a, &["subscription", "show", &secret_sub, "--json"]);
+    assert_eq!(
+        secret_shown["status"].as_str(),
+        Some("active"),
+        "a refused pause or resume moved the secret subscription: {secret_shown}"
+    );
+}
 // ---------------------------------------------------------------------------
 // Task-attach writes: no board-write-only path may touch an unreadable task.
 // ---------------------------------------------------------------------------
