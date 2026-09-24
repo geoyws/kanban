@@ -4813,6 +4813,9 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
     }
 
+    // The cast is load-bearing on macOS, where `st_dev` is `i32`; Linux
+    // clippy reads it as unnecessary because there it is already `u64`.
+    #[allow(clippy::unnecessary_cast)]
     fn fd_identity(fd: i32) -> (u64, u64) {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         unsafe {
