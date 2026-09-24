@@ -242,6 +242,22 @@ launched on `hax` for both targets, the local and embedded-remote install
 guards are still byte-identical twins, the served-exe proof and its recovery
 are unchanged, and retention, rollback and the release identity are unchanged.
 
+Addendum 2026-09-24 (measured deploying 0e8cfea, task t-75b98b99): a hig
+install is driven from a hax shell and needs `--hax-install-root`. Running
+`install hig` from a hig shell dies in `install_package`'s `require_host hax`
+before dispatching (`target hax requires host hax, but this shell is hig`),
+and running it from hax without `--hax-install-root` dies in `install_remote`
+(`--hax-install-root is required for hig installs`). The working invocation,
+from hax, passes both roots — `--hax-install-root` pointing at the hax
+install root that holds the release's canonical activation receipt, which
+`install_remote` validates before its first ssh or staging action:
+`hig-release.sh install hig --package DIR --install-root
+/root/.local/share/kanban-releases --hax-install-root
+/root/.local/share/kanban-releases`. `install_remote` copies the package to
+hig itself over ssh, so no relay is needed and hig never needs to reach hax
+(a hig-shell scp from hax fails with `Connection closed`). The same two
+sentences now live in the script's `usage()` block.
+
 ## References
 
 - `scripts/hig-release.sh`

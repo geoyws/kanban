@@ -67,6 +67,17 @@ usage:
   hig-release.sh package hax [--output DIR] [--builder-image REF@sha256:HEX]
   hig-release.sh install <hax|hig> --package DIR --install-root DIR [--hax-install-root DIR]
   hig-release.sh rollback <hax|hig> --install-root DIR [--steps N]
+
+  install runs on hax for both targets: install_package refuses any other
+  host before dispatching, so a hig-shell 'install hig' dies with
+  'target hax requires host hax'. A hig install runs install_remote over
+  ssh from hax and copies the package itself (tar over the same ssh), so
+  no relay is needed and hig never needs to reach hax. It requires
+  --hax-install-root pointing at the hax install root that holds the
+  release's canonical activation receipt. Working invocation, from hax:
+    hig-release.sh install hig --package DIR \
+      --install-root /root/.local/share/kanban-releases \
+      --hax-install-root /root/.local/share/kanban-releases
 EOF
   exit 64
 }
