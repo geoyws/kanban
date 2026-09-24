@@ -3702,6 +3702,61 @@ mod tests {
         }
     }
 
+    /// WEB-60 — a namespaced tag reads as a chip with the estate dimmed.
+    ///
+    /// The proof reads the bundle's own bytes, because that is what the
+    /// browser receives: the stylesheet declares the three chip rules with
+    /// the dim and the bold and nothing else, and the script carries the
+    /// markers the `TagChips` helper renders. A chip that dropped either half
+    /// of the namespace fails here before it ever reaches a browser, whose
+    /// half is SPA-59's.
+    #[test]
+    fn namespaced_tag_chips_dim_the_estate_and_bolden_the_subsystem_unit() {
+        let stylesheet = bundle_stylesheet();
+        for (selector, property, value) in [
+            (".tag-chip", "white-space", "nowrap"),
+            (".tag-chip .tag-estate", "opacity", "0.75"),
+            (".tag-chip .tag-sub", "font-weight", "700"),
+        ] {
+            let rules = css_rules(&stylesheet)
+                .into_iter()
+                .filter(|rule| rule.selectors == vec![selector.to_owned()])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rules.len(),
+                1,
+                "the stylesheet declares {} rules selecting exactly {selector}",
+                rules.len()
+            );
+            let declared = css_declarations(&rules[0].body);
+            assert!(
+                declared
+                    .iter()
+                    .any(|(name, held)| name == property && held == value),
+                "{selector} does not declare {property}:{value}: {declared:?}"
+            );
+            // The chip names its namespace by weight of ink, never by a new
+            // colour: no token, no hex, no radius, no border.
+            for (name, held) in &declared {
+                assert!(
+                    !held.contains('#')
+                        && !held.starts_with("var(--")
+                        && name != "border-radius"
+                        && !name.starts_with("border"),
+                    "{selector} declares {name}:{held}, so the chip carries its own colour"
+                );
+            }
+        }
+        let script = crate::bundle::asset(crate::bundle::SCRIPT).expect("the embedded script");
+        let script = String::from_utf8_lossy(script.bytes).into_owned();
+        for marker in ["tag-chip", "tag-estate", "tag-sub", "data-tag"] {
+            assert!(
+                script.contains(marker),
+                "the bundle renders no {marker}: the chip markup is gone"
+            );
+        }
+    }
+
     /// WEB-42 — tables lose their borders and keep the hairline.
     #[test]
     fn tables_declare_only_the_row_hairline_unit() {

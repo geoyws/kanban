@@ -448,6 +448,50 @@ pub(crate) fn validate_tag_name(name: &str) -> Result<String> {
     Ok(name)
 }
 
+/// The estate a board files namespaced tags under: the compile-time
+/// board-to-estate map.
+///
+/// Boards follow durable product-estate ownership boundaries, and a bare tag
+/// carries no estate — so `tag add` builds the repair from this table rather
+/// than asking the caller to guess. An unmapped board gets the estate list
+/// with no suggestion, because there is no board truth to build one from.
+/// Adding a fourth estate, or moving a board, is a deliberate edit here —
+/// the one board vocabulary beside [`ESTATES`] — never a side effect of a
+/// mistyped tag.
+pub(crate) fn estate_for_board(board: &str) -> Option<&'static str> {
+    match board {
+        "px" | "fmx" | "hx" | "hrx" | "ix" | "mx-root" | "prjx-root" | "rentx-root"
+        | "auditx-root" | "ifca-docs" | "prjx" => Some("ifca"),
+        "kanban" | "omp" | "acies" | "dotfiles" | "geoyws" | "atmux" | "dash" | "gitea"
+        | "journal" | "orch" | "hax" => Some("geoyws"),
+        "memberx" => Some("unum"),
+        name if name.starts_with("unum") => Some("unum"),
+        _ => None,
+    }
+}
+
+/// Refuse a bare tag name on `tag add` with the board's namespaced form.
+///
+/// A slashed name is not bare — its estate was already checked by
+/// [`validate_tag_name`] — so this answers `Ok` for anything carrying `/`
+/// and for nothing else. The refusal writes nothing; it names the exact
+/// registration to run instead.
+pub(crate) fn refuse_bare_tag_name(board: &str, name: &str) -> Result<()> {
+    if name.contains('/') {
+        return Ok(());
+    }
+    let estates = ESTATES.join(", ");
+    match estate_for_board(board) {
+        Some(estate) => {
+            bail!("tag {name} is not namespaced: use {estate}/{name} (estates: {estates})")
+        }
+        None => bail!(
+            "tag {name} is not namespaced: no estate maps this board, so register it as \
+             <estate>/{name} (estates: {estates})"
+        ),
+    }
+}
+
 fn validate_registered_tags(
     connection: &Connection,
     tags: &[String],
@@ -14990,6 +15034,62 @@ mod tests {
             .to_string();
         assert!(estate.contains("acme"), "{estate}");
         assert!(estate.contains("ifca, unum, geoyws"), "{estate}");
+    }
+
+    /// CLI-02 — every named board files under its estate, and nothing else
+    /// files anywhere.
+    ///
+    /// The map is the repair `tag add` names, so a board filed wrong here
+    /// sends the operator to register under the wrong owner. One table,
+    /// because every row here is the same question.
+    #[test]
+    fn estate_for_board_maps_each_named_board_to_its_estate() {
+        for (board, estate) in [
+            ("px", "ifca"),
+            ("fmx", "ifca"),
+            ("hx", "ifca"),
+            ("hrx", "ifca"),
+            ("ix", "ifca"),
+            ("mx-root", "ifca"),
+            ("prjx-root", "ifca"),
+            ("rentx-root", "ifca"),
+            ("auditx-root", "ifca"),
+            ("ifca-docs", "ifca"),
+            ("prjx", "ifca"),
+            ("kanban", "geoyws"),
+            ("omp", "geoyws"),
+            ("acies", "geoyws"),
+            ("dotfiles", "geoyws"),
+            ("geoyws", "geoyws"),
+            ("atmux", "geoyws"),
+            ("dash", "geoyws"),
+            ("gitea", "geoyws"),
+            ("journal", "geoyws"),
+            ("orch", "geoyws"),
+            ("hax", "geoyws"),
+            ("unum", "unum"),
+            ("unum-ledger", "unum"),
+            ("memberx", "unum"),
+        ] {
+            assert_eq!(
+                estate_for_board(board),
+                Some(estate),
+                "board {board} must file under {estate}"
+            );
+        }
+        for board in ["scratch", "TAGS", "Alpha", "", "ifca"] {
+            assert_eq!(
+                estate_for_board(board),
+                None,
+                "board {board} must map to no estate"
+            );
+        }
+        // A slashed name is never bare, on any board: the estate half was
+        // already checked by `validate_tag_name`, so there is nothing left to
+        // refuse here.
+        for board in ["prjx", "kanban", "memberx", "scratch"] {
+            refuse_bare_tag_name(board, "ifca/assistant").expect("a namespaced name is never bare");
+        }
     }
 
     #[test]

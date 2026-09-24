@@ -2,8 +2,9 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `WEB`. Requirement IDs are `WEB-01` .. `WEB-59` and are stable across wording
-  refinements (WEB-56..59 were added by the 2026-09-17 SPEC-READY review; numbering is by
+- **Slice ID:** `WEB`. Requirement IDs are `WEB-01` .. `WEB-60` and are stable across wording
+  refinements (WEB-56..59 were added by the 2026-09-17 SPEC-READY review, WEB-60 by the
+  2026-09-25 tag-namespace slice under George's `a-3990a3e3` approval; numbering is by
   creation, grouping is by topic).
 - **Baseline:** 2026-09-17 at commit `56e6b24` on branch `docs/t-b349fa14-spec`. Every "today"
   claim below cites the line that has it, as `<path>:<line>`.
@@ -462,6 +463,22 @@ On `/boards` and `/deployments`, every `th` and `td` computes a total border wid
 `0px`, that `1px` is the row separator in `--surface0`, and every numeric cell computes
 `text-align: right` with the `--mono` family.
 
+**WEB-60** — a namespaced tag reads as a chip with the estate dimmed.
+Strength: MUST · Layer: unit · Source: board rows `t-7f596f45`, `t-fb600b26`; George,
+2026-09-24, attention `a-3990a3e3` (the chip half of the one-change approval); tag-namespace
+sweep `t-f46a2b8a` (SPA-59 holds the browser half).
+The bundle stylesheet — the one place the design system is true of since `t-bf255880` wave 2
+deleted the served `CSS` const — declares `.tag-chip` with `white-space:nowrap`, `.tag-chip
+.tag-estate` with `opacity:0.75`, and `.tag-chip .tag-sub` with `font-weight:700`; those three
+rules declare no colour token, no hex literal, no radius and no border, so SPA-56's arithmetic
+is untouched. The embedded script carries the chip markers (`tag-chip`, `tag-estate`,
+`tag-sub`, `data-tag`), so every `, tagged …` clause renders one `.tag-chip` per tag with the
+full slash spelling in `data-tag`: the estate prefix dimmed, the subsystem bold. A tag with no
+slash renders whole and bold — there is no prefix to dim — so bare legacy tags render as
+before.
+*Failure behaviour:* a joined plain-text tag list, or a chip that drops either half of the
+namespace, fails this requirement.
+
 ### Responsiveness
 
 **WEB-44** — nothing overflows sideways, anywhere.
@@ -771,6 +788,17 @@ at 60 px, and the note field is still at 716–785 — inside the viewport and a
 816. Without the restore the same scenario reports both positions at 0 and the note at
 1130–1199, off the screen.
 
+**A17 — a namespaced tag reads as a chip with the estate dimmed (WEB-60).**
+*Given* the shipped bundle,
+*when* its stylesheet bytes are read,
+*then* `.tag-chip` declares `white-space:nowrap`, `.tag-chip .tag-estate` declares
+`opacity:0.75`, `.tag-chip .tag-sub` declares `font-weight:700`, and none of the three rules
+declares a colour token, a hex literal, a radius or a border; *and when* its script bytes are
+read, *then* they carry `tag-chip`, `tag-estate`, `tag-sub` and `data-tag`, so every
+`, tagged …` clause renders one `.tag-chip` per tag with the full slash spelling in
+`data-tag` — the estate prefix dimmed, the subsystem bold — while a slash-free tag renders
+whole and bold.
+
 **Categories deliberately not exercised here.** Unauthenticated access, session handling and
 CSRF-token design are the edge's and are already proven where they live: kanban implements no
 authentication (ADR-016:49), the actor header is trusted only from the edge
@@ -956,11 +984,14 @@ rows are the rows to add to `docs/testing/compiled-rust-e2e-matrix.md`:
 | WEB-57 | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | chrome | M2 |
 | WEB-58 | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` † | unit | M1 |
 | WEB-59 | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | chrome | M2 |
+| WEB-60 | `namespaced_tag_chips_dim_the_estate_and_bolden_the_subsystem_unit` | unit | M1 |
 
-Counts: 59 requirements — 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 30
+Counts: 60 requirements — 58 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY; by layer, 31
 `unit`, 28 `chrome`, 1 `http`. WEB-47's MAY became a MUST on 2026-09-18, and
 WEB-40 moved from `unit` to `chrome` with `t-bf255880` wave 1, when every page
-that lists rows became the bundle's.
+that lists rows became the bundle's. WEB-60 joined 2026-09-25 with `t-7f596f45`: the served
+chip CSS and script markers, proved over the bundle's own bytes while SPA-59 holds the
+browser half.
 
 ## Appendix A — the design plan, verbatim
 

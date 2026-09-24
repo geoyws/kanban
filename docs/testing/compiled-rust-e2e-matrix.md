@@ -235,7 +235,7 @@ asserting real database state plus tenancy isolation` — or the superseding dat
 One row per mandatory requirement; a `MAY` gets a row only if it is actually tested. The section
 is updated in the same change as the specification delta it traces.
 
-## Requirements trace — `docs/specs/web-ui.md` WEB-01..WEB-59
+## Requirements trace — `docs/specs/web-ui.md` WEB-01..WEB-60
 
 One row per requirement, on branch `docs/t-5e88b314-release` at 2026-09-17:
 commit `b98e81e` plus the WEB-38 HTTP test written the same day. `Layer` uses
@@ -308,10 +308,11 @@ each test measures; this table carries only the mapping.
 | WEB-57 | MUST | chrome | `an_incomplete_own_answer_refuses_before_posting_in_real_chrome` | |
 | WEB-58 | MUST | unit | `every_deck_rule_is_scoped_to_a_page_whose_script_ran` | shipped test, green against the rewritten stylesheet **Deleted 2026-09-19 by `t-bf255880` wave 2** with the `CSS` constant it read. The bundle's stylesheet is swept by the WEB-01/04/06/08/09/10 unit proofs, which read `bundle_stylesheet()` since wave 2; deck rules ship in a page that always ran its script, so the scoping clause is vacuous. |
 | WEB-59 | MUST | chrome | `the_live_line_and_the_toast_log_say_only_their_own_thing_in_real_chrome` | |
+| WEB-60 | MUST | unit | `namespaced_tag_chips_dim_the_estate_and_bolden_the_subsystem_unit` | landed 2026-09-25 with `t-7f596f45`: asserts the bundle stylesheet declares `.tag-chip` nowrap, `.tag-chip .tag-estate` at opacity `0.75` and `.tag-chip .tag-sub` at weight `700` with no colour token, hex, radius or border in those rules, and that the embedded script carries the `tag-chip`/`tag-estate`/`tag-sub`/`data-tag` markers. The browser half is SPA-59's. |
 
-59 requirements: 57 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY — WEB-47's MAY
+60 requirements: 58 MUST, 2 SHOULD (WEB-06, WEB-21), no MAY — WEB-47's MAY
 became a MUST on 2026-09-18. By layer,
-30 `unit`, 28 `chrome` and 1 `http` — every requirement maps to an existing
+31 `unit`, 28 `chrome` and 1 `http` — every requirement maps to an existing
 test at the layer §3 assigns it. WEB-40 moved from `unit` to `chrome` with
 `t-bf255880` wave 1.
 
@@ -583,6 +584,29 @@ each row says `no e2e coverage` plainly.
 7 requirements: 7 MUST, no SHOULD or MAY. The sixth kind raises, lists, shows,
 resolves, reopens and migrates through the existing attention machinery; the
 board schema stands at 33.
+
+## Requirements trace — docs/specs/cli.md CLI-01..CLI-05
+
+`tag add` registers only namespaced tags, refused with the board's estate, on branch
+`wt/t-7f596f45-tagns` at 2026-09-25. Every test these rows name exists in that build,
+enumerated with `cargo test --locked --lib -- --list` (unit rows) and
+`cargo test --locked --test e2e -- --list` (process rows). `Layer` uses the specification's
+own vocabulary, where `unit` is an in-process Rust `#[test]` and `process` is a
+compiled-binary process-boundary exchange in `tests/e2e.rs` with no HTTP and no browser.
+Of the 5 requirements — all `MUST` — 4 are proved at `process` and 1 at `unit`, and none
+carries browser evidence: the slice changes no served markup (the chip half is `WEB-60`
+above), so each row says `no e2e coverage` plainly.
+
+| Requirement | Strength | Layer | Existing test | Note |
+| --- | --- | --- | --- | --- |
+| `CLI-01` | MUST | process | `tag_add_refuses_a_bare_name_with_the_boards_mapped_estate` | table-driven over `prjx`/`ifca`, `kanban`/`geoyws`, `memberx`/`unum` and `unum-ledger`/`unum`; asserts the exact sentence and an empty master file. no e2e coverage |
+| `CLI-02` | MUST | unit | `estate_for_board_maps_each_named_board_to_its_estate` | every named board plus the `unum*` rule, unmapped names, and the slashed-name exemption. no e2e coverage |
+| `CLI-03` | MUST | process | `tag_add_refuses_a_bare_name_on_an_unmapped_board_with_the_estate_list_only` | asserts the estate list is carried and no single `estate/name` is suggested. no e2e coverage |
+| `CLI-04` | MUST | process | `tag_add_registers_a_namespaced_tag` | `ifca/assistant` on `prjx`: registers, lists, attaches. no e2e coverage |
+| `CLI-05` | MUST | process | `tag_filters_refuse_unknown_names_exactly_as_before` | `task list`, `attention list` and rule task-tag validation refuse bare `nope` with their baseline sentences. no e2e coverage |
+
+5 requirements: 5 MUST, no SHOULD or MAY. A refused registration writes nothing; bare
+legacy tags already registered stay registered and migrate with `tag rename`.
 
 ## Watch coverage note
 

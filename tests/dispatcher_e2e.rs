@@ -228,7 +228,17 @@ impl Fixture {
     }
 
     fn append_event(&self, tag: &str) {
-        let output = self.kanban(&["tag", "add", tag, "--as", "test@dispatcher", "--json"]);
+        // `tag add` registers only namespaced tags; the estate half is never
+        // asserted here, only the delivery the event triggers.
+        let namespaced = format!("geoyws/{tag}");
+        let output = self.kanban(&[
+            "tag",
+            "add",
+            &namespaced,
+            "--as",
+            "test@dispatcher",
+            "--json",
+        ]);
         assert_success(&output, "tag add");
     }
 

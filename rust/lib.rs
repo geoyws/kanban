@@ -7370,9 +7370,17 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
     }
     if command == "tag" && sub == Some("add") {
         let name = rest.first().context("tag name is required")?;
+        // The shape first, so a malformed name keeps `validate_tag_name`'s
+        // sentence; then the namespace, built from the board's own estate —
+        // the registry selection, falling back to the board's stored name.
+        let name = crate::store::validate_tag_name(name)?;
+        let board = selected_board_name(&args)?
+            .or(store.board_name()?)
+            .unwrap_or_default();
+        crate::store::refuse_bare_tag_name(&board, &name)?;
         return print(
             &store.add_tag(
-                name,
+                &name,
                 args.one("description"),
                 Some(args.one("as").unwrap_or("system@cli")),
             )?,
