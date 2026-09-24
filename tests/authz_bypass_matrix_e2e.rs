@@ -1031,12 +1031,14 @@ fn no_selector_reaches_a_board_the_caller_has_no_authority_over() {
 /// reconnect", which is not revocation.
 ///
 /// This starts a real `watch --follow` process, observes a tagged row's event
-/// arrive, retires the tag grant while the stream is still open, and then
-/// observes the next event on that same row NOT arrive. The process is
-/// asserted still running and still producing output, so what is measured is a
-/// live stream that stopped delivering — not a crashed one, and not a
-/// reconnect. Restoring the grant then makes the withheld row appear on the
-/// SAME stream, which is only possible if the authority is re-read per poll.
+/// arrive, retires the tag grant while the stream is still open — the next
+/// attach is refused outright, because a caller who cannot read the row
+/// cannot write to it either — then restores the grant just long enough to
+/// write one event, revokes again, and observes that event NOT arrive. The
+/// process is asserted still running and still producing output, so what is
+/// measured is a live stream that stopped delivering — not a crashed one, and
+/// not a reconnect. Restoring the grant then makes the withheld row appear on
+/// the SAME stream, which is only possible if the authority is re-read per poll.
 #[test]
 fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     let estate = ManagedEstate::new("revocation");
@@ -1084,9 +1086,29 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     // Revoke, with the stream still open and the process untouched.
     estate.revoke_atom("tag:live");
 
-    // After revocation: the next event on the same row must not be delivered.
+    // The write stops too: without the tag the caller cannot attach to the
+    // row at all, so the refused note never reaches the ledger.
+    estate.denied(&work_a, &note_on(&watched_id, "after-revocation"));
+
+    // To observe what the LIVE stream does with an event it must not deliver,
+    // that event has to be written by someone who still may: restore the tag,
+    // write the note, and revoke again — all with the stream still open.
+    // Anything the stream delivered while the grant was back is drained, so
+    // what follows measures only the revoked state.
+    estate.enforce("direct");
+    estate.grant(
+        "p-watcher",
+        &[
+            tag_scope("read", &estate.id_a, "live"),
+            tag_scope("write", &estate.id_a, "live"),
+        ],
+    );
+    estate.enforce("managed");
     stream.drain();
     estate.ok_json(&work_a, &note_on(&watched_id, "after-revocation"));
+    estate.revoke_atom("tag:live");
+    // After revocation: the next event on the same row must not be delivered.
+    stream.drain();
     thread::sleep(SETTLE);
     let after = stream.drain();
     assert_eq!(
@@ -1115,7 +1137,13 @@ fn revoking_authority_stops_a_live_watch_stream_without_a_reconnect() {
     // SAME process, which is only possible because the authority is re-minted
     // once per poll rather than cached for the life of the stream.
     estate.enforce("direct");
-    estate.grant("p-watcher", &[tag_scope("read", &estate.id_a, "live")]);
+    estate.grant(
+        "p-watcher",
+        &[
+            tag_scope("read", &estate.id_a, "live"),
+            tag_scope("write", &estate.id_a, "live"),
+        ],
+    );
     estate.enforce("managed");
     stream.drain();
     estate.ok_json(&work_a, &note_on(&watched_id, "after-restore"));
@@ -5460,4 +5488,403 @@ fn denied_and_unknown_task_ids_answer_identically_on_task_routes() {
         Some(secret.as_str()),
         "a refused remove moved a row: {survived}"
     );
+}
+// ---------------------------------------------------------------------------
+// Task-attach writes: no board-write-only path may touch an unreadable task.
+// ---------------------------------------------------------------------------
+
+/// ACC-14, task-attach writes: a managed caller holding board read and write
+/// (plus `visible` at both capabilities) but no `secret` scope must not
+/// attach rows to a `secret` task, and a denied task id must answer
+/// byte-identically to a never-created id on every such write — with nothing
+/// recorded.
+///
+/// INTEGRATION, at the layer `process`: the real binary against a real
+/// managed estate. Covers `note`, `attention raise --task`, `sitrep post
+/// --task`, `checkpoint`, `handoff create` with a task, `task add --parent` /
+/// `--depends-on`, `task update --parent`, `subscription add --subject` /
+/// `--relation`, and `deploy start --task`.
+#[test]
+fn task_attach_writes_refuse_a_tag_denied_task_like_an_unknown_id() {
+    fn sitrep_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "sitrep",
+            "post",
+            "attach probe body",
+            "--as",
+            "probe",
+            "--lane",
+            "driver-1",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    fn raise_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "attention",
+            "raise",
+            "attach probe body",
+            "--kind",
+            "decision",
+            "--as",
+            "probe",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    fn checkpoint_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "checkpoint",
+            task,
+            "--lease",
+            "lease-bogus",
+            "--as",
+            "probe",
+            "--summary",
+            "attach probe summary",
+            "--intent",
+            "attach probe intent",
+            "--next-action",
+            "attach probe next",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ]
+    }
+    fn handoff_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "handoff",
+            "create",
+            task,
+            "--lease",
+            "lease-bogus",
+            "--as",
+            "probe",
+            "--summary",
+            "attach probe summary",
+            "--intent",
+            "attach probe intent",
+            "--next-action",
+            "attach probe next",
+            "--repo",
+            "/tmp/attach-probe",
+            "--branch",
+            "main",
+            "--head",
+            SEED_HEAD,
+            "--dirty",
+            "clean",
+            "--json",
+        ]
+    }
+    fn subscription_base<'a>() -> Vec<&'a str> {
+        vec![
+            "subscription",
+            "add",
+            "--consumer",
+            "probe-consumer",
+            "--action",
+            "probe-action",
+            "--timeout-ms",
+            "100",
+            "--max-retries",
+            "1",
+            "--rate-per-minute",
+            "60",
+            "--max-concurrency",
+            "1",
+            "--as",
+            "probe",
+        ]
+    }
+    fn subscription_on_subject(task: &str) -> Vec<&str> {
+        let mut args = subscription_base();
+        args.extend_from_slice(&["--subject", task, "--json"]);
+        args
+    }
+    fn subscription_on_relation(target: &str) -> Vec<&str> {
+        let mut args = subscription_base();
+        args.extend_from_slice(&["--relation", target, "--json"]);
+        args
+    }
+    fn deploy_on_task(task: &str) -> Vec<&str> {
+        vec![
+            "deploy",
+            "start",
+            "--repo",
+            "kanban",
+            "--commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--tier",
+            "@_uat",
+            "--environment",
+            "probe-env",
+            "--host",
+            "probe-host",
+            "--url",
+            "http://localhost:9999",
+            "--as",
+            "probe",
+            "--task",
+            task,
+            "--json",
+        ]
+    }
+    let estate = ManagedEstate::new("acc14-task-attach");
+    let work_a = estate.work_a.clone();
+    for tag in ["visible", "secret"] {
+        estate.ok_json(&work_a, &["tag", "add", tag, "--as", "seed", "--json"]);
+    }
+    // Unmanaged first: where no guard can deny, an unknown id keeps its plain
+    // message on the paths that previously answered it.
+    for (args, what) in [
+        (note_on("t-never-created", "unmanaged probe"), "note add"),
+        (sitrep_on_task("t-never-created"), "sitrep post --task"),
+    ] {
+        let plain = estate.run(&work_a, &args);
+        assert!(!plain.status.success(), "{what} should fail unmanaged");
+        let plain_stderr = String::from_utf8_lossy(&plain.stderr).into_owned();
+        assert!(
+            plain_stderr.contains("task t-never-created not found"),
+            "{what} lost its plain unmanaged message: {plain_stderr}"
+        );
+        assert!(
+            !plain_stderr.contains(DENIED),
+            "{what} answers a denial where no guard can deny: {plain_stderr}"
+        );
+    }
+    for (id, title, tag) in [
+        ("t-attach-secret", "the attach secret task", "secret"),
+        ("t-attach-visible", "the attach visible task", "visible"),
+    ] {
+        estate.ok_json(
+            &work_a,
+            &[
+                "task", "add", title, "--id", id, "--type", "story", "--tag", tag, "--as", "seed",
+                "--json",
+            ],
+        );
+    }
+    estate.ok_json(
+        &work_a,
+        &[
+            "task",
+            "add",
+            "the attach child",
+            "--id",
+            "t-attach-child",
+            "--parent",
+            "t-attach-visible",
+            "--as",
+            "seed",
+            "--json",
+        ],
+    );
+    estate.bind_self(
+        "p-attach",
+        &[
+            board_scope("read", &estate.id_a),
+            board_scope("write", &estate.id_a),
+            tag_scope("read", &estate.id_a, "visible"),
+            tag_scope("write", &estate.id_a, "visible"),
+        ],
+    );
+    estate.enforce("managed");
+    // Each task-attach write: the denied id and the never-created id exit
+    // with the same code and byte-identical stderr — the generic denial —
+    // and the denied form must not succeed.
+    let assert_write_identical = |denied_args: &[&str], unknown_args: &[&str], what: &str| {
+        let denied = estate.run(&work_a, denied_args);
+        let unknown = estate.run(&work_a, unknown_args);
+        assert!(
+            !denied.status.success(),
+            "{what} with a denied id succeeded but must be refused"
+        );
+        assert_eq!(
+            denied.status.code(),
+            unknown.status.code(),
+            "{what} exit codes differ between a denied id and an unknown id"
+        );
+        assert_eq!(
+            denied.stderr, unknown.stderr,
+            "{what} stderr differs between a denied id and an unknown id"
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
+        assert!(
+            stderr.contains(DENIED),
+            "{what} did not answer the non-enumerating denial: {stderr}"
+        );
+    };
+    assert_write_identical(
+        &note_on("t-attach-secret", "attach probe body"),
+        &note_on("t-never-created", "attach probe body"),
+        "note add",
+    );
+    assert_write_identical(
+        &raise_on_task("t-attach-secret"),
+        &raise_on_task("t-never-created"),
+        "attention raise --task",
+    );
+    assert_write_identical(
+        &sitrep_on_task("t-attach-secret"),
+        &sitrep_on_task("t-never-created"),
+        "sitrep post --task",
+    );
+    assert_write_identical(
+        &checkpoint_on_task("t-attach-secret"),
+        &checkpoint_on_task("t-never-created"),
+        "checkpoint",
+    );
+    assert_write_identical(
+        &handoff_on_task("t-attach-secret"),
+        &handoff_on_task("t-never-created"),
+        "handoff create --task",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "add",
+            "attach child probe",
+            "--id",
+            "t-attach-child-probe",
+            "--parent",
+            "t-attach-secret",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        &[
+            "task",
+            "add",
+            "attach child probe",
+            "--id",
+            "t-attach-child-probe",
+            "--parent",
+            "t-never-created",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        "task add --parent",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "add",
+            "attach dep probe",
+            "--id",
+            "t-attach-dep-probe",
+            "--depends-on",
+            "t-attach-secret",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        &[
+            "task",
+            "add",
+            "attach dep probe",
+            "--id",
+            "t-attach-dep-probe",
+            "--depends-on",
+            "t-never-created",
+            "--as",
+            "probe",
+            "--json",
+        ],
+        "task add --depends-on",
+    );
+    assert_write_identical(
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--parent",
+            "t-attach-secret",
+            "--as",
+            "probe",
+        ],
+        &[
+            "task",
+            "update",
+            "t-attach-child",
+            "--parent",
+            "t-never-created",
+            "--as",
+            "probe",
+        ],
+        "task update --parent",
+    );
+    // The subject is addressed `task:ID`, exactly as the usage line spells it.
+    assert_write_identical(
+        &subscription_on_subject("task:t-attach-secret"),
+        &subscription_on_subject("task:t-never-created"),
+        "subscription add --subject",
+    );
+    assert_write_identical(
+        &subscription_on_relation("depends-on:t-attach-secret"),
+        &subscription_on_relation("depends-on:t-never-created"),
+        "subscription add --relation",
+    );
+    assert_write_identical(
+        &deploy_on_task("t-attach-secret"),
+        &deploy_on_task("t-never-created"),
+        "deploy start --task",
+    );
+    // Nothing was written. As the board owner the same caller re-reads every
+    // row the refused writes could have touched: each task-scoped ledger
+    // holds only its birth event, the phantom children do not exist, and no
+    // subscription was created.
+    estate.grant("p-attach", &owner_of(&estate.id_a));
+    for task in ["t-attach-secret", "t-attach-visible", "t-attach-child"] {
+        let ledger = estate.ok(&work_a, &["events", "--task", task, "--all", "--json"]);
+        let events: Vec<Value> = serde_json::from_str(&ledger).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a refused attach wrote to {task}: {ledger}"
+        );
+        assert!(
+            ledger.contains("task_added"),
+            "{task} lost its birth event: {ledger}"
+        );
+        for marker in ["probe-host", "t-attach-child-probe", "t-attach-dep-probe"] {
+            assert!(
+                !ledger.contains(marker),
+                "a refused attach left {marker} on {task}: {ledger}"
+            );
+        }
+    }
+    for phantom in ["t-attach-child-probe", "t-attach-dep-probe"] {
+        let shown = estate.run(&work_a, &["task", "show", phantom]);
+        assert!(
+            !shown.status.success(),
+            "a refused relation add created {phantom}"
+        );
+    }
+    let subscriptions = estate.ok_json(&work_a, &["subscription", "list", "--all", "--json"]);
+    assert!(
+        subscriptions.as_array().unwrap().is_empty(),
+        "a refused subscription was created: {subscriptions}"
+    );
+    // The control path works: as the owner the same caller attaches a note
+    // to the secret task, so the denials above came from the tag and not a
+    // broken write path.
+    estate.ok(&work_a, &note_on("t-attach-secret", "control note"));
 }
