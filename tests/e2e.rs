@@ -2434,9 +2434,9 @@ fn compiled_binary_persists_across_processes_and_rotates_handoff_lease() {
     assert_eq!(doctor["healthy"], true);
     assert_eq!(doctor["registrySchemaVersion"], 14);
     assert_eq!(doctor["supportedRegistrySchemaVersion"], 14);
-    assert_eq!(doctor["supportedBoardSchemaVersion"], 33);
-    assert_eq!(doctor["projects"][0]["schemaVersion"], 33);
-    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 33);
+    assert_eq!(doctor["supportedBoardSchemaVersion"], 34);
+    assert_eq!(doctor["projects"][0]["schemaVersion"], 34);
+    assert_eq!(doctor["projects"][0]["supportedSchemaVersion"], 34);
     assert_eq!(
         doctor["projects"][0]["workspaceRoots"]
             .as_array()
@@ -17729,10 +17729,10 @@ fn handoff_history_survives_the_task_it_was_about() {
         "the account did not survive"
     );
     assert_eq!(kept["fromAgent"], "agent-a");
-    assert!(
-        kept["taskID"].is_null(),
-        "the link to a removed task should be dropped, not dangle"
-    );
+    // Since BOARD_V34 the link is plain TEXT with no `ON DELETE SET NULL`:
+    // the account keeps the removed task's id — which the read paths gate
+    // on — instead of dropping it into board scope.
+    assert_eq!(kept["taskID"], "t-1");
 
     // And the board is still consistent: a dangling reference would show here.
     let doctor = fixture.ok_json(&fixture.main, &["doctor", "--json"]);
@@ -18433,7 +18433,10 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
         .iter()
         .find(|a| a["id"] == blocking["id"])
         .expect("the item was deleted with its task");
-    assert!(survivor["taskID"].is_null());
+    // Since BOARD_V34 the link is plain TEXT with no `ON DELETE SET NULL`:
+    // the orphaned row keeps the removed task's id (which the read paths
+    // gate on) instead of reading as board scope.
+    assert_eq!(survivor["taskID"], "t-1");
     assert_eq!(
         survivor["status"], "open",
         "removing a task answered nothing"
@@ -18475,7 +18478,7 @@ fn attention_is_recorded_for_the_operator_and_kept_after_it_is_settled() {
     assert_eq!(survivor["tags"], json!(["infra", "ui"]));
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        33
+        34
     );
 }
 
@@ -19271,7 +19274,7 @@ fn schema_30_migrates_once_to_native_check_columns_without_inventing_a_check() {
     );
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        33
+        34
     );
     let checked = fixture.ok_json(
         &fixture.main,
@@ -20663,7 +20666,7 @@ fn a_board_migrates_from_schema_24_to_25_and_its_existing_attention_rows_read_as
     let migrated = fixture.ok_json(&fixture.main, &["attention", "list", "--all", "--json"]);
     assert_eq!(
         fixture.ok_json(&fixture.main, &["doctor", "--json"])["projects"][0]["schemaVersion"],
-        33
+        34
     );
     for row in migrated.as_array().unwrap() {
         assert!(row["question"].is_null());
@@ -57103,7 +57106,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated, 33, "the board did not migrate forward");
+    assert_eq!(migrated, 34, "the board did not migrate forward");
 
     // The migrated board takes a fresh complaint, and only under its kind.
     let complaint = fixture.ok_json(
@@ -57135,7 +57138,7 @@ fn complaint_migration_carries_five_kind_board_forward() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(again, 33);
+    assert_eq!(again, 34);
 }
 
 /// COMPLAINT-05: a complaint resolves, refuses, and reopens exactly like any
