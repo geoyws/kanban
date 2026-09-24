@@ -19079,29 +19079,8 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
         )
         .unwrap();
     assert_eq!(restored_definition, stored_definition);
-    // ACC-06: the checked row settles only through its check. The answer is
-    // `store`, so this resolve both records it and reveals the definition
-    // the moment the answer stands.
-    let refused_without_answer = fixture.run(
-        &fixture.main,
-        &[
-            "attention",
-            "resolve",
-            id,
-            "--as",
-            "geoyws",
-            "--choice",
-            "approve",
-            "--json",
-        ],
-    );
-    assert!(!refused_without_answer.status.success());
-    let refusal = refusal_object(&refused_without_answer);
-    assert!(
-        refusal.contains("Which layer owns the definition?"),
-        "{refusal}"
-    );
-    assert!(refusal.contains("--check-answered"), "{refusal}");
+    // The answer is `store`, so this resolve both records it and reveals the
+    // definition the moment the answer stands.
     let resolved = fixture.ok_json(
         &fixture.main,
         &[
@@ -19161,24 +19140,6 @@ fn native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically() 
     assert!(reopened["check"].get("explanation").is_none());
     assert!(reopened["check"].get("answered").is_none());
     assert!(!reopened.to_string().contains("SECRET_RECEIPT"));
-    let refused_again = fixture.run(
-        &fixture.main,
-        &[
-            "attention",
-            "resolve",
-            id,
-            "--as",
-            "geoyws",
-            "--choice",
-            "approve",
-            "--json",
-        ],
-    );
-    assert!(!refused_again.status.success());
-    assert!(
-        refusal_object(&refused_again).contains("--check-answered"),
-        "a reopened row asks again"
-    );
 }
 #[test]
 fn native_check_refuses_a_diagnosis_shaped_raise_then_accepts_the_rewrite() {
@@ -19411,40 +19372,6 @@ fn resolve_records_the_native_check_answer_as_data_across_the_three_paths() {
         .unwrap()
         .len();
 
-    // Path one: no answer, no resolution — the refusal names the question.
-    let bare = fixture.run(
-        &fixture.main,
-        &[
-            "attention",
-            "resolve",
-            checked_id,
-            "--as",
-            "geoyws",
-            "--choice",
-            "approve",
-            "--json",
-        ],
-    );
-    assert!(!bare.status.success());
-    let bare_refusal = refusal_object(&bare);
-    assert!(
-        bare_refusal.contains("Where does the one check answer live after a resolve?"),
-        "{bare_refusal}"
-    );
-    assert!(bare_refusal.contains("--check-answered"), "{bare_refusal}");
-    let still_open = fixture.ok_json(&fixture.main, &["attention", "show", checked_id, "--json"]);
-    assert_eq!(still_open["status"], "open");
-    assert!(still_open["check"].get("answer").is_none());
-    assert_eq!(
-        fixture
-            .ok_json(&fixture.main, &["events", "--json"])
-            .as_array()
-            .unwrap()
-            .len(),
-        events_before,
-        "a refused resolve must write no event"
-    );
-
     // An undeclared key is refused before any result or resolution write.
     let undeclared = fixture.run(
         &fixture.main,
@@ -19613,6 +19540,272 @@ fn resolve_records_the_native_check_answer_as_data_across_the_three_paths() {
     );
     assert_eq!(plain_resolved["status"], "resolved");
     assert!(plain_resolved.get("check").is_none());
+}
+
+/// ACC-06 as amended, ACC-20 and ACC-21 (t-1aa9f553): a bare resolve settles
+/// a checked row and leaves the check pending; `attention check` answers it
+/// once whether the row is open or resolved, through the store law the web
+/// route shares, and its receipt teaches — the verdict, the correct key with
+/// its label and the explanation, for a pass as much as a miss.
+#[test]
+fn attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits() {
+    let fixture = Fixture::new("native-acc-check-verb");
+    fixture.ok_json(&fixture.main, &["init", "--name", "ACC-CHECK", "--json"]);
+    let raise_checked = |body: &str| -> String {
+        raise_carded(
+            &fixture,
+            body,
+            "claude@driver",
+            &[
+                "--check",
+                "Where does the one check answer live?",
+                "--check-choice",
+                "fields=Stored fields on the attention row",
+                "--check-choice",
+                "notes=Note text on the resolution",
+                "--check-answer",
+                "fields",
+                "--check-explain",
+                "SECRET_TEACH rust/store.rs records answered, correct and answeredAt as columns.",
+                "--check-about",
+                "rust/store.rs",
+            ],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let assert_pending = |check: &Value| {
+        assert_eq!(check["question"], "Where does the one check answer live?");
+        assert_eq!(check["about"], "rust/store.rs");
+        for hidden in ["answer", "explanation", "answered", "correct", "answeredAt"] {
+            assert!(check.get(hidden).is_none(), "{hidden} leaked: {check}");
+        }
+    };
+
+    // (a) A bare resolve settles the row; the check stays pending, redacted
+    // on the receipt, on show and on the resolved listing, and no echo is
+    // written because nothing was answered.
+    let later = raise_checked("Settled now, answered later.");
+    let resolved = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &later,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert_eq!(resolved["status"], "resolved");
+    assert_pending(&resolved["check"]);
+    assert!(!resolved["resolution"].as_str().unwrap().contains("ACC:"));
+    assert_pending(
+        &fixture.ok_json(&fixture.main, &["attention", "show", &later, "--json"])["check"],
+    );
+    let listed = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "list",
+            "--status",
+            "resolved",
+            "--limit",
+            "500",
+            "--json",
+        ],
+    );
+    let listed_row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == later.as_str())
+        .unwrap();
+    assert_pending(&listed_row["check"]);
+    assert!(!listed.to_string().contains("SECRET_TEACH"));
+
+    // (b) The resolved row accepts its one answer; the receipt carries the
+    // result beside the correct key and the explanation, the row stays
+    // resolved, and the ledger records the answer without the explanation.
+    let miss = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "check",
+            &later,
+            "--as",
+            "geoyws",
+            "--key",
+            "notes",
+            "--json",
+        ],
+    );
+    assert_eq!(miss["status"], "resolved");
+    assert_eq!(miss["check"]["answered"], "notes");
+    assert_eq!(miss["check"]["correct"], false);
+    assert_eq!(miss["check"]["answer"], "fields");
+    assert!(miss["check"]["answeredAt"].as_i64().is_some());
+    assert!(
+        miss["check"]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("SECRET_TEACH")
+    );
+    assert_eq!(miss["resolution"], resolved["resolution"]);
+    let events = fixture.ok_json(&fixture.main, &["events", "--json"]);
+    let answered_event = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "attention_check_answered")
+        .unwrap();
+    assert_eq!(answered_event["payload"]["answered"], "notes");
+    assert_eq!(answered_event["payload"]["correct"], false);
+    assert!(!events.to_string().contains("SECRET_TEACH"));
+    // A second answer — the same key or another — is refused unchanged.
+    let before = attention_and_chain(&fixture);
+    for key in ["fields", "notes"] {
+        let again = attention_refusal(&fixture, &["check", &later, "--as", "geoyws", "--key", key]);
+        assert!(again.contains("exactly one answer"), "{again}");
+    }
+    assert_eq!(attention_and_chain(&fixture), before);
+
+    // (e) Reopen clears the result; the check is answerable again, and the
+    // human receipt teaches on a pass too.
+    let reopened = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "reopen",
+            &later,
+            "--as",
+            "geoyws",
+            "--note",
+            "Ask again.",
+            "--json",
+        ],
+    );
+    assert_pending(&reopened["check"]);
+    let text = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "check",
+            &later,
+            "--as",
+            "geoyws",
+            "--key",
+            "fields",
+        ],
+    );
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "ACC: pass\nanswer: fields — Stored fields on the attention row\nwhy: SECRET_TEACH \
+         rust/store.rs records answered, correct and answeredAt as columns.\n"
+    );
+    assert_eq!(
+        fixture.ok_json(&fixture.main, &["attention", "show", &later, "--json"])["status"],
+        "open"
+    );
+
+    // (c) On an open row the raiser's answer leaves it open; a later bare
+    // resolve reuses the recorded result and echoes nothing.
+    let open = raise_checked("Answered first, settled after.");
+    let answered = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "check",
+            &open,
+            "--as",
+            "claude@driver",
+            "--key",
+            "notes",
+            "--json",
+        ],
+    );
+    assert_eq!(answered["status"], "open");
+    assert_eq!(answered["check"]["correct"], false);
+    let miss_text = fixture.run(
+        &fixture.main,
+        &[
+            "attention",
+            "check",
+            &open,
+            "--as",
+            "geoyws",
+            "--key",
+            "fields",
+        ],
+    );
+    assert!(
+        !miss_text.status.success(),
+        "the text path refuses a second answer too"
+    );
+    let settled = fixture.ok_json(
+        &fixture.main,
+        &[
+            "attention",
+            "resolve",
+            &open,
+            "--as",
+            "geoyws",
+            "--choice",
+            "approve",
+            "--json",
+        ],
+    );
+    assert_eq!(settled["status"], "resolved");
+    assert_eq!(settled["check"]["answered"], "notes");
+    assert!(!settled["resolution"].as_str().unwrap().contains("ACC:"));
+
+    // (d) Refusals write nothing: no check, an undeclared key, and an actor
+    // who is neither the operator nor the raiser.
+    let plain = raise_carded(&fixture, "No check here.", "claude@driver", &[]);
+    let plain = plain["id"].as_str().unwrap();
+    let pending = raise_checked("Still pending.");
+    let before = attention_and_chain(&fixture);
+    let no_check = attention_refusal(
+        &fixture,
+        &["check", plain, "--as", "geoyws", "--key", "fields"],
+    );
+    assert!(
+        no_check.contains("carries no comprehension check"),
+        "{no_check}"
+    );
+    let undeclared = attention_refusal(
+        &fixture,
+        &["check", &pending, "--as", "geoyws", "--key", "nope"],
+    );
+    assert!(
+        undeclared.contains("names no --check-choice"),
+        "{undeclared}"
+    );
+    let stranger = attention_refusal(
+        &fixture,
+        &[
+            "check",
+            &pending,
+            "--as",
+            "codex@driver-2",
+            "--key",
+            "fields",
+        ],
+    );
+    assert!(
+        stranger.contains("only geoyws or that same raiser may answer its check"),
+        "{stranger}"
+    );
+    assert!(!stranger.contains("SECRET_TEACH"), "{stranger}");
+    assert_eq!(attention_and_chain(&fixture), before);
 }
 #[test]
 fn an_attention_raised_without_choices_reads_as_the_default_approve_reject_pair_with_no_recommendation()
@@ -57161,6 +57354,7 @@ fn generated_surface_publishes_complaint_without_new_tool() {
             "attention show",
             "attention update",
             "attention resolve",
+            "attention check",
             "attention reopen"
         ]
     );

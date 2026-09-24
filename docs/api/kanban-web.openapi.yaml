@@ -890,7 +890,7 @@ paths:
     post:
       operationId: answerAttentionCheck
       tags: [writes]
-      summary: Answer an open item's comprehension check without settling it.
+      summary: Answer an item's comprehension check, open or resolved, without changing its status.
       description: |
         `rust/serve.rs`'s `post` router, beside the reply route.
 
@@ -907,18 +907,19 @@ paths:
         6. The board resolves, or `404`.
         7. `Store::answer_attention_check_from_trusted_edge` accepts it, or
            `409` with the store's own sentence. The operation is the same
-           `record_check_answer` law the CLI's `--check-answered` resolve
-           uses (ACC-11): there is no second answer behaviour. A row with no
-           check, an already-answered check, an undeclared key or a resolved
-           row is refused; the row stays open.
+           `record_check_answer` law the CLI's `--check-answered` resolve and
+           `attention check` verb use (ACC-11, ACC-21): there is no second
+           answer behaviour. A row with no check, an already-answered check or
+           an undeclared key is refused. An open or a resolved row is accepted
+           (ACC-20); its status is unchanged either way.
 
-        On success: `303` to `/?checked={id}`. Nothing is settled — the
-        decision the answer unlocks is a separate `reply`.
+        On success: `303` to `/?checked={id}`. Nothing is settled — on an
+        open row the decision the answer unlocks is a separate `reply`.
 
         The pre-answer projection this route's page was rendered from omits
         `answer` and `explanation` (ACC-10); the post-answer projection a
         refresh then reads may carry both (ACC-13).
-      x-requirement: [SPA-11, ACC-11]
+      x-requirement: [SPA-11, ACC-11, ACC-20]
       x-store-method: Store::answer_attention_check_from_trusted_edge
       parameters:
         - $ref: "#/components/parameters/Project"
@@ -987,9 +988,9 @@ paths:
         "409":
           description: |
             The check was not answered. The row carries no check, the check is
-            already answered, the key is one it does not declare (ACC-07), or
-            the row is resolved. The store's sentence is returned as written,
-            and the row stays open.
+            already answered, or the key is one it does not declare (ACC-07).
+            A resolved row is not refused for being resolved (ACC-20). The
+            store's sentence is returned as written, and the row is unchanged.
 
             **This is a form POST, so the refusal is a page.** The store's
             sentence is the text of the `<p class=error>` under

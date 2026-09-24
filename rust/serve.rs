@@ -869,8 +869,8 @@ fn post(request: &mut Request, url: &str, config: &ServeConfig) -> Result<WebRes
         unreachable!("the route shape was checked above")
     };
     // The check answer is its own write (ACC-11): one key, through the same
-    // Store operation the CLI's `--check-answered` resolve uses, settling
-    // nothing — the row stays open for the decision the answer unlocks.
+    // Store operation the CLI's `--check-answered` and `attention check` use,
+    // settling nothing — an open row stays open, a resolved one stays history.
     if parts[3] == "check" {
         let key = strict_form_value(body, "key")
             .ok()

@@ -406,6 +406,7 @@ kb att update a-12345678 --clear-tags --as codex@driver
 kb att update a-12345678 --clear-card --as codex@driver
 kb att resolve a-12345678 --as geoyws --choice review-now
 kb att resolve a-12345678 --as geoyws --choice review-now --check-answered store
+kb att check a-12345678 --as geoyws --key store
 kb att resolve a-12345678 --as geoyws --choice custom --outcome defer --note "After the aix pin lands."
 ```
 
@@ -440,15 +441,19 @@ it. Reopening returns the item to the open queue without clearing `resolvedAt`,
 the `attention_reopened` event, adds `reopenedAt`, `reopenedBy` and
 `reopenNote`, and the transition is audited.
 
-A row carrying a check settles only through it: `attention resolve` on an
-unanswered check is refused with the check's question and nothing is written,
-while `--check-answered KEY` records the one answer as data — `check.answered`,
-`check.correct` and `check.answeredAt` — and appends the human echo
-`ACC: pass` or `ACC: miss on <key>` to the resolution. A key the check did not
-declare is refused before any write, a row with no check refuses the flag by
-name, and a second answer never replaces the first. After the answer is
-recorded, `attention show` reveals the answer and explanation; a reopen clears
-the recorded result with the decision, so the next resolution answers again.
+A row carrying a check may settle with or without its answer: `attention
+resolve` without `--check-answered` settles the row and leaves the check pending
+— still redacted, still answerable — while `--check-answered KEY` records the
+one answer as data — `check.answered`, `check.correct` and `check.answeredAt` —
+and appends the human echo `ACC: pass` or `ACC: miss on <key>` to the
+resolution. `attention check ID --as ACTOR --key KEY` records the one answer on
+its own, whether the row is open or resolved and without changing its status;
+only `geoyws` or the raiser may run it, and it prints the verdict, the correct
+key with its label and the explanation (`--json` returns the row). A key the
+check did not declare is refused before any write, a row with no check refuses
+the flag by name, and a second answer never replaces the first. After the
+answer is recorded, `attention show` reveals the answer and explanation; a
+reopen clears the recorded result with the decision, so the check answers again.
 On the web card, the check sits between the body and the decision it gates:
 the decision controls stay inert behind a disabled fieldset until
 `POST /attention/{project}/{id}/check` records the one answer, a miss shows

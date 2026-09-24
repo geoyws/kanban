@@ -497,7 +497,7 @@ Of the 18 requirements — all `MUST` — 15 are proved at `process` and 2 at `u
 | `MODEL-17` | MUST | process | `mcp_schema_exposes_allowed_model_array_and_claim_model_string` | `schema --json` kinds `list`/`list`/`value` for `allowed-model` on `task add`/`task update`/`task list` and `value` for `model`; the MCP tools type it array on `task_add`/`task_update`, string on `task_list`, and `model` string on `claim`/`handoff accept` |
 | `MODEL-18` | MUST | unit | `task_detail_lists_allowed_models_and_the_holders_model_unit` | `rust/serve.rs` `mod tests` reading served bytes: the `allowed models` row present when restricted and absent when not, and the holder's `model` line — no e2e coverage, and none planned for this row |
 
-## Requirements trace — docs/specs/acc.md ACC-01..ACC-19
+## Requirements trace — docs/specs/acc.md ACC-01..ACC-21
 
 Definition authoring and schema evidence landed on 2026-09-21 for ACC-01..04, the
 raiser-only authoring half of ACC-05, and the always-redacted show/list portion of ACC-13.
@@ -506,8 +506,11 @@ reopen-clear) and all of ACC-06/07/08 at the CLI/store layer, including the v32 
 columns. The web card landed later on 2026-09-22 for ACC-09..12, including the shared POST
 endpoint and the source-redaction sweep. The miss-rate report landed on 2026-09-23 for
 ACC-18/ACC-19: the CLI `--check-report` and the one `/decided` summary block, both grouped
-by the shared `Store::aggregate_check_report`. Digest/reader cutover and legacy body migration
-remain `PLANNED`; no row below claims those later slices.
+by the shared `Store::aggregate_check_report`. The 2026-09-24 owner-authorised scope change
+(`t-1aa9f553`) amended ACC-06 — a bare resolve now settles a checked row and leaves the check
+pending — and landed ACC-20/ACC-21: one answer accepted open or resolved, and the CLI
+`attention check` verb with its teaching receipt. Digest/reader cutover and legacy body
+migration remain `PLANNED`; no row below claims those later slices.
 
 | Requirement | Strength | Layer | Existing test | Note |
 | --- | --- | --- | --- | --- |
@@ -516,7 +519,7 @@ remain `PLANNED`; no row below claims those later slices.
 | `ACC-03` | MUST | unit/process | `check_json_refuses_decisional_and_unknown_fields`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically` | serde refuses outcome, recommended and unknown definition fields; serialized choices never carry them or mutate the decision |
 | `ACC-04` | MUST | unit | `diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule`; `diagnosis_markers_respect_case_and_word_boundaries`; `native_check_refuses_a_diagnosis_shaped_raise_then_accepts_the_rewrite` | every approved marker in question, choice label and explanation with the byte-exact rule sentence; case/word-boundary edges plus the compiled raise-refuse-then-rewrite e2e; `about` is intentionally outside this marker rule |
 | `ACC-05` | MUST | process | `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `native_attention_check_round_trips_rewrites_redacts_and_refuses_atomically`; `answered_check_locks_definition_and_a_later_resolve_reuses_it`; `attention_check_update_is_raiser_only_across_the_three_actors` | only `raisedBy` may author/update, including no `geoyws` exception with another lane refused the same way; the answered-open lock refuses a raiser rewrite while the answer stands; reopen clears decision and check result together and restores raiser update; resolve takes only `--check-answered`, never a check definition |
-| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | a checked row refuses a bare resolve naming its question and writes nothing; the web-recorded answer lets a later resolve settle with no second flag; a no-check row refuses `--check-answered` by name and otherwise resolves as before |
+| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | as amended 2026-09-24: a bare resolve settles a checked row with no result or `ACC:` echo and the check stays redacted on the receipt, show and resolved list; a recorded answer lets a later resolve settle with no second flag; a no-check row refuses `--check-answered` by name and otherwise resolves as before |
 | `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | declared key records `answered`/`correct`/`answeredAt` as columns the v32 triggers keep absent-or-complete on a defined check; the `ACC: pass` / `ACC: miss on <key>` echo agrees with the stored fields and the `attention_resolved` payload; an undeclared key is refused before any write |
 | `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one right or wrong declared answer resolves with its result and echo; a second `--check-answered` after any recorded answer is refused unchanged; no attempts counter or retry path exists in the surface; concurrent submissions serialize behind the same Store transaction |
 | `ACC-09` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | check first with the `about` chip, decision inert behind a disabled fieldset until the server holds the answer, one answer with no retry control, a miss shows the explanation above the unlocked choices |
@@ -530,10 +533,13 @@ remain `PLANNED`; no row below claims those later slices.
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
 | `ACC-18` | MUST | process | `att_list_check_report_groups_worst_first_with_adr037_caps`; `att_list_check_report_fans_out_across_boards`; `aggregate_check_report_groups_worst_first_with_truncation_and_skips` | A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; registry fan-out with the board-selector refusal; store-level worst-first, truncation and skip unit |
 | `ACC-19` | MUST | chrome | `decided_page_carries_one_check_summary_block` | A18 sentence shape, row links, test ids and omission on empty, plus the `/api/v1/decided` `checkSummary` projection beside the page's rows |
+| `ACC-20` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | the compiled binary answers a resolved row's check once (status and resolution unchanged, `attention_check_answered` recorded without the explanation) and an open row's check once (row stays open); identical and different second answers are refused with the board and audit chain unchanged; reopen clears and the check answers again |
+| `ACC-21` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | `attention check --json` receipt carries `answer`, `explanation`, `answered`, `correct`, `answeredAt`; the text receipt is byte-exact `ACC: pass` / `answer: <key> — <label>` / `why: <explanation>`; the raiser may answer, a non-raiser non-`geoyws` actor is refused naming the raiser, no-check and undeclared-key refusals write nothing |
 
-19 requirements: 19 MUST, no SHOULD or MAY. ACC-01..12 carry definition-, answer- and
+21 requirements: 21 MUST, no SHOULD or MAY. ACC-01..12 carry definition-, answer- and
 web-card-slice evidence (ACC-05 and ACC-13 remain partial pending their remaining halves);
-ACC-18/ACC-19 carry the miss-rate report evidence; every reader/migration slice remains `PLANNED`.
+ACC-18/ACC-19 carry the miss-rate report evidence; ACC-20/ACC-21 carry the deferred-answer and
+CLI check-verb evidence; every reader/migration slice remains `PLANNED`.
 
 ## Requirements trace — docs/specs/complaint.md COMPLAINT-01..COMPLAINT-07
 

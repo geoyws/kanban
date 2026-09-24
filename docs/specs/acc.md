@@ -2,7 +2,7 @@
 
 ## 1. Identity and baseline
 
-- **Slice ID:** `ACC`. Requirement IDs are `ACC-01` .. `ACC-19`, stable across wording
+- **Slice ID:** `ACC`. Requirement IDs are `ACC-01` .. `ACC-21`, stable across wording
   refinements; numbering is by creation and grouping is by topic.
 - **Baseline:** `2026-09-21` at commit `04a66b1` on branch
   `docs/t-6a3dd1a6-acc-spec`.
@@ -13,6 +13,11 @@
   verified the delta against the SDD §1 exit criteria (findings F1–F4 raised and closed, §8
   single-row-per-requirement restored). Specification readiness authorises neither
   implementation, rollout nor release.
+- **Status (delta 2026-09-24):** owner-authorised scope change on board task `t-1aa9f553`
+  (George, 2026-09-24, chose "Ledger + skills"): ACC-06, ACC-15 and ACC-17 superseded in place,
+  ACC-20 and ACC-21 appended. Drafted with the implementation on branch
+  `wt/t-1aa9f553-ledger` from base `f7cc09f`; the independent `/quality spec` review of this
+  delta is pending, and readiness authorises neither rollout nor release.
 - **Owner (product scope):** George.
 - **Decider (wording of this document):** George.
 - **Sources:**
@@ -34,6 +39,12 @@
   - George, 2026-09-21 (scope decision recorded on `t-cbaff421`) — every later pre-answer
     read redacts answer and explanation, including the raiser's own show; the successful raise
     receipt alone may echo the just-authored definition.
+  - George, 2026-09-24 (scope decision on `t-1aa9f553`, "Ledger + skills") — `/kb-att` clears
+    attention rows with no check quiz in the way; checks move to a separate `/kb-acc` run when he
+    has time, and every answer there says right or wrong, gives the correct choice and the
+    explanation, for a pass as much as a miss ("ACC doesn't even correct me atm if i was wrong
+    or explain why i was right"). The ledger therefore settles a checked row without its answer
+    and accepts the one answer later, open or resolved.
 - **Trace matrix:** `docs/testing/compiled-rust-e2e-matrix.md`. §8 carries one row per
   requirement and names implementation evidence only after it lands.
 
@@ -47,17 +58,19 @@ records the answer as data and never exposes its answer key to the browser in ad
 
 - **Raiser** — authors and may update a native check while holding the relevant code,
   component, host or tier context.
-- **George / decision maker** — answers the check through the web card, CLI or `/kb-att`, then
-  makes the existing decision.
+- **George / decision maker** — answers the check through the web card, the CLI
+  (`attention resolve --check-answered` or `attention check`) or `/kb-acc`, and makes the
+  existing decision, before or after the answer.
 - **Clerk / other lane / MCP caller** — reads the permitted redacted projection but cannot
   synthesize, add or change a check.
 - **Operator** — migrates legacy body-block ACCs and reads aggregate check results by subject.
 
 **In scope.** The native check block on `attention raise` and `attention update`;
-`attention resolve --check-answered`; its Store invariants and persisted result; list, show,
-MCP and digest projections; `POST /attention/{project}/{id}/check`; the mounted decision card;
-legacy `ACC:` body-block migration; the `/kb` and `/kb-att` native-field cutover;
-`attention list --check-report` and one aggregate summary block on `/decided`.
+`attention resolve --check-answered`; `attention check`; its Store invariants and persisted
+result; list, show, MCP and digest projections; `POST /attention/{project}/{id}/check`; the
+mounted decision card; legacy `ACC:` body-block migration; the `/kb`, `/kb-att` and `/kb-acc`
+native-field cutover; `attention list --check-report` and one aggregate summary block on
+`/decided`.
 
 **Boundaries.** Existing board/tag tenancy, actor authentication, attention status transitions,
 decision outcomes, choice key/label bounds, card hotkeys and Undo remain owned by their current
@@ -136,14 +149,24 @@ with decision choices locked behind a new answer, and restores raiser update.
 
 ### Answer and resolution
 
-**ACC-06 — Require an answer when a checked row is resolved.**
-Strength: MUST · Layer: process · Source: `e-5c8f7735` §Ledger; `t-d7e6af5f`.
-`attention resolve ... --check-answered KEY` is required for a row carrying an unanswered check.
-Omitting it refuses resolution and prints the check question; the row stays open and no decision,
-check result or event is written. If the web has already recorded the one answer, later web or
-CLI resolve finds it, asks nothing twice and requires no second `--check-answered`. Supplying the
-flag for a row with no check is refused by name. A row with no check and no answer input resolves
-exactly as before ACC.
+**ACC-06 — Settle a checked row with or without its answer.**
+Strength: MUST · Layer: process · Source: `e-5c8f7735` §Ledger; `t-d7e6af5f`; George,
+2026-09-24 on `t-1aa9f553`.
+`attention resolve ... --check-answered KEY` is optional for a row carrying an unanswered check.
+Supplied, it records the one answer (ACC-07) before the row resolves. Omitted, the row resolves
+exactly as a row without a check does: no check result is written, no `ACC:` echo is added to the
+resolution, and the check stays pending — redacted on every read (ACC-13) and answerable later
+(ACC-20). If the one answer is already recorded, a later web or CLI resolve finds it, asks
+nothing twice and requires no second `--check-answered`. Supplying the flag for a row with no
+check is refused by name. A row with no check and no answer input resolves exactly as before ACC.
+
+*Superseded 2026-09-24.* The wording this replaces read: "`attention resolve ...
+--check-answered KEY` is required for a row carrying an unanswered check. Omitting it refuses
+resolution and prints the check question; the row stays open and no decision, check result or
+event is written." That gate put a quiz in front of every decision George clears through
+`/kb-att`. He chose, on 2026-09-24 (`t-1aa9f553`, "Ledger + skills"), to clear decisions
+without it and answer checks separately through `/kb-acc`; the answer is still recorded exactly
+once, now possibly after resolution (ACC-20).
 
 **ACC-07 — Validate and persist the submitted answer as data.**
 Strength: MUST · Layer: process · Source: `t-d7e6af5f`; `e-bef5dd2a` §What the kanban team owns 3.
@@ -223,11 +246,19 @@ unchecked, known and unknown rows.
 
 **ACC-15 — Cut readers and skills over to native data.**
 Strength: MUST · Layer: process · Source: `e-bef5dd2a` root cause; `t-94076221`.
-`lane-att.sh` and `/kb-att` read only the native check question, `about` and choices before
-answer, ask the check first and pass the recorded answer to resolution.
+`lane-att.sh`, `/kb-att` and `/kb-acc` read only the native check question, `about` and choices
+before answer. `/kb-att` resolves attention rows without asking the check, which stays pending
+(ACC-06). `/kb-acc` finds pending checks on open and resolved rows, asks each one and records the
+answer through `attention check` (ACC-21), then shows the verdict, the correct choice and the
+explanation from its receipt.
 `/kb` authors the five native inputs. The legacy body-block reader and clerk synthesis are
 removed: a row with no native check is shown with no check and reported as drafting debt, never
 silently given a generated one.
+
+*Superseded 2026-09-24.* The wording this replaces read: "`lane-att.sh` and `/kb-att` read only
+the native check question, `about` and choices before answer, ask the check first and pass the
+recorded answer to resolution." George moved the check out of `/kb-att` into a separate `/kb-acc`
+run on 2026-09-24 (`t-1aa9f553`), and asked that every answer be corrected and explained.
 
 **ACC-16 — Migrate legacy body blocks once without changing other rows.**
 Strength: MUST · Layer: process · Source: `t-cbaff421` PERSISTENCE; `t-94076221` Migration.
@@ -242,8 +273,13 @@ Strength: MUST · Layer: process · Source: `e-5c8f7735` §Ledger; `t-d7e6af5f`.
 Existing and newly written rows without a check continue to list, show, render and resolve with
 their pre-ACC observable behaviour. Their JSON/MCP projection omits the check rather than
 fabricating an empty or partial block. An older client that sends no check inputs remains valid;
-an older client cannot bypass a check because ACC-06 refuses checked-row resolution without the
-answer.
+an older client that resolves a checked row without the answer settles it and leaves the check
+pending and answerable (ACC-06, ACC-20) — it cannot record, replace or read a result.
+
+*Superseded 2026-09-24.* The wording this replaces read: "an older client cannot bypass a check
+because ACC-06 refuses checked-row resolution without the answer." ACC-06 no longer refuses
+(George, 2026-09-24, `t-1aa9f553`); the check is deferred rather than bypassed, because its one
+answer can still be recorded after resolution.
 
 ### Miss-rate report
 
@@ -302,6 +338,29 @@ no resolved checked rows the block is omitted and the existing empty page
 carries post-answer aggregate data only — `about` strings and counts; it never carries answer
 keys, explanations, choice labels or raiser identity, and redaction otherwise follows ACC-13.
 
+### Deferred answers
+
+**ACC-20 — Accept the one answer while the row is open or resolved.**
+Strength: MUST · Layer: process · Source: George, 2026-09-24 on `t-1aa9f553`; ACC-08.
+A check whose answer is not yet recorded accepts its one answer through the shared Store answer
+operation whether its row is open or resolved. Recording the answer changes neither the row's
+status, decision nor resolution text, and is not a card edit under ACC-05: the definition stays
+as authored. Every other refusal of ACC-07, ACC-08 and ACC-14 is unchanged — a row with no check,
+an already-recorded answer (identical or different key) and an undeclared key are refused
+without mutation. Reopen still clears the recorded result (ACC-05), after which the check
+accepts one new answer.
+
+**ACC-21 — Answer a check from the CLI and teach with the receipt.**
+Strength: MUST · Layer: process · Source: George, 2026-09-24 on `t-1aa9f553`; ACC-11.
+`attention check ID --as ACTOR --key KEY [--json]` (spelled `kb att check …` through the skill
+alias) records the one answer through the same Store answer operation as the ACC-11 web route; it
+cannot implement a second answer law. Only `geoyws` or the row's `raisedBy` may run it, as with
+resolve, and the refusal names the raiser. The `--json` receipt is the row's post-answer
+projection: `check` carries `question`, `choices`, `about`, `answer` (the correct key),
+`explanation`, `answered`, `correct` and `answeredAt`. The text receipt prints three lines, for
+a pass as much as a miss: `ACC: pass` or `ACC: miss on <key>` (agreeing with the stored result as
+ACC-07's echo does), then `answer: <correct key> — <its label>`, then `why: <explanation>`.
+
 ## 4. Acceptance examples
 
 ### A1 — valid full block (`ACC-01`, `ACC-02`, `ACC-03`, `ACC-05`)
@@ -339,9 +398,14 @@ check-definition input to update, or any actor tries to add/change a definition 
 *then* the request is refused naming the raiser and the definition and event history are unchanged.
 ### A6 — missing or already-recorded answer (`ACC-06`)
 *Given* an open checked row with no recorded answer, *when* resolve omits `--check-answered`,
-*then* it is refused with the question, the row remains open and no decision, result or event is
-written; *given* the web already recorded the answer, *when* web or CLI resolves without a second
-answer flag, *then* resolution uses the recorded result, asks nothing twice and succeeds.
+*then* the row resolves, no result or `ACC:` echo is written and the check stays pending and
+redacted on show and list; *given* the answer is already recorded, *when* web or CLI resolves
+without a second answer flag, *then* resolution uses the recorded result, asks nothing twice and
+succeeds.
+
+*Superseded 2026-09-24.* The example this replaces read: "*when* resolve omits
+`--check-answered`, *then* it is refused with the question, the row remains open and no
+decision, result or event is written". See ACC-06.
 
 ### A7 — right answer (`ACC-07`)
 
@@ -440,10 +504,26 @@ explanation, choice label or raiser name occurs in the block. *Given* a board wi
 resolved checked rows, *when* `/decided` loads, *then* the block is omitted while the
 existing empty page reads unchanged.
 
+### A19 — deferred answer on a resolved row (`ACC-06`, `ACC-20`, `ACC-21`)
+
+*Given* a checked row whose answer is `fields` (label `Stored fields on the attention row`)
+resolved with no `--check-answered`, *when* `attention check ID --as geoyws --key notes --json`
+runs, *then* the receipt reads `status=resolved`, `answered=notes`, `correct=false`,
+`answer=fields` and carries the explanation, and the ledger records `attention_check_answered`
+without the explanation; *when* either key is submitted again, *then* it is refused and the board
+and audit chain are unchanged. *When* the row is reopened and `attention check ID --as geoyws
+--key fields` runs without `--json`, *then* stdout is exactly `ACC: pass`, `answer: fields —
+Stored fields on the attention row` and `why: <explanation>` on three lines and the row is open.
+*Given* an open checked row, *when* its raiser answers it, *then* it stays open and a later bare
+resolve reuses the result with no echo. *When* the row has no check, the key is undeclared, or
+the actor is neither `geoyws` nor the raiser, *then* the command is refused naming why and
+nothing changes.
+
 ## 5. Contracts and data
 
 - **Interface version or schema:** CLI adds the five definition inputs,
-  `attention resolve --check-answered KEY` and `attention list --check-report [--all]
+  `attention resolve --check-answered KEY`, `attention check ID --as ACTOR --key KEY [--json]` and
+  `attention list --check-report [--all]
   [--all-boards] [--limit N] [--json]`; MCP exposes their typed equivalents; HTTP adds
   `POST /attention/{project}/{id}/check` to the repository's pinned OpenAPI document. `/decided`
   gains one summary block on its existing route with no new endpoint. OpenAPI is
@@ -456,9 +536,9 @@ existing empty page reads unchanged.
   restores the unanswered open-row state.
 - **Migration:** schema bump at the ADR-045 boundary plus the one-shot, receipt-bearing conversion
   in ACC-16; forward migration only. Rows without a valid leading legacy block are unchanged.
-- **Compatibility:** absent checks remain absent and preserve old read/resolve behaviour; checked
-  rows fail closed against old resolvers that omit the answer; redaction is an omission, not a
-  renamed or nullable answer field.
+- **Compatibility:** absent checks remain absent and preserve old read/resolve behaviour; old
+  resolvers that omit the answer settle a checked row and leave its check pending (ACC-06,
+  ACC-17); redaction is an omission, not a renamed or nullable answer field.
 - **Read projection:** before answer recording, every show, list, MCP, digest and HTTP read omits
   answer and explanation for every actor, including `raisedBy`. A successful raise receipt is a
   same-write acknowledgement, not a later read, and is the sole allowed pre-answer full-definition
@@ -511,6 +591,13 @@ to return the full unanswered definition. That requirement was superseded on 202
 binding. George chose safe redaction on every later show/read instead of adding a principal
 binding or token. The successful raise response remains a same-write receipt and may echo what
 its author just supplied.
+**Resolved scope history.** ACC-06 originally refused to resolve a checked row without its
+answer, and the Store refused to answer a check on a resolved row. George chose "Ledger + skills"
+on 2026-09-24 (`t-1aa9f553`): resolve no longer waits for the check, the one answer is accepted
+open or resolved (ACC-20), and the CLI gained `attention check` (ACC-21) so `/kb-acc` can ask
+checks apart from `/kb-att` and correct every answer. ACC-06, ACC-15, ACC-17 and A6 carry dated
+`Superseded` paragraphs quoting the replaced wording. The web card's check-before-decision order
+(ACC-09) is unchanged.
 
 ## 8. Verification
 
@@ -524,7 +611,7 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-03` | MUST | unit | `PLANNED` | no recommendation, outcome or decision mutation |
 | `ACC-04` | MUST | unit | `diagnosis_markers_are_refused_in_every_checked_text_location_with_the_exact_rule`; `diagnosis_markers_respect_case_and_word_boundaries`; `native_check_refuses_a_diagnosis_shaped_raise_then_accepts_the_rewrite` | every approved marker in question, choice label and explanation with the byte-exact rule sentence; case/word-boundary edges plus the compiled raise-refuse-then-rewrite e2e; `about` is intentionally outside this marker rule |
 | `ACC-05` | MUST | process | `answered_check_locks_definition_and_a_later_resolve_reuses_it`; `native_check_store_round_trip_redaction_authorization_and_atomic_update`; `attention_check_update_is_raiser_only_across_the_three_actors` | raiser-only authoring and resolved immutability landed 2026-09-21; answered-open lock and reopen-clear/restore landed 2026-09-22; the three-actor update pin (raiser, another lane, `geoyws`) and the resolve-takes-only-`--check-answered` refusal land with `t-1227a592` |
-| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | missing/no-check/undeclared-key paths plus a recorded answer letting a later resolve settle with no second flag; the web-answer half lands with ACC-11 |
+| `ACC-06` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it`; `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | as amended 2026-09-24: a bare resolve settles a checked row with no result or echo and the check stays redacted on the receipt, show and resolved list; no-check/undeclared-key paths; a recorded answer lets a later resolve settle with no second flag |
 | `ACC-07` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `v32_result_columns_are_absent_complete_and_defined` | persisted answer/correct/time, note agreement, v32 all-or-none columns |
 | `ACC-08` | MUST | process | `resolve_records_the_native_check_answer_as_data_across_the_three_paths`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | right/wrong paths and immutable duplicate; serialized concurrent answers land with the ACC-11 endpoint |
 | `ACC-09` | MUST | chrome | `the_check_card_answers_before_the_decision_and_never_leaks_the_key` | check-first card with inert decision, one answer, unlock and miss explanation |
@@ -538,6 +625,8 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 | `ACC-17` | MUST | process | `PLANNED` | no-check older-client compatibility |
 | `ACC-18` | MUST | process | `att_list_check_report_groups_worst_first_with_adr037_caps`; `att_list_check_report_fans_out_across_boards`; `aggregate_check_report_groups_worst_first_with_truncation_and_skips` | A17 table values, truncation case, JSON keys, limit/cap refusals, status/filter/shape-conflict refusals and empty board; registry fan-out with the board-selector refusal; store-level worst-first, truncation and skip unit |
 | `ACC-19` | MUST | chrome | `decided_page_carries_one_check_summary_block` | A18 sentence shape, row links, test ids and omission on empty, plus the `/api/v1/decided` `checkSummary` projection beside the page's rows |
+| `ACC-20` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits`; `answered_check_locks_definition_and_a_later_resolve_reuses_it` | one answer on a resolved row and on an open row, status/resolution unchanged; identical and different second answers refused with board and audit chain unchanged; reopen clears and the check answers again |
+| `ACC-21` | MUST | process | `attention_check_answers_once_open_or_resolved_and_resolve_no_longer_waits` | compiled `attention check` JSON receipt with answer, explanation and result; byte-exact three-line text receipt on a pass; raiser allowed, non-raiser non-`geoyws` refused naming the raiser, no-check and undeclared-key refusals |
 
 ## 9. Change log
 
@@ -575,3 +664,11 @@ evidence only after it lands; incomplete requirements remain explicitly `PARTIAL
 Review fixes the same day: miss rate pinned to truncation toward zero with an A17 1/6 case;
 A17 extended to the status-conflict, row-filter and shape-flag refusals; §2 teaching-purpose
 and no-target bullets restored verbatim beside the leaderboard bullet.
+
+- 2026-09-24 — owner-authorised scope change for `t-1aa9f553` (George, "Ledger + skills"):
+  ACC-06 no longer refuses a bare resolve of a checked row, the check stays pending; ACC-15 moves
+  the check out of `/kb-att` into `/kb-acc`; ACC-17's older-client clause follows ACC-06; A6 is
+  rewritten. Each carries a dated `Superseded` paragraph quoting its old wording. ACC-20 (one
+  answer, open or resolved) and ACC-21 (the CLI `attention check` verb and its teaching receipt)
+  are appended at the end of the creation sequence with A19. ACC-09's web check-before-decision
+  card is unchanged.

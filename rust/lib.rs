@@ -232,6 +232,9 @@ Usage:
              [--json]
   kanban attention resolve ID --as ACTOR --choice custom --outcome approve|reject|defer|other
              --note TEXT [--json]
+  kanban attention check ID --as ACTOR --key KEY [--json]
+             (answer the row's comprehension check once, open or resolved;
+             prints the verdict, the correct key and label, and why)
   kanban attention reopen ID --as ACTOR --note TEXT [--json]
   kanban sprint new TITLE --target-version X.Y.Z --start EPOCH_MS --end EPOCH_MS --as ACTOR [--id sp-…] [--body TEXT | --body-file PATH] [--json]
   kanban sprint plan ID --body TEXT|--body-file PATH --as ACTOR [--candidate ID ... | --parent-epic ID | --empty-scope] [--json]
@@ -1377,6 +1380,7 @@ pub(crate) const COMMANDS: &[CommandRow] = &[
         &["id"],
         false,
     ),
+    ("attention", Some("check"), &["as", "key"], &["id"], false),
     ("attention", Some("reopen"), &["as", "note"], &["id"], false),
     (
         "sprint",
@@ -3842,6 +3846,37 @@ fn render_check_report(groups: &[CheckReportGroup]) -> String {
         ));
     }
     out
+}
+
+/// The human `attention check` receipt (ACC-21): the verdict line agreeing
+/// with the stored result (ACC-07), then the correct key with its label,
+/// then the explanation — for a pass as much as a miss.
+fn render_check_answer(item: &Attention) -> Result<String> {
+    let check = item
+        .check
+        .as_ref()
+        .with_context(|| format!("attention {} carries no comprehension check", item.id))?;
+    let (Some(answered), Some(correct), Some(answer), Some(explanation)) = (
+        check.answered.as_deref(),
+        check.correct,
+        check.answer.as_deref(),
+        check.explanation.as_deref(),
+    ) else {
+        bail!("attention {}: the check answer was not recorded", item.id);
+    };
+    let verdict = if correct {
+        "ACC: pass".to_owned()
+    } else {
+        format!("ACC: miss on {answered}")
+    };
+    let label = check
+        .choices
+        .iter()
+        .find(|choice| choice.key == answer)
+        .map_or("", |choice| choice.label.as_str());
+    Ok(format!(
+        "{verdict}\nanswer: {answer} — {label}\nwhy: {explanation}"
+    ))
 }
 
 fn search_options(args: &Args, query: &str) -> Result<SearchOptions> {
@@ -7490,6 +7525,15 @@ fn run_argv(argv: Vec<String>) -> Result<()> {
             )?,
             args.has("json"),
         );
+    }
+    if command == "attention" && sub == Some("check") {
+        let id = rest.first().context("attention id is required")?;
+        let answered =
+            store.answer_attention_check(id, args.require("as")?, args.require("key")?)?;
+        if args.has("json") {
+            return print(&answered, true);
+        }
+        return emit(&render_check_answer(&answered)?);
     }
     if command == "attention" && sub == Some("reopen") {
         let id = rest.first().context("attention id is required")?;

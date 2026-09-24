@@ -7089,9 +7089,11 @@ impl Store {
             );
         }
         let now = now_ms();
-        // ACC-06: a checked row settles only through its check. The gate runs
+        // ACC-06 (amended 2026-09-24, t-1aa9f553): a checked row settles with
+        // or without its answer. A supplied answer is validated and recorded
         // before the decision is composed, so a refusal leaves the row, its
-        // result columns and the event history untouched.
+        // result columns and the event history untouched; an omitted one
+        // leaves the check pending, redacted and answerable later (ACC-20).
         let mut check_echo = None;
         let mut recorded = None;
         match existing.check.as_ref() {
@@ -7113,27 +7115,15 @@ impl Store {
                 }
             }
             Some(check) => {
-                let Some(key) = check_answered else {
-                    bail!(
-                        "attention {id} carries a comprehension check that must be answered \
-                         before it resolves: \"{}\" — answer it with --check-answered KEY \
-                         (declared keys: {})",
-                        check.question,
-                        check
-                            .choices
-                            .iter()
-                            .map(|choice| choice.key.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                };
-                let correct = record_check_answer(&transaction, id, check, key, now)?;
-                recorded = Some((key, correct));
-                check_echo = Some(if correct {
-                    "ACC: pass".to_owned()
-                } else {
-                    format!("ACC: miss on {key}")
-                });
+                if let Some(key) = check_answered {
+                    let correct = record_check_answer(&transaction, id, check, key, now)?;
+                    recorded = Some((key, correct));
+                    check_echo = Some(if correct {
+                        "ACC: pass".to_owned()
+                    } else {
+                        format!("ACC: miss on {key}")
+                    });
+                }
             }
         }
         // The composer lives here and nowhere else, so no caller can produce
@@ -7267,8 +7257,10 @@ impl Store {
     /// Record the one answer to a row's check without settling it — the web
     /// card's write (ACC-11), through the same `record_check_answer` law the
     /// CLI's `--check-answered` resolve uses, so no second answer behaviour
-    /// can exist. The row stays open; a later resolve finds the recorded
-    /// answer and asks nothing twice (ACC-06).
+    /// can exist. The row's status is unchanged: an open row stays open and a
+    /// later resolve finds the recorded answer and asks nothing twice
+    /// (ACC-06); a resolved row stays history with its result now recorded
+    /// (ACC-20).
     pub(crate) fn answer_attention_check_from_trusted_edge(
         &mut self,
         id: &str,
@@ -7276,6 +7268,20 @@ impl Store {
         key: &str,
     ) -> Result<Attention> {
         self.answer_check_with_authorization(id, actor, actor, key, true)
+    }
+
+    /// Record the one answer to a row's check from the CLI (`attention
+    /// check`, ACC-21): the web route's operation under the resolve verb's
+    /// authorization — only the operator or the row's raiser may answer.
+    /// The receipt is the post-answer projection, carrying the correct key
+    /// and the explanation beside the recorded result (ACC-13).
+    pub fn answer_attention_check(
+        &mut self,
+        id: &str,
+        actor: &str,
+        key: &str,
+    ) -> Result<Attention> {
+        self.answer_check_with_authorization(id, actor, actor, key, false)
     }
 
     fn answer_check_with_authorization(
@@ -7297,12 +7303,6 @@ impl Store {
             .query_row("SELECT * FROM attention WHERE id=?", [id], attention_row)
             .optional()?
             .with_context(|| format!("attention {id} not found"))?;
-        if existing.status != "open" {
-            bail!(
-                "attention {id} was already resolved by {} — its check cannot be answered now",
-                existing.resolved_by.unwrap_or_else(|| "someone".into())
-            );
-        }
         if !trusted_edge
             && authorization_actor != OPERATOR_ACTOR
             && authorization_actor != existing.raised_by

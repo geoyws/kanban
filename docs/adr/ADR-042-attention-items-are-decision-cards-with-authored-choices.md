@@ -848,6 +848,38 @@ through a real stdio `Session`.
 
 Phase 3's two real-Chrome cases are named in §6.
 
+## 2026-09-24 amendment: resolve does not wait for the check; answer it later, once
+
+George chose "Ledger + skills" on 2026-09-24 (board task `t-1aa9f553`): he clears
+decisions through `/kb-att` with no check quiz in the way, and answers checks
+separately through `/kb-acc` when he has time, where every answer must say right
+or wrong, give the correct choice and give the explanation — for a pass as much
+as a miss. The ledger changes three things, recorded as an owner-authorised scope
+change in `docs/specs/acc.md` (ACC-06, ACC-15 and ACC-17 superseded in place,
+ACC-20 and ACC-21 appended):
+
+1. `attention resolve` on a row with an unanswered check and no `--check-answered`
+   settles the row. No result and no `ACC:` echo is written; the check stays
+   pending, redacted on every read, and answerable later. `--check-answered KEY`
+   stays optional and records the answer before the row resolves, as before.
+2. The one answer is accepted whether the row is open or resolved. Recording it
+   changes neither status, decision nor resolution text, and is not a card edit:
+   the definition stays immutable on a resolved row. A second answer, an
+   undeclared key and a row with no check are refused as before; reopen still
+   clears the result.
+3. `attention check ID --as ACTOR --key KEY [--json]` records it from the CLI
+   through the same Store operation as `POST /attention/{project}/{id}/check`
+   (`Store::answer_attention_check` beside
+   `Store::answer_attention_check_from_trusted_edge`, one law). Only `geoyws` or
+   the row's raiser may run it, as with resolve. Its receipt is the post-answer
+   projection — correct key, explanation and result — and its text form prints
+   `ACC: pass` or `ACC: miss on <key>`, then `answer: <key> — <label>`, then
+   `why: <explanation>`.
+
+The web card is unchanged: it still asks the check before the decision (ACC-09).
+This supersedes the 2026-09-23 amendment only where that implied a checked row
+cannot settle before its answer; the one-answer, no-retry law stands.
+
 ## 2026-09-23 amendment: the check is part of the card; one recorded answer, never withheld
 
 The native check the 2026-09-21 amendment added beside the decision card is part
